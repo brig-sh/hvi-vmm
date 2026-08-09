@@ -1,0 +1,147 @@
+# hvi
+
+An **observable** microVMM for **Linux guests** (arm64 and x86-64), with three
+host backends behind one CLI:
+
+| Guest | Host | Backend | Status |
+| --- | --- | --- | --- |
+| aarch64 | macOS / Apple silicon | Apple **Hypervisor.framework** (`applevisor`) | boots + benchmarked |
+| aarch64 | Linux | **KVM** (`kvm-ioctls`) | boots to userspace + SMP (vGICv3 or vGICv2) |
+| x86-64 | Linux | **KVM** | boots to userspace + virtio-blk/net + SMP (live in CI) |
+
+See [`docs/architecture.md`](docs/architecture.md) for how the pieces fit
+together (backends, boot protocols, device model, the event ledger, the
+extension seam).
+
+hvi owns guest RAM and the vCPUs. Because it *is* the virtio backend, it sees
+every disk and network boundary event without guest cooperation — including DNS
+names and TLS SNI — and emits them as `RawEvent` NDJSON, so a guest on macOS
+produces the same telemetry stream as the KVM/Linux path.
+
+## Layout
+
+```
+src/
+  main.rs                     CLI (boot | dump-fdt | smoke); selects the backend by target
+  config.rs                   BootConfig / Stop (shared by all backends)
+  machine_macos.rs            Hypervisor.framework backend (macOS + aarch64)
+  machine_linux.rs            KVM backend (Linux + aarch64)
+  machine_x86.rs              KVM backend (Linux + x86-64)
+  boot.rs layout.rs fdt.rs    arm64 Image parse, guest RAM layout, devicetree
+  boot_x86.rs layout_x86.rs   x86 bzImage + boot_params + e820, guest memory map
+  mptable.rs uart16550.rs     x86 Intel MP table, 16550 COM1 serial
+  guestmem.rs                 Send+Sync guest-RAM accessor over the host mapping
+  virtio*.rs                  virtio-mmio blk / net (built-in stack + gvisor-tap relay + SNI) / vsock
+  pl011.rs                    PL011 UART (arm64)
+  plugin.rs                  the extension seam (Plugin / VmHandle / CpuHandle / IoSink)
+  plugins.rs                tools built on it: memory dump, I/O trace
+  events.rs                   RawEvent NDJSON ledger
+  smoke.rs                    M0 hvf smoke test (macOS only)
+docs/                         architecture + writing a tool
+tools/mk-initramfs.py
+```
+
+The three backends share every module except `machine_*`/`smoke`; the split is
+what makes each port small (the virtio devices and the ledger are hypervisor-
+and arch-neutral — they need only a guest-RAM accessor). The arch-specific
+surface is the boot protocol (`boot*`/`layout*`/`fdt`/`mptable`).
+
+## Build
+
+```sh
+# macOS / Apple silicon (needs Xcode CLT):
+cargo build --release
+codesign --sign - --entitlements hvi.entitlements --force --options runtime target/release/hvi
+#   or: ./run.sh --release boot --kernel <Image> ...   (builds, signs, runs)
+
+# Linux (needs /dev/kvm to run) — arm64 or x86-64, native:
+cargo build --release
+
+# Cross compile-check the arm64 Linux backend from an x86 host:
+rustup target add aarch64-unknown-linux-gnu
+cargo check --target aarch64-unknown-linux-gnu
+```
+
+## Run
+
+```sh
+hvi boot --kernel <arm64 Image | x86-64 bzImage> \
+  [--initramfs <cpio>] [--disk <raw.img>] [--mem-mib N] [--cpus N] \
+  [--net | --net-gateway <gvisor-tap .qemu socket>] \
+  [--agent-sock <unix socket>] \
+  [--events <ledger.ndjson>] [--sandbox-id <id>]
+
+hvi dump-fdt --kernel <Image> [--out fdt.dtb]   # pre-boot pipeline, no hypervisor
+hvi smoke                                        # macOS-only M0 hvf test
+hvi --version
+```
+
+### Tools
+
+`--dump-memory <path>` writes guest RAM to a file with the VM parked, on the
+console's interrupt key (**Ctrl-]**) or automatically with `--dump-after
+<secs>`. The image is raw guest-physical memory; on x86 that is two regions,
+because of the MMIO hole.
+
+`--trace-io <path>` logs every virtio-blk request and virtio-net frame as the
+device sees it, one line each — the unaggregated counterpart to the ledger's
+per-flow `net` records.
+
+Both attach through the seam in [`src/plugin.rs`](src/plugin.rs), which is
+also what another crate would use to attach a tool of its own: a debugger, a
+profiler, a snapshotter. See [`docs/plugins.md`](docs/plugins.md); the two
+in [`src/plugins.rs`](src/plugins.rs) are short enough to read as the worked
+examples, and between them they use every part of it.
+
+- **macOS** needs the `com.apple.security.hypervisor` entitlement and an
+  interactive host (AMFI). The boundary telemetry lands in `--events <path>` as
+  `RawEvent` NDJSON.
+- **Linux** needs `/dev/kvm`. On arm64 the guest GIC version follows the host's:
+  a GICv3 host gets vGICv3, a GIC-400 host gets vGICv2 (capped at 8 vCPUs, a
+  GICv2 architectural limit).
+
+## CI
+
+A pull request runs `.github/workflows/pr-build-and-verify.yml`, a push to `main`
+runs `main-build-and-verify.yml`. Both call the same reusable workflows:
+
+- **validate-commits** (pull requests only) -- commit-message conventions and
+  spelling, over the tree and over the messages the pull request adds.
+- **validate-code** -- `tools/tidy.sh --check` (fmt, comment reflow, clippy,
+  rustdoc) on x86 Linux, plus clippy and rustdoc for the arm64/KVM backend
+  cross-checked from the same runner and for the hvf backend on `macos-15`.
+- **build-and-test** -- unit tests on x86 Linux; build, test and entitlement
+  sign on `macos-15`; then a live boot on each backend.
+- **boot-x86** -- live boot of a real Linux kernel under the x86/KVM backend to
+  the userspace/VFS gate, with `--cpus 2` asserting SMP AP bringup.
+- **boot-arm64-hvf** / **boot-arm64-kvm** -- the same for the two arm64
+  backends, on self-hosted runners.
+
+The GitHub-hosted x86 `ubuntu-latest` runners expose `/dev/kvm`, so the x86 live
+boot actually runs in CI. GitHub-hosted arm64 runners do **not** expose KVM, so
+both arm64 backends are compile-checked in CI and boot-tested on self-hosted
+runners.
+
+Run `tools/tidy.sh` before you push. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the commit conventions and the full job list.
+
+## Status and limits
+
+hvi is young, and deliberately small. It boots and runs Linux guests on all
+three backends with virtio-blk, virtio-net and virtio-vsock, and each backend
+is exercised in CI.
+
+The limits worth knowing before you build on it:
+
+- **No egress from the built-in network stack.** `--net` on its own answers ARP,
+  ICMP, DNS and DHCP from a user-space stack inside the VMM; TCP is seen but not
+  forwarded. Real egress means `--net-gateway <socket>` or, on Linux,
+  `--net-tap <dev>`.
+- **8 vCPUs on a GICv2 arm64 host.** The guest's interrupt controller follows
+  the host's, and GICv2 caps there architecturally. A GICv3 host has no such
+  limit.
+- **macOS needs the hypervisor entitlement and an interactive session.** The
+  signature has to be applied to the binary that actually runs: copying a signed
+  Mach-O invalidates it, so `codesign` after every build, not once.
+- **One disk and one NIC.** `--disk` and `--net` take a single device each;
+  there is no hotplug, and no PCI at all.

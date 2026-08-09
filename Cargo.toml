@@ -1,0 +1,51 @@
+[package]
+name = "hvi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "A small microVMM for Linux guests — Hypervisor.framework (macOS) and KVM (Linux) backends"
+license = "Apache-2.0"
+repository = "https://github.com/nofireai/hvi"
+
+# The backend is chosen by target:
+#   macOS + aarch64  -> Apple Hypervisor.framework (applevisor)
+#   Linux + aarch64  -> KVM (kvm-ioctls / kvm-bindings), arm64 guest
+#   Linux + x86_64   -> KVM (kvm-ioctls / kvm-bindings), x86-64 guest
+# On any other host the crate builds to a stub (see src/main.rs), so the shared,
+# hypervisor-agnostic logic and its unit tests still compile everywhere.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust devicetree builder used by the portable `fdt` module (and its unit
+# tests), so it must build on every host, not just the VMM targets.
+vm-fdt = "0.3.0"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+applevisor = "1.0.0"
+# Raw Hypervisor.framework entry points. Needed for hv_vm_map on a host pointer
+# we allocated ourselves (shared guest RAM); applevisor only maps its own.
+applevisor-sys = "1.0.0"
+libc = "0.2"
+
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+kvm-ioctls = "0.20"
+kvm-bindings = "0.11"
+libc = "0.2"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+kvm-ioctls = "0.20"
+# fam-wrappers gives the CpuId FAM wrapper for KVM_GET_SUPPORTED_CPUID / SET_CPUID2.
+kvm-bindings = { version = "0.11", features = ["fam-wrappers"] }
+libc = "0.2"
+
+# The VMM as a library, so it can be linked as well as run.
+[lib]
+name = "hvi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hvi"
+path = "src/main.rs"
+
+[profile.release]
+debug = true

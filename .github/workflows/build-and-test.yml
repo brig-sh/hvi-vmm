@@ -1,0 +1,294 @@
+name: Build and test
+
+# Build and run what a hosted runner can actually run: the unit suites on both
+# host backends, and a live boot on each of the three backends.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Unit tests for the shared core on a cheap x86 Linux runner. Neither the
+  # macOS nor the arm64 backend compiles here (both are gated by target), so
+  # this proves the hypervisor-agnostic logic passes anywhere.
+  test-portable:
+    name: Test portable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - run: cargo test
+
+  # macOS / Apple silicon backend: Hypervisor.framework build and unit tests,
+  # plus the ad-hoc signing step, since an unsigned binary cannot create a VM.
+  # A live boot additionally needs an interactive host (AMFI), so CI stops at
+  # build, test and sign.
+  build-and-test-macos:
+    name: Build and test macos/hvf
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf
+      - name: build
+        run: cargo build
+      - name: test
+        run: cargo test
+      - name: sign (ad-hoc, entitlement)
+        run: |
+          cargo build --release
+          codesign --sign - --entitlements hvi.entitlements --force --options runtime target/release/hvi
+          codesign -dv --entitlements - target/release/hvi 2>&1 | grep -i hypervisor
+
+  # Live boot (x86/KVM): boot a real Linux kernel under the x86 backend and
+  # assert it reaches the kernel + the userspace / no-rootfs VFS gate. Booting
+  # with --cpus 2 also exercises SMP: the BSP enters long mode and the guest
+  # brings the AP online with INIT-SIPI-SIPI serviced by the in-kernel LAPIC, so
+  # we additionally assert both processors activate. Needs a runner with
+  # /dev/kvm (GitHub-hosted ubuntu has KVM); skips cleanly otherwise.
+  boot-x86:
+    name: Boot x86
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: x86-live
+      - id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then echo "ok=yes" >> "$GITHUB_OUTPUT"; ls -l /dev/kvm; \
+          else echo "ok=no" >> "$GITHUB_OUTPUT"; echo "::warning::/dev/kvm absent — skipping live boot"; fi
+      - name: build
+        if: steps.kvm.outputs.ok == 'yes'
+        run: cargo build --release
+      - name: guest kernel
+        if: steps.kvm.outputs.ok == 'yes'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual
+      - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          KIMG=$(ls -1 /boot/vmlinuz-* | sort -V | tail -1); echo "kernel: $KIMG"
+          sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
+            --cmdline "console=ttyS0 panic=-1" </dev/null | tee boot.log || true
+          grep -q "Linux version" boot.log || { echo "::error::kernel did not boot"; exit 1; }
+          grep -qE "Unable to mount root fs|Run /init" boot.log || { echo "::error::did not reach the userspace/VFS gate"; exit 1; }
+          echo "boot gate reached ✓"
+          grep -qE "Total of 2 processors activated|smp: Brought up 1 node, 2 CPUs" boot.log \
+            || { echo "::error::AP did not come online — SMP bringup failed"; exit 1; }
+          echo "SMP: 2 processors online ✓"
+      # backing_len's BLKGETSIZE64 branch self-skips when no block device is
+      # openable, which is every unprivileged run — so nothing exercised it
+      # live. A loop device over a sparse file is exactly the shape that broke
+      # (metadata().len() == 0), and HVI_BLOCK_DEV points the test at it so a
+      # skip cannot pass for coverage. Loop devices need root, not KVM, but the
+      # build above is gated on KVM, so gate the same way.
+      - name: virtio-blk sizing against a real block device
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          truncate -s 64M blk.img
+          LOOP=$(sudo losetup --find --show blk.img)
+          echo "loop device: $LOOP"
+          # Build the test binary as the runner user, so the cargo caches stay
+          # unowned by root; only the test itself needs sudo to open the device.
+          BIN=$(cargo test --release --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true
+                            and .target.name=="hvi" and (.target.kind|contains(["bin"])))
+                     | .executable')
+          echo "test binary: $BIN"
+          sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
+            virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture
+          sudo losetup -d "$LOOP"
+
+  boot-arm64-hvf:
+    name: Boot arm64/hvf
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: build and sign
+        run: |
+          # The entitlement is what lets an ad-hoc signed binary call HVF; the
+          # signature must be applied to the binary that actually runs, since
+          # copying a signed Mach-O invalidates it.
+          cargo build --release
+          codesign --sign - --entitlements hvi.entitlements --force target/release/hvi
+          codesign -dv --entitlements - target/release/hvi 2>&1 | grep -qi hypervisor
+      - name: hvf smoke
+        run: |
+          # Fail fast and legibly if the runner cannot use HVF, rather than
+          # leaving a boot timeout to explain it.
+          ./target/release/hvi smoke
+          ./target/release/hvi smoke --shm
+      - name: guest kernel
+        run: |
+          # An uncompressed arm64 Image, published as an OCI artifact by
+          # urunc-images. `oras` is on the runner for the image work already.
+          oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
+          ls -l guest/Image && file guest/Image | grep -qi "MS-DOS\|data\|ARM64\|Linux"
+      - name: keep-alive initramfs
+        run: |
+          # Unattended: hold userspace long enough for a few snapshots, then
+          # power off, instead of dropping to a shell that would block.
+          python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
+          ls -l target/initramfs.cpio
+      - name: boot to userspace
+        run: |
+          ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --mem-mib 1024 --events ev.ndjson \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > run.log 2>&1 || true
+          tail -25 run.log
+          grep -q "Linux version" run.log \
+            || { echo "::error::the arm64 guest did not boot"; exit 1; }
+          grep -q "HVI-INITRAMFS-UP" run.log \
+            || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+  # Live boot (arm64/KVM): the last backend with no live cover. Runs on a
+  # self-hosted arm64 runner. Hosted arm64 Linux runners expose no /dev/kvm,
+  # so this cannot be done any other way. A GIC-400 host exercises the vGICv2
+  # path specifically.
+  boot-arm64-kvm:
+    name: Boot arm64/kvm
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: kvm availability
+        run: |
+          # Fail fast and legibly if the runner lost /dev/kvm access, rather
+          # than leaving a boot timeout to explain it. The runner user must be
+          # in the kvm group; a group added after the runner started does not
+          # reach it until the runner is restarted.
+          test -w /dev/kvm \
+            || { echo "::error::runner cannot write /dev/kvm (kvm group? runner restarted?)"; exit 1; }
+          grep -m1 GICv /proc/interrupts || true
+      - name: build
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --release
+      - name: guest kernel
+        run: |
+          oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
+          ls -l guest/Image
+      - name: keep-alive initramfs
+        run: |
+          python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
+          ls -l target/initramfs.cpio
+      - name: boot to userspace
+        run: |
+          # --cpus 2 also asserts SMP secondary bring-up through the guest's
+          # own in-kernel PSCI CPU_ON.
+          timeout 180 ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --mem-mib 1024 --cpus 2 --events ev.ndjson \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > run.log 2>&1 || true
+          grep -aE "vGICv3|vCPU\(s\)" run.log || true
+          tail -25 run.log
+          grep -q "Linux version" run.log \
+            || { echo "::error::the arm64 guest did not boot under KVM"; exit 1; }
+          grep -q "HVI-INITRAMFS-UP" run.log \
+            || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+          grep -q "SMP: Total of 2 processors activated" run.log \
+            || { echo "::error::the second vCPU never came up"; exit 1; }
+      # The tap attach is the urunc integration path: urunc creates the tap and
+      # hvi only opens it, so a CI tap created with `ip tuntap` stands in for
+      # urunc exactly. Creating one needs CAP_NET_ADMIN, and the runner user's
+      # privileges are not a given -- so unlike /dev/kvm above (which the job
+      # cannot do anything without) this probes and skips with a warning rather
+      # than going red on an unprivileged runner.
+      # The negative half of the tap behavior: an unusable --net-tap must
+      # refuse the boot, not warn and fall back -- that is the change 9b5b77b
+      # makes, and only a live boot runs that arm. Opening a tap that does not
+      # exist needs no privileges, so unlike the positive boot below this runs
+      # on every runner, probe or no probe.
+      - name: an unusable tap refuses to boot
+        run: |
+          set +e
+          timeout 30 ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --mem-mib 1024 --net-tap hvi-ci-nope \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > tap-refuse.log 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -ne 0 ] \
+            || { echo "::error::a boot with an unusable tap succeeded"; tail -10 tap-refuse.log; exit 1; }
+          grep -q "hvi-ci-nope" tap-refuse.log \
+            || { echo "::error::the boot error does not name the tap"; tail -10 tap-refuse.log; exit 1; }
+          echo "an unusable tap fails the boot and names the interface"
+      - name: tap network probe
+        id: tap
+        run: |
+          # A leftover tap from a crashed earlier run would make the probe
+          # misread "File exists" as "no privileges", so clear it first.
+          ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true
+          # `user` lets the unprivileged hvi process attach to the device;
+          # `vnet_hdr` matches how urunc creates it (TUNTAP_VNET_HDR).
+          if ip tuntap add mode tap name hvi-ci-tap user "$(id -un)" vnet_hdr 2>/dev/null; then
+            NET=""
+          elif sudo -n ip tuntap add mode tap name hvi-ci-tap user "$(id -un)" vnet_hdr 2>/dev/null; then
+            NET="sudo -n"
+          else
+            echo "ok=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::cannot create a tap (needs CAP_NET_ADMIN or passwordless sudo) -- skipping the tap network boot"
+            exit 0
+          fi
+          $NET ip addr add 172.30.0.1/24 dev hvi-ci-tap
+          $NET ip link set hvi-ci-tap up
+          ip -d link show hvi-ci-tap
+          echo "ok=yes" >> "$GITHUB_OUTPUT"
+      - name: boot with the container network on a real tap
+        if: steps.tap.outputs.ok == 'yes'
+        run: |
+          # The whole tap path in one assertion: attach to a pre-existing tap,
+          # present the override MAC, and have the guest ping the host side of
+          # the tap. The neighbor entry the ping leaves behind proves frames
+          # on the tap carried the --net-mac address. The asserts run while
+          # the guest sits in its keep-alive window: detaching drops carrier,
+          # and the kernel may then evict the neighbor entry
+          # (arp_evict_nocarrier defaults on).
+          python3 tools/mk-initramfs.py --out target/initramfs-tap.cpio \
+            --keep-alive 45 --net-static 172.30.0.2/24,172.30.0.1
+          ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs-tap.cpio \
+            --mem-mib 1024 --net-tap hvi-ci-tap --net-mac 52:54:00:c1:5c:01 \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > tap.log 2>&1 &
+          # The init pings before it prints the userspace marker, so once the
+          # marker is up the pings are done.
+          for i in $(seq 1 60); do
+            grep -q "HVI-INITRAMFS-UP" tap.log 2>/dev/null && break
+            sleep 1
+          done
+          grep -q "HVI-INITRAMFS-UP" tap.log \
+            || { echo "::error::the guest did not reach userspace with --net-tap"; tail -20 tap.log; exit 1; }
+          grep -q "bytes from 172.30.0.1" tap.log \
+            || { echo "::error::the guest could not ping the host across the tap"; tail -20 tap.log; exit 1; }
+          ip neigh show dev hvi-ci-tap
+          ip neigh show dev hvi-ci-tap | grep -qi "52:54:00:c1:5c:01" \
+            || { echo "::error::no traffic with the assigned MAC reached the tap"; exit 1; }
+          pkill -f "target/release/hvi boot" || true
+          echo "tap network: the guest pinged the host with the override MAC over hvi-ci-tap"
+      - name: tap teardown
+        if: always()
+        run: |
+          # The tap is host state that would outlive the job on this
+          # persistent runner; remove it however it was created. (The probe's
+          # pre-clean also covers a crashed run, so best-effort is enough.)
+          pkill -f "target/release/hvi boot" 2>/dev/null || true
+          ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true

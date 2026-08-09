@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required for any Hypervisor.framework use (hv_vm_create et al). -->
+	<key>com.apple.security.hypervisor</key>
+	<true/>
+	<!-- M2 adds the vmnet-backed virtio-net backend; uncomment then.
+	<key>com.apple.vm.networking</key>
+	<true/>
+	-->
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+/target
+
+# Installed by `npm ci` for the commit-message linter; the pin that matters is
+# .github/linters/package-lock.json, which is committed.
+/.github/linters/node_modules/
+
+# Claude Code session worktrees and local state.
+.claude/
+
+# Guest artifacts pulled for local boot tests.
+guest/
+ev.ndjson
+run.log
+smoke.log

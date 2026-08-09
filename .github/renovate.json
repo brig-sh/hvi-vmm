@@ -1,0 +1,35 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "configMigration": true,
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":gitSignOff",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(build)",
+    ":semanticCommitScope(deps)"
+  ],
+  "prHourlyLimit": 5,
+  "labels": ["dependencies"],
+  "commitMessageLowerCase": "never",
+  "commitBodyTable": true,
+  "packageRules": [
+    {
+      "description": "Keep the SHA-pinned actions bumped.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "semanticCommitType": "ci"
+    },
+    {
+      "description": "Keep the Cargo dependencies bumped; the lockfile is committed.",
+      "matchManagers": ["cargo"],
+      "groupName": "cargo dependencies"
+    },
+    {
+      "description": "Keep the commitlint tooling under .github/linters bumped.",
+      "matchManagers": ["npm"],
+      "groupName": "commitlint",
+      "semanticCommitType": "ci"
+    }
+  ]
+}

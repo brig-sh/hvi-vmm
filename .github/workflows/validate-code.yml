@@ -1,0 +1,60 @@
+name: Validate code
+
+# Lint only, read-only: format, comment reflow, clippy and rustdoc, once per
+# backend. Building and testing is build-and-test.yml.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The shared, hypervisor-agnostic core plus the x86-64/KVM backend, on a cheap
+  # x86 Linux runner. This is the job that owns formatting for the whole tree:
+  # rustfmt does not evaluate cfg, so it reaches every module, including the
+  # backends this runner cannot build.
+  tidy-portable:
+    name: Tidy portable + x86
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          nightly: "true"
+      - run: tools/tidy.sh --check
+
+  # The arm64/KVM backend, cross compile-checked from the x86 runner: clippy and
+  # rustdoc need no cross-linker, and GitHub-hosted arm64 runners expose no
+  # /dev/kvm anyway, so a live boot of this backend happens out of band.
+  tidy-linux-aarch64:
+    name: Tidy linux/aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: aarch64-unknown-linux-gnu
+          cache-key: aarch64-linux
+      - run: tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
+
+  # The Hypervisor.framework backend. Needs macOS 15+: the in-kernel GICv3 API
+  # (hv_gic_*) it links against was added there.
+  tidy-macos-hvf:
+    name: Tidy macos/hvf
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf
+      - run: tools/tidy.sh --check --lint-only

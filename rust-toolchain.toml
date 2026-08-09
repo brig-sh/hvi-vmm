@@ -1,0 +1,10 @@
+# Pin the toolchain so a fresh checkout builds reproducibly alongside the
+# committed lockfile, and so a new lint landing in a stable release is a
+# deliberate bump rather than a red CI on an untouched tree. `rust-version` in
+# Cargo.toml is the MSRV floor, a separate compatibility contract rather than
+# this build pin. The comment-reflow check in tools/tidy.sh needs a nightly
+# rustfmt, installed separately (rustfmt's wrap_comments is nightly-only).
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

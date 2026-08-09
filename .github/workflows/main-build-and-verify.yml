@@ -1,0 +1,21 @@
+name: Build and verify main
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-code:
+    name: Validate code
+    uses: ./.github/workflows/validate-code.yml
+
+  build-and-test:
+    name: Build and test
+    uses: ./.github/workflows/build-and-test.yml

@@ -1,0 +1,27 @@
+name: Build and verify
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same PR (or ref for a manual dispatch).
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-commits:
+    name: Validate commits
+    uses: ./.github/workflows/validate-commits.yml
+
+  validate-code:
+    name: Validate code
+    uses: ./.github/workflows/validate-code.yml
+
+  build-and-test:
+    name: Build and test
+    uses: ./.github/workflows/build-and-test.yml

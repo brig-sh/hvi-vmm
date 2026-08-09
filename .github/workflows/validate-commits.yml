@@ -1,0 +1,143 @@
+name: Validate commits
+
+# Commit hygiene for a pull request: the message conventions and spelling. Runs
+# only on pull requests, the gate before a rebase-and-merge lands the commits on
+# main verbatim.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # Message conventions: conventional `type(scope): Subject` capped at 72
+  # columns, a capitalized subject without a trailing period, body prose wrapped
+  # at 72 (trailers exempt), and a Signed-off-by trailer (DCO). Rules live in
+  # .github/linters/commitlint.config.mjs.
+  lint-commit-messages:
+    name: Lint commit messages
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: commitlint walks the PR's commit range, and its
+      # trailer-exists rule reads trailers through git.
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: .github/linters/package-lock.json
+
+      - name: Install the pinned commitlint
+        working-directory: .github/linters
+        run: npm ci
+
+      # Lint each commit separately rather than the range in one call, so a
+      # failure can name the commit it belongs to: commitlint prints the message
+      # but not its sha. Violations become annotations and a run summary, so a
+      # reviewer sees which commit to fix without opening the log.
+      - name: Lint the commit messages
+        working-directory: .github/linters
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          failed=0
+          echo "## Commit message check" >> "$GITHUB_STEP_SUMMARY"
+          for sha in $(git rev-list --reverse --no-merges \
+                        "${BASE_SHA}..${HEAD_SHA}"); do
+            short=$(git log -1 --format=%h "$sha")
+            subject=$(git log -1 --format=%s "$sha")
+            if out=$(./node_modules/.bin/commitlint \
+                       --config commitlint.config.mjs \
+                       --from "${sha}~1" --to "$sha" 2>&1); then
+              echo "- \`${short}\` ${subject}" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            failed=1
+            # Keep the rule violations only: drop the echoed message, the
+            # totals line, and the help footer.
+            problems=$(echo "$out" | grep -E '^\s*✖' \
+                       | grep -v 'problems' \
+                       | sed -E 's/^[[:space:]]*✖[[:space:]]*//' || true)
+            echo "::error::${short} ${subject}"
+            echo "- \`${short}\` ${subject} **FAILED**" \
+              >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::error::  ${line}"
+              echo "  - ${line}" >> "$GITHUB_STEP_SUMMARY"
+            done <<< "$problems"
+          done
+          if [ "$failed" = 1 ]; then
+            echo "See https://www.conventionalcommits.org/ and CONTRIBUTING.md" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+  # Spelling, over both the tree and the commit messages the PR adds. The
+  # allowlist lives in .github/linters/typos.toml.
+  check-spelling:
+    name: Check spelling
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install typos
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+        with:
+          tool: typos-cli
+
+      - name: Check the tree for typos
+        run: typos --config .github/linters/typos.toml
+
+      # commitlint covers the message shape, not its spelling, so run the
+      # messages the PR adds through the same dictionary. Per commit rather than
+      # one pipe: reading stdin, typos reports the position as "-:<line>", which
+      # says nothing about which commit the typo is in.
+      - name: Check the commit messages for typos
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          failed=0
+          echo "## Commit message spelling" >> "$GITHUB_STEP_SUMMARY"
+          for sha in $(git rev-list --reverse --no-merges \
+                        "${BASE_SHA}..${HEAD_SHA}"); do
+            short=$(git log -1 --format=%h "$sha")
+            subject=$(git log -1 --format=%s "$sha")
+            # --format brief keeps one line per typo, readable as an annotation.
+            if out=$(git log -1 --format=%B "$sha" \
+                     | typos --config .github/linters/typos.toml \
+                             --format brief - 2>&1); then
+              echo "- \`${short}\` ${subject}" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            failed=1
+            echo "::error::${short} ${subject}"
+            echo "- \`${short}\` ${subject} **FAILED**" \
+              >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              # Reading stdin, typos reports the position as "-:<line>:<col>";
+              # name the commit instead, with the offset within its message.
+              line="${short}:${line#-:}"
+              echo "::error::  ${line}"
+              echo "  - ${line}" >> "$GITHUB_STEP_SUMMARY"
+            done <<< "$out"
+          done
+          if [ "$failed" = 1 ]; then
+            echo "Fix the typo, or add the word to .github/linters/typos.toml" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

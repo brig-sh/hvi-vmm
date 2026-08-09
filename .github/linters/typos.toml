@@ -1,0 +1,18 @@
+# Spell-check configuration for crate-ci/typos, covering both the tree and the
+# commit messages of a pull request (see validate-commits.yml).
+
+# Domain terms and identifiers that are not misspellings.
+[default.extend-words]
+# PL011 register names: MIS is the masked interrupt status register.
+mis = "mis"
+# 16550 register names: THR is the transmit holding register, THRE the
+# "transmit holding register empty" bit in LSR.
+thr = "thr"
+thre = "thre"
+# Plural of VA, a virtual address.
+vas = "vas"
+# The C field name in struct msghdr is msg_controllen.
+controllen = "controllen"
+# "FTER" is the event rings' magic, the four bytes a reader validates the ring
+# header with, the way "FTCB" heads the control block.
+fter = "fter"
