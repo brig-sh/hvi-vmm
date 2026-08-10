@@ -307,6 +307,23 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
     let _raw = RawTerm::enable();
 
+    // Confine the process. Deliberately the last line before the guest runs:
+    // everything above acquires host authority (the VM, the guest-RAM mapping,
+    // the block file, the ledger, the gateway connection, the listeners, the
+    // terminal), everything below only services guest I/O with what is already
+    // open. See `sandbox`.
+    //
+    // Failing closed: a profile that will not install is a profile nobody has
+    // tested, and continuing would hand a guest-facing process the host's full
+    // ambient authority under a log line claiming it was sandboxed.
+    if cfg.sandbox {
+        crate::sandbox::enter()
+            .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
+        eprintln!("[hvi] seatbelt sandbox: on (deny default)");
+    } else {
+        eprintln!("[hvi] seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority");
+    }
+
     // One thread per vCPU; join them all (cpu0 ends on PSCI SYSTEM_OFF and
     // stops the rest).
     let mut joins = Vec::new();
