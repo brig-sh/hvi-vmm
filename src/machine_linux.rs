@@ -381,11 +381,27 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         obs.attach(Arc::new(shared.clone()) as Arc<dyn VmHandle>)?;
     }
 
+    // Arm the seccomp filters before the first thread is spawned. This compiles
+    // both allowlists and fails the boot if either will not, so a bad list is an
+    // error here rather than a SIGSYS inside a device thread later. Nothing is
+    // filtered yet: each thread installs its own as it starts (see `seccomp`).
+    if cfg.sandbox {
+        crate::seccomp::arm()?;
+    }
+
+    // Every listener is bound here, before any filter goes in: the seccomp
+    // allowlists permit accept4 on a listener we already hold but not socket or
+    // bind, so a listener created later would be trapped.
+    let agent_listener = match &cfg.agent_sock {
+        Some(path) => Some(bind_unix(path)?),
+        None => None,
+    };
+
     // Helper threads.
     spawn_input_thread(shared.clone());
-    if let (Some(sock), Some(dev)) = (&cfg.agent_sock, &shared.vsock) {
+    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
         spawn_vsock_bridge(
-            sock.clone(),
+            listener,
             Arc::clone(dev),
             Arc::clone(&shared.mem),
             Arc::clone(&vm),
@@ -415,6 +431,28 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let sh = shared.clone();
         joins.push(std::thread::spawn(move || run_cpu(id as u32, vcpu, sh)));
     }
+
+    // The main thread filters itself last, once everything it had to spawn
+    // exists. Doing it in this order is what lets both allowlists refuse
+    // `seccomp` itself: nothing is ever created underneath a filter except the
+    // per-connection vsock readers, which inherit one on purpose.
+    if cfg.sandbox {
+        crate::seccomp::install(crate::seccomp::Thread::Vmm)?;
+        let (vmm, vcpu) = crate::seccomp::allowed_counts()?;
+        if crate::seccomp::log_mode() {
+            eprintln!(
+                "[hvi] seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
+                crate::seccomp::LOG_ENV
+            );
+        } else {
+            eprintln!("[hvi] seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)");
+        }
+    } else {
+        eprintln!(
+            "[hvi] seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
+        );
+    }
+
     for j in joins {
         let _ = j.join();
     }
@@ -425,6 +463,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
 /// A single vCPU thread: KVM_RUN loop with MMIO/PSCI handling.
 fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
+    // The tight filter, installed before this thread touches anything the guest
+    // controls: MMIO exits are serviced inline here, so the virtio device models
+    // -- the code that parses guest descriptors -- run on this thread.
+    crate::seccomp::install_thread(crate::seccomp::Thread::Vcpu);
     // SAFETY: pthread_self is always valid on the current thread.
     let tid = unsafe { libc::pthread_self() } as u64;
     if let Ok(mut t) = sh.threads.lock() {
@@ -839,6 +881,7 @@ fn set_gic_attr_u32(
 /// ordinary byte, so a run with no plugin passes stdin through untouched.
 fn spawn_input_thread(sh: Shared) {
     std::thread::spawn(move || {
+        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
         let mut byte = [0u8; 1];
         loop {
             // SAFETY: reading one byte from fd 0.
@@ -865,18 +908,13 @@ fn spawn_input_thread(sh: Shared) {
 
 /// Bridges the host agent Unix socket to the guest vsock device (exec).
 fn spawn_vsock_bridge(
-    sock_path: String,
+    listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
 ) {
-    use std::os::unix::net::UnixListener;
     std::thread::spawn(move || {
-        let _ = std::fs::remove_file(&sock_path);
-        let Ok(listener) = UnixListener::bind(&sock_path) else {
-            eprintln!("[hvi/kvm] vsock bridge: cannot bind {sock_path}");
-            return;
-        };
+        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let Ok(reader) = stream.try_clone() else {
@@ -934,6 +972,7 @@ fn spawn_net_tap_reader(
 ) {
     use std::io::Read;
     std::thread::spawn(move || {
+        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
         let mut buf = vec![0u8; 65_536];
         loop {
             let n = match reader.read(&mut buf) {
@@ -964,6 +1003,7 @@ fn spawn_net_gateway_reader(
 ) {
     use std::io::Read;
     std::thread::spawn(move || {
+        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
         let mut hdr = [0u8; 4];
         loop {
             if reader.read_exact(&mut hdr).is_err() {
@@ -1019,4 +1059,18 @@ impl Drop for RawTerm {
             libc::tcsetattr(0, libc::TCSANOW, &self.orig);
         }
     }
+}
+
+/// Binds a Unix listener at `path`, clearing a stale socket from a previous run
+/// first (which would otherwise make `bind` fail with EADDRINUSE).
+///
+/// The caller used to do this inside the thread it spawned. It does it in
+/// `boot` instead because the seccomp filters allow `accept4` but not `socket`
+/// or `bind` -- a listener created after the filter is in would be killed --
+/// and because a failure is now a boot error the caller sees rather than a line
+/// in the log of a guest that is already running.
+fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    let _ = std::fs::remove_file(path);
+    std::os::unix::net::UnixListener::bind(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}")))
 }

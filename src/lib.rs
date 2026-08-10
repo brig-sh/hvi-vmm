@@ -73,6 +73,12 @@ pub mod rtc_cmos;
 /// Seatbelt confinement for the macOS backend, and the selftest that proves it.
 #[cfg(target_os = "macos")]
 pub mod sandbox;
+/// seccomp-bpf confinement for the Linux backends, and the selftest for it.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod seccomp;
 /// Guest RAM backed by a shareable object, so another process can map it.
 pub mod sharedmem;
 /// The tap side of virtio-net, and the portable vnet-header framing.
