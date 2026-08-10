@@ -70,6 +70,9 @@ pub mod quiesce;
 /// MC146818 RTC / CMOS, which an x86 guest reads before it has a timer.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod rtc_cmos;
+/// Seatbelt confinement for the macOS backend, and the selftest that proves it.
+#[cfg(target_os = "macos")]
+pub mod sandbox;
 /// Guest RAM backed by a shareable object, so another process can map it.
 pub mod sharedmem;
 /// The tap side of virtio-net, and the portable vnet-header framing.

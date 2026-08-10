@@ -43,6 +43,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err("`dump-fdt` builds an arm64 devicetree; not applicable on x86".into())
             }
         }
+        // Proves the profile on a host that cannot boot a guest: it needs no
+        // hypervisor entitlement, so a hosted macOS runner can still check the
+        // confinement. A subcommand rather than a `#[test]` because entering
+        // the sandbox is irreversible and process-wide -- inside `cargo test`
+        // it would confine every other test sharing the process.
+        Some("sandbox-selftest") => {
+            #[cfg(target_os = "macos")]
+            {
+                let bad = hvi::sandbox::selftest()?;
+                if bad > 0 {
+                    return Err(format!(
+                        "{bad} sandbox probe(s) did not behave as the profile says they should"
+                    )
+                    .into());
+                }
+                println!("sandbox selftest: every probe matched the profile");
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("`sandbox-selftest` exercises Seatbelt; macOS only".into())
+            }
+        }
         Some("smoke") => {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
@@ -77,7 +100,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         None => {
-            eprintln!("hvi — a microVMM\n\nusage: hvi <boot|dump-fdt|smoke|--version> [args]");
+            eprintln!(
+                "hvi — a microVMM\n\nusage: hvi \
+                 <boot|dump-fdt|smoke|sandbox-selftest|--version> [args]"
+            );
             Ok(())
         }
         Some(other) => Err(format!(
@@ -207,6 +233,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dump_memory = None;
     let mut dump_after = None;
     let mut trace_io = None;
+    let mut sandbox = true;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -231,6 +258,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 dump_after = Some(it.next().ok_or("--dump-after needs seconds")?.parse()?);
             }
             "--trace-io" => trace_io = it.next().cloned(),
+            "--no-sandbox" => sandbox = false,
             other => return Err(format!("unknown boot arg {other:?}").into()),
         }
     }
@@ -266,6 +294,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         sandbox_id,
         vcpus,
         agent_sock,
+        sandbox,
         // `None` rather than an empty chain, so with no tools asked for the
         // hooks stay a null check.
         plugin: if tools.is_empty() {
