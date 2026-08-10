@@ -158,11 +158,27 @@ jobs:
             || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
   # Live boot (arm64/KVM): the last backend with no live cover. Runs on a
   # self-hosted arm64 runner. Hosted arm64 Linux runners expose no /dev/kvm,
-  # so this cannot be done any other way. A GIC-400 host exercises the vGICv2
-  # path specifically.
+  # so this cannot be done any other way.
+  #
+  # Which vGIC the guest gets is the host's to decide, not ours: hvi asks KVM
+  # for the one the host can serve, so a GICv3 host yields vGICv3 while a
+  # GIC-400 host yields vGICv2 and refuses a vGICv3 with ENODEV. Those are
+  # different code paths in the FDT and in interrupt delivery, so both hosts
+  # are run, each pinned by label rather than left to whichever arm64 machine
+  # happens to be free.
   boot-arm64-kvm:
-    name: Boot arm64/kvm
-    runs-on: [self-hosted, Linux, ARM64]
+    name: Boot arm64/kvm (${{ matrix.vgic }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: nbfc
+            vgic: vGICv2
+            expect_gicv3: "no"
+          - runner: gicv3
+            vgic: vGICv3
+            expect_gicv3: "yes"
+    runs-on: [self-hosted, Linux, ARM64, "${{ matrix.runner }}"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -198,6 +214,13 @@ jobs:
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > run.log 2>&1 || true
           grep -aE "vGICv3|vCPU\(s\)" run.log || true
+          # The label claims which interrupt controller this host has; the
+          # guest console reports which one it actually got. Cross-check, so a
+          # relabelled or replaced runner fails here rather than quietly
+          # turning this matrix into two runs of the same path.
+          if grep -qa "GICv3:" run.log; then SAW=yes; else SAW=no; fi
+          [ "$SAW" = "${{ matrix.expect_gicv3 }}" ] \
+            || { echo "::error::expected GICv3=${{ matrix.expect_gicv3 }}, guest reported GICv3=$SAW"; exit 1; }
           tail -25 run.log
           grep -q "Linux version" run.log \
             || { echo "::error::the arm64 guest did not boot under KVM"; exit 1; }
