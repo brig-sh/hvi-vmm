@@ -69,12 +69,36 @@ hvi boot --kernel <arm64 Image | x86-64 bzImage> \
   [--initramfs <cpio>] [--disk <raw.img>] [--mem-mib N] [--cpus N] \
   [--net | --net-gateway <gvisor-tap .qemu socket>] \
   [--agent-sock <unix socket>] \
-  [--events <ledger.ndjson>] [--sandbox-id <id>]
+  [--events <ledger.ndjson>] [--sandbox-id <id>] [--no-sandbox]
 
 hvi dump-fdt --kernel <Image> [--out fdt.dtb]   # pre-boot pipeline, no hypervisor
 hvi smoke                                        # macOS-only M0 hvf test
+hvi sandbox-selftest                             # macOS: prove the Seatbelt profile
+hvi seccomp-selftest                             # Linux: prove the seccomp filters
 hvi --version
 ```
+
+### Confinement
+
+The VMM confines itself before it services any guest I/O, and it is **on by
+default**: a Seatbelt profile on macOS, seccomp-bpf allowlists on Linux
+(`resources/seccomp/*.json`, one per architecture). The reason is that the
+virtio backends parse guest-controlled data on the same threads that run the
+vCPUs, so a bug in one of them is a bug in a process that would otherwise hold
+the host's full syscall surface. Two Linux filters, because the threads differ:
+`vcpu` is the tight one, `vmm` covers the main thread and the host-side I/O
+threads.
+
+Each backend prints what it installed, so a host where confinement did not
+happen says so rather than implying it. `--no-sandbox` boots unconfined, for
+debugging a run the profile or the filters break; on Linux, `HVI_SECCOMP=log`
+keeps the same allowlists but has the kernel record a mismatch instead of
+killing the process, which is how you find a syscall a distro needs and these
+lists do not have.
+
+The selftests are the negative test: they install the filters that actually
+ship and check both directions — what a confined thread must keep, and what it
+must lose. Neither needs a hypervisor or privileges.
 
 ### Tools
 

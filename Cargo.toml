@@ -31,12 +31,19 @@ libc = "0.2"
 kvm-ioctls = "0.20"
 kvm-bindings = "0.11"
 libc = "0.2"
+# seccomp-bpf allowlists for the Linux backends. The rust-vmm crate extracted
+# from Firecracker: it owns the syscall tables and the BPF codegen, so
+# `resources/seccomp/*.json` is all we write. The `json` feature pulls
+# serde/serde_json, which this crate already depends on.
+seccompiler = { version = "0.5", features = ["json"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 kvm-ioctls = "0.20"
 # fam-wrappers gives the CpuId FAM wrapper for KVM_GET_SUPPORTED_CPUID / SET_CPUID2.
 kvm-bindings = { version = "0.11", features = ["fam-wrappers"] }
 libc = "0.2"
+# See the aarch64 section above.
+seccompiler = { version = "0.5", features = ["json"] }
 
 # The VMM as a library, so it can be linked as well as run.
 [lib]

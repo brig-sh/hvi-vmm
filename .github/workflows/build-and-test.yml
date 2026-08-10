@@ -26,6 +26,26 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - run: cargo test
 
+  # The seccomp filters, proved without a hypervisor. `seccomp-selftest`
+  # installs the allowlists that actually ship in child processes and checks
+  # both directions: the syscalls a filtered thread must keep, and the ones it
+  # must lose. It needs no /dev/kvm and no privileges, so a hosted runner can
+  # fail a bad list even though it cannot boot a guest — which matters, because
+  # a filter that is too tight is a crash at run time, not a build error.
+  seccomp-x86:
+    name: Seccomp filters (x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: seccomp-x86
+      - run: cargo build --release
+      - name: selftest
+        run: ./target/release/hvi seccomp-selftest
+
   # macOS / Apple silicon backend: Hypervisor.framework build and unit tests,
   # plus the ad-hoc signing step, since an unsigned binary cannot create a VM.
   # A live boot additionally needs an interactive host (AMFI), so CI stops at
@@ -80,9 +100,16 @@ jobs:
         if: steps.kvm.outputs.ok == 'yes'
         run: |
           KIMG=$(ls -1 /boot/vmlinuz-* | sort -V | tail -1); echo "kernel: $KIMG"
+          # 2>&1: the VMM's own lines (including what it says about seccomp)
+          # go to stderr, and asserting on them means capturing them.
           sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
-            --cmdline "console=ttyS0 panic=-1" </dev/null | tee boot.log || true
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot.log || true
           grep -q "Linux version" boot.log || { echo "::error::kernel did not boot"; exit 1; }
+          # The filters are on by default, so a boot that says otherwise is a
+          # regression in the default, not just a missing log line.
+          grep -qa "seccomp: on" boot.log \
+            || { echo "::error::booted without seccomp enforcement"; exit 1; }
+          echo "seccomp enforced during the live boot ✓"
           grep -qE "Unable to mount root fs|Run /init" boot.log || { echo "::error::did not reach the userspace/VFS gate"; exit 1; }
           echo "boot gate reached ✓"
           grep -qE "Total of 2 processors activated|smp: Brought up 1 node, 2 CPUs" boot.log \
@@ -213,6 +240,11 @@ jobs:
           cache-key: linux-arm64-${{ matrix.runner }}
       - name: build
         run: cargo build --release
+      # The aarch64 allowlist is a different file from the x86 one, and the
+      # hosted seccomp job cannot run it. This is the only place it is
+      # exercised rather than merely compiled.
+      - name: seccomp filters (aarch64)
+        run: ./target/release/hvi seccomp-selftest
       - name: guest kernel
         env:
           # This image is public, so the pull needs no credentials -- but
@@ -248,6 +280,11 @@ jobs:
           if grep -qa "GICv3:" run.log; then SAW=yes; else SAW=no; fi
           [ "$SAW" = "${{ matrix.expect_gicv3 }}" ] \
             || { echo "::error::expected GICv3=${{ matrix.expect_gicv3 }}, guest reported GICv3=$SAW"; exit 1; }
+          # aarch64 has its own allowlist, so "the filters work" has to be
+          # asserted on an arm64 host and not inferred from the x86 run.
+          grep -qa "seccomp: on" run.log \
+            || { echo "::error::booted without seccomp enforcement"; exit 1; }
+          echo "seccomp enforced during the live boot ✓"
           tail -25 run.log
           grep -q "Linux version" run.log \
             || { echo "::error::the arm64 guest did not boot under KVM"; exit 1; }
