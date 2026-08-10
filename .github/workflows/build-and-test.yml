@@ -192,10 +192,17 @@ jobs:
           test -w /dev/kvm \
             || { echo "::error::runner cannot write /dev/kvm (kvm group? runner restarted?)"; exit 1; }
           grep -m1 GICv /proc/interrupts || true
+      # Install the toolchain rather than trusting one to be pre-provisioned
+      # in the runner user's home. That assumption held while a single machine
+      # served this job and broke as soon as it did not: the runner user is
+      # not the one who set the host up, its $HOME is not the one rustup was
+      # installed into, and the failure surfaces as a bare
+      # "cargo: command not found" at the build step.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-arm64-${{ matrix.runner }}
       - name: build
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo build --release
+        run: cargo build --release
       - name: guest kernel
         run: |
           oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
