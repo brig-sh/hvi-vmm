@@ -66,6 +66,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err("`sandbox-selftest` exercises Seatbelt; macOS only".into())
             }
         }
+        // The Linux counterpart: installs the production seccomp allowlists in
+        // child processes and reports which syscalls survived. Needs no
+        // hypervisor and no privileges, so a hosted runner can prove the filter
+        // even where it cannot boot a guest. Children rather than threads
+        // because a denied syscall traps: an in-process probe would end the
+        // selftest at the first denial instead of reporting it.
+        Some("seccomp-selftest") => {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            {
+                let bad = hvi::seccomp::selftest()?;
+                if bad > 0 {
+                    return Err(format!(
+                        "{bad} seccomp probe(s) did not behave as the filters say they should"
+                    )
+                    .into());
+                }
+                println!("seccomp selftest: every probe matched the filters");
+                Ok(())
+            }
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            {
+                Err("`seccomp-selftest` exercises seccomp-bpf; Linux x86-64/aarch64 only".into())
+            }
+        }
         Some("smoke") => {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
@@ -102,7 +132,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             eprintln!(
                 "hvi — a microVMM\n\nusage: hvi \
-                 <boot|dump-fdt|smoke|sandbox-selftest|--version> [args]"
+                 <boot|dump-fdt|smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
             );
             Ok(())
         }
