@@ -133,7 +133,17 @@ jobs:
           ./target/release/hvi smoke
           ./target/release/hvi smoke --shm
       - name: guest kernel
+        env:
+          # This image is public, so the pull needs no credentials -- but
+          # oras still consults the credential helper for any registry
+          # named in ~/.docker/config.json, and on the macOS runners that
+          # helper reads the login keychain. A runner is a background
+          # service with no interactive session, so the keychain is locked
+          # and cannot be prompted: the pull fails on authentication it
+          # never needed. Point oras at an empty config instead.
+          DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
         run: |
+          mkdir -p "$DOCKER_CONFIG"
           # An uncompressed arm64 Image, published as an OCI artifact by
           # urunc-images. `oras` is on the runner for the image work already.
           oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
@@ -204,7 +214,17 @@ jobs:
       - name: build
         run: cargo build --release
       - name: guest kernel
+        env:
+          # This image is public, so the pull needs no credentials -- but
+          # oras still consults the credential helper for any registry
+          # named in ~/.docker/config.json, and on the macOS runners that
+          # helper reads the login keychain. A runner is a background
+          # service with no interactive session, so the keychain is locked
+          # and cannot be prompted: the pull fails on authentication it
+          # never needed. Point oras at an empty config instead.
+          DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
         run: |
+          mkdir -p "$DOCKER_CONFIG"
           oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
           ls -l guest/Image
       - name: keep-alive initramfs
