@@ -65,6 +65,14 @@ pub struct RegsView {
     pub ttbr1: u64,
     pub sctlr: u64,
     pub sp_el1: u64,
+    /// Translation control: TCR_EL1 (arm64), naming the granule and address
+    /// size an out-of-VMM walker needs to size the page tables rather than
+    /// assume a layout. Zero on x86-64.
+    pub tcr: u64,
+    /// The task the vCPU is running: `SP_EL0` on arm64 (Linux keeps `current`
+    /// there while in the kernel), from which a walker recovers the KASLR slide
+    /// by climbing `real_parent` to `init_task`. Zero on x86-64.
+    pub current_task: u64,
 }
 
 /// What the VMM offers a plugin once, during boot, before any vCPU starts.
