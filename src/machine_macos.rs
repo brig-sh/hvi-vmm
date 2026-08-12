@@ -564,6 +564,8 @@ impl CpuHandle for Cpu<'_> {
             ttbr1,
             sctlr: self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0),
             sp_el1: self.vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0),
+            tcr: self.vcpu.get_sys_reg(SysReg::TCR_EL1).unwrap_or(0),
+            current_task: self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0),
         }
     }
 

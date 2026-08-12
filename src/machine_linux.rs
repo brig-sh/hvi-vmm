@@ -56,6 +56,10 @@ const REG_SP_EL1: u64 = 0x6030_0000_0010_0044;
 const REG_SCTLR_EL1: u64 = 0x6030_0000_0013_c080;
 const REG_TTBR0_EL1: u64 = 0x6030_0000_0013_c100;
 const REG_TTBR1_EL1: u64 = 0x6030_0000_0013_c101;
+const REG_TCR_EL1: u64 = 0x6030_0000_0013_c102;
+// SP_EL0 is a core register (user_pt_regs.sp), not a sysreg: Linux keeps
+// `current` there while running in the kernel.
+const REG_SP_EL0: u64 = 0x6030_0000_0010_003e;
 
 /// PSTATE = EL1h + DAIF masked (the arm64 Linux boot-protocol entry state).
 const PSTATE_EL1H_DAIF: u64 = 0x3c5;
@@ -775,6 +779,8 @@ impl CpuHandle for Cpu<'_> {
             ttbr1,
             sctlr: get_u64(self.vcpu, REG_SCTLR_EL1),
             sp_el1: get_u64(self.vcpu, REG_SP_EL1),
+            tcr: get_u64(self.vcpu, REG_TCR_EL1),
+            current_task: get_u64(self.vcpu, REG_SP_EL0),
         }
     }
 
