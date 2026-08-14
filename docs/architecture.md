@@ -290,8 +290,11 @@ Interrupt injection is the one device-facing thing that differs by backend:
   mount, block image, or DAX window is involved. Lookup, attributes, links,
   directory traversal and reads are supported, and real host file handles keep
   open files valid across rename/unlink. Writable exports add create, write,
-  truncate, chmod, directories, links, rename, removal and fsync; read-only
-  exports return `EROFS` for the same requests. Seatbelt independently grants
+  truncate, metadata and xattr updates, locks, allocation, seek/copy, directory
+  handles/readdirplus, atomic rename variants, tmpfiles, removal and sync;
+  read-only exports return `EROFS` for mutations. Writable exports advertise
+  zero cache timeouts for coherence with concurrent host edits. Guest root is
+  mapped to the macOS uid/gid running HVI. Seatbelt independently grants
   `file-read*` or `file-read* file-write*` only below each exported subtree.
 
 The serial console is a **PL011** (`pl011.rs`, MMIO) on arm64 and a **16550**

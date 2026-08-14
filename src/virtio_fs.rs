@@ -13,12 +13,16 @@
 //! without block images.
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 
 use crate::guestmem::GuestRam;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
@@ -60,19 +64,32 @@ const WRITE: u32 = 16;
 const STATFS: u32 = 17;
 const RELEASE: u32 = 18;
 const FSYNC: u32 = 20;
+const SETXATTR: u32 = 21;
 const GETXATTR: u32 = 22;
 const LISTXATTR: u32 = 23;
+const REMOVEXATTR: u32 = 24;
 const FLUSH: u32 = 25;
 const INIT: u32 = 26;
 const OPENDIR: u32 = 27;
 const READDIR: u32 = 28;
 const RELEASEDIR: u32 = 29;
 const FSYNCDIR: u32 = 30;
+const GETLK: u32 = 31;
+const SETLK: u32 = 32;
+const SETLKW: u32 = 33;
 const ACCESS: u32 = 34;
 const CREATE: u32 = 35;
 const DESTROY: u32 = 38;
+const POLL: u32 = 40;
 const BATCH_FORGET: u32 = 42;
+const FALLOCATE: u32 = 43;
+const READDIRPLUS: u32 = 44;
 const RENAME2: u32 = 45;
+const LSEEK: u32 = 46;
+const COPY_FILE_RANGE: u32 = 47;
+const SYNCFS: u32 = 50;
+const TMPFILE: u32 = 51;
+const STATX: u32 = 52;
 
 // Linux open flags carried on the wire. They must never be passed directly to
 // macOS, whose constants differ.
@@ -98,9 +115,30 @@ const FATTR_KILL_SUIDGID: u32 = 1 << 11;
 
 const FUSE_GETATTR_FH: u32 = 1;
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
+const FUSE_OPEN_KILL_SUIDGID: u32 = 1;
+const FUSE_WRITE_KILL_SUIDGID: u32 = 1 << 2;
+const FUSE_LK_FLOCK: u32 = 1;
+const FUSE_RELEASE_FLOCK_UNLOCK: u32 = 1 << 1;
 const RENAME_NOREPLACE: u32 = 1;
+const RENAME_EXCHANGE: u32 = 2;
+const RENAME_WHITEOUT: u32 = 4;
+
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
+
+const LINUX_XATTR_CREATE: u32 = 1;
+const LINUX_XATTR_REPLACE: u32 = 2;
+
+const LINUX_F_RDLCK: u32 = 0;
+const LINUX_F_WRLCK: u32 = 1;
+const LINUX_F_UNLCK: u32 = 2;
 
 const S_IFMT: u32 = 0o170000;
+const S_IFIFO: u32 = 0o010000;
 const S_IFREG: u32 = 0o100000;
 
 // Linux errno values. Host errno numbers are not portable from macOS to the
@@ -108,24 +146,42 @@ const S_IFREG: u32 = 0o100000;
 const ENOENT: i32 = 2;
 const EPERM: i32 = 1;
 const EIO: i32 = 5;
+const ENXIO: i32 = 6;
 const EBADF: i32 = 9;
+const EAGAIN: i32 = 11;
 const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
 const EXDEV: i32 = 18;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
+const ENOTTY: i32 = 25;
+const EFBIG: i32 = 27;
 const ENOSPC: i32 = 28;
 const EROFS: i32 = 30;
 const ENOSYS: i32 = 38;
 const ENOTEMPTY: i32 = 39;
 const ELOOP: i32 = 40;
+const ERANGE: i32 = 34;
+const EDEADLK: i32 = 35;
 const ENODATA: i32 = 61;
 const EOPNOTSUPP: i32 = 95;
 
 struct FileHandle {
     file: File,
     writable: bool,
+    temporary_path: Option<PathBuf>,
+}
+
+struct DirHandle {
+    file: File,
+    entries: Vec<OsString>,
+}
+
+struct Node {
+    key: (u64, u64),
+    paths: Vec<PathBuf>,
+    lookups: u64,
 }
 
 /// A virtio-fs device exporting exactly one canonical host directory.
@@ -138,11 +194,13 @@ pub struct VirtioFs {
     queue_sel: u32,
     queues: [Queue; NUM_QUEUES],
     interrupt_status: u32,
-    nodes: HashMap<u64, PathBuf>,
+    nodes: HashMap<u64, Node>,
     inode_ids: HashMap<(u64, u64), u64>,
     next_node: u64,
     handles: HashMap<u64, FileHandle>,
+    dir_handles: HashMap<u64, DirHandle>,
     next_handle: u64,
+    next_tmpfile: u64,
 }
 
 impl VirtioFs {
@@ -165,8 +223,15 @@ impl VirtioFs {
         let mut tag_buf = [0u8; TAG_LEN];
         tag_buf[..bytes.len()].copy_from_slice(bytes);
         let mut nodes = HashMap::new();
-        nodes.insert(FUSE_ROOT_ID, root.clone());
         let root_meta = fs::symlink_metadata(&root)?;
+        nodes.insert(
+            FUSE_ROOT_ID,
+            Node {
+                key: (root_meta.dev(), root_meta.ino()),
+                paths: vec![root.clone()],
+                lookups: u64::MAX,
+            },
+        );
         let mut inode_ids = HashMap::new();
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
         Ok(Self {
@@ -182,7 +247,9 @@ impl VirtioFs {
             inode_ids,
             next_node: FUSE_ROOT_ID + 1,
             handles: HashMap::new(),
+            dir_handles: HashMap::new(),
             next_handle: 1,
+            next_tmpfile: 1,
         })
     }
 
@@ -388,7 +455,15 @@ impl VirtioFs {
         }
         let payload = &raw[IN_HEADER_LEN..declared];
         let result = match opcode {
-            FORGET | BATCH_FORGET | DESTROY => return Vec::new(),
+            FORGET => {
+                self.forget(nodeid, payload);
+                return Vec::new();
+            }
+            BATCH_FORGET => {
+                self.batch_forget(payload);
+                return Vec::new();
+            }
+            DESTROY => return Vec::new(),
             INIT => self.init(payload),
             LOOKUP => self.lookup(nodeid, payload),
             GETATTR => self.getattr(nodeid, payload),
@@ -406,21 +481,42 @@ impl VirtioFs {
             OPENDIR => self.open(nodeid, payload, true),
             READ => self.read(nodeid, payload, max_out.saturating_sub(OUT_HEADER_LEN)),
             WRITE => self.write(payload),
-            READDIR => self.readdir(nodeid, payload, max_out.saturating_sub(OUT_HEADER_LEN)),
+            READDIR => self.readdir(
+                nodeid,
+                payload,
+                max_out.saturating_sub(OUT_HEADER_LEN),
+                false,
+            ),
             STATFS => self.statfs(),
             ACCESS => self.access(nodeid, payload),
             CREATE => self.create(nodeid, payload),
-            GETXATTR => Err(ENODATA),
-            LISTXATTR => self.listxattr(payload),
+            SETXATTR => self.setxattr(nodeid, payload),
+            GETXATTR => self.getxattr(nodeid, payload),
+            LISTXATTR => self.listxattr(nodeid, payload),
+            REMOVEXATTR => self.removexattr(nodeid, payload),
             RELEASE => self.release(payload),
-            RELEASEDIR => Ok(Vec::new()),
+            RELEASEDIR => self.release_dir(payload),
             FLUSH => self.flush(payload),
             FSYNC => self.fsync(payload),
-            FSYNCDIR => Ok(Vec::new()),
-            // Extended mutations that are not implemented yet still preserve
-            // a read-only export's stronger EROFS contract.
-            21 | 24 | 43 | 47..=51 if !self.writable => Err(EROFS),
-            21 | 24 | 43 | 47..=51 => Err(EOPNOTSUPP),
+            FSYNCDIR => self.fsync_dir(payload),
+            GETLK => self.lock(payload, GETLK),
+            SETLK => self.lock(payload, SETLK),
+            SETLKW => self.lock(payload, SETLKW),
+            POLL => self.poll(payload),
+            FALLOCATE => self.fallocate(payload),
+            READDIRPLUS => self.readdir(
+                nodeid,
+                payload,
+                max_out.saturating_sub(OUT_HEADER_LEN),
+                true,
+            ),
+            LSEEK => self.lseek(payload),
+            COPY_FILE_RANGE => self.copy_file_range(payload),
+            SYNCFS => self.syncfs(),
+            TMPFILE => self.tmpfile(nodeid, payload),
+            STATX => self.statx(nodeid, payload),
+            39 => Err(ENOTTY), // IOCTL: regular files can use libc fallbacks.
+            48 | 49 => Err(EOPNOTSUPP), // No DAX mapping window.
             _ => Err(ENOSYS),
         };
         match result {
@@ -441,11 +537,33 @@ impl VirtioFs {
             return Ok(out);
         }
         const ASYNC_READ: u32 = 1 << 0;
+        const POSIX_LOCKS: u32 = 1 << 1;
+        const ATOMIC_O_TRUNC: u32 = 1 << 3;
+        const EXPORT_SUPPORT: u32 = 1 << 4;
         const BIG_WRITES: u32 = 1 << 5;
+        const FLOCK_LOCKS: u32 = 1 << 10;
         const AUTO_INVAL_DATA: u32 = 1 << 12;
+        const DO_READDIRPLUS: u32 = 1 << 13;
+        const READDIRPLUS_AUTO: u32 = 1 << 14;
         const MAX_PAGES: u32 = 1 << 22;
         const CACHE_SYMLINKS: u32 = 1 << 23;
-        let supported = ASYNC_READ | BIG_WRITES | AUTO_INVAL_DATA | MAX_PAGES | CACHE_SYMLINKS;
+        const HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+        const SETXATTR_EXT: u32 = 1 << 29;
+        let mut supported = ASYNC_READ
+            | POSIX_LOCKS
+            | ATOMIC_O_TRUNC
+            | EXPORT_SUPPORT
+            | BIG_WRITES
+            | FLOCK_LOCKS
+            | AUTO_INVAL_DATA
+            | DO_READDIRPLUS
+            | READDIRPLUS_AUTO
+            | MAX_PAGES
+            | HANDLE_KILLPRIV_V2
+            | SETXATTR_EXT;
+        if !self.writable {
+            supported |= CACHE_SYMLINKS;
+        }
         let mut out = Vec::with_capacity(64);
         put_u32(&mut out, 7);
         put_u32(&mut out, minor.min(39));
@@ -482,7 +600,8 @@ impl VirtioFs {
         };
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
         let node = self.node_for(path, &meta);
-        Ok(entry_out(node, &meta))
+        self.remember_lookup(node);
+        Ok(self.entry_out(node, &meta))
     }
 
     fn getattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -498,7 +617,7 @@ impl VirtioFs {
         } else {
             fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?
         };
-        Ok(attr_out(node, &meta))
+        Ok(self.attr_out(node, &meta))
     }
 
     fn setattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -506,56 +625,112 @@ impl VirtioFs {
         let valid = get_u32(input, 0).ok_or(EINVAL)?;
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
         let size = get_u64(input, 16).ok_or(EINVAL)?;
+        let atime = get_u64(input, 32).ok_or(EINVAL)?;
+        let mtime = get_u64(input, 40).ok_or(EINVAL)?;
+        let atime_nsec = get_u32(input, 56).ok_or(EINVAL)?;
+        let mtime_nsec = get_u32(input, 60).ok_or(EINVAL)?;
         let mode = get_u32(input, 68).ok_or(EINVAL)?;
-
-        // Ownership and timestamp translation need explicit guest/host ID and
-        // clock semantics. Refuse those bits rather than silently applying the
-        // wrong identity or following a symlink during a timestamp update.
-        let unsupported = FATTR_UID
+        let uid = get_u32(input, 76).ok_or(EINVAL)?;
+        let gid = get_u32(input, 80).ok_or(EINVAL)?;
+        let known = FATTR_MODE
+            | FATTR_UID
             | FATTR_GID
+            | FATTR_SIZE
             | FATTR_ATIME
             | FATTR_MTIME
+            | FATTR_FH
             | FATTR_ATIME_NOW
             | FATTR_MTIME_NOW
-            | FATTR_CTIME;
-        if valid & unsupported != 0 {
-            return Err(EOPNOTSUPP);
-        }
-        let known =
-            FATTR_MODE | FATTR_SIZE | FATTR_FH | FATTR_LOCKOWNER | FATTR_KILL_SUIDGID | unsupported;
+            | FATTR_LOCKOWNER
+            | FATTR_CTIME
+            | FATTR_KILL_SUIDGID;
         if valid & !known != 0 {
             return Err(EINVAL);
         }
 
+        let path = if valid & FATTR_FH == 0 {
+            Some(self.node_path(node)?.to_owned())
+        } else {
+            None
+        };
+        let handle = if valid & FATTR_FH != 0 {
+            Some(self.handles.get(&fh).ok_or(EBADF)?)
+        } else {
+            None
+        };
+
         if valid & FATTR_SIZE != 0 {
-            if valid & FATTR_FH != 0 {
-                let handle = self.handles.get(&fh).ok_or(EBADF)?;
+            if let Some(handle) = handle {
                 if !handle.writable {
                     return Err(EBADF);
                 }
                 handle.file.set_len(size).map_err(io_errno)?;
             } else {
-                let file = open_host_file(self.node_path(node)?, LINUX_O_WRONLY, false, 0)
+                let file = open_host_file(path.as_deref().ok_or(EINVAL)?, LINUX_O_WRONLY, false, 0)
                     .map_err(io_errno)?;
                 file.set_len(size).map_err(io_errno)?;
             }
         }
-        if valid & FATTR_MODE != 0 {
-            fs::set_permissions(self.node_path(node)?, Permissions::from_mode(mode & 0o7777))
-                .map_err(io_errno)?;
+
+        if valid & (FATTR_UID | FATTR_GID) != 0 {
+            let host_uid = if valid & FATTR_UID != 0 {
+                Some(guest_uid_to_host(uid))
+            } else {
+                None
+            };
+            let host_gid = if valid & FATTR_GID != 0 {
+                Some(guest_gid_to_host(gid))
+            } else {
+                None
+            };
+            if let Some(handle) = handle {
+                host_fchown(&handle.file, host_uid, host_gid)?;
+            } else {
+                host_lchown(path.as_deref().ok_or(EINVAL)?, host_uid, host_gid)?;
+            }
         }
 
-        let meta = if valid & FATTR_FH != 0 {
-            self.handles
-                .get(&fh)
-                .ok_or(EBADF)?
-                .file
-                .metadata()
-                .map_err(io_errno)?
+        if valid & (FATTR_MODE | FATTR_KILL_SUIDGID) != 0 {
+            let current = if let Some(handle) = handle {
+                handle.file.metadata().map_err(io_errno)?.mode()
+            } else {
+                fs::symlink_metadata(path.as_deref().ok_or(EINVAL)?)
+                    .map_err(io_errno)?
+                    .mode()
+            };
+            let mut new_mode = if valid & FATTR_MODE != 0 {
+                mode & 0o7777
+            } else {
+                current & 0o7777
+            };
+            if valid & FATTR_KILL_SUIDGID != 0 {
+                new_mode &= !0o6000;
+            }
+            if let Some(handle) = handle {
+                handle
+                    .file
+                    .set_permissions(Permissions::from_mode(new_mode))
+                    .map_err(io_errno)?;
+            } else {
+                host_lchmod(path.as_deref().ok_or(EINVAL)?, new_mode)?;
+            }
+        }
+
+        if valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
+            let times = fuse_times(valid, atime, atime_nsec, mtime, mtime_nsec)?;
+            if let Some(handle) = handle {
+                host_futimens(&handle.file, &times)?;
+            } else {
+                host_lutimens(path.as_deref().ok_or(EINVAL)?, &times)?;
+            }
+        }
+
+        let meta = if let Some(handle) = handle {
+            handle.file.metadata().map_err(io_errno)?
         } else {
-            fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?
+            fs::symlink_metadata(path.as_deref().ok_or(EINVAL)?).map_err(io_errno)?
         };
-        Ok(attr_out(node, &meta))
+        Ok(self.attr_out(node, &meta))
     }
 
     fn require_writable(&self) -> Result<(), i32> {
@@ -578,24 +753,26 @@ impl VirtioFs {
     fn new_entry(&mut self, path: PathBuf) -> Result<Vec<u8>, i32> {
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
         let node = self.node_for(path, &meta);
-        Ok(entry_out(node, &meta))
+        self.remember_lookup(node);
+        Ok(self.entry_out(node, &meta))
     }
 
     fn mknod(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let mode = get_u32(input, 0).ok_or(EINVAL)?;
-        if mode & S_IFMT != S_IFREG {
-            // Never create host device nodes from a guest. CREATE normally
-            // handles regular files; this path is its older-kernel fallback.
-            return Err(EPERM);
-        }
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
-        let file =
-            open_host_file(&path, LINUX_O_WRONLY | LINUX_O_EXCL, true, mode).map_err(io_errno)?;
-        file.set_permissions(Permissions::from_mode(mode & 0o7777))
-            .map_err(io_errno)?;
-        drop(file);
+        match mode & S_IFMT {
+            S_IFREG => {
+                let file = open_host_file(&path, LINUX_O_WRONLY | LINUX_O_EXCL, true, mode)
+                    .map_err(io_errno)?;
+                file.set_permissions(Permissions::from_mode(mode & 0o7777))
+                    .map_err(io_errno)?;
+            }
+            S_IFIFO => host_mkfifo(&path, mode & 0o7777)?,
+            // Never create host device nodes or sockets from a guest.
+            _ => return Err(EPERM),
+        }
         self.new_entry(path)
     }
 
@@ -642,7 +819,7 @@ impl VirtioFs {
         } else {
             fs::remove_file(&path).map_err(io_errno)?;
         }
-        self.inode_ids.remove(&(meta.dev(), meta.ino()));
+        self.forget_node_path(&path, &meta);
         Ok(Vec::new())
     }
 
@@ -654,36 +831,65 @@ impl VirtioFs {
         } else {
             (0, 8)
         };
-        if flags & !RENAME_NOREPLACE != 0 {
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+            || flags & RENAME_WHITEOUT != 0
+            || flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0
+        {
             return Err(EOPNOTSUPP);
         }
         let (old_name, next) = nul_name_with_end(input, names_at)?;
         let new_name = nul_name(input, next)?;
         let old_path = self.child_path(old_parent, old_name)?;
         let new_path = self.child_path(new_parent, new_name)?;
-        if flags & RENAME_NOREPLACE != 0 && fs::symlink_metadata(&new_path).is_ok() {
-            return Err(EEXIST);
-        }
-
+        let old_meta = fs::symlink_metadata(&old_path).map_err(io_errno)?;
         let replaced = fs::symlink_metadata(&new_path).ok();
-        fs::rename(&old_path, &new_path).map_err(io_errno)?;
+        host_rename(&old_path, &new_path, flags)?;
+        if flags & RENAME_EXCHANGE != 0 {
+            self.exchange_node_paths(&old_path, &new_path);
+            return Ok(Vec::new());
+        }
         if let Some(meta) = replaced {
-            self.inode_ids.remove(&(meta.dev(), meta.ino()));
+            if (meta.dev(), meta.ino()) == (old_meta.dev(), old_meta.ino()) {
+                return Ok(Vec::new());
+            }
+            self.forget_node_path(&new_path, &meta);
         }
         self.rewrite_node_paths(&old_path, &new_path);
         Ok(Vec::new())
     }
 
     fn rewrite_node_paths(&mut self, old: &Path, new: &Path) {
-        for path in self.nodes.values_mut() {
-            let Ok(suffix) = path.strip_prefix(old) else {
-                continue;
-            };
-            *path = if suffix.as_os_str().is_empty() {
-                new.to_owned()
-            } else {
-                new.join(suffix)
-            };
+        for node in self.nodes.values_mut() {
+            for path in &mut node.paths {
+                let Ok(suffix) = path.strip_prefix(old) else {
+                    continue;
+                };
+                *path = if suffix.as_os_str().is_empty() {
+                    new.to_owned()
+                } else {
+                    new.join(suffix)
+                };
+            }
+        }
+    }
+
+    fn exchange_node_paths(&mut self, left: &Path, right: &Path) {
+        for node in self.nodes.values_mut() {
+            for path in &mut node.paths {
+                if let Ok(suffix) = path.strip_prefix(left) {
+                    *path = if suffix.as_os_str().is_empty() {
+                        right.to_owned()
+                    } else {
+                        right.join(suffix)
+                    };
+                } else if let Ok(suffix) = path.strip_prefix(right) {
+                    *path = if suffix.as_os_str().is_empty() {
+                        left.to_owned()
+                    } else {
+                        left.join(suffix)
+                    };
+                }
+            }
         }
     }
 
@@ -691,16 +897,21 @@ impl VirtioFs {
         self.require_writable()?;
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let mode = get_u32(input, 4).ok_or(EINVAL)?;
+        let open_flags = get_u32(input, 12).ok_or(EINVAL)?;
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
         let file = open_host_file(&path, flags, true, mode).map_err(io_errno)?;
         file.set_permissions(Permissions::from_mode(mode & 0o7777))
             .map_err(io_errno)?;
+        if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
+            clear_suid_sgid(&file)?;
+        }
         let meta = file.metadata().map_err(io_errno)?;
         let node = self.node_for(path, &meta);
+        self.remember_lookup(node);
         let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0);
-        let mut out = entry_out(node, &meta);
-        put_open_out(&mut out, fh, false);
+        let mut out = self.entry_out(node, &meta);
+        put_open_out(&mut out, fh, false, !self.writable);
         Ok(out)
     }
     fn readlink(&self, node: u64) -> Result<Vec<u8>, i32> {
@@ -718,7 +929,10 @@ impl VirtioFs {
 
     fn open(&mut self, node: u64, input: &[u8], directory: bool) -> Result<Vec<u8>, i32> {
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
-        let wants_write = flags & LINUX_O_ACCMODE != 0 || flags & LINUX_O_TRUNC != 0;
+        let open_flags = get_u32(input, 4).ok_or(EINVAL)?;
+        let wants_write = flags & LINUX_O_ACCMODE != 0
+            || flags & LINUX_O_TRUNC != 0
+            || open_flags & FUSE_OPEN_KILL_SUIDGID != 0;
         if wants_write && !self.writable {
             return Err(EROFS);
         }
@@ -731,13 +945,16 @@ impl VirtioFs {
             return Err(EISDIR);
         }
         let fh = if directory {
-            node // directory traversal remains stateless
+            self.insert_dir_handle(&path)?
         } else {
             let file = open_host_file(&path, flags, false, 0).map_err(io_errno)?;
+            if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
+                clear_suid_sgid(&file)?;
+            }
             self.insert_handle(file, wants_write)
         };
         let mut out = Vec::with_capacity(16);
-        put_open_out(&mut out, fh, directory);
+        put_open_out(&mut out, fh, directory, !self.writable);
         Ok(out)
     }
 
@@ -770,6 +987,7 @@ impl VirtioFs {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let offset = get_u64(input, 8).ok_or(EINVAL)?;
         let size = get_u32(input, 16).ok_or(EINVAL)? as usize;
+        let write_flags = get_u32(input, 20).ok_or(EINVAL)?;
         if size > MAX_WRITE as usize || input.len() < 40 + size {
             return Err(EINVAL);
         }
@@ -781,22 +999,72 @@ impl VirtioFs {
             .file
             .write_at(&input[40..40 + size], offset)
             .map_err(io_errno)?;
+        if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
+            clear_suid_sgid(&handle.file)?;
+        }
         let mut out = Vec::with_capacity(8);
         put_u32(&mut out, n as u32);
         put_u32(&mut out, 0);
         Ok(out)
     }
 
-    fn insert_handle(&mut self, file: File, writable: bool) -> u64 {
+    fn next_handle(&mut self) -> u64 {
         let fh = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1).max(1);
-        self.handles.insert(fh, FileHandle { file, writable });
         fh
+    }
+
+    fn insert_handle(&mut self, file: File, writable: bool) -> u64 {
+        let fh = self.next_handle();
+        self.handles.insert(
+            fh,
+            FileHandle {
+                file,
+                writable,
+                temporary_path: None,
+            },
+        );
+        fh
+    }
+
+    fn insert_dir_handle(&mut self, path: &Path) -> Result<u64, i32> {
+        let file = open_host_dir(path).map_err(io_errno)?;
+        let mut entries: Vec<OsString> = fs::read_dir(path)
+            .map_err(io_errno)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        entries.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        entries.insert(0, OsString::from_vec(b"..".to_vec()));
+        entries.insert(0, OsString::from_vec(b".".to_vec()));
+        let fh = self.next_handle();
+        self.dir_handles.insert(fh, DirHandle { file, entries });
+        Ok(fh)
     }
 
     fn release(&mut self, input: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
-        self.handles.remove(&fh);
+        let flags = get_u32(input, 12).unwrap_or(0);
+        let handle = self.handles.remove(&fh).ok_or(EBADF)?;
+        if flags & FUSE_RELEASE_FLOCK_UNLOCK != 0 {
+            let result = unsafe { libc::flock(handle.file.as_raw_fd(), libc::LOCK_UN) };
+            if result != 0 {
+                return Err(io_errno(io::Error::last_os_error()));
+            }
+        }
+        if let Some(path) = handle.temporary_path {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_errno(err)),
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn release_dir(&mut self, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        self.dir_handles.remove(&fh).ok_or(EBADF)?;
         Ok(Vec::new())
     }
 
@@ -822,7 +1090,268 @@ impl VirtioFs {
         Ok(Vec::new())
     }
 
-    fn readdir(&mut self, node: u64, input: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+    fn fsync_dir(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        let flags = get_u32(input, 8).ok_or(EINVAL)?;
+        let handle = self.dir_handles.get(&fh).ok_or(EBADF)?;
+        if flags & FUSE_FSYNC_FDATASYNC != 0 {
+            handle.file.sync_data().map_err(io_errno)?;
+        } else {
+            handle.file.sync_all().map_err(io_errno)?;
+        }
+        Ok(Vec::new())
+    }
+
+    fn lock(&self, input: &[u8], opcode: u32) -> Result<Vec<u8>, i32> {
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        let start = get_u64(input, 16).ok_or(EINVAL)?;
+        let end = get_u64(input, 24).ok_or(EINVAL)?;
+        let lock_type = get_u32(input, 32).ok_or(EINVAL)?;
+        let _pid = get_u32(input, 36).ok_or(EINVAL)?;
+        let flags = get_u32(input, 40).ok_or(EINVAL)?;
+        let handle = self.handles.get(&fh).ok_or(EBADF)?;
+
+        if flags & FUSE_LK_FLOCK != 0 {
+            if opcode == GETLK {
+                let mut out = Vec::with_capacity(24);
+                put_u64(&mut out, start);
+                put_u64(&mut out, end);
+                put_u32(&mut out, LINUX_F_UNLCK);
+                put_u32(&mut out, 0);
+                return Ok(out);
+            }
+            let mut operation = match lock_type {
+                LINUX_F_RDLCK => libc::LOCK_SH,
+                LINUX_F_WRLCK => libc::LOCK_EX,
+                LINUX_F_UNLCK => libc::LOCK_UN,
+                _ => return Err(EINVAL),
+            };
+            if opcode == SETLK {
+                operation |= libc::LOCK_NB;
+            }
+            let result = unsafe { libc::flock(handle.file.as_raw_fd(), operation) };
+            if result != 0 {
+                return Err(io_errno(io::Error::last_os_error()));
+            }
+            return Ok(Vec::new());
+        }
+
+        let mut host_lock: libc::flock = unsafe { std::mem::zeroed() };
+        host_lock.l_start = i64::try_from(start).map_err(|_| EFBIG)? as libc::off_t;
+        host_lock.l_len = if end == u64::MAX {
+            0
+        } else {
+            i64::try_from(end.checked_sub(start).ok_or(EINVAL)?.saturating_add(1))
+                .map_err(|_| EFBIG)? as libc::off_t
+        };
+        // OFD locking scopes the lock to this FUSE open handle. Both Linux and
+        // macOS require l_pid=0 for F_OFD_* commands; the guest pid is not a
+        // meaningful host pid and must not be forwarded.
+        host_lock.l_pid = 0;
+        host_lock.l_whence = libc::SEEK_SET as i16;
+        host_lock.l_type = linux_lock_to_host(lock_type)?;
+        let command = match opcode {
+            GETLK => libc::F_OFD_GETLK,
+            SETLK => libc::F_OFD_SETLK,
+            SETLKW => libc::F_OFD_SETLKW,
+            _ => return Err(EINVAL),
+        };
+        let result = unsafe { libc::fcntl(handle.file.as_raw_fd(), command, &mut host_lock) };
+        if result != 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        if opcode != GETLK {
+            return Ok(Vec::new());
+        }
+        let returned_start = host_lock.l_start.max(0) as u64;
+        let returned_end = if host_lock.l_len == 0 {
+            u64::MAX
+        } else {
+            returned_start
+                .saturating_add(host_lock.l_len as u64)
+                .saturating_sub(1)
+        };
+        let mut out = Vec::with_capacity(24);
+        put_u64(&mut out, returned_start);
+        put_u64(&mut out, returned_end);
+        put_u32(&mut out, host_lock_to_linux(host_lock.l_type)?);
+        put_u32(&mut out, host_lock.l_pid.max(0) as u32);
+        Ok(out)
+    }
+
+    fn poll(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        if !self.handles.contains_key(&fh) && !self.dir_handles.contains_key(&fh) {
+            return Err(EBADF);
+        }
+        let events = get_u32(input, 20).ok_or(EINVAL)?;
+        let mut out = Vec::with_capacity(8);
+        put_u32(&mut out, events);
+        put_u32(&mut out, 0);
+        Ok(out)
+    }
+
+    fn fallocate(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+        self.require_writable()?;
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        let offset = get_u64(input, 8).ok_or(EINVAL)?;
+        let length = get_u64(input, 16).ok_or(EINVAL)?;
+        let mode = get_u32(input, 24).ok_or(EINVAL)?;
+        let handle = self.handles.get(&fh).ok_or(EBADF)?;
+        if !handle.writable {
+            return Err(EBADF);
+        }
+        host_fallocate(&handle.file, offset, length, mode)?;
+        Ok(Vec::new())
+    }
+
+    fn lseek(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        let offset = get_u64(input, 8).ok_or(EINVAL)?;
+        let whence = get_u32(input, 16).ok_or(EINVAL)?;
+        let handle = self.handles.get(&fh).ok_or(EBADF)?;
+        let host_whence = match whence {
+            0 => libc::SEEK_SET,
+            1 => libc::SEEK_CUR,
+            2 => libc::SEEK_END,
+            3 => libc::SEEK_DATA,
+            4 => libc::SEEK_HOLE,
+            _ => return Err(EINVAL),
+        };
+        let offset = i64::try_from(offset).map_err(|_| EFBIG)?;
+        let result = unsafe { libc::lseek(handle.file.as_raw_fd(), offset, host_whence) };
+        if result < 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        let mut out = Vec::with_capacity(8);
+        put_u64(&mut out, result as u64);
+        Ok(out)
+    }
+
+    fn copy_file_range(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+        self.require_writable()?;
+        let source_fh = get_u64(input, 0).ok_or(EINVAL)?;
+        let source_offset = get_u64(input, 8).ok_or(EINVAL)?;
+        let target_fh = get_u64(input, 24).ok_or(EINVAL)?;
+        let target_offset = get_u64(input, 32).ok_or(EINVAL)?;
+        let requested = get_u64(input, 40).ok_or(EINVAL)?.min(u32::MAX as u64);
+        let flags = get_u64(input, 48).ok_or(EINVAL)?;
+        if flags != 0 {
+            return Err(EINVAL);
+        }
+        let source = self.handles.get(&source_fh).ok_or(EBADF)?;
+        let target = self.handles.get(&target_fh).ok_or(EBADF)?;
+        if !target.writable {
+            return Err(EBADF);
+        }
+        let source_meta = source.file.metadata().map_err(io_errno)?;
+        let target_meta = target.file.metadata().map_err(io_errno)?;
+        if source_meta.dev() == target_meta.dev()
+            && source_meta.ino() == target_meta.ino()
+            && ranges_overlap(source_offset, target_offset, requested)
+        {
+            return Err(EINVAL);
+        }
+        let mut copied = 0u64;
+        let mut buffer = vec![0u8; MAX_WRITE as usize];
+        while copied < requested {
+            let want = (requested - copied).min(buffer.len() as u64) as usize;
+            let read = source
+                .file
+                .read_at(&mut buffer[..want], source_offset.saturating_add(copied))
+                .map_err(io_errno)?;
+            if read == 0 {
+                break;
+            }
+            let mut written = 0usize;
+            while written < read {
+                let n = target
+                    .file
+                    .write_at(
+                        &buffer[written..read],
+                        target_offset
+                            .saturating_add(copied)
+                            .saturating_add(written as u64),
+                    )
+                    .map_err(io_errno)?;
+                if n == 0 {
+                    return Err(EIO);
+                }
+                written += n;
+            }
+            copied += read as u64;
+            if read < want {
+                break;
+            }
+        }
+        let mut out = Vec::with_capacity(8);
+        put_u32(&mut out, copied as u32);
+        put_u32(&mut out, 0);
+        Ok(out)
+    }
+
+    fn syncfs(&self) -> Result<Vec<u8>, i32> {
+        for handle in self.handles.values() {
+            handle.file.sync_all().map_err(io_errno)?;
+        }
+        for handle in self.dir_handles.values() {
+            handle.file.sync_all().map_err(io_errno)?;
+        }
+        Ok(Vec::new())
+    }
+
+    fn tmpfile(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        self.require_writable()?;
+        let flags = get_u32(input, 0).ok_or(EINVAL)?;
+        let mode = get_u32(input, 4).ok_or(EINVAL)?;
+        let parent_path = self.node_path(parent)?.to_owned();
+        let id = self.next_tmpfile;
+        self.next_tmpfile = self.next_tmpfile.saturating_add(1).max(1);
+        let path = parent_path.join(format!(".hvi-tmp-{}-{id}", std::process::id()));
+        let file = open_host_file(&path, flags | LINUX_O_EXCL, true, mode).map_err(io_errno)?;
+        file.set_permissions(Permissions::from_mode(mode & 0o7777))
+            .map_err(io_errno)?;
+        let meta = file.metadata().map_err(io_errno)?;
+        let node = self.node_for(path.clone(), &meta);
+        self.remember_lookup(node);
+        let fh = self.next_handle();
+        self.handles.insert(
+            fh,
+            FileHandle {
+                file,
+                writable: true,
+                temporary_path: Some(path),
+            },
+        );
+        let mut out = self.entry_out(node, &meta);
+        put_open_out(&mut out, fh, false, false);
+        Ok(out)
+    }
+
+    fn statx(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let flags = get_u32(input, 0).ok_or(EINVAL)?;
+        let fh = get_u64(input, 8).ok_or(EINVAL)?;
+        let meta = if flags & FUSE_GETATTR_FH != 0 {
+            self.handles
+                .get(&fh)
+                .ok_or(EBADF)?
+                .file
+                .metadata()
+                .map_err(io_errno)?
+        } else {
+            fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?
+        };
+        Ok(statx_out(node, &meta, self.cache_seconds()))
+    }
+
+    fn readdir(
+        &mut self,
+        node: u64,
+        input: &[u8],
+        capacity: usize,
+        plus: bool,
+    ) -> Result<Vec<u8>, i32> {
+        let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let offset = get_u64(input, 8).ok_or(EINVAL)? as usize;
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
         let limit = requested.min(capacity);
@@ -837,24 +1366,22 @@ impl VirtioFs {
             dir.parent().unwrap_or(&self.root).to_owned()
         };
         let parent_meta = fs::symlink_metadata(&parent_path).map_err(io_errno)?;
-        let parent_node = self.node_for(parent_path, &parent_meta);
-        let mut entries: Vec<(OsString, PathBuf)> = fs::read_dir(&dir)
-            .map_err(io_errno)?
-            .filter_map(Result::ok)
-            .map(|entry| (entry.file_name(), entry.path()))
-            .collect();
-        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        entries.insert(
-            0,
-            (
-                OsString::from_vec(b"..".to_vec()),
-                self.node_path(parent_node)?.to_owned(),
-            ),
-        );
-        entries.insert(0, (OsString::from_vec(b".".to_vec()), dir));
+        let parent_node = if plus {
+            self.node_for(parent_path.clone(), &parent_meta)
+        } else {
+            parent_meta.ino()
+        };
+        let names = self.dir_handles.get(&fh).ok_or(EBADF)?.entries.clone();
 
         let mut out = Vec::new();
-        for (idx, (name, path)) in entries.into_iter().enumerate().skip(offset) {
+        for (idx, name) in names.into_iter().enumerate().skip(offset) {
+            let path = if idx == 0 {
+                dir.clone()
+            } else if idx == 1 {
+                parent_path.clone()
+            } else {
+                dir.join(&name)
+            };
             let meta = match fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(_) => continue,
@@ -863,13 +1390,19 @@ impl VirtioFs {
                 node
             } else if idx == 1 {
                 parent_node
-            } else {
+            } else if plus {
                 self.node_for(path, &meta)
+            } else {
+                meta.ino()
             };
             let name = name.as_bytes();
-            let record_len = align8(24 + name.len());
+            let record_len = align8((if plus { 128 } else { 0 }) + 24 + name.len());
             if out.len() + record_len > limit {
                 break;
+            }
+            if plus {
+                self.remember_lookup(entry_node);
+                out.extend_from_slice(&self.entry_out(entry_node, &meta));
             }
             put_u64(&mut out, entry_node);
             put_u64(&mut out, (idx + 1) as u64);
@@ -882,13 +1415,25 @@ impl VirtioFs {
     }
 
     fn statfs(&self) -> Result<Vec<u8>, i32> {
+        let path = path_cstring(&self.root)?;
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
+        if result != 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
         let mut out = Vec::with_capacity(80);
-        for value in [0u64; 5] {
+        for value in [
+            stats.f_blocks as u64,
+            stats.f_bfree as u64,
+            stats.f_bavail as u64,
+            stats.f_files as u64,
+            stats.f_ffree as u64,
+        ] {
             put_u64(&mut out, value);
         }
-        put_u32(&mut out, 4096);
-        put_u32(&mut out, 255);
-        put_u32(&mut out, 4096);
+        put_u32(&mut out, stats.f_bsize as u32);
+        put_u32(&mut out, stats.f_namemax as u32);
+        put_u32(&mut out, stats.f_frsize as u32);
         put_u32(&mut out, 0);
         out.resize(80, 0);
         Ok(out)
@@ -904,70 +1449,192 @@ impl VirtioFs {
         }
     }
 
-    fn listxattr(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
-        let size = get_u32(input, 0).ok_or(EINVAL)?;
-        if size == 0 {
-            let mut out = Vec::with_capacity(8);
-            put_u32(&mut out, 0);
-            put_u32(&mut out, 0);
-            Ok(out)
-        } else {
-            Ok(Vec::new())
+    fn setxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        self.require_writable()?;
+        let size = get_u32(input, 0).ok_or(EINVAL)? as usize;
+        let flags = get_u32(input, 4).ok_or(EINVAL)?;
+        if flags & !(LINUX_XATTR_CREATE | LINUX_XATTR_REPLACE) != 0
+            || flags == (LINUX_XATTR_CREATE | LINUX_XATTR_REPLACE)
+        {
+            return Err(EINVAL);
         }
+        let (name, value_at) = nul_name_with_end(input, 16)?;
+        let value = input
+            .get(value_at..value_at.checked_add(size).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        host_setxattr(self.node_path(node)?, name, value, flags)?;
+        Ok(Vec::new())
+    }
+
+    fn getxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let size = get_u32(input, 0).ok_or(EINVAL)? as usize;
+        let name = nul_name(input, 8)?;
+        let value = host_getxattr(self.node_path(node)?, name)?;
+        xattr_response(size, value)
+    }
+
+    fn listxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        let size = get_u32(input, 0).ok_or(EINVAL)?;
+        let value = host_listxattr(self.node_path(node)?)?;
+        xattr_response(size as usize, value)
+    }
+
+    fn removexattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        self.require_writable()?;
+        let name = nul_name(input, 0)?;
+        host_removexattr(self.node_path(node)?, name)?;
+        Ok(Vec::new())
     }
 
     fn node_path(&self, node: u64) -> Result<&Path, i32> {
-        self.nodes.get(&node).map(PathBuf::as_path).ok_or(ENOENT)
+        let remembered = self.nodes.get(&node).ok_or(ENOENT)?;
+        remembered
+            .paths
+            .iter()
+            .find(|path| {
+                fs::symlink_metadata(path)
+                    .map(|meta| (meta.dev(), meta.ino()) == remembered.key)
+                    .unwrap_or(false)
+            })
+            .map(PathBuf::as_path)
+            .ok_or(ENOENT)
     }
 
     fn node_for(&mut self, path: PathBuf, meta: &Metadata) -> u64 {
         let key = (meta.dev(), meta.ino());
         if let Some(node) = self.inode_ids.get(&key) {
-            // Hard links intentionally share a node. Prefer a live spelling if
-            // the original link was removed while another remains.
-            if self
-                .nodes
-                .get(node)
-                .is_some_and(|remembered| fs::symlink_metadata(remembered).is_err())
-            {
-                self.nodes.insert(*node, path);
+            if let Some(remembered) = self.nodes.get_mut(node) {
+                if !remembered.paths.contains(&path) {
+                    remembered.paths.push(path);
+                }
             }
             return *node;
         }
         let node = self.next_node;
         self.next_node = self.next_node.saturating_add(1);
-        self.nodes.insert(node, path.clone());
+        self.nodes.insert(
+            node,
+            Node {
+                key,
+                paths: vec![path],
+                lookups: 0,
+            },
+        );
         self.inode_ids.insert(key, node);
         node
     }
+
+    fn remember_lookup(&mut self, node: u64) {
+        if let Some(remembered) = self.nodes.get_mut(&node) {
+            remembered.lookups = remembered.lookups.saturating_add(1);
+        }
+    }
+
+    fn forget(&mut self, node: u64, input: &[u8]) {
+        let count = get_u64(input, 0).unwrap_or(0);
+        self.forget_count(node, count);
+    }
+
+    fn batch_forget(&mut self, input: &[u8]) {
+        let count = get_u32(input, 0).unwrap_or(0) as usize;
+        for index in 0..count {
+            let Some(offset) = 8usize.checked_add(index.saturating_mul(16)) else {
+                break;
+            };
+            let (Some(node), Some(lookups)) = (get_u64(input, offset), get_u64(input, offset + 8))
+            else {
+                break;
+            };
+            self.forget_count(node, lookups);
+        }
+    }
+
+    fn forget_count(&mut self, node: u64, count: u64) {
+        if node == FUSE_ROOT_ID {
+            return;
+        }
+        let Some(remembered) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        remembered.lookups = remembered.lookups.saturating_sub(count);
+        if remembered.lookups != 0 {
+            return;
+        }
+        let key = remembered.key;
+        self.nodes.remove(&node);
+        self.inode_ids.remove(&key);
+    }
+
+    fn forget_node_path(&mut self, path: &Path, meta: &Metadata) {
+        let key = (meta.dev(), meta.ino());
+        let Some(node_id) = self.inode_ids.get(&key).copied() else {
+            return;
+        };
+        let mut empty = false;
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.paths.retain(|candidate| candidate != path);
+            empty = node.paths.is_empty();
+        }
+        if empty && node_id != FUSE_ROOT_ID {
+            self.nodes.remove(&node_id);
+            self.inode_ids.remove(&key);
+        }
+    }
+
+    fn cache_seconds(&self) -> u64 {
+        if self.writable {
+            0
+        } else {
+            60
+        }
+    }
+
+    fn attr_out(&self, node: u64, meta: &Metadata) -> Vec<u8> {
+        attr_out(node, meta, self.cache_seconds())
+    }
+
+    fn entry_out(&self, node: u64, meta: &Metadata) -> Vec<u8> {
+        entry_out(node, meta, self.cache_seconds())
+    }
 }
 
-fn attr_out(node: u64, meta: &Metadata) -> Vec<u8> {
+fn attr_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(104);
-    put_u64(&mut out, 60);
+    put_u64(&mut out, cache_seconds);
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
     put_attr(&mut out, node, meta);
     out
 }
 
-fn entry_out(node: u64, meta: &Metadata) -> Vec<u8> {
+fn entry_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     put_u64(&mut out, node);
     put_u64(&mut out, 1); // generation
-    put_u64(&mut out, 60);
-    put_u64(&mut out, 60);
+    put_u64(&mut out, cache_seconds);
+    put_u64(&mut out, cache_seconds);
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
     put_attr(&mut out, node, meta);
     out
 }
 
-fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool) {
+fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
     put_u64(out, fh);
     // Cache directory contents and regular-file pages. Attribute/entry
     // timeouts remain short, so host-side changes are still rediscovered.
-    put_u32(out, if directory { 1 << 3 } else { 1 << 1 });
+    put_u32(
+        out,
+        if cache {
+            if directory {
+                1 << 3
+            } else {
+                1 << 1
+            }
+        } else {
+            0
+        },
+    );
     put_u32(out, 0); // backing_id (signed on the wire, zero means none)
 }
 
@@ -993,6 +1660,616 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
     // symlink followed behind the guest VFS's back.
     options.custom_flags(libc::O_NOFOLLOW);
     options.open(path)
+}
+
+fn open_host_dir(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn clear_suid_sgid(file: &File) -> Result<(), i32> {
+    let mode = file.metadata().map_err(io_errno)?.mode() & 0o7777;
+    if mode & 0o6000 != 0 {
+        file.set_permissions(Permissions::from_mode(mode & !0o6000))
+            .map_err(io_errno)?;
+    }
+    Ok(())
+}
+
+fn path_cstring(path: &Path) -> Result<CString, i32> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)
+}
+
+fn guest_uid_to_host(uid: u32) -> libc::uid_t {
+    if uid == 0 {
+        unsafe { libc::geteuid() }
+    } else {
+        uid
+    }
+}
+
+fn guest_gid_to_host(gid: u32) -> libc::gid_t {
+    if gid == 0 {
+        unsafe { libc::getegid() }
+    } else {
+        gid
+    }
+}
+
+fn host_uid_to_guest(uid: u32) -> u32 {
+    if uid == unsafe { libc::geteuid() } {
+        0
+    } else {
+        uid
+    }
+}
+
+fn host_gid_to_guest(gid: u32) -> u32 {
+    if gid == unsafe { libc::getegid() } {
+        0
+    } else {
+        gid
+    }
+}
+
+fn host_fchown(file: &File, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> Result<(), i32> {
+    let result = unsafe {
+        libc::fchown(
+            file.as_raw_fd(),
+            uid.unwrap_or(!0 as libc::uid_t),
+            gid.unwrap_or(!0 as libc::gid_t),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+fn host_lchown(path: &Path, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let result = unsafe {
+        libc::lchown(
+            path.as_ptr(),
+            uid.unwrap_or(!0 as libc::uid_t),
+            gid.unwrap_or(!0 as libc::gid_t),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+fn host_lchmod(path: &Path, mode: u32) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let result = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+fn fuse_times(
+    valid: u32,
+    atime: u64,
+    atime_nsec: u32,
+    mtime: u64,
+    mtime_nsec: u32,
+) -> Result<[libc::timespec; 2], i32> {
+    fn one(valid: bool, now: bool, seconds: u64, nanos: u32) -> Result<libc::timespec, i32> {
+        if now {
+            return Ok(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            });
+        }
+        if !valid {
+            return Ok(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            });
+        }
+        if nanos >= 1_000_000_000 || seconds > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+        Ok(libc::timespec {
+            tv_sec: seconds as libc::time_t,
+            tv_nsec: nanos as libc::c_long,
+        })
+    }
+
+    Ok([
+        one(
+            valid & FATTR_ATIME != 0,
+            valid & FATTR_ATIME_NOW != 0,
+            atime,
+            atime_nsec,
+        )?,
+        one(
+            valid & FATTR_MTIME != 0,
+            valid & FATTR_MTIME_NOW != 0,
+            mtime,
+            mtime_nsec,
+        )?,
+    ])
+}
+
+fn host_futimens(file: &File, times: &[libc::timespec; 2]) -> Result<(), i32> {
+    let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+fn host_lutimens(path: &Path, times: &[libc::timespec; 2]) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+fn xattr_name(name: &[u8]) -> Result<CString, i32> {
+    if name.is_empty() || name.contains(&b'/') {
+        return Err(EINVAL);
+    }
+    CString::new(name).map_err(|_| EINVAL)
+}
+
+fn xattr_response(requested: usize, value: Vec<u8>) -> Result<Vec<u8>, i32> {
+    if requested == 0 {
+        let len = u32::try_from(value.len()).map_err(|_| EFBIG)?;
+        let mut out = Vec::with_capacity(8);
+        put_u32(&mut out, len);
+        put_u32(&mut out, 0);
+        return Ok(out);
+    }
+    if requested < value.len() {
+        return Err(ERANGE);
+    }
+    Ok(value)
+}
+
+#[cfg(target_os = "macos")]
+fn host_getxattr(path: &Path, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let path = path_cstring(path)?;
+    let name = xattr_name(name)?;
+    let needed = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if needed < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    let mut value = vec![0u8; needed as usize];
+    let got = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if got < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    value.truncate(got as usize);
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+fn host_getxattr(path: &Path, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let path = path_cstring(path)?;
+    let name = xattr_name(name)?;
+    let needed = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    let mut value = vec![0u8; needed as usize];
+    let got = unsafe {
+        libc::lgetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if got < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    value.truncate(got as usize);
+    Ok(value)
+}
+
+#[cfg(target_os = "macos")]
+fn host_setxattr(path: &Path, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let name = xattr_name(name)?;
+    let host_flags = libc::XATTR_NOFOLLOW
+        | if flags & LINUX_XATTR_CREATE != 0 {
+            libc::XATTR_CREATE
+        } else if flags & LINUX_XATTR_REPLACE != 0 {
+            libc::XATTR_REPLACE
+        } else {
+            0
+        };
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            host_flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_setxattr(path: &Path, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let name = xattr_name(name)?;
+    let result = unsafe {
+        libc::lsetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags as i32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_listxattr(path: &Path) -> Result<Vec<u8>, i32> {
+    let path = path_cstring(path)?;
+    let needed =
+        unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW) };
+    if needed < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    let mut value = vec![0u8; needed as usize];
+    let got = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if got < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    value.truncate(got as usize);
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+fn host_listxattr(path: &Path) -> Result<Vec<u8>, i32> {
+    let path = path_cstring(path)?;
+    let needed = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    let mut value = vec![0u8; needed as usize];
+    let got = unsafe { libc::llistxattr(path.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if got < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    value.truncate(got as usize);
+    Ok(value)
+}
+
+#[cfg(target_os = "macos")]
+fn host_removexattr(path: &Path, name: &[u8]) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let name = xattr_name(name)?;
+    let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+fn linux_lock_to_host(lock_type: u32) -> Result<i16, i32> {
+    match lock_type {
+        LINUX_F_RDLCK => Ok(libc::F_RDLCK),
+        LINUX_F_WRLCK => Ok(libc::F_WRLCK),
+        LINUX_F_UNLCK => Ok(libc::F_UNLCK),
+        _ => Err(EINVAL),
+    }
+}
+
+fn host_lock_to_linux(lock_type: i16) -> Result<u32, i32> {
+    if lock_type == libc::F_RDLCK {
+        Ok(LINUX_F_RDLCK)
+    } else if lock_type == libc::F_WRLCK {
+        Ok(LINUX_F_WRLCK)
+    } else if lock_type == libc::F_UNLCK {
+        Ok(LINUX_F_UNLCK)
+    } else {
+        Err(EIO)
+    }
+}
+
+fn ranges_overlap(left: u64, right: u64, length: u64) -> bool {
+    if length == 0 {
+        return false;
+    }
+    left < right.saturating_add(length) && right < left.saturating_add(length)
+}
+
+fn host_mkfifo(path: &Path, mode: u32) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let result = unsafe { libc::mkfifo(path.as_ptr(), mode as libc::mode_t) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_rename(old: &Path, new: &Path, flags: u32) -> Result<(), i32> {
+    if flags == 0 {
+        return fs::rename(old, new).map_err(io_errno);
+    }
+    let old = path_cstring(old)?;
+    let new = path_cstring(new)?;
+    let host_flags = if flags & RENAME_EXCHANGE != 0 {
+        0x2
+    } else {
+        0x4
+    };
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            host_flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_rename(old: &Path, new: &Path, flags: u32) -> Result<(), i32> {
+    if flags == 0 {
+        return fs::rename(old, new).map_err(io_errno);
+    }
+    let old = path_cstring(old)?;
+    let new = path_cstring(new)?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<(), i32> {
+    let unsupported = FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE | FALLOC_FL_UNSHARE_RANGE;
+    if mode & unsupported != 0
+        || mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0
+    {
+        return Err(EOPNOTSUPP);
+    }
+    if length == 0 {
+        return Err(EINVAL);
+    }
+    let end = offset.checked_add(length).ok_or(EFBIG)?;
+    let offset = i64::try_from(offset).map_err(|_| EFBIG)?;
+    let length = i64::try_from(length).map_err(|_| EFBIG)?;
+
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+        if mode != (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) {
+            return Err(EOPNOTSUPP);
+        }
+        let mut punch = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset,
+            fp_length: length,
+        };
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut punch) };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(io_errno(io::Error::last_os_error()))
+        };
+    }
+
+    if mode & FALLOC_FL_ZERO_RANGE != 0 {
+        if mode & !(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) != 0 {
+            return Err(EOPNOTSUPP);
+        }
+        let old_size = file.metadata().map_err(io_errno)?.len();
+        let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
+            end.min(old_size)
+        } else {
+            if end > old_size {
+                file.set_len(end).map_err(io_errno)?;
+            }
+            end
+        };
+        let zeros = vec![0u8; MAX_WRITE as usize];
+        let mut cursor = offset as u64;
+        while cursor < zero_end {
+            let count = (zero_end - cursor).min(zeros.len() as u64) as usize;
+            let mut written = 0;
+            while written < count {
+                let n = file
+                    .write_at(&zeros[written..count], cursor + written as u64)
+                    .map_err(io_errno)?;
+                if n == 0 {
+                    return Err(EIO);
+                }
+                written += n;
+            }
+            cursor += count as u64;
+        }
+        return Ok(());
+    }
+
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: offset,
+        fst_length: length,
+        fst_bytesalloc: 0,
+    };
+    let mut result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    if result != 0 {
+        store.fst_flags = libc::F_ALLOCATEALL;
+        result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    }
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    if mode & FALLOC_FL_KEEP_SIZE == 0 && end > file.metadata().map_err(io_errno)?.len() {
+        file.set_len(end).map_err(io_errno)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<(), i32> {
+    let offset = i64::try_from(offset).map_err(|_| EFBIG)?;
+    let length = i64::try_from(length).map_err(|_| EFBIG)?;
+    let result = unsafe { libc::fallocate(file.as_raw_fd(), mode as i32, offset, length) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
+const STATX_BASIC_STATS: u32 = 0x07ff;
+const STATX_BTIME: u32 = 0x0800;
+
+#[cfg(target_os = "macos")]
+fn metadata_btime(meta: &Metadata) -> Option<(i64, u32)> {
+    Some((meta.st_birthtime(), meta.st_birthtime_nsec().max(0) as u32))
+}
+
+#[cfg(target_os = "linux")]
+fn metadata_btime(_meta: &Metadata) -> Option<(i64, u32)> {
+    None
+}
+
+fn statx_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
+    let btime = metadata_btime(meta);
+    let mut out = Vec::with_capacity(288);
+    put_u64(&mut out, cache_seconds);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_u64(&mut out, 0);
+    put_u64(&mut out, 0);
+
+    put_u32(
+        &mut out,
+        STATX_BASIC_STATS | if btime.is_some() { STATX_BTIME } else { 0 },
+    );
+    put_u32(&mut out, meta.blksize() as u32);
+    put_u64(&mut out, 0);
+    put_u32(&mut out, meta.nlink() as u32);
+    put_u32(&mut out, host_uid_to_guest(meta.uid()));
+    put_u32(&mut out, host_gid_to_guest(meta.gid()));
+    put_u16(&mut out, meta.mode() as u16);
+    put_u16(&mut out, 0);
+    put_u64(&mut out, node);
+    put_u64(&mut out, meta.size());
+    put_u64(&mut out, meta.blocks());
+    put_u64(&mut out, 0);
+    put_statx_time(&mut out, meta.atime(), meta.atime_nsec());
+    let (birth_seconds, birth_nanos) = btime.unwrap_or((0, 0));
+    put_statx_time(&mut out, birth_seconds, birth_nanos as i64);
+    put_statx_time(&mut out, meta.ctime(), meta.ctime_nsec());
+    put_statx_time(&mut out, meta.mtime(), meta.mtime_nsec());
+    for _ in 0..4 {
+        put_u32(&mut out, 0);
+    }
+    for _ in 0..14 {
+        put_u64(&mut out, 0);
+    }
+    debug_assert_eq!(out.len(), 288);
+    out
+}
+
+fn put_statx_time(out: &mut Vec<u8>, seconds: i64, nanos: i64) {
+    put_i64(out, seconds);
+    put_u32(out, nanos.max(0) as u32);
+    put_i32(out, 0);
+}
+
+#[cfg(target_os = "linux")]
+fn host_removexattr(path: &Path, name: &[u8]) -> Result<(), i32> {
+    let path = path_cstring(path)?;
+    let name = xattr_name(name)?;
+    let result = unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
 }
 
 fn nul_name(input: &[u8], offset: usize) -> Result<&[u8], i32> {
@@ -1029,8 +2306,8 @@ fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Metadata) {
     put_u32(out, meta.ctime_nsec().max(0) as u32);
     put_u32(out, meta.mode());
     put_u32(out, meta.nlink() as u32);
-    put_u32(out, meta.uid());
-    put_u32(out, meta.gid());
+    put_u32(out, host_uid_to_guest(meta.uid()));
+    put_u32(out, host_gid_to_guest(meta.gid()));
     put_u32(out, 0); // macOS st_rdev encoding is not Linux-compatible
     put_u32(out, meta.blksize() as u32);
     put_u32(out, 0);
@@ -1064,7 +2341,17 @@ fn io_errno(err: io::Error) -> i32 {
         Some(code) if code == libc::ENOTDIR => return ENOTDIR,
         Some(code) if code == libc::EISDIR => return EISDIR,
         Some(code) if code == libc::EINVAL => return EINVAL,
+        Some(code) if code == libc::ENXIO => return ENXIO,
+        Some(code) if code == libc::EAGAIN => return EAGAIN,
+        Some(code) if code == libc::EDEADLK => return EDEADLK,
+        Some(code) if code == libc::ENOTTY => return ENOTTY,
+        Some(code) if code == libc::EFBIG => return EFBIG,
         Some(code) if code == libc::ENOSPC => return ENOSPC,
+        Some(code) if code == libc::EROFS => return EROFS,
+        Some(code) if code == libc::ERANGE => return ERANGE,
+        Some(code) if is_no_xattr(code) => return ENODATA,
+        Some(code) if code == libc::EOPNOTSUPP => return EOPNOTSUPP,
+        Some(code) if code == libc::ENOSYS => return ENOSYS,
         Some(code) if code == libc::ENOTEMPTY => return ENOTEMPTY,
         Some(code) if code == libc::ELOOP => return ELOOP,
         _ => {}
@@ -1079,6 +2366,16 @@ fn io_errno(err: io::Error) -> i32 {
         io::ErrorKind::Unsupported => ENOSYS,
         _ => EIO,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_no_xattr(code: i32) -> bool {
+    code == libc::ENOATTR
+}
+
+#[cfg(target_os = "linux")]
+fn is_no_xattr(code: i32) -> bool {
+    code == libc::ENODATA
 }
 
 fn success_response(unique: u64, payload: &[u8]) -> Vec<u8> {
@@ -1126,6 +2423,10 @@ fn put_i32(out: &mut Vec<u8>, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn put_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -1161,6 +2462,22 @@ mod tests {
 
     fn fixture() -> (PathBuf, VirtioFs) {
         fixture_with_access(false)
+    }
+
+    fn lookup_node(dev: &mut VirtioFs, parent: u64, name: &[u8]) -> u64 {
+        let mut payload = name.to_vec();
+        payload.push(0);
+        let out = dev.handle_fuse(&request(LOOKUP, parent, &payload), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        get_u64(&out, OUT_HEADER_LEN).unwrap()
+    }
+
+    fn open_rw(dev: &mut VirtioFs, node: u64) -> u64 {
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        get_u64(&out, OUT_HEADER_LEN).unwrap()
     }
 
     #[test]
@@ -1374,6 +2691,252 @@ mod tests {
             get_u64(&issue, OUT_HEADER_LEN),
             get_u64(&banner, OUT_HEADER_LEN)
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn writable_exports_disable_host_incoherent_caches() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        // fuse_entry_out.entry_valid and attr_valid are both zero.
+        let lookup = dev.handle_fuse(&request(LOOKUP, etc, b"issue\0"), 4096);
+        assert_eq!(get_u64(&lookup, OUT_HEADER_LEN + 16), Some(0));
+        assert_eq!(get_u64(&lookup, OUT_HEADER_LEN + 24), Some(0));
+        let issue = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+        let mut open = vec![0u8; 8];
+        open[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        let opened = dev.handle_fuse(&request(OPEN, issue, &open), 4096);
+        // No FOPEN_KEEP_CACHE on a writable share.
+        assert_eq!(get_u32(&opened, OUT_HEADER_LEN + 8), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn setattr_updates_mode_times_and_reports_squashed_owner() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let mut input = vec![0u8; 88];
+        input[0..4].copy_from_slice(&(FATTR_MODE | FATTR_ATIME | FATTR_MTIME).to_le_bytes());
+        input[32..40].copy_from_slice(&1_700_000_001u64.to_le_bytes());
+        input[40..48].copy_from_slice(&1_700_000_002u64.to_le_bytes());
+        input[56..60].copy_from_slice(&123u32.to_le_bytes());
+        input[60..64].copy_from_slice(&456u32.to_le_bytes());
+        input[68..72].copy_from_slice(&0o640u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let meta = fs::metadata(dir.join("etc/issue")).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o640);
+        assert_eq!(meta.atime(), 1_700_000_001);
+        assert_eq!(meta.mtime(), 1_700_000_002);
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 68), Some(0));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 72), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extended_attributes_round_trip() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let mut set = vec![0u8; 16];
+        set[0..4].copy_from_slice(&5u32.to_le_bytes());
+        set.extend_from_slice(b"user.hvi\0value");
+        let out = dev.handle_fuse(&request(SETXATTR, issue, &set), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let mut get = vec![0u8; 8];
+        get[0..4].copy_from_slice(&16u32.to_le_bytes());
+        get.extend_from_slice(b"user.hvi\0");
+        let out = dev.handle_fuse(&request(GETXATTR, issue, &get), 4096);
+        assert_eq!(&out[OUT_HEADER_LEN..], b"value");
+
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LISTXATTR, issue, &list), 8192);
+        assert!(out[OUT_HEADER_LEN..]
+            .split(|byte| *byte == 0)
+            .any(|name| name == b"user.hvi"));
+
+        let out = dev.handle_fuse(&request(REMOVEXATTR, issue, b"user.hvi\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let out = dev.handle_fuse(&request(GETXATTR, issue, &get), 4096);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -ENODATA);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn allocation_seek_and_copy_work_on_host_files() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("source"), b"abcdefgh").unwrap();
+        fs::write(dir.join("target"), b"--------").unwrap();
+        let source = lookup_node(&mut dev, FUSE_ROOT_ID, b"source");
+        let target = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
+        let source_fh = open_rw(&mut dev, source);
+        let target_fh = open_rw(&mut dev, target);
+
+        let mut zero = vec![0u8; 32];
+        zero[0..8].copy_from_slice(&source_fh.to_le_bytes());
+        zero[8..16].copy_from_slice(&2u64.to_le_bytes());
+        zero[16..24].copy_from_slice(&3u64.to_le_bytes());
+        zero[24..28].copy_from_slice(&(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE).to_le_bytes());
+        let out = dev.handle_fuse(&request(FALLOCATE, source, &zero), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(fs::read(dir.join("source")).unwrap(), b"ab\0\0\0fgh");
+
+        let mut copy = vec![0u8; 56];
+        copy[0..8].copy_from_slice(&source_fh.to_le_bytes());
+        copy[8..16].copy_from_slice(&5u64.to_le_bytes());
+        copy[16..24].copy_from_slice(&target.to_le_bytes());
+        copy[24..32].copy_from_slice(&target_fh.to_le_bytes());
+        copy[32..40].copy_from_slice(&1u64.to_le_bytes());
+        copy[40..48].copy_from_slice(&3u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(COPY_FILE_RANGE, source, &copy), 4096);
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN), Some(3));
+        assert_eq!(fs::read(dir.join("target")).unwrap(), b"-fgh----");
+
+        let mut seek = vec![0u8; 24];
+        seek[0..8].copy_from_slice(&target_fh.to_le_bytes());
+        seek[16..20].copy_from_slice(&2u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LSEEK, target, &seek), 4096);
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(8));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readdirplus_uses_a_real_directory_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
+        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+        let mut read = vec![0u8; 40];
+        read[0..8].copy_from_slice(&fh.to_le_bytes());
+        read[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, etc, &read), 8192);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(out.len() > OUT_HEADER_LEN + 128 + 24);
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(etc));
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASEDIR, etc, &release), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_exchange_and_hardlink_aliases_remain_addressable() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("left"), b"left").unwrap();
+        fs::write(dir.join("right"), b"right").unwrap();
+        let left = lookup_node(&mut dev, FUSE_ROOT_ID, b"left");
+        let right = lookup_node(&mut dev, FUSE_ROOT_ID, b"right");
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        put_u32(&mut rename, RENAME_EXCHANGE);
+        put_u32(&mut rename, 0);
+        rename.extend_from_slice(b"left\0right\0");
+        let out = dev.handle_fuse(&request(RENAME2, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(fs::read(dir.join("left")).unwrap(), b"right");
+        assert_eq!(fs::read(dir.join("right")).unwrap(), b"left");
+        assert_eq!(dev.node_path(left).unwrap(), dev.root().join("right"));
+        assert_eq!(dev.node_path(right).unwrap(), dev.root().join("left"));
+
+        fs::hard_link(dir.join("right"), dir.join("alias")).unwrap();
+        assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"alias"), left);
+        let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"right\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.node_path(left).unwrap(), dev.root().join("alias"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn statx_and_statfs_return_real_data() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let out = dev.handle_fuse(&request(STATX, issue, &[0; 24]), 4096);
+        assert_eq!(out.len(), OUT_HEADER_LEN + 288);
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN + 32 + 32), Some(issue));
+        let out = dev.handle_fuse(&request(STATFS, FUSE_ROOT_ID, &[]), 4096);
+        assert_eq!(out.len(), OUT_HEADER_LEN + 80);
+        assert!(get_u64(&out, OUT_HEADER_LEN).unwrap() > 0);
+        assert!(get_u32(&out, OUT_HEADER_LEN + 40).unwrap() > 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn locks_conflict_between_open_file_descriptions() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let first = open_rw(&mut dev, issue);
+        let second = open_rw(&mut dev, issue);
+        let mut lock = vec![0u8; 48];
+        lock[0..8].copy_from_slice(&first.to_le_bytes());
+        lock[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        lock[32..36].copy_from_slice(&LINUX_F_WRLCK.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        lock[0..8].copy_from_slice(&second.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
+        let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
+        assert!(errno == -EAGAIN || errno == -EACCES);
+
+        lock[0..8].copy_from_slice(&first.to_le_bytes());
+        lock[32..36].copy_from_slice(&LINUX_F_UNLCK.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tmpfile_can_be_linked_before_release() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut input = vec![0u8; 16];
+        input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        input[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        let out = dev.handle_fuse(&request(TMPFILE, FUSE_ROOT_ID, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+        let temporary = dev
+            .handles
+            .get(&fh)
+            .unwrap()
+            .temporary_path
+            .clone()
+            .unwrap();
+
+        let mut link = Vec::new();
+        put_u64(&mut link, node);
+        link.extend_from_slice(b"linked-temp\0");
+        let out = dev.handle_fuse(&request(LINK, FUSE_ROOT_ID, &link), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(!temporary.exists());
+        assert!(dir.join("linked-temp").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forget_releases_inode_state_and_a_new_lookup_gets_a_fresh_node() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let mut forget = Vec::new();
+        put_u64(&mut forget, 1);
+        assert!(dev
+            .handle_fuse(&request(FORGET, issue, &forget), 4096)
+            .is_empty());
+        assert!(!dev.nodes.contains_key(&issue));
+        let replacement = lookup_node(&mut dev, etc, b"issue");
+        assert_ne!(replacement, issue);
         let _ = fs::remove_dir_all(dir);
     }
 }
