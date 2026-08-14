@@ -1981,7 +1981,16 @@ impl VirtioFs {
         if let Some(node) = self.inode_ids.get(&key) {
             if let Some(remembered) = self.nodes.get_mut(node) {
                 if !remembered.paths.contains(&path) {
+                    // A path we have not seen before resolving to an inode we
+                    // already know is either a new alias or, after an unlink
+                    // whose FORGET has not arrived yet, the host reusing the
+                    // inode number for a different file. The cached xattr
+                    // described the old occupant, so drop it: this is the one
+                    // place a node can start referring to something the cache
+                    // does not describe. A repeat lookup of an already-known
+                    // path keeps its cache, which is the hot path.
                     remembered.paths.push(path);
+                    remembered.guest_attr = None;
                 }
             }
             return *node;
@@ -3575,6 +3584,66 @@ mod tests {
         let out = dev.handle_fuse(&request(LINK, etc_node, &link), 4096);
         assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(issue_node));
         assert_eq!(fs::read(dir.join("etc/banner")).unwrap(), b"hello\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Attaching a previously unseen path to an inode we already know must
+    /// drop that node's cached guest attribute.
+    ///
+    /// That happens for a new hard link, and -- the case that actually
+    /// corrupts -- when the host reuses an inode number for a freshly created
+    /// file while the guest still holds a lookup reference to the unlinked
+    /// one. Before the cache every attribute reply re-read the xattr, so a
+    /// stale value was not representable; the cache makes it possible, and
+    /// this pins the invalidation that prevents it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_path_for_a_known_inode_drops_the_cached_guest_attribute() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue_node = lookup_node(&mut dev, etc_node, b"issue");
+
+        // Populate the cache. The fixture's files are host-created, so this
+        // caches "no xattr present".
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 68), Some(0));
+
+        // Write the xattr behind the device's back, standing in for what a
+        // creation into a reused inode would leave on disk.
+        set_guest_attr(
+            &dir.join("etc/issue"),
+            GuestAttr {
+                mode: S_IFREG | 0o600,
+                uid: 4242,
+                gid: 4243,
+            },
+        )
+        .unwrap();
+
+        // Still the cached answer: serving the memoised miss is the whole
+        // point, and nothing has told us the inode changed identity yet.
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 68), Some(0));
+
+        // A second name for the same inode is that signal.
+        let mut link = Vec::new();
+        put_u64(&mut link, issue_node);
+        link.extend_from_slice(b"alias\0");
+        let out = dev.handle_fuse(&request(LINK, etc_node, &link), 4096);
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(issue_node));
+
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &[0u8; 16]), 4096);
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 68),
+            Some(4242),
+            "stale uid served from the cache after the inode gained a new path"
+        );
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 72), Some(4243));
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 60).unwrap() & 0o7777,
+            0o600
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
