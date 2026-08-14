@@ -248,6 +248,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 root,
                 &share.tag,
                 share.mode.writable(),
+                share.cache,
             )?)),
         });
     }

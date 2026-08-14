@@ -178,9 +178,13 @@ The limits worth knowing before you build on it:
   are not wired yet. Writable shares support development workloads: file and
   directory handles, hard links, atomic rename variants, timestamps, xattrs,
   locks, allocation/zero/punch, seek/copy, statx/statfs, FIFOs and tmpfiles.
-  Writable exports disable guest metadata/page retention so edits made
-  concurrently on the host are revalidated. On macOS, Linux mode/uid/gid values
-  are persisted in a private host xattr while the host inode retains enough
-  owner access for the unprivileged VMM; restrictive modes and arbitrary guest
-  owners therefore survive a backend restart. Protect a shared OCI cache with
-  `--share-ro`, or give `--share-rw` an instance-owned APFS clone.
+  A trailing `cache=auto|always|none` on a share selects how much the guest
+  may cache: `auto` (the default) keeps attributes for a second and retains
+  page cache across opens, `none` revalidates everything against the host for
+  a tree the host mutates concurrently, and `always` adds the writeback cache,
+  which is only correct when the guest is the sole writer. On macOS, Linux
+  mode/uid/gid values are persisted in a private host xattr while the host
+  inode retains enough owner access for the unprivileged VMM; restrictive
+  modes and arbitrary guest owners therefore survive a backend restart.
+  Protect a shared OCI cache with `--share-ro`, or give `--share-rw` an
+  instance-owned APFS clone.

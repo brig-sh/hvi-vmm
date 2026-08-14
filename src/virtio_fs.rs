@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 
+use crate::config::CachePolicy;
 use crate::guestmem::GuestRam;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
@@ -209,6 +210,7 @@ struct Node {
 pub struct VirtioFs {
     root: PathBuf,
     writable: bool,
+    cache_policy: CachePolicy,
     tag: [u8; TAG_LEN],
     status: u32,
     dev_feat_sel: u32,
@@ -227,7 +229,12 @@ pub struct VirtioFs {
 impl VirtioFs {
     /// Creates an export. `root` must already be canonical so the same exact
     /// path and access mode can be granted by Seatbelt.
-    pub fn new(root: PathBuf, tag: &str, writable: bool) -> io::Result<Self> {
+    pub fn new(
+        root: PathBuf,
+        tag: &str,
+        writable: bool,
+        cache_policy: CachePolicy,
+    ) -> io::Result<Self> {
         if !root.is_absolute() || !root.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -258,6 +265,7 @@ impl VirtioFs {
         Ok(Self {
             root,
             writable,
+            cache_policy,
             tag: tag_buf,
             status: 0,
             dev_feat_sel: 0,
@@ -574,6 +582,15 @@ impl VirtioFs {
         const CACHE_SYMLINKS: u32 = 1 << 23;
         const HANDLE_KILLPRIV_V2: u32 = 1 << 28;
         const SETXATTR_EXT: u32 = 1 << 29;
+        // Every LOOKUP/READDIR the guest issues in parallel is independent of
+        // every other -- there is no shared cursor or lock this backend needs
+        // to serialise them for.
+        const PARALLEL_DIROPS: u32 = 1 << 18;
+        // Hands mtime/ctime/size ownership to the guest, which then batches
+        // writes into large aligned WRITEs instead of round-tripping through
+        // us for every page. Only correct when the guest is the sole writer,
+        // which is exactly what CachePolicy::Always asserts.
+        const WRITEBACK_CACHE: u32 = 1 << 16;
         let mut supported = ASYNC_READ
             | POSIX_LOCKS
             | ATOMIC_O_TRUNC
@@ -585,9 +602,15 @@ impl VirtioFs {
             | READDIRPLUS_AUTO
             | MAX_PAGES
             | HANDLE_KILLPRIV_V2
-            | SETXATTR_EXT;
-        if !self.writable {
+            | SETXATTR_EXT
+            | PARALLEL_DIROPS;
+        // Read-only shares always get this (cannot go stale from the guest's
+        // side); writable shares only when the operator opted into caching.
+        if !self.writable || self.cache_policy != CachePolicy::None {
             supported |= CACHE_SYMLINKS;
+        }
+        if self.writable && self.cache_policy == CachePolicy::Always {
+            supported |= WRITEBACK_CACHE;
         }
         let mut out = Vec::with_capacity(64);
         put_u32(&mut out, 7);
@@ -1006,7 +1029,7 @@ impl VirtioFs {
         self.remember_lookup(node);
         let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path);
         let mut out = self.entry_out(node, &meta);
-        put_open_out(&mut out, fh, false, !self.writable);
+        put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
     fn readlink(&self, node: u64) -> Result<Vec<u8>, i32> {
@@ -1049,7 +1072,12 @@ impl VirtioFs {
             self.insert_handle(file, wants_write, path)
         };
         let mut out = Vec::with_capacity(16);
-        put_open_out(&mut out, fh, directory, !self.writable);
+        put_open_out(
+            &mut out,
+            fh,
+            directory,
+            self.cache_policy != CachePolicy::None,
+        );
         Ok(out)
     }
 
@@ -1707,10 +1735,13 @@ impl VirtioFs {
     }
 
     fn cache_seconds(&self) -> u64 {
-        if self.writable {
+        if self.cache_policy == CachePolicy::None {
             0
-        } else {
+        } else if !self.writable {
+            // Read-only shares cannot go stale from the guest's own writes.
             60
+        } else {
+            1
         }
     }
 
@@ -2697,15 +2728,19 @@ mod tests {
         out
     }
 
-    fn fixture_with_access(writable: bool) -> (PathBuf, VirtioFs) {
+    fn fixture_with_cache(writable: bool, cache: CachePolicy) -> (PathBuf, VirtioFs) {
         let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("hvi-virtiofs-test-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("etc")).unwrap();
         fs::write(dir.join("etc/issue"), b"hello\n").unwrap();
-        let fs = VirtioFs::new(fs::canonicalize(&dir).unwrap(), "rootfs", writable).unwrap();
+        let fs = VirtioFs::new(fs::canonicalize(&dir).unwrap(), "rootfs", writable, cache).unwrap();
         (dir, fs)
+    }
+
+    fn fixture_with_access(writable: bool) -> (PathBuf, VirtioFs) {
+        fixture_with_cache(writable, CachePolicy::Auto)
     }
 
     fn fixture() -> (PathBuf, VirtioFs) {
@@ -2741,6 +2776,111 @@ mod tests {
         assert_eq!(get_u32(&out, 16), Some(7));
         assert_eq!(get_u32(&out, 20), Some(39));
         assert_eq!(get_u32(&out, 40), Some(1)); // time_gran
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn init_payload_offering_everything() -> Vec<u8> {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, 7);
+        put_u32(&mut payload, 39);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, u32::MAX);
+        payload
+    }
+
+    #[test]
+    fn init_writable_always_negotiates_writeback_cache() {
+        const WRITEBACK_CACHE: u32 = 1 << 16;
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::Always);
+        let out = dev.handle_fuse(&request(INIT, 0, &init_payload_offering_everything()), 4096);
+        let flags = get_u32(&out, OUT_HEADER_LEN + 12).unwrap();
+        assert_ne!(
+            flags & WRITEBACK_CACHE,
+            0,
+            "Always + writable negotiates it"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_writable_auto_does_not_negotiate_writeback_cache() {
+        const WRITEBACK_CACHE: u32 = 1 << 16;
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::Auto);
+        let out = dev.handle_fuse(&request(INIT, 0, &init_payload_offering_everything()), 4096);
+        let flags = get_u32(&out, OUT_HEADER_LEN + 12).unwrap();
+        assert_eq!(
+            flags & WRITEBACK_CACHE,
+            0,
+            "handing over mtime/size ownership needs an explicit Always"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_always_negotiates_parallel_diroops() {
+        const PARALLEL_DIROPS: u32 = 1 << 18;
+        for (writable, cache) in [
+            (false, CachePolicy::Auto),
+            (true, CachePolicy::None),
+            (true, CachePolicy::Always),
+        ] {
+            let (dir, mut dev) = fixture_with_cache(writable, cache);
+            let out = dev.handle_fuse(&request(INIT, 0, &init_payload_offering_everything()), 4096);
+            let flags = get_u32(&out, OUT_HEADER_LEN + 12).unwrap();
+            assert_ne!(flags & PARALLEL_DIROPS, 0, "{writable:?}/{cache:?}");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn writable_auto_cache_returns_nonzero_timeouts_and_none_returns_zero() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::Auto);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let lookup = dev.handle_fuse(&request(LOOKUP, etc, b"issue\0"), 4096);
+        assert_ne!(
+            get_u64(&lookup, OUT_HEADER_LEN + 16),
+            Some(0),
+            "entry_valid"
+        );
+        assert_ne!(get_u64(&lookup, OUT_HEADER_LEN + 24), Some(0), "attr_valid");
+        let issue = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+        let getattr = dev.handle_fuse(&request(GETATTR, issue, &[]), 4096);
+        assert_ne!(
+            get_u64(&getattr, OUT_HEADER_LEN),
+            Some(0),
+            "attr_out attr_valid"
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let lookup = dev.handle_fuse(&request(LOOKUP, etc, b"issue\0"), 4096);
+        assert_eq!(get_u64(&lookup, OUT_HEADER_LEN + 16), Some(0));
+        assert_eq!(get_u64(&lookup, OUT_HEADER_LEN + 24), Some(0));
+        let issue = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+        let getattr = dev.handle_fuse(&request(GETATTR, issue, &[]), 4096);
+        assert_eq!(get_u64(&getattr, OUT_HEADER_LEN), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_keep_cache_flag_follows_cache_policy() {
+        const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+        let mut open = vec![0u8; 8];
+        open[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::Auto);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let opened = dev.handle_fuse(&request(OPEN, issue, &open), 4096);
+        assert_eq!(get_u32(&opened, OUT_HEADER_LEN + 8), Some(FOPEN_KEEP_CACHE));
+        let _ = fs::remove_dir_all(dir);
+
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let opened = dev.handle_fuse(&request(OPEN, issue, &open), 4096);
+        assert_eq!(get_u32(&opened, OUT_HEADER_LEN + 8), Some(0));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2963,9 +3103,14 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // Renamed from `writable_exports_disable_host_incoherent_caches`: Task 1
+    // made `Auto` (the default) hand out non-zero timeouts and
+    // FOPEN_KEEP_CACHE on writable shares, which is the whole point of that
+    // task. `None` is the policy that keeps the old fully-incoherent
+    // behaviour, so that is what this test now exercises.
     #[test]
-    fn writable_exports_disable_host_incoherent_caches() {
-        let (dir, mut dev) = fixture_with_access(true);
+    fn writable_none_cache_disables_host_incoherent_caches() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
         // fuse_entry_out.entry_valid and attr_valid are both zero.
         let lookup = dev.handle_fuse(&request(LOOKUP, etc, b"issue\0"), 4096);
@@ -3020,7 +3165,13 @@ mod tests {
         assert_eq!(host_meta.mode() & 0o700, 0o700);
         fs::write(dir.join("locked/host-still-has-access"), b"ok").unwrap();
 
-        let mut reopened = VirtioFs::new(fs::canonicalize(&dir).unwrap(), "rootfs", true).unwrap();
+        let mut reopened = VirtioFs::new(
+            fs::canonicalize(&dir).unwrap(),
+            "rootfs",
+            true,
+            CachePolicy::Auto,
+        )
+        .unwrap();
         let lookup = reopened.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"locked\0"), 4096);
         assert_eq!(
             get_u32(&lookup, OUT_HEADER_LEN + 40 + 60).unwrap() & 0o7777,
