@@ -301,6 +301,23 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return Err(format!("duplicate virtio-fs tag {tag:?}").into());
                 }
+                // Optional trailing `cache=auto|always|none`; anything else is
+                // the next flag and is left for the outer loop to consume.
+                let mut cache = config::CachePolicy::Auto;
+                if let Some(spec) = it.clone().next().and_then(|s| s.strip_prefix("cache=")) {
+                    cache = match spec {
+                        "auto" => config::CachePolicy::Auto,
+                        "always" => config::CachePolicy::Always,
+                        "none" => config::CachePolicy::None,
+                        other => {
+                            return Err(format!(
+                                "unknown cache policy {other:?}; expected auto, always or none"
+                            )
+                            .into())
+                        }
+                    };
+                    it.next();
+                }
                 let path = std::fs::canonicalize(path)?;
                 if !path.is_dir() {
                     return Err(
@@ -311,6 +328,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     path,
                     tag: tag.clone(),
                     mode,
+                    cache,
                 });
             }
             "--net" => net = true,

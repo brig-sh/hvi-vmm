@@ -17,12 +17,31 @@ impl ShareMode {
     }
 }
 
+/// How long the guest may keep metadata and page-cache contents without
+/// re-checking the host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CachePolicy {
+    /// Metadata cached for a second and page cache retained across opens, with
+    /// the guest revalidating on size/mtime change. Matches virtiofsd's
+    /// default.
+    #[default]
+    Auto,
+    /// Additionally lets the guest own the page cache for writes, batching them
+    /// into large aligned WRITEs. Only correct when the guest is the sole
+    /// writer.
+    Always,
+    /// Every lookup and read goes to the host. Correct under concurrent host
+    /// mutation, and slow.
+    None,
+}
+
 /// One host directory exported to the guest through virtio-fs.
 #[derive(Debug, Clone)]
 pub struct FsShare {
     pub path: PathBuf,
     pub tag: String,
     pub mode: ShareMode,
+    pub cache: CachePolicy,
 }
 
 /// Inputs for a boot. Populated by `main::boot_guest` from the CLI and handed
