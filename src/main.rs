@@ -280,19 +280,24 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
-            "--share-ro" => {
+            "--share-ro" | "--share-rw" => {
+                let mode = if a == "--share-rw" {
+                    config::ShareMode::ReadWrite
+                } else {
+                    config::ShareMode::ReadOnly
+                };
                 let path = it
                     .next()
-                    .ok_or("--share-ro needs a host directory and tag")?;
+                    .ok_or("--share-ro/--share-rw needs a host directory and tag")?;
                 let tag = it
                     .next()
-                    .ok_or("--share-ro needs a host directory and tag")?;
+                    .ok_or("--share-ro/--share-rw needs a host directory and tag")?;
                 if tag.is_empty() || tag.len() > 36 || tag.as_bytes().contains(&0) {
                     return Err("virtio-fs tag must be 1..=36 bytes and contain no NUL".into());
                 }
                 if fs_shares
                     .iter()
-                    .any(|share: &config::ReadOnlyShare| share.tag == *tag)
+                    .any(|share: &config::FsShare| share.tag == *tag)
                 {
                     return Err(format!("duplicate virtio-fs tag {tag:?}").into());
                 }
@@ -302,9 +307,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         format!("virtio-fs export is not a directory: {}", path.display()).into(),
                     );
                 }
-                fs_shares.push(config::ReadOnlyShare {
+                fs_shares.push(config::FsShare {
                     path,
                     tag: tag.clone(),
+                    mode,
                 });
             }
             "--net" => net = true,

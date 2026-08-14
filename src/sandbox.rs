@@ -29,10 +29,11 @@
 //! is: one line later and the profile would have to grant filesystem and socket
 //! rights it can now refuse outright. The one exception is virtio-fs: directory
 //! entries and files are opened lazily as the guest requests them. When
-//! read-only shares are configured, [`enter_with_readonly_shares`] appends one
-//! `file-read*` subpath rule for the already-canonical export root. The path is
+//! shares are configured, [`enter_with_shares`] appends one narrow subpath rule
+//! for every already-canonical export root. Read-only exports receive
+//! `file-read*`; writable exports also receive `file-write*`. The path is
 //! required to be UTF-8/control-free and SBPL-escaped before interpolation;
-//! write access and every path outside that subtree remain denied.
+//! every path outside those subtrees remains denied.
 //!
 //! The vCPU threads are created *after* this point and that is fine:
 //! `hv_vcpu_create` and `hv_vcpu_run` on a fresh thread work under a bare
@@ -132,7 +133,7 @@ pub fn enter() -> io::Result<()> {
 
 /// Backwards-compatible single-export entry point.
 pub fn enter_with_readonly_share(root: Option<&Path>) -> io::Result<()> {
-    enter_with_paths(root)
+    enter_with_paths(root.into_iter().map(|path| (path, false)))
 }
 
 /// Installs the production profile, granting read-only access to each
@@ -140,12 +141,22 @@ pub fn enter_with_readonly_share(root: Option<&Path>) -> io::Result<()> {
 /// them, unlike virtio-blk's already-open descriptor, so one narrow subtree
 /// grant per export is required after confinement.
 pub fn enter_with_readonly_shares(roots: &[PathBuf]) -> io::Result<()> {
-    enter_with_paths(roots.iter().map(PathBuf::as_path))
+    enter_with_paths(roots.iter().map(|root| (root.as_path(), false)))
 }
 
-fn enter_with_paths<'a>(roots: impl IntoIterator<Item = &'a Path>) -> io::Result<()> {
+/// Installs the production profile with independently read-only or writable
+/// virtio-fs exports. The boolean is true only for a writable share.
+pub fn enter_with_shares(shares: &[(PathBuf, bool)]) -> io::Result<()> {
+    enter_with_paths(
+        shares
+            .iter()
+            .map(|(root, writable)| (root.as_path(), *writable)),
+    )
+}
+
+fn enter_with_paths<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io::Result<()> {
     let mut policy = PROFILE.to_owned();
-    for root in roots {
+    for (root, writable) in roots {
         let root = root.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -161,10 +172,17 @@ fn enter_with_paths<'a>(roots: impl IntoIterator<Item = &'a Path>) -> io::Result
         // SBPL strings use the conventional backslash escapes. Escaping both
         // special characters keeps a caller-controlled path data, not policy.
         let escaped = root.replace('\\', "\\\\").replace('"', "\\\"");
-        policy.push_str(&format!(
-            "\n;; virtio-fs may acquire files only below this canonical read-only export.\n\
-             (allow file-read* (subpath \"{escaped}\"))\n"
-        ));
+        if writable {
+            policy.push_str(&format!(
+                "\n;; virtio-fs may read and mutate only below this canonical writable export.\n\
+                 (allow file-read* file-write* (subpath \"{escaped}\"))\n"
+            ));
+        } else {
+            policy.push_str(&format!(
+                "\n;; virtio-fs may acquire files only below this canonical read-only export.\n\
+                 (allow file-read* (subpath \"{escaped}\"))\n"
+            ));
+        }
     }
     let profile =
         CString::new(policy).map_err(|_| io::Error::other("sandbox profile has a NUL"))?;

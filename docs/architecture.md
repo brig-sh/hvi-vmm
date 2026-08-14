@@ -284,12 +284,15 @@ Interrupt injection is the one device-facing thing that differs by backend:
   accept opens a vsock stream to the guest agent (host CID 2, guest CID 3, port
   1024), relaying bytes both ways and raising the vsock IRQ.
 - **virtio-fs** (`virtio_fs.rs`, device id 26, macOS arm64) — exports one
-  canonical host directory per repeated `--share-ro <path> <tag>`. HVI answers
+  canonical host directory per repeated `--share-ro <path> <tag>` or
+  `--share-rw <path> <tag>`. HVI answers
   the guest's FUSE messages directly over hiprio + request virtqueues; no macFUSE
   mount, block image, or DAX window is involved. Lookup, attributes, links,
-  directory traversal and reads are supported, hard links preserve inode
-  identity, and every mutation returns `EROFS`. Seatbelt grants lazy opens only
-  below the exported subtree.
+  directory traversal and reads are supported, and real host file handles keep
+  open files valid across rename/unlink. Writable exports add create, write,
+  truncate, chmod, directories, links, rename, removal and fsync; read-only
+  exports return `EROFS` for the same requests. Seatbelt independently grants
+  `file-read*` or `file-read* file-write*` only below each exported subtree.
 
 The serial console is a **PL011** (`pl011.rs`, MMIO) on arm64 and a **16550**
 (`uart16550.rs`, PIO `0x3f8`) on x86.
