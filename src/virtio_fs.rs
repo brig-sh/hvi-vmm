@@ -12,6 +12,7 @@
 //! an immutable OCI cache to remain protected while an instance-owned APFS
 //! clone or an explicit volume is exported without a block image.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
@@ -43,6 +44,14 @@ const MAX_WRITE: u32 = 1 << 20;
 
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
+
+/// Largest iovec count a single `preadv`/`pwritev` may carry. `libc::IOV_MAX`
+/// is only defined for BSD-family targets in the `libc` crate; on Linux this
+/// is `UIO_MAXIOV`, kernel-enforced and stable since 2.6.18.
+#[cfg(target_os = "macos")]
+const IOV_MAX: usize = libc::IOV_MAX as usize;
+#[cfg(target_os = "linux")]
+const IOV_MAX: usize = 1024;
 
 const FUSE_ROOT_ID: u64 = 1;
 const IN_HEADER_LEN: usize = 40;
@@ -184,6 +193,14 @@ struct FileHandle {
     temporary_path: Option<PathBuf>,
 }
 
+/// What a handler produced. `Direct` means the handler already placed its
+/// payload in the guest's output descriptors, past the reply header, and
+/// `handle_chain` has nothing left to copy.
+enum Reply {
+    Buffered(Vec<u8>),
+    Direct(usize),
+}
+
 #[derive(Clone, Copy)]
 struct RequestContext {
     uid: u32,
@@ -244,6 +261,14 @@ pub struct VirtioFs {
     dir_handles: HashMap<u64, DirHandle>,
     next_handle: u64,
     next_tmpfile: u64,
+    /// How many READs and WRITEs took the zero-copy `preadv`/`pwritev` path.
+    ///
+    /// Both direct paths fall back to the buffered one by returning `None`,
+    /// which is correct but indistinguishable from the fast path by result
+    /// alone -- so without a counter a regression that disables zero-copy
+    /// entirely still passes every behavioural test. `Cell` because
+    /// `read_direct` only needs `&self`.
+    zero_copy: Cell<(u64, u64)>,
 }
 
 impl VirtioFs {
@@ -300,7 +325,24 @@ impl VirtioFs {
             dir_handles: HashMap::new(),
             next_handle: 1,
             next_tmpfile: 1,
+            zero_copy: Cell::new((0, 0)),
         })
+    }
+
+    /// `(reads, writes)` served zero-copy since boot.
+    #[cfg(test)]
+    fn zero_copy_counts(&self) -> (u64, u64) {
+        self.zero_copy.get()
+    }
+
+    fn note_zero_copy_read(&self) {
+        let (r, w) = self.zero_copy.get();
+        self.zero_copy.set((r + 1, w));
+    }
+
+    fn note_zero_copy_write(&self) {
+        let (r, w) = self.zero_copy.get();
+        self.zero_copy.set((r, w + 1));
     }
 
     #[must_use]
@@ -438,8 +480,14 @@ impl VirtioFs {
 
     fn handle_chain(&mut self, mem: &GuestRam, queue_idx: usize, head: u16) -> u32 {
         let q = &self.queues[queue_idx];
-        let mut request = Vec::new();
-        let mut output = Vec::new();
+        // Descriptor-lists, not a concatenated buffer: Linux always lays a
+        // request out as header(+small fixed args) in the input descriptors
+        // and any bulk payload in its own descriptor(s), which is what lets
+        // READ/WRITE go straight to/from guest RAM below instead of through
+        // an intermediate copy.
+        let mut input: Vec<(u64, u32)> = Vec::new();
+        let mut output: Vec<(u64, u32)> = Vec::new();
+        let mut total_in = 0usize;
         let mut desc = head;
         for _ in 0..q.size() {
             let Some(da) = q.desc_addr(desc) else {
@@ -456,43 +504,92 @@ impl VirtioFs {
             if flags & DESC_WRITE != 0 {
                 output.push((addr, len));
             } else {
-                let Some(total) = request.len().checked_add(len as usize) else {
+                let Some(total) = total_in.checked_add(len as usize) else {
                     return 0;
                 };
                 if total > MAX_REQUEST {
                     return 0;
                 }
-                let start = request.len();
-                request.resize(total, 0);
-                if mem.read(addr, &mut request[start..]).is_err() {
-                    return 0;
-                }
+                total_in = total;
+                input.push((addr, len));
             }
             if flags & DESC_NEXT == 0 {
                 break;
             }
             desc = next;
         }
-        if request.len() < IN_HEADER_LEN || output.is_empty() {
+        if total_in < IN_HEADER_LEN || output.is_empty() {
             return 0;
         }
         let max_out: usize = output.iter().map(|(_, len)| *len as usize).sum();
-        let response = self.handle_fuse(&request, max_out);
-        if response.len() > max_out {
-            return 0;
-        }
-        let mut copied = 0usize;
-        for (addr, len) in output {
-            if copied == response.len() {
-                break;
+        match self.handle_fuse_desc(mem, &input, &output, max_out) {
+            Reply::Direct(n) => n as u32,
+            Reply::Buffered(response) => {
+                if response.len() > max_out {
+                    return 0;
+                }
+                let mut copied = 0usize;
+                for (addr, len) in output {
+                    if copied == response.len() {
+                        break;
+                    }
+                    let n = (len as usize).min(response.len() - copied);
+                    if mem.write(addr, &response[copied..copied + n]).is_err() {
+                        return copied as u32;
+                    }
+                    copied += n;
+                }
+                copied as u32
             }
-            let n = (len as usize).min(response.len() - copied);
-            if mem.write(addr, &response[copied..copied + n]).is_err() {
-                return copied as u32;
-            }
-            copied += n;
         }
-        copied as u32
+    }
+
+    /// Descriptor-aware dispatch, called from `handle_chain`. `handle_fuse`
+    /// itself is untouched and keeps its exact signature -- every opcode
+    /// other than READ/WRITE, and any READ/WRITE that does not fit the
+    /// direct path, ends up here reconstructing the same concatenated
+    /// request buffer `handle_chain` used to build unconditionally before
+    /// this change, and handing it to `handle_fuse` exactly as before. That
+    /// is also the whole of what the 22 pre-existing tests exercise, since
+    /// they call `handle_fuse` directly with no `GuestRam` at all.
+    ///
+    /// Only READ and WRITE ever take the direct path below, and only when
+    /// the shape is exactly what they need (a real file handle, descriptor
+    /// counts under `IOV_MAX`, the declared size matching what the
+    /// descriptors actually carry).
+    fn handle_fuse_desc(
+        &mut self,
+        mem: &GuestRam,
+        input: &[(u64, u32)],
+        output: &[(u64, u32)],
+        max_out: usize,
+    ) -> Reply {
+        let mut header = [0u8; IN_HEADER_LEN];
+        if gather(mem, input, 0, &mut header).is_err() {
+            return Reply::Buffered(error_response(0, EIO));
+        }
+        let declared = get_u32(&header, 0).unwrap_or(0) as usize;
+        let opcode = get_u32(&header, 4).unwrap_or(0);
+        let unique = get_u64(&header, 8).unwrap_or(0);
+
+        let direct = match opcode {
+            READ => self.read_direct(mem, unique, declared, input, output, max_out),
+            WRITE => {
+                let nodeid = get_u64(&header, 16).unwrap_or(0);
+                self.write_direct(mem, nodeid, unique, declared, input)
+            }
+            _ => None,
+        };
+        if let Some(reply) = direct {
+            return reply;
+        }
+
+        let total: usize = input.iter().map(|(_, len)| *len as usize).sum();
+        let mut request = vec![0u8; total];
+        if gather(mem, input, 0, &mut request).is_err() {
+            return Reply::Buffered(error_response(unique, EIO));
+        }
+        Reply::Buffered(self.handle_fuse(&request, max_out))
     }
 
     fn handle_fuse(&mut self, raw: &[u8], max_out: usize) -> Vec<u8> {
@@ -1164,6 +1261,129 @@ impl VirtioFs {
         put_u32(&mut out, n as u32);
         put_u32(&mut out, 0);
         Ok(out)
+    }
+
+    /// The zero-copy READ path: `preadv` straight into the guest's output
+    /// descriptors past the 16-byte out-header, instead of `read`'s
+    /// allocate + `read_at` + `handle_chain`'s old scatter-copy.
+    ///
+    /// `None` means "take the buffered path instead" (via `read` above) --
+    /// used for anything this shortcut does not handle, including the
+    /// `fh == 0` stateless-read compatibility branch and a chain with more
+    /// output descriptors than `IOV_MAX`, so as not to duplicate that
+    /// handling here.
+    fn read_direct(
+        &self,
+        mem: &GuestRam,
+        unique: u64,
+        declared: usize,
+        input: &[(u64, u32)],
+        output: &[(u64, u32)],
+        max_out: usize,
+    ) -> Option<Reply> {
+        // fuse_read_in: fh(8) offset(8) size(4), the fields `read` uses.
+        // `declared > total_in` mirrors `handle_fuse`'s own top-level check
+        // (a guest cannot declare more than it physically supplied); without
+        // it this shortcut would accept a malformed request the buffered
+        // path has always rejected with EINVAL.
+        let total_in: usize = input.iter().map(|(_, len)| *len as usize).sum();
+        if declared < IN_HEADER_LEN + 20 || declared > total_in {
+            return None;
+        }
+        let mut args = [0u8; 20];
+        gather(mem, input, IN_HEADER_LEN, &mut args).ok()?;
+        let fh = get_u64(&args, 0)?;
+        if fh == 0 {
+            return None;
+        }
+        let offset = get_u64(&args, 8)?;
+        let requested = get_u32(&args, 16)? as usize;
+        let handle = self.handles.get(&fh)?;
+
+        let capacity = max_out.saturating_sub(OUT_HEADER_LEN);
+        let want = requested.min(capacity).min(MAX_WRITE as usize);
+        let (iov, _covered) = build_iov(mem, output, OUT_HEADER_LEN, want, true).ok()?;
+
+        let n = match preadv_retry(&handle.file, &iov, offset) {
+            Ok(n) => n,
+            Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
+        };
+        self.note_zero_copy_read();
+        match write_direct_out_header(mem, output, unique, (OUT_HEADER_LEN + n) as u32) {
+            Ok(()) => Some(Reply::Direct(OUT_HEADER_LEN + n)),
+            Err(_) => Some(Reply::Buffered(error_response(unique, EIO))),
+        }
+    }
+
+    /// The zero-copy WRITE path: `pwritev` straight out of the guest's input
+    /// descriptors carrying the payload, instead of concatenating every
+    /// input descriptor into one growing `Vec` before a single `write_at`.
+    ///
+    /// `None` falls back to the buffered `write` above, which re-validates
+    /// independently -- this includes the security-relevant bound (`size`
+    /// must not exceed what the guest actually declared/supplied), so a
+    /// mismatch here is always safe to just defer rather than reject
+    /// itself.
+    fn write_direct(
+        &mut self,
+        mem: &GuestRam,
+        node: u64,
+        unique: u64,
+        declared: usize,
+        input: &[(u64, u32)],
+    ) -> Option<Reply> {
+        if !self.writable {
+            return None;
+        }
+        let total_in: usize = input.iter().map(|(_, len)| *len as usize).sum();
+        if declared < IN_HEADER_LEN || declared > total_in {
+            return None;
+        }
+        // fuse_write_in: fh(8) offset(8) size(4) write_flags(4), matching
+        // `write`'s own field offsets below.
+        let mut args = [0u8; 24];
+        gather(mem, input, IN_HEADER_LEN, &mut args).ok()?;
+        let fh = get_u64(&args, 0)?;
+        let offset = get_u64(&args, 8)?;
+        let size = get_u32(&args, 16)? as usize;
+        let write_flags = get_u32(&args, 20)?;
+
+        // The security boundary: a guest must not make the daemon write from
+        // outside the descriptors it actually offered. Mirrors `write`'s own
+        // `size > MAX_WRITE || input.len() < 40 + size` bound exactly, using
+        // `declared` (the guest's own claim) rather than the raw descriptor
+        // byte count, since trailing descriptor slack past `declared` is not
+        // part of the logical request either.
+        if size > MAX_WRITE as usize || declared < IN_HEADER_LEN + 40 + size {
+            return None;
+        }
+
+        let handle = self.handles.get(&fh)?;
+        if !handle.writable {
+            return None;
+        }
+        let (iov, covered) = build_iov(mem, input, IN_HEADER_LEN + 40, size, false).ok()?;
+        if covered < size {
+            return None;
+        }
+
+        let n = match pwritev_retry(&handle.file, &iov, offset) {
+            Ok(n) => n,
+            Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
+        };
+        self.note_zero_copy_write();
+        if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
+            if let Some(handle) = self.handles.get(&fh) {
+                if let Err(errno) = clear_suid_sgid(&handle.path, &handle.file) {
+                    return Some(Reply::Buffered(error_response(unique, errno)));
+                }
+            }
+            self.invalidate_guest_attr(node);
+        }
+        let mut payload = Vec::with_capacity(8);
+        put_u32(&mut payload, n as u32);
+        put_u32(&mut payload, 0);
+        Some(Reply::Buffered(success_response(unique, &payload)))
     }
 
     fn next_handle(&mut self) -> u64 {
@@ -2799,6 +3019,184 @@ fn is_no_xattr(code: i32) -> bool {
     code == libc::ENODATA
 }
 
+/// Reads `out.len()` bytes from the logical concatenation of `descs`,
+/// starting `skip` bytes in. Errors if the descriptors do not carry that
+/// many bytes past the skip -- the same "descriptors do not actually carry
+/// what they claim" case a full reconstruction would also reject.
+fn gather(mem: &GuestRam, descs: &[(u64, u32)], skip: usize, out: &mut [u8]) -> Result<(), ()> {
+    let mut pos = 0usize; // position in the logical concatenation
+    let mut filled = 0usize;
+    for &(addr, len) in descs {
+        if filled == out.len() {
+            break;
+        }
+        let len = len as usize;
+        let desc_end = pos + len;
+        if desc_end > skip {
+            let start_in_desc = skip.saturating_sub(pos);
+            let avail = (len - start_in_desc).min(out.len() - filled);
+            let base = addr.checked_add(start_in_desc as u64).ok_or(())?;
+            mem.read(base, &mut out[filled..filled + avail])
+                .map_err(|_| ())?;
+            filled += avail;
+        }
+        pos = desc_end;
+    }
+    if filled < out.len() {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+/// Builds iovecs borrowing guest RAM directly for `descs`, skipping `skip`
+/// bytes of the logical concatenation and capping the total at `cap` bytes.
+/// `writable` selects `slice_mut` (READ's output descriptors) vs `slice`
+/// (WRITE's input descriptors carrying the payload). Returns the iovecs and
+/// how many bytes they actually cover, which can be less than `cap` if the
+/// descriptors run out first.
+///
+/// Errors (falling back to the buffered path) if there are more descriptors
+/// than `IOV_MAX`, or if a descriptor's range is not in mapped guest RAM.
+fn build_iov(
+    mem: &GuestRam,
+    descs: &[(u64, u32)],
+    skip: usize,
+    cap: usize,
+    writable: bool,
+) -> Result<(Vec<libc::iovec>, usize), ()> {
+    if descs.len() > IOV_MAX {
+        return Err(());
+    }
+    let mut iov = Vec::with_capacity(descs.len());
+    let mut pos = 0usize;
+    let mut total = 0usize;
+    for &(addr, len) in descs {
+        if total == cap {
+            break;
+        }
+        let len = len as usize;
+        let desc_end = pos + len;
+        if desc_end > skip {
+            let start_in_desc = skip.saturating_sub(pos);
+            let avail = (len - start_in_desc).min(cap - total);
+            if avail > 0 {
+                let base = addr.checked_add(start_in_desc as u64).ok_or(())?;
+                let ptr: *mut u8 = if writable {
+                    mem.slice_mut(base, avail).map_err(|_| ())?.as_mut_ptr()
+                } else {
+                    mem.slice(base, avail).map_err(|_| ())?.as_ptr().cast_mut()
+                };
+                iov.push(libc::iovec {
+                    iov_base: ptr.cast(),
+                    iov_len: avail,
+                });
+                total += avail;
+            }
+        }
+        pos = desc_end;
+    }
+    Ok((iov, total))
+}
+
+/// Writes a success `fuse_out_header` (`total_len`, error 0, `unique`)
+/// scattered across `output`'s leading `OUT_HEADER_LEN` bytes -- the region
+/// `build_iov(..., OUT_HEADER_LEN, ...)` deliberately excludes, so this never
+/// overlaps the direct-path payload it is called after.
+fn write_direct_out_header(
+    mem: &GuestRam,
+    output: &[(u64, u32)],
+    unique: u64,
+    total_len: u32,
+) -> io::Result<()> {
+    let mut header = [0u8; OUT_HEADER_LEN];
+    header[0..4].copy_from_slice(&total_len.to_le_bytes());
+    header[8..16].copy_from_slice(&unique.to_le_bytes());
+    let mut copied = 0usize;
+    for &(addr, len) in output {
+        if copied == header.len() {
+            break;
+        }
+        let n = (len as usize).min(header.len() - copied);
+        mem.write(addr, &header[copied..copied + n])?;
+        copied += n;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn raw_preadv(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
+    let n = unsafe { libc::preadv(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off_t) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn raw_preadv(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
+    // glibc does not expose plain `preadv` (only `preadv64`/`preadv2`); on a
+    // 64-bit target `off64_t` is the same width `off_t` would be anyway.
+    let n = unsafe { libc::preadv64(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off64_t) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
+    let n = unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off_t) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
+    let n = unsafe { libc::pwritev64(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off64_t) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// `preadv`, retried on `EINTR`. An empty `iov` is a legitimate zero-length
+/// read (e.g. offset already at EOF with nothing requested) rather than a
+/// syscall with a null iovec pointer.
+fn preadv_retry(file: &File, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
+    if iov.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        match raw_preadv(file.as_raw_fd(), iov, offset) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `pwritev`, retried on `EINTR`. See `preadv_retry` for the empty-`iov`
+/// case.
+fn pwritev_retry(file: &File, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
+    if iov.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        match raw_pwritev(file.as_raw_fd(), iov, offset) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn success_response(unique: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(OUT_HEADER_LEN + payload.len());
     put_u32(&mut out, (OUT_HEADER_LEN + payload.len()) as u32);
@@ -3713,6 +4111,288 @@ mod tests {
         assert!(!dev.nodes.contains_key(&issue));
         let replacement = lookup_node(&mut dev, etc, b"issue");
         assert_ne!(replacement, issue);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- Task 3: the direct-path tests below drive a real virtqueue over a
+    // `GuestRam` backed by a plain `Vec<u8>`, the same pattern virtio_net.rs
+    // uses. Everything above this point exercises `handle_fuse` with no
+    // guest memory at all, which is the buffered path; these instead go
+    // through `mmio`/`process_queue`/`handle_chain` so the READ/WRITE direct
+    // path in `handle_fuse_desc` is what actually runs.
+
+    const REQ_QUEUE: u32 = 0;
+
+    /// Programs a queue the way the Linux virtio-mmio driver does: select,
+    /// size, the three ring addresses, then READY last.
+    fn program_queue(
+        dev: &mut VirtioFs,
+        mem: &GuestRam,
+        size: u32,
+        desc: u64,
+        avail: u64,
+        used: u64,
+    ) {
+        dev.mmio(mem, reg::QUEUE_SEL, true, u64::from(REQ_QUEUE));
+        dev.mmio(mem, reg::QUEUE_NUM, true, u64::from(size));
+        dev.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        dev.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
+        dev.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        dev.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        dev.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        dev.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
+        dev.mmio(mem, reg::QUEUE_READY, true, 1);
+    }
+
+    fn write_desc(
+        mem: &GuestRam,
+        table: u64,
+        idx: u16,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let da = table + u64::from(idx) * 16;
+        mem.write_u64(da, addr).unwrap();
+        mem.write_u32(da + 8, len).unwrap();
+        mem.write_u16(da + 12, flags).unwrap();
+        mem.write_u16(da + 14, next).unwrap();
+    }
+
+    /// Publishes `head` as the one available buffer and notifies the device,
+    /// which processes it inline.
+    fn notify_head(dev: &mut VirtioFs, mem: &GuestRam, avail: u64, head: u16) {
+        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
+        mem.write_u16(avail + 4, head).unwrap(); // avail.ring[0]
+        dev.mmio(mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+    }
+
+    /// The `len` the device reported for the one chain `notify_head` submits.
+    fn used_len(mem: &GuestRam, used: u64) -> u32 {
+        mem.read_u32(used + 4 + 4).unwrap()
+    }
+
+    fn fuse_in_header(len: u32, opcode: u32, unique: u64, nodeid: u64) -> Vec<u8> {
+        let mut h = vec![0u8; IN_HEADER_LEN];
+        h[0..4].copy_from_slice(&len.to_le_bytes());
+        h[4..8].copy_from_slice(&opcode.to_le_bytes());
+        h[8..16].copy_from_slice(&unique.to_le_bytes());
+        h[16..24].copy_from_slice(&nodeid.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn direct_read_spans_two_output_descriptors() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let content: Vec<u8> = (0..1000u32).map(|i| (i % 256) as u8).collect();
+        fs::write(dir.join("big"), &content).unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"big");
+        let fh = open_rw(&mut dev, node);
+
+        let mut backing = vec![0u8; 0x10000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used, in_buf, out1, out2) = (
+            base,
+            base + 0x100,
+            base + 0x200,
+            base + 0x1000,
+            base + 0x2000,
+            base + 0x3000,
+        );
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        let mut req = fuse_in_header(80, READ, 0xabcd, node);
+        let mut args = vec![0u8; 40];
+        args[0..8].copy_from_slice(&fh.to_le_bytes());
+        args[16..20].copy_from_slice(&1000u32.to_le_bytes());
+        req.extend_from_slice(&args);
+        mem.write(in_buf, &req).unwrap();
+
+        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        // Header (16) + the first 400 payload bytes in one descriptor, the
+        // remaining 600 payload bytes in a second -- the payload spans both.
+        write_desc(&mem, desc, 1, out1, 416, DESC_WRITE | DESC_NEXT, 2);
+        write_desc(&mem, desc, 2, out2, 600, DESC_WRITE, 0);
+        notify_head(&mut dev, &mem, avail, 0);
+
+        let mut got = vec![0u8; 1000];
+        mem.read(out1 + OUT_HEADER_LEN as u64, &mut got[0..400])
+            .unwrap();
+        mem.read(out2, &mut got[400..1000]).unwrap();
+        assert_eq!(got, content);
+        assert_eq!(mem.read_u32(out1).unwrap(), (OUT_HEADER_LEN + 1000) as u32);
+        assert_eq!(mem.read_u64(out1 + 8).unwrap(), 0xabcd);
+        assert_eq!(used_len(&mem, used), (OUT_HEADER_LEN + 1000) as u32);
+        // The buffered fallback would produce byte-identical output, so assert
+        // the fast path was the one that ran.
+        assert_eq!(
+            dev.zero_copy_counts().0,
+            1,
+            "READ did not take the zero-copy path"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_read_reports_true_length_on_short_read_at_eof() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("short"), b"0123456789").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"short");
+        let fh = open_rw(&mut dev, node);
+
+        let mut backing = vec![0u8; 0x10000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used, in_buf, out) = (
+            base,
+            base + 0x100,
+            base + 0x200,
+            base + 0x1000,
+            base + 0x2000,
+        );
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        let mut req = fuse_in_header(80, READ, 0x55, node);
+        let mut args = vec![0u8; 40];
+        args[0..8].copy_from_slice(&fh.to_le_bytes());
+        args[16..20].copy_from_slice(&100u32.to_le_bytes()); // more than the file has
+        req.extend_from_slice(&args);
+        mem.write(in_buf, &req).unwrap();
+
+        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        write_desc(
+            &mem,
+            desc,
+            1,
+            out,
+            OUT_HEADER_LEN as u32 + 100,
+            DESC_WRITE,
+            0,
+        );
+        notify_head(&mut dev, &mem, avail, 0);
+
+        let mut got = [0u8; 10];
+        mem.read(out + OUT_HEADER_LEN as u64, &mut got).unwrap();
+        assert_eq!(&got, b"0123456789");
+        assert_eq!(mem.read_u32(out).unwrap(), (OUT_HEADER_LEN + 10) as u32);
+        assert_eq!(used_len(&mem, used), (OUT_HEADER_LEN + 10) as u32);
+        assert_eq!(
+            dev.zero_copy_counts().0,
+            1,
+            "READ did not take the zero-copy path"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_write_spans_two_input_descriptors() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), vec![0u8; 1000]).unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
+        let fh = open_rw(&mut dev, node);
+
+        let mut backing = vec![0u8; 0x10000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used, hdr_buf, payload1, payload2, out) = (
+            base,
+            base + 0x100,
+            base + 0x200,
+            base + 0x1000,
+            base + 0x2000,
+            base + 0x3000,
+            base + 0x4000,
+        );
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        let size = 1000u32;
+        let mut hdr = fuse_in_header(40 + 40 + size, WRITE, 0x99, node);
+        let mut args = vec![0u8; 40];
+        args[0..8].copy_from_slice(&fh.to_le_bytes());
+        args[16..20].copy_from_slice(&size.to_le_bytes());
+        hdr.extend_from_slice(&args);
+        mem.write(hdr_buf, &hdr).unwrap();
+
+        let part1: Vec<u8> = (0..400u32).map(|i| (i % 251) as u8).collect();
+        let part2: Vec<u8> = (0..600u32).map(|i| ((i + 7) % 251) as u8).collect();
+        mem.write(payload1, &part1).unwrap();
+        mem.write(payload2, &part2).unwrap();
+
+        write_desc(&mem, desc, 0, hdr_buf, hdr.len() as u32, DESC_NEXT, 1);
+        write_desc(&mem, desc, 1, payload1, part1.len() as u32, DESC_NEXT, 2);
+        write_desc(&mem, desc, 2, payload2, part2.len() as u32, DESC_NEXT, 3);
+        write_desc(&mem, desc, 3, out, 64, DESC_WRITE, 0);
+        notify_head(&mut dev, &mem, avail, 0);
+
+        let mut expected = part1;
+        expected.extend_from_slice(&part2);
+        assert_eq!(fs::read(dir.join("target")).unwrap(), expected);
+        assert_eq!(
+            mem.read_u32(out + OUT_HEADER_LEN as u64).unwrap(),
+            size,
+            "fuse_write_out.size"
+        );
+        assert_eq!(mem.read_u32(out).unwrap(), (OUT_HEADER_LEN + 8) as u32);
+        assert_eq!(
+            dev.zero_copy_counts().1,
+            1,
+            "WRITE did not take the zero-copy path"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A guest must not be able to make the daemon write from outside the
+    /// descriptors it actually offered: `fuse_write_in.size` claims 1000
+    /// bytes, but only 100 payload bytes (and a `declared` consistent with
+    /// only those 100) are actually in the chain.
+    #[test]
+    fn direct_write_with_declared_size_exceeding_descriptors_is_rejected() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), b"before").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
+        let fh = open_rw(&mut dev, node);
+
+        let mut backing = vec![0u8; 0x10000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used, hdr_buf, payload, out) = (
+            base,
+            base + 0x100,
+            base + 0x200,
+            base + 0x1000,
+            base + 0x2000,
+            base + 0x3000,
+        );
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        let claimed_size = 1000u32;
+        let actual_payload = 100u32;
+        let mut hdr = fuse_in_header(40 + 40 + actual_payload, WRITE, 0x77, node);
+        let mut args = vec![0u8; 40];
+        args[0..8].copy_from_slice(&fh.to_le_bytes());
+        args[16..20].copy_from_slice(&claimed_size.to_le_bytes());
+        hdr.extend_from_slice(&args);
+        mem.write(hdr_buf, &hdr).unwrap();
+        mem.write(payload, &vec![0xaau8; actual_payload as usize])
+            .unwrap();
+
+        write_desc(&mem, desc, 0, hdr_buf, hdr.len() as u32, DESC_NEXT, 1);
+        write_desc(&mem, desc, 1, payload, actual_payload, DESC_NEXT, 2);
+        write_desc(&mem, desc, 2, out, 64, DESC_WRITE, 0);
+        notify_head(&mut dev, &mem, avail, 0);
+
+        assert_eq!(mem.read_u32(out).unwrap(), OUT_HEADER_LEN as u32);
+        assert_eq!(mem.read_u32(out + 4).unwrap() as i32, -EINVAL);
+        assert_eq!(fs::read(dir.join("target")).unwrap(), b"before");
+        // The oversized claim must be refused before any `pwritev`, not merely
+        // produce an error after one: no zero-copy write may have happened.
+        assert_eq!(
+            dev.zero_copy_counts().1,
+            0,
+            "an over-declared WRITE reached the zero-copy path"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }
