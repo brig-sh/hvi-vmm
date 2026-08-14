@@ -1,6 +1,19 @@
 //! Backend-independent boot configuration and result types, shared by the
 //! macOS (Hypervisor.framework) and Linux (KVM) machine backends.
 
+use std::path::PathBuf;
+
+/// One host directory exported to the guest through virtio-fs.
+///
+/// The first implementation deliberately exposes only a read-only share. The
+/// guest's writable root is supplied by the initrd's tmpfs overlay, so the OCI
+/// bundle on the host can never be modified by the guest.
+#[derive(Debug, Clone)]
+pub struct ReadOnlyShare {
+    pub path: PathBuf,
+    pub tag: String,
+}
+
 /// Inputs for a boot. Populated by `main::boot_guest` from the CLI and handed
 /// to the active backend's `boot()`.
 pub struct BootConfig {
@@ -9,6 +22,9 @@ pub struct BootConfig {
     pub mem_bytes: u64,
     pub cmdline: String,
     pub disk: Option<String>,
+    /// An unpacked directory shared read-only with the guest through
+    /// virtio-fs. Linux mounts this by `tag`; no block image is involved.
+    pub fs_share: Option<ReadOnlyShare>,
     pub net: bool,
     /// When set, virtio-net relays frames to this gvisor-tap-vsock gateway QEMU
     /// stream socket (real egress) instead of the built-in user-space stack.

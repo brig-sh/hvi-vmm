@@ -16,3 +16,5 @@ controllen = "controllen"
 # "FTER" is the event rings' magic, the four bytes a reader validates the ring
 # header with, the way "FTCB" heads the control block.
 fter = "fter"
+# O_WRONLY, the Linux open(2) access mode the virtio-fs backend translates.
+wronly = "wronly"

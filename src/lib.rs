@@ -88,6 +88,9 @@ pub mod tap;
 pub mod uart16550;
 /// virtio-blk over MMIO.
 pub mod virtio;
+/// Virtio-fs over MMIO, serving an unpacked host directory.
+#[cfg(target_os = "macos")]
+pub mod virtio_fs;
 /// virtio-net over MMIO, with a built-in stack, a tap, or a gateway relay.
 pub mod virtio_net;
 /// virtio-vsock over MMIO, bridged to a host Unix socket (guest agent).

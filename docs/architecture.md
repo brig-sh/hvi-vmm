@@ -171,6 +171,7 @@ EL1.
 | virtio-blk | `0x0200_0000` (size `0x200`) | SPI 2 → INTID 34 |
 | virtio-net | `0x0200_0200` | SPI 3 → INTID 35 |
 | virtio-vsock | `0x0200_0400` | SPI 4 → INTID 36 |
+| virtio-fs | `0x0200_0600` | SPI 5 → INTID 37 |
 | GIC distributor | `0x0800_0000` (size `0x1_0000`) | — |
 | GIC redistributor | `0x080A_0000` (per-vCPU frame) | — |
 | kernel / dtb / initrd | packed up from RAM base | — |
@@ -282,6 +283,13 @@ Interrupt injection is the one device-facing thing that differs by backend:
   `--agent-sock`, `spawn_vsock_bridge` stands up a host `UnixListener`; each
   accept opens a vsock stream to the guest agent (host CID 2, guest CID 3, port
   1024), relaying bytes both ways and raising the vsock IRQ.
+- **virtio-fs** (`virtio_fs.rs`, device id 26, macOS arm64) — exports one
+  canonical host directory from `--share-ro <path> <tag>`. HVI answers the
+  guest's FUSE messages directly over hiprio + request virtqueues; no macFUSE
+  mount, block image, or DAX window is involved. Lookup, attributes, links,
+  directory traversal and reads are supported, hard links preserve inode
+  identity, and every mutation returns `EROFS`. Seatbelt grants lazy opens only
+  below the exported subtree.
 
 The serial console is a **PL011** (`pl011.rs`, MMIO) on arm64 and a **16550**
 (`uart16550.rs`, PIO `0x3f8`) on x86.

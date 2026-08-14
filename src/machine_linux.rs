@@ -120,6 +120,9 @@ struct Shared {
 
 /// Boots `cfg` on KVM and runs until the guest powers off.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+    if cfg.fs_share.is_some() {
+        return Err("--share-ro is currently implemented by the macOS HVI backend only".into());
+    }
     install_kick_handler();
 
     let img = Arm64Image::parse(&cfg.kernel)?;
@@ -270,6 +273,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
+    let fdt_devices = fdt::VirtioDevices {
+        blk: has_blk,
+        net: has_net,
+        vsock: has_vsock,
+        fs: false,
+    };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
     // Two DTB passes (its length feeds the initramfs placement).
@@ -280,15 +289,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         0x4000,
         initrd_len,
     );
-    let dtb0 = fdt::build(
-        &provisional,
-        &gic,
-        num_cpus,
-        &cfg.cmdline,
-        has_blk,
-        has_net,
-        has_vsock,
-    )?;
+    let dtb0 = fdt::build(&provisional, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
     let layout = GuestLayout::new(
         cfg.mem_bytes,
         img.text_offset,
@@ -296,15 +297,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         dtb0.len() as u64,
         initrd_len,
     );
-    let dtb = fdt::build(
-        &layout,
-        &gic,
-        num_cpus,
-        &cfg.cmdline,
-        has_blk,
-        has_net,
-        has_vsock,
-    )?;
+    let dtb = fdt::build(&layout, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
     layout.validate()?;
 
     ram.write(layout.kernel_addr, &cfg.kernel)?;
