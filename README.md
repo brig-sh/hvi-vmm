@@ -31,7 +31,7 @@ src/
   boot_x86.rs layout_x86.rs   x86 bzImage + boot_params + e820, guest memory map
   mptable.rs uart16550.rs     x86 Intel MP table, 16550 COM1 serial
   guestmem.rs                 Send+Sync guest-RAM accessor over the host mapping
-  virtio*.rs                  virtio-mmio blk / net / vsock / read-only virtio-fs
+  virtio*.rs                  virtio-mmio blk / net / vsock / virtio-fs
   pl011.rs                    PL011 UART (arm64)
   plugin.rs                  the extension seam (Plugin / VmHandle / CpuHandle / IoSink)
   plugins.rs                tools built on it: memory dump, I/O trace
@@ -68,6 +68,7 @@ cargo check --target aarch64-unknown-linux-gnu
 hvi boot --kernel <arm64 Image | x86-64 bzImage> \
   [--initramfs <cpio>] [--disk <raw.img>] [--mem-mib N] [--cpus N] \
   [--share-ro <host-directory> <mount-tag>]... \
+  [--share-rw <host-directory> <mount-tag>]... \
   [--net | --net-gateway <gvisor-tap .qemu socket>] \
   [--agent-sock <unix socket>] \
   [--events <ledger.ndjson>] [--sandbox-id <id>] [--no-sandbox]
@@ -170,8 +171,11 @@ The limits worth knowing before you build on it:
   Mach-O invalidates it, so `codesign` after every build, not once.
 - **One disk and one NIC.** `--disk` and `--net` take a single device each;
   there is no hotplug, and no PCI at all.
-- **Read-only directory shares on macOS.** Repeat
-  `--share-ro <path> <tag>` to export unpacked directories through independent
+- **Directory shares on macOS.** Repeat `--share-ro <path> <tag>` or
+  `--share-rw <path> <tag>` to export unpacked directories through independent
   virtio-fs devices, without block images or host FUSE mounts. Each has one
   request queue and no DAX window; tags must be unique, and the Linux backends
-  are not wired yet. Use in-guest overlays for writes.
+  are not wired yet. Keep OCI rootfs exports read-only and reserve writable
+  exports for explicit volumes. Writable shares support normal file and
+  namespace operations; ownership changes, timestamp setting, xattrs and
+  allocation hints are not implemented yet.

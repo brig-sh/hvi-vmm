@@ -125,7 +125,9 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
 /// Boots `cfg` on KVM (x86-64) and runs until the guest powers off.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if !cfg.fs_shares.is_empty() {
-        return Err("--share-ro is currently implemented by the macOS HVI backend only".into());
+        return Err(
+            "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
+        );
     }
     install_kick_handler();
     let num_cpus = cfg.vcpus.max(1);

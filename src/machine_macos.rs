@@ -215,7 +215,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         None => None,
     };
     let mut fs = Vec::with_capacity(cfg.fs_shares.len());
-    let mut fs_roots = Vec::with_capacity(cfg.fs_shares.len());
+    let mut fs_access = Vec::with_capacity(cfg.fs_shares.len());
     let mut fs_tags = std::collections::HashSet::new();
     for (index, share) in cfg.fs_shares.iter().enumerate() {
         if !fs_tags.insert(share.tag.as_str()) {
@@ -230,16 +230,25 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             return Err("virtio-fs MMIO devices would overlap the GIC".into());
         }
         let root = std::fs::canonicalize(&share.path)?;
+        let access = if share.mode.writable() {
+            "read-write"
+        } else {
+            "read-only"
+        };
         eprintln!(
-            "[hvi] virtio-fs[{index}]: {} as {:?} (read-only)",
+            "[hvi] virtio-fs[{index}]: {} as {:?} ({access})",
             root.display(),
             share.tag
         );
-        fs_roots.push(root.clone());
+        fs_access.push((root.clone(), share.mode.writable()));
         fs.push(SharedFs {
             base,
             intid: 32 + spi,
-            dev: Arc::new(Mutex::new(VirtioFs::new(root, &share.tag)?)),
+            dev: Arc::new(Mutex::new(VirtioFs::new(
+                root,
+                &share.tag,
+                share.mode.writable(),
+            )?)),
         });
     }
     let has_blk = virtio.is_some();
@@ -359,7 +368,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
     if cfg.sandbox {
-        crate::sandbox::enter_with_readonly_shares(&fs_roots)
+        crate::sandbox::enter_with_shares(&fs_access)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         eprintln!("[hvi] seatbelt sandbox: on (deny default)");
     } else {
@@ -825,7 +834,7 @@ fn service_vsock(
     let _ = sh.vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
 }
 
-/// Services the read-only virtio-fs MMIO transport and its used-ring IRQ.
+/// Services a virtio-fs MMIO transport and its used-ring IRQ.
 fn service_fs(
     vcpu: &Vcpu,
     sh: &Shared,
