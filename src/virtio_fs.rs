@@ -8,9 +8,9 @@
 //!
 //! The backend intentionally starts with the conservative shape needed to
 //! boot an OCI bundle: one request queue, no DAX window, no indirect
-//! descriptors. Each device is independently read-only or read-write; the OCI
-//! rootfs stays protected while explicitly writable volumes can be exported
-//! without block images.
+//! descriptors. Each device is independently read-only or read-write, allowing
+//! an immutable OCI cache to remain protected while an instance-owned APFS
+//! clone or an explicit volume is exported without a block image.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
@@ -133,6 +133,13 @@ const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
 const LINUX_XATTR_CREATE: u32 = 1;
 const LINUX_XATTR_REPLACE: u32 = 2;
 
+// macOS cannot apply arbitrary Linux owners from an unprivileged VMM, and
+// applying a guest mode such as 0000 to the host inode would prevent the VMM
+// itself from serving later requests. Persist the guest-visible metadata in
+// private, no-follow xattrs while retaining host-owner access.
+const HVI_XATTR_PREFIX: &[u8] = b"com.nubificus.hvi.";
+const HVI_XATTR_LINUX_ATTR: &[u8] = b"com.nubificus.hvi.linux-attr";
+
 const LINUX_F_RDLCK: u32 = 0;
 const LINUX_F_WRLCK: u32 = 1;
 const LINUX_F_UNLCK: u32 = 2;
@@ -170,7 +177,21 @@ const EOPNOTSUPP: i32 = 95;
 struct FileHandle {
     file: File,
     writable: bool,
+    path: PathBuf,
     temporary_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct RequestContext {
+    uid: u32,
+    gid: u32,
+}
+
+#[derive(Clone, Copy)]
+struct GuestAttr {
+    mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 struct DirHandle {
@@ -450,6 +471,10 @@ impl VirtioFs {
         let opcode = get_u32(raw, 4).unwrap_or(0);
         let unique = get_u64(raw, 8).unwrap_or(0);
         let nodeid = get_u64(raw, 16).unwrap_or(0);
+        let request_context = RequestContext {
+            uid: get_u32(raw, 24).unwrap_or(0),
+            gid: get_u32(raw, 28).unwrap_or(0),
+        };
         if declared < IN_HEADER_LEN || declared > raw.len() {
             return error_response(unique, EINVAL);
         }
@@ -469,9 +494,9 @@ impl VirtioFs {
             GETATTR => self.getattr(nodeid, payload),
             SETATTR => self.setattr(nodeid, payload),
             READLINK => self.readlink(nodeid),
-            SYMLINK => self.symlink(nodeid, payload),
-            MKNOD => self.mknod(nodeid, payload),
-            MKDIR => self.mkdir(nodeid, payload),
+            SYMLINK => self.symlink(nodeid, payload, request_context),
+            MKNOD => self.mknod(nodeid, payload, request_context),
+            MKDIR => self.mkdir(nodeid, payload, request_context),
             UNLINK => self.remove(nodeid, payload, false),
             RMDIR => self.remove(nodeid, payload, true),
             RENAME => self.rename(nodeid, payload, false),
@@ -489,7 +514,7 @@ impl VirtioFs {
             ),
             STATFS => self.statfs(),
             ACCESS => self.access(nodeid, payload),
-            CREATE => self.create(nodeid, payload),
+            CREATE => self.create(nodeid, payload, request_context),
             SETXATTR => self.setxattr(nodeid, payload),
             GETXATTR => self.getxattr(nodeid, payload),
             LISTXATTR => self.listxattr(nodeid, payload),
@@ -513,7 +538,7 @@ impl VirtioFs {
             LSEEK => self.lseek(payload),
             COPY_FILE_RANGE => self.copy_file_range(payload),
             SYNCFS => self.syncfs(),
-            TMPFILE => self.tmpfile(nodeid, payload),
+            TMPFILE => self.tmpfile(nodeid, payload, request_context),
             STATX => self.statx(nodeid, payload),
             39 => Err(ENOTTY), // IOCTL: regular files can use libc fallbacks.
             48 | 49 => Err(EOPNOTSUPP), // No DAX mapping window.
@@ -599,7 +624,7 @@ impl VirtioFs {
             parent_path.join(OsStr::from_bytes(name))
         };
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
-        let node = self.node_for(path, &meta);
+        let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &meta))
     }
@@ -658,6 +683,10 @@ impl VirtioFs {
         } else {
             None
         };
+        let metadata_path = handle
+            .map(|handle| handle.path.as_path())
+            .or(path.as_deref())
+            .ok_or(EINVAL)?;
 
         if valid & FATTR_SIZE != 0 {
             if let Some(handle) = handle {
@@ -673,46 +702,83 @@ impl VirtioFs {
         }
 
         if valid & (FATTR_UID | FATTR_GID) != 0 {
-            let host_uid = if valid & FATTR_UID != 0 {
-                Some(guest_uid_to_host(uid))
-            } else {
-                None
-            };
-            let host_gid = if valid & FATTR_GID != 0 {
-                Some(guest_gid_to_host(gid))
-            } else {
-                None
-            };
-            if let Some(handle) = handle {
-                host_fchown(&handle.file, host_uid, host_gid)?;
-            } else {
-                host_lchown(path.as_deref().ok_or(EINVAL)?, host_uid, host_gid)?;
+            #[cfg(target_os = "macos")]
+            {
+                let current_meta = if let Some(handle) = handle {
+                    handle.file.metadata().map_err(io_errno)?
+                } else {
+                    fs::symlink_metadata(metadata_path).map_err(io_errno)?
+                };
+                let mut guest = guest_attr(Some(metadata_path), &current_meta);
+                if valid & FATTR_UID != 0 {
+                    guest.uid = uid;
+                }
+                if valid & FATTR_GID != 0 {
+                    guest.gid = gid;
+                }
+                set_guest_attr(metadata_path, guest)?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let host_uid = if valid & FATTR_UID != 0 {
+                    Some(guest_uid_to_host(uid))
+                } else {
+                    None
+                };
+                let host_gid = if valid & FATTR_GID != 0 {
+                    Some(guest_gid_to_host(gid))
+                } else {
+                    None
+                };
+                if let Some(handle) = handle {
+                    host_fchown(&handle.file, host_uid, host_gid)?;
+                } else {
+                    host_lchown(path.as_deref().ok_or(EINVAL)?, host_uid, host_gid)?;
+                }
             }
         }
 
         if valid & (FATTR_MODE | FATTR_KILL_SUIDGID) != 0 {
-            let current = if let Some(handle) = handle {
-                handle.file.metadata().map_err(io_errno)?.mode()
+            let current_meta = if let Some(handle) = handle {
+                handle.file.metadata().map_err(io_errno)?
             } else {
-                fs::symlink_metadata(path.as_deref().ok_or(EINVAL)?)
-                    .map_err(io_errno)?
-                    .mode()
+                fs::symlink_metadata(path.as_deref().ok_or(EINVAL)?).map_err(io_errno)?
             };
             let mut new_mode = if valid & FATTR_MODE != 0 {
                 mode & 0o7777
             } else {
-                current & 0o7777
+                guest_attr(Some(metadata_path), &current_meta).mode & 0o7777
             };
             if valid & FATTR_KILL_SUIDGID != 0 {
                 new_mode &= !0o6000;
             }
-            if let Some(handle) = handle {
-                handle
-                    .file
-                    .set_permissions(Permissions::from_mode(new_mode))
-                    .map_err(io_errno)?;
-            } else {
-                host_lchmod(path.as_deref().ok_or(EINVAL)?, new_mode)?;
+            #[cfg(target_os = "macos")]
+            {
+                if !current_meta.file_type().is_symlink() {
+                    let host_mode = host_creation_mode(new_mode, current_meta.is_dir());
+                    if let Some(handle) = handle {
+                        handle
+                            .file
+                            .set_permissions(Permissions::from_mode(host_mode))
+                            .map_err(io_errno)?;
+                    } else {
+                        host_lchmod(path.as_deref().ok_or(EINVAL)?, host_mode)?;
+                    }
+                }
+                let mut guest = guest_attr(Some(metadata_path), &current_meta);
+                guest.mode = (current_meta.mode() & S_IFMT) | new_mode;
+                set_guest_attr(metadata_path, guest)?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(handle) = handle {
+                    handle
+                        .file
+                        .set_permissions(Permissions::from_mode(new_mode))
+                        .map_err(io_errno)?;
+                } else {
+                    host_lchmod(path.as_deref().ok_or(EINVAL)?, new_mode)?;
+                }
             }
         }
 
@@ -757,45 +823,65 @@ impl VirtioFs {
         Ok(self.entry_out(node, &meta))
     }
 
-    fn mknod(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn mknod(
+        &mut self,
+        parent: u64,
+        input: &[u8],
+        context: RequestContext,
+    ) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let mode = get_u32(input, 0).ok_or(EINVAL)?;
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
         match mode & S_IFMT {
             S_IFREG => {
-                let file = open_host_file(&path, LINUX_O_WRONLY | LINUX_O_EXCL, true, mode)
-                    .map_err(io_errno)?;
-                file.set_permissions(Permissions::from_mode(mode & 0o7777))
-                    .map_err(io_errno)?;
+                open_host_file(
+                    &path,
+                    LINUX_O_WRONLY | LINUX_O_EXCL,
+                    true,
+                    host_creation_mode(mode, false),
+                )
+                .map_err(io_errno)?;
             }
-            S_IFIFO => host_mkfifo(&path, mode & 0o7777)?,
+            S_IFIFO => host_mkfifo(&path, host_creation_mode(mode, false))?,
             // Never create host device nodes or sockets from a guest.
             _ => return Err(EPERM),
         }
+        initialize_guest_metadata(&path, mode, context)?;
         self.new_entry(path)
     }
 
-    fn mkdir(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn mkdir(
+        &mut self,
+        parent: u64,
+        input: &[u8],
+        context: RequestContext,
+    ) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let mode = get_u32(input, 0).ok_or(EINVAL)?;
         let name = nul_name(input, 8)?;
         let path = self.child_path(parent, name)?;
         let mut builder = fs::DirBuilder::new();
         builder
-            .mode(mode & 0o7777)
+            .mode(host_creation_mode(mode, true))
             .create(&path)
             .map_err(io_errno)?;
-        fs::set_permissions(&path, Permissions::from_mode(mode & 0o7777)).map_err(io_errno)?;
+        initialize_guest_metadata(&path, mode, context)?;
         self.new_entry(path)
     }
 
-    fn symlink(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn symlink(
+        &mut self,
+        parent: u64,
+        input: &[u8],
+        context: RequestContext,
+    ) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let (name, next) = nul_name_with_end(input, 0)?;
         let target = nul_name(input, next)?;
         let path = self.child_path(parent, name)?;
         std::os::unix::fs::symlink(OsStr::from_bytes(target), &path).map_err(io_errno)?;
+        initialize_guest_metadata(&path, 0o777, context)?;
         self.new_entry(path)
     }
 
@@ -893,23 +979,28 @@ impl VirtioFs {
         }
     }
 
-    fn create(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn create(
+        &mut self,
+        parent: u64,
+        input: &[u8],
+        context: RequestContext,
+    ) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let mode = get_u32(input, 4).ok_or(EINVAL)?;
         let open_flags = get_u32(input, 12).ok_or(EINVAL)?;
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
-        let file = open_host_file(&path, flags, true, mode).map_err(io_errno)?;
-        file.set_permissions(Permissions::from_mode(mode & 0o7777))
+        let file = open_host_file(&path, flags, true, host_creation_mode(mode, false))
             .map_err(io_errno)?;
+        initialize_guest_metadata(&path, mode, context)?;
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-            clear_suid_sgid(&file)?;
+            clear_suid_sgid(&path, &file)?;
         }
         let meta = file.metadata().map_err(io_errno)?;
-        let node = self.node_for(path, &meta);
+        let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
-        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0);
+        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path);
         let mut out = self.entry_out(node, &meta);
         put_open_out(&mut out, fh, false, !self.writable);
         Ok(out)
@@ -949,9 +1040,9 @@ impl VirtioFs {
         } else {
             let file = open_host_file(&path, flags, false, 0).map_err(io_errno)?;
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-                clear_suid_sgid(&file)?;
+                clear_suid_sgid(&path, &file)?;
             }
-            self.insert_handle(file, wants_write)
+            self.insert_handle(file, wants_write, path)
         };
         let mut out = Vec::with_capacity(16);
         put_open_out(&mut out, fh, directory, !self.writable);
@@ -1000,7 +1091,7 @@ impl VirtioFs {
             .write_at(&input[40..40 + size], offset)
             .map_err(io_errno)?;
         if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
-            clear_suid_sgid(&handle.file)?;
+            clear_suid_sgid(&handle.path, &handle.file)?;
         }
         let mut out = Vec::with_capacity(8);
         put_u32(&mut out, n as u32);
@@ -1014,13 +1105,14 @@ impl VirtioFs {
         fh
     }
 
-    fn insert_handle(&mut self, file: File, writable: bool) -> u64 {
+    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf) -> u64 {
         let fh = self.next_handle();
         self.handles.insert(
             fh,
             FileHandle {
                 file,
                 writable,
+                path,
                 temporary_path: None,
             },
         );
@@ -1138,7 +1230,11 @@ impl VirtioFs {
 
         let mut host_lock: libc::flock = unsafe { std::mem::zeroed() };
         host_lock.l_start = i64::try_from(start).map_err(|_| EFBIG)? as libc::off_t;
-        host_lock.l_len = if end == u64::MAX {
+        // Linux FUSE encodes a lock through EOF with OFFSET_MAX (i64::MAX),
+        // while host fcntl represents the same range with l_len=0. Adding one
+        // to the inclusive Linux end would otherwise overflow and surface as
+        // EFBIG to applications such as apt.
+        host_lock.l_len = if end >= i64::MAX as u64 {
             0
         } else {
             i64::try_from(end.checked_sub(start).ok_or(EINVAL)?.saturating_add(1))
@@ -1300,7 +1396,12 @@ impl VirtioFs {
         Ok(Vec::new())
     }
 
-    fn tmpfile(&mut self, parent: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn tmpfile(
+        &mut self,
+        parent: u64,
+        input: &[u8],
+        context: RequestContext,
+    ) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let mode = get_u32(input, 4).ok_or(EINVAL)?;
@@ -1308,9 +1409,14 @@ impl VirtioFs {
         let id = self.next_tmpfile;
         self.next_tmpfile = self.next_tmpfile.saturating_add(1).max(1);
         let path = parent_path.join(format!(".hvi-tmp-{}-{id}", std::process::id()));
-        let file = open_host_file(&path, flags | LINUX_O_EXCL, true, mode).map_err(io_errno)?;
-        file.set_permissions(Permissions::from_mode(mode & 0o7777))
-            .map_err(io_errno)?;
+        let file = open_host_file(
+            &path,
+            flags | LINUX_O_EXCL,
+            true,
+            host_creation_mode(mode, false),
+        )
+        .map_err(io_errno)?;
+        initialize_guest_metadata(&path, mode, context)?;
         let meta = file.metadata().map_err(io_errno)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
@@ -1320,6 +1426,7 @@ impl VirtioFs {
             FileHandle {
                 file,
                 writable: true,
+                path: path.clone(),
                 temporary_path: Some(path),
             },
         );
@@ -1341,7 +1448,12 @@ impl VirtioFs {
         } else {
             fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?
         };
-        Ok(statx_out(node, &meta, self.cache_seconds()))
+        Ok(statx_out(
+            node,
+            &meta,
+            self.cache_seconds(),
+            guest_attr(self.node_path(node).ok(), &meta),
+        ))
     }
 
     fn readdir(
@@ -1459,6 +1571,9 @@ impl VirtioFs {
             return Err(EINVAL);
         }
         let (name, value_at) = nul_name_with_end(input, 16)?;
+        if is_private_xattr(name) {
+            return Err(EPERM);
+        }
         let value = input
             .get(value_at..value_at.checked_add(size).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
@@ -1469,19 +1584,25 @@ impl VirtioFs {
     fn getxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(input, 0).ok_or(EINVAL)? as usize;
         let name = nul_name(input, 8)?;
+        if is_private_xattr(name) {
+            return Err(ENODATA);
+        }
         let value = host_getxattr(self.node_path(node)?, name)?;
         xattr_response(size, value)
     }
 
     fn listxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(input, 0).ok_or(EINVAL)?;
-        let value = host_listxattr(self.node_path(node)?)?;
+        let value = filter_private_xattrs(host_listxattr(self.node_path(node)?)?);
         xattr_response(size as usize, value)
     }
 
     fn removexattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let name = nul_name(input, 0)?;
+        if is_private_xattr(name) {
+            return Err(EPERM);
+        }
         host_removexattr(self.node_path(node)?, name)?;
         Ok(Vec::new())
     }
@@ -1590,24 +1711,34 @@ impl VirtioFs {
     }
 
     fn attr_out(&self, node: u64, meta: &Metadata) -> Vec<u8> {
-        attr_out(node, meta, self.cache_seconds())
+        attr_out(
+            node,
+            meta,
+            self.cache_seconds(),
+            guest_attr(self.node_path(node).ok(), meta),
+        )
     }
 
     fn entry_out(&self, node: u64, meta: &Metadata) -> Vec<u8> {
-        entry_out(node, meta, self.cache_seconds())
+        entry_out(
+            node,
+            meta,
+            self.cache_seconds(),
+            guest_attr(self.node_path(node).ok(), meta),
+        )
     }
 }
 
-fn attr_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
+fn attr_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let mut out = Vec::with_capacity(104);
     put_u64(&mut out, cache_seconds);
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
-    put_attr(&mut out, node, meta);
+    put_attr(&mut out, node, meta, guest);
     out
 }
 
-fn entry_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
+fn entry_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     put_u64(&mut out, node);
     put_u64(&mut out, 1); // generation
@@ -1615,7 +1746,7 @@ fn entry_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
     put_u64(&mut out, cache_seconds);
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
-    put_attr(&mut out, node, meta);
+    put_attr(&mut out, node, meta, guest);
     out
 }
 
@@ -1670,7 +1801,55 @@ fn open_host_dir(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn clear_suid_sgid(file: &File) -> Result<(), i32> {
+#[cfg(target_os = "macos")]
+fn host_creation_mode(mode: u32, directory: bool) -> u32 {
+    (mode & 0o777) | if directory { 0o700 } else { 0o600 }
+}
+
+#[cfg(target_os = "linux")]
+fn host_creation_mode(mode: u32, _directory: bool) -> u32 {
+    mode & 0o7777
+}
+
+#[cfg(target_os = "macos")]
+fn initialize_guest_metadata(path: &Path, mode: u32, context: RequestContext) -> Result<(), i32> {
+    let meta = fs::symlink_metadata(path).map_err(io_errno)?;
+    if !meta.file_type().is_symlink() {
+        let host_mode = host_creation_mode(mode, meta.is_dir());
+        fs::set_permissions(path, Permissions::from_mode(host_mode)).map_err(io_errno)?;
+    }
+    set_guest_attr(
+        path,
+        GuestAttr {
+            mode: (meta.mode() & S_IFMT) | (mode & 0o7777),
+            uid: context.uid,
+            gid: context.gid,
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_guest_metadata(path: &Path, mode: u32, _context: RequestContext) -> Result<(), i32> {
+    let meta = fs::symlink_metadata(path).map_err(io_errno)?;
+    if !meta.file_type().is_symlink() {
+        fs::set_permissions(path, Permissions::from_mode(mode & 0o7777)).map_err(io_errno)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_suid_sgid(path: &Path, file: &File) -> Result<(), i32> {
+    let meta = file.metadata().map_err(io_errno)?;
+    let mut guest = guest_attr(Some(path), &meta);
+    if guest.mode & 0o6000 != 0 {
+        guest.mode &= !0o6000;
+        set_guest_attr(path, guest)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_suid_sgid(_path: &Path, file: &File) -> Result<(), i32> {
     let mode = file.metadata().map_err(io_errno)?.mode() & 0o7777;
     if mode & 0o6000 != 0 {
         file.set_permissions(Permissions::from_mode(mode & !0o6000))
@@ -1679,10 +1858,65 @@ fn clear_suid_sgid(file: &File) -> Result<(), i32> {
     Ok(())
 }
 
+fn is_private_xattr(name: &[u8]) -> bool {
+    name.starts_with(HVI_XATTR_PREFIX)
+}
+
+fn filter_private_xattrs(value: Vec<u8>) -> Vec<u8> {
+    let mut filtered = Vec::with_capacity(value.len());
+    for name in value.split(|byte| *byte == 0) {
+        if name.is_empty() || is_private_xattr(name) {
+            continue;
+        }
+        filtered.extend_from_slice(name);
+        filtered.push(0);
+    }
+    filtered
+}
+
+#[cfg(target_os = "macos")]
+fn set_guest_attr(path: &Path, guest: GuestAttr) -> Result<(), i32> {
+    let mut value = [0u8; 12];
+    value[0..4].copy_from_slice(&(guest.mode & 0o177777).to_le_bytes());
+    value[4..8].copy_from_slice(&guest.uid.to_le_bytes());
+    value[8..12].copy_from_slice(&guest.gid.to_le_bytes());
+    host_setxattr(path, HVI_XATTR_LINUX_ATTR, &value, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn stored_guest_attr(path: &Path) -> Option<GuestAttr> {
+    let value = host_getxattr(path, HVI_XATTR_LINUX_ATTR).ok()?;
+    if value.len() != 12 {
+        return None;
+    }
+    Some(GuestAttr {
+        mode: u32::from_le_bytes(value[0..4].try_into().ok()?),
+        uid: u32::from_le_bytes(value[4..8].try_into().ok()?),
+        gid: u32::from_le_bytes(value[8..12].try_into().ok()?),
+    })
+}
+
+fn guest_attr(path: Option<&Path>, meta: &Metadata) -> GuestAttr {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = path {
+        if let Some(mut guest) = stored_guest_attr(path) {
+            guest.mode = (meta.mode() & S_IFMT) | (guest.mode & 0o7777);
+            return guest;
+        }
+    }
+
+    GuestAttr {
+        mode: meta.mode(),
+        uid: host_uid_to_guest(meta.uid()),
+        gid: host_gid_to_guest(meta.gid()),
+    }
+}
+
 fn path_cstring(path: &Path) -> Result<CString, i32> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)
 }
 
+#[cfg(target_os = "linux")]
 fn guest_uid_to_host(uid: u32) -> libc::uid_t {
     if uid == 0 {
         unsafe { libc::geteuid() }
@@ -1691,6 +1925,7 @@ fn guest_uid_to_host(uid: u32) -> libc::uid_t {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn guest_gid_to_host(gid: u32) -> libc::gid_t {
     if gid == 0 {
         unsafe { libc::getegid() }
@@ -1715,6 +1950,7 @@ fn host_gid_to_guest(gid: u32) -> u32 {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn host_fchown(file: &File, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> Result<(), i32> {
     let result = unsafe {
         libc::fchown(
@@ -1730,6 +1966,7 @@ fn host_fchown(file: &File, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) 
     }
 }
 
+#[cfg(target_os = "linux")]
 fn host_lchown(path: &Path, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> Result<(), i32> {
     let path = path_cstring(path)?;
     let result = unsafe {
@@ -2215,7 +2452,7 @@ fn metadata_btime(_meta: &Metadata) -> Option<(i64, u32)> {
     None
 }
 
-fn statx_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
+fn statx_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let btime = metadata_btime(meta);
     let mut out = Vec::with_capacity(288);
     put_u64(&mut out, cache_seconds);
@@ -2231,9 +2468,9 @@ fn statx_out(node: u64, meta: &Metadata, cache_seconds: u64) -> Vec<u8> {
     put_u32(&mut out, meta.blksize() as u32);
     put_u64(&mut out, 0);
     put_u32(&mut out, meta.nlink() as u32);
-    put_u32(&mut out, host_uid_to_guest(meta.uid()));
-    put_u32(&mut out, host_gid_to_guest(meta.gid()));
-    put_u16(&mut out, meta.mode() as u16);
+    put_u32(&mut out, guest.uid);
+    put_u32(&mut out, guest.gid);
+    put_u16(&mut out, guest.mode as u16);
     put_u16(&mut out, 0);
     put_u64(&mut out, node);
     put_u64(&mut out, meta.size());
@@ -2294,7 +2531,7 @@ fn validate_mutation_name(name: &[u8]) -> Result<(), i32> {
     }
 }
 
-fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Metadata) {
+fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Metadata, guest: GuestAttr) {
     put_u64(out, node);
     put_u64(out, meta.size());
     put_u64(out, meta.blocks());
@@ -2304,10 +2541,10 @@ fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Metadata) {
     put_u32(out, meta.atime_nsec().max(0) as u32);
     put_u32(out, meta.mtime_nsec().max(0) as u32);
     put_u32(out, meta.ctime_nsec().max(0) as u32);
-    put_u32(out, meta.mode());
+    put_u32(out, guest.mode);
     put_u32(out, meta.nlink() as u32);
-    put_u32(out, host_uid_to_guest(meta.uid()));
-    put_u32(out, host_gid_to_guest(meta.gid()));
+    put_u32(out, guest.uid);
+    put_u32(out, guest.gid);
     put_u32(out, 0); // macOS st_rdev encoding is not Linux-compatible
     put_u32(out, meta.blksize() as u32);
     put_u32(out, 0);
@@ -2446,6 +2683,13 @@ mod tests {
         put_u64(&mut out, node);
         out.resize(IN_HEADER_LEN, 0);
         out.extend_from_slice(payload);
+        out
+    }
+
+    fn request_as(opcode: u32, node: u64, payload: &[u8], uid: u32, gid: u32) -> Vec<u8> {
+        let mut out = request(opcode, node, payload);
+        out[24..28].copy_from_slice(&uid.to_le_bytes());
+        out[28..32].copy_from_slice(&gid.to_le_bytes());
         out
     }
 
@@ -2734,6 +2978,54 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restrictive_modes_and_linux_owners_persist_without_locking_out_host() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&0u32.to_le_bytes());
+        mkdir.extend_from_slice(b"locked\0");
+        let out = dev.handle_fuse(&request_as(MKDIR, FUSE_ROOT_ID, &mkdir, 42, 43), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 40 + 60).unwrap() & 0o7777, 0);
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 40 + 68), Some(42));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 40 + 72), Some(43));
+
+        let host_meta = fs::metadata(dir.join("locked")).unwrap();
+        assert_eq!(host_meta.mode() & 0o700, 0o700);
+        fs::write(dir.join("locked/host-still-has-access"), b"ok").unwrap();
+
+        let mut reopened = VirtioFs::new(fs::canonicalize(&dir).unwrap(), "rootfs", true).unwrap();
+        let lookup = reopened.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"locked\0"), 4096);
+        assert_eq!(
+            get_u32(&lookup, OUT_HEADER_LEN + 40 + 60).unwrap() & 0o7777,
+            0
+        );
+        assert_eq!(get_u32(&lookup, OUT_HEADER_LEN + 40 + 68), Some(42));
+        assert_eq!(get_u32(&lookup, OUT_HEADER_LEN + 40 + 72), Some(43));
+
+        let locked = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&4096u32.to_le_bytes());
+        let listed = reopened.handle_fuse(&request(LISTXATTR, locked, &list), 8192);
+        assert!(!listed[OUT_HEADER_LEN..]
+            .windows(HVI_XATTR_PREFIX.len())
+            .any(|window| window == HVI_XATTR_PREFIX));
+        let private = reopened.handle_fuse(
+            &request(
+                GETXATTR,
+                locked,
+                b"\x04\0\0\0\0\0\0\0com.nubificus.hvi.mode\0",
+            ),
+            4096,
+        );
+        assert_eq!(
+            i32::from_le_bytes(private[4..8].try_into().unwrap()),
+            -ENODATA
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn extended_attributes_round_trip() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -2874,10 +3166,21 @@ mod tests {
         let second = open_rw(&mut dev, issue);
         let mut lock = vec![0u8; 48];
         lock[0..8].copy_from_slice(&first.to_le_bytes());
-        lock[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        lock[24..32].copy_from_slice(&(i64::MAX as u64).to_le_bytes());
         lock[32..36].copy_from_slice(&LINUX_F_WRLCK.to_le_bytes());
+
+        let mut probe = lock.clone();
+        probe[0..8].copy_from_slice(&second.to_le_bytes());
+        let out = dev.handle_fuse(&request(GETLK, issue, &probe), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16), Some(LINUX_F_UNLCK));
+
         let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
+
+        let out = dev.handle_fuse(&request(GETLK, issue, &probe), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16), Some(LINUX_F_WRLCK));
 
         lock[0..8].copy_from_slice(&second.to_le_bytes());
         let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
