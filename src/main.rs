@@ -203,7 +203,13 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Two passes: the DTB's own length feeds the initramfs placement, so build
     // once with a provisional slot, then rebuild at the settled layout.
     let provisional = GuestLayout::new(ram_size, img.text_offset, kernel_size, 0x4000, initrd_size);
-    let dtb0 = fdt::build(&provisional, &gic, 1, &cmdline, false, false, false)?;
+    let dtb0 = fdt::build(
+        &provisional,
+        &gic,
+        1,
+        &cmdline,
+        fdt::VirtioDevices::default(),
+    )?;
     let layout = GuestLayout::new(
         ram_size,
         img.text_offset,
@@ -211,7 +217,7 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         dtb0.len() as u64,
         initrd_size,
     );
-    let dtb = fdt::build(&layout, &gic, 1, &cmdline, false, false, false)?;
+    let dtb = fdt::build(&layout, &gic, 1, &cmdline, fdt::VirtioDevices::default())?;
     layout.validate()?;
 
     println!(
@@ -252,6 +258,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disk = None;
+    let mut fs_share = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -273,6 +280,30 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
+            "--share-ro" => {
+                if fs_share.is_some() {
+                    return Err("only one --share-ro export is currently supported".into());
+                }
+                let path = it
+                    .next()
+                    .ok_or("--share-ro needs a host directory and tag")?;
+                let tag = it
+                    .next()
+                    .ok_or("--share-ro needs a host directory and tag")?;
+                if tag.is_empty() || tag.len() > 36 || tag.as_bytes().contains(&0) {
+                    return Err("virtio-fs tag must be 1..=36 bytes and contain no NUL".into());
+                }
+                let path = std::fs::canonicalize(path)?;
+                if !path.is_dir() {
+                    return Err(
+                        format!("virtio-fs export is not a directory: {}", path.display()).into(),
+                    );
+                }
+                fs_share = Some(config::ReadOnlyShare {
+                    path,
+                    tag: tag.clone(),
+                });
+            }
             "--net" => net = true,
             "--net-gateway" => net_gateway = it.next().cloned(),
             "--net-tap" => net_tap = it.next().cloned(),
@@ -316,6 +347,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: mem_mib << 20,
         cmdline,
         disk,
+        fs_share,
         net,
         net_gateway,
         net_tap,

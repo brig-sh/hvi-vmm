@@ -15,7 +15,8 @@ use vm_fdt::{Error, FdtWriter};
 
 use crate::layout::{
     GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
-    VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    VIRTIO_FS_BASE, VIRTIO_FS_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 
 const PHANDLE_GIC: u32 = 1;
@@ -26,6 +27,15 @@ const IRQ_SPI: u32 = 0;
 const IRQ_PPI: u32 = 1;
 /// GIC interrupt flag cell.
 const IRQ_LEVEL_HIGH: u32 = 4;
+
+/// The virtio-mmio nodes backed by this boot.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VirtioDevices {
+    pub blk: bool,
+    pub net: bool,
+    pub vsock: bool,
+    pub fs: bool,
+}
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
 /// command line. When `layout.initrd_size` is non-zero, `/chosen` gets the
@@ -40,9 +50,7 @@ pub fn build(
     gic: &GicLayout,
     num_cpus: u32,
     bootargs: &str,
-    has_blk: bool,
-    has_net: bool,
-    has_vsock: bool,
+    devices: VirtioDevices,
 ) -> Result<Vec<u8>, Error> {
     let mut fdt = FdtWriter::new()?;
 
@@ -174,14 +182,17 @@ pub fn build(
         fdt.property_array_u32("interrupts", &[IRQ_SPI, spi, IRQ_LEVEL_HIGH])?;
         fdt.end_node(node)
     };
-    if has_blk {
+    if devices.blk {
         virtio_node(VIRTIO_BASE, VIRTIO_SPI)?;
     }
-    if has_net {
+    if devices.net {
         virtio_node(VIRTIO_NET_BASE, VIRTIO_NET_SPI)?;
     }
-    if has_vsock {
+    if devices.vsock {
         virtio_node(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI)?;
+    }
+    if devices.fs {
+        virtio_node(VIRTIO_FS_BASE, VIRTIO_FS_SPI)?;
     }
 
     fdt.end_node(root)?;
@@ -204,9 +215,7 @@ mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             "earlycon=pl011,0x09000000",
-            false,
-            false,
-            false,
+            VirtioDevices::default(),
         )
         .unwrap();
         // FDT magic 0xd00dfeed, big-endian, at the front of the header.
@@ -224,12 +233,29 @@ mod tests {
             &GicLayout::QEMU_VIRT,
             2,
             "console=ttyAMA0",
-            false,
-            false,
-            false,
+            VirtioDevices::default(),
         )
         .unwrap();
         assert_eq!(&blob[0..4], &[0xd0, 0x0d, 0xfe, 0xed]);
+    }
+
+    #[test]
+    fn advertises_virtio_fs_only_when_backed() {
+        let l = sample_layout(0);
+        let absent = build(&l, &GicLayout::QEMU_VIRT, 1, "", VirtioDevices::default()).unwrap();
+        let present = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices {
+                fs: true,
+                ..VirtioDevices::default()
+            },
+        )
+        .unwrap();
+        assert!(!contains(&absent, "virtio_mmio@2000600"));
+        assert!(contains(&present, "virtio_mmio@2000600"));
     }
 
     /// Returns true if `needle` appears in the blob's strings/structure, which
@@ -243,11 +269,18 @@ mod tests {
     #[test]
     fn intc_compatible_follows_gic_version() {
         let l = sample_layout(0);
-        let v3 = build(&l, &GicLayout::QEMU_VIRT, 1, "", false, false, false).unwrap();
+        let v3 = build(&l, &GicLayout::QEMU_VIRT, 1, "", VirtioDevices::default()).unwrap();
         assert!(contains(&v3, "arm,gic-v3"));
         assert!(!contains(&v3, "arm,cortex-a15-gic"));
 
-        let v2 = build(&l, &GicLayout::QEMU_VIRT_V2, 1, "", false, false, false).unwrap();
+        let v2 = build(
+            &l,
+            &GicLayout::QEMU_VIRT_V2,
+            1,
+            "",
+            VirtioDevices::default(),
+        )
+        .unwrap();
         assert!(contains(&v2, "arm,cortex-a15-gic"));
         assert!(!contains(&v2, "arm,gic-v3"));
     }
@@ -258,7 +291,7 @@ mod tests {
     fn v2_reg_describes_dist_and_cpu_interface() {
         let l = sample_layout(0);
         let g = GicLayout::QEMU_VIRT_V2;
-        let blob = build(&l, &g, 1, "", false, false, false).unwrap();
+        let blob = build(&l, &g, 1, "", VirtioDevices::default()).unwrap();
         let mut want = Vec::new();
         for v in [g.gicd_base, g.gicd_size, g.gicr_base, g.gicr_size] {
             want.extend_from_slice(&v.to_be_bytes());

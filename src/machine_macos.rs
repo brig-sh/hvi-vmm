@@ -26,11 +26,13 @@ use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
     GicLayout, GicVersion, GuestLayout, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
-    VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    VIRTIO_FS_BASE, VIRTIO_FS_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::virtio::VirtioBlk;
+use crate::virtio_fs::VirtioFs;
 use crate::virtio_net::VirtioNet;
 use crate::virtio_vsock::VirtioVsock;
 
@@ -44,6 +46,7 @@ const UART_INTID: u32 = 32 + UART_SPI;
 const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
 const VIRTIO_NET_INTID: u32 = 32 + VIRTIO_NET_SPI;
 const VIRTIO_VSOCK_INTID: u32 = 32 + VIRTIO_VSOCK_SPI;
+const VIRTIO_FS_INTID: u32 = 32 + VIRTIO_FS_SPI;
 
 /// PSCI function IDs (SMC64/HVC calling convention) we recognise.
 mod psci {
@@ -72,6 +75,7 @@ struct Shared {
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
+    fs: Option<Arc<Mutex<VirtioFs>>>,
     emit: Arc<Mutex<Emitter>>,
     running: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
@@ -191,9 +195,40 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
         Arc::new(Mutex::new(VirtioVsock::new()))
     });
+    // Bind before Seatbelt is installed. Accepting on this already-open
+    // listener remains allowed afterwards; acquiring a new socket does not.
+    let agent_listener = match &cfg.agent_sock {
+        Some(path) => {
+            let _ = std::fs::remove_file(path);
+            Some(
+                std::os::unix::net::UnixListener::bind(path)
+                    .map_err(|e| format!("bind agent socket {path}: {e}"))?,
+            )
+        }
+        None => None,
+    };
+    let fs = cfg
+        .fs_share
+        .as_ref()
+        .map(|share| {
+            eprintln!(
+                "[hvi] virtio-fs: {} as {:?} (read-only)",
+                share.path.display(),
+                share.tag
+            );
+            VirtioFs::new(share.path.clone(), &share.tag).map(|dev| Arc::new(Mutex::new(dev)))
+        })
+        .transpose()?;
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
+    let has_fs = fs.is_some();
+    let fdt_devices = fdt::VirtioDevices {
+        blk: has_blk,
+        net: has_net,
+        vsock: has_vsock,
+        fs: has_fs,
+    };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
     if emitter.enabled() {
@@ -211,15 +246,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         0x4000,
         initrd_len,
     );
-    let dtb0 = fdt::build(
-        &provisional,
-        &gic,
-        num_cpus,
-        &cfg.cmdline,
-        has_blk,
-        has_net,
-        has_vsock,
-    )?;
+    let dtb0 = fdt::build(&provisional, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
     let layout = GuestLayout::new(
         cfg.mem_bytes,
         img.text_offset,
@@ -227,15 +254,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         dtb0.len() as u64,
         initrd_len,
     );
-    let dtb = fdt::build(
-        &layout,
-        &gic,
-        num_cpus,
-        &cfg.cmdline,
-        has_blk,
-        has_net,
-        has_vsock,
-    )?;
+    let dtb = fdt::build(&layout, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
     layout.validate()?;
 
     ram.write(layout.kernel_addr, &cfg.kernel)?;
@@ -258,6 +277,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         virtio,
         net,
         vsock,
+        fs,
         emit: Arc::new(Mutex::new(emitter)),
         running: Arc::new(AtomicBool::new(true)),
         handles: Arc::new(Mutex::new(Vec::new())),
@@ -287,9 +307,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         shared.plugin.clone(),
         Arc::clone(&shared.handles),
     );
-    if let (Some(sock), Some(dev)) = (&cfg.agent_sock, &shared.vsock) {
+    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
         spawn_vsock_bridge(
-            sock.clone(),
+            listener,
             Arc::clone(dev),
             Arc::clone(&shared.mem),
             vm.clone(),
@@ -317,8 +337,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
     if cfg.sandbox {
-        crate::sandbox::enter()
-            .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
+        crate::sandbox::enter_with_readonly_share(
+            cfg.fs_share.as_ref().map(|share| share.path.as_path()),
+        )
+        .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         eprintln!("[hvi] seatbelt sandbox: on (deny default)");
     } else {
         eprintln!("[hvi] seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority");
@@ -433,6 +455,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         {
                             if let Some(dev) = &sh.vsock {
                                 service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
+                            }
+                            advance_pc(&vcpu);
+                        } else if (VIRTIO_FS_BASE..VIRTIO_FS_BASE + VIRTIO_SIZE).contains(&ipa) {
+                            if let Some(dev) = &sh.fs {
+                                service_fs(&vcpu, &sh, dev, ipa - VIRTIO_FS_BASE, syn);
                             }
                             advance_pc(&vcpu);
                         } else {
@@ -776,29 +803,40 @@ fn service_vsock(
     let _ = sh.vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
 }
 
+/// Services the read-only virtio-fs MMIO transport and its used-ring IRQ.
+fn service_fs(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioFs>>, offset: u64, syndrome: u64) {
+    let da = DataAbort::from_syndrome(syndrome);
+    if !da.isv {
+        return;
+    }
+    let level = {
+        let mut d = dev.lock().unwrap();
+        if da.is_write {
+            let v = read_gpr(vcpu, da.reg);
+            d.mmio(&sh.mem, offset, true, v);
+        } else {
+            let v = d.mmio(&sh.mem, offset, false, 0) & width_mask(da.width);
+            write_gpr(vcpu, da.reg, v);
+        }
+        d.irq_level()
+    };
+    let _ = sh.vm.gic_set_spi(VIRTIO_FS_INTID, level);
+}
+
 /// Bridges the host agent Unix socket to the guest vsock device. Each accepted
 /// connection is opened to the guest agent (host CID 2 -> guest CID 3, port
 /// 1024) and relayed both ways by a per-connection reader thread. After any
 /// host->guest injection the vsock GIC line is raised and the vCPUs kicked so
 /// the guest drains its RX queue promptly.
 fn spawn_vsock_bridge(
-    sock_path: String,
+    listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
 ) {
-    use std::os::unix::net::UnixListener;
     std::thread::spawn(move || {
-        let _ = std::fs::remove_file(&sock_path);
-        let listener = match UnixListener::bind(&sock_path) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[hvi] vsock bridge: cannot bind {sock_path}: {e}");
-                return;
-            }
-        };
-        eprintln!("[hvi] vsock bridge: listening on {sock_path}");
+        eprintln!("[hvi] vsock bridge: listening");
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let Ok(reader) = stream.try_clone() else {

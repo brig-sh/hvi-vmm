@@ -31,7 +31,7 @@ src/
   boot_x86.rs layout_x86.rs   x86 bzImage + boot_params + e820, guest memory map
   mptable.rs uart16550.rs     x86 Intel MP table, 16550 COM1 serial
   guestmem.rs                 Send+Sync guest-RAM accessor over the host mapping
-  virtio*.rs                  virtio-mmio blk / net (built-in stack + gvisor-tap relay + SNI) / vsock
+  virtio*.rs                  virtio-mmio blk / net / vsock / read-only virtio-fs
   pl011.rs                    PL011 UART (arm64)
   plugin.rs                  the extension seam (Plugin / VmHandle / CpuHandle / IoSink)
   plugins.rs                tools built on it: memory dump, I/O trace
@@ -67,6 +67,7 @@ cargo check --target aarch64-unknown-linux-gnu
 ```sh
 hvi boot --kernel <arm64 Image | x86-64 bzImage> \
   [--initramfs <cpio>] [--disk <raw.img>] [--mem-mib N] [--cpus N] \
+  [--share-ro <host-directory> <mount-tag>] \
   [--net | --net-gateway <gvisor-tap .qemu socket>] \
   [--agent-sock <unix socket>] \
   [--events <ledger.ndjson>] [--sandbox-id <id>] [--no-sandbox]
@@ -169,3 +170,7 @@ The limits worth knowing before you build on it:
   Mach-O invalidates it, so `codesign` after every build, not once.
 - **One disk and one NIC.** `--disk` and `--net` take a single device each;
   there is no hotplug, and no PCI at all.
+- **One read-only directory share on macOS.** `--share-ro <path> <tag>` exports
+  an unpacked directory through virtio-fs without a block image or host FUSE
+  mount. It has one request queue and no DAX window; use an in-guest overlay
+  for writes. Additional shares and the Linux backends are not wired yet.

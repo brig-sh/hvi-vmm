@@ -14,8 +14,8 @@
 //!
 //! # Why a deny-default profile can be this small
 //!
-//! Everything the VMM needs from the host is acquired before the guest runs and
-//! is held as a descriptor afterwards:
+//! Everything the VMM normally needs from the host is acquired before the
+//! guest runs and is held as a descriptor afterwards:
 //!
 //! - guest RAM is a POSIX shared-memory object that [`crate::sharedmem`]
 //!   unlinks the moment it is mapped, so it is reachable only through the fd;
@@ -27,10 +27,12 @@
 //! descriptors already held, so the profile does not need to name any of them.
 //! That is the whole reason [`enter`](crate::sandbox::enter) is called where it
 //! is: one line later and the profile would have to grant filesystem and socket
-//! rights it can now
-//! refuse outright. It is also why the profile is a static string with nothing
-//! interpolated into it -- no caller-controlled path reaches the policy, so
-//! there is no SBPL-injection surface to get wrong.
+//! rights it can now refuse outright. The one exception is virtio-fs: directory
+//! entries and files are opened lazily as the guest requests them. When a
+//! read-only share is configured, [`enter_with_readonly_share`] appends one
+//! `file-read*` subpath rule for the already-canonical export root. The path is
+//! required to be UTF-8/control-free and SBPL-escaped before interpolation;
+//! write access and every path outside that subtree remain denied.
 //!
 //! The vCPU threads are created *after* this point and that is fine:
 //! `hv_vcpu_create` and `hv_vcpu_run` on a fresh thread work under a bare
@@ -52,6 +54,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
+use std::path::Path;
 
 /// The Seatbelt profile, in SBPL.
 ///
@@ -124,10 +127,39 @@ extern "C" {
 /// nobody has tested, and continuing would silently return the process to full
 /// ambient authority.
 pub fn enter() -> io::Result<()> {
-    // The profile is a compile-time constant with no NULs, so this cannot fail;
-    // map it anyway rather than unwrap in a security path.
+    enter_with_readonly_share(None)
+}
+
+/// Installs the production profile, optionally granting read-only access to
+/// one canonical virtio-fs export. The device opens files lazily as the guest
+/// requests them, unlike virtio-blk's already-open backing descriptor, so this
+/// narrow subtree grant is required for directory sharing to remain usable
+/// after confinement.
+pub fn enter_with_readonly_share(root: Option<&Path>) -> io::Result<()> {
+    let mut policy = PROFILE.to_owned();
+    if let Some(root) = root {
+        let root = root.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtio-fs export path is not valid UTF-8 for Seatbelt",
+            )
+        })?;
+        if root.chars().any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtio-fs export path contains a control character",
+            ));
+        }
+        // SBPL strings use the conventional backslash escapes. Escaping both
+        // special characters keeps a caller-controlled path data, not policy.
+        let escaped = root.replace('\\', "\\\\").replace('"', "\\\"");
+        policy.push_str(&format!(
+            "\n;; virtio-fs may acquire files only below its canonical read-only export.\n\
+             (allow file-read* (subpath \"{escaped}\"))\n"
+        ));
+    }
     let profile =
-        CString::new(PROFILE).map_err(|_| io::Error::other("sandbox profile has a NUL"))?;
+        CString::new(policy).map_err(|_| io::Error::other("sandbox profile has a NUL"))?;
     let mut err: *mut libc::c_char = std::ptr::null_mut();
     // SAFETY: `profile` is a live NUL-terminated string; `err` is a valid
     // out-pointer that libsandbox fills only on failure, and which we free

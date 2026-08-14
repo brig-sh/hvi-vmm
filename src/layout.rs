@@ -33,6 +33,8 @@ pub const VIRTIO_NET_BASE: u64 = 0x0200_0200;
 pub const VIRTIO_NET_SPI: u32 = 3;
 pub const VIRTIO_VSOCK_BASE: u64 = 0x0200_0400;
 pub const VIRTIO_VSOCK_SPI: u32 = 4;
+pub const VIRTIO_FS_BASE: u64 = 0x0200_0600;
+pub const VIRTIO_FS_SPI: u32 = 5;
 
 /// GICv3 placement, defaulting to the QEMU virt values.
 /// Which GIC architecture the guest is given.
