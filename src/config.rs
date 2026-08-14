@@ -29,6 +29,13 @@ pub enum CachePolicy {
     /// Additionally lets the guest own the page cache for writes, batching them
     /// into large aligned WRITEs. Only correct when the guest is the sole
     /// writer.
+    ///
+    /// A trade, not a straight win, and which way it goes depends entirely on
+    /// how the workload writes. Measured with `tools/fsbench` writing 256 MiB:
+    /// at `dd bs=4k` it batched 65536 requests down to a few hundred and ran
+    /// 2.4x faster, while at `bs=1M` it ran 3.7x slower, because the guest's
+    /// writeback path then costs more than the requests it saves. Worth it for
+    /// many small writes to the same file, not for bulk sequential ones.
     Always,
     /// Every lookup and read goes to the host. Correct under concurrent host
     /// mutation, and slow.
