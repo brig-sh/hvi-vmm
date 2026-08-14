@@ -3392,6 +3392,90 @@ mod tests {
         get_u64(&out, OUT_HEADER_LEN).unwrap()
     }
 
+    /// Daemon-side cost of the metadata path, the one real workloads (a build
+    /// tree, `ls -R`, a source checkout) spend their time in. Drives the device
+    /// directly, so it measures host-side work only: no guest kernel, and so no
+    /// benefit from the attribute/entry timeouts, which cut the number of
+    /// requests that ever arrive rather than the cost of serving one.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_metadata_workload
+    #[test]
+    #[ignore]
+    fn bench_metadata_workload() {
+        const FILES: usize = 200;
+        const ROUNDS: usize = 20;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        for i in 0..FILES {
+            fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
+        }
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+
+        // Warm the host's own metadata caches so this measures our syscall
+        // count, not cold I/O.
+        for i in 0..FILES {
+            let mut name = format!("file-{i:04}").into_bytes();
+            name.push(0);
+            let _ = dev.handle_fuse(&request(LOOKUP, tree_node, &name), 4096);
+        }
+
+        let start = std::time::Instant::now();
+        let mut ops = 0u64;
+        for _ in 0..ROUNDS {
+            // A directory listing, the way the guest does it.
+            let out = dev.handle_fuse(&request(OPENDIR, tree_node, &[0u8; 8]), 4096);
+            let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+            let mut offset = 0u64;
+            loop {
+                let mut input = vec![0u8; 40];
+                input[0..8].copy_from_slice(&fh.to_le_bytes());
+                input[8..16].copy_from_slice(&offset.to_le_bytes());
+                input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+                let out = dev.handle_fuse(&request(READDIRPLUS, tree_node, &input), 4096 + 16);
+                ops += 1;
+                if out.len() <= OUT_HEADER_LEN {
+                    break;
+                }
+                // Last dirent's offset field is the next starting point.
+                let mut pos = OUT_HEADER_LEN;
+                let mut last = offset;
+                while pos + 152 <= out.len() {
+                    last = get_u64(&out, pos + 128 + 8).unwrap();
+                    let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
+                    pos += align8(128 + 24 + namelen);
+                }
+                if last == offset {
+                    break;
+                }
+                offset = last;
+            }
+            let mut input = vec![0u8; 8];
+            input[0..8].copy_from_slice(&fh.to_le_bytes());
+            dev.handle_fuse(&request(RELEASEDIR, tree_node, &input), 4096);
+
+            // Then stat every entry, which is what a build actually does.
+            for i in 0..FILES {
+                let mut name = format!("file-{i:04}").into_bytes();
+                name.push(0);
+                let out = dev.handle_fuse(&request(LOOKUP, tree_node, &name), 4096);
+                let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+                dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+                ops += 2;
+            }
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "BENCH metadata: {} ops in {:.3} ms => {:.2} us/op",
+            ops,
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / ops as f64
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn init_negotiates_without_dax() {
         let (dir, mut dev) = fixture();
