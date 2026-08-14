@@ -17,7 +17,9 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -195,15 +197,33 @@ struct GuestAttr {
     gid: u32,
 }
 
+/// One `fs::read_dir` entry captured at OPENDIR time.
+#[derive(Clone)]
+struct DirEntryInfo {
+    name: OsString,
+    /// `d_ino` from the same dirent; free on both macOS and Linux, unlike a
+    /// stat, so plain (non-plus) READDIR never needs one for the inode number
+    /// it reports.
+    ino: u64,
+    /// From `d_type` at opendir time; `None` when the host returned DT_UNKNOWN
+    /// and a stat is genuinely required.
+    file_type: Option<std::fs::FileType>,
+}
+
 struct DirHandle {
     file: File,
-    entries: Vec<OsString>,
+    entries: Vec<DirEntryInfo>,
 }
 
 struct Node {
     key: (u64, u64),
     paths: Vec<PathBuf>,
     lookups: u64,
+    /// Cached `com.nubificus.hvi.linux-attr`. `Some(None)` means "checked, not
+    /// present" so a miss costs no syscall either. Invalidated whenever this
+    /// module writes the xattr or changes ownership/mode. macOS only; on
+    /// Linux `guest_attr` has no xattr path, so this is simply never filled.
+    guest_attr: Option<Option<GuestAttr>>,
 }
 
 /// A virtio-fs device exporting exactly one canonical host directory.
@@ -258,6 +278,7 @@ impl VirtioFs {
                 key: (root_meta.dev(), root_meta.ino()),
                 paths: vec![root.clone()],
                 lookups: u64::MAX,
+                guest_attr: None,
             },
         );
         let mut inode_ids = HashMap::new();
@@ -513,7 +534,7 @@ impl VirtioFs {
             OPEN => self.open(nodeid, payload, false),
             OPENDIR => self.open(nodeid, payload, true),
             READ => self.read(nodeid, payload, max_out.saturating_sub(OUT_HEADER_LEN)),
-            WRITE => self.write(payload),
+            WRITE => self.write(nodeid, payload),
             READDIR => self.readdir(
                 nodeid,
                 payload,
@@ -649,23 +670,22 @@ impl VirtioFs {
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
-        Ok(self.entry_out(node, &meta))
+        Ok(self.entry_out(node, &path, &meta))
     }
 
-    fn getattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn getattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let flags = get_u32(input, 0).unwrap_or(0);
         let fh = get_u64(input, 8).unwrap_or(0);
-        let meta = if flags & FUSE_GETATTR_FH != 0 {
-            self.handles
-                .get(&fh)
-                .ok_or(EBADF)?
-                .file
-                .metadata()
-                .map_err(io_errno)?
+        let (path, meta) = if flags & FUSE_GETATTR_FH != 0 {
+            let handle = self.handles.get(&fh).ok_or(EBADF)?;
+            let meta = handle.file.metadata().map_err(io_errno)?;
+            (handle.path.clone(), meta)
         } else {
-            fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?
+            let path = self.node_path(node)?.to_owned();
+            let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+            (path, meta)
         };
-        Ok(self.attr_out(node, &meta))
+        Ok(self.attr_out(node, &path, &meta))
     }
 
     fn setattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -814,12 +834,24 @@ impl VirtioFs {
             }
         }
 
-        let meta = if let Some(handle) = handle {
-            handle.file.metadata().map_err(io_errno)?
+        // Clone the path out from under `handle` (rather than keep borrowing
+        // it) so the borrow of `self.handles` ends here, before the `&mut
+        // self` calls below that invalidate the cache and build the reply.
+        let (final_path, meta) = if let Some(handle) = handle {
+            (
+                handle.path.clone(),
+                handle.file.metadata().map_err(io_errno)?,
+            )
         } else {
-            fs::symlink_metadata(path.as_deref().ok_or(EINVAL)?).map_err(io_errno)?
+            let final_path = path.as_deref().ok_or(EINVAL)?.to_owned();
+            let meta = fs::symlink_metadata(&final_path).map_err(io_errno)?;
+            (final_path, meta)
         };
-        Ok(self.attr_out(node, &meta))
+        // A setattr may have written HVI_XATTR_LINUX_ATTR above (uid/gid/mode
+        // branches); unconditionally invalidating is simpler than tracking
+        // exactly which branch fired, and costs nothing but a HashMap write.
+        self.invalidate_guest_attr(node);
+        Ok(self.attr_out(node, &final_path, &meta))
     }
 
     fn require_writable(&self) -> Result<(), i32> {
@@ -845,9 +877,9 @@ impl VirtioFs {
 
     fn new_entry(&mut self, path: PathBuf) -> Result<Vec<u8>, i32> {
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
-        let node = self.node_for(path, &meta);
+        let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
-        Ok(self.entry_out(node, &meta))
+        Ok(self.entry_out(node, &path, &meta))
     }
 
     fn mknod(
@@ -1027,8 +1059,8 @@ impl VirtioFs {
         let meta = file.metadata().map_err(io_errno)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
+        let mut out = self.entry_out(node, &path, &meta);
         let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path);
-        let mut out = self.entry_out(node, &meta);
         put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
@@ -1068,6 +1100,7 @@ impl VirtioFs {
             let file = open_host_file(&path, flags, false, 0).map_err(io_errno)?;
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
                 clear_suid_sgid(&path, &file)?;
+                self.invalidate_guest_attr(node);
             }
             self.insert_handle(file, wants_write, path)
         };
@@ -1105,7 +1138,7 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn write(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn write(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let offset = get_u64(input, 8).ok_or(EINVAL)?;
@@ -1123,7 +1156,9 @@ impl VirtioFs {
             .write_at(&input[40..40 + size], offset)
             .map_err(io_errno)?;
         if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
+            let handle = self.handles.get(&fh).ok_or(EBADF)?;
             clear_suid_sgid(&handle.path, &handle.file)?;
+            self.invalidate_guest_attr(node);
         }
         let mut out = Vec::with_capacity(8);
         put_u32(&mut out, n as u32);
@@ -1153,14 +1188,35 @@ impl VirtioFs {
 
     fn insert_dir_handle(&mut self, path: &Path) -> Result<u64, i32> {
         let file = open_host_dir(path).map_err(io_errno)?;
-        let mut entries: Vec<OsString> = fs::read_dir(path)
+        // `file_type()`/`ino()` are read straight off the dirent (`d_type`,
+        // `d_ino`) on macOS and Linux, so capturing them here costs nothing
+        // beyond the readdir(3) calls this loop already makes.
+        let mut entries: Vec<DirEntryInfo> = fs::read_dir(path)
             .map_err(io_errno)?
             .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
+            .map(|entry| DirEntryInfo {
+                name: entry.file_name(),
+                ino: entry.ino(),
+                file_type: entry.file_type().ok(),
+            })
             .collect();
-        entries.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        entries.insert(0, OsString::from_vec(b"..".to_vec()));
-        entries.insert(0, OsString::from_vec(b".".to_vec()));
+        entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        entries.insert(
+            0,
+            DirEntryInfo {
+                name: OsString::from_vec(b"..".to_vec()),
+                ino: 0,
+                file_type: None,
+            },
+        );
+        entries.insert(
+            0,
+            DirEntryInfo {
+                name: OsString::from_vec(b".".to_vec()),
+                ino: 0,
+                file_type: None,
+            },
+        );
         let fh = self.next_handle();
         self.dir_handles.insert(fh, DirHandle { file, entries });
         Ok(fh)
@@ -1452,6 +1508,7 @@ impl VirtioFs {
         let meta = file.metadata().map_err(io_errno)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
+        let mut out = self.entry_out(node, &path, &meta);
         let fh = self.next_handle();
         self.handles.insert(
             fh,
@@ -1462,30 +1519,25 @@ impl VirtioFs {
                 temporary_path: Some(path),
             },
         );
-        let mut out = self.entry_out(node, &meta);
         put_open_out(&mut out, fh, false, false);
         Ok(out)
     }
 
-    fn statx(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn statx(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
-        let meta = if flags & FUSE_GETATTR_FH != 0 {
-            self.handles
-                .get(&fh)
-                .ok_or(EBADF)?
-                .file
-                .metadata()
-                .map_err(io_errno)?
+        let (path, meta) = if flags & FUSE_GETATTR_FH != 0 {
+            let handle = self.handles.get(&fh).ok_or(EBADF)?;
+            let meta = handle.file.metadata().map_err(io_errno)?;
+            (Some(handle.path.clone()), meta)
         } else {
-            fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?
+            let path = self.node_path(node)?.to_owned();
+            let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+            (Some(path), meta)
         };
-        Ok(statx_out(
-            node,
-            &meta,
-            self.cache_seconds(),
-            guest_attr(self.node_path(node).ok(), &meta),
-        ))
+        let cache_seconds = self.cache_seconds();
+        let guest = self.guest_attr(node, path.as_deref(), &meta);
+        Ok(statx_out(node, &meta, cache_seconds, guest))
     }
 
     fn readdir(
@@ -1515,43 +1567,86 @@ impl VirtioFs {
         } else {
             parent_meta.ino()
         };
-        let names = self.dir_handles.get(&fh).ok_or(EBADF)?.entries.clone();
+
+        // No reply can hold more than `limit / min_record_len` entries, so
+        // that -- not the whole remaining tail of the directory -- bounds how
+        // much of `entries` needs copying out from under the dir handle's
+        // borrow. Cloning the full vector (or even the full tail) on every
+        // call is what made a paginated listing of a large directory
+        // quadratic: this makes each call's copy independent of directory
+        // size.
+        let min_record = align8((if plus { 128 } else { 0 }) + 24 + 1);
+        let max_entries = limit / min_record + 1;
+        let batch: Vec<(usize, DirEntryInfo)> = self
+            .dir_handles
+            .get(&fh)
+            .ok_or(EBADF)?
+            .entries
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(max_entries)
+            .map(|(idx, entry)| (idx, entry.clone()))
+            .collect();
 
         let mut out = Vec::new();
-        for (idx, name) in names.into_iter().enumerate().skip(offset) {
+        for (idx, entry) in batch {
             let path = if idx == 0 {
                 dir.clone()
             } else if idx == 1 {
                 parent_path.clone()
             } else {
-                dir.join(&name)
+                dir.join(&entry.name)
             };
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(_) => continue,
-            };
-            let entry_node = if idx == 0 {
-                node
-            } else if idx == 1 {
-                parent_node
-            } else if plus {
-                self.node_for(path, &meta)
-            } else {
-                meta.ino()
-            };
-            let name = name.as_bytes();
+            let name = entry.name.as_bytes();
             let record_len = align8((if plus { 128 } else { 0 }) + 24 + name.len());
             if out.len() + record_len > limit {
                 break;
             }
+
             if plus {
+                // READDIRPLUS always needs full attributes, so the d_type
+                // fast path below does not apply here.
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                let entry_node = if idx == 0 {
+                    node
+                } else if idx == 1 {
+                    parent_node
+                } else {
+                    self.node_for(path.clone(), &meta)
+                };
                 self.remember_lookup(entry_node);
-                out.extend_from_slice(&self.entry_out(entry_node, &meta));
+                out.extend_from_slice(&self.entry_out(entry_node, &path, &meta));
+                put_u64(&mut out, entry_node);
+                put_u64(&mut out, (idx + 1) as u64);
+                put_u32(&mut out, name.len() as u32);
+                put_u32(&mut out, dirent_type(&meta));
+            } else {
+                // `.`/`..` are not from `fs::read_dir`, so they carry no
+                // cached type; every other entry's d_type/ino came for free
+                // off the directory at OPENDIR time and needs no stat here.
+                let (entry_ino, dtype) = match entry.file_type {
+                    Some(ft) if idx > 1 => (entry.ino, dirent_type_ft(&ft)),
+                    _ => match fs::symlink_metadata(&path) {
+                        Ok(meta) => (meta.ino(), dirent_type(&meta)),
+                        Err(_) => continue,
+                    },
+                };
+                let entry_node = if idx == 0 {
+                    node
+                } else if idx == 1 {
+                    parent_node
+                } else {
+                    entry_ino
+                };
+                put_u64(&mut out, entry_node);
+                put_u64(&mut out, (idx + 1) as u64);
+                put_u32(&mut out, name.len() as u32);
+                put_u32(&mut out, dtype);
             }
-            put_u64(&mut out, entry_node);
-            put_u64(&mut out, (idx + 1) as u64);
-            put_u32(&mut out, name.len() as u32);
-            put_u32(&mut out, dirent_type(&meta));
             out.extend_from_slice(name);
             out.resize(align8(out.len()), 0);
         }
@@ -1641,6 +1736,14 @@ impl VirtioFs {
 
     fn node_path(&self, node: u64) -> Result<&Path, i32> {
         let remembered = self.nodes.get(&node).ok_or(ENOENT)?;
+        // With one alias there is nothing to disambiguate: a stale path still
+        // fails at the caller's real syscall with the same errno, so skipping
+        // the validating stat here does not change observable behaviour. Only
+        // hard links / concurrent renames leave more than one path, and only
+        // then is the scan below needed.
+        if let [only] = remembered.paths.as_slice() {
+            return Ok(only.as_path());
+        }
         remembered
             .paths
             .iter()
@@ -1671,6 +1774,7 @@ impl VirtioFs {
                 key,
                 paths: vec![path],
                 lookups: 0,
+                guest_attr: None,
             },
         );
         self.inode_ids.insert(key, node);
@@ -1745,22 +1849,64 @@ impl VirtioFs {
         }
     }
 
-    fn attr_out(&self, node: u64, meta: &Metadata) -> Vec<u8> {
-        attr_out(
-            node,
-            meta,
-            self.cache_seconds(),
-            guest_attr(self.node_path(node).ok(), meta),
-        )
+    /// Every caller already resolved `path` (typically for the
+    /// `symlink_metadata` that produced `meta`); taking it here instead of
+    /// re-resolving via `node_path` saves a redundant stat and is strictly
+    /// more correct, since it is the exact path `meta` was read from.
+    fn attr_out(&mut self, node: u64, path: &Path, meta: &Metadata) -> Vec<u8> {
+        let cache_seconds = self.cache_seconds();
+        let guest = self.guest_attr(node, Some(path), meta);
+        attr_out(node, meta, cache_seconds, guest)
     }
 
-    fn entry_out(&self, node: u64, meta: &Metadata) -> Vec<u8> {
-        entry_out(
-            node,
-            meta,
-            self.cache_seconds(),
-            guest_attr(self.node_path(node).ok(), meta),
-        )
+    fn entry_out(&mut self, node: u64, path: &Path, meta: &Metadata) -> Vec<u8> {
+        let cache_seconds = self.cache_seconds();
+        let guest = self.guest_attr(node, Some(path), meta);
+        entry_out(node, meta, cache_seconds, guest)
+    }
+
+    /// Cached `com.nubificus.hvi.linux-attr` lookup. A getxattr call costs one
+    /// syscall on a miss and two on a hit (size probe then read), and this is
+    /// asked for on every attribute reply -- caching it on the `Node` turns
+    /// that into at most one syscall for the node's whole cached lifetime.
+    /// The mode's file-type bits still always come from the live `meta`, only
+    /// the permission bits and uid/gid are cached.
+    fn guest_attr(&mut self, node: u64, path: Option<&Path>, meta: &Metadata) -> GuestAttr {
+        #[cfg(target_os = "macos")]
+        if let Some(path) = path {
+            let stored = match self.nodes.get(&node).map(|n| n.guest_attr) {
+                Some(Some(cached)) => cached,
+                _ => {
+                    let stored = stored_guest_attr(path);
+                    if let Some(n) = self.nodes.get_mut(&node) {
+                        n.guest_attr = Some(stored);
+                    }
+                    stored
+                }
+            };
+            if let Some(mut guest) = stored {
+                guest.mode = (meta.mode() & S_IFMT) | (guest.mode & 0o7777);
+                return guest;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let _ = (node, path);
+        GuestAttr {
+            mode: meta.mode(),
+            uid: host_uid_to_guest(meta.uid()),
+            gid: host_gid_to_guest(meta.gid()),
+        }
+    }
+
+    /// Drops a node's cached guest attribute after this module writes
+    /// `HVI_XATTR_LINUX_ATTR` or otherwise changes what it reports for that
+    /// node, so the next attribute reply re-reads it instead of serving the
+    /// value from before the change. A no-op on Linux, where the field is
+    /// never populated.
+    fn invalidate_guest_attr(&mut self, node: u64) {
+        if let Some(n) = self.nodes.get_mut(&node) {
+            n.guest_attr = None;
+        }
     }
 }
 
@@ -2590,7 +2736,10 @@ fn nonnegative(value: i64) -> u64 {
 }
 
 fn dirent_type(meta: &Metadata) -> u32 {
-    let ty = meta.file_type();
+    dirent_type_ft(&meta.file_type())
+}
+
+fn dirent_type_ft(ty: &std::fs::FileType) -> u32 {
     if ty.is_dir() {
         4
     } else if ty.is_file() {
@@ -3288,6 +3437,154 @@ mod tests {
         release[0..8].copy_from_slice(&fh.to_le_bytes());
         let out = dev.handle_fuse(&request(RELEASEDIR, etc, &release), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Parses a READDIR(PLUS) payload (the reply past `OUT_HEADER_LEN`) into
+    /// (reported ino/node, next offset, d_type, name, plus-mode mode bits).
+    fn parse_readdir_entries(payload: &[u8], plus: bool) -> Vec<(u64, u64, u32, String, u32)> {
+        let mut entries = Vec::new();
+        let mut pos = 0;
+        while pos < payload.len() {
+            let (node, mode) = if plus {
+                let node = get_u64(payload, pos).unwrap();
+                let mode = get_u32(payload, pos + 100).unwrap();
+                pos += 128;
+                (node, mode)
+            } else {
+                (0, 0)
+            };
+            let ino = get_u64(payload, pos).unwrap();
+            let off = get_u64(payload, pos + 8).unwrap();
+            let namelen = get_u32(payload, pos + 16).unwrap() as usize;
+            let dtype = get_u32(payload, pos + 20).unwrap();
+            let name = String::from_utf8(payload[pos + 24..pos + 24 + namelen].to_vec()).unwrap();
+            pos += align8(24 + namelen);
+            entries.push((if plus { node } else { ino }, off, dtype, name, mode));
+        }
+        entries
+    }
+
+    fn host_listing(dir: &Path) -> Vec<String> {
+        let mut names = vec![".".to_string(), "..".to_string()];
+        let mut host: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        host.sort();
+        names.extend(host);
+        names
+    }
+
+    #[test]
+    fn readdir_matches_host_directory_names_types_and_order() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("etc/sub")).unwrap();
+        std::os::unix::fs::symlink("issue", dir.join("etc/issue-link")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
+        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+        let mut read = vec![0u8; 40];
+        read[0..8].copy_from_slice(&fh.to_le_bytes());
+        read[16..20].copy_from_slice(&65536u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIR, etc, &read), 65536 + OUT_HEADER_LEN);
+        let entries = parse_readdir_entries(&out[OUT_HEADER_LEN..], false);
+        let names: Vec<String> = entries.iter().map(|(_, _, _, n, _)| n.clone()).collect();
+        assert_eq!(names, host_listing(&dir.join("etc")));
+        let type_of = |n: &str| entries.iter().find(|e| e.3 == n).unwrap().2;
+        assert_eq!(type_of("sub"), 4, "directory");
+        assert_eq!(type_of("issue"), 8, "regular file");
+        assert_eq!(type_of("issue-link"), 10, "symlink");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn paginated_readdir_yields_each_entry_exactly_once() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..40 {
+            fs::write(dir.join("etc").join(format!("f{i:02}")), b"x").unwrap();
+        }
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
+        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0u64;
+        let mut rounds = 0;
+        loop {
+            let mut read = vec![0u8; 40];
+            read[0..8].copy_from_slice(&fh.to_le_bytes());
+            read[8..16].copy_from_slice(&offset.to_le_bytes());
+            // Small enough to force several rounds over 40+2 entries.
+            read[16..20].copy_from_slice(&256u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(READDIR, etc, &read), 256 + OUT_HEADER_LEN);
+            let entries = parse_readdir_entries(&out[OUT_HEADER_LEN..], false);
+            if entries.is_empty() {
+                break;
+            }
+            for (_, off, _, name, _) in &entries {
+                seen.push(name.clone());
+                offset = *off;
+            }
+            rounds += 1;
+            assert!(rounds < 100, "runaway pagination");
+        }
+        assert!(rounds > 1, "the small max_out should force multiple rounds");
+        assert_eq!(seen, host_listing(&dir.join("etc")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readdirplus_reports_correct_attributes_for_each_type() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("etc/sub")).unwrap();
+        std::os::unix::fs::symlink("issue", dir.join("etc/issue-link")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
+        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+        let mut read = vec![0u8; 40];
+        read[0..8].copy_from_slice(&fh.to_le_bytes());
+        read[16..20].copy_from_slice(&65536u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, etc, &read), 65536 + OUT_HEADER_LEN);
+        let entries = parse_readdir_entries(&out[OUT_HEADER_LEN..], true);
+        let find = |n: &str| entries.iter().find(|e| e.3 == n).unwrap().clone();
+
+        let (_, _, dtype, _, mode) = find("sub");
+        assert_eq!(dtype, 4);
+        assert_eq!(mode & S_IFMT, libc::S_IFDIR as u32);
+
+        let (_, _, dtype, _, mode) = find("issue");
+        assert_eq!(dtype, 8);
+        assert_eq!(mode & S_IFMT, S_IFREG);
+
+        let (_, _, dtype, _, mode) = find("issue-link");
+        assert_eq!(dtype, 10);
+        assert_eq!(mode & S_IFMT, libc::S_IFLNK as u32);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hard_link_removal_leaves_the_remaining_alias_addressable() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("primary"), b"data").unwrap();
+        fs::hard_link(dir.join("primary"), dir.join("secondary")).unwrap();
+        let primary = lookup_node(&mut dev, FUSE_ROOT_ID, b"primary");
+        let secondary = lookup_node(&mut dev, FUSE_ROOT_ID, b"secondary");
+        assert_eq!(primary, secondary);
+
+        let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"primary\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        // Exercises the multi-alias validating scan in node_path: the
+        // single-alias fast path (2a) must not be taken while `primary` is
+        // still a (now stale) entry in this node's path list.
+        assert_eq!(
+            dev.node_path(secondary).unwrap(),
+            dev.root().join("secondary")
+        );
+        let getattr = dev.handle_fuse(&request(GETATTR, secondary, &[]), 4096);
+        assert_eq!(get_u32(&getattr, 4), Some(0));
+        assert_eq!(get_u64(&getattr, OUT_HEADER_LEN + 24), Some(4)); // size
         let _ = fs::remove_dir_all(dir);
     }
 
