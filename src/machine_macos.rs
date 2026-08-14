@@ -25,8 +25,8 @@ use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
-    GicLayout, GicVersion, GuestLayout, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
-    VIRTIO_FS_BASE, VIRTIO_FS_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, GuestLayout, RAM_BASE, UART_BASE,
+    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
@@ -46,7 +46,6 @@ const UART_INTID: u32 = 32 + UART_SPI;
 const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
 const VIRTIO_NET_INTID: u32 = 32 + VIRTIO_NET_SPI;
 const VIRTIO_VSOCK_INTID: u32 = 32 + VIRTIO_VSOCK_SPI;
-const VIRTIO_FS_INTID: u32 = 32 + VIRTIO_FS_SPI;
 
 /// PSCI function IDs (SMC64/HVC calling convention) we recognise.
 mod psci {
@@ -66,6 +65,14 @@ struct Secondary {
     cv: Condvar,
 }
 
+/// One tagged virtio-fs export and its dynamically assigned transport slot.
+#[derive(Clone)]
+struct SharedFs {
+    base: u64,
+    intid: u32,
+    dev: Arc<Mutex<VirtioFs>>,
+}
+
 /// State shared across all vCPU threads.
 #[derive(Clone)]
 struct Shared {
@@ -75,7 +82,7 @@ struct Shared {
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
-    fs: Option<Arc<Mutex<VirtioFs>>>,
+    fs: Vec<SharedFs>,
     emit: Arc<Mutex<Emitter>>,
     running: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
@@ -207,27 +214,42 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let fs = cfg
-        .fs_share
-        .as_ref()
-        .map(|share| {
-            eprintln!(
-                "[hvi] virtio-fs: {} as {:?} (read-only)",
-                share.path.display(),
-                share.tag
-            );
-            VirtioFs::new(share.path.clone(), &share.tag).map(|dev| Arc::new(Mutex::new(dev)))
-        })
-        .transpose()?;
+    let mut fs = Vec::with_capacity(cfg.fs_shares.len());
+    let mut fs_roots = Vec::with_capacity(cfg.fs_shares.len());
+    let mut fs_tags = std::collections::HashSet::new();
+    for (index, share) in cfg.fs_shares.iter().enumerate() {
+        if !fs_tags.insert(share.tag.as_str()) {
+            return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
+        }
+        let base = virtio_fs_base(index).ok_or("too many virtio-fs devices")?;
+        let spi = virtio_fs_spi(index).ok_or("too many virtio-fs devices")?;
+        let end = base
+            .checked_add(VIRTIO_SIZE)
+            .ok_or("virtio-fs MMIO address overflow")?;
+        if end > gic.gicd_base {
+            return Err("virtio-fs MMIO devices would overlap the GIC".into());
+        }
+        let root = std::fs::canonicalize(&share.path)?;
+        eprintln!(
+            "[hvi] virtio-fs[{index}]: {} as {:?} (read-only)",
+            root.display(),
+            share.tag
+        );
+        fs_roots.push(root.clone());
+        fs.push(SharedFs {
+            base,
+            intid: 32 + spi,
+            dev: Arc::new(Mutex::new(VirtioFs::new(root, &share.tag)?)),
+        });
+    }
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
-    let has_fs = fs.is_some();
     let fdt_devices = fdt::VirtioDevices {
         blk: has_blk,
         net: has_net,
         vsock: has_vsock,
-        fs: has_fs,
+        fs_count: fs.len(),
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -337,10 +359,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
     if cfg.sandbox {
-        crate::sandbox::enter_with_readonly_share(
-            cfg.fs_share.as_ref().map(|share| share.path.as_path()),
-        )
-        .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
+        crate::sandbox::enter_with_readonly_shares(&fs_roots)
+            .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         eprintln!("[hvi] seatbelt sandbox: on (deny default)");
     } else {
         eprintln!("[hvi] seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority");
@@ -457,10 +477,12 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                 service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
                             }
                             advance_pc(&vcpu);
-                        } else if (VIRTIO_FS_BASE..VIRTIO_FS_BASE + VIRTIO_SIZE).contains(&ipa) {
-                            if let Some(dev) = &sh.fs {
-                                service_fs(&vcpu, &sh, dev, ipa - VIRTIO_FS_BASE, syn);
-                            }
+                        } else if let Some(fs) = sh
+                            .fs
+                            .iter()
+                            .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
+                        {
+                            service_fs(&vcpu, &sh, &fs.dev, fs.intid, ipa - fs.base, syn);
                             advance_pc(&vcpu);
                         } else {
                             eprintln!(
@@ -804,7 +826,14 @@ fn service_vsock(
 }
 
 /// Services the read-only virtio-fs MMIO transport and its used-ring IRQ.
-fn service_fs(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioFs>>, offset: u64, syndrome: u64) {
+fn service_fs(
+    vcpu: &Vcpu,
+    sh: &Shared,
+    dev: &Arc<Mutex<VirtioFs>>,
+    intid: u32,
+    offset: u64,
+    syndrome: u64,
+) {
     let da = DataAbort::from_syndrome(syndrome);
     if !da.isv {
         return;
@@ -820,7 +849,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioFs>>, offset: u64,
         }
         d.irq_level()
     };
-    let _ = sh.vm.gic_set_spi(VIRTIO_FS_INTID, level);
+    let _ = sh.vm.gic_set_spi(intid, level);
 }
 
 /// Bridges the host agent Unix socket to the guest vsock device. Each accepted

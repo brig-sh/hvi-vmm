@@ -28,8 +28,8 @@
 //! That is the whole reason [`enter`](crate::sandbox::enter) is called where it
 //! is: one line later and the profile would have to grant filesystem and socket
 //! rights it can now refuse outright. The one exception is virtio-fs: directory
-//! entries and files are opened lazily as the guest requests them. When a
-//! read-only share is configured, [`enter_with_readonly_share`] appends one
+//! entries and files are opened lazily as the guest requests them. When
+//! read-only shares are configured, [`enter_with_readonly_shares`] appends one
 //! `file-read*` subpath rule for the already-canonical export root. The path is
 //! required to be UTF-8/control-free and SBPL-escaped before interpolation;
 //! write access and every path outside that subtree remain denied.
@@ -54,7 +54,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The Seatbelt profile, in SBPL.
 ///
@@ -127,17 +127,25 @@ extern "C" {
 /// nobody has tested, and continuing would silently return the process to full
 /// ambient authority.
 pub fn enter() -> io::Result<()> {
-    enter_with_readonly_share(None)
+    enter_with_readonly_shares(&[])
 }
 
-/// Installs the production profile, optionally granting read-only access to
-/// one canonical virtio-fs export. The device opens files lazily as the guest
-/// requests them, unlike virtio-blk's already-open backing descriptor, so this
-/// narrow subtree grant is required for directory sharing to remain usable
-/// after confinement.
+/// Backwards-compatible single-export entry point.
 pub fn enter_with_readonly_share(root: Option<&Path>) -> io::Result<()> {
+    enter_with_paths(root)
+}
+
+/// Installs the production profile, granting read-only access to each
+/// canonical virtio-fs export. Devices open files lazily as the guest requests
+/// them, unlike virtio-blk's already-open descriptor, so one narrow subtree
+/// grant per export is required after confinement.
+pub fn enter_with_readonly_shares(roots: &[PathBuf]) -> io::Result<()> {
+    enter_with_paths(roots.iter().map(PathBuf::as_path))
+}
+
+fn enter_with_paths<'a>(roots: impl IntoIterator<Item = &'a Path>) -> io::Result<()> {
     let mut policy = PROFILE.to_owned();
-    if let Some(root) = root {
+    for root in roots {
         let root = root.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -154,7 +162,7 @@ pub fn enter_with_readonly_share(root: Option<&Path>) -> io::Result<()> {
         // special characters keeps a caller-controlled path data, not policy.
         let escaped = root.replace('\\', "\\\\").replace('"', "\\\"");
         policy.push_str(&format!(
-            "\n;; virtio-fs may acquire files only below its canonical read-only export.\n\
+            "\n;; virtio-fs may acquire files only below this canonical read-only export.\n\
              (allow file-read* (subpath \"{escaped}\"))\n"
         ));
     }
