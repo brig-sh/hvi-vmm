@@ -810,7 +810,11 @@ impl VirtioFs {
     fn child_path(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
         validate_mutation_name(name)?;
         let parent = self.node_path(parent)?;
-        if !fs::symlink_metadata(parent).map_err(io_errno)?.is_dir() {
+        // FUSE path resolution follows directory symlinks.  Keep using
+        // symlink_metadata for the node identity, but follow the parent here
+        // so mutations below a symlinked directory (common in distro include
+        // trees) are not rejected as ENOTDIR/ENOENT.
+        if !fs::metadata(parent).map_err(io_errno)?.is_dir() {
             return Err(ENOTDIR);
         }
         Ok(parent.join(OsStr::from_bytes(name)))
@@ -1468,7 +1472,7 @@ impl VirtioFs {
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
         let limit = requested.min(capacity);
         let dir = self.node_path(node)?.to_owned();
-        if !fs::symlink_metadata(&dir).map_err(io_errno)?.is_dir() {
+        if !fs::metadata(&dir).map_err(io_errno)?.is_dir() {
             return Err(ENOTDIR);
         }
 
@@ -2839,6 +2843,27 @@ mod tests {
         let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"work\0"), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert!(!dir.join("work").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn writable_operations_follow_directory_symlinks() {
+        let (dir, mut dev) = fixture_with_access(true);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("etc", dir.join("include")).expect("create directory symlink");
+
+        let lookup = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"include\0"), 4096);
+        assert_eq!(get_u32(&lookup, 4), Some(0));
+        let include_node = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&(LINUX_O_RDWR | LINUX_O_EXCL).to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b"from-link\0");
+        let out = dev.handle_fuse(&request(CREATE, include_node, &create), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(dir.join("etc/from-link").exists());
+
         let _ = fs::remove_dir_all(dir);
     }
 
