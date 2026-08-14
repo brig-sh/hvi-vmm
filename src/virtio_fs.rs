@@ -254,6 +254,19 @@ pub struct VirtioFs {
     queue_sel: u32,
     queues: [Queue; NUM_QUEUES],
     interrupt_status: u32,
+    /// Bitmask of queue indices notified since the last drain: bit `i` set
+    /// means queue `i` had a `QUEUE_NOTIFY` land on it. Set by the vCPU
+    /// thread in `mmio`, cleared by `take_notified`/`drain_notified`, which
+    /// only the worker thread calls. Both sides only ever touch it with the
+    /// device mutex held (this struct sits behind `Arc<Mutex<VirtioFs>>` in
+    /// `machine_macos`), so a plain `u32` is enough -- no atomic needed. A
+    /// notify that lands while the worker is mid-drain just sets a bit the
+    /// worker's next `take_notified` in the same drain pass will see (this
+    /// field is a bitmask, not a count, so a queue notified twice before a
+    /// drain still only costs one `process_queue` call); the worker's
+    /// post-drain recheck (see `spawn_fs_worker`) is what catches a notify
+    /// that lands after the drain but before the worker parks again.
+    notified: u32,
     nodes: HashMap<u64, Node>,
     inode_ids: HashMap<(u64, u64), u64>,
     next_node: u64,
@@ -318,6 +331,7 @@ impl VirtioFs {
             queue_sel: 0,
             queues: std::array::from_fn(|_| Queue::default()),
             interrupt_status: 0,
+            notified: 0,
             nodes,
             inode_ids,
             next_node: FUSE_ROOT_ID + 1,
@@ -359,8 +373,15 @@ impl VirtioFs {
         self.queues.get_mut(self.queue_sel as usize)
     }
 
-    /// Services a virtio-mmio register access. Queue notifications are drained
-    /// in one batch, avoiding an exit/interrupt round trip per request.
+    /// Services a virtio-mmio register access.
+    ///
+    /// `QUEUE_NOTIFY` never runs a FUSE request here: it only records the
+    /// queue index in `notified` and returns. That is what keeps the vCPU
+    /// off the host filesystem -- `spawn_fs_worker` (`machine_macos.rs`) is
+    /// the thread that actually calls `process_queue`, off the exit path
+    /// entirely. Every other register (status, queue programming, config
+    /// reads, `INTERRUPT_ACK`) is cheap and stays handled inline here, same
+    /// as before.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
@@ -379,7 +400,7 @@ impl VirtioFs {
                     }
                 }
                 reg::QUEUE_NOTIFY if (v as usize) < NUM_QUEUES => {
-                    self.process_queue(mem, v as usize);
+                    self.notified |= 1 << v;
                 }
                 reg::INTERRUPT_ACK => self.interrupt_status &= !v,
                 reg::STATUS => self.status = v,
@@ -451,16 +472,67 @@ impl VirtioFs {
         u64::from_le_bytes(word)
     }
 
-    fn process_queue(&mut self, mem: &GuestRam, queue_idx: usize) {
+    /// Clears and returns the set of queues notified since the last call.
+    /// Only `drain_notified` calls this; kept separate so a test can
+    /// observe the bitmask `mmio` left behind without also draining it.
+    pub(crate) fn take_notified(&mut self) -> u32 {
+        std::mem::take(&mut self.notified)
+    }
+
+    /// Drains every queue flagged by a `QUEUE_NOTIFY` since the last drain.
+    /// This is the worker thread's side of Stage A: `mmio` (the vCPU thread)
+    /// only ever sets bits in `notified`, and this is the only thing that
+    /// clears them and actually calls `process_queue`. Always called with
+    /// the device mutex held, and never from the vCPU thread.
+    pub(crate) fn drain_notified(&mut self, mem: &GuestRam) {
+        self.drain_notified_bounded(mem, u16::MAX);
+    }
+
+    /// Drains every flagged queue, servicing at most `budget` chains from
+    /// each. Returns true when work remained, meaning the caller should hand
+    /// the rest to the worker thread instead of finishing it itself.
+    ///
+    /// This is what lets the vCPU service a shallow queue in its own exit.
+    /// Waking the worker costs a park/unpark and a context switch -- around
+    /// 20us measured -- which is far more than a virtio-fs request against a
+    /// warm local filesystem actually takes (a 4 KiB write is ~7us of host
+    /// time). Handing every request over therefore made small-write workloads
+    /// 2.6x slower than servicing them inline. Deep queues still go to the
+    /// worker, where the handoff is amortised over many requests and the
+    /// overlap with the guest is what matters.
+    pub(crate) fn drain_notified_bounded(&mut self, mem: &GuestRam, budget: u16) -> bool {
+        let mask = self.take_notified();
+        let mut remaining = false;
+        for idx in 0..NUM_QUEUES {
+            if mask & (1 << idx) != 0 && self.process_queue_bounded(mem, idx, budget) {
+                // Re-flag: the queue still has chains the budget did not
+                // cover, and `take_notified` has already cleared the bit.
+                self.notified |= 1 << idx;
+                remaining = true;
+            }
+        }
+        remaining
+    }
+
+    /// Services at most `budget` chains from `queue_idx`. Returns true when
+    /// the queue still had work left over, so a bounded caller knows to hand
+    /// the remainder on rather than dropping it.
+    pub(crate) fn process_queue_bounded(
+        &mut self,
+        mem: &GuestRam,
+        queue_idx: usize,
+        budget: u16,
+    ) -> bool {
         if !self.queues[queue_idx].is_ready() {
-            return;
+            return false;
         }
         let Some(pending) = self.queues[queue_idx].pending(mem) else {
-            return;
+            return false;
         };
+        let take = pending.min(budget);
         let mut last = self.queues[queue_idx].last_avail();
         let mut serviced = false;
-        for _ in 0..pending {
+        for _ in 0..take {
             let Some(slot) = self.queues[queue_idx].avail_slot(last) else {
                 break;
             };
@@ -476,6 +548,7 @@ impl VirtioFs {
         if serviced {
             self.interrupt_status |= 1;
         }
+        take < pending
     }
 
     fn handle_chain(&mut self, mem: &GuestRam, queue_idx: usize, head: u16) -> u32 {
@@ -1366,7 +1439,6 @@ impl VirtioFs {
         if covered < size {
             return None;
         }
-
         let n = match pwritev_retry(&handle.file, &iov, offset) {
             Ok(n) => n,
             Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
@@ -3262,7 +3334,8 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -4229,12 +4302,16 @@ mod tests {
         mem.write_u16(da + 14, next).unwrap();
     }
 
-    /// Publishes `head` as the one available buffer and notifies the device,
-    /// which processes it inline.
+    /// Publishes `head` as the one available buffer, notifies the device,
+    /// then drains it -- standing in for the worker thread that does the
+    /// draining in production (Stage A moved that off `mmio` itself; see
+    /// `queue_notify_only_records_the_index_and_does_no_io` below for a test
+    /// of `mmio`'s half of that split in isolation).
     fn notify_head(dev: &mut VirtioFs, mem: &GuestRam, avail: u64, head: u16) {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, head).unwrap(); // avail.ring[0]
         dev.mmio(mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.drain_notified(mem);
     }
 
     /// The `len` the device reported for the one chain `notify_head` submits.
@@ -4461,6 +4538,274 @@ mod tests {
             dev.zero_copy_counts().1,
             0,
             "an over-declared WRITE reached the zero-copy path"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- Stage A: `QUEUE_NOTIFY` no longer runs the request inline; it just
+    // records the queue index for a worker thread (`spawn_fs_worker` in
+    // `machine_macos.rs`) to drain. The two tests below cover the part of
+    // that split this module can exercise without a live VM: that `mmio`
+    // itself does no I/O, and that the notified-bitmask/`process_queue`
+    // hand-off it feeds is race-free under concurrent access.
+
+    /// `mmio`'s `QUEUE_NOTIFY` arm must return having done nothing but flag
+    /// the queue: no guest-memory access, no FUSE dispatch, no interrupt.
+    /// `drain_notified` -- the worker's call, never the vCPU's -- is what
+    /// actually runs the request.
+    #[test]
+    fn queue_notify_only_records_the_index_and_does_no_io() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"hello").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = open_rw(&mut dev, node);
+
+        let mut backing = vec![0u8; 0x10000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used, in_buf, out) = (
+            base,
+            base + 0x100,
+            base + 0x200,
+            base + 0x1000,
+            base + 0x2000,
+        );
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        let mut req = fuse_in_header(80, READ, 0x1234, node);
+        let mut args = vec![0u8; 40];
+        args[0..8].copy_from_slice(&fh.to_le_bytes());
+        args[16..20].copy_from_slice(&5u32.to_le_bytes());
+        req.extend_from_slice(&args);
+        mem.write(in_buf, &req).unwrap();
+        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        write_desc(&mem, desc, 1, out, OUT_HEADER_LEN as u32 + 5, DESC_WRITE, 0);
+        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
+        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = head 0
+
+        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            0,
+            "QUEUE_NOTIFY must not touch the used ring synchronously"
+        );
+        assert!(
+            !dev.irq_level(),
+            "QUEUE_NOTIFY must not raise an interrupt synchronously -- no \
+             request has run yet"
+        );
+
+        // The worker's side of the split: draining now must service exactly
+        // the request the vCPU thread queued.
+        dev.drain_notified(&mem);
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            1,
+            "drain_notified must service the request the notify flagged"
+        );
+        let mut got = [0u8; 5];
+        mem.read(out + OUT_HEADER_LEN as u64, &mut got).unwrap();
+        assert_eq!(&got, b"hello");
+        assert!(dev.irq_level());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A vCPU services a shallow queue inline and hands a deep one to the
+    /// worker. The budget is what splits the two, so it must service exactly
+    /// that many chains, report that work is left, and re-flag the queue --
+    /// otherwise the remainder is stranded until the guest happens to notify
+    /// again, which for a blocking FUSE call it never will.
+    #[test]
+    fn a_bounded_drain_services_its_budget_and_strands_nothing() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"hello").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = open_rw(&mut dev, node);
+
+        let mut backing = vec![0u8; 0x20000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used) = (base, base + 0x100, base + 0x200);
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        // Four independent READ chains, each a request descriptor followed by
+        // a writable reply descriptor.
+        const CHAINS: u16 = 4;
+        for i in 0..CHAINS {
+            let in_buf = base + 0x1000 + u64::from(i) * 0x200;
+            let out = base + 0x8000 + u64::from(i) * 0x200;
+            let mut req = fuse_in_header(80, READ, 0x100 + u64::from(i), node);
+            let mut args = vec![0u8; 40];
+            args[0..8].copy_from_slice(&fh.to_le_bytes());
+            args[16..20].copy_from_slice(&5u32.to_le_bytes());
+            req.extend_from_slice(&args);
+            mem.write(in_buf, &req).unwrap();
+            write_desc(
+                &mem,
+                desc,
+                i * 2,
+                in_buf,
+                req.len() as u32,
+                DESC_NEXT,
+                i * 2 + 1,
+            );
+            write_desc(
+                &mem,
+                desc,
+                i * 2 + 1,
+                out,
+                OUT_HEADER_LEN as u32 + 5,
+                DESC_WRITE,
+                0,
+            );
+            mem.write_u16(avail + 4 + u64::from(i) * 2, i * 2).unwrap();
+        }
+        mem.write_u16(avail + 2, CHAINS).unwrap();
+
+        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+
+        let remaining = dev.drain_notified_bounded(&mem, 2);
+        assert!(
+            remaining,
+            "a budget below the queue depth must report work left"
+        );
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            2,
+            "a bounded drain must service exactly its budget"
+        );
+
+        // Re-flagged, so the worker picks the rest up without a fresh notify.
+        let remaining = dev.drain_notified_bounded(&mem, u16::MAX);
+        assert!(!remaining, "the second pass should exhaust the queue");
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            CHAINS,
+            "every queued chain must be serviced, none stranded"
+        );
+        for i in 0..CHAINS {
+            let out = base + 0x8000 + u64::from(i) * 0x200;
+            let mut got = [0u8; 5];
+            mem.read(out + OUT_HEADER_LEN as u64, &mut got).unwrap();
+            assert_eq!(&got, b"hello", "chain {i} did not get its reply");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The failure mode Stage A must rule out is notify-during-drain: a
+    /// `QUEUE_NOTIFY` landing on the vCPU thread while the worker thread is
+    /// mid-`drain_notified` must never leave a published request stranded.
+    ///
+    /// This drives `mmio`/`drain_notified` from two real threads sharing an
+    /// `Arc<Mutex<VirtioFs>>`, the same sharing `spawn_fs_worker` uses in
+    /// production: one thread publishes `REQS` independent single-request
+    /// notifies back to back (racing however the scheduler interleaves it
+    /// with the other thread's drains), the other drains in a tight loop.
+    /// After the producer has fully joined -- so every one of its `mmio`
+    /// calls has completed and is visible to whichever thread next takes the
+    /// lock -- one guaranteed final `drain_notified` call is what a real
+    /// worker's post-drain-recheck-before-park does; skipping it is exactly
+    /// the classic lost-wakeup bug this test exists to catch. Every request
+    /// must show up in the used ring exactly once: none stranded, none
+    /// double-serviced.
+    #[test]
+    fn concurrent_notifies_during_a_drain_leave_nothing_stranded() {
+        const REQS: u16 = 64;
+        const QUEUE_SIZE: u32 = 128;
+        // Spaced generously so a GETATTR response (well under 0x200 bytes)
+        // can never reach into the next request's input buffer.
+        const STRIDE: u64 = 0x400;
+
+        let (dir, dev) = fixture();
+        let dev = Arc::new(Mutex::new(dev));
+
+        let mut backing = vec![0u8; 0x20000];
+        let base = 0x4000_0000u64;
+        let mem = Arc::new(GuestRam::new(backing.as_mut_ptr(), base, backing.len()));
+        let (desc, avail, used) = (base, base + 0x1000, base + 0x2000);
+        let bufs = base + 0x4000;
+
+        {
+            let mut d = dev.lock().unwrap();
+            program_queue(&mut d, &mem, QUEUE_SIZE, desc, avail, used);
+        }
+
+        // Lay out REQS independent 2-descriptor chains up front -- guest
+        // descriptor tables are static, only avail/used move as requests are
+        // published and serviced.
+        for i in 0..REQS {
+            let head = i * 2;
+            let in_buf = bufs + u64::from(i) * STRIDE;
+            let out_buf = in_buf + STRIDE / 2;
+            let req = request(GETATTR, FUSE_ROOT_ID, &[]);
+            mem.write(in_buf, &req).unwrap();
+            write_desc(
+                &mem,
+                desc,
+                head,
+                in_buf,
+                req.len() as u32,
+                DESC_NEXT,
+                head + 1,
+            );
+            write_desc(
+                &mem,
+                desc,
+                head + 1,
+                out_buf,
+                (STRIDE / 2) as u32,
+                DESC_WRITE,
+                0,
+            );
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Stands in for the vCPU thread: publishes one request at a time and
+        // rings the doorbell after each.
+        let producer = {
+            let dev = Arc::clone(&dev);
+            let mem = Arc::clone(&mem);
+            std::thread::spawn(move || {
+                for i in 0..REQS {
+                    mem.write_u16(avail + 4 + u64::from(i) * 2, i * 2).unwrap();
+                    mem.write_u16(avail + 2, i + 1).unwrap(); // avail.idx
+                    dev.lock()
+                        .unwrap()
+                        .mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // Stands in for the worker thread's drain loop.
+        let drainer = {
+            let dev = Arc::clone(&dev);
+            let mem = Arc::clone(&mem);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    dev.lock().unwrap().drain_notified(&mem);
+                    std::thread::yield_now();
+                }
+                // The post-drain recheck a real worker does right before
+                // parking again -- guaranteed to observe every notify the
+                // producer made, since `producer.join()` happened-before
+                // `stop.store`, below.
+                dev.lock().unwrap().drain_notified(&mem);
+            })
+        };
+
+        producer.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        drainer.join().unwrap();
+
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            REQS,
+            "every published request must be serviced exactly once -- none \
+             stranded, none double-serviced"
         );
         let _ = fs::remove_dir_all(dir);
     }

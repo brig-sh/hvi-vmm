@@ -31,7 +31,7 @@ use crate::layout::{
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
-use crate::virtio::VirtioBlk;
+use crate::virtio::{reg, VirtioBlk};
 use crate::virtio_fs::VirtioFs;
 use crate::virtio_net::VirtioNet;
 use crate::virtio_vsock::VirtioVsock;
@@ -65,13 +65,62 @@ struct Secondary {
     cv: Condvar,
 }
 
-/// One tagged virtio-fs export and its dynamically assigned transport slot.
+/// One tagged virtio-fs export, its dynamically assigned transport slot, and
+/// the wake signal its dedicated worker thread (`spawn_fs_worker`) parks on.
 #[derive(Clone)]
 struct SharedFs {
     base: u64,
     intid: u32,
     dev: Arc<Mutex<VirtioFs>>,
+    wake: Arc<FsWake>,
 }
+
+/// A virtio-fs device's coalescing wake signal (Stage A: one dedicated
+/// worker thread per device, off the vCPU's exit path). `service_fs` calls
+/// [`FsWake::wake`] unconditionally on every `QUEUE_NOTIFY`, whether or not
+/// the worker looks idle; the worker's [`FsWake::park`] is the standard
+/// predicate-plus-`Condvar` pattern, so a notify landing between the
+/// worker's post-drain recheck and it actually parking is observed rather
+/// than lost -- see `spawn_fs_worker` for the full argument.
+struct FsWake {
+    woken: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl FsWake {
+    fn new() -> Self {
+        Self {
+            woken: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Signals the worker. Safe to call whether or not it is currently
+    /// parked -- a signal that arrives mid-drain is simply picked up on the
+    /// worker's next pass, never lost.
+    fn wake(&self) {
+        let mut woken = self.woken.lock().unwrap();
+        *woken = true;
+        self.ready.notify_one();
+    }
+
+    /// Blocks until the next [`FsWake::wake`], then clears the flag. Never
+    /// called with the virtio-fs device mutex held -- this is purely the
+    /// wake signal, independent of the device's own lock.
+    fn park(&self) {
+        let mut woken = self.woken.lock().unwrap();
+        while !*woken {
+            woken = self.ready.wait(woken).unwrap();
+        }
+        *woken = false;
+    }
+}
+
+/// How many virtio-fs chains a vCPU services in its own exit before handing
+/// the rest to the device's worker thread. Chosen so a single guest syscall's
+/// worth of requests never pays a thread handoff, while a guest that has
+/// queued deeply still gets serviced off the vCPU.
+const FS_INLINE_BUDGET: u16 = 8;
 
 /// State shared across all vCPU threads.
 #[derive(Clone)]
@@ -250,6 +299,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 share.mode.writable(),
                 share.cache,
             )?)),
+            wake: Arc::new(FsWake::new()),
         });
     }
     let has_blk = virtio.is_some();
@@ -355,6 +405,19 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Arc::clone(&shared.mem),
             vm.clone(),
             Arc::clone(&shared.handles),
+        );
+    }
+    // Stage A: each virtio-fs device gets its own worker thread so FUSE
+    // servicing (every host pread/pwrite/stat/getxattr the guest's requests
+    // need) never runs on a vCPU thread. See `spawn_fs_worker`.
+    for fs in &shared.fs {
+        spawn_fs_worker(
+            Arc::clone(&fs.dev),
+            fs.intid,
+            Arc::clone(&shared.mem),
+            vm.clone(),
+            Arc::clone(&shared.handles),
+            Arc::clone(&fs.wake),
         );
     }
     let _raw = RawTerm::enable();
@@ -492,7 +555,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             .iter()
                             .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
                         {
-                            service_fs(&vcpu, &sh, &fs.dev, fs.intid, ipa - fs.base, syn);
+                            service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
                             advance_pc(&vcpu);
                         } else {
                             eprintln!(
@@ -835,21 +898,32 @@ fn service_vsock(
     let _ = sh.vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
 }
 
-/// Services a virtio-fs MMIO transport and its used-ring IRQ.
-fn service_fs(
-    vcpu: &Vcpu,
-    sh: &Shared,
-    dev: &Arc<Mutex<VirtioFs>>,
-    intid: u32,
-    offset: u64,
-    syndrome: u64,
-) {
+/// Services a virtio-fs MMIO transport access.
+///
+/// Every register except `QUEUE_NOTIFY` is handled inline here exactly as
+/// the other virtio devices are: they are cheap and already serialised by
+/// the device mutex. `QUEUE_NOTIFY` is the one exception (Stage A): `mmio`
+/// itself only records the queue index (see its doc comment), so servicing
+/// it here would mean nothing to observe yet -- the request has not run.
+/// Instead this wakes the device's worker thread and returns without
+/// touching the GIC; the worker raises the SPI itself once its drain pass
+/// settles (`spawn_fs_worker`), coalescing however many requests that pass
+/// served into one interrupt.
+///
+/// `INTERRUPT_ACK` is deliberately not special-cased: it still falls
+/// through to the `gic_set_spi(intid, d.irq_level())` below exactly as
+/// before, which is what keeps the SPI line consistent if a completion from
+/// the worker lands concurrently with the ack (both take the device mutex,
+/// so the read of `irq_level()` after the ack always reflects the true
+/// post-ack state, worker races included).
+fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);
     if !da.isv {
         return;
     }
-    let level = {
-        let mut d = dev.lock().unwrap();
+    let is_notify = da.is_write && offset == reg::QUEUE_NOTIFY;
+    {
+        let mut d = fs.dev.lock().unwrap();
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.mem, offset, true, v);
@@ -857,9 +931,37 @@ fn service_fs(
             let v = d.mmio(&sh.mem, offset, false, 0) & width_mask(da.width);
             write_gpr(vcpu, da.reg, v);
         }
-        d.irq_level()
-    };
-    let _ = sh.vm.gic_set_spi(intid, level);
+        // Inside the lock, deliberately. Now that a worker thread also drives
+        // this device, reading the level here and setting the line after
+        // releasing lets the two interleave: an INTERRUPT_ACK that observes
+        // `irq_level() == false` can set the line low *after* a worker that
+        // just completed a request set it high, leaving a filled used ring
+        // with no interrupt. If that was the guest's last outstanding
+        // request nothing will notify again and the FUSE call hangs. Setting
+        // the line while still holding the mutex makes the last writer of
+        // the line the last observer of `interrupt_status`.
+        if !is_notify {
+            let _ = sh.vm.gic_set_spi(fs.intid, d.irq_level());
+        }
+    }
+    if is_notify {
+        // Service a shallow queue right here rather than paying a thread
+        // handoff for it. Waking the worker costs ~20us of park/unpark and
+        // context switch, against ~7us of host time for a 4 KiB write, so
+        // handing every request over made small-write workloads 2.6x slower
+        // than the pre-worker code. Anything past the budget goes to the
+        // worker, which is where a deep queue belongs: the handoff is
+        // amortised and the vCPU gets to run the guest while it drains.
+        let (remaining, level) = {
+            let mut d = fs.dev.lock().unwrap();
+            let remaining = d.drain_notified_bounded(&sh.mem, FS_INLINE_BUDGET);
+            (remaining, d.irq_level())
+        };
+        let _ = sh.vm.gic_set_spi(fs.intid, level);
+        if remaining {
+            fs.wake.wake();
+        }
+    }
 }
 
 /// Bridges the host agent Unix socket to the guest vsock device. Each accepted
@@ -958,6 +1060,58 @@ fn spawn_net_gateway_reader(
             let _ = vm.gic_set_spi(VIRTIO_NET_INTID, level);
             kick_all(&vm, &handles);
         }
+    });
+}
+
+/// Runs a virtio-fs device's FUSE servicing off the vCPU thread (Stage A of
+/// the virtio-fs concurrency work). `service_fs` only ever records a
+/// `QUEUE_NOTIFY` and calls `wake.wake()`; every host syscall a request
+/// needs -- `pread`, `pwrite`, `stat`, `getxattr`, all of it -- happens here
+/// instead, so a vCPU is never blocked behind the host filesystem and the
+/// guest can keep more than one request in flight.
+///
+/// One worker per device, not a pool: `VirtioFs` still has exactly one
+/// `Mutex` guarding all of its state, so this thread is the only thing
+/// draining a given device, same as the vCPU thread used to be. A pool
+/// would need to split that state first (separate per-handle locks, I/O
+/// outside the lock) -- that is Stage B, out of scope here.
+///
+/// Interrupts are coalesced by construction: `drain_notified` empties every
+/// flagged queue under one lock acquisition, so this raises the SPI and
+/// kicks the vCPUs once per drain pass, not once per request however many
+/// requests that pass served.
+///
+/// No lost wakeups: `wake.park()` is the standard predicate-plus-`Condvar`
+/// pattern (see `FsWake`), and the vCPU thread signals unconditionally on
+/// every notify, so a notify racing this loop is either folded into the
+/// drain already in progress (both sides serialise on the device mutex) or
+/// observed by the next `park()` call. The device mutex is held only for
+/// the drain itself, never across `park()`.
+///
+/// Shutdown: like the vsock bridge and the net gateway reader, this runs
+/// until the process exits. There is no VM teardown path today for any of
+/// the host-side bridge threads to hook into, so this does not invent one.
+fn spawn_fs_worker(
+    dev: Arc<Mutex<VirtioFs>>,
+    intid: u32,
+    mem: Arc<GuestRam>,
+    vm: VmGic,
+    handles: Arc<Mutex<Vec<VcpuHandle>>>,
+    wake: Arc<FsWake>,
+) {
+    std::thread::spawn(move || loop {
+        wake.park();
+        {
+            let mut d = dev.lock().unwrap();
+            d.drain_notified(&mem);
+            // Raised under the same mutex the vCPU's INTERRUPT_ACK takes, so
+            // the two cannot interleave into a low line over a non-empty
+            // used ring -- see the matching comment in `service_fs`.
+            let _ = vm.gic_set_spi(intid, d.irq_level());
+        }
+        // Outside the lock: `kick_all` takes the vCPU-handle mutex, and it
+        // does not need to be atomic with the line, only to follow it.
+        kick_all(&vm, &handles);
     });
 }
 
