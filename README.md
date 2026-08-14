@@ -175,10 +175,12 @@ The limits worth knowing before you build on it:
   `--share-rw <path> <tag>` to export unpacked directories through independent
   virtio-fs devices, without block images or host FUSE mounts. Each has one
   request queue and no DAX window; tags must be unique, and the Linux backends
-  are not wired yet. Keep OCI rootfs exports read-only and reserve writable
-  exports for explicit volumes. Writable shares support development workloads:
-  file and directory handles, hard links, atomic rename variants, timestamps,
-  xattrs, locks, allocation/zero/punch, seek/copy, statx/statfs, FIFOs and
-  tmpfiles. Writable exports disable guest metadata/page retention so edits made
-  concurrently on the host are revalidated. This is a single-user mapping:
-  guest uid/gid 0 maps to the macOS user that launched HVI.
+  are not wired yet. Writable shares support development workloads: file and
+  directory handles, hard links, atomic rename variants, timestamps, xattrs,
+  locks, allocation/zero/punch, seek/copy, statx/statfs, FIFOs and tmpfiles.
+  Writable exports disable guest metadata/page retention so edits made
+  concurrently on the host are revalidated. On macOS, Linux mode/uid/gid values
+  are persisted in a private host xattr while the host inode retains enough
+  owner access for the unprivileged VMM; restrictive modes and arbitrary guest
+  owners therefore survive a backend restart. Protect a shared OCI cache with
+  `--share-ro`, or give `--share-rw` an instance-owned APFS clone.
