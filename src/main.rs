@@ -258,7 +258,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disk = None;
-    let mut fs_share = None;
+    let mut fs_shares = Vec::new();
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -281,9 +281,6 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
             "--share-ro" => {
-                if fs_share.is_some() {
-                    return Err("only one --share-ro export is currently supported".into());
-                }
                 let path = it
                     .next()
                     .ok_or("--share-ro needs a host directory and tag")?;
@@ -293,13 +290,19 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if tag.is_empty() || tag.len() > 36 || tag.as_bytes().contains(&0) {
                     return Err("virtio-fs tag must be 1..=36 bytes and contain no NUL".into());
                 }
+                if fs_shares
+                    .iter()
+                    .any(|share: &config::ReadOnlyShare| share.tag == *tag)
+                {
+                    return Err(format!("duplicate virtio-fs tag {tag:?}").into());
+                }
                 let path = std::fs::canonicalize(path)?;
                 if !path.is_dir() {
                     return Err(
                         format!("virtio-fs export is not a directory: {}", path.display()).into(),
                     );
                 }
-                fs_share = Some(config::ReadOnlyShare {
+                fs_shares.push(config::ReadOnlyShare {
                     path,
                     tag: tag.clone(),
                 });
@@ -347,7 +350,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: mem_mib << 20,
         cmdline,
         disk,
-        fs_share,
+        fs_shares,
         net,
         net_gateway,
         net_tap,

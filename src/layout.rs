@@ -36,6 +36,20 @@ pub const VIRTIO_VSOCK_SPI: u32 = 4;
 pub const VIRTIO_FS_BASE: u64 = 0x0200_0600;
 pub const VIRTIO_FS_SPI: u32 = 5;
 
+/// Placement of the `index`th virtio-fs device. Each export gets an
+/// independent transport and interrupt because one virtio-fs device carries
+/// exactly one mount tag.
+#[must_use]
+pub fn virtio_fs_base(index: usize) -> Option<u64> {
+    let offset = (index as u64).checked_mul(VIRTIO_SIZE)?;
+    VIRTIO_FS_BASE.checked_add(offset)
+}
+
+#[must_use]
+pub fn virtio_fs_spi(index: usize) -> Option<u32> {
+    VIRTIO_FS_SPI.checked_add(u32::try_from(index).ok()?)
+}
+
 /// GICv3 placement, defaulting to the QEMU virt values.
 /// Which GIC architecture the guest is given.
 ///

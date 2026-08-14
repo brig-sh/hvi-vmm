@@ -15,8 +15,7 @@ use vm_fdt::{Error, FdtWriter};
 
 use crate::layout::{
     GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
-    VIRTIO_FS_BASE, VIRTIO_FS_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 
 const PHANDLE_GIC: u32 = 1;
@@ -34,7 +33,7 @@ pub struct VirtioDevices {
     pub blk: bool,
     pub net: bool,
     pub vsock: bool,
-    pub fs: bool,
+    pub fs_count: usize,
 }
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
@@ -191,8 +190,15 @@ pub fn build(
     if devices.vsock {
         virtio_node(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI)?;
     }
-    if devices.fs {
-        virtio_node(VIRTIO_FS_BASE, VIRTIO_FS_SPI)?;
+    for index in 0..devices.fs_count {
+        // The machine validates these placements before it asks us to build;
+        // checked helpers keep a pathological library caller from wrapping.
+        if let (Some(base), Some(spi)) = (
+            crate::layout::virtio_fs_base(index),
+            crate::layout::virtio_fs_spi(index),
+        ) {
+            virtio_node(base, spi)?;
+        }
     }
 
     fdt.end_node(root)?;
@@ -249,13 +255,14 @@ mod tests {
             1,
             "",
             VirtioDevices {
-                fs: true,
+                fs_count: 2,
                 ..VirtioDevices::default()
             },
         )
         .unwrap();
         assert!(!contains(&absent, "virtio_mmio@2000600"));
         assert!(contains(&present, "virtio_mmio@2000600"));
+        assert!(contains(&present, "virtio_mmio@2000800"));
     }
 
     /// Returns true if `needle` appears in the blob's strings/structure, which

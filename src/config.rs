@@ -22,9 +22,10 @@ pub struct BootConfig {
     pub mem_bytes: u64,
     pub cmdline: String,
     pub disk: Option<String>,
-    /// An unpacked directory shared read-only with the guest through
-    /// virtio-fs. Linux mounts this by `tag`; no block image is involved.
-    pub fs_share: Option<ReadOnlyShare>,
+    /// Unpacked directories shared read-only with the guest through
+    /// independent virtio-fs devices. The Linux guest mounts each by `tag`;
+    /// no block images are involved.
+    pub fs_shares: Vec<ReadOnlyShare>,
     pub net: bool,
     /// When set, virtio-net relays frames to this gvisor-tap-vsock gateway QEMU
     /// stream socket (real egress) instead of the built-in user-space stack.

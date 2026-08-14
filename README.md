@@ -67,7 +67,7 @@ cargo check --target aarch64-unknown-linux-gnu
 ```sh
 hvi boot --kernel <arm64 Image | x86-64 bzImage> \
   [--initramfs <cpio>] [--disk <raw.img>] [--mem-mib N] [--cpus N] \
-  [--share-ro <host-directory> <mount-tag>] \
+  [--share-ro <host-directory> <mount-tag>]... \
   [--net | --net-gateway <gvisor-tap .qemu socket>] \
   [--agent-sock <unix socket>] \
   [--events <ledger.ndjson>] [--sandbox-id <id>] [--no-sandbox]
@@ -170,7 +170,8 @@ The limits worth knowing before you build on it:
   Mach-O invalidates it, so `codesign` after every build, not once.
 - **One disk and one NIC.** `--disk` and `--net` take a single device each;
   there is no hotplug, and no PCI at all.
-- **One read-only directory share on macOS.** `--share-ro <path> <tag>` exports
-  an unpacked directory through virtio-fs without a block image or host FUSE
-  mount. It has one request queue and no DAX window; use an in-guest overlay
-  for writes. Additional shares and the Linux backends are not wired yet.
+- **Read-only directory shares on macOS.** Repeat
+  `--share-ro <path> <tag>` to export unpacked directories through independent
+  virtio-fs devices, without block images or host FUSE mounts. Each has one
+  request queue and no DAX window; tags must be unique, and the Linux backends
+  are not wired yet. Use in-guest overlays for writes.
