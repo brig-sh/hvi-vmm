@@ -29,10 +29,11 @@
 //! is: one line later and the profile would have to grant filesystem and socket
 //! rights it can now refuse outright. The one exception is virtio-fs: directory
 //! entries and files are opened lazily as the guest requests them. When
-//! shares are configured, [`enter_with_shares`] appends one narrow subpath rule
-//! for every already-canonical export root. Read-only exports receive
-//! `file-read*`; writable exports also receive `file-write*`. The path is
-//! required to be UTF-8/control-free and SBPL-escaped before interpolation;
+//! shares are configured,
+//! [`enter_with_shares`](crate::sandbox::enter_with_shares) appends one narrow
+//! subpath rule for every already-canonical export root. Read-only exports
+//! receive `file-read*`; writable exports also receive `file-write*`. The path
+//! is required to be UTF-8/control-free and SBPL-escaped before interpolation;
 //! every path outside those subtrees remains denied.
 //!
 //! The vCPU threads are created *after* this point and that is fine:
