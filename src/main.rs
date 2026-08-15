@@ -380,7 +380,14 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Set before any share is served: the mapping is read on every attribute
     // reply, and a device already answering with the old identity would hand
     // the guest a home it cannot write.
+    //
+    // macOS only, because virtio_fs is: the Linux backend has no in-process
+    // file server to tell. The flags still parse there so a command line is
+    // portable, they simply have nothing to configure.
+    #[cfg(target_os = "macos")]
     hvi::virtio_fs::set_guest_ids(fs_uid, fs_gid);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (fs_uid, fs_gid);
 
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
