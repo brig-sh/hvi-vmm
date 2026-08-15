@@ -258,6 +258,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disk = None;
+    let mut fs_uid: u32 = 0;
+    let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
     let mut net = false;
     let mut net_gateway = None;
@@ -280,6 +282,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
+            // Who the host's files belong to inside the guest. Defaults to
+            // root, which suits a guest whose workload runs as root; a guest
+            // running as anyone else needs its own uid here, or every write to
+            // a shared directory is refused by the guest kernel before it
+            // reaches us. See virtio_fs::set_guest_ids.
+            "--fs-uid" => fs_uid = it.next().ok_or("--fs-uid needs a value")?.parse()?,
+            "--fs-gid" => fs_gid = it.next().ok_or("--fs-gid needs a value")?.parse()?,
             "--share-ro" | "--share-rw" => {
                 let mode = if a == "--share-rw" {
                     config::ShareMode::ReadWrite
@@ -368,6 +377,11 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let kernel_path = kernel.ok_or("boot needs --kernel <Image>")?;
+    // Set before any share is served: the mapping is read on every attribute
+    // reply, and a device already answering with the old identity would hand
+    // the guest a home it cannot write.
+    hvi::virtio_fs::set_guest_ids(fs_uid, fs_gid);
+
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
         initramfs: initramfs.map(std::fs::read).transpose()?,
