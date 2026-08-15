@@ -23,6 +23,7 @@ use std::os::unix::fs::{
 };
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
@@ -2400,7 +2401,7 @@ fn path_cstring(path: &Path) -> Result<CString, i32> {
 
 #[cfg(target_os = "linux")]
 fn guest_uid_to_host(uid: u32) -> libc::uid_t {
-    if uid == 0 {
+    if uid == guest_uid() {
         unsafe { libc::geteuid() }
     } else {
         uid
@@ -2409,16 +2410,46 @@ fn guest_uid_to_host(uid: u32) -> libc::uid_t {
 
 #[cfg(target_os = "linux")]
 fn guest_gid_to_host(gid: u32) -> libc::gid_t {
-    if gid == 0 {
+    if gid == guest_gid() {
         unsafe { libc::getegid() }
     } else {
         gid
     }
 }
 
+/// The guest-side identity the host user is presented as.
+///
+/// Everything the host user owns appears inside the guest as this uid/gid, and
+/// the guest writing as it maps back. Zero -- the default -- makes the person
+/// running hvi root in the guest, which is what a guest whose workload runs as
+/// root needs.
+///
+/// It is configurable because that default silently locks out every guest that
+/// does *not* run as root. Such a guest sees a home directory owned by a root
+/// it is not, and the guest kernel refuses the write before the request ever
+/// reaches this file server -- so the failure is a bare EACCES with nothing
+/// pointing at the mapping that caused it. Point these at the uid the workload
+/// runs as and the files belong to it.
+static GUEST_UID: AtomicU32 = AtomicU32::new(0);
+static GUEST_GID: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the identity above. Call once, before the device is served.
+pub fn set_guest_ids(uid: u32, gid: u32) {
+    GUEST_UID.store(uid, Ordering::Relaxed);
+    GUEST_GID.store(gid, Ordering::Relaxed);
+}
+
+fn guest_uid() -> u32 {
+    GUEST_UID.load(Ordering::Relaxed)
+}
+
+fn guest_gid() -> u32 {
+    GUEST_GID.load(Ordering::Relaxed)
+}
+
 fn host_uid_to_guest(uid: u32) -> u32 {
     if uid == unsafe { libc::geteuid() } {
-        0
+        guest_uid()
     } else {
         uid
     }
@@ -2426,7 +2457,7 @@ fn host_uid_to_guest(uid: u32) -> u32 {
 
 fn host_gid_to_guest(gid: u32) -> u32 {
     if gid == unsafe { libc::getegid() } {
-        0
+        guest_gid()
     } else {
         gid
     }
