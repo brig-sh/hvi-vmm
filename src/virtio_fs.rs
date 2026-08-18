@@ -1510,6 +1510,15 @@ impl VirtioFs {
         if !directory && meta.is_dir() {
             return Err(EISDIR);
         }
+        // Only a regular file may be opened here. Opening a FIFO blocks until
+        // the other end is opened, and this request holds the device mutex --
+        // on the vCPU thread when the queue is shallow enough to be served
+        // inline -- so the guest would stop the VM rather than just itself.
+        // A guest kernel opens a FIFO, socket or device node on a FUSE mount
+        // itself and never sends OPEN for one, so refusing costs it nothing.
+        if !directory && !meta.is_file() {
+            return Err(EPERM);
+        }
         let fh = if directory {
             self.insert_dir_handle(&path)?
         } else {
@@ -4484,6 +4493,34 @@ mod tests {
         let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
         assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -EINVAL);
         assert!(dir.join("etc").is_dir());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Opening a FIFO blocks until the other end is opened, and the device
+    /// serves a request holding its own mutex, on the vCPU thread for a
+    /// shallow queue. A guest that made a FIFO and opened it therefore stopped
+    /// the whole VM, not just its own request.
+    #[test]
+    fn opening_a_fifo_is_refused_rather_than_blocking() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut mknod = vec![0u8; 16];
+        mknod[0..4].copy_from_slice(&(S_IFIFO | 0o644).to_le_bytes());
+        mknod.extend_from_slice(b"pipe\0");
+        let out = dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &mknod), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        // Served on another thread so a regression fails this test instead of
+        // hanging the suite the way it would hang a guest.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = dev.handle_fuse(&request(OPEN, node, &[0u8; 8]), 4096);
+            let _ = tx.send(i32::from_le_bytes(out[4..8].try_into().unwrap()));
+        });
+        let errno = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO blocked the device");
+        assert_eq!(errno, -EPERM);
         let _ = fs::remove_dir_all(dir);
     }
 
