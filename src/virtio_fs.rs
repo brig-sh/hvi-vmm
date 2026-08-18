@@ -160,6 +160,9 @@ const LINUX_F_UNLCK: u32 = 2;
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFREG: u32 = 0o100000;
+const S_IFSOCK: u32 = 0o140000;
+/// `DT_SOCK`, the readdir type byte for a socket.
+const DT_SOCK: u32 = 12;
 
 // Linux errno values. Host errno numbers are not portable from macOS to the
 // Linux guest, so errors are translated explicitly.
@@ -254,6 +257,28 @@ struct DirHandle {
     entries: Vec<DirEntryInfo>,
 }
 
+/// A guest-created Unix socket, held in the device rather than on the host.
+/// See `VirtioFs::sockets`.
+#[derive(Clone, Copy)]
+struct SocketNode {
+    /// `S_IFSOCK` and the permission bits. Kept here so `chmod` on a socket
+    /// works: a caller may well insist on 0700 before it will use one.
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    /// Stable for the socket's whole life. A guest that looks the path up
+    /// again after its cache is dropped has to arrive at the same inode, or
+    /// the socket the server is bound to becomes unreachable.
+    ino: u64,
+}
+
+/// The `st_dev` synthetic inodes are numbered under.
+///
+/// `inode_ids` is keyed by the host's `(dev, ino)`, so a synthetic node needs
+/// a device number no `stat` can return. macOS `dev_t` is 32-bit, so the top
+/// of the 64-bit space cannot collide.
+const SOCKET_DEV: u64 = u64::MAX;
+
 struct Node {
     key: (u64, u64),
     paths: Vec<PathBuf>,
@@ -292,6 +317,24 @@ pub struct VirtioFs {
     nodes: HashMap<u64, Node>,
     inode_ids: HashMap<(u64, u64), u64>,
     next_node: u64,
+    /// Unix sockets the guest has bound inside a share, by path.
+    ///
+    /// They live here rather than on the host because a socket needs the
+    /// filesystem for exactly two things -- an inode reporting `S_IFSOCK`,
+    /// and an identity stable enough that a later lookup finds the same one.
+    /// The rendezvous and every byte of data belong to the guest kernel's own
+    /// unix socket table, and no FUSE request ever carries socket traffic, so
+    /// there is nothing the host has to store.
+    ///
+    /// Keeping them out of the share is the point rather than a limitation.
+    /// The host cannot make one anyway -- `mknod(S_IFSOCK)` is EPERM on macOS
+    /// without root, and `bind(2)` cannot reach these paths at all, since a
+    /// share's host path is routinely longer than `sun_path`'s 104 bytes --
+    /// and serving them from here keeps a guest-controlled inode type off the
+    /// host filesystem, which is what the device refused them for to begin
+    /// with.
+    sockets: HashMap<PathBuf, SocketNode>,
+    next_socket_ino: u64,
     handles: HashMap<u64, FileHandle>,
     dir_handles: HashMap<u64, DirHandle>,
     next_handle: u64,
@@ -357,6 +400,8 @@ impl VirtioFs {
             nodes,
             inode_ids,
             next_node: FUSE_ROOT_ID + 1,
+            sockets: HashMap::new(),
+            next_socket_ino: 1,
             handles: HashMap::new(),
             dir_handles: HashMap::new(),
             next_handle: 1,
@@ -859,6 +904,13 @@ impl VirtioFs {
         } else {
             parent_path.join(OsStr::from_bytes(name))
         };
+        // A socket this device holds has no host entry to stat, so it is
+        // looked for before the error is reported rather than after.
+        if let Some(socket) = self.sockets.get(&path).copied() {
+            let node = self.socket_node_id(&path, socket.ino);
+            self.remember_lookup(node);
+            return Ok(socket_entry_out(node, socket));
+        }
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
@@ -866,6 +918,9 @@ impl VirtioFs {
     }
 
     fn getattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+        if let Some((_, socket)) = self.socket_at(node) {
+            return Ok(socket_attr_out(node, socket));
+        }
         let flags = get_u32(input, 0).unwrap_or(0);
         let fh = get_u64(input, 8).unwrap_or(0);
         let (path, meta) = if flags & FUSE_GETATTR_FH != 0 {
@@ -883,6 +938,24 @@ impl VirtioFs {
     fn setattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let valid = get_u32(input, 0).ok_or(EINVAL)?;
+        // A socket's attributes live in this device, so a chmod or chown of
+        // one updates the record instead of reaching for a file that is not
+        // there. This is not academic: a program may refuse to use a socket
+        // whose directory or mode is not what it left it as.
+        if let Some((path, mut socket)) = self.socket_at(node) {
+            if valid & FATTR_MODE != 0 {
+                let mode = get_u32(input, 68).ok_or(EINVAL)?;
+                socket.mode = S_IFSOCK | (mode & 0o7777);
+            }
+            if valid & FATTR_UID != 0 {
+                socket.uid = get_u32(input, 76).ok_or(EINVAL)?;
+            }
+            if valid & FATTR_GID != 0 {
+                socket.gid = get_u32(input, 80).ok_or(EINVAL)?;
+            }
+            self.sockets.insert(path, socket);
+            return Ok(socket_attr_out(node, socket));
+        }
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
         let size = get_u64(input, 16).ok_or(EINVAL)?;
         let atime = get_u64(input, 32).ok_or(EINVAL)?;
@@ -1095,11 +1168,73 @@ impl VirtioFs {
                 .map_err(io_errno)?;
             }
             S_IFIFO => host_mkfifo(&path, host_creation_mode(mode, false))?,
-            // Never create host device nodes or sockets from a guest.
+            // A socket is served from this device rather than created on the
+            // host: see `VirtioFs::sockets`. `bind(2)` in the guest is what
+            // lands here, and it expects the entry to exist afterwards.
+            S_IFSOCK => return self.create_socket(path, mode, context),
+            // Never create host device nodes from a guest.
             _ => return Err(EPERM),
         }
         initialize_guest_metadata(&path, mode, context)?;
         self.new_entry(path)
+    }
+
+    /// Records a socket at `path` and answers as if it had been created.
+    fn create_socket(
+        &mut self,
+        path: PathBuf,
+        mode: u32,
+        context: RequestContext,
+    ) -> Result<Vec<u8>, i32> {
+        // A host entry at the same name wins: the guest asked to create
+        // something that is already there, whatever its type.
+        if fs::symlink_metadata(&path).is_ok() || self.sockets.contains_key(&path) {
+            return Err(EEXIST);
+        }
+        let ino = self.next_socket_ino;
+        self.next_socket_ino = self.next_socket_ino.saturating_add(1);
+        let socket = SocketNode {
+            mode: S_IFSOCK | (mode & 0o7777),
+            uid: context.uid,
+            gid: context.gid,
+            ino,
+        };
+        self.sockets.insert(path.clone(), socket);
+        let node = self.socket_node_id(&path, ino);
+        self.remember_lookup(node);
+        Ok(socket_entry_out(node, socket))
+    }
+
+    /// The node id for a socket, allocated once and then remembered, so a
+    /// lookup after the guest dropped its cache lands on the same inode.
+    fn socket_node_id(&mut self, path: &Path, ino: u64) -> u64 {
+        let key = (SOCKET_DEV, ino);
+        if let Some(node) = self.inode_ids.get(&key) {
+            return *node;
+        }
+        let node = self.next_node;
+        self.next_node = self.next_node.saturating_add(1);
+        self.inode_ids.insert(key, node);
+        self.nodes.insert(
+            node,
+            Node {
+                key,
+                paths: vec![path.to_owned()],
+                lookups: 0,
+                guest_attr: None,
+            },
+        );
+        node
+    }
+
+    /// The socket at `node`, if that node is one.
+    fn socket_at(&self, node: u64) -> Option<(PathBuf, SocketNode)> {
+        let remembered = self.nodes.get(&node)?;
+        if remembered.key.0 != SOCKET_DEV {
+            return None;
+        }
+        let path = remembered.paths.first()?;
+        self.sockets.get(path).map(|s| (path.clone(), *s))
     }
 
     fn mkdir(
@@ -1150,6 +1285,22 @@ impl VirtioFs {
         self.require_writable()?;
         let name = nul_name(input, 0)?;
         let path = self.child_path(parent, name)?;
+        // Unlinking a socket takes it out of this device and leaves the host
+        // alone, because putting it there was never part of creating it.
+        if !directory && self.sockets.remove(&path).is_some() {
+            let stale: Vec<u64> = self
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.key.0 == SOCKET_DEV && node.paths.contains(&path))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in stale {
+                if let Some(node) = self.nodes.remove(&id) {
+                    self.inode_ids.remove(&node.key);
+                }
+            }
+            return Ok(Vec::new());
+        }
         let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
         if directory {
             fs::remove_dir(&path).map_err(io_errno)?;
@@ -1514,6 +1665,22 @@ impl VirtioFs {
                 file_type: entry.file_type().ok(),
             })
             .collect();
+        // Sockets this device holds are in no host directory, so they are
+        // added here rather than found by `read_dir`. Doing it while the
+        // handle is built means the listing is a snapshot like every other
+        // entry's, and the pagination below needs to know nothing about them.
+        for (socket_path, socket) in &self.sockets {
+            if socket_path.parent() != Some(path) {
+                continue;
+            }
+            if let Some(name) = socket_path.file_name() {
+                entries.push(DirEntryInfo {
+                    name: name.to_owned(),
+                    ino: socket.ino,
+                    file_type: None,
+                });
+            }
+        }
         entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
         entries.insert(
             0,
@@ -1919,6 +2086,20 @@ impl VirtioFs {
             }
 
             if plus {
+                // A socket has no host entry behind it, so its attributes
+                // come from this device rather than from a stat.
+                if let Some(socket) = self.sockets.get(&path).copied() {
+                    let entry_node = self.socket_node_id(&path, socket.ino);
+                    self.remember_lookup(entry_node);
+                    out.extend_from_slice(&socket_entry_out(entry_node, socket));
+                    put_u64(&mut out, entry_node);
+                    put_u64(&mut out, (idx + 1) as u64);
+                    put_u32(&mut out, name.len() as u32);
+                    put_u32(&mut out, DT_SOCK);
+                    out.extend_from_slice(name);
+                    out.resize(align8(out.len()), 0);
+                    continue;
+                }
                 // READDIRPLUS always needs full attributes, so the d_type
                 // fast path below does not apply here.
                 let meta = match fs::symlink_metadata(&path) {
@@ -1944,9 +2125,15 @@ impl VirtioFs {
                 // off the directory at OPENDIR time and needs no stat here.
                 let (entry_ino, dtype) = match entry.file_type {
                     Some(ft) if idx > 1 => (entry.ino, dirent_type_ft(&ft)),
-                    _ => match fs::symlink_metadata(&path) {
-                        Ok(meta) => (meta.ino(), dirent_type(&meta)),
-                        Err(_) => continue,
+                    // A socket carries no cached `d_type` -- it came from
+                    // this device, not from a dirent -- and there is nothing
+                    // to stat, so it is answered from the record.
+                    _ => match self.sockets.get(&path) {
+                        Some(socket) => (socket.ino, DT_SOCK),
+                        None => match fs::symlink_metadata(&path) {
+                            Ok(meta) => (meta.ino(), dirent_type(&meta)),
+                            Err(_) => continue,
+                        },
                     },
                 };
                 let entry_node = if idx == 0 {
@@ -2231,6 +2418,56 @@ impl VirtioFs {
             n.guest_attr = None;
         }
     }
+}
+
+/// The attribute block for a socket this device holds rather than the host.
+///
+/// Everything a socket inode has is in `SocketNode`; there is no `Metadata` to
+/// read because there is no file. Sizes and timestamps are zero, which is what
+/// a freshly bound socket looks like anyway, and nothing consults them.
+fn put_socket_attr(out: &mut Vec<u8>, node: u64, socket: SocketNode) {
+    put_u64(out, node);
+    put_u64(out, 0); // size
+    put_u64(out, 0); // blocks
+    put_u64(out, 0); // atime
+    put_u64(out, 0); // mtime
+    put_u64(out, 0); // ctime
+    put_u32(out, 0);
+    put_u32(out, 0);
+    put_u32(out, 0);
+    put_u32(out, socket.mode);
+    put_u32(out, 1); // nlink
+    put_u32(out, socket.uid);
+    put_u32(out, socket.gid);
+    put_u32(out, 0); // rdev
+    put_u32(out, 4096); // blksize
+    put_u32(out, 0);
+}
+
+fn socket_entry_out(node: u64, socket: SocketNode) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    put_u64(&mut out, node);
+    put_u64(&mut out, 1); // generation
+                          // No entry/attribute caching. The guest kernel is the only thing that can
+                          // tell us a socket has gone, and it does that with UNLINK, so there is
+                          // nothing to rediscover by expiring the entry -- but a zero timeout keeps
+                          // the guest asking us rather than trusting a cached negative if a lookup
+                          // and an unlink race.
+    put_u64(&mut out, 0);
+    put_u64(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_socket_attr(&mut out, node, socket);
+    out
+}
+
+fn socket_attr_out(node: u64, socket: SocketNode) -> Vec<u8> {
+    let mut out = Vec::with_capacity(104);
+    put_u64(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_socket_attr(&mut out, node, socket);
+    out
 }
 
 fn attr_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
@@ -3499,6 +3736,93 @@ mod tests {
 
     fn fixture() -> (PathBuf, VirtioFs) {
         fixture_with_access(false)
+    }
+
+    /// A guest binding a Unix socket sends MKNOD with S_IFSOCK. It has to
+    /// succeed, and nothing may appear on the host: a socket needs the
+    /// filesystem only for an inode of the right type, because the rendezvous
+    /// and the data are the guest kernel's own business. Proven on Linux
+    /// against a FUSE filesystem whose sockets were backed by nothing at all --
+    /// bind, connect and a round trip between two processes all worked.
+    #[test]
+    fn a_guest_socket_is_served_without_touching_the_host() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut payload = Vec::new();
+        put_u32(&mut payload, S_IFSOCK | 0o700);
+        put_u32(&mut payload, 0); // rdev
+        put_u32(&mut payload, 0); // umask
+        put_u32(&mut payload, 0); // padding
+        payload.extend_from_slice(b"control.sock\0");
+
+        let out = dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &payload), 4096);
+        assert_eq!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            0,
+            "MKNOD of a socket was refused"
+        );
+
+        // The host has nothing, which is the whole point.
+        assert!(
+            !dir.join("control.sock").exists(),
+            "a socket reached the host filesystem"
+        );
+
+        // The guest sees it, with the type and mode it asked for.
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"control.sock\0");
+        let attrs = dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        let mode = u32::from_le_bytes(attrs[92..96].try_into().unwrap());
+        assert_eq!(mode & S_IFMT, S_IFSOCK, "not reported as a socket");
+        assert_eq!(mode & 0o7777, 0o700, "mode was not preserved");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The identity requirement. A guest that drops its cache and looks the
+    /// path up again must arrive at the same inode, or the socket its server
+    /// is bound to becomes unreachable. Verified on Linux by dropping the
+    /// kernel's dentry cache under a live bind and reconnecting.
+    #[test]
+    fn a_socket_keeps_its_identity_across_lookups() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut payload = Vec::new();
+        put_u32(&mut payload, S_IFSOCK | 0o700);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        payload.extend_from_slice(b"keep.sock\0");
+        dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &payload), 4096);
+
+        let first = lookup_node(&mut dev, FUSE_ROOT_ID, b"keep.sock\0");
+        let second = lookup_node(&mut dev, FUSE_ROOT_ID, b"keep.sock\0");
+        assert_eq!(first, second, "the same socket resolved to two nodes");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Unlinking takes the socket out of the device, and the host -- which
+    /// never had it -- is left alone.
+    #[test]
+    fn unlinking_a_socket_removes_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut payload = Vec::new();
+        put_u32(&mut payload, S_IFSOCK | 0o700);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        payload.extend_from_slice(b"gone.sock\0");
+        dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &payload), 4096);
+
+        let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"gone.sock\0"), 4096);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), 0);
+
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"gone.sock\0"), 4096);
+        assert_eq!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            -ENOENT,
+            "the socket outlived its unlink"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn lookup_node(dev: &mut VirtioFs, parent: u64, name: &[u8]) -> u64 {
