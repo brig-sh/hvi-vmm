@@ -191,9 +191,9 @@ impl GuestRam {
         Ok(())
     }
 
-    /// Borrows `[gpa, gpa+len)` as host memory, for a caller that wants to
-    /// hand the bytes to a syscall (`preadv`/`pwritev`-style) rather than
-    /// copy them through an intermediate buffer.
+    /// Addresses `[gpa, gpa+len)` in the host mapping, for a caller that hands
+    /// the bytes to a syscall (`preadv`/`pwritev`-style) rather than copying
+    /// them through an intermediate buffer.
     ///
     /// # Errors
     ///
@@ -202,33 +202,20 @@ impl GuestRam {
     ///
     /// # Safety contract
     ///
-    /// Same as `read`/`write`: the bytes race the running guest, which is
-    /// intrinsic to servicing a virtqueue the guest may concurrently touch.
-    pub fn slice(&self, gpa: u64, len: usize) -> io::Result<&[u8]> {
+    /// Returns a raw pointer, not a slice, on purpose. A `&[u8]` or
+    /// `&mut [u8]` would tell the compiler something untrue about these
+    /// bytes: the guest runs while the syscall is in flight, and a guest may
+    /// point two descriptors of one chain at one address, so a caller
+    /// assembling an iovec array would hold overlapping borrows of the same
+    /// memory. Handing back a pointer keeps the bounds check and drops the
+    /// aliasing claim, which is the part that was never true.
+    ///
+    /// The caller owes the usual raw-pointer duties: stay within `len`, and
+    /// expect the bytes to race the running guest as `read`/`write` do.
+    pub fn host_ptr(&self, gpa: u64, len: usize) -> io::Result<*mut u8> {
         let off = self.offset(gpa, len)?;
         // SAFETY: `off..off+len` is in-bounds, checked above by `offset`.
-        Ok(unsafe { std::slice::from_raw_parts(self.host.add(off), len) })
-    }
-
-    /// Mutably borrows `[gpa, gpa+len)` as host memory.
-    ///
-    /// # Errors
-    ///
-    /// Errors if the range is outside mapped guest RAM or straddles the MMIO
-    /// hole.
-    ///
-    /// # Safety contract
-    ///
-    /// Takes `&self`, not `&mut self` -- the same interior-mutability model
-    /// this module documents at the top (the host mapping outlives every
-    /// vCPU thread and every access is bounds-checked; nothing here upgrades
-    /// that to an exclusive borrow the compiler could rely on for aliasing).
-    /// Same race-with-the-guest caveat as `read`/`write`/`slice`.
-    #[allow(clippy::mut_from_ref)] // deliberate: see the safety contract above
-    pub fn slice_mut(&self, gpa: u64, len: usize) -> io::Result<&mut [u8]> {
-        let off = self.offset(gpa, len)?;
-        // SAFETY: `off..off+len` is in-bounds, checked above by `offset`.
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.host.add(off), len) })
+        Ok(unsafe { self.host.add(off) })
     }
 
     pub fn read_u16(&self, gpa: u64) -> io::Result<u16> {
@@ -289,27 +276,25 @@ mod tests {
     }
 
     #[test]
-    fn slice_in_bounds_reads_what_slice_mut_wrote() {
+    fn host_ptr_in_bounds_addresses_the_mapping() {
         let mut backing = vec![0u8; 0x1000];
         let base = 0x4000_0000;
         let ram = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
-        ram.slice_mut(base + 0x10, 4)
-            .unwrap()
-            .copy_from_slice(&0xdead_beefu32.to_le_bytes());
-        assert_eq!(
-            ram.slice(base + 0x10, 4).unwrap(),
-            0xdead_beefu32.to_le_bytes()
-        );
+        let ptr = ram.host_ptr(base + 0x10, 4).unwrap();
+        // SAFETY: `host_ptr` bounds-checked these four bytes.
+        unsafe { std::ptr::copy_nonoverlapping(0xdead_beefu32.to_le_bytes().as_ptr(), ptr, 4) };
+        let mut got = [0u8; 4];
+        ram.read(base + 0x10, &mut got).unwrap();
+        assert_eq!(u32::from_le_bytes(got), 0xdead_beef);
     }
 
     #[test]
-    fn slice_out_of_bounds_errors() {
+    fn host_ptr_out_of_bounds_errors() {
         let mut backing = vec![0u8; 0x1000];
         let base = 0x4000_0000;
         let ram = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
-        assert!(ram.slice(base - 4, 4).is_err());
-        assert!(ram.slice(base + 0x0ffe, 4).is_err());
-        assert!(ram.slice_mut(base + 0x0ffe, 4).is_err());
+        assert!(ram.host_ptr(base - 4, 4).is_err());
+        assert!(ram.host_ptr(base + 0x0ffe, 4).is_err());
     }
 }
 
@@ -376,15 +361,14 @@ mod split_tests {
         assert!(ram.read(LOW as u64 - 8, &mut buf).is_ok());
     }
 
-    /// `slice`/`slice_mut` share `offset()` with `read`/`write`, so they must
-    /// refuse the same straddling range rather than silently handing back
+    /// `host_ptr` shares `offset()` with `read`/`write`, so it must refuse the
+    /// same straddling range rather than silently handing back a pointer to
     /// bytes that jump from the low half into the high half.
     #[test]
-    fn slice_may_not_straddle_the_seam() {
+    fn host_ptr_may_not_straddle_the_seam() {
         let (_b, ram) = split();
-        assert!(ram.slice(LOW as u64 - 4, 8).is_err());
-        assert!(ram.slice(LOW as u64 - 8, 8).is_ok());
-        assert!(ram.slice_mut(LOW as u64 - 4, 8).is_err());
+        assert!(ram.host_ptr(LOW as u64 - 4, 8).is_err());
+        assert!(ram.host_ptr(LOW as u64 - 8, 8).is_ok());
     }
 
     #[test]
