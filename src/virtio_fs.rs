@@ -330,6 +330,11 @@ impl VirtioFs {
         }
         let mut tag_buf = [0u8; TAG_LEN];
         tag_buf[..bytes.len()].copy_from_slice(bytes);
+        // Every containment check below compares a resolved path against this
+        // one, and a prefix test between a resolved path and an unresolved
+        // root silently passes. Resolve it here rather than trusting the
+        // caller to have done it.
+        let root = fs::canonicalize(&root)?;
         let mut nodes = HashMap::new();
         let root_meta = fs::symlink_metadata(&root)?;
         nodes.insert(
@@ -848,6 +853,7 @@ impl VirtioFs {
             return Err(EINVAL);
         }
         let parent_path = self.node_path(parent)?.to_owned();
+        self.contained_dir(&parent_path)?;
         let path = if name == b"." {
             parent_path
         } else if name == b".." {
@@ -1054,6 +1060,34 @@ impl VirtioFs {
         }
     }
 
+    /// Rejects a directory that resolves outside the export.
+    ///
+    /// Every host syscall here re-resolves its whole path from `/`, so a path
+    /// that sits below the root as a string still lands wherever its
+    /// components point. A symlinked directory inside the export is enough:
+    /// the join looks contained and the syscall is not. Resolving the parent
+    /// and comparing it component-wise against the root is what keeps a
+    /// lookup or a mutation inside the share.
+    ///
+    /// The final component is deliberately not resolved. It may legitimately
+    /// be a symlink the guest is meant to see and resolve in its own
+    /// namespace, and every open of it already carries `O_NOFOLLOW`.
+    ///
+    /// This resolves and then lets the caller's syscall resolve again, so a
+    /// host-side actor that swaps a component in between still wins. Closing
+    /// that needs fd-relative resolution with `O_NOFOLLOW` on every
+    /// component, which is a larger change than this one.
+    fn contained_dir(&self, path: &Path) -> Result<(), i32> {
+        if fs::canonicalize(path)
+            .map_err(io_errno)?
+            .starts_with(&self.root)
+        {
+            Ok(())
+        } else {
+            Err(EPERM)
+        }
+    }
+
     fn child_path(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
         validate_mutation_name(name)?;
         let parent = self.node_path(parent)?;
@@ -1064,6 +1098,7 @@ impl VirtioFs {
         if !fs::metadata(parent).map_err(io_errno)?.is_dir() {
             return Err(ENOTDIR);
         }
+        self.contained_dir(parent)?;
         Ok(parent.join(OsStr::from_bytes(name)))
     }
 
@@ -1142,7 +1177,7 @@ impl VirtioFs {
         let name = nul_name(input, 8)?;
         let old_path = self.node_path(old_node)?.to_owned();
         let new_path = self.child_path(new_parent, name)?;
-        fs::hard_link(&old_path, &new_path).map_err(io_errno)?;
+        host_link(&old_path, &new_path)?;
         self.new_entry(new_path)
     }
 
@@ -2814,6 +2849,36 @@ fn ranges_overlap(left: u64, right: u64, length: u64) -> bool {
     left < right.saturating_add(length) && right < left.saturating_add(length)
 }
 
+/// Hard links `old` to `new` without resolving `old` when it is a symlink.
+///
+/// `link(2)` on macOS follows the symlink and links whatever it names, so a
+/// guest that pointed a symlink at a host file outside the export and then
+/// hard linked it got a real directory entry inside the export sharing that
+/// file's inode -- with no symlink left for anything downstream to notice.
+/// `linkat` with no flags is defined not to follow, which is the behaviour
+/// this device has always wanted.
+fn host_link(old: &Path, new: &Path) -> Result<(), i32> {
+    let old = path_cstring(old)?;
+    let new = path_cstring(new)?;
+    // SAFETY: both arguments are NUL-terminated C strings that outlive the
+    // call, and `AT_FDCWD` resolves each path from the working directory
+    // exactly as the `link(2)` this replaces did.
+    let result = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_errno(io::Error::last_os_error()))
+    }
+}
+
 fn host_mkfifo(path: &Path, mode: u32) -> Result<(), i32> {
     let path = path_cstring(path)?;
     let result = unsafe { libc::mkfifo(path.as_ptr(), mode as libc::mode_t) };
@@ -3983,6 +4048,81 @@ mod tests {
         let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
         assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -EINVAL);
         assert!(dir.join("etc").is_dir());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A path outside any export, for the escape tests below.
+    fn outside_path(what: &str) -> PathBuf {
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hvi-virtiofs-outside-{what}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    /// Hard linking a symlink must link the symlink, never the file it names.
+    /// macOS `link(2)` follows symlinks, so a guest that pointed a symlink at
+    /// a host file and then hard linked it got a real directory entry inside
+    /// the export sharing that file's inode.
+    #[test]
+    fn hard_linking_a_symlink_does_not_capture_its_target() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("file");
+        fs::write(&outside, b"host only\n").unwrap();
+
+        let mut symlink = Vec::new();
+        symlink.extend_from_slice(b"escape\0");
+        symlink.extend_from_slice(outside.as_os_str().as_bytes());
+        symlink.push(0);
+        let out = dev.handle_fuse(&request(SYMLINK, FUSE_ROOT_ID, &symlink), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let escape = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let mut link = Vec::new();
+        put_u64(&mut link, escape);
+        link.extend_from_slice(b"captured\0");
+        let out = dev.handle_fuse(&request(LINK, FUSE_ROOT_ID, &link), 4096);
+
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        // The link is to the symlink inode, so the new name is itself a
+        // symlink and shares nothing with the file outside the export.
+        let captured = fs::symlink_metadata(dir.join("captured")).unwrap();
+        assert!(
+            captured.file_type().is_symlink(),
+            "hard link resolved the symlink instead of linking it"
+        );
+        assert_ne!(
+            captured.ino(),
+            fs::metadata(&outside).unwrap().ino(),
+            "the file outside the export is reachable from inside it"
+        );
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A mutation whose parent resolves through a symlink must not land
+    /// outside the export. `child_path` follows the parent on purpose, so the
+    /// joined path can sit under the root as a string while the syscall
+    /// resolves somewhere else entirely.
+    #[test]
+    fn a_symlinked_directory_cannot_take_a_mutation_outside_the_export() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("dir");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
+
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"out");
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&0o755u32.to_le_bytes());
+        mkdir.extend_from_slice(b"planted\0");
+        dev.handle_fuse(&request(MKDIR, node, &mkdir), 4096);
+
+        assert!(
+            !outside.join("planted").exists(),
+            "mutation escaped the export through a symlinked directory"
+        );
+        let _ = fs::remove_dir_all(&outside);
         let _ = fs::remove_dir_all(dir);
     }
 
