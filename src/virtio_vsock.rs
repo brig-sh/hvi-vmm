@@ -47,6 +47,13 @@ const OP_CREDIT_REQUEST: u16 = 7;
 const OUR_BUF_ALLOC: u32 = 256 * 1024;
 /// Max payload per RW packet to the guest.
 const MAX_RW: usize = 16 * 1024;
+/// Ceiling on the packet a transmit chain may assemble.
+///
+/// Descriptor lengths are guest-controlled, so without a ceiling the guest
+/// decides how much the host allocates and zeroes for one packet. A header
+/// plus the largest payload this device carries is all a well-behaved guest
+/// ever sends.
+const MAX_TX_PACKET: usize = HDR_LEN + MAX_RW;
 
 #[derive(Clone, Copy, Default)]
 struct Hdr {
@@ -342,9 +349,17 @@ impl VirtioVsock {
                 mem.read_u16(da + 14).ok()?,
             );
             if flags & 2 == 0 {
-                let mut seg = vec![0u8; len as usize];
-                mem.read(addr, &mut seg).ok()?;
-                buf.extend_from_slice(&seg);
+                // The length comes from the guest, so it is checked against
+                // the ceiling before it is allowed to size an allocation, and
+                // the bytes are read straight into the packet rather than
+                // through a segment buffer the guest also sized.
+                let len = len as usize;
+                let start = buf.len();
+                if start.checked_add(len)? > MAX_TX_PACKET {
+                    return None;
+                }
+                buf.resize(start + len, 0);
+                mem.read(addr, &mut buf[start..]).ok()?;
             }
             if flags & 1 == 0 {
                 break;
@@ -582,6 +597,39 @@ mod session_tests {
             .unwrap();
         let mut buf = vec![0u8; n];
         s.read_exact(&mut buf).ok().map(|()| buf)
+    }
+
+    /// A descriptor length is guest-controlled, and the transmit path sized an
+    /// allocation from it directly. A chain claiming more than the largest
+    /// packet this device carries must be refused before anything is
+    /// allocated.
+    #[test]
+    fn an_oversized_transmit_chain_is_refused() {
+        const BASE: u64 = 0x4000_0000;
+        let mut backing = vec![0u8; 0x20000];
+        let mem = mem_of(&mut backing);
+        let mut dev = VirtioVsock::new();
+        let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+
+        dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
+        dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
+        dev.mmio(&mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
+        dev.mmio(&mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        dev.mmio(&mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
+        dev.mmio(&mem, reg::QUEUE_READY, true, 1);
+
+        // One byte past the ceiling, and still inside guest RAM, so only the
+        // ceiling can reject it.
+        let oversized = (HDR_LEN + 16 * 1024 + 1) as u32;
+        mem.write_u64(desc, data).unwrap();
+        mem.write_u32(desc + 8, oversized).unwrap();
+        mem.write_u16(desc + 12, 0).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+
+        assert_eq!(dev.read_tx(&mem, 0), None);
     }
 
     /// Regression for the cross-session injection: session B is registered and

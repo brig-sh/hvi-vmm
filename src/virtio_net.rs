@@ -46,6 +46,15 @@ const F_MAC_LO: u32 = 1 << 5; // VIRTIO_NET_F_MAC (low word bit 5)
 /// virtio-net header length with VIRTIO_F_VERSION_1 (`virtio_net_hdr_v1`).
 pub const NET_HDR_LEN: usize = 12;
 
+/// Ceiling on the frame a transmit chain may assemble.
+///
+/// Descriptor lengths are guest-controlled, so without a ceiling the guest
+/// decides how much the host allocates and zeroes for one frame. The gateway
+/// relay already refuses anything longer than 64 KiB and no MTU this device
+/// serves comes near it, so a chain claiming more is either broken or
+/// deliberate.
+const MAX_TX_FRAME: usize = NET_HDR_LEN + 65536;
+
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
 
@@ -290,10 +299,18 @@ impl VirtioNet {
                 mem.read_u16(da + 14).ok()?,
             );
             if flags & 2 == 0 {
-                // readable segment (device-readable)
-                let mut seg = vec![0u8; len as usize];
-                mem.read(addr, &mut seg).ok()?;
-                buf.extend_from_slice(&seg);
+                // Readable segment (device-readable). The length comes from
+                // the guest, so it is checked against the ceiling before it
+                // is allowed to size an allocation, and the bytes are read
+                // straight into the frame rather than through a segment
+                // buffer the guest also sized.
+                let len = len as usize;
+                let start = buf.len();
+                if start.checked_add(len)? > MAX_TX_FRAME {
+                    return None;
+                }
+                buf.resize(start + len, 0);
+                mem.read(addr, &mut buf[start..]).ok()?;
             }
             if flags & 1 == 0 {
                 break;
@@ -940,6 +957,29 @@ mod tests {
         let (name, end) = parse_dns_name(&m, 12).unwrap();
         assert_eq!(name, "example.com");
         assert_eq!(end, m.len());
+    }
+
+    /// A descriptor length is guest-controlled, and the transmit path sized
+    /// an allocation from it directly. A chain that claims more than the
+    /// device could ever send must be refused before anything is allocated.
+    #[test]
+    fn an_oversized_transmit_chain_is_refused() {
+        let mut net = VirtioNet::new();
+        const BASE: u64 = 0x4000_0000;
+        let mut backing = vec![0u8; 0x20000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+
+        // One byte past the ceiling, and still inside guest RAM, so only the
+        // ceiling can reject it.
+        let oversized = (NET_HDR_LEN + 65536 + 1) as u32;
+        mem.write_u64(desc, data).unwrap();
+        mem.write_u32(desc + 8, oversized).unwrap();
+        mem.write_u16(desc + 12, 0).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+
+        assert_eq!(net.read_tx_frame(&mem, 0), None);
     }
 
     /// A question that ends before its type and class fields must be refused.
