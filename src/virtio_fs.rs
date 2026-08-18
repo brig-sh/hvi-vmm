@@ -186,6 +186,27 @@ const ERANGE: i32 = 34;
 const EDEADLK: i32 = 35;
 const ENODATA: i32 = 61;
 const EOPNOTSUPP: i32 = 95;
+// Linux generic errno values, like the rest of this block. These were missing,
+// and io_errno's catch-all reported every one of them to the guest as EIO.
+//
+// EMFILE is the one that mattered: hvi pins a host file descriptor for every
+// open guest handle, and with the macOS default soft limit of 256 a build
+// inside the guest exhausts them. The guest then sees "Input/output error" on
+// random unrelated files -- a Go build failing to open package archives, gcc
+// unable to execute its own cc1 -- with nothing to suggest the real cause.
+// Reproduced by booting the same image twice: at `ulimit -n 256` the guest
+// fails all over, at 8192 the identical workload is clean.
+const ENOMEM: i32 = 12;
+const EBUSY: i32 = 16;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ETXTBSY: i32 = 26;
+const EMLINK: i32 = 31;
+const ENAMETOOLONG: i32 = 36;
+const ENOLCK: i32 = 37;
+const EOVERFLOW: i32 = 75;
+const ESTALE: i32 = 116;
+const EDQUOT: i32 = 122;
 
 struct FileHandle {
     file: File,
@@ -3107,6 +3128,17 @@ fn io_errno(err: io::Error) -> i32 {
         Some(code) if code == libc::ENOSYS => return ENOSYS,
         Some(code) if code == libc::ENOTEMPTY => return ENOTEMPTY,
         Some(code) if code == libc::ELOOP => return ELOOP,
+        Some(code) if code == libc::EMFILE => return EMFILE,
+        Some(code) if code == libc::ENFILE => return ENFILE,
+        Some(code) if code == libc::ETXTBSY => return ETXTBSY,
+        Some(code) if code == libc::ENAMETOOLONG => return ENAMETOOLONG,
+        Some(code) if code == libc::EBUSY => return EBUSY,
+        Some(code) if code == libc::ENOMEM => return ENOMEM,
+        Some(code) if code == libc::EMLINK => return EMLINK,
+        Some(code) if code == libc::ENOLCK => return ENOLCK,
+        Some(code) if code == libc::EOVERFLOW => return EOVERFLOW,
+        Some(code) if code == libc::ESTALE => return ESTALE,
+        Some(code) if code == libc::EDQUOT => return EDQUOT,
         _ => {}
     }
     match err.kind() {
@@ -3364,6 +3396,68 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Descriptor exhaustion must reach the guest as EMFILE, not EIO.
+    ///
+    /// This is the bug that cost a session of guessing. hvi pins one host fd
+    /// per open guest handle; with the macOS default soft limit of 256, a
+    /// build inside the guest exhausts them and every affected open failed
+    /// with "Input/output error" on a random unrelated file. Confirmed by
+    /// booting the same image at `ulimit -n 256` (guest fails all over, hvi
+    /// peaks at 258 fds) and at 8192 (identical workload clean, peak 2134).
+    ///
+    /// The catch-all in io_errno is what turned a precise, actionable errno
+    /// into the least informative one available.
+    #[test]
+    fn errnos_that_used_to_collapse_to_eio_are_named() {
+        for (code, want, what) in [
+            (libc::EMFILE, EMFILE, "per-process fd limit"),
+            (libc::ENFILE, ENFILE, "system-wide fd limit"),
+            (libc::ETXTBSY, ETXTBSY, "text file busy"),
+            (libc::ENAMETOOLONG, ENAMETOOLONG, "name too long"),
+            (libc::EBUSY, EBUSY, "busy"),
+            (libc::ENOMEM, ENOMEM, "out of memory"),
+            (libc::EMLINK, EMLINK, "too many links"),
+            (libc::ENOLCK, ENOLCK, "no locks available"),
+            (libc::EOVERFLOW, EOVERFLOW, "overflow"),
+            (libc::ESTALE, ESTALE, "stale handle"),
+            (libc::EDQUOT, EDQUOT, "quota exceeded"),
+        ] {
+            let got = io_errno(io::Error::from_raw_os_error(code));
+            assert_eq!(
+                got, want,
+                "{what} (host errno {code}) reported to the guest as {got}, want {want}"
+            );
+            assert_ne!(
+                got, EIO,
+                "{what} is still collapsing to EIO, which tells the guest nothing"
+            );
+        }
+    }
+
+    /// The errnos that were already mapped stay mapped.
+    #[test]
+    fn the_existing_errno_mapping_is_unchanged() {
+        for (code, want) in [
+            (libc::ENOENT, ENOENT),
+            (libc::EACCES, EACCES),
+            (libc::EEXIST, EEXIST),
+            (libc::ENOTDIR, ENOTDIR),
+            (libc::EISDIR, EISDIR),
+            (libc::ENOSPC, ENOSPC),
+            (libc::ELOOP, ELOOP),
+        ] {
+            assert_eq!(io_errno(io::Error::from_raw_os_error(code)), want);
+        }
+    }
+
+    /// An errno with no mapping still becomes EIO -- that fallback is correct,
+    /// it was only ever the coverage that was wrong.
+    #[test]
+    fn an_unknown_errno_still_becomes_eio() {
+        assert_eq!(io_errno(io::Error::from_raw_os_error(libc::EPROTO)), EIO);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};

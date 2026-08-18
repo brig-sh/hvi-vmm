@@ -42,6 +42,10 @@ pub mod esr;
 pub mod events;
 /// Devicetree builder for the arm64 guest.
 #[cfg(target_arch = "aarch64")]
+/// Raising the open-file limit hvi runs under. virtio-fs spends the guest's
+/// concurrency out of this process's descriptor table.
+pub mod fdlimit;
+
 pub mod fdt;
 /// `Send + Sync` accessor over the host's guest-RAM mapping.
 pub mod guestmem;
