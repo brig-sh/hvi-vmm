@@ -40,12 +40,16 @@ pub mod config;
 pub mod esr;
 /// The `RawEvent` NDJSON ledger.
 pub mod events;
-/// Devicetree builder for the arm64 guest.
-#[cfg(target_arch = "aarch64")]
 /// Raising the open-file limit hvi runs under. virtio-fs spends the guest's
 /// concurrency out of this process's descriptor table.
+#[cfg(target_arch = "aarch64")]
 pub mod fdlimit;
-
+/// Devicetree builder for the arm64 guest.
+///
+/// Gated to match `layout` below, which it builds from: an x86 guest is
+/// described by the MP table instead. Left ungated, this module took
+/// `crate::layout` with it into every x86 build.
+#[cfg(target_arch = "aarch64")]
 pub mod fdt;
 /// `Send + Sync` accessor over the host's guest-RAM mapping.
 pub mod guestmem;

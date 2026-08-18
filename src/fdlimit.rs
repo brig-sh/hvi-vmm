@@ -17,8 +17,8 @@
 //! virtio-fs pins one host file descriptor per open guest handle: a `File` in
 //! `handles` for every OPEN, another in `dir_handles` for every OPENDIR,
 //! released only when the guest sends RELEASE or RELEASEDIR. That is the right
-//! design -- the guest's fd is a host fd -- but it means the guest's concurrency
-//! is spent out of hvi's own descriptor table.
+//! design -- the guest's fd is a host fd -- but it means the guest's
+//! concurrency is spent out of hvi's own descriptor table.
 //!
 //! macOS gives a process launched outside a terminal a soft `RLIMIT_NOFILE` of
 //! 256. A build inside the guest goes through that without trying: an idle
@@ -149,10 +149,7 @@ mod tests {
             lim.rlim_cur
         };
         match raise_open_file_limit() {
-            Ok(now) => assert!(
-                now >= before,
-                "the limit went down: {before} -> {now}"
-            ),
+            Ok(now) => assert!(now >= before, "the limit went down: {before} -> {now}"),
             Err(e) => panic!("could not raise the open-file limit: {e}"),
         }
     }
