@@ -94,6 +94,9 @@ pub mod tap;
 /// 16550A UART (x86 console).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod uart16550;
+/// Concurrency litmus test for the used-ring publish in `virtio::Queue`.
+#[cfg(test)]
+mod used_ring_litmus;
 /// virtio-blk over MMIO.
 pub mod virtio;
 /// Virtio-fs over MMIO, serving an unpacked host directory.

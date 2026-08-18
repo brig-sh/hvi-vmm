@@ -157,6 +157,13 @@ impl Queue {
     /// let a single notify drive up to 65535 descriptor-chain walks.
     pub(crate) fn pending(&self, mem: &GuestRam) -> Option<u16> {
         let idx = mem.read_u16(self.avail + 2).ok()?;
+        // Acquire against the guest's `virtio_wmb()`: the driver fills the
+        // avail ring slot and the descriptor table before it bumps
+        // `avail.idx`, and the ring slot is an unrelated address, so without
+        // this the host may read the slot before it reads the index and get
+        // the previous wrap's head. Free on x86, a `dmb ishld` on arm64, and
+        // only once per drain pass rather than per chain.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let n = idx.wrapping_sub(self.last_avail);
         (n <= self.size()).then_some(n)
     }
@@ -204,6 +211,16 @@ impl Queue {
         let entry = self.used + 4 + u64::from(used_idx % n) * 8;
         let _ = mem.write_u32(entry, u32::from(head));
         let _ = mem.write_u32(entry + 4, len);
+        // Release against the guest's `virtio_rmb()` in
+        // `virtqueue_get_buf_ctx_split`. The element and `used.idx` are
+        // separate addresses with no dependency between them, so on arm64
+        // the guest -- running on another core the whole time a host worker
+        // thread is completing requests -- may observe the bumped index
+        // while the element still holds the previous wrap's contents. It
+        // then takes a descriptor id it has already freed, prints
+        // "id %u is not a head!", sets `vq->broken` and fails every later
+        // enqueue with -EIO.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         let _ = mem.write_u16(self.used + 2, used_idx.wrapping_add(1));
     }
 }
