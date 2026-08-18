@@ -16,7 +16,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::Ipv4Addr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -89,15 +89,28 @@ struct FiveTuple {
     dst_port: u16,
 }
 
+/// How long a line may sit in the buffer before it is written out.
+///
+/// A traced run is normally ended with a signal or a `kill`, and neither runs
+/// a destructor, so a line that only ever reached the buffer is lost. Writing
+/// each line straight through would undo the buffering the high-rate sources
+/// need, so the emitter drains on this cadence instead: the cost stays off the
+/// per-event path, and what an abrupt exit can take is bounded by one interval
+/// rather than by the size of the buffer.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Writes `RawEvent` NDJSON to a file (one line per event). Disabled unless a
 /// path is given, so the stream is a clean ledger separate from the guest
 /// console (stdout) and the human-readable capture logs (stderr).
 pub struct Emitter {
     sandbox_id: String,
     /// Buffered so a high-rate boundary stream (e.g. per-request block events
-    /// under fio) is not one `write(2)` per line. Flushed on each snapshot and
-    /// on drop.
+    /// under fio) is not one `write(2)` per line. Drained on the
+    /// [`FLUSH_INTERVAL`] cadence, by an explicit [`Emitter::flush`], and by
+    /// the writer's own drop.
     out: Option<BufWriter<File>>,
+    /// When the buffer was last drained, for the cadence above.
+    last_flush: Instant,
 }
 
 impl Emitter {
@@ -115,6 +128,7 @@ impl Emitter {
         Ok(Emitter {
             sandbox_id: sandbox_id.to_string(),
             out,
+            last_flush: Instant::now(),
         })
     }
 
@@ -124,11 +138,12 @@ impl Emitter {
     }
 
     /// Flushes buffered ledger lines to disk so a reader (a collector, or a
-    /// `tail -f`) sees them promptly.
+    /// `tail -f`) sees them promptly, and restarts the cadence.
     pub fn flush(&mut self) {
         if let Some(out) = self.out.as_mut() {
             let _ = out.flush();
         }
+        self.last_flush = Instant::now();
     }
 
     /// Writes one `RawEvent` line: the crate's envelope around a caller's
@@ -152,6 +167,9 @@ impl Emitter {
         };
         if let Ok(line) = serde_json::to_string(&ev) {
             let _ = writeln!(out, "{line}");
+        }
+        if self.last_flush.elapsed() >= FLUSH_INTERVAL {
+            self.flush();
         }
     }
 
@@ -273,6 +291,31 @@ mod tests {
             s,
             r#"{"sandbox_id":"vm1","ts":1,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":40000,"dst_ip":"10.0.2.3","dst_port":53},"direction":"egress","guest_initiated":true,"bytes":72,"dns":"example.com"}}"#
         );
+    }
+
+    /// A traced run is normally ended with a signal, and a signal runs no
+    /// destructor, so buffered lines only survive if they reach the file
+    /// while the VM is still running.
+    #[test]
+    fn buffered_lines_reach_the_file_while_the_emitter_lives() {
+        let path = std::env::temp_dir().join(format!("hvi-cadence-{}.ndjson", std::process::id()));
+        let p = path.to_str().unwrap();
+        let mut e = Emitter::new(Some(p), "vm1").unwrap();
+        let block = CapturedEvent::Block {
+            lba: 8,
+            len: 4096,
+            write: true,
+        };
+
+        e.captured(&block);
+        std::thread::sleep(FLUSH_INTERVAL + std::time::Duration::from_millis(50));
+        e.captured(&block);
+
+        // Still alive, never flushed by hand: whatever is on disk got there
+        // on the emitter's own cadence.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "both lines reached the ledger");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
