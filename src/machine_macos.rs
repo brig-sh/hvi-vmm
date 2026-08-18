@@ -284,6 +284,28 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         } else {
             "read-only"
         };
+        // Raise the descriptor limit before the first share exists, and say
+        // what we got.
+        //
+        // virtio-fs pins one host fd per open guest handle, so the guest's
+        // concurrency is spent out of this process's table. macOS gives a
+        // process launched outside a terminal 256, which a build inside the
+        // guest exhausts without trying -- and what the guest then saw was
+        // "Input/output error" on random unrelated files, because every
+        // unmapped host errno was reported as EIO.
+        //
+        // Logging the number is deliberate and unconditional: diagnosing this
+        // from the guest side took a session of guessing, and one line here
+        // would have ended it in a single run.
+        if index == 0 {
+            match crate::fdlimit::raise_open_file_limit() {
+                Ok(limit) => eprintln!("[hvi] open-file limit: {limit}"),
+                Err(e) => eprintln!(
+                    "[hvi] open-file limit: could not raise it ({e}); \
+                     a busy guest may see EMFILE as I/O errors"
+                ),
+            }
+        }
         eprintln!(
             "[hvi] virtio-fs[{index}]: {} as {:?} ({access})",
             root.display(),
