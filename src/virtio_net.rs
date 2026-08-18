@@ -737,7 +737,15 @@ fn parse_dns_name(msg: &[u8], off: usize) -> Option<(String, usize)> {
         name.push_str(&String::from_utf8_lossy(label));
         i = end;
     }
-    Some((name, i + 4)) // skip QTYPE + QCLASS
+    // A question is the name followed by QTYPE and QCLASS. Report the end
+    // only when those four bytes are really there: the caller slices the
+    // question out of the message with this offset, so a name that runs to
+    // the end of a truncated message would take the slice past it.
+    let qend = i.checked_add(4)?;
+    if qend > msg.len() {
+        return None;
+    }
+    Some((name, qend))
 }
 
 /// Best-effort TLS SNI from a TCP payload that begins with a TLS ClientHello.
@@ -932,6 +940,20 @@ mod tests {
         let (name, end) = parse_dns_name(&m, 12).unwrap();
         assert_eq!(name, "example.com");
         assert_eq!(end, m.len());
+    }
+
+    /// A question that ends before its type and class fields must be refused.
+    /// The offset `parse_dns_name` reports is used to slice the question back
+    /// into the reply, so reporting one past the end of the message panicked
+    /// the vCPU thread inside the MMIO exit that was serving the guest.
+    #[test]
+    fn a_dns_question_without_type_and_class_is_refused() {
+        let mut truncated = vec![0u8; 12];
+        truncated.push(0); // root label, and then nothing
+        assert_eq!(parse_dns_name(&truncated, 12), None);
+
+        let mut net = VirtioNet::new();
+        assert_eq!(net.handle_dns(1234, &truncated), None);
     }
 
     #[test]
