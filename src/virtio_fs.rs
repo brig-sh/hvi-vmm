@@ -1441,7 +1441,7 @@ impl VirtioFs {
 
         let capacity = max_out.saturating_sub(OUT_HEADER_LEN);
         let want = requested.min(capacity).min(MAX_WRITE as usize);
-        let (iov, _covered) = build_iov(mem, output, OUT_HEADER_LEN, want, true).ok()?;
+        let (iov, _covered) = build_iov(mem, output, OUT_HEADER_LEN, want).ok()?;
 
         let n = match preadv_retry(&handle.file, &iov, offset) {
             Ok(n) => n,
@@ -1501,7 +1501,7 @@ impl VirtioFs {
         if !handle.writable {
             return None;
         }
-        let (iov, covered) = build_iov(mem, input, IN_HEADER_LEN + 40, size, false).ok()?;
+        let (iov, covered) = build_iov(mem, input, IN_HEADER_LEN + 40, size).ok()?;
         if covered < size {
             return None;
         }
@@ -3269,10 +3269,8 @@ fn gather(mem: &GuestRam, descs: &[(u64, u32)], skip: usize, out: &mut [u8]) -> 
 
 /// Builds iovecs borrowing guest RAM directly for `descs`, skipping `skip`
 /// bytes of the logical concatenation and capping the total at `cap` bytes.
-/// `writable` selects `slice_mut` (READ's output descriptors) vs `slice`
-/// (WRITE's input descriptors carrying the payload). Returns the iovecs and
-/// how many bytes they actually cover, which can be less than `cap` if the
-/// descriptors run out first.
+/// Returns the iovecs and how many bytes they actually cover, which can be
+/// less than `cap` if the descriptors run out first.
 ///
 /// Errors (falling back to the buffered path) if there are more descriptors
 /// than `IOV_MAX`, or if a descriptor's range is not in mapped guest RAM.
@@ -3281,7 +3279,6 @@ fn build_iov(
     descs: &[(u64, u32)],
     skip: usize,
     cap: usize,
-    writable: bool,
 ) -> Result<(Vec<libc::iovec>, usize), ()> {
     if descs.len() > IOV_MAX {
         return Err(());
@@ -3300,11 +3297,7 @@ fn build_iov(
             let avail = (len - start_in_desc).min(cap - total);
             if avail > 0 {
                 let base = addr.checked_add(start_in_desc as u64).ok_or(())?;
-                let ptr: *mut u8 = if writable {
-                    mem.slice_mut(base, avail).map_err(|_| ())?.as_mut_ptr()
-                } else {
-                    mem.slice(base, avail).map_err(|_| ())?.as_ptr().cast_mut()
-                };
+                let ptr = mem.host_ptr(base, avail).map_err(|_| ())?;
                 iov.push(libc::iovec {
                     iov_base: ptr.cast(),
                     iov_len: avail,
