@@ -15,18 +15,13 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::{self, File, Metadata, OpenOptions, Permissions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{
-    DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-};
+use std::os::unix::fs::{DirBuilderExt, DirEntryExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-
-#[cfg(target_os = "macos")]
-use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 
 use crate::config::CachePolicy;
 use crate::guestmem::GuestRam;
@@ -159,7 +154,9 @@ const LINUX_F_UNLCK: u32 = 2;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
 /// `DT_SOCK`, the readdir type byte for a socket.
 const DT_SOCK: u32 = 12;
@@ -405,7 +402,7 @@ impl VirtioFs {
         // path.
         let root = fs::canonicalize(&root)?;
         let mut nodes = HashMap::new();
-        let root_meta = fs::symlink_metadata(&root)?;
+        let root_meta = Stat::lstat(&root).map_err(io::Error::from_raw_os_error)?;
         nodes.insert(
             FUSE_ROOT_ID,
             Node {
@@ -946,7 +943,7 @@ impl VirtioFs {
             self.remember_lookup(node);
             return Ok(socket_entry_out(node, socket));
         }
-        let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+        let meta = Stat::lstat(&path)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &path, &meta))
@@ -960,11 +957,11 @@ impl VirtioFs {
         let fh = get_u64(input, 8).unwrap_or(0);
         let (path, meta) = if flags & FUSE_GETATTR_FH != 0 {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
-            let meta = handle.file.metadata().map_err(io_errno)?;
+            let meta = Stat::of_file(&handle.file)?;
             (handle.path.clone(), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+            let meta = Stat::lstat(&path)?;
             (path, meta)
         };
         Ok(self.attr_out(node, &path, &meta))
@@ -1064,9 +1061,9 @@ impl VirtioFs {
             #[cfg(target_os = "macos")]
             {
                 let current_meta = if let Some(handle) = handle {
-                    handle.file.metadata().map_err(io_errno)?
+                    Stat::of_file(&handle.file)?
                 } else {
-                    fs::symlink_metadata(metadata_path).map_err(io_errno)?
+                    Stat::lstat(metadata_path)?
                 };
                 let mut guest = guest_attr(Some(metadata_path), &current_meta);
                 if valid & FATTR_UID != 0 {
@@ -1099,9 +1096,9 @@ impl VirtioFs {
 
         if valid & (FATTR_MODE | FATTR_KILL_SUIDGID) != 0 {
             let current_meta = if let Some(handle) = handle {
-                handle.file.metadata().map_err(io_errno)?
+                Stat::of_file(&handle.file)?
             } else {
-                fs::symlink_metadata(path.as_deref().ok_or(EINVAL)?).map_err(io_errno)?
+                Stat::lstat(path.as_deref().ok_or(EINVAL)?)?
             };
             let mut new_mode = if valid & FATTR_MODE != 0 {
                 mode & 0o7777
@@ -1113,7 +1110,7 @@ impl VirtioFs {
             }
             #[cfg(target_os = "macos")]
             {
-                if !current_meta.file_type().is_symlink() {
+                if !current_meta.is_symlink() {
                     let host_mode = host_creation_mode(new_mode, current_meta.is_dir());
                     if let Some(handle) = handle {
                         handle
@@ -1154,13 +1151,10 @@ impl VirtioFs {
         // it) so the borrow of `self.handles` ends here, before the `&mut
         // self` calls below that invalidate the cache and build the reply.
         let (final_path, meta) = if let Some(handle) = handle {
-            (
-                handle.path.clone(),
-                handle.file.metadata().map_err(io_errno)?,
-            )
+            (handle.path.clone(), Stat::of_file(&handle.file)?)
         } else {
             let final_path = path.as_deref().ok_or(EINVAL)?.to_owned();
-            let meta = fs::symlink_metadata(&final_path).map_err(io_errno)?;
+            let meta = Stat::lstat(&final_path)?;
             (final_path, meta)
         };
         // A setattr may have written HVI_XATTR_LINUX_ATTR above (uid/gid/mode
@@ -1204,7 +1198,7 @@ impl VirtioFs {
     }
 
     fn new_entry(&mut self, path: PathBuf) -> Result<Vec<u8>, i32> {
-        let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+        let meta = Stat::lstat(&path)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &path, &meta))
@@ -1365,7 +1359,7 @@ impl VirtioFs {
             }
             return Ok(Vec::new());
         }
-        let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+        let meta = Stat::lstat(&path)?;
         if directory {
             fs::remove_dir(&path).map_err(io_errno)?;
         } else {
@@ -1393,8 +1387,8 @@ impl VirtioFs {
         let new_name = nul_name(input, next)?;
         let old_path = self.child_path(old_parent, old_name)?;
         let new_path = self.child_path(new_parent, new_name)?;
-        let old_meta = fs::symlink_metadata(&old_path).map_err(io_errno)?;
-        let replaced = fs::symlink_metadata(&new_path).ok();
+        let old_meta = Stat::lstat(&old_path)?;
+        let replaced = Stat::lstat(&new_path).ok();
         host_rename(&old_path, &new_path, flags)?;
         if flags & RENAME_EXCHANGE != 0 {
             self.exchange_node_paths(&old_path, &new_path);
@@ -1463,7 +1457,7 @@ impl VirtioFs {
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
             clear_suid_sgid(&path, &file)?;
         }
-        let meta = file.metadata().map_err(io_errno)?;
+        let meta = Stat::of_file(&file)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         let mut out = self.entry_out(node, &path, &meta);
@@ -1492,7 +1486,7 @@ impl VirtioFs {
             return Err(EROFS);
         }
         let path = self.node_path(node)?.to_owned();
-        let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+        let meta = Stat::lstat(&path)?;
         if directory && !meta.is_dir() {
             return Err(ENOTDIR);
         }
@@ -1545,7 +1539,7 @@ impl VirtioFs {
             // A zero handle preserves compatibility with the earliest
             // stateless backend and is useful for pre-open protocol tests.
             let path = self.node_path(node)?;
-            let meta = fs::symlink_metadata(path).map_err(io_errno)?;
+            let meta = Stat::lstat(path)?;
             if !meta.is_file() {
                 return Err(if meta.is_dir() { EISDIR } else { EINVAL });
             }
@@ -1986,8 +1980,8 @@ impl VirtioFs {
         if !target.writable {
             return Err(EBADF);
         }
-        let source_meta = source.file.metadata().map_err(io_errno)?;
-        let target_meta = target.file.metadata().map_err(io_errno)?;
+        let source_meta = Stat::of_file(&source.file)?;
+        let target_meta = Stat::of_file(&target.file)?;
         if source_meta.dev() == target_meta.dev()
             && source_meta.ino() == target_meta.ino()
             && ranges_overlap(source_offset, target_offset, requested)
@@ -2063,7 +2057,7 @@ impl VirtioFs {
         )
         .map_err(io_errno)?;
         initialize_guest_metadata(&path, mode, context)?;
-        let meta = file.metadata().map_err(io_errno)?;
+        let meta = Stat::of_file(&file)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         let mut out = self.entry_out(node, &path, &meta);
@@ -2086,11 +2080,11 @@ impl VirtioFs {
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
         let (path, meta) = if flags & FUSE_GETATTR_FH != 0 {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
-            let meta = handle.file.metadata().map_err(io_errno)?;
+            let meta = Stat::of_file(&handle.file)?;
             (Some(handle.path.clone()), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            let meta = fs::symlink_metadata(&path).map_err(io_errno)?;
+            let meta = Stat::lstat(&path)?;
             (Some(path), meta)
         };
         let cache_seconds = self.cache_seconds();
@@ -2119,7 +2113,7 @@ impl VirtioFs {
         } else {
             dir.parent().unwrap_or(&self.root).to_owned()
         };
-        let parent_meta = fs::symlink_metadata(&parent_path).map_err(io_errno)?;
+        let parent_meta = Stat::lstat(&parent_path)?;
         let parent_node = if plus {
             self.node_for(parent_path.clone(), &parent_meta)
         } else {
@@ -2179,7 +2173,7 @@ impl VirtioFs {
                 }
                 // READDIRPLUS always needs full attributes, so the d_type
                 // fast path below does not apply here.
-                let meta = match fs::symlink_metadata(&path) {
+                let meta = match Stat::lstat(&path) {
                     Ok(meta) => meta,
                     Err(_) => continue,
                 };
@@ -2207,7 +2201,7 @@ impl VirtioFs {
                     // to stat, so it is answered from the record.
                     _ => match self.sockets.get(&path) {
                         Some(socket) => (socket.ino, DT_SOCK),
-                        None => match fs::symlink_metadata(&path) {
+                        None => match Stat::lstat(&path) {
                             Ok(meta) => (meta.ino(), dirent_type(&meta)),
                             Err(_) => continue,
                         },
@@ -2368,7 +2362,7 @@ impl VirtioFs {
             .paths
             .iter()
             .find(|path| {
-                fs::symlink_metadata(path)
+                Stat::lstat(path)
                     .map(|meta| (meta.dev(), meta.ino()) == remembered.key)
                     .unwrap_or(false)
             })
@@ -2376,7 +2370,7 @@ impl VirtioFs {
             .ok_or(ENOENT)
     }
 
-    fn node_for(&mut self, path: PathBuf, meta: &Metadata) -> u64 {
+    fn node_for(&mut self, path: PathBuf, meta: &Stat) -> u64 {
         let key = (meta.dev(), meta.ino());
         if let Some(node) = self.inode_ids.get(&key) {
             if let Some(remembered) = self.nodes.get_mut(node) {
@@ -2451,7 +2445,7 @@ impl VirtioFs {
         self.inode_ids.remove(&key);
     }
 
-    fn forget_node_path(&mut self, path: &Path, meta: &Metadata) {
+    fn forget_node_path(&mut self, path: &Path, meta: &Stat) {
         let key = (meta.dev(), meta.ino());
         let Some(node_id) = self.inode_ids.get(&key).copied() else {
             return;
@@ -2482,13 +2476,13 @@ impl VirtioFs {
     /// `symlink_metadata` that produced `meta`); taking it here instead of
     /// re-resolving via `node_path` saves a redundant stat and is strictly
     /// more correct, since it is the exact path `meta` was read from.
-    fn attr_out(&mut self, node: u64, path: &Path, meta: &Metadata) -> Vec<u8> {
+    fn attr_out(&mut self, node: u64, path: &Path, meta: &Stat) -> Vec<u8> {
         let cache_seconds = self.cache_seconds();
         let guest = self.guest_attr(node, Some(path), meta);
         attr_out(node, meta, cache_seconds, guest)
     }
 
-    fn entry_out(&mut self, node: u64, path: &Path, meta: &Metadata) -> Vec<u8> {
+    fn entry_out(&mut self, node: u64, path: &Path, meta: &Stat) -> Vec<u8> {
         let cache_seconds = self.cache_seconds();
         let guest = self.guest_attr(node, Some(path), meta);
         entry_out(node, meta, cache_seconds, guest)
@@ -2500,7 +2494,7 @@ impl VirtioFs {
     /// that into at most one syscall for the node's whole cached lifetime.
     /// The mode's file-type bits still always come from the live `meta`, only
     /// the permission bits and uid/gid are cached.
-    fn guest_attr(&mut self, node: u64, path: Option<&Path>, meta: &Metadata) -> GuestAttr {
+    fn guest_attr(&mut self, node: u64, path: Option<&Path>, meta: &Stat) -> GuestAttr {
         #[cfg(target_os = "macos")]
         if let Some(path) = path {
             let stored = match self.nodes.get(&node).map(|n| n.guest_attr) {
@@ -2590,7 +2584,7 @@ fn socket_attr_out(node: u64, socket: SocketNode) -> Vec<u8> {
     out
 }
 
-fn attr_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
+fn attr_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let mut out = Vec::with_capacity(104);
     put_u64(&mut out, cache_seconds);
     put_u32(&mut out, 0);
@@ -2599,7 +2593,7 @@ fn attr_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) ->
     out
 }
 
-fn entry_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
+fn entry_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     put_u64(&mut out, node);
     put_u64(&mut out, 1); // generation
@@ -2784,6 +2778,143 @@ impl DirCache {
 /// The buffer grows rather than trusting one `PATH_MAX`: `readlinkat`
 /// truncates silently when the target does not fit, and a truncated symlink
 /// target handed to a guest is a wrong answer rather than an error.
+/// A `stat` this device can obtain from a path *or* a descriptor.
+///
+/// `std::fs::Metadata` is the obvious type for this and cannot be used:
+/// there is no way to build one from `fstatat`, and moving the device onto
+/// descriptors (#30) is exactly that call. So the fields it needs are carried
+/// here instead. Same values, same meanings, same accessor names and return
+/// types as `MetadataExt` -- the difference is only where it can come from.
+#[derive(Clone, Copy)]
+struct Stat {
+    raw: libc::stat,
+}
+
+impl Stat {
+    /// Stats a path without following it if it is a symlink.
+    ///
+    /// The path form, still used by everything that has not moved onto a
+    /// descriptor yet.
+    fn lstat(path: &Path) -> Result<Self, i32> {
+        let path = path_cstring(path)?;
+        let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is NUL-terminated and outlives the call; `raw` is a
+        // valid, fully owned `stat` for the kernel to fill.
+        let result = unsafe { libc::lstat(path.as_ptr(), &mut raw) };
+        if result != 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Stats an entry relative to a directory descriptor, following nothing.
+    ///
+    /// Used by the tests here and by stage 2c, which moves LOOKUP and GETATTR
+    /// onto it. It lands with the type rather than after it so the type is
+    /// complete and the equivalence test can prove this form agrees with the
+    /// path form.
+    #[allow(dead_code)]
+    fn at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<Self, i32> {
+        let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dirfd` is open for the call, `name` is NUL-terminated, and
+        // `raw` is a valid `stat` for the kernel to fill.
+        let result = unsafe {
+            libc::fstatat(
+                dirfd.as_raw_fd(),
+                name.as_ptr(),
+                &mut raw,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Stats an already-open file, for the GETATTR that carries a handle.
+    fn of_file(file: &File) -> Result<Self, i32> {
+        let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the descriptor is owned by `file` and open for the call.
+        let result = unsafe { libc::fstat(file.as_raw_fd(), &mut raw) };
+        if result != 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        Ok(Self { raw })
+    }
+
+    fn dev(&self) -> u64 {
+        self.raw.st_dev as u64
+    }
+    fn ino(&self) -> u64 {
+        self.raw.st_ino
+    }
+    fn mode(&self) -> u32 {
+        u32::from(self.raw.st_mode)
+    }
+    fn nlink(&self) -> u64 {
+        u64::from(self.raw.st_nlink)
+    }
+    fn uid(&self) -> u32 {
+        self.raw.st_uid
+    }
+    fn gid(&self) -> u32 {
+        self.raw.st_gid
+    }
+    fn size(&self) -> u64 {
+        nonnegative(self.raw.st_size)
+    }
+    fn blocks(&self) -> u64 {
+        nonnegative(self.raw.st_blocks)
+    }
+    fn blksize(&self) -> u64 {
+        nonnegative(i64::from(self.raw.st_blksize))
+    }
+    /// Unused until device nodes need it; kept so the type covers a `stat`
+    /// rather than only the fields today's callers happen to read.
+    #[allow(dead_code)]
+    fn rdev(&self) -> u64 {
+        self.raw.st_rdev as u64
+    }
+    fn atime(&self) -> i64 {
+        self.raw.st_atime
+    }
+    fn atime_nsec(&self) -> i64 {
+        self.raw.st_atime_nsec
+    }
+    fn mtime(&self) -> i64 {
+        self.raw.st_mtime
+    }
+    fn mtime_nsec(&self) -> i64 {
+        self.raw.st_mtime_nsec
+    }
+    fn ctime(&self) -> i64 {
+        self.raw.st_ctime
+    }
+    fn ctime_nsec(&self) -> i64 {
+        self.raw.st_ctime_nsec
+    }
+    fn birthtime(&self) -> i64 {
+        self.raw.st_birthtime
+    }
+    fn birthtime_nsec(&self) -> i64 {
+        self.raw.st_birthtime_nsec
+    }
+
+    fn file_kind(&self) -> u32 {
+        self.mode() & S_IFMT
+    }
+    fn is_dir(&self) -> bool {
+        self.file_kind() == S_IFDIR
+    }
+    fn is_file(&self) -> bool {
+        self.file_kind() == S_IFREG
+    }
+    fn is_symlink(&self) -> bool {
+        self.file_kind() == S_IFLNK
+    }
+}
+
 fn read_link_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<Vec<u8>, i32> {
     let mut size = 256usize;
     loop {
@@ -2939,8 +3070,8 @@ fn host_creation_mode(mode: u32, _directory: bool) -> u32 {
 
 #[cfg(target_os = "macos")]
 fn initialize_guest_metadata(path: &Path, mode: u32, context: RequestContext) -> Result<(), i32> {
-    let meta = fs::symlink_metadata(path).map_err(io_errno)?;
-    if !meta.file_type().is_symlink() {
+    let meta = Stat::lstat(path)?;
+    if !meta.is_symlink() {
         let host_mode = host_creation_mode(mode, meta.is_dir());
         fs::set_permissions(path, Permissions::from_mode(host_mode)).map_err(io_errno)?;
     }
@@ -2956,8 +3087,8 @@ fn initialize_guest_metadata(path: &Path, mode: u32, context: RequestContext) ->
 
 #[cfg(target_os = "linux")]
 fn initialize_guest_metadata(path: &Path, mode: u32, _context: RequestContext) -> Result<(), i32> {
-    let meta = fs::symlink_metadata(path).map_err(io_errno)?;
-    if !meta.file_type().is_symlink() {
+    let meta = Stat::lstat(path)?;
+    if !meta.is_symlink() {
         fs::set_permissions(path, Permissions::from_mode(mode & 0o7777)).map_err(io_errno)?;
     }
     Ok(())
@@ -2965,7 +3096,7 @@ fn initialize_guest_metadata(path: &Path, mode: u32, _context: RequestContext) -
 
 #[cfg(target_os = "macos")]
 fn clear_suid_sgid(path: &Path, file: &File) -> Result<(), i32> {
-    let meta = file.metadata().map_err(io_errno)?;
+    let meta = Stat::of_file(file)?;
     let mut guest = guest_attr(Some(path), &meta);
     if guest.mode & 0o6000 != 0 {
         guest.mode &= !0o6000;
@@ -2976,7 +3107,7 @@ fn clear_suid_sgid(path: &Path, file: &File) -> Result<(), i32> {
 
 #[cfg(target_os = "linux")]
 fn clear_suid_sgid(_path: &Path, file: &File) -> Result<(), i32> {
-    let mode = file.metadata().map_err(io_errno)?.mode() & 0o7777;
+    let mode = Stat::of_file(file)?.mode() & 0o7777;
     if mode & 0o6000 != 0 {
         file.set_permissions(Permissions::from_mode(mode & !0o6000))
             .map_err(io_errno)?;
@@ -3022,7 +3153,7 @@ fn stored_guest_attr(path: &Path) -> Option<GuestAttr> {
     })
 }
 
-fn guest_attr(path: Option<&Path>, meta: &Metadata) -> GuestAttr {
+fn guest_attr(path: Option<&Path>, meta: &Stat) -> GuestAttr {
     #[cfg(target_os = "macos")]
     if let Some(path) = path {
         if let Some(mut guest) = stored_guest_attr(path) {
@@ -3564,7 +3695,7 @@ fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<()
         if mode & !(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) != 0 {
             return Err(EOPNOTSUPP);
         }
-        let old_size = file.metadata().map_err(io_errno)?.len();
+        let old_size = Stat::of_file(file)?.size();
         let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
             end.min(old_size)
         } else {
@@ -3607,7 +3738,7 @@ fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<()
     if result != 0 {
         return Err(io_errno(io::Error::last_os_error()));
     }
-    if mode & FALLOC_FL_KEEP_SIZE == 0 && end > file.metadata().map_err(io_errno)?.len() {
+    if mode & FALLOC_FL_KEEP_SIZE == 0 && end > Stat::of_file(file)?.size() {
         file.set_len(end).map_err(io_errno)?;
     }
     Ok(())
@@ -3629,16 +3760,16 @@ const STATX_BASIC_STATS: u32 = 0x07ff;
 const STATX_BTIME: u32 = 0x0800;
 
 #[cfg(target_os = "macos")]
-fn metadata_btime(meta: &Metadata) -> Option<(i64, u32)> {
-    Some((meta.st_birthtime(), meta.st_birthtime_nsec().max(0) as u32))
+fn metadata_btime(meta: &Stat) -> Option<(i64, u32)> {
+    Some((meta.birthtime(), meta.birthtime_nsec().max(0) as u32))
 }
 
 #[cfg(target_os = "linux")]
-fn metadata_btime(_meta: &Metadata) -> Option<(i64, u32)> {
+fn metadata_btime(_meta: &Stat) -> Option<(i64, u32)> {
     None
 }
 
-fn statx_out(node: u64, meta: &Metadata, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
+fn statx_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let btime = metadata_btime(meta);
     let mut out = Vec::with_capacity(288);
     put_u64(&mut out, cache_seconds);
@@ -3717,7 +3848,7 @@ fn validate_mutation_name(name: &[u8]) -> Result<(), i32> {
     }
 }
 
-fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Metadata, guest: GuestAttr) {
+fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Stat, guest: GuestAttr) {
     put_u64(out, node);
     put_u64(out, meta.size());
     put_u64(out, meta.blocks());
@@ -3740,8 +3871,21 @@ fn nonnegative(value: i64) -> u64 {
     value.max(0) as u64
 }
 
-fn dirent_type(meta: &Metadata) -> u32 {
-    dirent_type_ft(&meta.file_type())
+fn dirent_type(meta: &Stat) -> u32 {
+    dirent_type_ft_from_mode(meta.file_kind())
+}
+
+/// The readdir type byte for a mode's file-kind bits.
+///
+/// Split out from the `FileType` form because a [`Stat`] carries the mode
+/// rather than a `FileType`, and readdir needs the same answer from both.
+fn dirent_type_ft_from_mode(kind: u32) -> u32 {
+    match kind {
+        S_IFDIR => 4,
+        S_IFREG => 8,
+        S_IFLNK => 10,
+        _ => 0,
+    }
 }
 
 fn dirent_type_ft(ty: &std::fs::FileType) -> u32 {
@@ -4104,6 +4248,10 @@ mod tests {
     }
 
     use super::*;
+    // The device no longer reads std's Metadata -- Stat replaced it (#30) --
+    // but the tests still assert against the host filesystem directly, which
+    // is exactly where std's accessors belong.
+    use std::os::unix::fs::MetadataExt as _;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -4788,6 +4936,72 @@ mod tests {
             "hvi-virtiofs-outside-{what}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    /// `Stat` replaced `std::fs::Metadata` across thirteen signatures, which
+    /// is a transcription job: a field read from the wrong place, or cast
+    /// wrongly, compiles and passes every behavioural test while reporting
+    /// nonsense to the guest. So each accessor is checked against the answer
+    /// std gives for the same file, which is the thing it replaced.
+    #[test]
+    fn stat_agrees_with_the_metadata_it_replaced() {
+        let dir = outside_path("stat-equiv");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        fs::write(&file, b"0123456789").unwrap();
+        fs::set_permissions(&file, Permissions::from_mode(0o642)).unwrap();
+
+        let std_meta = fs::symlink_metadata(&file).unwrap();
+        let ours = Stat::lstat(&file).unwrap();
+
+        assert_eq!(ours.dev(), std_meta.dev(), "dev");
+        assert_eq!(ours.ino(), std_meta.ino(), "ino");
+        assert_eq!(ours.mode(), std_meta.mode(), "mode");
+        assert_eq!(ours.nlink(), std_meta.nlink(), "nlink");
+        assert_eq!(ours.uid(), std_meta.uid(), "uid");
+        assert_eq!(ours.gid(), std_meta.gid(), "gid");
+        assert_eq!(ours.size(), std_meta.size(), "size");
+        assert_eq!(ours.blocks(), std_meta.blocks(), "blocks");
+        assert_eq!(ours.blksize(), std_meta.blksize(), "blksize");
+        assert_eq!(ours.atime(), std_meta.atime(), "atime");
+        assert_eq!(ours.atime_nsec(), std_meta.atime_nsec(), "atime_nsec");
+        assert_eq!(ours.mtime(), std_meta.mtime(), "mtime");
+        assert_eq!(ours.mtime_nsec(), std_meta.mtime_nsec(), "mtime_nsec");
+        assert_eq!(ours.ctime(), std_meta.ctime(), "ctime");
+        assert_eq!(ours.ctime_nsec(), std_meta.ctime_nsec(), "ctime_nsec");
+        assert_eq!(ours.is_file(), std_meta.is_file(), "is_file");
+        assert_eq!(ours.is_dir(), std_meta.is_dir(), "is_dir");
+        assert_eq!(
+            ours.is_symlink(),
+            std_meta.file_type().is_symlink(),
+            "is_symlink"
+        );
+        assert_eq!(ours.size(), 10, "the file really is ten bytes");
+        assert_eq!(ours.mode() & 0o7777, 0o642, "the mode really is 0642");
+
+        // A directory and a symlink, so the kind bits are exercised rather
+        // than just the regular-file case.
+        let dir_stat = Stat::lstat(&dir).unwrap();
+        assert!(dir_stat.is_dir() && !dir_stat.is_file() && !dir_stat.is_symlink());
+
+        std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
+        let link_stat = Stat::lstat(&dir.join("l")).unwrap();
+        assert!(link_stat.is_symlink(), "lstat must not follow the link");
+        assert!(!link_stat.is_file());
+
+        // And the descriptor forms must agree with the path form.
+        let opened = File::open(&file).unwrap();
+        let by_fd = Stat::of_file(&opened).unwrap();
+        assert_eq!((by_fd.dev(), by_fd.ino()), (ours.dev(), ours.ino()));
+
+        let cache_root = fs::canonicalize(&dir).unwrap();
+        let mut cache = DirCache::new(&cache_root, 4).unwrap();
+        let dirfd = cache.dir_fd(Path::new("")).unwrap();
+        let by_at = Stat::at(dirfd, &CString::new("f").unwrap()).unwrap();
+        assert_eq!((by_at.dev(), by_at.ino()), (ours.dev(), ours.ino()));
+        assert_eq!(by_at.mode(), ours.mode());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// READLINK had no test at all, so moving it onto `readlinkat` would have
