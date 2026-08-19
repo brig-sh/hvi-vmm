@@ -1327,6 +1327,12 @@ impl VirtioFs {
         // inline -- so the guest would stop the VM rather than just itself.
         // A guest kernel opens a FIFO, socket or device node on a FUSE mount
         // itself and never sends OPEN for one, so refusing costs it nothing.
+        //
+        // `meta` comes from `symlink_metadata`, so this refuses a symlink too.
+        // That is deliberate rather than a side effect: `open_host_file`
+        // already passes `O_NOFOLLOW`, so such an open never succeeded, and
+        // the only change is that the guest now sees EPERM where it saw
+        // ELOOP.
         if !directory && !meta.is_file() {
             return Err(EPERM);
         }
