@@ -13,7 +13,7 @@
 //! clone or an explicit volume is exported without a block image.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io;
@@ -21,8 +21,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{
     DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::{Path, PathBuf};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(target_os = "macos")]
@@ -2582,6 +2582,175 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
     put_u32(out, 0); // backing_id (signed on the wire, zero means none)
 }
 
+/// How many directory descriptors [`DirCache`] keeps open.
+///
+/// Descriptors are a budget this device already spends: it pins one per open
+/// guest handle, and exhausting them reaches the guest as EMFILE
+/// (NOFireAI/hvi-vmm#34). `fdlimit::raise_open_file_limit` lifts the soft
+/// limit to the hard one at startup, so the ceiling is not macOS's bare 256 --
+/// but "not 256" is not "unlimited", and a cache that grows with the guest's
+/// directory count is a way to spend the whole budget on lookups. Bounded
+/// instead, small enough to leave the handle budget alone and large enough
+/// that a build's working set of directories stays resident.
+// Unused on purpose: this is stage one of NOFireAI/hvi-vmm#30, landing the
+// resolver and its tests before the call sites move onto it. The next stage
+// removes this attribute along with the first path-based caller.
+#[allow(dead_code)]
+const DIR_CACHE_LIMIT: usize = 128;
+
+/// Directory descriptors for the export, keyed by node.
+///
+/// This is the resolver Option B is built on (NOFireAI/hvi-vmm#30). Nothing
+/// calls it yet: it lands first, with its tests, so the 120-odd call sites
+/// that follow are mechanical against a primitive that has already been
+/// argued about.
+///
+/// # Why descriptors rather than paths
+///
+/// Resolving a path string asks the host to interpret names that mean
+/// something in the guest. An absolute symlink inside a container rootfs --
+/// `/usr/lib/ssl/certs -> /etc/ssl/certs` -- names the guest's `/etc`, and
+/// the host reads the same bytes as its own. Refusing what that resolves to
+/// refuses ordinary guest paths, which is what broke booting a stock image
+/// and what NOFireAI/hvi-vmm#40 removed.
+///
+/// Descending by descriptor asks no such question. Each component is opened
+/// relative to the one before it with `O_NOFOLLOW`, so a symlink cannot
+/// redirect the walk, and every descriptor here is reachable from the root by
+/// a chain of non-following opens. Containment stops being a check that can be
+/// wrong and becomes a property of how the descriptor was obtained.
+///
+/// It also closes a race the old check documented and could not fix: that one
+/// resolved a path and then let the syscall resolve it again, so anything
+/// host-side could swap a component in between.
+#[allow(dead_code)]
+struct DirCache {
+    /// The export root. Pinned: never evicted, and the origin of every walk.
+    root: OwnedFd,
+    open: HashMap<u64, OwnedFd>,
+    /// Least-recently-used first. Only node ids present in `open` appear here.
+    lru: VecDeque<u64>,
+    limit: usize,
+}
+
+#[allow(dead_code)]
+impl DirCache {
+    fn new(root: &Path, limit: usize) -> io::Result<Self> {
+        let root = open_dir_nofollow_at(None, root.as_os_str().as_bytes())
+            .map_err(io::Error::from_raw_os_error)?;
+        Ok(Self {
+            root,
+            open: HashMap::new(),
+            lru: VecDeque::new(),
+            limit: limit.max(1),
+        })
+    }
+
+    /// A descriptor for `node`, whose path relative to the export root is
+    /// `relative`.
+    ///
+    /// The caller supplies the relative path because the node map is still the
+    /// device's own business at this stage. Once the call sites move over, a
+    /// hit costs no path work at all.
+    ///
+    /// The borrow is what makes this safe to hand out: it holds `&mut self`
+    /// for as long as the descriptor is alive, so nothing can evict the entry
+    /// underneath the caller.
+    fn dir_fd(&mut self, node: u64, relative: &Path) -> Result<BorrowedFd<'_>, i32> {
+        if node == FUSE_ROOT_ID || relative.as_os_str().is_empty() {
+            return Ok(self.root.as_fd());
+        }
+        if self.open.contains_key(&node) {
+            self.touch(node);
+        } else {
+            let fd = self.walk(relative)?;
+            self.admit(node, fd);
+        }
+        Ok(self.open.get(&node).expect("just inserted").as_fd())
+    }
+
+    /// Opens each component in turn from the root, following nothing.
+    fn walk(&self, relative: &Path) -> Result<OwnedFd, i32> {
+        let mut current: Option<OwnedFd> = None;
+        for component in relative.components() {
+            let name = match component {
+                Component::Normal(name) => name,
+                // A relative path built from the node map should contain
+                // neither. Refusing is not defensive dressing: `..` is exactly
+                // the component that would climb out of the export, and the
+                // walk is the only thing standing between it and the host.
+                _ => return Err(EINVAL),
+            };
+            let parent = current
+                .as_ref()
+                .map(|fd| fd.as_raw_fd())
+                .unwrap_or_else(|| self.root.as_raw_fd());
+            current = Some(open_dir_nofollow_at(Some(parent), name.as_bytes())?);
+        }
+        current.ok_or(EINVAL)
+    }
+
+    fn touch(&mut self, node: u64) {
+        if let Some(at) = self.lru.iter().position(|n| *n == node) {
+            self.lru.remove(at);
+        }
+        self.lru.push_back(node);
+    }
+
+    fn admit(&mut self, node: u64, fd: OwnedFd) {
+        while self.open.len() >= self.limit {
+            match self.lru.pop_front() {
+                // Dropping the descriptor closes it, which is the whole point
+                // of the bound.
+                Some(evicted) => drop(self.open.remove(&evicted)),
+                None => break,
+            }
+        }
+        self.open.insert(node, fd);
+        self.lru.push_back(node);
+    }
+
+    /// Drops a node's descriptor, for FORGET and for the paths that invalidate
+    /// a node (rename, unlink) once the call sites move over.
+    fn forget(&mut self, node: u64) {
+        if self.open.remove(&node).is_some() {
+            if let Some(at) = self.lru.iter().position(|n| *n == node) {
+                self.lru.remove(at);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn resident(&self) -> usize {
+        self.open.len()
+    }
+}
+
+/// Opens a directory without following a symlink in its final component.
+///
+/// `parent` selects the form: `Some(fd)` resolves `name` relative to that
+/// descriptor, `None` treats it as a path from the host's root, which is only
+/// used for the export root itself.
+#[allow(dead_code)]
+fn open_dir_nofollow_at(parent: Option<RawFd>, name: &[u8]) -> Result<OwnedFd, i32> {
+    let name = CString::new(name).map_err(|_| EINVAL)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and outlives the call; `parent`, when
+    // given, is a descriptor this cache owns. The result is handed straight to
+    // `OwnedFd`, which closes it.
+    let fd = unsafe {
+        match parent {
+            Some(dirfd) => libc::openat(dirfd, name.as_ptr(), flags),
+            None => libc::open(name.as_ptr(), flags),
+        }
+    };
+    if fd < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh descriptor this call owns and has not shared.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Opens a host file with the flags the guest asked for.
 ///
 /// This translates by hand rather than going through `OpenOptions`, which
@@ -4513,6 +4682,147 @@ mod tests {
             "hvi-virtiofs-outside-{what}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    /// A tree to walk, returned with its own resolved root so the assertions
+    /// compare like with like on a macOS `/var` -> `/private/var` temp dir.
+    fn dircache_fixture() -> (PathBuf, DirCache) {
+        let dir = outside_path("dircache");
+        fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
+        fs::create_dir_all(dir.join("etc")).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let cache = DirCache::new(&dir, DIR_CACHE_LIMIT).unwrap();
+        (dir, cache)
+    }
+
+    /// The root is the origin of every walk and is never keyed or evicted.
+    #[test]
+    fn dircache_serves_the_root_without_walking() {
+        let (dir, mut cache) = dircache_fixture();
+        let fd = cache.dir_fd(FUSE_ROOT_ID, Path::new("")).unwrap();
+        assert!(fd.as_raw_fd() >= 0);
+        assert_eq!(cache.resident(), 0, "the root is pinned, not cached");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A descriptor for a nested directory, and the second ask is a hit.
+    #[test]
+    fn dircache_walks_then_reuses() {
+        let (dir, mut cache) = dircache_fixture();
+        let first = cache
+            .dir_fd(2, Path::new("usr/lib/ssl"))
+            .unwrap()
+            .as_raw_fd();
+        assert_eq!(cache.resident(), 1);
+        let second = cache
+            .dir_fd(2, Path::new("usr/lib/ssl"))
+            .unwrap()
+            .as_raw_fd();
+        assert_eq!(
+            first, second,
+            "a hit must hand back the descriptor already open, not walk again"
+        );
+        assert_eq!(cache.resident(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The point of the whole design: a directory symlink pointing outside the
+    /// export cannot be walked through, because every component is opened with
+    /// O_NOFOLLOW. This is the case the removed containment check tried to
+    /// catch by resolving a path, and got wrong for ordinary guest paths.
+    #[test]
+    fn dircache_cannot_walk_through_a_symlink_out_of_the_export() {
+        let (dir, mut cache) = dircache_fixture();
+        let outside = outside_path("escape-target");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
+
+        // ENOTDIR rather than ELOOP, which is worth knowing: O_NOFOLLOW means
+        // the open lands on the symlink itself, and O_DIRECTORY then refuses
+        // it because a symlink is not a directory. The refusal is what this
+        // test is for; the errno is recorded so a later change to it is a
+        // deliberate one rather than a surprise.
+        let err = cache.dir_fd(3, Path::new("out")).unwrap_err();
+        assert_eq!(err, ENOTDIR, "a symlinked component must refuse the walk");
+        assert_eq!(cache.resident(), 0, "nothing may be admitted on failure");
+
+        // And the same holds for a component in the middle of a path.
+        fs::create_dir_all(outside.join("deeper")).unwrap();
+        let err = cache.dir_fd(4, Path::new("out/deeper")).unwrap_err();
+        assert_eq!(err, ENOTDIR);
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `..` is the component that would climb out of the export, so the walk
+    /// refuses it rather than trusting whoever built the path.
+    #[test]
+    fn dircache_refuses_a_parent_component() {
+        let (dir, mut cache) = dircache_fixture();
+        assert_eq!(
+            cache.dir_fd(5, Path::new("usr/../etc")).unwrap_err(),
+            EINVAL
+        );
+        assert_eq!(cache.dir_fd(6, Path::new("/etc")).unwrap_err(), EINVAL);
+        assert_eq!(cache.resident(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The bound is the reason this cannot spend the descriptor budget the
+    /// device already shares with open guest handles (#34).
+    #[test]
+    fn dircache_holds_no_more_than_its_limit() {
+        let dir = outside_path("dircache-bound");
+        for i in 0..8 {
+            fs::create_dir_all(dir.join(format!("d{i}"))).unwrap();
+        }
+        let dir = fs::canonicalize(&dir).unwrap();
+        let mut cache = DirCache::new(&dir, 3).unwrap();
+        for i in 0..8u64 {
+            cache.dir_fd(10 + i, Path::new(&format!("d{i}"))).unwrap();
+            assert!(
+                cache.resident() <= 3,
+                "cache grew past its limit at {i}: {}",
+                cache.resident()
+            );
+        }
+        assert_eq!(cache.resident(), 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Eviction is least-recently-used, so a directory kept warm survives a
+    /// sweep through colder ones.
+    #[test]
+    fn dircache_evicts_the_least_recently_used() {
+        let dir = outside_path("dircache-lru");
+        for name in ["hot", "a", "b", "c"] {
+            fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        let dir = fs::canonicalize(&dir).unwrap();
+        let mut cache = DirCache::new(&dir, 2).unwrap();
+
+        let hot = cache.dir_fd(20, Path::new("hot")).unwrap().as_raw_fd();
+        for (node, name) in [(21u64, "a"), (22, "b"), (23, "c")] {
+            cache.dir_fd(node, Path::new(name)).unwrap();
+            // Keep `hot` warm across each admission.
+            let again = cache.dir_fd(20, Path::new("hot")).unwrap().as_raw_fd();
+            assert_eq!(again, hot, "the warm entry was evicted after {name}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// FORGET and the invalidating mutations need a way to drop a descriptor.
+    #[test]
+    fn dircache_forget_releases_the_descriptor() {
+        let (dir, mut cache) = dircache_fixture();
+        cache.dir_fd(7, Path::new("etc")).unwrap();
+        assert_eq!(cache.resident(), 1);
+        cache.forget(7);
+        assert_eq!(cache.resident(), 0);
+        cache.forget(7); // idempotent
+        assert_eq!(cache.resident(), 0);
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// Hard linking a symlink must link the symlink, never the file it names.
