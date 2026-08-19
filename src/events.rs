@@ -89,14 +89,22 @@ struct FiveTuple {
     dst_port: u16,
 }
 
-/// How long a line may sit in the buffer before it is written out.
+/// How long a line may sit in the buffer before the next event writes it out.
 ///
 /// A traced run is normally ended with a signal or a `kill`, and neither runs
 /// a destructor, so a line that only ever reached the buffer is lost. Writing
 /// each line straight through would undo the buffering the high-rate sources
-/// need, so the emitter drains on this cadence instead: the cost stays off the
-/// per-event path, and what an abrupt exit can take is bounded by one interval
-/// rather than by the size of the buffer.
+/// need, so the emitter drains on this cadence instead, keeping the `write(2)`
+/// off all but one event in each interval.
+///
+/// Read the bound carefully: the drain only ever fires from inside
+/// [`Emitter::emit_payload`], so it is one interval *of continued traffic*,
+/// not one interval of wall time. The last events before a quiet period stay
+/// in the buffer until something else is emitted, which is exactly the case a
+/// `kill` at the end of a run hits. Closing that needs a drain driven by
+/// something other than the event stream, and the natural place for it is a
+/// thread this VMM can also shut down, which it currently cannot do for any of
+/// its threads.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Writes `RawEvent` NDJSON to a file (one line per event). Disabled unless a
