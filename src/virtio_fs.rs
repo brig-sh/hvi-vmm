@@ -943,7 +943,7 @@ impl VirtioFs {
             self.remember_lookup(node);
             return Ok(socket_entry_out(node, socket));
         }
-        let meta = Stat::lstat(&path)?;
+        let meta = self.stat_in_export(&path)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &path, &meta))
@@ -961,7 +961,7 @@ impl VirtioFs {
             (handle.path.clone(), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            let meta = Stat::lstat(&path)?;
+            let meta = self.stat_in_export(&path)?;
             (path, meta)
         };
         Ok(self.attr_out(node, &path, &meta))
@@ -2341,11 +2341,36 @@ impl VirtioFs {
     /// can be handed the root deal with it before asking.
     fn entry_at(&mut self, node: u64) -> Result<(BorrowedFd<'_>, CString), i32> {
         let relative = self.relative_of(node)?;
+        self.at_relative(&relative)
+    }
+
+    /// The same pair for a path already known relative to the export root.
+    ///
+    /// LOOKUP needs this rather than the node form: the entry it is asked
+    /// about has no node yet, which is the whole point of the request.
+    fn at_relative(&mut self, relative: &Path) -> Result<(BorrowedFd<'_>, CString), i32> {
         let name = relative.file_name().ok_or(EINVAL)?;
         let name = CString::new(name.as_bytes()).map_err(|_| EINVAL)?;
         let parent = relative.parent().unwrap_or(Path::new("")).to_owned();
         let dirfd = self.dirs.dir_fd(&parent)?;
         Ok((dirfd, name))
+    }
+
+    /// Stats an absolute path inside the export by descriptor.
+    ///
+    /// The export root is the case that has no parent to be asked through, so
+    /// it is stated from the root descriptor itself. Everything below it is a
+    /// `fstatat` on its parent.
+    fn stat_in_export(&mut self, path: &Path) -> Result<Stat, i32> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| EINVAL)?
+            .to_owned();
+        if relative.as_os_str().is_empty() {
+            return Stat::of_fd(self.dirs.root_fd());
+        }
+        let (dirfd, name) = self.at_relative(&relative)?;
+        Stat::at(dirfd, &name)
     }
 
     fn node_path(&self, node: u64) -> Result<&Path, i32> {
@@ -2808,12 +2833,6 @@ impl Stat {
     }
 
     /// Stats an entry relative to a directory descriptor, following nothing.
-    ///
-    /// Used by the tests here and by stage 2c, which moves LOOKUP and GETATTR
-    /// onto it. It lands with the type rather than after it so the type is
-    /// complete and the equivalence test can prove this form agrees with the
-    /// path form.
-    #[allow(dead_code)]
     fn at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<Self, i32> {
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `dirfd` is open for the call, `name` is NUL-terminated, and
@@ -2834,9 +2853,16 @@ impl Stat {
 
     /// Stats an already-open file, for the GETATTR that carries a handle.
     fn of_file(file: &File) -> Result<Self, i32> {
+        Self::of_fd(file.as_fd())
+    }
+
+    /// Stats whatever a descriptor refers to, which for the export root is the
+    /// only form available: it has no parent to be asked through.
+    fn of_fd(fd: BorrowedFd<'_>) -> Result<Self, i32> {
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: the descriptor is owned by `file` and open for the call.
-        let result = unsafe { libc::fstat(file.as_raw_fd(), &mut raw) };
+        // SAFETY: the descriptor is open for the call and `raw` is a valid
+        // `stat` for the kernel to fill.
+        let result = unsafe { libc::fstat(fd.as_raw_fd(), &mut raw) };
         if result != 0 {
             return Err(io_errno(io::Error::last_os_error()));
         }
@@ -4936,6 +4962,81 @@ mod tests {
             "hvi-virtiofs-outside-{what}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    /// `.` and `..` do not resolve to `parent/name`, so they take a different
+    /// route to a descriptor than every other lookup: `..` at the export root
+    /// is the root, which has no parent to be asked through and is stated from
+    /// its own descriptor.
+    #[test]
+    fn lookup_of_dot_and_dotdot_resolves_by_descriptor() {
+        let (dir, mut dev) = fixture();
+
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b".\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(FUSE_ROOT_ID));
+
+        // `..` at the root stays at the root rather than climbing out.
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"..\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(FUSE_ROOT_ID));
+        // The device reports node ids as inodes, never host ones, so the
+        // stat is checked by its mode instead: fuse_entry_out is nodeid,
+        // generation and the two validity pairs, then fuse_attr, whose mode
+        // sits at +100. A directory here means the root descriptor really was
+        // stated rather than a zeroed attr going out.
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 100).map(|m| m & S_IFMT),
+            Some(S_IFDIR),
+            "the root must come back stated as a directory"
+        );
+
+        // `..` from a subdirectory climbs to the root and no further.
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let out = dev.handle_fuse(&request(LOOKUP, etc, b"..\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(FUSE_ROOT_ID));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A deliberate behaviour change, pinned so it is a decision rather than a
+    /// discovery.
+    ///
+    /// Descending now refuses to traverse a symlinked directory: the walk
+    /// opens every component with O_NOFOLLOW, so asking for a child *of a
+    /// symlink node* fails where the old path join silently followed it.
+    ///
+    /// This is safe because it is not how a guest asks. A guest kernel that
+    /// meets a symlink resolves it itself -- LOOKUP returns the link, the
+    /// guest READLINKs it and walks the target -- so it never asks for a child
+    /// under a link node. The symlink itself still looks up and reads back
+    /// exactly as before; it is only descending *through* one that changes.
+    #[test]
+    fn descending_through_a_symlinked_directory_is_refused() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("real")).unwrap();
+        fs::write(dir.join("real/f"), b"hello").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+
+        // The link itself is an ordinary lookup, and reads back as a symlink.
+        let link = lookup_node(&mut dev, FUSE_ROOT_ID, b"link");
+        let out = dev.handle_fuse(&request(READLINK, link, &[]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(&out[OUT_HEADER_LEN..], b"real");
+
+        // Descending through it is refused rather than silently followed.
+        let out = dev.handle_fuse(&request(LOOKUP, link, b"f\0"), 4096);
+        let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
+        assert_eq!(
+            errno, -ENOTDIR,
+            "a child under a symlink node must not resolve through it"
+        );
+
+        // The same file by its real path is unaffected.
+        let real = lookup_node(&mut dev, FUSE_ROOT_ID, b"real");
+        let f = lookup_node(&mut dev, real, b"f");
+        assert!(f != 0);
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// `Stat` replaced `std::fs::Metadata` across thirteen signatures, which
