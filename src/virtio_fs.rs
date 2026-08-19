@@ -2297,7 +2297,7 @@ impl VirtioFs {
         }
     }
 
-    fn setxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn setxattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let size = get_u32(input, 0).ok_or(EINVAL)? as usize;
         let flags = get_u32(input, 4).ok_or(EINVAL)?;
@@ -2313,33 +2313,37 @@ impl VirtioFs {
         let value = input
             .get(value_at..value_at.checked_add(size).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
-        host_setxattr(self.node_path(node)?, name, value, flags)?;
+        let fd = self.open_entry_at(node)?;
+        fd_setxattr(fd.as_fd(), name, value, flags)?;
         Ok(Vec::new())
     }
 
-    fn getxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn getxattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(input, 0).ok_or(EINVAL)? as usize;
         let name = nul_name(input, 8)?;
         if is_private_xattr(name) {
             return Err(ENODATA);
         }
-        let value = host_getxattr(self.node_path(node)?, name)?;
+        let fd = self.open_entry_at(node)?;
+        let value = fd_getxattr(fd.as_fd(), name)?;
         xattr_response(size, value)
     }
 
-    fn listxattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn listxattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(input, 0).ok_or(EINVAL)?;
-        let value = filter_private_xattrs(host_listxattr(self.node_path(node)?)?);
+        let fd = self.open_entry_at(node)?;
+        let value = filter_private_xattrs(fd_listxattr(fd.as_fd())?);
         xattr_response(size as usize, value)
     }
 
-    fn removexattr(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn removexattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let name = nul_name(input, 0)?;
         if is_private_xattr(name) {
             return Err(EPERM);
         }
-        host_removexattr(self.node_path(node)?, name)?;
+        let fd = self.open_entry_at(node)?;
+        fd_removexattr(fd.as_fd(), name)?;
         Ok(Vec::new())
     }
 
@@ -2423,6 +2427,26 @@ impl VirtioFs {
         let old_fd = self.dirs.dir_fd_owned(&old_parent)?;
         let new_fd = self.dirs.dir_fd_owned(&new_parent)?;
         Ok((old_fd, old_name, new_fd, new_name))
+    }
+
+    /// Opens the entry a node names, for attribute work.
+    ///
+    /// The export root has no parent to be asked through, so it is opened
+    /// from its own descriptor; everything else goes through its parent's.
+    #[cfg(target_os = "macos")]
+    fn open_entry_at(&mut self, node: u64) -> Result<OwnedFd, i32> {
+        if self.relative_of(node)?.as_os_str().is_empty() {
+            // SAFETY: the root descriptor is owned by the cache and open.
+            let dup =
+                unsafe { libc::fcntl(self.dirs.root_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if dup < 0 {
+                return Err(io_errno(io::Error::last_os_error()));
+            }
+            // SAFETY: a fresh descriptor this call owns.
+            return Ok(unsafe { OwnedFd::from_raw_fd(dup) });
+        }
+        let (dirfd, name) = self.entry_at(node)?;
+        open_entry_nofollow(dirfd, &name)
     }
 
     /// Stats an absolute path inside the export by descriptor.
@@ -3039,6 +3063,144 @@ fn unlink_at(dirfd: BorrowedFd<'_>, name: &CStr, directory: bool) -> Result<(), 
     let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
     // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
     let result = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Opens an entry for attribute work, following nothing.
+///
+/// Two macOS details make this possible at all, and both were measured rather
+/// than assumed:
+///
+/// `O_SYMLINK` opens a symlink *itself*, so a link's own attributes are
+/// reachable by descriptor rather than only by path. Without it a symlink
+/// would have to stay on the path form, since `O_NOFOLLOW` refuses to open
+/// one at all -- that is what the plan in #30 expected, and it turned out not
+/// to be the case.
+///
+/// `O_NONBLOCK` is not optional. Opening a FIFO blocks until the other end is
+/// opened, and this call happens with the device mutex held, so without it a
+/// guest could stop the VM by asking for the attributes of a pipe it never
+/// opens.
+#[cfg(target_os = "macos")]
+fn open_entry_nofollow(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, i32> {
+    let base = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), base | libc::O_NOFOLLOW) };
+    if fd >= 0 {
+        // SAFETY: a fresh descriptor this call owns.
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ELOOP) {
+        return Err(io_errno(err));
+    }
+    // ELOOP from O_NOFOLLOW means the entry is a symlink, which is the case
+    // O_SYMLINK exists for.
+    // SAFETY: as above.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), base | libc::O_SYMLINK) };
+    if fd < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh descriptor this call owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Reads an extended attribute from an open descriptor.
+#[cfg(target_os = "macos")]
+fn fd_getxattr(fd: BorrowedFd<'_>, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let name = xattr_name(name)?;
+    // SAFETY: `fd` is open for the call and `name` is NUL-terminated. A null
+    // buffer with zero length is how the size is asked for.
+    let needed =
+        unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    if needed < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    let mut value = vec![0u8; needed as usize];
+    // SAFETY: the buffer is `needed` bytes for a call told it is that long.
+    let got = unsafe {
+        libc::fgetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr() as *mut libc::c_void,
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if got < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    value.truncate(got as usize);
+    Ok(value)
+}
+
+/// Writes an extended attribute to an open descriptor.
+///
+/// A read-only descriptor is enough, which was also measured: the guest's
+/// request may name a file this device has no reason to open for writing.
+#[cfg(target_os = "macos")]
+fn fd_setxattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
+    let name = xattr_name(name)?;
+    let host_flags = if flags & LINUX_XATTR_CREATE != 0 {
+        libc::XATTR_CREATE
+    } else if flags & LINUX_XATTR_REPLACE != 0 {
+        libc::XATTR_REPLACE
+    } else {
+        0
+    };
+    // SAFETY: `fd` is open for the call, `name` is NUL-terminated, and the
+    // value pointer is valid for the length given.
+    let result = unsafe {
+        libc::fsetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            host_flags,
+        )
+    };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Lists the extended attributes on an open descriptor.
+#[cfg(target_os = "macos")]
+fn fd_listxattr(fd: BorrowedFd<'_>) -> Result<Vec<u8>, i32> {
+    // SAFETY: `fd` is open for the call; a null buffer asks for the size.
+    let needed = unsafe { libc::flistxattr(fd.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    if needed < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    let mut names = vec![0u8; needed as usize];
+    // SAFETY: the buffer is `needed` bytes for a call told it is that long.
+    let got = unsafe {
+        libc::flistxattr(
+            fd.as_raw_fd(),
+            names.as_mut_ptr() as *mut libc::c_char,
+            names.len(),
+            0,
+        )
+    };
+    if got < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    names.truncate(got as usize);
+    Ok(names)
+}
+
+/// Removes an extended attribute from an open descriptor.
+#[cfg(target_os = "macos")]
+fn fd_removexattr(fd: BorrowedFd<'_>, name: &[u8]) -> Result<(), i32> {
+    let name = xattr_name(name)?;
+    // SAFETY: `fd` is open for the call and `name` is NUL-terminated.
+    let result = unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr(), 0) };
     if result != 0 {
         return Err(io_errno(io::Error::last_os_error()));
     }
@@ -3827,30 +3989,6 @@ fn host_setxattr(path: &Path, name: &[u8], value: &[u8], flags: u32) -> Result<(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn host_listxattr(path: &Path) -> Result<Vec<u8>, i32> {
-    let path = path_cstring(path)?;
-    let needed =
-        unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW) };
-    if needed < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    let mut value = vec![0u8; needed as usize];
-    let got = unsafe {
-        libc::listxattr(
-            path.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    if got < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    value.truncate(got as usize);
-    Ok(value)
-}
-
 #[cfg(target_os = "linux")]
 fn host_listxattr(path: &Path) -> Result<Vec<u8>, i32> {
     let path = path_cstring(path)?;
@@ -3865,18 +4003,6 @@ fn host_listxattr(path: &Path) -> Result<Vec<u8>, i32> {
     }
     value.truncate(got as usize);
     Ok(value)
-}
-
-#[cfg(target_os = "macos")]
-fn host_removexattr(path: &Path, name: &[u8]) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let name = xattr_name(name)?;
-    let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
 }
 
 fn linux_lock_to_host(lock_type: u32) -> Result<i16, i32> {
@@ -5087,6 +5213,120 @@ mod tests {
         let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"work\0"), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert!(!dir.join("work").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A symlink's own extended attributes, by descriptor.
+    ///
+    /// The plan in #30 expected this one to stay path-based: `O_NOFOLLOW`
+    /// refuses to open a symlink, so there seemed to be no descriptor to work
+    /// from. macOS has `O_SYMLINK`, which opens the link itself, and that
+    /// closes the gap the plan left open. The attribute must land on the link
+    /// rather than on the file it names, which is the whole point.
+    #[test]
+    fn a_symlink_carries_its_own_xattrs_through_a_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), b"x").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let link = lookup_node(&mut dev, FUSE_ROOT_ID, b"link");
+
+        let mut set = vec![0u8; 16];
+        set[0..4].copy_from_slice(&5u32.to_le_bytes()); // value size
+        set.extend_from_slice(b"user.mark\0");
+        set.extend_from_slice(b"onlnk");
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(SETXATTR, link, &set), 4096), 4),
+            Some(0),
+            "setting an xattr on a symlink"
+        );
+
+        let mut get = vec![0u8; 8];
+        get[0..4].copy_from_slice(&64u32.to_le_bytes());
+        get.extend_from_slice(b"user.mark\0");
+        let out = dev.handle_fuse(&request(GETXATTR, link, &get), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(&out[OUT_HEADER_LEN..], b"onlnk", "read back from the link");
+
+        // And it is the link's, not the target's.
+        let on_target = host_getxattr(&dir.join("target"), b"user.mark");
+        assert!(
+            on_target.is_err(),
+            "the attribute landed on the file the link names"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Asking for a FIFO's attributes must not hang the device.
+    ///
+    /// Opening a FIFO blocks until the other end is opened, and this happens
+    /// with the device mutex held, so without O_NONBLOCK a guest could stop
+    /// the VM by asking about a pipe nobody opens. The `open` handler refuses
+    /// FIFOs for exactly this reason; the attribute path opens them, so it
+    /// carries the flag instead.
+    #[test]
+    fn a_fifos_attributes_do_not_block_the_device() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut mknod = vec![0u8; 16];
+        mknod[0..4].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
+        mknod.extend_from_slice(b"pipe\0");
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &mknod), 4096),
+                4
+            ),
+            Some(0)
+        );
+        let pipe = lookup_node(&mut dev, FUSE_ROOT_ID, b"pipe");
+
+        // No reader and no writer exists for this FIFO. If the open blocked,
+        // this test would never return.
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&256u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LISTXATTR, pipe, &list), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "listing a FIFO's attributes returned rather than blocking"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The private attribute stays hidden, and stays unwritable, now that the
+    /// handlers reach the host through a descriptor.
+    #[test]
+    fn the_private_xattr_is_still_hidden_from_the_guest() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+
+        // A guest may not write it.
+        let mut set = vec![0u8; 16];
+        set[0..4].copy_from_slice(&4u32.to_le_bytes());
+        set.extend_from_slice(HVI_XATTR_LINUX_ATTR);
+        set.push(0);
+        set.extend_from_slice(b"aaaa");
+        assert_eq!(
+            i32::from_le_bytes(
+                dev.handle_fuse(&request(SETXATTR, issue, &set), 4096)[4..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            -EPERM,
+            "the guest must not write the device's own attribute"
+        );
+
+        // And it does not appear in a listing, even though it is on the file.
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&1024u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LISTXATTR, issue, &list), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let names = &out[OUT_HEADER_LEN..];
+        assert!(
+            !names
+                .windows(HVI_XATTR_LINUX_ATTR.len())
+                .any(|w| w == HVI_XATTR_LINUX_ATTR),
+            "the device's own attribute leaked into a guest listing"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
