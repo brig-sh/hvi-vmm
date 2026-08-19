@@ -14,7 +14,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -368,6 +368,10 @@ pub struct VirtioFs {
     /// entirely still passes every behavioural test. `Cell` because
     /// `read_direct` only needs `&self`.
     zero_copy: Cell<(u64, u64)>,
+    /// Directory descriptors for resolving without paths (#30). Read
+    /// operations resolve through this; the rest of the device still joins
+    /// path strings and moves over a stage at a time.
+    dirs: DirCache,
 }
 
 impl VirtioFs {
@@ -413,6 +417,9 @@ impl VirtioFs {
         );
         let mut inode_ids = HashMap::new();
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
+        // Opened before `root` is moved into the struct, and once: every walk
+        // starts from this descriptor.
+        let dirs = DirCache::new(&root, DIR_CACHE_LIMIT)?;
         Ok(Self {
             root,
             writable,
@@ -434,6 +441,7 @@ impl VirtioFs {
             next_handle: 1,
             next_tmpfile: 1,
             zero_copy: Cell::new((0, 0)),
+            dirs,
         })
     }
 
@@ -1463,17 +1471,15 @@ impl VirtioFs {
         put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
-    fn readlink(&self, node: u64) -> Result<Vec<u8>, i32> {
-        let path = self.node_path(node)?;
-        let meta = fs::symlink_metadata(path).map_err(io_errno)?;
-        if !meta.file_type().is_symlink() {
-            return Err(EINVAL);
-        }
-        Ok(fs::read_link(path)
-            .map_err(io_errno)?
-            .as_os_str()
-            .as_bytes()
-            .to_vec())
+    /// Reads a symlink through the export's descriptors (#30).
+    ///
+    /// The explicit "is it a symlink" check is gone rather than lost:
+    /// `readlinkat` answers EINVAL for anything that is not one, which is the
+    /// errno the check was producing by hand, and it answers it without a
+    /// second syscall that could disagree with the first.
+    fn readlink(&mut self, node: u64) -> Result<Vec<u8>, i32> {
+        let (dirfd, name) = self.entry_at(node)?;
+        read_link_at(dirfd, &name)
     }
 
     fn open(&mut self, node: u64, input: &[u8], directory: bool) -> Result<Vec<u8>, i32> {
@@ -2226,9 +2232,12 @@ impl VirtioFs {
     }
 
     fn statfs(&self) -> Result<Vec<u8>, i32> {
-        let path = path_cstring(&self.root)?;
         let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
+        // The root descriptor rather than the root path: the answer is about
+        // the filesystem the export is on, and the descriptor names it without
+        // a resolution that could land elsewhere.
+        // SAFETY: the descriptor is owned by the cache and open for the call.
+        let result = unsafe { libc::fstatvfs(self.dirs.root_fd().as_raw_fd(), &mut stats) };
         if result != 0 {
             return Err(io_errno(io::Error::last_os_error()));
         }
@@ -2250,9 +2259,18 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn access(&self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn access(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let mask = get_u32(input, 0).ok_or(EINVAL)?;
-        fs::symlink_metadata(self.node_path(node)?).map_err(io_errno)?;
+        // Existence only, as before: the guest's own permission model is
+        // carried in the private xattr, not in the host's bits.
+        //
+        // The export root has no final component to name, and it exists by
+        // construction -- the constructor opened it. Everything else is asked
+        // through its parent's descriptor.
+        if !self.relative_of(node)?.as_os_str().is_empty() {
+            let (dirfd, name) = self.entry_at(node)?;
+            exists_at(dirfd, &name)?;
+        }
         if mask & 2 != 0 && !self.writable {
             Err(EROFS)
         } else {
@@ -2304,6 +2322,36 @@ impl VirtioFs {
         }
         host_removexattr(self.node_path(node)?, name)?;
         Ok(Vec::new())
+    }
+
+    /// A node's path relative to the export root.
+    ///
+    /// The node map still stores absolute paths, so this is the bridge between
+    /// it and the descriptor cache while the call sites move over (#30). The
+    /// root itself yields an empty path, which the cache reads as "the root".
+    fn relative_of(&self, node: u64) -> Result<PathBuf, i32> {
+        let path = self.node_path(node)?;
+        // A node path that is not below the root is a bug in the node
+        // bookkeeping rather than something to resolve around, and answering
+        // EINVAL is better than walking from somewhere unintended.
+        Ok(path
+            .strip_prefix(&self.root)
+            .map_err(|_| EINVAL)?
+            .to_owned())
+    }
+
+    /// The parent's directory descriptor and the final component, which is the
+    /// pair every `*at()` call takes.
+    ///
+    /// Errors for the export root, which has no final component. Callers that
+    /// can be handed the root deal with it before asking.
+    fn entry_at(&mut self, node: u64) -> Result<(BorrowedFd<'_>, CString), i32> {
+        let relative = self.relative_of(node)?;
+        let name = relative.file_name().ok_or(EINVAL)?;
+        let name = CString::new(name.as_bytes()).map_err(|_| EINVAL)?;
+        let parent = relative.parent().unwrap_or(Path::new("")).to_owned();
+        let dirfd = self.dirs.dir_fd(&parent)?;
+        Ok((dirfd, name))
     }
 
     fn node_path(&self, node: u64) -> Result<&Path, i32> {
@@ -2627,9 +2675,9 @@ const DIR_CACHE_LIMIT: usize = 128;
 struct DirCache {
     /// The export root. Pinned: never evicted, and the origin of every walk.
     root: OwnedFd,
-    open: HashMap<u64, OwnedFd>,
-    /// Least-recently-used first. Only node ids present in `open` appear here.
-    lru: VecDeque<u64>,
+    open: HashMap<PathBuf, OwnedFd>,
+    /// Least-recently-used first. Only paths present in `open` appear here.
+    lru: VecDeque<PathBuf>,
     limit: usize,
 }
 
@@ -2646,27 +2694,28 @@ impl DirCache {
         })
     }
 
-    /// A descriptor for `node`, whose path relative to the export root is
-    /// `relative`.
+    /// A descriptor for the directory at `relative`, a path below the export
+    /// root.
     ///
-    /// The caller supplies the relative path because the node map is still the
-    /// device's own business at this stage. Once the call sites move over, a
-    /// hit costs no path work at all.
+    /// Keyed by that path rather than by node id, which is what the first
+    /// caller wanted: a lookup needs its *parent's* descriptor, and a child
+    /// node does not know its parent's id. Paths also invalidate naturally,
+    /// since a rename is exactly what changes them.
     ///
     /// The borrow is what makes this safe to hand out: it holds `&mut self`
     /// for as long as the descriptor is alive, so nothing can evict the entry
     /// underneath the caller.
-    fn dir_fd(&mut self, node: u64, relative: &Path) -> Result<BorrowedFd<'_>, i32> {
-        if node == FUSE_ROOT_ID || relative.as_os_str().is_empty() {
+    fn dir_fd(&mut self, relative: &Path) -> Result<BorrowedFd<'_>, i32> {
+        if relative.as_os_str().is_empty() {
             return Ok(self.root.as_fd());
         }
-        if self.open.contains_key(&node) {
-            self.touch(node);
+        if self.open.contains_key(relative) {
+            self.touch(relative);
         } else {
             let fd = self.walk(relative)?;
-            self.admit(node, fd);
+            self.admit(relative.to_path_buf(), fd);
         }
-        Ok(self.open.get(&node).expect("just inserted").as_fd())
+        Ok(self.open.get(relative).expect("just inserted").as_fd())
     }
 
     /// Opens each component in turn from the root, following nothing.
@@ -2690,14 +2739,14 @@ impl DirCache {
         current.ok_or(EINVAL)
     }
 
-    fn touch(&mut self, node: u64) {
-        if let Some(at) = self.lru.iter().position(|n| *n == node) {
+    fn touch(&mut self, relative: &Path) {
+        if let Some(at) = self.lru.iter().position(|p| p == relative) {
             self.lru.remove(at);
         }
-        self.lru.push_back(node);
+        self.lru.push_back(relative.to_path_buf());
     }
 
-    fn admit(&mut self, node: u64, fd: OwnedFd) {
+    fn admit(&mut self, relative: PathBuf, fd: OwnedFd) {
         while self.open.len() >= self.limit {
             match self.lru.pop_front() {
                 // Dropping the descriptor closes it, which is the whole point
@@ -2706,24 +2755,81 @@ impl DirCache {
                 None => break,
             }
         }
-        self.open.insert(node, fd);
-        self.lru.push_back(node);
+        self.lru.push_back(relative.clone());
+        self.open.insert(relative, fd);
     }
 
-    /// Drops a node's descriptor, for FORGET and for the paths that invalidate
-    /// a node (rename, unlink) once the call sites move over.
-    fn forget(&mut self, node: u64) {
-        if self.open.remove(&node).is_some() {
-            if let Some(at) = self.lru.iter().position(|n| *n == node) {
+    /// Drops a descriptor, for the mutations that invalidate a path (rename,
+    /// unlink, rmdir) once those call sites move over.
+    fn forget(&mut self, relative: &Path) {
+        if self.open.remove(relative).is_some() {
+            if let Some(at) = self.lru.iter().position(|p| p == relative) {
                 self.lru.remove(at);
             }
         }
+    }
+
+    fn root_fd(&self) -> BorrowedFd<'_> {
+        self.root.as_fd()
     }
 
     #[cfg(test)]
     fn resident(&self) -> usize {
         self.open.len()
     }
+}
+
+/// Reads a symlink relative to a directory descriptor.
+///
+/// The buffer grows rather than trusting one `PATH_MAX`: `readlinkat`
+/// truncates silently when the target does not fit, and a truncated symlink
+/// target handed to a guest is a wrong answer rather than an error.
+fn read_link_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<Vec<u8>, i32> {
+    let mut size = 256usize;
+    loop {
+        let mut buf = vec![0u8; size];
+        // SAFETY: `dirfd` is open for the call, `name` is NUL-terminated, and
+        // the buffer is `size` bytes for a call told it is `size` bytes.
+        let written = unsafe {
+            libc::readlinkat(
+                dirfd.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                size,
+            )
+        };
+        if written < 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        let written = written as usize;
+        if written < size {
+            buf.truncate(written);
+            return Ok(buf);
+        }
+        // Filled it exactly: indistinguishable from truncation, so grow.
+        size = size.checked_mul(2).ok_or(EINVAL)?;
+        if size > 64 * 1024 {
+            return Err(ENAMETOOLONG);
+        }
+    }
+}
+
+/// Reports whether an entry exists relative to a directory descriptor,
+/// without following it if it is a symlink.
+fn exists_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<(), i32> {
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
+    let result = unsafe {
+        libc::faccessat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            libc::F_OK,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Opens a directory without following a symlink in its final component.
@@ -4684,6 +4790,86 @@ mod tests {
         ))
     }
 
+    /// READLINK had no test at all, so moving it onto `readlinkat` would have
+    /// been covered by nothing. The target is read back exactly, including one
+    /// long enough to force the buffer to grow past its first guess.
+    #[test]
+    fn readlink_returns_the_target_through_a_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        std::os::unix::fs::symlink("etc/issue", dir.join("short")).unwrap();
+        let long_target = "d/".repeat(200) + "leaf";
+        std::os::unix::fs::symlink(&long_target, dir.join("long")).unwrap();
+
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"short");
+        let out = dev.handle_fuse(&request(READLINK, node, &[]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(&out[OUT_HEADER_LEN..], b"etc/issue");
+
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"long");
+        let out = dev.handle_fuse(&request(READLINK, node, &[]), 8192);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(
+            &out[OUT_HEADER_LEN..],
+            long_target.as_bytes(),
+            "a target longer than the first buffer must not come back truncated"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `readlinkat` answers EINVAL for a non-symlink, which is the errno the
+    /// removed hand-rolled check produced. Pinned so the simplification is not
+    /// a behaviour change.
+    #[test]
+    fn readlink_on_a_regular_file_is_einval() {
+        let (dir, mut dev) = fixture();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let out = dev.handle_fuse(&request(READLINK, issue, &[]), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| e as i32), Some(-EINVAL));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// ACCESS had no test either, and the export root is the case most likely
+    /// to break: it has no final component to name, so it cannot be asked
+    /// through a parent descriptor and is answered from the root itself.
+    #[test]
+    fn access_answers_for_the_root_and_for_entries() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let out = dev.handle_fuse(&request(ACCESS, FUSE_ROOT_ID, &[0; 8]), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the export root must be reachable"
+        );
+
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let out = dev.handle_fuse(&request(ACCESS, etc, &[0; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        // Write access against a read-only export is still refused.
+        let (ro_dir, mut ro) = fixture();
+        let mut mask = vec![0u8; 8];
+        mask[0..4].copy_from_slice(&2u32.to_le_bytes());
+        let out = ro.handle_fuse(&request(ACCESS, FUSE_ROOT_ID, &mask), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| e as i32), Some(-EROFS));
+
+        let _ = fs::remove_dir_all(ro_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A node whose entry has been removed underneath the device answers
+    /// ENOENT rather than succeeding on a stale path.
+    #[test]
+    fn access_reports_a_vanished_entry() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("doomed"), b"x").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"doomed");
+        fs::remove_file(dir.join("doomed")).unwrap();
+        let out = dev.handle_fuse(&request(ACCESS, node, &[0; 8]), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| e as i32), Some(-ENOENT));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A tree to walk, returned with its own resolved root so the assertions
     /// compare like with like on a macOS `/var` -> `/private/var` temp dir.
     fn dircache_fixture() -> (PathBuf, DirCache) {
@@ -4699,7 +4885,7 @@ mod tests {
     #[test]
     fn dircache_serves_the_root_without_walking() {
         let (dir, mut cache) = dircache_fixture();
-        let fd = cache.dir_fd(FUSE_ROOT_ID, Path::new("")).unwrap();
+        let fd = cache.dir_fd(Path::new("")).unwrap();
         assert!(fd.as_raw_fd() >= 0);
         assert_eq!(cache.resident(), 0, "the root is pinned, not cached");
         let _ = fs::remove_dir_all(dir);
@@ -4709,15 +4895,9 @@ mod tests {
     #[test]
     fn dircache_walks_then_reuses() {
         let (dir, mut cache) = dircache_fixture();
-        let first = cache
-            .dir_fd(2, Path::new("usr/lib/ssl"))
-            .unwrap()
-            .as_raw_fd();
+        let first = cache.dir_fd(Path::new("usr/lib/ssl")).unwrap().as_raw_fd();
         assert_eq!(cache.resident(), 1);
-        let second = cache
-            .dir_fd(2, Path::new("usr/lib/ssl"))
-            .unwrap()
-            .as_raw_fd();
+        let second = cache.dir_fd(Path::new("usr/lib/ssl")).unwrap().as_raw_fd();
         assert_eq!(
             first, second,
             "a hit must hand back the descriptor already open, not walk again"
@@ -4742,13 +4922,13 @@ mod tests {
         // it because a symlink is not a directory. The refusal is what this
         // test is for; the errno is recorded so a later change to it is a
         // deliberate one rather than a surprise.
-        let err = cache.dir_fd(3, Path::new("out")).unwrap_err();
+        let err = cache.dir_fd(Path::new("out")).unwrap_err();
         assert_eq!(err, ENOTDIR, "a symlinked component must refuse the walk");
         assert_eq!(cache.resident(), 0, "nothing may be admitted on failure");
 
         // And the same holds for a component in the middle of a path.
         fs::create_dir_all(outside.join("deeper")).unwrap();
-        let err = cache.dir_fd(4, Path::new("out/deeper")).unwrap_err();
+        let err = cache.dir_fd(Path::new("out/deeper")).unwrap_err();
         assert_eq!(err, ENOTDIR);
 
         let _ = fs::remove_dir_all(&outside);
@@ -4760,11 +4940,8 @@ mod tests {
     #[test]
     fn dircache_refuses_a_parent_component() {
         let (dir, mut cache) = dircache_fixture();
-        assert_eq!(
-            cache.dir_fd(5, Path::new("usr/../etc")).unwrap_err(),
-            EINVAL
-        );
-        assert_eq!(cache.dir_fd(6, Path::new("/etc")).unwrap_err(), EINVAL);
+        assert_eq!(cache.dir_fd(Path::new("usr/../etc")).unwrap_err(), EINVAL);
+        assert_eq!(cache.dir_fd(Path::new("/etc")).unwrap_err(), EINVAL);
         assert_eq!(cache.resident(), 0);
         let _ = fs::remove_dir_all(dir);
     }
@@ -4780,7 +4957,7 @@ mod tests {
         let dir = fs::canonicalize(&dir).unwrap();
         let mut cache = DirCache::new(&dir, 3).unwrap();
         for i in 0..8u64 {
-            cache.dir_fd(10 + i, Path::new(&format!("d{i}"))).unwrap();
+            cache.dir_fd(Path::new(&format!("d{i}"))).unwrap();
             assert!(
                 cache.resident() <= 3,
                 "cache grew past its limit at {i}: {}",
@@ -4802,11 +4979,11 @@ mod tests {
         let dir = fs::canonicalize(&dir).unwrap();
         let mut cache = DirCache::new(&dir, 2).unwrap();
 
-        let hot = cache.dir_fd(20, Path::new("hot")).unwrap().as_raw_fd();
-        for (node, name) in [(21u64, "a"), (22, "b"), (23, "c")] {
-            cache.dir_fd(node, Path::new(name)).unwrap();
+        let hot = cache.dir_fd(Path::new("hot")).unwrap().as_raw_fd();
+        for name in ["a", "b", "c"] {
+            cache.dir_fd(Path::new(name)).unwrap();
             // Keep `hot` warm across each admission.
-            let again = cache.dir_fd(20, Path::new("hot")).unwrap().as_raw_fd();
+            let again = cache.dir_fd(Path::new("hot")).unwrap().as_raw_fd();
             assert_eq!(again, hot, "the warm entry was evicted after {name}");
         }
         let _ = fs::remove_dir_all(dir);
@@ -4816,11 +4993,11 @@ mod tests {
     #[test]
     fn dircache_forget_releases_the_descriptor() {
         let (dir, mut cache) = dircache_fixture();
-        cache.dir_fd(7, Path::new("etc")).unwrap();
+        cache.dir_fd(Path::new("etc")).unwrap();
         assert_eq!(cache.resident(), 1);
-        cache.forget(7);
+        cache.forget(Path::new("etc"));
         assert_eq!(cache.resident(), 0);
-        cache.forget(7); // idempotent
+        cache.forget(Path::new("etc")); // idempotent
         assert_eq!(cache.resident(), 0);
         let _ = fs::remove_dir_all(dir);
     }
