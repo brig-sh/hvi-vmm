@@ -416,7 +416,7 @@ impl VirtioFs {
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
         // Opened before `root` is moved into the struct, and once: every walk
         // starts from this descriptor.
-        let dirs = DirCache::new(&root, DIR_CACHE_LIMIT)?;
+        let dirs = DirCache::new(&root, DIR_CACHE_LIMIT, cache_policy != CachePolicy::None)?;
         Ok(Self {
             root,
             writable,
@@ -1365,6 +1365,7 @@ impl VirtioFs {
         } else {
             fs::remove_file(&path).map_err(io_errno)?;
         }
+        self.invalidate_dirs(&path);
         self.forget_node_path(&path, &meta);
         Ok(Vec::new())
     }
@@ -1390,6 +1391,10 @@ impl VirtioFs {
         let old_meta = Stat::lstat(&old_path)?;
         let replaced = Stat::lstat(&new_path).ok();
         host_rename(&old_path, &new_path, flags)?;
+        // Both ends now refer to something other than they did, and for a
+        // directory that is true of everything beneath them too.
+        self.invalidate_dirs(&old_path);
+        self.invalidate_dirs(&new_path);
         if flags & RENAME_EXCHANGE != 0 {
             self.exchange_node_paths(&old_path, &new_path);
             return Ok(Vec::new());
@@ -2356,6 +2361,19 @@ impl VirtioFs {
         Ok((dirfd, name))
     }
 
+    /// Drops any cached descriptor for an absolute path inside the export,
+    /// and for everything beneath it.
+    ///
+    /// Called wherever a mutation makes a path refer to something else, which
+    /// is every removal and every rename. Creating is not one of those: a name
+    /// that did not exist cannot have been cached.
+    fn invalidate_dirs(&mut self, path: &Path) {
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            let relative = relative.to_owned();
+            self.dirs.forget_subtree(&relative);
+        }
+    }
+
     /// Stats an absolute path inside the export by descriptor.
     ///
     /// The export root is the case that has no parent to be asked through, so
@@ -2695,6 +2713,16 @@ struct DirCache {
     /// The export root. Pinned: never evicted, and the origin of every walk.
     root: OwnedFd,
     open: HashMap<PathBuf, OwnedFd>,
+    /// Off under `CachePolicy::None`, whose contract is that every lookup
+    /// reaches the host. Holding a descriptor would quietly break that: a
+    /// directory replaced host-side keeps the same path and gets a new inode,
+    /// and a kept descriptor still refers to the old one. With caching off
+    /// every resolution re-walks, so a host-side replacement is picked up on
+    /// the next request, which is what that policy promises.
+    caching: bool,
+    /// Where a walk's result lives when it is not being cached, so a borrowed
+    /// descriptor can still be handed out. Replaced on every miss.
+    scratch: Option<OwnedFd>,
     /// Least-recently-used first. Only paths present in `open` appear here.
     lru: VecDeque<PathBuf>,
     limit: usize,
@@ -2702,12 +2730,14 @@ struct DirCache {
 
 #[allow(dead_code)]
 impl DirCache {
-    fn new(root: &Path, limit: usize) -> io::Result<Self> {
+    fn new(root: &Path, limit: usize, caching: bool) -> io::Result<Self> {
         let root = open_dir_nofollow_at(None, root.as_os_str().as_bytes())
             .map_err(io::Error::from_raw_os_error)?;
         Ok(Self {
             root,
             open: HashMap::new(),
+            caching,
+            scratch: None,
             lru: VecDeque::new(),
             limit: limit.max(1),
         })
@@ -2727,6 +2757,11 @@ impl DirCache {
     fn dir_fd(&mut self, relative: &Path) -> Result<BorrowedFd<'_>, i32> {
         if relative.as_os_str().is_empty() {
             return Ok(self.root.as_fd());
+        }
+        if !self.caching {
+            let fd = self.walk(relative)?;
+            self.scratch = Some(fd);
+            return Ok(self.scratch.as_ref().expect("just set").as_fd());
         }
         if self.open.contains_key(relative) {
             self.touch(relative);
@@ -2776,6 +2811,25 @@ impl DirCache {
         }
         self.lru.push_back(relative.clone());
         self.open.insert(relative, fd);
+    }
+
+    /// Drops the descriptor for `relative` and for everything beneath it.
+    ///
+    /// A path and the inode behind it are not the same thing, and a mutation
+    /// is where they come apart: remove a directory and make another by the
+    /// same name and every descriptor cached under that name still refers to
+    /// the dead one. The subtree goes too, because removing or renaming a
+    /// directory takes its whole contents with it.
+    fn forget_subtree(&mut self, relative: &Path) {
+        let doomed: Vec<PathBuf> = self
+            .open
+            .keys()
+            .filter(|cached| cached.as_path() == relative || cached.starts_with(relative))
+            .cloned()
+            .collect();
+        for path in doomed {
+            self.forget(&path);
+        }
     }
 
     /// Drops a descriptor, for the mutations that invalidate a path (rename,
@@ -4964,6 +5018,96 @@ mod tests {
         ))
     }
 
+    /// A descriptor cached for a directory must not outlive that directory.
+    ///
+    /// Remove the directory and make a new one by the same name and the path
+    /// string is unchanged while the inode behind it is not. A descriptor kept
+    /// from before still refers to the dead one, so everything asked through
+    /// it is answered about a directory that no longer exists. Caching this
+    /// without invalidating was a real bug, and this is the case that finds
+    /// it: the guest does the removal itself, so the device sees it and has no
+    /// excuse.
+    #[test]
+    fn a_directory_the_guest_removed_does_not_leave_a_live_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&0o755u32.to_le_bytes());
+        mkdir.extend_from_slice(b"work\0");
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(MKDIR, FUSE_ROOT_ID, &mkdir), 4096),
+                4
+            ),
+            Some(0)
+        );
+
+        // Look through it, which is what puts its descriptor in the cache.
+        let work = lookup_node(&mut dev, FUSE_ROOT_ID, b"work");
+        fs::write(dir.join("work/before"), b"1").unwrap();
+        lookup_node(&mut dev, work, b"before");
+
+        // The guest removes it and makes another by the same name.
+        fs::remove_file(dir.join("work/before")).unwrap();
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"work\0"), 4096),
+                4
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(MKDIR, FUSE_ROOT_ID, &mkdir), 4096),
+                4
+            ),
+            Some(0)
+        );
+        fs::write(dir.join("work/after"), b"2").unwrap();
+
+        let work = lookup_node(&mut dev, FUSE_ROOT_ID, b"work");
+        let out = dev.handle_fuse(&request(LOOKUP, work, b"after\0"), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "a file in the new directory must be found, not looked for in the old one"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The same replacement done *host-side*, which the device cannot observe.
+    ///
+    /// `CachePolicy::None` is the policy whose contract is that every lookup
+    /// reaches the host, so under it the descriptor cache is bypassed and a
+    /// host-side replacement is picked up on the next request. Under `Auto`
+    /// it would not be, and that is not a bug: `cache_seconds` already tells
+    /// the guest to hold attributes, so a host-side change is not immediately
+    /// visible there by design.
+    #[test]
+    fn a_host_side_replacement_is_seen_when_the_policy_promises_it() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        fs::create_dir_all(dir.join("work")).unwrap();
+        fs::write(dir.join("work/before"), b"1").unwrap();
+
+        let work = lookup_node(&mut dev, FUSE_ROOT_ID, b"work");
+        lookup_node(&mut dev, work, b"before");
+
+        // Entirely behind the device's back.
+        fs::remove_file(dir.join("work/before")).unwrap();
+        fs::remove_dir(dir.join("work")).unwrap();
+        fs::create_dir(dir.join("work")).unwrap();
+        fs::write(dir.join("work/after"), b"2").unwrap();
+
+        let work = lookup_node(&mut dev, FUSE_ROOT_ID, b"work");
+        let out = dev.handle_fuse(&request(LOOKUP, work, b"after\0"), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "under CachePolicy::None every lookup must reach the host"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// `.` and `..` do not resolve to `parent/name`, so they take a different
     /// route to a descriptor than every other lookup: `..` at the export root
     /// is the root, which has no parent to be asked through and is stated from
@@ -5096,7 +5240,7 @@ mod tests {
         assert_eq!((by_fd.dev(), by_fd.ino()), (ours.dev(), ours.ino()));
 
         let cache_root = fs::canonicalize(&dir).unwrap();
-        let mut cache = DirCache::new(&cache_root, 4).unwrap();
+        let mut cache = DirCache::new(&cache_root, 4, true).unwrap();
         let dirfd = cache.dir_fd(Path::new("")).unwrap();
         let by_at = Stat::at(dirfd, &CString::new("f").unwrap()).unwrap();
         assert_eq!((by_at.dev(), by_at.ino()), (ours.dev(), ours.ino()));
@@ -5192,7 +5336,7 @@ mod tests {
         fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
         fs::create_dir_all(dir.join("etc")).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        let cache = DirCache::new(&dir, DIR_CACHE_LIMIT).unwrap();
+        let cache = DirCache::new(&dir, DIR_CACHE_LIMIT, true).unwrap();
         (dir, cache)
     }
 
@@ -5270,7 +5414,7 @@ mod tests {
             fs::create_dir_all(dir.join(format!("d{i}"))).unwrap();
         }
         let dir = fs::canonicalize(&dir).unwrap();
-        let mut cache = DirCache::new(&dir, 3).unwrap();
+        let mut cache = DirCache::new(&dir, 3, true).unwrap();
         for i in 0..8u64 {
             cache.dir_fd(Path::new(&format!("d{i}"))).unwrap();
             assert!(
@@ -5292,7 +5436,7 @@ mod tests {
             fs::create_dir_all(dir.join(name)).unwrap();
         }
         let dir = fs::canonicalize(&dir).unwrap();
-        let mut cache = DirCache::new(&dir, 2).unwrap();
+        let mut cache = DirCache::new(&dir, 2, true).unwrap();
 
         let hot = cache.dir_fd(Path::new("hot")).unwrap().as_raw_fd();
         for name in ["a", "b", "c"] {
