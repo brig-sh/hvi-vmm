@@ -1334,7 +1334,8 @@ impl VirtioFs {
         let name = nul_name(input, 8)?;
         let old_path = self.node_path(old_node)?.to_owned();
         let new_path = self.child_path(new_parent, name)?;
-        host_link(&old_path, &new_path)?;
+        let (old_fd, old_name, new_fd, new_name) = self.two_entries_at(&old_path, &new_path)?;
+        host_link(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name)?;
         self.new_entry(new_path)
     }
 
@@ -1386,7 +1387,8 @@ impl VirtioFs {
         let new_path = self.child_path(new_parent, new_name)?;
         let old_meta = Stat::lstat(&old_path)?;
         let replaced = Stat::lstat(&new_path).ok();
-        host_rename(&old_path, &new_path, flags)?;
+        let (old_fd, old_name, new_fd, new_name) = self.two_entries_at(&old_path, &new_path)?;
+        host_rename(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name, flags)?;
         // Both ends now refer to something other than they did, and for a
         // directory that is true of everything beneath them too.
         self.invalidate_dirs(&old_path);
@@ -2379,6 +2381,28 @@ impl VirtioFs {
         }
     }
 
+    /// Both ends of a two-path operation, resolved together.
+    ///
+    /// Returns each parent's descriptor owned rather than borrowed, because
+    /// the borrowed form can only hand out one at a time.
+    fn two_entries_at(
+        &mut self,
+        old: &Path,
+        new: &Path,
+    ) -> Result<(OwnedFd, CString, OwnedFd, CString), i32> {
+        let old_rel = self.relative_of_path(old)?;
+        let new_rel = self.relative_of_path(new)?;
+        let old_name =
+            CString::new(old_rel.file_name().ok_or(EINVAL)?.as_bytes()).map_err(|_| EINVAL)?;
+        let new_name =
+            CString::new(new_rel.file_name().ok_or(EINVAL)?.as_bytes()).map_err(|_| EINVAL)?;
+        let old_parent = old_rel.parent().unwrap_or(Path::new("")).to_owned();
+        let new_parent = new_rel.parent().unwrap_or(Path::new("")).to_owned();
+        let old_fd = self.dirs.dir_fd_owned(&old_parent)?;
+        let new_fd = self.dirs.dir_fd_owned(&new_parent)?;
+        Ok((old_fd, old_name, new_fd, new_name))
+    }
+
     /// Stats an absolute path inside the export by descriptor.
     ///
     /// The export root is the case that has no parent to be asked through, so
@@ -2845,6 +2869,30 @@ impl DirCache {
                 self.lru.remove(at);
             }
         }
+    }
+
+    /// An owned descriptor for `relative`.
+    ///
+    /// LINK and RENAME name two paths and need both descriptors at once,
+    /// which the borrowed form cannot give: it holds `&mut self` for as long
+    /// as the descriptor lives, so a second call cannot be made while the
+    /// first result is alive. Duplicating costs one syscall at the only two
+    /// call sites that need it, rather than threading a second lifetime
+    /// through the whole path layer.
+    ///
+    /// `F_DUPFD_CLOEXEC` rather than `dup`, so the close-on-exec discipline
+    /// every other descriptor here carries is not quietly dropped at the one
+    /// place two of them meet.
+    fn dir_fd_owned(&mut self, relative: &Path) -> Result<OwnedFd, i32> {
+        let fd = self.dir_fd(relative)?;
+        // SAFETY: `fd` is open for the call; the result is a fresh descriptor
+        // this call owns and hands straight to `OwnedFd`.
+        let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(io_errno(io::Error::last_os_error()));
+        }
+        // SAFETY: a fresh descriptor, not shared with anything else.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
     }
 
     fn root_fd(&self) -> BorrowedFd<'_> {
@@ -3697,17 +3745,19 @@ fn ranges_overlap(left: u64, right: u64, length: u64) -> bool {
 /// file's inode -- with no symlink left for anything downstream to notice.
 /// `linkat` with no flags is defined not to follow, which is the behaviour
 /// this device has always wanted.
-fn host_link(old: &Path, new: &Path) -> Result<(), i32> {
-    let old = path_cstring(old)?;
-    let new = path_cstring(new)?;
-    // SAFETY: both arguments are NUL-terminated C strings that outlive the
-    // call, and `AT_FDCWD` resolves each path from the working directory
-    // exactly as the `link(2)` this replaces did.
+fn host_link(
+    old_dir: BorrowedFd<'_>,
+    old: &CStr,
+    new_dir: BorrowedFd<'_>,
+    new: &CStr,
+) -> Result<(), i32> {
+    // SAFETY: both names are NUL-terminated and outlive the call, and both
+    // descriptors are open for it.
     let result = unsafe {
         libc::linkat(
-            libc::AT_FDCWD,
+            old_dir.as_raw_fd(),
             old.as_ptr(),
-            libc::AT_FDCWD,
+            new_dir.as_raw_fd(),
             new.as_ptr(),
             0,
         )
@@ -3730,22 +3780,41 @@ fn host_mkfifo(path: &Path, mode: u32) -> Result<(), i32> {
 }
 
 #[cfg(target_os = "macos")]
-fn host_rename(old: &Path, new: &Path, flags: u32) -> Result<(), i32> {
+fn host_rename(
+    old_dir: BorrowedFd<'_>,
+    old: &CStr,
+    new_dir: BorrowedFd<'_>,
+    new: &CStr,
+    flags: u32,
+) -> Result<(), i32> {
     if flags == 0 {
-        return fs::rename(old, new).map_err(io_errno);
+        // SAFETY: both names are NUL-terminated and outlive the call, and
+        // both descriptors are open for it.
+        let result = unsafe {
+            libc::renameat(
+                old_dir.as_raw_fd(),
+                old.as_ptr(),
+                new_dir.as_raw_fd(),
+                new.as_ptr(),
+            )
+        };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(io_errno(io::Error::last_os_error()))
+        };
     }
-    let old = path_cstring(old)?;
-    let new = path_cstring(new)?;
     let host_flags = if flags & RENAME_EXCHANGE != 0 {
         0x2
     } else {
         0x4
     };
+    // SAFETY: as above; renameatx_np takes the same pair of descriptors.
     let result = unsafe {
         libc::renameatx_np(
-            libc::AT_FDCWD,
+            old_dir.as_raw_fd(),
             old.as_ptr(),
-            libc::AT_FDCWD,
+            new_dir.as_raw_fd(),
             new.as_ptr(),
             host_flags,
         )
@@ -5058,6 +5127,81 @@ mod tests {
             "hvi-virtiofs-outside-{what}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    /// The two-path operations resolve both ends through descriptors, so a
+    /// symlinked parent refuses them for the same structural reason a
+    /// one-path mutation does.
+    #[test]
+    fn link_and_rename_cannot_reach_through_a_symlinked_directory() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("two-path-escape");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let out_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"out");
+
+        // LINK into a directory reached through the symlink.
+        let mut link = vec![0u8; 8];
+        link[0..8].copy_from_slice(&issue.to_le_bytes());
+        link.extend_from_slice(b"planted\0");
+        dev.handle_fuse(&request(LINK, out_node, &link), 4096);
+        assert!(
+            !outside.join("planted").exists(),
+            "a hard link escaped through a symlinked directory"
+        );
+
+        // RENAME into the same place.
+        let mut rename = vec![0u8; 8];
+        rename[0..8].copy_from_slice(&out_node.to_le_bytes());
+        rename.extend_from_slice(b"issue\0");
+        rename.extend_from_slice(b"moved\0");
+        dev.handle_fuse(&request(RENAME, etc, &rename), 4096);
+        assert!(
+            !outside.join("moved").exists(),
+            "a rename escaped through a symlinked directory"
+        );
+        assert!(dir.join("etc/issue").exists(), "and the source survived");
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Each two-path operation duplicates two descriptors. Duplicates that are
+    /// not released are how this device reaches EMFILE and reports nonsense on
+    /// unrelated files (#34), so the count must come back to where it started.
+    #[test]
+    fn two_path_operations_do_not_leak_descriptors() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let open_now = || fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+
+        // Warm the cache and the fixture so the baseline is steady.
+        for round in 0..4u32 {
+            fs::write(dir.join(format!("f{round}")), b"x").unwrap();
+            let mut rename = vec![0u8; 8];
+            rename[0..8].copy_from_slice(&FUSE_ROOT_ID.to_le_bytes());
+            rename.extend_from_slice(format!("f{round}\0").as_bytes());
+            rename.extend_from_slice(format!("g{round}\0").as_bytes());
+            dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        }
+        let before = open_now();
+
+        for round in 100..160u32 {
+            fs::write(dir.join(format!("f{round}")), b"x").unwrap();
+            let mut rename = vec![0u8; 8];
+            rename[0..8].copy_from_slice(&FUSE_ROOT_ID.to_le_bytes());
+            rename.extend_from_slice(format!("f{round}\0").as_bytes());
+            rename.extend_from_slice(format!("g{round}\0").as_bytes());
+            let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "rename {round} failed");
+        }
+        let after = open_now();
+        assert!(
+            after <= before + 2,
+            "sixty renames leaked descriptors: {before} -> {after}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// A descriptor cached for a directory must not outlive that directory.
