@@ -18,7 +18,7 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, DirEntryExt, FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirEntryExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1305,11 +1305,9 @@ impl VirtioFs {
         let mode = get_u32(input, 0).ok_or(EINVAL)?;
         let name = nul_name(input, 8)?;
         let path = self.child_path(parent, name)?;
-        let mut builder = fs::DirBuilder::new();
-        builder
-            .mode(host_creation_mode(mode, true))
-            .create(&path)
-            .map_err(io_errno)?;
+        let host_mode = host_creation_mode(mode, true);
+        let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
+        mkdir_at(dirfd, &entry, host_mode)?;
         initialize_guest_metadata(&path, mode, context)?;
         self.new_entry(path)
     }
@@ -1324,7 +1322,8 @@ impl VirtioFs {
         let (name, next) = nul_name_with_end(input, 0)?;
         let target = nul_name(input, next)?;
         let path = self.child_path(parent, name)?;
-        std::os::unix::fs::symlink(OsStr::from_bytes(target), &path).map_err(io_errno)?;
+        let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
+        symlink_at(target, dirfd, &entry)?;
         initialize_guest_metadata(&path, 0o777, context)?;
         self.new_entry(path)
     }
@@ -1360,11 +1359,8 @@ impl VirtioFs {
             return Ok(Vec::new());
         }
         let meta = Stat::lstat(&path)?;
-        if directory {
-            fs::remove_dir(&path).map_err(io_errno)?;
-        } else {
-            fs::remove_file(&path).map_err(io_errno)?;
-        }
+        let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
+        unlink_at(dirfd, &entry, directory)?;
         self.invalidate_dirs(&path);
         self.forget_node_path(&path, &meta);
         Ok(Vec::new())
@@ -2339,6 +2335,15 @@ impl VirtioFs {
             .to_owned())
     }
 
+    /// The path form of [`Self::relative_of`], for the mutations that have
+    /// built a child path but have no node for it yet.
+    fn relative_of_path(&self, path: &Path) -> Result<PathBuf, i32> {
+        Ok(path
+            .strip_prefix(&self.root)
+            .map_err(|_| EINVAL)?
+            .to_owned())
+    }
+
     /// The parent's directory descriptor and the final component, which is the
     /// pair every `*at()` call takes.
     ///
@@ -2850,6 +2855,43 @@ impl DirCache {
     fn resident(&self) -> usize {
         self.open.len()
     }
+}
+
+/// Creates a directory relative to a directory descriptor.
+fn mkdir_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
+    let result = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Creates a symlink relative to a directory descriptor.
+///
+/// The target is stored exactly as the guest gave it. It names something in
+/// the guest's namespace, not ours, so it is not ours to interpret -- which is
+/// the same reason the walk refuses to follow one.
+fn symlink_at(target: &[u8], dirfd: BorrowedFd<'_>, name: &CStr) -> Result<(), i32> {
+    let target = CString::new(target).map_err(|_| EINVAL)?;
+    // SAFETY: both strings are NUL-terminated and outlive the call, and
+    // `dirfd` is open for it.
+    let result = unsafe { libc::symlinkat(target.as_ptr(), dirfd.as_raw_fd(), name.as_ptr()) };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Removes an entry relative to a directory descriptor.
+fn unlink_at(dirfd: BorrowedFd<'_>, name: &CStr, directory: bool) -> Result<(), i32> {
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
+    let result = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Reads a symlink relative to a directory descriptor.
@@ -5507,17 +5549,19 @@ mod tests {
     /// joined path can sit under the root as a string while the syscall
     /// resolves somewhere else entirely.
     ///
-    /// Ignored rather than deleted, because the property is still one we want.
-    /// The device-side check that satisfied it resolved the parent host-side,
-    /// which refused ordinary guest paths as well -- an absolute symlink in a
-    /// container rootfs names the guest's filesystem, not ours -- and broke
-    /// booting a stock image. Containment is the Seatbelt profile's alone
-    /// again, as it was before that check, and the sandbox does refuse this
-    /// escape at the syscall. What is missing is the device's own answer,
-    /// which returns with fd-relative resolution (NOFireAI/hvi-vmm#30). Turn
-    /// this back on with that change; it is the test for it.
+    /// Live again, and by a different mechanism than the one that first
+    /// satisfied it. That one resolved the parent host-side and compared the
+    /// result to the root, which refused ordinary guest paths too -- an
+    /// absolute symlink in a container rootfs names the guest's filesystem,
+    /// not ours -- and broke booting a stock image, so it was removed in #40
+    /// and this test was ignored rather than deleted.
+    ///
+    /// It passes now without any check at all. The mutation resolves through
+    /// its parent's descriptor, and the walk that produced that descriptor
+    /// opened every component with `O_NOFOLLOW`, so a symlinked directory
+    /// cannot be descended in the first place. Containment stopped being
+    /// something asked and became something true (#30).
     #[test]
-    #[ignore = "device-side containment returns with fd-relative resolution (#30)"]
     fn a_symlinked_directory_cannot_take_a_mutation_outside_the_export() {
         let (dir, mut dev) = fixture_with_access(true);
         let outside = outside_path("dir");
