@@ -1058,6 +1058,21 @@ impl VirtioFs {
             .map(|handle| handle.path.as_path())
             .or(path.as_deref())
             .ok_or(EINVAL)?;
+        // The private attribute lives on the entry itself, so it needs a
+        // descriptor for it rather than for its parent. A request carrying a
+        // handle already has one open; otherwise the entry is opened through
+        // the parent resolved above.
+        #[cfg(target_os = "macos")]
+        let metadata_fd: Option<OwnedFd> = match (handle, entry.as_ref()) {
+            (Some(_), _) => None,
+            (None, Some((dirfd, name))) => Some(open_entry_nofollow(dirfd.as_fd(), name)?),
+            (None, None) => None,
+        };
+        #[cfg(target_os = "macos")]
+        let meta_fd: Option<BorrowedFd<'_>> = match handle {
+            Some(h) => Some(h.file.as_fd()),
+            None => metadata_fd.as_ref().map(|fd| fd.as_fd()),
+        };
 
         if valid & FATTR_SIZE != 0 {
             if let Some(handle) = handle {
@@ -1080,14 +1095,14 @@ impl VirtioFs {
                 } else {
                     Stat::lstat(metadata_path)?
                 };
-                let mut guest = guest_attr(Some(metadata_path), &current_meta);
+                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta);
                 if valid & FATTR_UID != 0 {
                     guest.uid = uid;
                 }
                 if valid & FATTR_GID != 0 {
                     guest.gid = gid;
                 }
-                set_guest_attr(metadata_path, guest)?;
+                set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
             }
             #[cfg(target_os = "linux")]
             {
@@ -1118,7 +1133,7 @@ impl VirtioFs {
             let mut new_mode = if valid & FATTR_MODE != 0 {
                 mode & 0o7777
             } else {
-                guest_attr(Some(metadata_path), &current_meta).mode & 0o7777
+                guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta).mode & 0o7777
             };
             if valid & FATTR_KILL_SUIDGID != 0 {
                 new_mode &= !0o6000;
@@ -1137,9 +1152,9 @@ impl VirtioFs {
                         chmod_at(dirfd.as_fd(), name, host_mode)?;
                     }
                 }
-                let mut guest = guest_attr(Some(metadata_path), &current_meta);
+                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta);
                 guest.mode = (current_meta.mode() & S_IFMT) | new_mode;
-                set_guest_attr(metadata_path, guest)?;
+                set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
             }
             #[cfg(target_os = "linux")]
             {
@@ -1248,7 +1263,10 @@ impl VirtioFs {
             // Never create host device nodes from a guest.
             _ => return Err(EPERM),
         }
-        initialize_guest_metadata(&path, mode, context)?;
+        {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            initialize_guest_metadata(dirfd, &name, mode, context)?;
+        }
         self.new_entry(path)
     }
 
@@ -1324,7 +1342,10 @@ impl VirtioFs {
         let host_mode = host_creation_mode(mode, true);
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         mkdir_at(dirfd, &entry, host_mode)?;
-        initialize_guest_metadata(&path, mode, context)?;
+        {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            initialize_guest_metadata(dirfd, &name, mode, context)?;
+        }
         self.new_entry(path)
     }
 
@@ -1340,7 +1361,10 @@ impl VirtioFs {
         let path = self.child_path(parent, name)?;
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         symlink_at(target, dirfd, &entry)?;
-        initialize_guest_metadata(&path, 0o777, context)?;
+        {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            initialize_guest_metadata(dirfd, &name, 0o777, context)?;
+        }
         self.new_entry(path)
     }
 
@@ -1475,7 +1499,10 @@ impl VirtioFs {
             let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
             open_host_file_at(dirfd, &name, flags, true, host_mode)?
         };
-        initialize_guest_metadata(&path, mode, context)?;
+        {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            initialize_guest_metadata(dirfd, &name, mode, context)?;
+        }
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
             clear_suid_sgid(&path, &file)?;
         }
@@ -2081,7 +2108,10 @@ impl VirtioFs {
             host_creation_mode(mode, false),
         )
         .map_err(io_errno)?;
-        initialize_guest_metadata(&path, mode, context)?;
+        {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            initialize_guest_metadata(dirfd, &name, mode, context)?;
+        }
         let meta = Stat::of_file(&file)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
@@ -2614,11 +2644,17 @@ impl VirtioFs {
     /// the permission bits and uid/gid are cached.
     fn guest_attr(&mut self, node: u64, path: Option<&Path>, meta: &Stat) -> GuestAttr {
         #[cfg(target_os = "macos")]
-        if let Some(path) = path {
+        if path.is_some() {
             let stored = match self.nodes.get(&node).map(|n| n.guest_attr) {
                 Some(Some(cached)) => cached,
                 _ => {
-                    let stored = stored_guest_attr(path);
+                    // A miss opens the entry. The cache is what keeps this off
+                    // the hot path: one open per node the first time it is
+                    // seen, in place of the getxattr this replaces.
+                    let stored = self
+                        .open_entry_at(node)
+                        .ok()
+                        .and_then(|fd| stored_guest_attr(fd.as_fd()));
                     if let Some(n) = self.nodes.get_mut(&node) {
                         n.guest_attr = Some(stored);
                     }
@@ -3588,14 +3624,20 @@ fn host_creation_mode(mode: u32, _directory: bool) -> u32 {
 }
 
 #[cfg(target_os = "macos")]
-fn initialize_guest_metadata(path: &Path, mode: u32, context: RequestContext) -> Result<(), i32> {
-    let meta = Stat::lstat(path)?;
+fn initialize_guest_metadata(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    mode: u32,
+    context: RequestContext,
+) -> Result<(), i32> {
+    let meta = Stat::at(dirfd, name)?;
+    let fd = open_entry_nofollow(dirfd, name)?;
     if !meta.is_symlink() {
         let host_mode = host_creation_mode(mode, meta.is_dir());
-        fs::set_permissions(path, Permissions::from_mode(host_mode)).map_err(io_errno)?;
+        chmod_at(dirfd, name, host_mode)?;
     }
     set_guest_attr(
-        path,
+        fd.as_fd(),
         GuestAttr {
             mode: (meta.mode() & S_IFMT) | (mode & 0o7777),
             uid: context.uid,
@@ -3605,21 +3647,28 @@ fn initialize_guest_metadata(path: &Path, mode: u32, context: RequestContext) ->
 }
 
 #[cfg(target_os = "linux")]
-fn initialize_guest_metadata(path: &Path, mode: u32, _context: RequestContext) -> Result<(), i32> {
-    let meta = Stat::lstat(path)?;
+fn initialize_guest_metadata(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    mode: u32,
+    _context: RequestContext,
+) -> Result<(), i32> {
+    let meta = Stat::at(dirfd, name)?;
     if !meta.is_symlink() {
-        fs::set_permissions(path, Permissions::from_mode(mode & 0o7777)).map_err(io_errno)?;
+        chmod_at(dirfd, name, mode & 0o7777)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn clear_suid_sgid(path: &Path, file: &File) -> Result<(), i32> {
+fn clear_suid_sgid(_path: &Path, file: &File) -> Result<(), i32> {
+    // The open file is the entry, so its own descriptor answers this without
+    // naming anything.
     let meta = Stat::of_file(file)?;
-    let mut guest = guest_attr(Some(path), &meta);
+    let mut guest = guest_attr(Some(file.as_fd()), &meta);
     if guest.mode & 0o6000 != 0 {
         guest.mode &= !0o6000;
-        set_guest_attr(path, guest)?;
+        set_guest_attr(file.as_fd(), guest)?;
     }
     Ok(())
 }
@@ -3651,17 +3700,17 @@ fn filter_private_xattrs(value: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(target_os = "macos")]
-fn set_guest_attr(path: &Path, guest: GuestAttr) -> Result<(), i32> {
+fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
     let mut value = [0u8; 12];
     value[0..4].copy_from_slice(&(guest.mode & 0o177777).to_le_bytes());
     value[4..8].copy_from_slice(&guest.uid.to_le_bytes());
     value[8..12].copy_from_slice(&guest.gid.to_le_bytes());
-    host_setxattr(path, HVI_XATTR_LINUX_ATTR, &value, 0)
+    fd_setxattr(fd, HVI_XATTR_LINUX_ATTR, &value, 0)
 }
 
 #[cfg(target_os = "macos")]
-fn stored_guest_attr(path: &Path) -> Option<GuestAttr> {
-    let value = host_getxattr(path, HVI_XATTR_LINUX_ATTR).ok()?;
+fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
+    let value = fd_getxattr(fd, HVI_XATTR_LINUX_ATTR).ok()?;
     if value.len() != 12 {
         return None;
     }
@@ -3672,10 +3721,10 @@ fn stored_guest_attr(path: &Path) -> Option<GuestAttr> {
     })
 }
 
-fn guest_attr(path: Option<&Path>, meta: &Stat) -> GuestAttr {
+fn guest_attr(fd: Option<BorrowedFd<'_>>, meta: &Stat) -> GuestAttr {
     #[cfg(target_os = "macos")]
-    if let Some(path) = path {
-        if let Some(mut guest) = stored_guest_attr(path) {
+    if let Some(fd) = fd {
+        if let Some(mut guest) = stored_guest_attr(fd) {
             guest.mode = (meta.mode() & S_IFMT) | (guest.mode & 0o7777);
             return guest;
         }
@@ -3881,41 +3930,6 @@ fn xattr_response(requested: usize, value: Vec<u8>) -> Result<Vec<u8>, i32> {
     Ok(value)
 }
 
-#[cfg(target_os = "macos")]
-fn host_getxattr(path: &Path, name: &[u8]) -> Result<Vec<u8>, i32> {
-    let path = path_cstring(path)?;
-    let name = xattr_name(name)?;
-    let needed = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    if needed < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    let mut value = vec![0u8; needed as usize];
-    let got = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    if got < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    value.truncate(got as usize);
-    Ok(value)
-}
-
 #[cfg(target_os = "linux")]
 fn host_getxattr(path: &Path, name: &[u8]) -> Result<Vec<u8>, i32> {
     let path = path_cstring(path)?;
@@ -3938,35 +3952,6 @@ fn host_getxattr(path: &Path, name: &[u8]) -> Result<Vec<u8>, i32> {
     }
     value.truncate(got as usize);
     Ok(value)
-}
-
-#[cfg(target_os = "macos")]
-fn host_setxattr(path: &Path, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let name = xattr_name(name)?;
-    let host_flags = libc::XATTR_NOFOLLOW
-        | if flags & LINUX_XATTR_CREATE != 0 {
-            libc::XATTR_CREATE
-        } else if flags & LINUX_XATTR_REPLACE != 0 {
-            libc::XATTR_REPLACE
-        } else {
-            0
-        };
-    let result = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-            host_flags,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5216,6 +5201,55 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// The guest's own uid, gid and mode survive a round trip now that the
+    /// private attribute travels by descriptor.
+    ///
+    /// This is the attribute that decides what a guest sees as ownership, so a
+    /// wrong answer here reads as a permissions problem rather than a crash --
+    /// the kind of thing a boot test notices late and a unit test should
+    /// notice first.
+    #[test]
+    fn the_guests_ownership_survives_a_descriptor_round_trip() {
+        let (dir, mut dev) = fixture_with_access(true);
+
+        // CREATE runs initialize_guest_metadata, which writes the attribute.
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&(LINUX_O_RDWR | LINUX_O_EXCL).to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o640).to_le_bytes());
+        create.extend_from_slice(b"owned\0");
+        let out = dev.handle_fuse(&request(CREATE, FUSE_ROOT_ID, &create), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        // The mode the guest asked for comes back, not the host's.
+        let out = dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let mode = get_u32(&out, OUT_HEADER_LEN + 16 + 60).unwrap();
+        assert_eq!(mode & 0o7777, 0o640, "the guest's mode did not survive");
+        assert_eq!(mode & S_IFMT, S_IFREG);
+
+        // Change ownership through SETATTR and read it back.
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&(FATTR_UID | FATTR_GID).to_le_bytes());
+        setattr[76..80].copy_from_slice(&1234u32.to_le_bytes());
+        setattr[80..84].copy_from_slice(&5678u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, node, &setattr), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let out = dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 68),
+            Some(1234),
+            "the uid the guest set did not come back"
+        );
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 72),
+            Some(5678),
+            "the gid the guest set did not come back"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A symlink's own extended attributes, by descriptor.
     ///
     /// The plan in #30 expected this one to stay path-based: `O_NOFOLLOW`
@@ -5247,10 +5281,11 @@ mod tests {
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(&out[OUT_HEADER_LEN..], b"onlnk", "read back from the link");
 
-        // And it is the link's, not the target's.
-        let on_target = host_getxattr(&dir.join("target"), b"user.mark");
+        // And it is the link's, not the target's. Opening the target directly
+        // is the check: the attribute must not be on the file it names.
+        let target = File::open(dir.join("target")).unwrap();
         assert!(
-            on_target.is_err(),
+            fd_getxattr(target.as_fd(), b"user.mark").is_err(),
             "the attribute landed on the file the link names"
         );
         let _ = fs::remove_dir_all(dir);
@@ -5609,8 +5644,11 @@ mod tests {
 
         // Write the xattr behind the device's back, standing in for what a
         // creation into a reused inode would leave on disk.
+        // Opened directly rather than through the device, which is the point:
+        // this stands in for something changing the attribute behind its back.
+        let behind_its_back = File::open(dir.join("etc/issue")).unwrap();
         set_guest_attr(
-            &dir.join("etc/issue"),
+            behind_its_back.as_fd(),
             GuestAttr {
                 mode: S_IFREG | 0o600,
                 uid: 4242,
