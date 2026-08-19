@@ -1034,6 +1034,21 @@ impl VirtioFs {
         } else {
             None
         };
+        // Resolved here, and owned rather than borrowed, because `handle`
+        // below holds a borrow of `self.handles` for the rest of the function
+        // and the borrowed descriptor form needs `&mut self`. One duplicate on
+        // the path that has no file handle, rather than a second lifetime
+        // threaded through everything that follows.
+        let entry = match path.as_deref() {
+            Some(target) => {
+                let relative = self.relative_of_path(target)?;
+                let name = CString::new(relative.file_name().ok_or(EINVAL)?.as_bytes())
+                    .map_err(|_| EINVAL)?;
+                let parent = relative.parent().unwrap_or(Path::new("")).to_owned();
+                Some((self.dirs.dir_fd_owned(&parent)?, name))
+            }
+            None => None,
+        };
         let handle = if valid & FATTR_FH != 0 {
             Some(self.handles.get(&fh).ok_or(EBADF)?)
         } else {
@@ -1051,8 +1066,8 @@ impl VirtioFs {
                 }
                 handle.file.set_len(size).map_err(io_errno)?;
             } else {
-                let file = open_host_file(path.as_deref().ok_or(EINVAL)?, LINUX_O_WRONLY, false, 0)
-                    .map_err(io_errno)?;
+                let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                let file = open_host_file_at(dirfd.as_fd(), name, LINUX_O_WRONLY, false, 0)?;
                 file.set_len(size).map_err(io_errno)?;
             }
         }
@@ -1118,7 +1133,8 @@ impl VirtioFs {
                             .set_permissions(Permissions::from_mode(host_mode))
                             .map_err(io_errno)?;
                     } else {
-                        host_lchmod(path.as_deref().ok_or(EINVAL)?, host_mode)?;
+                        let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                        chmod_at(dirfd.as_fd(), name, host_mode)?;
                     }
                 }
                 let mut guest = guest_attr(Some(metadata_path), &current_meta);
@@ -1133,7 +1149,8 @@ impl VirtioFs {
                         .set_permissions(Permissions::from_mode(new_mode))
                         .map_err(io_errno)?;
                 } else {
-                    host_lchmod(path.as_deref().ok_or(EINVAL)?, new_mode)?;
+                    let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                    chmod_at(dirfd.as_fd(), name, new_mode)?;
                 }
             }
         }
@@ -1214,17 +1231,16 @@ impl VirtioFs {
         let mode = get_u32(input, 0).ok_or(EINVAL)?;
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
+        let host_mode = host_creation_mode(mode, false);
         match mode & S_IFMT {
             S_IFREG => {
-                open_host_file(
-                    &path,
-                    LINUX_O_WRONLY | LINUX_O_EXCL,
-                    true,
-                    host_creation_mode(mode, false),
-                )
-                .map_err(io_errno)?;
+                let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+                open_host_file_at(dirfd, &name, LINUX_O_WRONLY | LINUX_O_EXCL, true, host_mode)?;
             }
-            S_IFIFO => host_mkfifo(&path, host_creation_mode(mode, false))?,
+            S_IFIFO => {
+                let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+                mkfifo_at(dirfd, &name, host_mode)?;
+            }
             // A socket is served from this device rather than created on the
             // host: see `VirtioFs::sockets`. `bind(2)` in the guest is what
             // lands here, and it expects the entry to exist afterwards.
@@ -3029,6 +3045,41 @@ fn unlink_at(dirfd: BorrowedFd<'_>, name: &CStr, directory: bool) -> Result<(), 
     Ok(())
 }
 
+/// Changes a mode relative to a directory descriptor, without following a
+/// symlink in the final component.
+fn chmod_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
+    let result = unsafe {
+        libc::fchmodat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Creates a FIFO relative to a directory descriptor.
+///
+/// `mkfifoat` is what this wants and macOS does not have it, so it is
+/// `mknodat` with `S_IFIFO`, which is the same call underneath. The guest
+/// never reaches a device node here: `mknod` refuses everything but a regular
+/// file, a FIFO and a socket before it gets this far.
+fn mkfifo_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
+    let kind = libc::S_IFIFO | (mode & 0o7777) as libc::mode_t;
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated. The
+    // device number is unused for a FIFO and passed as zero.
+    let result = unsafe { libc::mknodat(dirfd.as_raw_fd(), name.as_ptr(), kind, 0) };
+    if result != 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Reads a symlink relative to a directory descriptor.
 ///
 /// The buffer grows rather than trusting one `PATH_MAX`: `readlinkat`
@@ -3576,23 +3627,6 @@ fn host_lchown(path: &Path, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) 
     }
 }
 
-fn host_lchmod(path: &Path, mode: u32) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let result = unsafe {
-        libc::fchmodat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            mode as libc::mode_t,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
-}
-
 fn fuse_times(
     valid: u32,
     atime: u64,
@@ -3898,16 +3932,6 @@ fn host_link(
             0,
         )
     };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
-}
-
-fn host_mkfifo(path: &Path, mode: u32) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let result = unsafe { libc::mkfifo(path.as_ptr(), mode as libc::mode_t) };
     if result == 0 {
         Ok(())
     } else {
@@ -5063,6 +5087,92 @@ mod tests {
         let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"work\0"), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert!(!dir.join("work").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// SETATTR and MKNOD below a directory symlink, which is where the last
+    /// stage of this work broke every other mutation without the suite
+    /// noticing. Covered here before the same thing can happen again.
+    #[test]
+    fn setattr_and_mknod_work_below_a_directory_symlink() {
+        let (dir, mut dev) = fixture_with_access(true);
+        std::os::unix::fs::symlink("etc", dir.join("include")).unwrap();
+        let include = lookup_node(&mut dev, FUSE_ROOT_ID, b"include");
+
+        // MKNOD a regular file through the symlink.
+        let mut mknod = vec![0u8; 16];
+        mknod[0..4].copy_from_slice(&(S_IFREG | 0o644).to_le_bytes());
+        mknod.extend_from_slice(b"made\0");
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(MKNOD, include, &mknod), 4096), 4),
+            Some(0),
+            "MKNOD below a directory symlink"
+        );
+        assert!(dir.join("etc/made").is_file());
+
+        // And a FIFO, the other kind this device will create.
+        let mut fifo = vec![0u8; 16];
+        fifo[0..4].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
+        fifo.extend_from_slice(b"pipe\0");
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(MKNOD, include, &fifo), 4096), 4),
+            Some(0),
+            "MKNOD of a FIFO below a directory symlink"
+        );
+
+        // SETATTR the mode of something under the symlink.
+        let made = lookup_node(&mut dev, include, b"made");
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+        setattr[68..72].copy_from_slice(&0o755u32.to_le_bytes());
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(SETATTR, made, &setattr), 4096), 4),
+            Some(0),
+            "SETATTR below a directory symlink"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A device node is refused, and stays refused now that MKNOD creates
+    /// through a descriptor. Letting a guest make one on the host is the thing
+    /// this handler exists to prevent.
+    #[test]
+    fn mknod_still_refuses_a_device_node() {
+        let (dir, mut dev) = fixture_with_access(true);
+        // S_IFCHR, which is not one of the three kinds this device serves.
+        let mut mknod = vec![0u8; 16];
+        mknod[0..4].copy_from_slice(&(0o020000u32 | 0o666).to_le_bytes());
+        mknod.extend_from_slice(b"null\0");
+        let out = dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &mknod), 4096);
+        assert_eq!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            -EPERM,
+            "a guest must not create a host device node"
+        );
+        assert!(!dir.join("null").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// SETATTR must not follow a symlink when it changes a mode: the link's
+    /// own bits are the target, never those of whatever it names.
+    #[test]
+    fn setattr_chmod_does_not_follow_a_symlink() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), b"x").unwrap();
+        fs::set_permissions(dir.join("target"), Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+
+        let link = lookup_node(&mut dev, FUSE_ROOT_ID, b"link");
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+        setattr[68..72].copy_from_slice(&0o777u32.to_le_bytes());
+        dev.handle_fuse(&request(SETATTR, link, &setattr), 4096);
+
+        let target_mode = fs::symlink_metadata(dir.join("target")).unwrap().mode() & 0o777;
+        assert_eq!(
+            target_mode, 0o600,
+            "chmod through a symlink changed the file it names"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
