@@ -270,6 +270,27 @@ struct SocketNode {
     /// again after its cache is dropped has to arrive at the same inode, or
     /// the socket the server is bound to becomes unreachable.
     ino: u64,
+    /// Seconds and nanoseconds since the epoch, reported for all three of
+    /// atime, mtime and ctime.
+    ///
+    /// There is no host file to read a time off, and reporting zero -- which
+    /// this did at first -- dates every socket to 1 January 1970. That is
+    /// visibly wrong in a listing and worse than cosmetic for anything that
+    /// ages or sorts what it finds in a directory, `/tmp` reapers being the
+    /// obvious example.
+    time: (u64, u32),
+}
+
+/// Now, as a `(seconds, nanoseconds)` pair since the epoch.
+///
+/// A clock that is somehow before the epoch reports zero rather than
+/// panicking: a socket with a strange timestamp is not worth failing a
+/// `bind` over.
+fn now_parts() -> (u64, u32) {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs(), d.subsec_nanos()),
+        Err(_) => (0, 0),
+    }
 }
 
 /// The `st_dev` synthetic inodes are numbered under.
@@ -953,6 +974,22 @@ impl VirtioFs {
             if valid & FATTR_GID != 0 {
                 socket.gid = get_u32(input, 80).ok_or(EINVAL)?;
             }
+            // `touch` on a socket is legal and a guest may well do it, so an
+            // explicit time is taken and a "now" request is answered with the
+            // clock rather than ignored.
+            if valid & (FATTR_MTIME_NOW | FATTR_ATIME_NOW) != 0 {
+                socket.time = now_parts();
+            } else if valid & FATTR_MTIME != 0 {
+                socket.time = (
+                    get_u64(input, 40).ok_or(EINVAL)?,
+                    get_u32(input, 60).ok_or(EINVAL)?,
+                );
+            } else if valid & FATTR_ATIME != 0 {
+                socket.time = (
+                    get_u64(input, 32).ok_or(EINVAL)?,
+                    get_u32(input, 56).ok_or(EINVAL)?,
+                );
+            }
             self.sockets.insert(path, socket);
             return Ok(socket_attr_out(node, socket));
         }
@@ -1198,6 +1235,7 @@ impl VirtioFs {
             uid: context.uid,
             gid: context.gid,
             ino,
+            time: now_parts(),
         };
         self.sockets.insert(path.clone(), socket);
         let node = self.socket_node_id(&path, ino);
@@ -2426,15 +2464,16 @@ impl VirtioFs {
 /// read because there is no file. Sizes and timestamps are zero, which is what
 /// a freshly bound socket looks like anyway, and nothing consults them.
 fn put_socket_attr(out: &mut Vec<u8>, node: u64, socket: SocketNode) {
+    let (secs, nsecs) = socket.time;
     put_u64(out, node);
     put_u64(out, 0); // size
     put_u64(out, 0); // blocks
-    put_u64(out, 0); // atime
-    put_u64(out, 0); // mtime
-    put_u64(out, 0); // ctime
-    put_u32(out, 0);
-    put_u32(out, 0);
-    put_u32(out, 0);
+    put_u64(out, secs); // atime
+    put_u64(out, secs); // mtime
+    put_u64(out, secs); // ctime
+    put_u32(out, nsecs);
+    put_u32(out, nsecs);
+    put_u32(out, nsecs);
     put_u32(out, socket.mode);
     put_u32(out, 1); // nlink
     put_u32(out, socket.uid);
@@ -3773,6 +3812,41 @@ mod tests {
         let mode = u32::from_le_bytes(attrs[92..96].try_into().unwrap());
         assert_eq!(mode & S_IFMT, S_IFSOCK, "not reported as a socket");
         assert_eq!(mode & 0o7777, 0o700, "mode was not preserved");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A socket reported zero for atime, mtime and ctime when it was first
+    /// served from here, which dates every one of them to 1 January 1970 in
+    /// a listing -- visible in `ls -l`, and worse than cosmetic for anything
+    /// that ages what it finds in a directory.
+    #[test]
+    fn a_socket_is_stamped_with_a_real_time() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut payload = Vec::new();
+        put_u32(&mut payload, S_IFSOCK | 0o700);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        payload.extend_from_slice(b"dated.sock\0");
+        dev.handle_fuse(&request(MKNOD, FUSE_ROOT_ID, &payload), 4096);
+
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"dated.sock\0");
+        let attrs = dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        // put_attr's layout: the out header is 16 bytes, attr_out adds 16,
+        // then ino/size/blocks precede the three timestamps.
+        let atime = u64::from_le_bytes(attrs[56..64].try_into().unwrap());
+        let mtime = u64::from_le_bytes(attrs[64..72].try_into().unwrap());
+        let ctime = u64::from_le_bytes(attrs[72..80].try_into().unwrap());
+
+        assert!(atime >= before, "atime is not a real time: {atime}");
+        assert_eq!(mtime, atime, "mtime should match");
+        assert_eq!(ctime, atime, "ctime should match");
 
         let _ = fs::remove_dir_all(dir);
     }
