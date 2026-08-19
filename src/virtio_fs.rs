@@ -1454,8 +1454,11 @@ impl VirtioFs {
         let open_flags = get_u32(input, 12).ok_or(EINVAL)?;
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
-        let file = open_host_file(&path, flags, true, host_creation_mode(mode, false))
-            .map_err(io_errno)?;
+        let host_mode = host_creation_mode(mode, false);
+        let file = {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            open_host_file_at(dirfd, &name, flags, true, host_mode)?
+        };
         initialize_guest_metadata(&path, mode, context)?;
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
             clear_suid_sgid(&path, &file)?;
@@ -1514,7 +1517,10 @@ impl VirtioFs {
         let fh = if directory {
             self.insert_dir_handle(&path)?
         } else {
-            let file = open_host_file(&path, flags, false, 0).map_err(io_errno)?;
+            let file = {
+                let (dirfd, name) = self.entry_at(node)?;
+                open_host_file_at(dirfd, &name, flags, false, 0)?
+            };
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
                 clear_suid_sgid(&path, &file)?;
                 self.invalidate_guest_attr(node);
@@ -2801,25 +2807,106 @@ impl DirCache {
         Ok(self.open.get(relative).expect("just inserted").as_fd())
     }
 
-    /// Opens each component in turn from the root, following nothing.
+    /// Opens each component in turn, resolving symlinks inside the export's
+    /// own namespace.
+    ///
+    /// A symlink stored in a share names something the *guest* means, and the
+    /// guest sees the export as its root. `/etc/ssl/certs` therefore means
+    /// this export's `etc/ssl/certs`, not the host's `/etc` -- reading it the
+    /// host's way is what made the removed containment check refuse ordinary
+    /// container paths (#40).
+    ///
+    /// Resolving them the guest's way is both correct and contained: an
+    /// absolute target restarts at the export root, a relative one continues
+    /// from where it was found, and `..` cannot climb above the root because
+    /// there is nothing above it to climb to. No path leaves the share, so
+    /// nothing has to be checked afterwards to notice that it did.
+    ///
+    /// Every open is still `O_NOFOLLOW`. The kernel never follows anything on
+    /// this device's behalf; each hop is one this walk decided to take.
     fn walk(&self, relative: &Path) -> Result<OwnedFd, i32> {
-        let mut current: Option<OwnedFd> = None;
+        // Bounds the mutual recursion a pair of symlinks pointing at each
+        // other would otherwise be, and matches what a kernel reports for it.
+        const MAX_EXPANSIONS: usize = 40;
+
+        let mut pending: VecDeque<OsString> = VecDeque::new();
         for component in relative.components() {
-            let name = match component {
-                Component::Normal(name) => name,
-                // A relative path built from the node map should contain
-                // neither. Refusing is not defensive dressing: `..` is exactly
-                // the component that would climb out of the export, and the
-                // walk is the only thing standing between it and the host.
+            match component {
+                Component::Normal(name) => pending.push_back(name.to_owned()),
+                // The caller's path is built from the node map and should hold
+                // neither. A target's may, and is handled below.
                 _ => return Err(EINVAL),
-            };
+            }
+        }
+
+        let mut resolved: Vec<OsString> = Vec::new();
+        let mut expansions = 0usize;
+
+        while let Some(name) = pending.pop_front() {
+            if name == "." {
+                continue;
+            }
+            if name == ".." {
+                // Clamped at the root: the export is the guest's whole world.
+                resolved.pop();
+                continue;
+            }
+            let parent = self.open_resolved(&resolved)?;
+            let parent_fd = parent
+                .as_ref()
+                .map(|fd| fd.as_raw_fd())
+                .unwrap_or_else(|| self.root.as_raw_fd());
+            match open_dir_nofollow_at(Some(parent_fd), name.as_bytes()) {
+                Ok(_) => resolved.push(name),
+                Err(err) if err == ENOTDIR || err == ELOOP => {
+                    // Not a directory. A symlink is the case worth handling;
+                    // anything else keeps the error the open already gave.
+                    let borrowed = match parent.as_ref() {
+                        Some(fd) => fd.as_fd(),
+                        None => self.root.as_fd(),
+                    };
+                    let c_name = CString::new(name.as_bytes()).map_err(|_| EINVAL)?;
+                    let target = read_link_at(borrowed, &c_name).map_err(|_| err)?;
+                    expansions += 1;
+                    if expansions > MAX_EXPANSIONS {
+                        return Err(ELOOP);
+                    }
+                    let target = PathBuf::from(OsString::from_vec(target));
+                    if target.is_absolute() {
+                        // The guest's root is this export's root.
+                        resolved.clear();
+                    }
+                    for component in target.components().rev() {
+                        match component {
+                            Component::Normal(part) => pending.push_front(part.to_owned()),
+                            Component::ParentDir => pending.push_front(OsString::from("..")),
+                            Component::CurDir => {}
+                            // A target's leading "/" is the restart above.
+                            Component::RootDir | Component::Prefix(_) => {}
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.open_resolved(&resolved)?.ok_or(EINVAL)
+    }
+
+    /// Opens a chain of already-resolved component names from the root.
+    ///
+    /// `None` for the empty chain, which is the root itself and is pinned
+    /// rather than reopened.
+    fn open_resolved(&self, names: &[OsString]) -> Result<Option<OwnedFd>, i32> {
+        let mut current: Option<OwnedFd> = None;
+        for name in names {
             let parent = current
                 .as_ref()
                 .map(|fd| fd.as_raw_fd())
                 .unwrap_or_else(|| self.root.as_raw_fd());
             current = Some(open_dir_nofollow_at(Some(parent), name.as_bytes())?);
         }
-        current.ok_or(EINVAL)
+        Ok(current)
     }
 
     fn touch(&mut self, relative: &Path) {
@@ -3174,7 +3261,13 @@ fn open_dir_nofollow_at(parent: Option<RawFd>, name: &[u8]) -> Result<OwnedFd, i
 /// Two properties `OpenOptions` was supplying implicitly are set here
 /// deliberately: `O_CLOEXEC`, and refusing a path with an interior NUL rather
 /// than letting `open(2)` see a truncated one.
-fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Result<File> {
+/// Translates the guest's open flags into the host's.
+///
+/// Shared by the path and descriptor forms so the two cannot drift. The
+/// `O_NOFOLLOW` that keeps the final component honest, and the `O_CLOEXEC`
+/// that keeps a guest's descriptor out of any process this one spawns, are
+/// decided once here rather than at each call site.
+fn host_open_flags(flags: u32, create: bool) -> io::Result<i32> {
     let mut host_flags = match flags & LINUX_O_ACCMODE {
         0 => libc::O_RDONLY,
         LINUX_O_WRONLY => libc::O_WRONLY,
@@ -3206,6 +3299,18 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
     // A descriptor opened on the guest's behalf must not survive into any
     // process this one spawns. OpenOptions did this for us.
     host_flags |= libc::O_CLOEXEC;
+    Ok(host_flags)
+}
+
+/// Opens a host file with the flags the guest asked for.
+///
+/// This translates by hand rather than going through `OpenOptions`, which
+/// rejects `O_CREAT` or `O_TRUNC` without write access before issuing any
+/// syscall, so the kernel never gets a say. `O_CREAT|O_RDONLY` is exactly how
+/// a lock file is opened, and refusing it surfaced in the guest as
+/// `flock: cannot open lock file: Invalid argument`.
+fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Result<File> {
+    let host_flags = host_open_flags(flags, create)?;
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
     // SAFETY: c_path is NUL-terminated and outlives the call. The mode
@@ -3217,6 +3322,37 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
         return Err(io::Error::last_os_error());
     }
     // SAFETY: fd is a fresh descriptor this call owns and has not shared.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// The same, relative to a directory descriptor (NOFireAI/hvi-vmm#30).
+///
+/// `name` is the single component the guest asked for, so nothing here can
+/// resolve anywhere but inside the directory the descriptor already names.
+fn open_host_file_at(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    flags: u32,
+    create: bool,
+    mode: u32,
+) -> Result<File, i32> {
+    let host_flags = host_open_flags(flags, create).map_err(io_errno)?;
+    // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated. The
+    // mode is read by the kernel only when O_CREAT is set, and is passed as
+    // the promoted type a variadic openat(2) expects. The descriptor is handed
+    // straight to File, which owns and closes it.
+    let fd = unsafe {
+        libc::openat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            host_flags,
+            (mode & 0o7777) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh descriptor this call owns and has not shared.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -4930,6 +5066,130 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Every mutation below a directory symlink, not just CREATE.
+    ///
+    /// `writable_operations_follow_directory_symlinks` covers CREATE alone,
+    /// and that gap let the descriptor walk refuse MKDIR, SYMLINK and UNLINK
+    /// there with ENOTDIR while the suite stayed green.
+    #[test]
+    fn every_mutation_works_below_a_directory_symlink() {
+        let (dir, mut dev) = fixture_with_access(true);
+        std::os::unix::fs::symlink("etc", dir.join("include")).unwrap();
+        let include = lookup_node(&mut dev, FUSE_ROOT_ID, b"include");
+
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&0o755u32.to_le_bytes());
+        mkdir.extend_from_slice(b"sub\0");
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(MKDIR, include, &mkdir), 4096), 4),
+            Some(0),
+            "MKDIR below a directory symlink"
+        );
+        assert!(dir.join("etc/sub").is_dir());
+
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(SYMLINK, include, b"lnk\0target\0"), 4096),
+                4
+            ),
+            Some(0),
+            "SYMLINK below a directory symlink"
+        );
+
+        fs::write(dir.join("etc/doomed"), b"x").unwrap();
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(UNLINK, include, b"doomed\0"), 4096),
+                4
+            ),
+            Some(0),
+            "UNLINK below a directory symlink"
+        );
+        assert!(!dir.join("etc/doomed").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An absolute symlink target names the guest's root, which is the export,
+    /// and never the host's.
+    ///
+    /// This is the shape every container rootfs is full of --
+    /// `/usr/lib/ssl/certs -> /etc/ssl/certs` -- and reading it the host's way
+    /// is what made the removed containment check refuse ordinary paths and
+    /// hang a boot.
+    #[test]
+    fn an_absolute_symlink_target_is_rooted_at_the_export() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
+        fs::create_dir_all(dir.join("etc/ssl/certs")).unwrap();
+        fs::write(dir.join("etc/ssl/certs/ca.pem"), b"cert").unwrap();
+        // Exactly the rootfs shape, absolute target and all.
+        std::os::unix::fs::symlink("/etc/ssl/certs", dir.join("usr/lib/ssl/certs")).unwrap();
+
+        let usr = lookup_node(&mut dev, FUSE_ROOT_ID, b"usr");
+        let lib = lookup_node(&mut dev, usr, b"lib");
+        let ssl = lookup_node(&mut dev, lib, b"ssl");
+        let certs = lookup_node(&mut dev, ssl, b"certs");
+
+        // Reading through it lands inside the export, on the guest's own
+        // /etc rather than the host's.
+        let out = dev.handle_fuse(&request(LOOKUP, certs, b"ca.pem\0"), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "an absolute target must resolve against the export root"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A target that climbs cannot climb out: the export is the guest's whole
+    /// world, so `..` at its root has nowhere above to reach.
+    #[test]
+    fn a_climbing_symlink_target_is_clamped_at_the_export_root() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("climb-target");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), b"host-only").unwrap();
+
+        // Enough "../" to leave the export several times over.
+        std::os::unix::fs::symlink("../../../../../../../../etc", dir.join("climb")).unwrap();
+        let climb = lookup_node(&mut dev, FUSE_ROOT_ID, b"climb");
+
+        // It lands on the export's own etc, not anywhere above it.
+        let out = dev.handle_fuse(&request(LOOKUP, climb, b"issue\0"), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the climb must clamp at the export root and find its etc/issue"
+        );
+
+        // And a mutation through it cannot reach the host directory.
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&0o755u32.to_le_bytes());
+        mkdir.extend_from_slice(b"planted\0");
+        dev.handle_fuse(&request(MKDIR, climb, &mkdir), 4096);
+        assert!(
+            !outside.join("planted").exists(),
+            "a climbing target reached outside the export"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Two symlinks naming each other terminate rather than spinning.
+    #[test]
+    fn a_symlink_loop_is_refused_rather_than_walked_forever() {
+        let (dir, mut dev) = fixture_with_access(true);
+        std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
+
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let out = dev.handle_fuse(&request(LOOKUP, a, b"anything\0"), 4096);
+        let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
+        assert_eq!(errno, -ELOOP, "a symlink loop must terminate as ELOOP");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn writable_operations_follow_directory_symlinks() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -5197,9 +5457,15 @@ mod tests {
             assert_eq!(get_u32(&out, 4), Some(0), "rename {round} failed");
         }
         let after = open_now();
+        // The count is process-wide and the suite runs in parallel, so other
+        // tests opening files move it under this one. The tolerance is set by
+        // what a leak actually looks like rather than by hope: one duplicate
+        // per operation is sixty, and each rename takes two, so a real leak
+        // clears any plausible noise from a handful of concurrent tests.
+        let growth = after.saturating_sub(before);
         assert!(
-            after <= before + 2,
-            "sixty renames leaked descriptors: {before} -> {after}"
+            growth < 20,
+            "sixty renames leaked descriptors: {before} -> {after} (+{growth})"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -5329,43 +5595,35 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A deliberate behaviour change, pinned so it is a decision rather than a
-    /// discovery.
+    /// Descending through a symlinked directory works, and lands inside.
     ///
-    /// Descending now refuses to traverse a symlinked directory: the walk
-    /// opens every component with O_NOFOLLOW, so asking for a child *of a
-    /// symlink node* fails where the old path join silently followed it.
-    ///
-    /// This is safe because it is not how a guest asks. A guest kernel that
-    /// meets a symlink resolves it itself -- LOOKUP returns the link, the
-    /// guest READLINKs it and walks the target -- so it never asks for a child
-    /// under a link node. The symlink itself still looks up and reads back
-    /// exactly as before; it is only descending *through* one that changes.
+    /// I wrote this test the other way round in the stage that moved LOOKUP
+    /// onto descriptors, asserting the refusal as a deliberate change and
+    /// arguing a guest would never ask. A guest does ask: `child_path` has
+    /// always followed a symlinked parent on purpose, and the CREATE case had
+    /// a test for it that the change did not run. The refusal was a
+    /// regression wearing a comment.
     #[test]
-    fn descending_through_a_symlinked_directory_is_refused() {
+    fn descending_through_a_symlinked_directory_lands_inside() {
         let (dir, mut dev) = fixture_with_access(true);
         fs::create_dir_all(dir.join("real")).unwrap();
         fs::write(dir.join("real/f"), b"hello").unwrap();
         std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
 
-        // The link itself is an ordinary lookup, and reads back as a symlink.
+        // The link itself still reads back as a symlink.
         let link = lookup_node(&mut dev, FUSE_ROOT_ID, b"link");
         let out = dev.handle_fuse(&request(READLINK, link, &[]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(&out[OUT_HEADER_LEN..], b"real");
 
-        // Descending through it is refused rather than silently followed.
-        let out = dev.handle_fuse(&request(LOOKUP, link, b"f\0"), 4096);
-        let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
+        // And a child under it resolves to the real directory's entry.
+        let through = lookup_node(&mut dev, link, b"f");
+        let direct_parent = lookup_node(&mut dev, FUSE_ROOT_ID, b"real");
+        let direct = lookup_node(&mut dev, direct_parent, b"f");
         assert_eq!(
-            errno, -ENOTDIR,
-            "a child under a symlink node must not resolve through it"
+            through, direct,
+            "the same file reached both ways must be the same node"
         );
-
-        // The same file by its real path is unaffected.
-        let real = lookup_node(&mut dev, FUSE_ROOT_ID, b"real");
-        let f = lookup_node(&mut dev, real, b"f");
-        assert!(f != 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5551,10 +5809,19 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The point of the whole design: a directory symlink pointing outside the
-    /// export cannot be walked through, because every component is opened with
-    /// O_NOFOLLOW. This is the case the removed containment check tried to
-    /// catch by resolving a path, and got wrong for ordinary guest paths.
+    /// A symlink naming somewhere outside cannot reach it.
+    ///
+    /// Not by refusing to follow -- the walk does follow, because a guest that
+    /// stores `include -> etc` means it -- but because the target is read the
+    /// way the guest means it. An absolute target names the guest's root,
+    /// which is this export, so a host path stored in a symlink resolves to
+    /// the same path *inside* the share and simply is not there.
+    ///
+    /// This test asserted ENOTDIR when the walk refused to follow anything.
+    /// That was a behaviour I reasoned into and it was wrong: hvi has always
+    /// followed directory symlinks on purpose, for the distro include trees
+    /// `child_path` documents. The property it was reaching for survives; the
+    /// mechanism and the errno are different.
     #[test]
     fn dircache_cannot_walk_through_a_symlink_out_of_the_export() {
         let (dir, mut cache) = dircache_fixture();
@@ -5562,19 +5829,26 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
 
-        // ENOTDIR rather than ELOOP, which is worth knowing: O_NOFOLLOW means
-        // the open lands on the symlink itself, and O_DIRECTORY then refuses
-        // it because a symlink is not a directory. The refusal is what this
-        // test is for; the errno is recorded so a later change to it is a
-        // deliberate one rather than a surprise.
+        // Rooted at the export, the host path names nothing.
         let err = cache.dir_fd(Path::new("out")).unwrap_err();
-        assert_eq!(err, ENOTDIR, "a symlinked component must refuse the walk");
+        assert_eq!(
+            err, ENOENT,
+            "an absolute target must resolve inside the export, where it is absent"
+        );
         assert_eq!(cache.resident(), 0, "nothing may be admitted on failure");
 
-        // And the same holds for a component in the middle of a path.
+        // And it stays absent for a component in the middle of a path.
         fs::create_dir_all(outside.join("deeper")).unwrap();
-        let err = cache.dir_fd(Path::new("out/deeper")).unwrap_err();
-        assert_eq!(err, ENOTDIR);
+        assert_eq!(cache.dir_fd(Path::new("out/deeper")).unwrap_err(), ENOENT);
+
+        // The escape is what must not happen, whatever the errno: making the
+        // same path inside the export is what the target actually names.
+        let inside = dir.join(outside.strip_prefix("/").unwrap());
+        fs::create_dir_all(&inside).unwrap();
+        assert!(
+            cache.dir_fd(Path::new("out")).is_ok(),
+            "with the target present inside the export, the walk lands there"
+        );
 
         let _ = fs::remove_dir_all(&outside);
         let _ = fs::remove_dir_all(dir);
