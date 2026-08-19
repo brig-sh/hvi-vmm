@@ -394,10 +394,11 @@ impl VirtioFs {
         }
         let mut tag_buf = [0u8; TAG_LEN];
         tag_buf[..bytes.len()].copy_from_slice(bytes);
-        // Every containment check below compares a resolved path against this
-        // one, and a prefix test between a resolved path and an unresolved
-        // root silently passes. Resolve it here rather than trusting the
-        // caller to have done it.
+        // Every node path is built from this one, so resolve it here rather
+        // than trusting the caller to have done it: `..` at the export root is
+        // compared against it, and a mix of resolved and unresolved forms
+        // would make that comparison depend on how the caller spelled the
+        // path.
         let root = fs::canonicalize(&root)?;
         let mut nodes = HashMap::new();
         let root_meta = fs::symlink_metadata(&root)?;
@@ -919,7 +920,6 @@ impl VirtioFs {
             return Err(EINVAL);
         }
         let parent_path = self.node_path(parent)?.to_owned();
-        self.contained_dir(&parent_path)?;
         let path = if name == b"." {
             parent_path
         } else if name == b".." {
@@ -1170,34 +1170,6 @@ impl VirtioFs {
         }
     }
 
-    /// Rejects a directory that resolves outside the export.
-    ///
-    /// Every host syscall here re-resolves its whole path from `/`, so a path
-    /// that sits below the root as a string still lands wherever its
-    /// components point. A symlinked directory inside the export is enough:
-    /// the join looks contained and the syscall is not. Resolving the parent
-    /// and comparing it component-wise against the root is what keeps a
-    /// lookup or a mutation inside the share.
-    ///
-    /// The final component is deliberately not resolved. It may legitimately
-    /// be a symlink the guest is meant to see and resolve in its own
-    /// namespace, and every open of it already carries `O_NOFOLLOW`.
-    ///
-    /// This resolves and then lets the caller's syscall resolve again, so a
-    /// host-side actor that swaps a component in between still wins. Closing
-    /// that needs fd-relative resolution with `O_NOFOLLOW` on every
-    /// component, which is a larger change than this one.
-    fn contained_dir(&self, path: &Path) -> Result<(), i32> {
-        if fs::canonicalize(path)
-            .map_err(io_errno)?
-            .starts_with(&self.root)
-        {
-            Ok(())
-        } else {
-            Err(EPERM)
-        }
-    }
-
     fn child_path(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
         validate_mutation_name(name)?;
         let parent = self.node_path(parent)?;
@@ -1205,10 +1177,21 @@ impl VirtioFs {
         // symlink_metadata for the node identity, but follow the parent here
         // so mutations below a symlinked directory (common in distro include
         // trees) are not rejected as ENOTDIR/ENOENT.
+        //
+        // There was a containment check here and in `lookup` that resolved
+        // this path and refused it unless it stayed under the export root. It
+        // is gone, and re-adding it in that shape is not the fix: resolving a
+        // path string host-side asks the wrong question, because an absolute
+        // symlink in a guest rootfs names the guest's filesystem and not
+        // ours. `/usr/lib/ssl/certs -> /etc/ssl/certs` means the guest's
+        // `/etc`; on the host it resolves to `/private/etc/ssl/certs`, which
+        // is outside any export. Containment stays with the Seatbelt profile
+        // until the path layer resolves relative to a descriptor instead
+        // (NOFireAI/hvi-vmm#30), which makes it structural rather than a
+        // check that can be asked the wrong question.
         if !fs::metadata(parent).map_err(io_errno)?.is_dir() {
             return Err(ENOTDIR);
         }
-        self.contained_dir(parent)?;
         Ok(parent.join(OsStr::from_bytes(name)))
     }
 
@@ -4577,7 +4560,18 @@ mod tests {
     /// outside the export. `child_path` follows the parent on purpose, so the
     /// joined path can sit under the root as a string while the syscall
     /// resolves somewhere else entirely.
+    ///
+    /// Ignored rather than deleted, because the property is still one we want.
+    /// The device-side check that satisfied it resolved the parent host-side,
+    /// which refused ordinary guest paths as well -- an absolute symlink in a
+    /// container rootfs names the guest's filesystem, not ours -- and broke
+    /// booting a stock image. Containment is the Seatbelt profile's alone
+    /// again, as it was before that check, and the sandbox does refuse this
+    /// escape at the syscall. What is missing is the device's own answer,
+    /// which returns with fd-relative resolution (NOFireAI/hvi-vmm#30). Turn
+    /// this back on with that change; it is the test for it.
     #[test]
+    #[ignore = "device-side containment returns with fd-relative resolution (#30)"]
     fn a_symlinked_directory_cannot_take_a_mutation_outside_the_export() {
         let (dir, mut dev) = fixture_with_access(true);
         let outside = outside_path("dir");
