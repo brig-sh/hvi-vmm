@@ -43,17 +43,25 @@ const OP_RW: u16 = 5;
 const OP_CREDIT_UPDATE: u16 = 6;
 const OP_CREDIT_REQUEST: u16 = 7;
 
-/// Credit we advertise to the guest (our RX buffer).
+/// Device to guest: the credit we advertise, so how much unread data the guest
+/// may leave outstanding with us.
 const OUR_BUF_ALLOC: u32 = 256 * 1024;
-/// Max payload per RW packet to the guest.
+/// Device to guest: how much payload we put in one RW packet we send.
 const MAX_RW: usize = 16 * 1024;
-/// Ceiling on the packet a transmit chain may assemble.
+/// Guest to device: ceiling on the packet a transmit chain may assemble.
 ///
 /// Descriptor lengths are guest-controlled, so without a ceiling the guest
-/// decides how much the host allocates and zeroes for one packet. A header
-/// plus the largest payload this device carries is all a well-behaved guest
-/// ever sends.
-const MAX_TX_PACKET: usize = HDR_LEN + MAX_RW;
+/// decides how much the host allocates and zeroes for one packet.
+///
+/// The bound is the guest's own per-packet limit, which Linux spells
+/// `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`, and not one of the two constants above:
+/// those govern what this device sends, and a ceiling taken from either of
+/// them would reject ordinary traffic.
+/// A guest with credit to spare legitimately sends 64 KiB at a time, and
+/// `process_tx` completes a descriptor whether or not `read_tx` returned a
+/// packet, so a packet refused here would look to the guest like a write that
+/// succeeded.
+const MAX_TX_PACKET: usize = HDR_LEN + 64 * 1024;
 
 #[derive(Clone, Copy, Default)]
 struct Hdr {
@@ -623,13 +631,52 @@ mod session_tests {
 
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
-        let oversized = (HDR_LEN + 16 * 1024 + 1) as u32;
+        let oversized = (MAX_TX_PACKET + 1) as u32;
         mem.write_u64(desc, data).unwrap();
         mem.write_u32(desc + 8, oversized).unwrap();
         mem.write_u16(desc + 12, 0).unwrap();
         mem.write_u16(desc + 14, 0).unwrap();
 
         assert_eq!(dev.read_tx(&mem, 0), None);
+    }
+
+    /// A Linux guest splits a vsock send at `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`,
+    /// 64 KiB, and the credit we advertise lets it fill that. A packet that
+    /// size is ordinary traffic and must be carried: `process_tx` completes
+    /// the descriptor whether or not `read_tx` returned a packet, so dropping
+    /// one here would report a successful write to a guest whose bytes were
+    /// discarded.
+    #[test]
+    fn a_full_size_guest_packet_is_carried() {
+        const BASE: u64 = 0x4000_0000;
+        const PAYLOAD: usize = 64 * 1024;
+        let mut backing = vec![0u8; 0x30000];
+        let mem = mem_of(&mut backing);
+        let mut dev = VirtioVsock::new();
+        let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+
+        dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
+        dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
+        dev.mmio(&mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
+        dev.mmio(&mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        dev.mmio(&mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
+        dev.mmio(&mem, reg::QUEUE_READY, true, 1);
+
+        let full = pkt(OP_RW, 40000, &vec![0xa5u8; PAYLOAD]);
+        assert_eq!(full.len(), HDR_LEN + PAYLOAD);
+        mem.write(data, &full).unwrap();
+        mem.write_u64(desc, data).unwrap();
+        mem.write_u32(desc + 8, full.len() as u32).unwrap();
+        mem.write_u16(desc + 12, 0).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+
+        assert_eq!(
+            dev.read_tx(&mem, 0).map(|p| p.len()),
+            Some(HDR_LEN + PAYLOAD)
+        );
     }
 
     /// Regression for the cross-session injection: session B is registered and
