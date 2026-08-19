@@ -75,10 +75,23 @@ jobs:
   # with --cpus 2 also exercises SMP: the BSP enters long mode and the guest
   # brings the AP online with INIT-SIPI-SIPI serviced by the in-kernel LAPIC, so
   # we additionally assert both processors activate. Needs a runner with
-  # /dev/kvm (GitHub-hosted ubuntu has KVM); skips cleanly otherwise.
+  # /dev/kvm; skips cleanly otherwise.
+  #
+  # Self-hosted rather than GitHub-hosted, which is a change of runner and not
+  # of what is tested. The `guest kernel` step below installs a package, and on
+  # the hosted image that fetch wedged five times in one afternoon -- once for
+  # 55 minutes -- against a normal two, on unrelated pull requests, while
+  # GitHub reported no incident. Every time, cancelling and re-running cleared
+  # it, so it is a stuck fetch rather than a slow one (#49).
+  #
+  # A persistent runner also installs that kernel once instead of on every run,
+  # so the flaky dependency is off the path for all but the first job, and the
+  # boot itself is on bare metal rather than in a hosted VM. The arm64 KVM jobs
+  # below are already self-hosted for a harder reason -- no hosted arm64 runner
+  # exposes /dev/kvm at all -- so this is the same shape, not a new one.
   boot-x86:
     name: Boot x86
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, kvm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
