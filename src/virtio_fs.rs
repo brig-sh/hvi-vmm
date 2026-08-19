@@ -21,7 +21,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{
     DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2549,28 +2549,66 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
     put_u32(out, 0); // backing_id (signed on the wire, zero means none)
 }
 
+/// Opens a host file with the flags the guest asked for.
+///
+/// This translates by hand rather than going through `OpenOptions`, which
+/// validates the access mode against what is reasonable for application code
+/// and rejects `O_CREAT` or `O_TRUNC` without write access -- before issuing
+/// any syscall, so the kernel never gets a say. The kernel accepts both, and
+/// `O_CREAT|O_RDONLY` is exactly how a lock file is opened: `flock(1)`,
+/// iptables' `xtables.lock` and Go's `gofrs/flock` all want the inode rather
+/// than the bytes. Rejecting it surfaced in the guest as `flock: cannot open
+/// lock file: Invalid argument`, which reads as missing lock support and is
+/// not. A FUSE server has to be a faithful proxy for flags the guest kernel
+/// has already validated.
+///
+/// Two properties `OpenOptions` was supplying implicitly are set here
+/// deliberately: `O_CLOEXEC`, and refusing a path with an interior NUL rather
+/// than letting `open(2)` see a truncated one.
 fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Result<File> {
-    let access = flags & LINUX_O_ACCMODE;
-    if access == LINUX_O_ACCMODE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid Linux O_ACCMODE value",
-        ));
+    let mut host_flags = match flags & LINUX_O_ACCMODE {
+        0 => libc::O_RDONLY,
+        LINUX_O_WRONLY => libc::O_WRONLY,
+        LINUX_O_RDWR => libc::O_RDWR,
+        // Linux reserves the fourth O_ACCMODE value; a guest sending it did
+        // not come through a working open(2).
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Linux O_ACCMODE value",
+            ))
+        }
+    };
+    if flags & LINUX_O_APPEND != 0 {
+        host_flags |= libc::O_APPEND;
     }
-    let mut options = OpenOptions::new();
-    options.read(access == 0 || access == LINUX_O_RDWR);
-    options.write(access == LINUX_O_WRONLY || access == LINUX_O_RDWR);
-    options.append(flags & LINUX_O_APPEND != 0 && access != 0);
-    options.truncate(flags & LINUX_O_TRUNC != 0);
+    if flags & LINUX_O_TRUNC != 0 {
+        host_flags |= libc::O_TRUNC;
+    }
     if create {
-        options.create(true);
-        options.create_new(flags & LINUX_O_EXCL != 0);
-        options.mode(mode & 0o7777);
+        host_flags |= libc::O_CREAT;
+        if flags & LINUX_O_EXCL != 0 {
+            host_flags |= libc::O_EXCL;
+        }
     }
     // The final component must be the inode the guest looked up, never a host
     // symlink followed behind the guest VFS's back.
-    options.custom_flags(libc::O_NOFOLLOW);
-    options.open(path)
+    host_flags |= libc::O_NOFOLLOW;
+    // A descriptor opened on the guest's behalf must not survive into any
+    // process this one spawns. OpenOptions did this for us.
+    host_flags |= libc::O_CLOEXEC;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: c_path is NUL-terminated and outlives the call. The mode
+    // argument is read by the kernel only when O_CREAT is set, and is passed
+    // as the promoted type a variadic open(2) expects. The descriptor is
+    // handed straight to File, which owns and closes it.
+    let fd = unsafe { libc::open(c_path.as_ptr(), host_flags, (mode & 0o7777) as libc::c_uint) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh descriptor this call owns and has not shared.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn open_host_dir(path: &Path) -> io::Result<File> {
@@ -4811,6 +4849,101 @@ mod tests {
         lock[32..36].copy_from_slice(&LINUX_F_UNLCK.to_le_bytes());
         let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A lock file is opened `O_CREAT|O_RDONLY`: the caller wants an inode to
+    /// lock, not the bytes. `flock(1)`, iptables' `xtables.lock` and Go's
+    /// `gofrs/flock` all do exactly this. Routing it through `OpenOptions`
+    /// rejected the combination before any syscall, and the tools reported it
+    /// as `cannot open lock file: Invalid argument` -- which reads as absent
+    /// lock support but is nothing of the kind, because the lock is never
+    /// reached.
+    #[test]
+    fn a_read_only_create_can_take_a_lock() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut create = vec![0u8; 16];
+        // Access mode O_RDONLY, which is what those callers send.
+        create[0..4].copy_from_slice(&0u32.to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b"xtables.lock\0");
+        let out = dev.handle_fuse(&request(CREATE, FUSE_ROOT_ID, &create), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "O_CREAT|O_RDONLY has to reach the kernel"
+        );
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+        assert!(dir.join("xtables.lock").exists());
+
+        // flock(2) is indifferent to the access mode, which is the reason
+        // lock files can be opened read-only in the first place.
+        let mut lock = vec![0u8; 48];
+        lock[0..8].copy_from_slice(&fh.to_le_bytes());
+        lock[24..32].copy_from_slice(&(i64::MAX as u64).to_le_bytes());
+        lock[32..36].copy_from_slice(&LINUX_F_WRLCK.to_le_bytes());
+        lock[40..44].copy_from_slice(&FUSE_LK_FLOCK.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETLK, node, &lock), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `OpenOptions` set O_CLOEXEC for us. Opening by hand makes it ours to
+    /// remember, so it needs a test that fails if anyone forgets: a host
+    /// descriptor opened on the guest's behalf must not survive into a child.
+    #[test]
+    fn guest_descriptors_are_close_on_exec() {
+        let (dir, _dev) = fixture_with_access(true);
+        let file = open_host_file(&dir.join("cloexec-probe"), 0, true, 0o600).unwrap();
+        // SAFETY: querying descriptor flags on a descriptor we own.
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(descriptor_flags >= 0);
+        assert_ne!(
+            descriptor_flags & libc::FD_CLOEXEC,
+            0,
+            "a guest descriptor would leak into any process hvi spawns"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// O_NOFOLLOW was explicit before this change and stays explicit after it.
+    #[test]
+    fn the_final_component_is_never_a_followed_symlink() {
+        let (dir, _dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), b"host-side").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let err = open_host_file(&dir.join("link"), 0, false, 0).unwrap_err();
+        assert_eq!(io_errno(err), ELOOP);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `CString::new` is what refuses this now; before, `OpenOptions` did. An
+    /// interior NUL must not reach open(2), where it would silently name a
+    /// shorter path than the one asked for.
+    #[test]
+    fn a_path_with_an_interior_nul_is_refused() {
+        let (dir, _dev) = fixture_with_access(true);
+        let mut raw = dir.join("lock").into_os_string().into_vec();
+        raw.extend_from_slice(b"\0.ignored");
+        let path = PathBuf::from(OsString::from_vec(raw));
+        let err = open_host_file(&path, 0, true, 0o600).unwrap_err();
+        assert_eq!(io_errno(err), EINVAL);
+        assert!(
+            !dir.join("lock").exists(),
+            "the truncated path must not have been created"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Linux reserves the fourth O_ACCMODE value; it was refused before the
+    /// hand translation and is refused by it.
+    #[test]
+    fn a_reserved_access_mode_is_refused() {
+        let (dir, _dev) = fixture_with_access(true);
+        let err = open_host_file(&dir.join("bad"), LINUX_O_ACCMODE, true, 0o600).unwrap_err();
+        assert_eq!(io_errno(err), EINVAL);
+        assert!(!dir.join("bad").exists());
         let _ = fs::remove_dir_all(dir);
     }
 
