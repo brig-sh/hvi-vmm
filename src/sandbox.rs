@@ -243,6 +243,18 @@ pub struct SelftestFixtures {
     /// Directory holding the two path-backed fixtures; also the directory the
     /// "create a file" probe aims at, so a failure to deny is unambiguous.
     dir: std::path::PathBuf,
+    /// A canonical directory entered as a *writable virtio-fs export*, so the
+    /// selftest proves the granted subtree with the same profile text the VMM
+    /// installs. The escape probes below need it: a hard link from outside and
+    /// a write through an outbound symlink are only meaningful denials inside
+    /// a subtree where writing is otherwise allowed.
+    export: std::path::PathBuf,
+    /// A second export entered *read-only*, so the other branch of the rule
+    /// interpolation is installed and probed too. Without it, an edit that
+    /// widened the read-only format string to grant writes would pass every
+    /// test: the unit tests pin only the static profile, and the writable
+    /// export cannot tell the two branches apart.
+    export_ro: std::path::PathBuf,
 }
 
 /// The probe list. Ordered denials-first so a profile that is accidentally
@@ -266,6 +278,49 @@ fn probes() -> Vec<Probe> {
             what: "create a file next to the fixtures",
             expect_ok: false,
             run: |f| std::fs::write(f.dir.join("escaped"), b"x"),
+        },
+        Probe {
+            // A known escape route from a writable export (#31): a hard
+            // link whose source resolves outside the granted subtree would
+            // make the outside file reachable, and mutable, through the
+            // export. The link target sits inside the export, where writing
+            // is otherwise allowed, so only the link source is what this
+            // denial can be about. Only a policy denial counts: any other
+            // failure (a leftover target, a missing fixture) proves nothing
+            // about the profile, so it is reported as the escape not being
+            // denied rather than mistaken for a denial.
+            what: "hard-link an outside file into the export",
+            expect_ok: false,
+            run: |f| match std::fs::hard_link(f.dir.join("ledger"), f.export.join("pwned")) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(e),
+                _ => Ok(()),
+            },
+        },
+        Probe {
+            // The other known escape route (#31): a write through a symlink
+            // that sits inside the export and points outside it. Seatbelt
+            // evaluates the resolved path, so the deny must hold even
+            // though every path component the guest names is inside the
+            // granted subtree. Same strictness as above: only a policy
+            // denial counts.
+            what: "create through a symlink that points outside",
+            expect_ok: false,
+            run: |f| match std::fs::write(f.export.join("outside-link").join("planted"), b"x") {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(e),
+                _ => Ok(()),
+            },
+        },
+        Probe {
+            // The read-only branch of the rule interpolation: writing into
+            // a read-only export must stay denied by policy, or a widened
+            // format string has quietly made every read-only share
+            // guest-writable at this layer.
+            what: "create a file inside the read-only export",
+            expect_ok: false,
+            run: |f| match std::fs::write(f.export_ro.join("denied"), b"x") {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(e),
+                _ => Ok(()),
+            },
         },
         Probe {
             what: "list a directory",
@@ -363,6 +418,21 @@ fn probes() -> Vec<Probe> {
             },
         },
         // The other half: rights the VMM still needs, held as descriptors.
+        Probe {
+            // The grant that makes the escape denials above meaningful: if
+            // this probe fails, the export grant is dead and those denials
+            // prove nothing.
+            what: "create a file inside the writable export",
+            expect_ok: true,
+            run: |f| std::fs::write(f.export.join("inside"), b"x"),
+        },
+        Probe {
+            // The read-only grant's positive half, so its denial above
+            // cannot pass vacuously either.
+            what: "read a file inside the read-only export",
+            expect_ok: true,
+            run: |f| std::fs::read(f.export_ro.join("readable")).map(|_| ()),
+        },
         Probe {
             what: "write to a file opened before entry",
             expect_ok: true,
@@ -487,6 +557,10 @@ fn open_pty() -> io::Result<libc::c_int> {
 
 /// Enters the sandbox and proves the profile, in-process, with no hypervisor
 /// involved: every operation the VMM must keep and every one it must lose.
+/// Entry is through [`enter_with_shares`] with one writable and one
+/// read-only export, so both branches of the rule interpolation are
+/// installed, and the probes prove the granted subtrees: the grants work,
+/// and the known escape routes out of them (#31) stay denied.
 ///
 /// This is the negative test for the confinement. It has to run in a process
 /// that has *actually installed the production profile* -- checking the string
@@ -503,6 +577,27 @@ pub fn selftest() -> io::Result<usize> {
     // not make one.
     let dir = std::env::temp_dir().join(format!("hvi-sandbox-selftest-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
+    // One subtree is entered as a writable virtio-fs export and a second as
+    // a read-only one, so the selftest proves both branches of the rule
+    // interpolation: each grant works, and the escape routes stay denied.
+    // Canonical, as the VMM requires of every export root -- TMPDIR on macOS
+    // is itself behind a symlink. The outbound symlink for the escape probe
+    // is made before entry, the way a hostile guest would find one already
+    // present in a share. The pre-cleans keep a rerun honest: process ids
+    // recycle, so a leftover fixture from an earlier run in the same
+    // directory must not turn a probe's denial into a different error.
+    let export = dir.join("export");
+    std::fs::create_dir_all(&export)?;
+    let export = export.canonicalize()?;
+    for leftover in ["outside-link", "pwned", "inside"] {
+        let _ = std::fs::remove_file(export.join(leftover));
+    }
+    std::os::unix::fs::symlink(&dir, export.join("outside-link"))?;
+    let export_ro = dir.join("export-ro");
+    std::fs::create_dir_all(&export_ro)?;
+    let export_ro = export_ro.canonicalize()?;
+    std::fs::write(export_ro.join("readable"), b"x")?;
+    let _ = std::fs::remove_file(export_ro.join("denied"));
     let fixtures = SelftestFixtures {
         pre_opened: std::fs::File::create(dir.join("ledger"))?,
         pre_bound: {
@@ -513,10 +608,15 @@ pub fn selftest() -> io::Result<usize> {
         pre_mapped: crate::sharedmem::SharedRam::new(0x4000)?,
         pre_tty: open_pty()?,
         dir: dir.clone(),
+        export: export.clone(),
+        export_ro: export_ro.clone(),
     };
 
-    println!("hvi sandbox selftest: installing the production profile");
-    enter()?;
+    println!(
+        "hvi sandbox selftest: installing the production profile \
+         (one writable export, one read-only)"
+    );
+    enter_with_shares(&[(export.clone(), true), (export_ro, false)])?;
     println!("hvi sandbox selftest: sandbox is up\n");
 
     let mut bad = 0usize;
@@ -543,10 +643,14 @@ pub fn selftest() -> io::Result<usize> {
         );
     }
 
-    // Cleanup is the caller's problem: we can no longer unlink anything. The
-    // fixtures live under TMPDIR and are a socket and two small files.
+    // The writable export is the one place cleanup is still allowed, so use
+    // it: removing the symlink and the probe's file also keeps a rerun in a
+    // recycled directory clean. Everything outside the exports stays -- the
+    // sandbox forbids removing it.
+    let _ = std::fs::remove_file(export.join("outside-link"));
+    let _ = std::fs::remove_file(export.join("inside"));
     println!(
-        "\nfixtures left in {} (the sandbox forbids removing them)",
+        "\nfixtures left in {} (outside the exports, where the sandbox forbids removal)",
         dir.display()
     );
     Ok(bad)
