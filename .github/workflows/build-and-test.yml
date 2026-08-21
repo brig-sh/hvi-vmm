@@ -12,6 +12,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Name bash explicitly. The implicit default runs `bash -e` without pipefail,
+# so a failure in front of a `tee` or a `grep` can pass unseen. An explicit
+# `shell: bash` runs `bash -eo pipefail`.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # Unit tests for the shared core on a cheap x86 Linux runner. Neither the
   # macOS nor the arm64 backend compiles here (both are gated by target), so
@@ -19,6 +26,7 @@ jobs:
   test-portable:
     name: Test portable
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,6 +43,7 @@ jobs:
   seccomp-x86:
     name: Seccomp filters (x86-64)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,6 +62,7 @@ jobs:
   build-and-test-macos:
     name: Build and test macos/hvf
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -89,9 +99,14 @@ jobs:
   # boot itself is on bare metal rather than in a hosted VM. The arm64 KVM jobs
   # below are already self-hosted for a harder reason -- no hosted arm64 runner
   # exposes /dev/kvm at all -- so this is the same shape, not a new one.
+  # Every job carries a `timeout-minutes` well under the six-hour default.
+  # This matters most on the self-hosted jobs: each runs on the only runner
+  # of its kind, and one wedged job blocks that runner for everything else.
+  # The recorded failure mode is a stuck apt fetch of 55 minutes (#49).
   boot-x86:
     name: Boot x86
     runs-on: [self-hosted, Linux, X64, kvm]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -150,14 +165,32 @@ jobs:
           sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
             virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture
           sudo losetup -d "$LOOP"
+      # The inline greps keep only the lines they match. When the job fails,
+      # the full log answers the questions those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-x86-logs
+          path: boot.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   boot-arm64-hvf:
     name: Boot arm64/hvf
     runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Install the pinned toolchain and restore the cargo cache. The other
+      # self-hosted jobs install the toolchain for the same reason: a
+      # pre-provisioned rustup in the runner user's home is an assumption
+      # that broke before (see the note on the arm64/KVM job below).
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf-live
       - name: build and sign
         run: |
           # The entitlement is what lets an ad-hoc signed binary call HVF; the
@@ -196,7 +229,11 @@ jobs:
           ls -l target/initramfs.cpio
       - name: boot to userspace
         run: |
-          ./target/release/hvi boot \
+          # The alarm caps a wedged boot, like `timeout 180` on the KVM jobs.
+          # macOS ships no coreutils `timeout`; the alarm survives the exec
+          # and terminates the VMM when it fires.
+          perl -e 'alarm shift; exec @ARGV' 180 \
+            ./target/release/hvi boot \
             --kernel guest/Image --initramfs target/initramfs.cpio \
             --mem-mib 1024 --events ev.ndjson \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
@@ -206,6 +243,18 @@ jobs:
             || { echo "::error::the arm64 guest did not boot"; exit 1; }
           grep -q "HVI-INITRAMFS-UP" run.log \
             || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+      # The inline tail keeps 25 lines. When the job fails, the full log and
+      # the event ledger answer the questions those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-arm64-hvf-logs
+          path: |
+            run.log
+            ev.ndjson
+          retention-days: 7
+          if-no-files-found: ignore
   # Live boot (arm64/KVM): the last backend with no live cover. Runs on a
   # self-hosted arm64 runner. Hosted arm64 Linux runners expose no /dev/kvm,
   # so this cannot be done any other way.
@@ -229,6 +278,7 @@ jobs:
             vgic: vGICv3
             expect_gicv3: "yes"
     runs-on: [self-hosted, Linux, ARM64, "${{ matrix.runner }}"]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -384,6 +434,20 @@ jobs:
             || { echo "::error::no traffic with the assigned MAC reached the tap"; exit 1; }
           pkill -f "target/release/hvi boot" || true
           echo "tap network: the guest pinged the host with the override MAC over hvi-ci-tap"
+      # The inline tails keep 20 to 25 lines. When the job fails, the full
+      # logs and the event ledger answer the questions those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-arm64-kvm-${{ matrix.vgic }}-logs
+          path: |
+            run.log
+            ev.ndjson
+            tap.log
+            tap-refuse.log
+          retention-days: 7
+          if-no-files-found: ignore
       - name: tap teardown
         if: always()
         run: |

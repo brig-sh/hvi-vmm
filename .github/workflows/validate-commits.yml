@@ -18,6 +18,7 @@ jobs:
   lint-commit-messages:
     name: Lint commit messages
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # Full history: commitlint walks the PR's commit range, and its
       # trailer-exists rule reads trailers through git.
@@ -86,6 +87,7 @@ jobs:
   check-spelling:
     name: Check spelling
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check out the full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
