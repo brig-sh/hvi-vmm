@@ -112,7 +112,9 @@ jobs:
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
         if: steps.kvm.outputs.ok == 'yes'
         run: |
-          KIMG=$(ls -1 /boot/vmlinuz-* | sort -V | tail -1); echo "kernel: $KIMG"
+          # find rather than ls: parsing ls output is what SC2012 rightly
+          # refuses to bless.
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1); echo "kernel: $KIMG"
           # 2>&1: the VMM's own lines (including what it says about seccomp)
           # go to stderr, and asserting on them means capturing them.
           sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
@@ -371,7 +373,7 @@ jobs:
             </dev/null > tap.log 2>&1 &
           # The init pings before it prints the userspace marker, so once the
           # marker is up the pings are done.
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             grep -q "HVI-INITRAMFS-UP" tap.log 2>/dev/null && break
             sleep 1
           done
