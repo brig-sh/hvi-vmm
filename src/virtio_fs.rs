@@ -1223,6 +1223,7 @@ impl VirtioFs {
         // until the path layer resolves relative to a descriptor instead
         // (NOFireAI/hvi-vmm#30), which makes it structural rather than a
         // check that can be asked the wrong question.
+        note_host_op();
         if !fs::metadata(parent).map_err(io_errno)?.is_dir() {
             return Err(ENOTDIR);
         }
@@ -1779,6 +1780,7 @@ impl VirtioFs {
         // `file_type()`/`ino()` are read straight off the dirent (`d_type`,
         // `d_ino`) on macOS and Linux, so capturing them here costs nothing
         // beyond the readdir(3) calls this loop already makes.
+        note_host_op();
         let mut entries: Vec<DirEntryInfo> = fs::read_dir(path)
             .map_err(io_errno)?
             .filter_map(Result::ok)
@@ -2159,6 +2161,7 @@ impl VirtioFs {
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
         let limit = requested.min(capacity);
         let dir = self.node_path(node)?.to_owned();
+        note_host_op();
         if !fs::metadata(&dir).map_err(io_errno)?.is_dir() {
             return Err(ENOTDIR);
         }
@@ -3122,6 +3125,7 @@ fn unlink_at(dirfd: BorrowedFd<'_>, name: &CStr, directory: bool) -> Result<(), 
 /// opens.
 #[cfg(target_os = "macos")]
 fn open_entry_nofollow(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, i32> {
+    note_host_op();
     let base = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
     // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated.
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), base | libc::O_NOFOLLOW) };
@@ -3135,6 +3139,7 @@ fn open_entry_nofollow(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, i3
     }
     // ELOOP from O_NOFOLLOW means the entry is a symlink, which is the case
     // O_SYMLINK exists for.
+    note_host_op();
     // SAFETY: as above.
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), base | libc::O_SYMLINK) };
     if fd < 0 {
@@ -3278,6 +3283,36 @@ fn mkfifo_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
     Ok(())
 }
 
+// Host operations spent acquiring metadata, directory entries or
+// descriptors. Timing on a shared runner is noise, and a timing regression
+// passed every test twice (#38, #30); this count is exact, so a test can pin
+// the metadata workload's budget and fail when a change spends more.
+//
+// Every site that reaches the host filesystem to *find* something counts:
+// the three `Stat` forms, the entry and directory opens, `fs::read_dir`, and
+// the `fs::metadata` probes on the readdir path. A regression that routes
+// its extra work through `std::fs` rather than through the raw wrappers has
+// to move this number too, or the gate would not see the shape of change it
+// exists to catch.
+//
+// Thread-local, so a test under the parallel harness counts only the
+// requests it drives itself. Compiled out entirely outside `cfg(test)`: the
+// counter is a test hook, and this is the device's per-request path.
+#[cfg(test)]
+thread_local! {
+    static HOST_META_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[inline]
+fn note_host_op() {
+    HOST_META_OPS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_host_op() {}
+
 /// Reads a symlink relative to a directory descriptor.
 ///
 /// The buffer grows rather than trusting one `PATH_MAX`: `readlinkat`
@@ -3302,6 +3337,10 @@ impl Stat {
     /// descriptor yet.
     fn lstat(path: &Path) -> Result<Self, i32> {
         let path = path_cstring(path)?;
+        // Counted here rather than on entry: the conversion above can fail
+        // without reaching the kernel, and a count that includes calls that
+        // never happened is wrong in the direction that hides real work.
+        note_host_op();
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is NUL-terminated and outlives the call; `raw` is a
         // valid, fully owned `stat` for the kernel to fill.
@@ -3314,6 +3353,7 @@ impl Stat {
 
     /// Stats an entry relative to a directory descriptor, following nothing.
     fn at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<Self, i32> {
+        note_host_op();
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `dirfd` is open for the call, `name` is NUL-terminated, and
         // `raw` is a valid `stat` for the kernel to fill.
@@ -3339,6 +3379,7 @@ impl Stat {
     /// Stats whatever a descriptor refers to, which for the export root is the
     /// only form available: it has no parent to be asked through.
     fn of_fd(fd: BorrowedFd<'_>) -> Result<Self, i32> {
+        note_host_op();
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: the descriptor is open for the call and `raw` is a valid
         // `stat` for the kernel to fill.
@@ -3477,6 +3518,7 @@ fn exists_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<(), i32> {
 #[allow(dead_code)]
 fn open_dir_nofollow_at(parent: Option<RawFd>, name: &[u8]) -> Result<OwnedFd, i32> {
     let name = CString::new(name).map_err(|_| EINVAL)?;
+    note_host_op();
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `name` is NUL-terminated and outlives the call; `parent`, when
     // given, is a descriptor this cache owns. The result is handed straight to
@@ -3562,6 +3604,7 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
     let host_flags = host_open_flags(flags, create)?;
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    note_host_op();
     // SAFETY: c_path is NUL-terminated and outlives the call. The mode
     // argument is read by the kernel only when O_CREAT is set, and is passed
     // as the promoted type a variadic open(2) expects. The descriptor is
@@ -3586,6 +3629,7 @@ fn open_host_file_at(
     mode: u32,
 ) -> Result<File, i32> {
     let host_flags = host_open_flags(flags, create).map_err(io_errno)?;
+    note_host_op();
     // SAFETY: `dirfd` is open for the call and `name` is NUL-terminated. The
     // mode is read by the kernel only when O_CREAT is set, and is passed as
     // the promoted type a variadic openat(2) expects. The descriptor is handed
@@ -3606,6 +3650,7 @@ fn open_host_file_at(
 }
 
 fn open_host_dir(path: &Path) -> io::Result<File> {
+    note_host_op();
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -4894,11 +4939,182 @@ mod tests {
         get_u64(&out, OUT_HEADER_LEN).unwrap()
     }
 
+    /// What one round of the metadata workload spent, split by phase.
+    ///
+    /// The two numbers answer different questions and must not be added up
+    /// into one. `per_file` is the marginal cost of a LOOKUP/GETATTR pair
+    /// and depends on nothing but the code that serves those two requests.
+    /// `listing` also encodes the fixture's geometry: `readdir` spends one
+    /// parent stat per *request*, and the request count is the entry count
+    /// divided by however many dirents fit in a reply, so the file count,
+    /// the length of the names and the reply budget all move it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RoundCost {
+        /// Host operations spent on OPENDIR, the READDIRPLUS pages and
+        /// RELEASEDIR.
+        listing: u64,
+        /// Host operations spent per file on the LOOKUP/GETATTR pair.
+        per_file: u64,
+    }
+
+    /// One round of the metadata workload: list the tree the way the guest
+    /// does, then look up and stat every file. Returns what each phase spent,
+    /// read from the thread-local counter, so a caller can pin the budget or
+    /// time the round without owning the loop.
+    fn metadata_round_cost(dev: &mut VirtioFs, tree_node: u64, files: usize) -> RoundCost {
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let start = spent();
+        let out = dev.handle_fuse(&request(OPENDIR, tree_node, &[0u8; 8]), 4096);
+        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let mut offset = 0u64;
+        loop {
+            let mut input = vec![0u8; 40];
+            input[0..8].copy_from_slice(&fh.to_le_bytes());
+            input[8..16].copy_from_slice(&offset.to_le_bytes());
+            input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(READDIRPLUS, tree_node, &input), 4096 + 16);
+            if out.len() <= OUT_HEADER_LEN {
+                break;
+            }
+            // Last dirent's offset field is the next starting point.
+            let mut pos = OUT_HEADER_LEN;
+            let mut last = offset;
+            while pos + 152 <= out.len() {
+                last = get_u64(&out, pos + 128 + 8).unwrap();
+                let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
+                pos += align8(128 + 24 + namelen);
+            }
+            if last == offset {
+                break;
+            }
+            offset = last;
+        }
+        let mut input = vec![0u8; 8];
+        input[0..8].copy_from_slice(&fh.to_le_bytes());
+        dev.handle_fuse(&request(RELEASEDIR, tree_node, &input), 4096);
+        let listing = spent() - start;
+
+        // Then stat every entry, which is what a build actually does.
+        let lookups_start = spent();
+        for i in 0..files {
+            let mut name = format!("file-{i:04}").into_bytes();
+            name.push(0);
+            let out = dev.handle_fuse(&request(LOOKUP, tree_node, &name), 4096);
+            let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+            dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        }
+        let lookups = spent() - lookups_start;
+        if files == 0 {
+            return RoundCost {
+                listing,
+                per_file: 0,
+            };
+        }
+        // A phase whose cost is not uniform per file would make `per_file` a
+        // lie, so say so rather than rounding it away.
+        assert_eq!(
+            lookups % files as u64,
+            0,
+            "the LOOKUP/GETATTR phase spent {lookups} operations over {files} files, \
+             which is not a whole number each; per-file cost is no longer uniform"
+        );
+        RoundCost {
+            listing,
+            per_file: lookups / files as u64,
+        }
+    }
+
+    /// The metadata path's host-operation budget, pinned exactly.
+    ///
+    /// Timing cannot be this gate: the workload's own benchmark below is
+    /// `#[ignore]`d and 27 percent noisy between runs on one quiet host.
+    /// Counts are exact and deterministic, so this cannot go red on a busy
+    /// runner and cannot go green on a slow change. A change that spends
+    /// more host work per request -- issue #30 was 2.4 times more time on
+    /// this exact path -- moves a number here and fails.
+    ///
+    /// `virtio_fs` compiles on macOS only (`src/lib.rs`), so in CI this runs
+    /// in the `build-and-test-macos` job and nowhere else. That is the same
+    /// job the rest of this module's suite already runs in, and unlike the
+    /// timing benchmark it needs no dedicated or quiet runner.
+    ///
+    /// The two budgets are pinned separately because they are not the same
+    /// kind of number:
+    ///
+    /// - `per_file` is 2, and depends only on the code serving a LOOKUP and a
+    ///   GETATTR. A move here is a real per-request regression.
+    /// - `listing` is 36 for this fixture and is geometry-dependent: `readdir`
+    ///   spends one parent stat and one `read_dir` per *request*, and 25
+    ///   entries of 9-character names fit in pages of 26, so the entry count,
+    ///   the name length and the reply budget all move it. Changing the fixture
+    ///   is expected to change this number; changing neither is not.
+    ///
+    /// A change that moves either number DOWN is welcome: re-measure, update
+    /// the constant, and say so in the commit. Up is what this test stops.
+    #[test]
+    fn the_metadata_workload_spends_a_pinned_host_budget() {
+        const FILES: usize = 25;
+        // Per LOOKUP/GETATTR pair. Geometry-free: a move here is a real
+        // per-request regression.
+        const PER_FILE_BUDGET: u64 = 2;
+        // For this fixture only -- see the note on geometry above.
+        const LISTING_BUDGET: u64 = 36;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        for i in 0..FILES {
+            fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
+        }
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+
+        // The first round pays the one-time costs: the component descriptor
+        // for the tree, the node table entries. The budget is pinned on the
+        // steady state, and a third round proves the steady state is real.
+        let warm = metadata_round_cost(&mut dev, tree_node, FILES);
+        let steady = metadata_round_cost(&mut dev, tree_node, FILES);
+        let repeat = metadata_round_cost(&mut dev, tree_node, FILES);
+        assert_eq!(
+            steady, repeat,
+            "two identical warm rounds spent different amounts; the workload \
+             is not deterministic and cannot be a gate"
+        );
+        assert!(
+            warm.listing + warm.per_file * FILES as u64
+                >= steady.listing + steady.per_file * FILES as u64,
+            "the cold round ({warm:?}) spent less than a warm one ({steady:?})"
+        );
+
+        assert_eq!(
+            steady.per_file, PER_FILE_BUDGET,
+            "a LOOKUP/GETATTR pair now spends {} host operations, not the \
+             pinned {PER_FILE_BUDGET}. This number does not depend on the \
+             fixture, so a change here is a per-request regression unless the \
+             commit says why it is cheaper (#38)",
+            steady.per_file
+        );
+        assert_eq!(
+            steady.listing, LISTING_BUDGET,
+            "listing {FILES} entries now spends {} host operations, not the \
+             pinned {LISTING_BUDGET}. This number moves with the fixture too, \
+             so check the file count, the name length and the reply budget \
+             before concluding the serving path got more expensive (#38)",
+            steady.listing
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// Daemon-side cost of the metadata path, the one real workloads (a build
     /// tree, `ls -R`, a source checkout) spend their time in. Drives the device
     /// directly, so it measures host-side work only: no guest kernel, and so no
     /// benefit from the attribute/entry timeouts, which cut the number of
     /// requests that ever arrive rather than the cost of serving one.
+    ///
+    /// Runs the same rounds as the pinned gate above, through the same
+    /// helper, so the two cannot drift into measuring different workloads.
+    /// It reports host operations alongside the time, because the count is
+    /// the half of the answer that survives a noisy runner.
     ///
     /// Run with:
     ///   cargo test --release -- --ignored --nocapture bench_metadata_workload
@@ -4916,64 +5132,33 @@ mod tests {
         }
         let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
 
-        // Warm the host's own metadata caches so this measures our syscall
-        // count, not cold I/O.
-        for i in 0..FILES {
-            let mut name = format!("file-{i:04}").into_bytes();
-            name.push(0);
-            let _ = dev.handle_fuse(&request(LOOKUP, tree_node, &name), 4096);
-        }
+        // Warm the host's own caches, and the device's, so the timed rounds
+        // measure steady-state work rather than cold I/O.
+        metadata_round_cost(&mut dev, tree_node, FILES);
 
         let start = std::time::Instant::now();
-        let mut ops = 0u64;
+        let mut cost = RoundCost {
+            listing: 0,
+            per_file: 0,
+        };
         for _ in 0..ROUNDS {
-            // A directory listing, the way the guest does it.
-            let out = dev.handle_fuse(&request(OPENDIR, tree_node, &[0u8; 8]), 4096);
-            let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
-            let mut offset = 0u64;
-            loop {
-                let mut input = vec![0u8; 40];
-                input[0..8].copy_from_slice(&fh.to_le_bytes());
-                input[8..16].copy_from_slice(&offset.to_le_bytes());
-                input[16..20].copy_from_slice(&4096u32.to_le_bytes());
-                let out = dev.handle_fuse(&request(READDIRPLUS, tree_node, &input), 4096 + 16);
-                ops += 1;
-                if out.len() <= OUT_HEADER_LEN {
-                    break;
-                }
-                // Last dirent's offset field is the next starting point.
-                let mut pos = OUT_HEADER_LEN;
-                let mut last = offset;
-                while pos + 152 <= out.len() {
-                    last = get_u64(&out, pos + 128 + 8).unwrap();
-                    let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
-                    pos += align8(128 + 24 + namelen);
-                }
-                if last == offset {
-                    break;
-                }
-                offset = last;
-            }
-            let mut input = vec![0u8; 8];
-            input[0..8].copy_from_slice(&fh.to_le_bytes());
-            dev.handle_fuse(&request(RELEASEDIR, tree_node, &input), 4096);
-
-            // Then stat every entry, which is what a build actually does.
-            for i in 0..FILES {
-                let mut name = format!("file-{i:04}").into_bytes();
-                name.push(0);
-                let out = dev.handle_fuse(&request(LOOKUP, tree_node, &name), 4096);
-                let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
-                dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
-                ops += 2;
-            }
+            cost = metadata_round_cost(&mut dev, tree_node, FILES);
         }
         let elapsed = start.elapsed();
+        // One OPENDIR, one RELEASEDIR and the READDIRPLUS pages, plus a
+        // LOOKUP and a GETATTR per file.
+        let requests = (2 * FILES + 2) as u64 * ROUNDS as u64;
         println!(
-            "BENCH metadata: {} ops in {:.3} ms => {:.2} us/op",
-            ops,
+            "BENCH metadata: {} requests in {:.3} ms => {:.2} us/request",
+            requests,
             elapsed.as_secs_f64() * 1e3,
-            elapsed.as_secs_f64() * 1e6 / ops as f64
+            elapsed.as_secs_f64() * 1e6 / requests as f64
+        );
+        println!(
+            "BENCH metadata: {} host ops per round ({} listing + {} per file x {FILES})",
+            cost.listing + cost.per_file * FILES as u64,
+            cost.listing,
+            cost.per_file,
         );
         let _ = fs::remove_dir_all(dir);
     }
