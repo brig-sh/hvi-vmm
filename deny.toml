@@ -1,30 +1,31 @@
-# cargo-deny configuration. CI runs `cargo deny check` over the lockfile:
-# RUSTSEC advisories, licenses, duplicate versions, and registry sources.
-# The dependency graph is 21 external crates, several of them inside the
-# trusted computing base (applevisor, kvm-ioctls, seccompiler, libc), so a
-# change to this file is a change to what that base may contain.
+# Configuration for cargo-deny. CI runs `cargo deny check` over the
+# lockfile: RUSTSEC advisories, licenses, duplicate versions and registry
+# sources.
+#
+# The graph holds 21 external crates, and several are inside the trusted
+# computing base: applevisor, kvm-ioctls, seccompiler and libc. A change to
+# this file is therefore a change to what that base can contain.
 
 [graph]
-# Audit every feature's dependencies, not just the default set. The crate
-# declares no features today, so this changes nothing now; it means the
-# first feature that gates a dependency does not silently drop that
+# Audit the dependencies of every feature, not of the default set alone.
+# The crate declares no features today, so this changes nothing now. It
+# keeps the first feature that gates a dependency from dropping that
 # dependency out of the audited graph.
 all-features = true
 
 [advisories]
 version = 2
-# A yanked crate was pulled by its own author. Treat that as a report, not a
-# footnote.
+# The author of a yanked crate withdrew it. Report that, do not record it
+# as a footnote.
 yanked = "deny"
-# Each ignore entry must name the advisory and carry a comment that says why
-# the advisory does not apply here. An ignore without a reason does not pass
-# review.
+# Each entry must name the advisory and say why it does not apply here. An
+# entry with no reason does not pass review.
 ignore = []
 
 [licenses]
 version = 2
-# The allow list holds only what the current tree needs. Add a license here
-# when a dependency actually carries it, not in advance.
+# The list holds what the current tree needs and nothing more. Add a license
+# when a dependency carries it, not before.
 allow = [
     "Apache-2.0",
     "MIT",
@@ -33,9 +34,9 @@ allow = [
 ]
 
 [bans]
-# The lockfile holds two versions of bitflags today. Report duplicates rather
-# than fail on them: with 21 crates the report stays readable, and a new
-# duplicate arriving with an update is visible in the log.
+# The lockfile holds two versions of bitflags today. Report a duplicate
+# instead of failing on it. With 21 crates the report stays short, and a new
+# duplicate that arrives with an update is visible in the log.
 multiple-versions = "warn"
 wildcards = "deny"
 

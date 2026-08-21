@@ -12,9 +12,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Name bash explicitly. The implicit default runs `bash -e` without pipefail,
-# so a failure in front of a `tee` or a `grep` can pass unseen. An explicit
-# `shell: bash` runs `bash -eo pipefail`.
+# Every job sets a `timeout-minutes` far below the six-hour default. This
+# matters most for the self-hosted jobs: each runs on the only runner of its
+# kind, so one stuck job blocks that runner for everything else.
+
+# Name bash for every run block. The default shell runs `bash -e` without
+# pipefail, so a command that fails in front of a `tee` or a search can pass
+# unseen. An explicit `shell: bash` runs `bash -eo pipefail`.
 defaults:
   run:
     shell: bash
@@ -79,19 +83,20 @@ jobs:
           cargo build --release
           codesign --sign - --entitlements hvi.entitlements --force --options runtime target/release/hvi
           codesign -dv --entitlements - target/release/hvi 2>&1 | grep -i hypervisor
-      # The Seatbelt counterpart of the seccomp selftest above: install the
-      # production profile in-process and probe every right the VMM must keep
-      # and every one it must lose. It needs no hypervisor entitlement, so a
-      # hosted runner can run it. sandbox_init(3) is deprecated and its
-      # implicit denials are not contractual across OS releases, so this is
-      # the step that re-proves the profile on every release CI sees (#31).
+      # The Seatbelt counterpart of the seccomp selftest above. It installs
+      # the production profile in its own process, then probes every right
+      # the VMM must keep and every right it must lose. It needs no
+      # hypervisor entitlement, so a hosted runner can run it.
+      #
+      # sandbox_init(3) is deprecated, and its implicit denials are not
+      # contractual between OS releases. This step proves the profile again
+      # on each release that CI sees.
       - name: seatbelt selftest
         run: |
-          # On a target hvi does not cover at all -- an Intel mac runner --
-          # the binary prints a notice and exits zero, so a runner-image
-          # change could turn this step into a silent no-op. Assert the
-          # success line: the step cannot go green without the probes
-          # running.
+          # On a target that hvi does not cover, such as an Intel mac, the
+          # binary prints a notice and exits zero. A change of runner image
+          # could therefore make this step do nothing. Assert the success
+          # line, so the step cannot pass unless the probes ran.
           ./target/release/hvi sandbox-selftest | tee selftest.log
           grep -q "every probe matched the profile" selftest.log
 
@@ -114,10 +119,6 @@ jobs:
   # boot itself is on bare metal rather than in a hosted VM. The arm64 KVM jobs
   # below are already self-hosted for a harder reason -- no hosted arm64 runner
   # exposes /dev/kvm at all -- so this is the same shape, not a new one.
-  # Every job carries a `timeout-minutes` well under the six-hour default.
-  # This matters most on the self-hosted jobs: each runs on the only runner
-  # of its kind, and one wedged job blocks that runner for everything else.
-  # The recorded failure mode is a stuck apt fetch of 55 minutes (#49).
   boot-x86:
     name: Boot x86
     runs-on: [self-hosted, Linux, X64, kvm]
@@ -142,8 +143,8 @@ jobs:
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
         if: steps.kvm.outputs.ok == 'yes'
         run: |
-          # find rather than ls: parsing ls output is what SC2012 rightly
-          # refuses to bless.
+          # Use find, not ls. SC2012 refuses a script that parses the
+          # output of ls, and it is correct to do so.
           KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1); echo "kernel: $KIMG"
           # 2>&1: the VMM's own lines (including what it says about seccomp)
           # go to stderr, and asserting on them means capturing them.
@@ -182,8 +183,8 @@ jobs:
           sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
             virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture
           sudo losetup -d "$LOOP"
-      # The inline greps keep only the lines they match. When the job fails,
-      # the full log answers the questions those lines cannot.
+      # The searches above keep only the lines they match. When the job
+      # fails, the full log answers what those lines cannot.
       - name: keep the boot evidence
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -201,10 +202,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Install the pinned toolchain and restore the cargo cache. The other
-      # self-hosted jobs install the toolchain for the same reason: a
-      # pre-provisioned rustup in the runner user's home is an assumption
-      # that broke before (see the note on the arm64/KVM job below).
+      # Install the pinned toolchain and restore the cargo cache. Do not
+      # rely on a rustup that someone installed in the home directory of the
+      # runner user; see the note on the arm64/KVM job below.
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: macos-hvf-live
@@ -246,9 +246,9 @@ jobs:
           ls -l target/initramfs.cpio
       - name: boot to userspace
         run: |
-          # The alarm caps a wedged boot, like `timeout 180` on the KVM jobs.
-          # macOS ships no coreutils `timeout`; the alarm survives the exec
-          # and terminates the VMM when it fires.
+          # The alarm bounds a stuck boot, as `timeout 180` does on the KVM
+          # jobs. macOS supplies no coreutils `timeout`. The alarm stays
+          # through the exec and stops the VMM when it occurs.
           perl -e 'alarm shift; exec @ARGV' 180 \
             ./target/release/hvi boot \
             --kernel guest/Image --initramfs target/initramfs.cpio \
@@ -260,8 +260,8 @@ jobs:
             || { echo "::error::the arm64 guest did not boot"; exit 1; }
           grep -q "HVI-INITRAMFS-UP" run.log \
             || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
-      # The inline tail keeps 25 lines. When the job fails, the full log and
-      # the event ledger answer the questions those lines cannot.
+      # The tail above keeps 25 lines. When the job fails, the full log and
+      # the event ledger answer what those lines cannot.
       - name: keep the boot evidence
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -451,8 +451,8 @@ jobs:
             || { echo "::error::no traffic with the assigned MAC reached the tap"; exit 1; }
           pkill -f "target/release/hvi boot" || true
           echo "tap network: the guest pinged the host with the override MAC over hvi-ci-tap"
-      # The inline tails keep 20 to 25 lines. When the job fails, the full
-      # logs and the event ledger answer the questions those lines cannot.
+      # The tails above keep 20 to 25 lines. When the job fails, the full
+      # logs and the event ledger answer what those lines cannot.
       - name: keep the boot evidence
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
