@@ -103,6 +103,26 @@ jobs:
           # automatically.
           actionlint -color -shellcheck=shellcheck
 
+  # The dependency graph, examined: RUSTSEC advisories, licenses, duplicate
+  # versions and registry sources, per deny.toml. The graph is 21 external
+  # crates and several sit in the trusted computing base (applevisor,
+  # kvm-ioctls, seccompiler, libc), so this is the job that reports a new
+  # advisory, a license change, or a new transitive crate arriving with an
+  # update. It reads the lockfile rather than building anything, so it needs
+  # no cargo cache and finishes in well under a minute.
+  #
+  # The weekly audit-deps.yml lane runs the same composite against the same
+  # lockfile, for advisories that arrive between changes.
+  check-deps:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cargo-deny
+
   # The Hypervisor.framework backend. Needs macOS 15+: the in-kernel GICv3 API
   # (hv_gic_*) it links against was added there.
   tidy-macos-hvf:

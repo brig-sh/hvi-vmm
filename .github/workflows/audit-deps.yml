@@ -1,0 +1,111 @@
+name: Audit dependencies (weekly)
+
+# The per-PR `check-deps` job proves the graph at the moment a change lands.
+# Advisories also arrive between changes, against a lockfile nobody touched.
+# This lane re-checks the same lockfile on a schedule, and it is advisory:
+# a failure files or updates one tracking issue instead of turning `main`
+# red, because the remediation is a dependency update, not a revert.
+
+on:
+  schedule:
+    # Weekly, Monday 05:23 UTC. An odd minute, so the run does not queue
+    # behind the top-of-the-hour crowd.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+# `issues: write` is what the failure routing needs to file, comment on or
+# close the tracking issue. This is the one workflow that deviates from the
+# repo-wide `contents: read`; nothing else is granted.
+permissions:
+  contents: read
+  issues: write
+
+# The failure path reads the issue tracker and then writes to it. Two runs
+# overlapping -- a manual dispatch during the scheduled run, or a re-run --
+# would both find no open issue and both file one. Queue instead of
+# cancelling: a cancelled run reports nothing at all.
+concurrency:
+  group: audit-deps
+  cancel-in-progress: false
+
+env:
+  # Label carried by the tracking issue this lane files, and the key it
+  # dedups on.
+  ISSUE_LABEL: dependency-audit
+  # Deterministic (no run id): both the issue title and the dedup key, so a
+  # recurring failure maps to one open issue.
+  MARKER: "Weekly dependency audit is red"
+
+jobs:
+  audit:
+    name: Weekly dependency audit
+    # A fork that enables Actions would otherwise run this against its own
+    # lockfile and file issues in the fork.
+    if: github.repository == 'NOFireAI/hvi-vmm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `id` so the routing below can tell an audit failure from a checkout
+      # or installer flake. Without it, a 502 from the installer would file
+      # an issue naming an advisory that was never looked for.
+      - id: deny
+        uses: ./.github/actions/cargo-deny
+      - name: File or update the tracking issue
+        if: failure() && steps.deny.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Best-effort: make sure the label exists so `gh issue create
+          # --label` cannot fail on a missing label. Ignores "already exists".
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Weekly cargo-deny failures against the lockfile on main" \
+            2>/dev/null || true
+          # Find an existing open issue by the deterministic marker in the
+          # title (literal substring via contains). No `|| true` fallback: a
+          # rate-limited or failed lookup must stop the step, because taking
+          # it for "nothing open" is what files a duplicate. The limit is
+          # well above the number of issues this label can accumulate, since
+          # the success path below closes them.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
+          body=$(cat <<EOF
+          The weekly \`cargo deny check\` against the lockfile on \`main\` failed.
+
+          - Run: $run_url
+          - Config: \`deny.toml\`
+
+          A red run usually means a new RUSTSEC advisory against a crate the
+          lockfile already holds. The remediation is a dependency update, or
+          a justified \`ignore\` entry in \`deny.toml\` when the advisory does
+          not apply here.
+
+          This issue closes itself on the next green run of the lane.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi
+      - name: Close the tracking issue once the audit is green
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Without this the marker points at a resolved issue forever, and
+          # the next real failure lands as a comment on a thread nobody
+          # reads instead of arriving as a new issue.
+          for number in $(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[].number'); do
+            gh issue close "$number" \
+              --comment "The weekly dependency audit is green again as of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo "closed #$number"
+          done

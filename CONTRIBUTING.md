@@ -131,6 +131,10 @@ commits on `main` verbatim):
 - **lint-workflows**: actionlint plus shellcheck over the workflows
   themselves, with both binaries version-pinned and sha256-verified. The
   self-hosted runner labels live in `.github/actionlint.yaml`.
+- **check-deps**: `cargo deny check` over the lockfile: RUSTSEC advisories,
+  licenses, duplicate versions and registry sources, per `deny.toml`. The
+  tool pin and the invocation live in the `.github/actions/cargo-deny`
+  composite, shared with the weekly lane below.
 
 `build-and-test.yml`:
 
@@ -159,6 +163,15 @@ test` runs on x86 Linux and on macOS only, and the arm64/KVM jobs build and
 boot without a test step. Those modules are cross-linted, not unit-tested.
 This waits on a decision about the runner pool.
 
+`audit-deps.yml` is a third entry workflow, called by neither of the two
+above. It runs `cargo deny check` against the lockfile on `main` every
+Monday, for advisories that arrive between changes. It is advisory rather
+than blocking: a failure files a tracking issue labelled `dependency-audit`,
+or comments on the open one, and the next green run closes it. Nothing about
+a new advisory is fixed by reverting, so a red `main` would be noise. This is
+the only workflow granted `issues: write`, and the only scheduled one.
+
 External actions are pinned to commit SHAs, with the version in a comment.
 Renovate keeps those pins, the Cargo dependencies and the commitlint tooling
-updated (`.github/renovate.json`).
+updated (`.github/renovate.json`). The cargo-deny pin is an action input
+rather than a `uses:` ref, so a custom manager in that file covers it.
