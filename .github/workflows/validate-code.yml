@@ -47,6 +47,62 @@ jobs:
           cache-key: aarch64-linux
       - run: tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
 
+  # The workflows themselves. The build-and-test jobs embed a lot of bash
+  # (loop devices, taps, boot-log greps), and a quoting or expression error
+  # there costs a self-hosted runner cycle to find. actionlint parses every
+  # workflow and runs shellcheck over each run block. Both binaries are
+  # pinned by version and verified by sha256 before use, the download
+  # equivalent of the commit-SHA pins the `uses:` steps carry.
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+      SHELLCHECK_VERSION: v0.10.0
+      SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned shellcheck and actionlint
+        run: |
+          bin_dir="${RUNNER_TEMP}/lint-bin"
+          mkdir -p "$bin_dir"
+
+          # Verify each archive's sha256 before extracting, then place the
+          # binary on PATH for the steps below.
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$bin_dir/shellcheck"
+
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          mv actionlint "$bin_dir/actionlint"
+
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Assert shellcheck is available
+        run: |
+          # actionlint exits 0 when shellcheck is missing, and silently lints
+          # less. Fail here instead, so a missing sub-checker can never be
+          # mistaken for a clean run.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck not on PATH; actionlint would skip its shell checks and still pass"
+            exit 1
+          fi
+          shellcheck --version
+      - name: Lint workflow files
+        run: |
+          # No path args: actionlint discovers every workflow under
+          # .github/workflows/ on its own, so a new workflow is covered
+          # automatically.
+          actionlint -color -shellcheck=shellcheck
+
   # The Hypervisor.framework backend. Needs macOS 15+: the in-kernel GICv3 API
   # (hv_gic_*) it links against was added there.
   tidy-macos-hvf:

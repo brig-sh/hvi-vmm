@@ -128,6 +128,9 @@ commits on `main` verbatim):
   cross-checked from the x86 runner. No cross-linker is needed for either.
 - **tidy-macos-hvf**: the same two on `macos-15`, for the
   Hypervisor.framework backend.
+- **lint-workflows**: actionlint plus shellcheck over the workflows
+  themselves, with both binaries version-pinned and sha256-verified. The
+  self-hosted runner labels live in `.github/actionlint.yaml`.
 
 `build-and-test.yml`:
 
