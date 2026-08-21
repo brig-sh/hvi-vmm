@@ -79,6 +79,21 @@ jobs:
           cargo build --release
           codesign --sign - --entitlements hvi.entitlements --force --options runtime target/release/hvi
           codesign -dv --entitlements - target/release/hvi 2>&1 | grep -i hypervisor
+      # The Seatbelt counterpart of the seccomp selftest above: install the
+      # production profile in-process and probe every right the VMM must keep
+      # and every one it must lose. It needs no hypervisor entitlement, so a
+      # hosted runner can run it. sandbox_init(3) is deprecated and its
+      # implicit denials are not contractual across OS releases, so this is
+      # the step that re-proves the profile on every release CI sees (#31).
+      - name: seatbelt selftest
+        run: |
+          # On a target hvi does not cover at all -- an Intel mac runner --
+          # the binary prints a notice and exits zero, so a runner-image
+          # change could turn this step into a silent no-op. Assert the
+          # success line: the step cannot go green without the probes
+          # running.
+          ./target/release/hvi sandbox-selftest | tee selftest.log
+          grep -q "every probe matched the profile" selftest.log
 
   # Live boot (x86/KVM): boot a real Linux kernel under the x86 backend and
   # assert it reaches the kernel + the userspace / no-rootfs VFS gate. Booting
