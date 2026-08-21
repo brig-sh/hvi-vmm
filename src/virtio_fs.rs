@@ -3283,21 +3283,23 @@ fn mkfifo_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
     Ok(())
 }
 
-// Host operations spent acquiring metadata, directory entries or
-// descriptors. Timing on a shared runner is noise, and a timing regression
-// passed every test twice (#38, #30); this count is exact, so a test can pin
-// the metadata workload's budget and fail when a change spends more.
+// Counts the host operations that the device spends to find something:
+// metadata, directory entries or a descriptor. A test pins this count for a
+// known workload, which catches a change that makes the device do more host
+// work per request. Time cannot do that job, because a shared runner adds
+// more noise than a real regression does.
 //
-// Every site that reaches the host filesystem to *find* something counts:
+// Every site that reaches the host filesystem to find something must count:
 // the three `Stat` forms, the entry and directory opens, `fs::read_dir`, and
-// the `fs::metadata` probes on the readdir path. A regression that routes
-// its extra work through `std::fs` rather than through the raw wrappers has
-// to move this number too, or the gate would not see the shape of change it
-// exists to catch.
+// the `fs::metadata` probes on the readdir path. If a site does not count,
+// extra work routed through it stays invisible to the test.
 //
-// Thread-local, so a test under the parallel harness counts only the
-// requests it drives itself. Compiled out entirely outside `cfg(test)`: the
-// counter is a test hook, and this is the device's per-request path.
+// Each site counts after the work that can fail without a syscall, so a
+// rejected name or a bad flag does not add to the total.
+//
+// The count is thread-local, so a test under the parallel harness sees only
+// the requests it drives. It compiles to nothing outside `cfg(test)`: this
+// is the device's per-request path, and the count is a test hook.
 #[cfg(test)]
 thread_local! {
     static HOST_META_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3337,9 +3339,6 @@ impl Stat {
     /// descriptor yet.
     fn lstat(path: &Path) -> Result<Self, i32> {
         let path = path_cstring(path)?;
-        // Counted here rather than on entry: the conversion above can fail
-        // without reaching the kernel, and a count that includes calls that
-        // never happened is wrong in the direction that hides real work.
         note_host_op();
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is NUL-terminated and outlives the call; `raw` is a
@@ -4939,15 +4938,19 @@ mod tests {
         get_u64(&out, OUT_HEADER_LEN).unwrap()
     }
 
-    /// What one round of the metadata workload spent, split by phase.
+    /// What one round of the metadata workload spent, per phase.
     ///
-    /// The two numbers answer different questions and must not be added up
-    /// into one. `per_file` is the marginal cost of a LOOKUP/GETATTR pair
-    /// and depends on nothing but the code that serves those two requests.
-    /// `listing` also encodes the fixture's geometry: `readdir` spends one
-    /// parent stat per *request*, and the request count is the entry count
-    /// divided by however many dirents fit in a reply, so the file count,
-    /// the length of the names and the reply budget all move it.
+    /// Keep the two numbers apart. They answer different questions, and
+    /// their sum answers neither.
+    ///
+    /// `per_file` is the cost of one LOOKUP and one GETATTR. Only the code
+    /// that serves those two requests changes it.
+    ///
+    /// `listing` also follows the shape of the directory. `readdir` spends
+    /// one parent stat and one `fs::read_dir` for each request, and the
+    /// number of requests is the number of entries divided by the number of
+    /// dirents that fit in one reply. The entry count, the length of the
+    /// names and the reply budget therefore all change this number.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RoundCost {
         /// Host operations spent on OPENDIR, the READDIRPLUS pages and
@@ -4957,10 +4960,10 @@ mod tests {
         per_file: u64,
     }
 
-    /// One round of the metadata workload: list the tree the way the guest
-    /// does, then look up and stat every file. Returns what each phase spent,
-    /// read from the thread-local counter, so a caller can pin the budget or
-    /// time the round without owning the loop.
+    /// Runs one round of the metadata workload: list the tree the way the
+    /// guest does, then look up and stat every file. Returns what each phase
+    /// spent, so a caller can pin the budget or take the time of the round
+    /// without holding a copy of the loop.
     fn metadata_round_cost(dev: &mut VirtioFs, tree_node: u64, files: usize) -> RoundCost {
         let spent = || HOST_META_OPS.with(std::cell::Cell::get);
         let start = spent();
@@ -5024,40 +5027,35 @@ mod tests {
         }
     }
 
-    /// The metadata path's host-operation budget, pinned exactly.
+    /// Holds the metadata path to a fixed budget of host operations.
     ///
-    /// Timing cannot be this gate: the workload's own benchmark below is
-    /// `#[ignore]`d and 27 percent noisy between runs on one quiet host.
-    /// Counts are exact and deterministic, so this cannot go red on a busy
-    /// runner and cannot go green on a slow change. A change that spends
-    /// more host work per request -- issue #30 was 2.4 times more time on
-    /// this exact path -- moves a number here and fails.
+    /// This is the gate against a change that makes the device do more host
+    /// work per request. It counts operations instead of taking the time,
+    /// because the count is exact. A count cannot fail on a busy runner, and
+    /// it cannot pass a change that is slower but does the same work.
     ///
-    /// `virtio_fs` compiles on macOS only (`src/lib.rs`), so in CI this runs
-    /// in the `build-and-test-macos` job and nowhere else. That is the same
-    /// job the rest of this module's suite already runs in, and unlike the
-    /// timing benchmark it needs no dedicated or quiet runner.
+    /// The budget has two parts, and a failure means something different in
+    /// each:
     ///
-    /// The two budgets are pinned separately because they are not the same
-    /// kind of number:
+    /// - `per_file` is the cost of one LOOKUP and one GETATTR. Nothing but the
+    ///   code that serves those requests changes it, so a new value is a
+    ///   regression until someone shows why the path is cheaper.
+    /// - `listing` also follows the shape of the fixture. The entry count, the
+    ///   length of the names and the reply budget all change it. Check those
+    ///   three first, before you look for a regression.
     ///
-    /// - `per_file` is 2, and depends only on the code serving a LOOKUP and a
-    ///   GETATTR. A move here is a real per-request regression.
-    /// - `listing` is 36 for this fixture and is geometry-dependent: `readdir`
-    ///   spends one parent stat and one `read_dir` per *request*, and 25
-    ///   entries of 9-character names fit in pages of 26, so the entry count,
-    ///   the name length and the reply budget all move it. Changing the fixture
-    ///   is expected to change this number; changing neither is not.
+    /// If a change lowers either number, measure again, set the new value
+    /// here, and say in the commit why the path is cheaper.
     ///
-    /// A change that moves either number DOWN is welcome: re-measure, update
-    /// the constant, and say so in the commit. Up is what this test stops.
+    /// `virtio_fs` builds on macOS only, so CI runs this test in the
+    /// `build-and-test-macos` job. It needs no quiet or dedicated runner.
     #[test]
     fn the_metadata_workload_spends_a_pinned_host_budget() {
         const FILES: usize = 25;
-        // Per LOOKUP/GETATTR pair. Geometry-free: a move here is a real
-        // per-request regression.
+        // One entry open and one stat for the LOOKUP, then one stat for the
+        // GETATTR, less the descriptor that the lookup leaves in the cache.
         const PER_FILE_BUDGET: u64 = 2;
-        // For this fixture only -- see the note on geometry above.
+        // True for this fixture only. See the note above on what moves it.
         const LISTING_BUDGET: u64 = 36;
 
         let (dir, mut dev) = fixture_with_access(true);
@@ -5068,9 +5066,10 @@ mod tests {
         }
         let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
 
-        // The first round pays the one-time costs: the component descriptor
-        // for the tree, the node table entries. The budget is pinned on the
-        // steady state, and a third round proves the steady state is real.
+        // The first round pays the costs that occur once: the component
+        // descriptor for the tree, and the entries in the node table. The
+        // budget applies to the steady state, and the third round shows
+        // that the steady state is real.
         let warm = metadata_round_cost(&mut dev, tree_node, FILES);
         let steady = metadata_round_cost(&mut dev, tree_node, FILES);
         let repeat = metadata_round_cost(&mut dev, tree_node, FILES);
@@ -5105,16 +5104,19 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Daemon-side cost of the metadata path, the one real workloads (a build
-    /// tree, `ls -R`, a source checkout) spend their time in. Drives the device
-    /// directly, so it measures host-side work only: no guest kernel, and so no
-    /// benefit from the attribute/entry timeouts, which cut the number of
-    /// requests that ever arrive rather than the cost of serving one.
+    /// Takes the time of the metadata path, where a build tree, an `ls -R`
+    /// or a source checkout spends most of its requests.
     ///
-    /// Runs the same rounds as the pinned gate above, through the same
-    /// helper, so the two cannot drift into measuring different workloads.
-    /// It reports host operations alongside the time, because the count is
-    /// the half of the answer that survives a noisy runner.
+    /// It drives the device directly, so it measures host-side work alone.
+    /// There is no guest kernel, and therefore no help from the attribute
+    /// and entry timeouts. Those timeouts lower the number of requests that
+    /// arrive; they do not lower the cost of serving one.
+    ///
+    /// The rounds come from the same helper as the budget test above, so the
+    /// test and this benchmark always measure one workload.
+    ///
+    /// Read the host operations first. That count is exact, while the time
+    /// carries the noise of the machine it ran on.
     ///
     /// Run with:
     ///   cargo test --release -- --ignored --nocapture bench_metadata_workload
@@ -5132,8 +5134,8 @@ mod tests {
         }
         let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
 
-        // Warm the host's own caches, and the device's, so the timed rounds
-        // measure steady-state work rather than cold I/O.
+        // Warm the caches of the host and of the device, so the rounds below
+        // measure steady-state work and not cold I/O.
         metadata_round_cost(&mut dev, tree_node, FILES);
 
         let start = std::time::Instant::now();
@@ -5145,8 +5147,8 @@ mod tests {
             cost = metadata_round_cost(&mut dev, tree_node, FILES);
         }
         let elapsed = start.elapsed();
-        // One OPENDIR, one RELEASEDIR and the READDIRPLUS pages, plus a
-        // LOOKUP and a GETATTR per file.
+        // One OPENDIR, one RELEASEDIR and the READDIRPLUS pages, plus one
+        // LOOKUP and one GETATTR for each file.
         let requests = (2 * FILES + 2) as u64 * ROUNDS as u64;
         println!(
             "BENCH metadata: {} requests in {:.3} ms => {:.2} us/request",
@@ -5163,14 +5165,14 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// One round of the build workload's mutation phase: for every
-    /// `MUTATE_EVERY`-th file, write an object the way a compiler does --
-    /// create a temporary, fill it, close it, rename it over the previous
-    /// round's output. Returns the host operations it spent.
+    /// Runs one mutation phase of the build workload. For every
+    /// `MUTATE_EVERY`-th file it writes an object the way a compiler does:
+    /// create a temporary, fill it, close it, then rename it over the
+    /// object from the round before. Returns the host operations it spent.
     ///
-    /// The objects exist before the first round, so the directory holds the
-    /// same number of entries in every round and the read phase either side
-    /// of this one is listing the same tree each time.
+    /// The objects already exist when the first round starts. Every round
+    /// therefore lists a directory of the same size, and the read phases on
+    /// each side of this one stay comparable.
     fn build_mutation_cost(dev: &mut VirtioFs, tree_node: u64, files: usize, every: usize) -> u64 {
         let spent = || HOST_META_OPS.with(std::cell::Cell::get);
         let start = spent();
@@ -5204,36 +5206,36 @@ mod tests {
         spent() - start
     }
 
-    /// What continuous topology change costs the read path.
+    /// Measures what a directory that keeps changing costs the read path.
     ///
-    /// The review of #30 found the companion benchmark missing (#38): the
-    /// metadata loop opens, lists and stats and never mutates, so a
-    /// topology-keyed cache benchmarks at its best case, every probe a hit
-    /// and no invalidation ever priced. A build does not behave that way. It
-    /// stats sources continuously and, per compiled file, creates an object,
-    /// writes it and renames a temporary into place.
+    /// The metadata benchmark above never mutates. A cache that is keyed on
+    /// the shape of the directory therefore measures at its best case
+    /// there: every probe hits, and the cache never pays to rebuild. A
+    /// build does not behave that way. It stats sources continuously and,
+    /// for each file it compiles, creates an object, writes it, then
+    /// renames a temporary into place.
     ///
-    /// The answer is a ratio, not a blended average. Blending reads and
-    /// writes into one number does not price invalidation: write I/O
-    /// dominates it, and the result moves with `MUTATE_EVERY` rather than
-    /// with anything about the code. So this runs the *same* read rounds
-    /// twice -- once against a quiet tree, once interleaved with mutations
-    /// -- and reports what the second costs relative to the first. A cache
-    /// that invalidates cheaply keeps that ratio near 1; one that rebuilds
-    /// its world on every rename does not, and that is the number the
-    /// debate in #30 needs.
+    /// This benchmark runs the same read rounds twice. The first pass reads
+    /// a directory that nothing changes. The second pass reads the same
+    /// directory with mutations between the rounds. It reports the second
+    /// cost as a ratio of the first.
     ///
-    /// Read rounds are the same helper the pinned gate uses, so the two
-    /// benchmarks and the gate all measure one workload. Host operations are
-    /// reported alongside the times, because on a shared runner the counts
-    /// are the half of the answer that survives: five runs on one quiet host
-    /// gave ratios of 0.92, 1.22, 1.35, 1.40 and 1.66 while the operation
-    /// counts were identical every time, at 679 per read round either way.
-    /// Today's code therefore spends no extra host work under mutation, and
-    /// a spread that straddles 1 is the host's own caches rather than
-    /// anything this benchmark drove. Read one ratio as an order of
-    /// magnitude, never as a measurement, and take a change in the counts as
-    /// the real signal.
+    /// A ratio is necessary because one blended number hides the answer.
+    /// Write I/O is much more expensive than a read, so a blend mostly
+    /// reports the write cost. The blend then follows `MUTATE_EVERY`
+    /// instead of the code under test.
+    ///
+    /// Read the two outputs differently:
+    ///
+    /// - The host operations are exact. If a cache rebuilds its state on every
+    ///   rename, a read round under mutation spends more operations than a
+    ///   quiet one. The two counts are equal today.
+    /// - The ratio carries the noise of any measurement of time. It moves by
+    ///   tens of percent between runs on an idle host, and it can fall below 1.
+    ///   Take it as an order of magnitude, never as a measurement.
+    ///
+    /// Read rounds come from the same helper as the budget test, so the
+    /// test and both benchmarks always measure one workload.
     ///
     /// Run with:
     ///   cargo test --release -- --ignored --nocapture bench_build_workload
@@ -5250,9 +5252,8 @@ mod tests {
         for i in 0..FILES {
             fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
         }
-        // The objects the mutation phase rewrites exist from the start, so
-        // every round lists a directory of the same size and the quiet and
-        // busy read phases are comparable.
+        // Create the objects before the first round, so every round lists a
+        // directory of the same size.
         for i in (0..FILES).step_by(MUTATE_EVERY) {
             fs::write(tree.join(format!("obj-{i:04}")), b"objbytes").unwrap();
         }
@@ -5261,7 +5262,7 @@ mod tests {
         metadata_round_cost(&mut dev, tree_node, FILES);
         build_mutation_cost(&mut dev, tree_node, FILES, MUTATE_EVERY);
 
-        // Reads against a quiet tree: the baseline.
+        // Pass one: read a directory that nothing changes.
         let quiet_start = std::time::Instant::now();
         let mut quiet_cost = RoundCost {
             listing: 0,
@@ -5272,7 +5273,7 @@ mod tests {
         }
         let quiet = quiet_start.elapsed();
 
-        // The same reads, now with the topology changing under them.
+        // Pass two: the same reads, with a mutation after each round.
         let mut busy = std::time::Duration::ZERO;
         let mut mutate = std::time::Duration::ZERO;
         let mut busy_cost = RoundCost {

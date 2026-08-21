@@ -1,10 +1,14 @@
 name: Audit dependencies (weekly)
 
-# The per-PR `check-deps` job proves the graph at the moment a change lands.
-# Advisories also arrive between changes, against a lockfile nobody touched.
-# This lane re-checks the same lockfile on a schedule, and it is advisory:
-# a failure files or updates one tracking issue instead of turning `main`
-# red, because the remediation is a dependency update, not a revert.
+# Checks the dependency graph of `main` on a schedule.
+#
+# The `check-deps` job examines the graph when a change lands. Advisories
+# also arrive between changes, against a lockfile that nobody touched. This
+# lane finds those.
+#
+# It reports rather than blocks: a failure files or updates one tracking
+# issue and leaves `main` green. The correction for a new advisory is a
+# dependency update, not a revert.
 
 on:
   schedule:
@@ -20,10 +24,9 @@ permissions:
   contents: read
   issues: write
 
-# The failure path reads the issue tracker and then writes to it. Two runs
-# overlapping -- a manual dispatch during the scheduled run, or a re-run --
-# would both find no open issue and both file one. Queue instead of
-# cancelling: a cancelled run reports nothing at all.
+# The failure path reads the issue tracker, then writes to it. If two runs
+# overlap, both find no open issue and both file one. Queue the second run
+# rather than cancel it, because a cancelled run reports nothing.
 concurrency:
   group: audit-deps
   cancel-in-progress: false
@@ -48,9 +51,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # `id` so the routing below can tell an audit failure from a checkout
-      # or installer flake. Without it, a 502 from the installer would file
-      # an issue naming an advisory that was never looked for.
+      # The `id` lets the step below tell an audit failure from a checkout
+      # or installer error. Without it, a failed download files an issue
+      # that names an advisory which nothing looked for.
       - id: deny
         uses: ./.github/actions/cargo-deny
       - name: File or update the tracking issue
@@ -65,12 +68,11 @@ jobs:
             --color BFD4F2 \
             --description "Weekly cargo-deny failures against the lockfile on main" \
             2>/dev/null || true
-          # Find an existing open issue by the deterministic marker in the
-          # title (literal substring via contains). No `|| true` fallback: a
-          # rate-limited or failed lookup must stop the step, because taking
-          # it for "nothing open" is what files a duplicate. The limit is
-          # well above the number of issues this label can accumulate, since
-          # the success path below closes them.
+          # Find an open issue by the fixed marker in its title. The lookup
+          # has no `|| true`: a failed or rate-limited query must stop the
+          # step, because "no result" then files a duplicate. The limit is
+          # far above the number of issues this label can hold, because the
+          # success path below closes them.
           existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
             --limit 100 --json number,title \
             --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
@@ -99,9 +101,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Without this the marker points at a resolved issue forever, and
-          # the next real failure lands as a comment on a thread nobody
-          # reads instead of arriving as a new issue.
+          # Close the issue, or the title keeps matching an issue that is
+          # already resolved. The next real failure then arrives as a
+          # comment on a closed subject instead of as a new issue.
           for number in $(gh issue list --state open --label "$ISSUE_LABEL" \
             --limit 100 --json number,title \
             --jq 'map(select(.title | contains(env.MARKER))) | .[].number'); do

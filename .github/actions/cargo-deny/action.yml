@@ -1,14 +1,14 @@
 name: cargo-deny
 description: Install the pinned cargo-deny and check the dependency graph.
 
-# One definition for the two lanes that audit dependencies: the per-change
-# `check-deps` job and the weekly `audit-deps.yml` lane. Both must run the
-# same tool at the same version against the same config, so the pin and the
-# invocation live here rather than being copied into each.
+# One definition for the two lanes that audit dependencies: the `check-deps`
+# job and the weekly `audit-deps.yml` lane. Both must run the same tool, at
+# the same version, against the same configuration, so the pin and the
+# command live here instead of in each lane.
 #
-# The version pin is an action *input*, which Renovate's github-actions
-# manager does not read. `.github/renovate.json` carries a custom manager
-# for the line below; keep the `# renovate:` marker if this moves.
+# The version pin is an action input, which the github-actions manager of
+# Renovate does not read. `.github/renovate.json` holds a custom manager for
+# the line below. Keep the `# renovate:` marker with it.
 
 runs:
   using: composite
@@ -21,9 +21,9 @@ runs:
     - name: Check the dependency graph
       shell: bash
       # `cargo deny` runs through the rustup proxy, which resolves the
-      # toolchain pinned in rust-toolchain.toml and installs it if absent.
-      # This job needs no particular compiler, only `cargo metadata`, so
-      # take whatever the runner image already has and skip that download.
+      # toolchain that rust-toolchain.toml pins and installs it if it is
+      # absent. This job needs `cargo metadata` and no particular compiler,
+      # so use the toolchain in the runner image and skip that download.
       env:
         RUSTUP_TOOLCHAIN: stable
       run: cargo deny check

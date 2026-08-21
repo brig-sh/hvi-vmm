@@ -47,12 +47,13 @@ jobs:
           cache-key: aarch64-linux
       - run: tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
 
-  # The workflows themselves. The build-and-test jobs embed a lot of bash
-  # (loop devices, taps, boot-log greps), and a quoting or expression error
-  # there costs a self-hosted runner cycle to find. actionlint parses every
-  # workflow and runs shellcheck over each run block. Both binaries are
-  # pinned by version and verified by sha256 before use, the download
-  # equivalent of the commit-SHA pins the `uses:` steps carry.
+  # Lints the workflows. The build-and-test jobs hold a lot of bash: loop
+  # devices, taps and boot-log searches. A quoting or expression error there
+  # costs a self-hosted runner cycle to find.
+  #
+  # actionlint parses every workflow and runs shellcheck over each run
+  # block. Both binaries are pinned by version and verified by sha256, which
+  # is the download equivalent of the commit-SHA pins on the `uses:` steps.
   lint-workflows:
     name: Lint workflows
     runs-on: ubuntu-latest
@@ -88,9 +89,9 @@ jobs:
           echo "$bin_dir" >> "$GITHUB_PATH"
       - name: Assert shellcheck is available
         run: |
-          # actionlint exits 0 when shellcheck is missing, and silently lints
-          # less. Fail here instead, so a missing sub-checker can never be
-          # mistaken for a clean run.
+          # actionlint exits zero when shellcheck is absent, and lints less
+          # without saying so. Fail here instead, so an absent sub-checker
+          # cannot pass for a clean run.
           if ! command -v shellcheck >/dev/null 2>&1; then
             echo "::error::shellcheck not on PATH; actionlint would skip its shell checks and still pass"
             exit 1
@@ -98,18 +99,21 @@ jobs:
           shellcheck --version
       - name: Lint workflow files
         run: |
-          # No path args: actionlint discovers every workflow under
-          # .github/workflows/ on its own, so a new workflow is covered
-          # automatically.
+          # Give no path arguments. actionlint finds every workflow under
+          # .github/workflows/ by itself, so it covers a new workflow with
+          # no change here.
           actionlint -color -shellcheck=shellcheck
 
-  # The dependency graph, examined: RUSTSEC advisories, licenses, duplicate
-  # versions and registry sources, per deny.toml. The graph is 21 external
-  # crates and several sit in the trusted computing base (applevisor,
-  # kvm-ioctls, seccompiler, libc), so this is the job that reports a new
-  # advisory, a license change, or a new transitive crate arriving with an
-  # update. It reads the lockfile rather than building anything, so it needs
-  # no cargo cache and finishes in well under a minute.
+  # Examines the dependency graph against deny.toml: RUSTSEC advisories,
+  # licenses, duplicate versions and registry sources.
+  #
+  # The graph holds 21 external crates, and several are inside the trusted
+  # computing base: applevisor, kvm-ioctls, seccompiler and libc. This job
+  # reports a new advisory, a change of license, or a new transitive crate
+  # that arrives with an update.
+  #
+  # It reads the lockfile and builds nothing, so it needs no cargo cache and
+  # takes well under a minute.
   #
   # The weekly audit-deps.yml lane runs the same composite against the same
   # lockfile, for advisories that arrive between changes.

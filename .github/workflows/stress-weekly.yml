@@ -1,11 +1,12 @@
 name: Stress tests (weekly)
 
-# The used-ring litmus test is `#[ignore]`d for a reason its own doc comment
-# records: it is timing-dependent, and one run deadlocked a hosted job for 47
-# minutes on a step that takes 36 seconds. It must never gate a pull request.
-# It is still the only test that can catch a lost fence in
-# `Queue::push_used`, so run it on a schedule, advisory: a failure files or
-# updates one tracking issue instead of turning `main` red.
+# Runs the used-ring litmus test, which is the only test that can catch a
+# lost fence in `Queue::push_used`.
+#
+# The test carries `#[ignore]` because it depends on timing and can deadlock,
+# so it must never gate a pull request. This lane runs it on a schedule
+# instead, and reports rather than blocks: a failure files or updates one
+# tracking issue, and leaves `main` green.
 
 on:
   schedule:
@@ -49,16 +50,15 @@ jobs:
     # A fork that enables Actions would otherwise file issues in the fork.
     if: github.repository == 'NOFireAI/hvi-vmm'
     #
-    # arm64, and that is the whole point of the job. The test's own control
-    # arm reports that a strongly ordered host does not tear even without
-    # the fence, so on x86 the assertions are never exercised and the run is
-    # green whether or not `Queue::push_used` still has its `fence(Release)`.
-    # The test says so itself and prints "Run it on arm64."
+    # The runner must be arm64. A strongly ordered host, such as x86, does
+    # not tear even when the fence is absent. The test then passes whether
+    # or not `Queue::push_used` still has its `fence(Release)`, and its
+    # control arm says so and prints "Run it on arm64."
     #
-    # No machine label: this is a userspace threading test with no interest
-    # in KVM or in which interrupt controller the host has, so either arm64
-    # Linux runner serves. Weekly and seconds long, so the load on that pool
-    # is negligible -- and the timeouts below bound the deadlock case.
+    # There is no machine label. This is a userspace threading test, and it
+    # has no interest in KVM or in the interrupt controller of the host, so
+    # either arm64 Linux runner serves. It runs weekly and takes seconds.
+    # The timeouts below bound a deadlock.
     runs-on: [self-hosted, Linux, ARM64]
     # The recorded failure mode is a deadlock, not a slow pass. Cap the job
     # well under the runaway, far over the normal run.
@@ -73,26 +73,26 @@ jobs:
       - name: run the ignored litmus test
         id: litmus
         run: |
-          # Build the test binary first and run it directly, rather than
-          # letting `cargo test` spawn it. `timeout` signals the process it
-          # started: wrapping cargo would leave the deadlocked test binary
-          # running as an orphan, which is the case this bound exists for.
+          # Build the test binary, then run it directly. `timeout` signals
+          # the process it starts, so a wrapper around cargo would leave a
+          # deadlocked test binary running as an orphan. A deadlock is the
+          # case this bound exists for.
           BIN=$(cargo test --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true
                             and .target.name=="hvi" and (.target.kind|contains(["lib"])))
                      | .executable')
           test -n "$BIN" || { echo "::error::could not resolve the test binary"; exit 1; }
           echo "test binary: $BIN"
-          # --include-ignored rather than --ignored: `--ignored` runs *only*
-          # ignored tests, so the day this test loses its `#[ignore]` the
-          # filter would match it and the runner would then exclude it,
-          # reporting "running 0 tests" and exiting 0 forever.
+          # Use --include-ignored, not --ignored. `--ignored` runs ignored
+          # tests only. If this test loses its `#[ignore]`, the filter still
+          # matches it but `--ignored` then excludes it, and the step
+          # reports "running 0 tests" and exits zero.
           timeout --foreground -k 30 600 "$BIN" \
             used_ring_litmus::push_used_is_never_observed_torn \
             --exact --include-ignored --nocapture 2>&1 | tee litmus.log
-          # A filter that matches nothing also exits 0, so assert the test
-          # actually ran. Without this the lane cannot tell "passed" from
-          # "was never executed".
+          # A filter that matches nothing also exits zero. Assert that one
+          # test ran, or the lane cannot tell a pass from a test that never
+          # started.
           grep -qE "^test result: ok\. 1 passed" litmus.log \
             || { echo "::error::the litmus test did not run"; exit 1; }
       - name: keep the litmus output
@@ -104,9 +104,9 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
       - name: File or update the tracking issue
-        # Only a real test failure, not a checkout or toolchain flake: an
-        # issue asserting a memory-fence regression that was never looked
-        # for is worse than no issue at all.
+        # File an issue for a test failure only. A checkout or toolchain
+        # error must not report a memory-fence regression that nothing
+        # looked for.
         if: failure() && steps.litmus.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,8 +118,8 @@ jobs:
             --color BFD4F2 \
             --description "Weekly ignored stress-test failures" \
             2>/dev/null || true
-          # No `|| true` on the lookup: taking a rate-limited or failed
-          # query for "nothing open" is what files a duplicate.
+          # The lookup has no `|| true`. A failed or rate-limited query
+          # must stop the step, because "no result" then files a duplicate.
           existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
             --limit 100 --json number,title \
             --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
@@ -151,9 +151,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Without this the marker points at a resolved issue forever, and
-          # the next real failure lands as a comment on a thread nobody
-          # reads instead of arriving as a new issue.
+          # Close the issue, or the title keeps matching an issue that is
+          # already resolved. The next real failure then arrives as a
+          # comment on a closed subject instead of as a new issue.
           for number in $(gh issue list --state open --label "$ISSUE_LABEL" \
             --limit 100 --json number,title \
             --jq 'map(select(.title | contains(env.MARKER))) | .[].number'); do
