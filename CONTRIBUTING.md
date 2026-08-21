@@ -137,13 +137,24 @@ commits on `main` verbatim):
 - **boot-x86**: a live boot of a real Linux kernel to the userspace/VFS gate
   with `--cpus 2`, so SMP AP bringup is asserted too.
 - **boot-arm64-hvf** / **boot-arm64-kvm**: the same for the two arm64
-  backends, on self-hosted runners.
+  backends, on self-hosted runners. The hvf job also runs `hvi smoke` and
+  `hvi smoke --shm`; the `--shm` run spawns `smoke-shm-verify` in a child
+  process and fails when that child fails.
 
 The arm64 boots need self-hosted runners: GitHub-hosted arm64 runners expose no
 `/dev/kvm`, and a live macOS boot needs the hypervisor entitlement plus an
 interactive host (AMFI). Where no such runner is available the backends are
 still compile- and lint-checked. The x86 live jobs skip themselves with a
 warning if a runner turns up without `/dev/kvm`.
+
+Every job carries a `timeout-minutes` cap, so a wedged job cannot hold a
+self-hosted runner for the six-hour default. The boot jobs upload their logs
+and the event ledger as artifacts when they fail.
+
+One known gap: the unit tests of the arm64-Linux modules run nowhere. `cargo
+test` runs on x86 Linux and on macOS only, and the arm64/KVM jobs build and
+boot without a test step. Those modules are cross-linted, not unit-tested.
+This waits on a decision about the runner pool.
 
 External actions are pinned to commit SHAs, with the version in a comment.
 Renovate keeps those pins, the Cargo dependencies and the commitlint tooling
