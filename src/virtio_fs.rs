@@ -5163,6 +5163,156 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// One round of the build workload's mutation phase: for every
+    /// `MUTATE_EVERY`-th file, write an object the way a compiler does --
+    /// create a temporary, fill it, close it, rename it over the previous
+    /// round's output. Returns the host operations it spent.
+    ///
+    /// The objects exist before the first round, so the directory holds the
+    /// same number of entries in every round and the read phase either side
+    /// of this one is listing the same tree each time.
+    fn build_mutation_cost(dev: &mut VirtioFs, tree_node: u64, files: usize, every: usize) -> u64 {
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let start = spent();
+        for i in (0..files).step_by(every) {
+            let mut create = vec![0u8; 16];
+            create[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+            create[4..8].copy_from_slice(&(S_IFREG | 0o644).to_le_bytes());
+            create.extend_from_slice(format!("obj-{i:04}.tmp\0").as_bytes());
+            let out = dev.handle_fuse(&request(CREATE, tree_node, &create), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "CREATE failed");
+            let obj = get_u64(&out, OUT_HEADER_LEN).unwrap();
+            let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+
+            let mut write = vec![0u8; 40];
+            write[0..8].copy_from_slice(&fh.to_le_bytes());
+            write[16..20].copy_from_slice(&8u32.to_le_bytes());
+            write.extend_from_slice(b"objbytes");
+            let out = dev.handle_fuse(&request(WRITE, obj, &write), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "WRITE failed");
+
+            let mut release = vec![0u8; 24];
+            release[0..8].copy_from_slice(&fh.to_le_bytes());
+            dev.handle_fuse(&request(RELEASE, obj, &release), 4096);
+
+            let mut rename = Vec::new();
+            put_u64(&mut rename, tree_node);
+            rename.extend_from_slice(format!("obj-{i:04}.tmp\0obj-{i:04}\0").as_bytes());
+            let out = dev.handle_fuse(&request(RENAME, tree_node, &rename), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+        }
+        spent() - start
+    }
+
+    /// What continuous topology change costs the read path.
+    ///
+    /// The review of #30 found the companion benchmark missing (#38): the
+    /// metadata loop opens, lists and stats and never mutates, so a
+    /// topology-keyed cache benchmarks at its best case, every probe a hit
+    /// and no invalidation ever priced. A build does not behave that way. It
+    /// stats sources continuously and, per compiled file, creates an object,
+    /// writes it and renames a temporary into place.
+    ///
+    /// The answer is a ratio, not a blended average. Blending reads and
+    /// writes into one number does not price invalidation: write I/O
+    /// dominates it, and the result moves with `MUTATE_EVERY` rather than
+    /// with anything about the code. So this runs the *same* read rounds
+    /// twice -- once against a quiet tree, once interleaved with mutations
+    /// -- and reports what the second costs relative to the first. A cache
+    /// that invalidates cheaply keeps that ratio near 1; one that rebuilds
+    /// its world on every rename does not, and that is the number the
+    /// debate in #30 needs.
+    ///
+    /// Read rounds are the same helper the pinned gate uses, so the two
+    /// benchmarks and the gate all measure one workload. Host operations are
+    /// reported alongside the times, because on a shared runner the counts
+    /// are the half of the answer that survives: five runs on one quiet host
+    /// gave ratios of 0.92, 1.22, 1.35, 1.40 and 1.66 while the operation
+    /// counts were identical every time, at 679 per read round either way.
+    /// Today's code therefore spends no extra host work under mutation, and
+    /// a spread that straddles 1 is the host's own caches rather than
+    /// anything this benchmark drove. Read one ratio as an order of
+    /// magnitude, never as a measurement, and take a change in the counts as
+    /// the real signal.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_build_workload
+    #[test]
+    #[ignore]
+    fn bench_build_workload() {
+        const FILES: usize = 200;
+        const ROUNDS: usize = 20;
+        const MUTATE_EVERY: usize = 4;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        for i in 0..FILES {
+            fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
+        }
+        // The objects the mutation phase rewrites exist from the start, so
+        // every round lists a directory of the same size and the quiet and
+        // busy read phases are comparable.
+        for i in (0..FILES).step_by(MUTATE_EVERY) {
+            fs::write(tree.join(format!("obj-{i:04}")), b"objbytes").unwrap();
+        }
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+
+        metadata_round_cost(&mut dev, tree_node, FILES);
+        build_mutation_cost(&mut dev, tree_node, FILES, MUTATE_EVERY);
+
+        // Reads against a quiet tree: the baseline.
+        let quiet_start = std::time::Instant::now();
+        let mut quiet_cost = RoundCost {
+            listing: 0,
+            per_file: 0,
+        };
+        for _ in 0..ROUNDS {
+            quiet_cost = metadata_round_cost(&mut dev, tree_node, FILES);
+        }
+        let quiet = quiet_start.elapsed();
+
+        // The same reads, now with the topology changing under them.
+        let mut busy = std::time::Duration::ZERO;
+        let mut mutate = std::time::Duration::ZERO;
+        let mut busy_cost = RoundCost {
+            listing: 0,
+            per_file: 0,
+        };
+        let mut mutate_ops = 0u64;
+        for _ in 0..ROUNDS {
+            let t = std::time::Instant::now();
+            busy_cost = metadata_round_cost(&mut dev, tree_node, FILES);
+            busy += t.elapsed();
+
+            let t = std::time::Instant::now();
+            mutate_ops = build_mutation_cost(&mut dev, tree_node, FILES, MUTATE_EVERY);
+            mutate += t.elapsed();
+        }
+
+        let reads = (2 * FILES + 2) as u64 * ROUNDS as u64;
+        let writes = (FILES / MUTATE_EVERY * 4) as u64 * ROUNDS as u64;
+        let quiet_us = quiet.as_secs_f64() * 1e6 / reads as f64;
+        let busy_us = busy.as_secs_f64() * 1e6 / reads as f64;
+        println!("BENCH build: reads on a quiet tree      {quiet_us:.2} us/request");
+        println!("BENCH build: reads under mutation       {busy_us:.2} us/request");
+        println!(
+            "BENCH build: invalidation cost          {:.2}x",
+            busy_us / quiet_us
+        );
+        println!(
+            "BENCH build: mutations                  {:.2} us/op",
+            mutate.as_secs_f64() * 1e6 / writes as f64
+        );
+        println!(
+            "BENCH build: host ops per read round    {} quiet, {} under mutation",
+            quiet_cost.listing + quiet_cost.per_file * FILES as u64,
+            busy_cost.listing + busy_cost.per_file * FILES as u64,
+        );
+        println!("BENCH build: host ops per mutation round {mutate_ops}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn init_negotiates_without_dax() {
         let (dir, mut dev) = fixture();
