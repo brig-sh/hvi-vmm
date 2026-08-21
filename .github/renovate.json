@@ -13,6 +13,16 @@
   "labels": ["dependencies"],
   "commitMessageLowerCase": "never",
   "commitBodyTable": true,
+  "customManagers": [
+    {
+      "description": "Bump the cargo-deny pin, which sits in an action input the github-actions manager does not read.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/actions/cargo-deny/action\\.yml$/"],
+      "matchStrings": ["# renovate: datasource=crate depName=cargo-deny\\s+tool: cargo-deny@(?<currentValue>[0-9.]+)"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "cargo-deny"
+    }
+  ],
   "packageRules": [
     {
       "description": "Keep the SHA-pinned actions bumped.",
