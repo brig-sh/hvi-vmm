@@ -16,6 +16,14 @@ local run means a green `validate-code`. The reflow needs a nightly rustfmt
 (`wrap_comments` is nightly-only); without one the script says so and skips that
 pass, and CI catches what you missed.
 
+`tools/gates.sh` runs the CI checks a developer machine can run, in one
+command: `tidy.sh --check`, the aarch64 cross-lint, `cargo test`, `cargo deny
+check`, the workflow lint and the spell check. The last four need tools
+outside the pinned toolchain, so each is skipped when its tool is missing and
+every skip is named in the closing line -- the script never reports a bare
+`ok` when something did not run. The live boots, the other host's backend and
+the commit-message lint stay CI's job.
+
 Only the backend for your host target is compiled: the macOS/hvf one on Apple
 silicon, x86-64/KVM on an x86 Linux box. To lint a backend you have no host for,
 pass its target:
