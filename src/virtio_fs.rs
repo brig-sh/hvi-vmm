@@ -145,8 +145,8 @@ const LINUX_XATTR_REPLACE: u32 = 2;
 // applying a guest mode such as 0000 to the host inode would prevent the VMM
 // itself from serving later requests. Persist the guest-visible metadata in
 // private, no-follow xattrs while retaining host-owner access.
-const HVI_XATTR_PREFIX: &[u8] = b"com.nubificus.hvi.";
-const HVI_XATTR_LINUX_ATTR: &[u8] = b"com.nubificus.hvi.linux-attr";
+const HVI_XATTR_PREFIX: &[u8] = b"com.nofire.hvi.";
+const HVI_XATTR_LINUX_ATTR: &[u8] = b"com.nofire.hvi.linux-attr";
 
 const LINUX_F_RDLCK: u32 = 0;
 const LINUX_F_WRLCK: u32 = 1;
@@ -301,7 +301,7 @@ struct Node {
     key: (u64, u64),
     paths: Vec<PathBuf>,
     lookups: u64,
-    /// Cached `com.nubificus.hvi.linux-attr`. `Some(None)` means "checked, not
+    /// Cached `com.nofire.hvi.linux-attr`. `Some(None)` means "checked, not
     /// present" so a miss costs no syscall either. Invalidated whenever this
     /// module writes the xattr or changes ownership/mode. macOS only; on
     /// Linux `guest_attr` has no xattr path, so this is simply never filled.
@@ -2639,7 +2639,7 @@ impl VirtioFs {
         entry_out(node, meta, cache_seconds, guest)
     }
 
-    /// Cached `com.nubificus.hvi.linux-attr` lookup. A getxattr call costs one
+    /// Cached `com.nofire.hvi.linux-attr` lookup. A getxattr call costs one
     /// syscall on a miss and two on a hit (size probe then read), and this is
     /// asked for on every attribute reply -- caching it on the `Node` turns
     /// that into at most one syscall for the node's whole cached lifetime.
@@ -6824,11 +6824,7 @@ mod tests {
             .windows(HVI_XATTR_PREFIX.len())
             .any(|window| window == HVI_XATTR_PREFIX));
         let private = reopened.handle_fuse(
-            &request(
-                GETXATTR,
-                locked,
-                b"\x04\0\0\0\0\0\0\0com.nubificus.hvi.mode\0",
-            ),
+            &request(GETXATTR, locked, b"\x04\0\0\0\0\0\0\0com.nofire.hvi.mode\0"),
             4096,
         );
         assert_eq!(
