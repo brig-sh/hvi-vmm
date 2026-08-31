@@ -12,9 +12,10 @@ cargo test                 # the unit suite
 
 The fmt and reflow passes rewrite the tree in place. CI runs the same script
 with `--check`, the read-only variant that verifies without writing, so a clean
-local run means a green `validate-code`. The reflow needs a nightly rustfmt
-(`wrap_comments` is nightly-only); without one the script says so and skips that
-pass, and CI catches what you missed.
+local run means a green `validate-code`. The reflow needs the nightly rustfmt
+pinned in `pins.env` (`wrap_comments` is nightly-only); without that exact
+toolchain the script says so and skips that pass, and CI catches what you
+missed.
 
 `tools/gates.sh` runs the CI checks a developer machine can run, in one
 command: `tidy.sh --check`, the aarch64 cross-lint, `cargo test`, `cargo deny

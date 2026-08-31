@@ -516,7 +516,8 @@ fn probes() -> Vec<Probe> {
             expect_ok: true,
             run: |_| {
                 // The virtio paths allocate per request; a profile that broke
-                // this would break the VMM in a way no denial log would explain.
+                // this would break the VMM in a way no denial log would
+                // explain.
                 let v: Vec<u8> = vec![0u8; 4 << 20];
                 if v.len() != 4 << 20 {
                     return Err(io::Error::other("allocation short"));

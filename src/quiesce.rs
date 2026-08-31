@@ -97,7 +97,8 @@ impl Quiesce {
     /// Releases the quiesce and wakes every parked vCPU.
     pub fn release(&self) {
         self.requested.store(false, Ordering::Release);
-        // Take the lock so a vCPU cannot be between its flag check and its wait.
+        // Take the lock so a vCPU cannot be between its flag check and its
+        // wait.
         let _guard = self.parked.lock().unwrap();
         self.cv.notify_all();
     }

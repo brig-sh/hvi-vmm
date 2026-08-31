@@ -100,8 +100,9 @@ impl SharedRam {
         #[cfg(target_os = "macos")]
         {
             // macOS caps the name at 31 characters including the slash, and the
-            // object must be sized before it is mapped. O_EXCL so a stale object
-            // is an error rather than a silently reused mapping.
+            // object must be sized before it is mapped. O_EXCL so a stale
+            // object is an error rather than a silently reused
+            // mapping.
             //
             // The name carries a per-allocation counter as well as the pid,
             // because the pid alone is not unique within a process: the window

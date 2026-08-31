@@ -254,8 +254,9 @@ impl VirtioNet {
                 // Publish before the backend branch, so the ring carries egress
                 // whichever one carries the frame -- including the built-in
                 // stack, which observe_tx below never sees. Raw and unparsed:
-                // observe_tx is IPv4-only by design, while a reader with its own
-                // stack should get ARP, IPv6 and anything else too.
+                // observe_tx is IPv4-only by design, while a reader with its
+                // own stack should get ARP, IPv6 and anything
+                // else too.
                 if let Some(sink) = self.sink.as_ref() {
                     sink.net(&frame, true);
                 }
@@ -599,7 +600,8 @@ impl VirtioNet {
         r[20..24].copy_from_slice(&GW_IP.octets()); // siaddr (next server)
         r[28..44].copy_from_slice(&bootp[28..44]); // chaddr
         r[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]); // magic cookie
-                                                                // Options: msg type, server id, lease, subnet mask, router, DNS, end.
+
+        // Options: msg type, server id, lease, subnet mask, router, DNS, end.
         r.extend_from_slice(&[53, 1, reply_type]);
         r.extend_from_slice(&[54, 4]);
         r.extend_from_slice(&GW_IP.octets());
@@ -647,11 +649,14 @@ impl VirtioNet {
         let mut resp = Vec::new();
         resp.extend_from_slice(&dns[0..2]); // id
         let answers = u16::from(ip.is_some());
-        resp.extend_from_slice(&0x8180u16.to_be_bytes()); // response, recursion available
+        // response, recursion available
+        resp.extend_from_slice(&0x8180u16.to_be_bytes());
         resp.extend_from_slice(&1u16.to_be_bytes()); // qdcount
         resp.extend_from_slice(&answers.to_be_bytes()); // ancount
         resp.extend_from_slice(&[0, 0, 0, 0]); // ns/ar count
-        resp.extend_from_slice(&dns[12..qend]); // the question (name+type+class)
+
+        // the question (name+type+class)
+        resp.extend_from_slice(&dns[12..qend]);
         if let Some(v4) = ip {
             resp.extend_from_slice(&[0xc0, 0x0c]); // name pointer to offset 12
             resp.extend_from_slice(&1u16.to_be_bytes()); // type A
@@ -794,7 +799,8 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
         let elen = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
         let data = body.get(p + 4..p + 4 + elen)?;
         if etype == 0 {
-            // server_name extension: list_len(2), name_type(1), name_len(2), name.
+            // server_name extension: list_len(2), name_type(1), name_len(2),
+            // name.
             if data.len() >= 5 && data[2] == 0 {
                 let nlen = u16::from_be_bytes([data[3], data[4]]) as usize;
                 let name = data.get(5..5 + nlen)?;
