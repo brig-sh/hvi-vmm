@@ -121,6 +121,15 @@ jobs:
   # exposes /dev/kvm at all -- so this is the same shape, not a new one.
   boot-x86:
     name: Boot x86
+    # A fork's pull request is untrusted code. These runners are persistent
+    # machines we own, not ephemeral VMs, so a malicious pull request would not
+    # merely run once -- it could leave something behind for the next job. The
+    # hosted lanes above already cover a fork's build and unit tests; the live
+    # boots are what we withhold. Pushes, dispatches and same-repo pull
+    # requests are trusted and still run.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, kvm]
     timeout-minutes: 30
     steps:
@@ -196,6 +205,10 @@ jobs:
 
   boot-arm64-hvf:
     name: Boot arm64/hvf
+    # Withheld from fork pull requests; see the note on boot-x86.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
@@ -294,6 +307,10 @@ jobs:
           - runner: gicv3
             vgic: vGICv3
             expect_gicv3: "yes"
+    # Withheld from fork pull requests; see the note on boot-x86.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, "${{ matrix.runner }}"]
     timeout-minutes: 30
     steps:
