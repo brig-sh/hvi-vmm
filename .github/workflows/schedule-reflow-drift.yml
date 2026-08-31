@@ -1,0 +1,132 @@
+name: Reflow nightly drift (monthly)
+
+# Watches the pinned comment-reflow nightly for drift.
+#
+# The `tidy-portable` job runs the comment reflow on one pinned nightly
+# rustfmt (`pins.env`), so a newer nightly that wraps comments differently
+# cannot redden CI on an untouched tree. That pin also stops picking up a
+# newer rustfmt. This lane runs the same reflow check against the latest
+# nightly on a schedule, so the day the two disagree is caught here and the
+# pin is advanced deliberately, rather than surfacing later the first time
+# someone installs a fresh nightly.
+#
+# It reports rather than blocks: on drift it files or updates one tracking
+# issue and leaves `main` green. The correction is a pin bump, not a revert.
+
+on:
+  schedule:
+    # Monthly, the 1st at 07:17 UTC. An odd minute off the top of the hour,
+    # and clear of the Monday 05:23 and 06:43 weekly lanes for the months
+    # whose first day is a Monday.
+    - cron: "17 7 1 * *"
+  workflow_dispatch:
+
+# `issues: write` is what the drift routing needs to file, comment on or
+# close the tracking issue; nothing else is granted.
+permissions:
+  contents: read
+  issues: write
+
+# The drift path reads the issue tracker, then writes to it. A manual
+# dispatch overlapping the scheduled run would otherwise let both find no
+# open issue and both file one. Queue rather than cancel: a cancelled run
+# reports nothing.
+concurrency:
+  group: reflow-drift
+  cancel-in-progress: false
+
+env:
+  # Label carried by the tracking issue this lane files, and the key it
+  # dedups on.
+  ISSUE_LABEL: reflow-drift
+  # Deterministic (no run id): both the issue title and the dedup key, so
+  # recurring drift maps to one open issue.
+  MARKER: "Bump the pinned rustfmt reflow nightly"
+
+jobs:
+  reflow-drift:
+    name: Reflow nightly drift
+    # A fork that enables Actions would otherwise file issues in the fork.
+    if: github.repository == 'NOFireAI/hvi-vmm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the latest nightly rustfmt
+        run: >-
+          rustup toolchain install nightly --profile minimal
+          --component rustfmt --no-self-update
+      # The `id` lets the step below tell a real reflow difference from a
+      # checkout or installer error, which must not file a pin-bump issue.
+      # The config mirrors the reflow pass in `tools/tidy.sh`; keep them in
+      # step. `cargo fmt` reads only source, so no dependency build is needed.
+      - name: Check the tree against the latest nightly's reflow
+        id: reflow
+        run: >-
+          cargo +nightly fmt --all --
+          --config wrap_comments=true,comment_width=80 --check
+      - name: File or update the tracking issue
+        if: failure() && steps.reflow.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Best-effort: make sure the label exists so `gh issue create
+          # --label` cannot fail on a missing label. Ignores "already exists".
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "The pinned rustfmt reflow nightly is behind the latest" \
+            2>/dev/null || true
+          # Find an open issue by the fixed marker in its title. The lookup
+          # has no `|| true`: a failed or rate-limited query must stop the
+          # step, because "no result" then files a duplicate.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
+          body=$(cat <<EOF
+          ## Problem
+
+          The comment-reflow check runs on the nightly pinned in \`pins.env\`
+          (\`RUSTFMT_NIGHTLY\`). This lane ran the same check on the latest
+          nightly, whose rustfmt wraps comments differently, so the two
+          disagree on the committed tree. The pin stays green, but a
+          contributor formatting with a current nightly, and the next pin
+          bump, diverge from it.
+
+          ## Proposed solution
+
+          Bump \`RUSTFMT_NIGHTLY\` in \`pins.env\` to the newest nightly that
+          formats the tree clean, and run \`tools/tidy.sh\` in the same commit
+          to reflow, as the note in \`pins.env\` describes.
+
+          ## Additional context
+
+          - Run: $run_url
+
+          Opened by the \`Reflow nightly drift\` workflow. It closes itself on
+          the next monthly run that finds no drift.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi
+      - name: Close the tracking issue once the pin is current
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Close the issue, or the title keeps matching an issue that is
+          # already resolved. The next real drift then arrives as a comment
+          # on a closed subject instead of as a new issue.
+          for number in $(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[].number'); do
+            gh issue close "$number" \
+              --comment "The pinned rustfmt reflow nightly matches the latest again as of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo "closed #$number"
+          done
