@@ -2719,11 +2719,12 @@ fn socket_entry_out(node: u64, socket: SocketNode) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     put_u64(&mut out, node);
     put_u64(&mut out, 1); // generation
-                          // No entry/attribute caching. The guest kernel is the only thing that can
-                          // tell us a socket has gone, and it does that with UNLINK, so there is
-                          // nothing to rediscover by expiring the entry -- but a zero timeout keeps
-                          // the guest asking us rather than trusting a cached negative if a lookup
-                          // and an unlink race.
+
+    // No entry/attribute caching. The guest kernel is the only thing that can
+    // tell us a socket has gone, and it does that with UNLINK, so there is
+    // nothing to rediscover by expiring the entry -- but a zero timeout keeps
+    // the guest asking us rather than trusting a cached negative if a lookup
+    // and an unlink race.
     put_u64(&mut out, 0);
     put_u64(&mut out, 0);
     put_u32(&mut out, 0);
@@ -7441,7 +7442,8 @@ mod tests {
         let mut req = fuse_in_header(80, READ, 0x55, node);
         let mut args = vec![0u8; 40];
         args[0..8].copy_from_slice(&fh.to_le_bytes());
-        args[16..20].copy_from_slice(&100u32.to_le_bytes()); // more than the file has
+        // more than the file has
+        args[16..20].copy_from_slice(&100u32.to_le_bytes());
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
 

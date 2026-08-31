@@ -116,7 +116,8 @@ pub fn run_shm() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create + size the object. O_EXCL so a stale object from a crashed run is
     // an error rather than a silently reused mapping.
-    // SAFETY: `cname` is a valid NUL-terminated C string that outlives the call.
+    // SAFETY: `cname` is a valid NUL-terminated C string that outlives the
+    // call.
     let fd = unsafe {
         libc::shm_open(
             cname.as_ptr(),
@@ -208,8 +209,8 @@ pub fn run_shm() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("guest store read back via host mapping: {via_host:#x}");
 
-    // ...and, the actual point, through a *separate process* that only knows the
-    // object's name. This is the plugin's access path.
+    // ...and, the actual point, through a *separate process* that only knows
+    // the object's name. This is the plugin's access path.
     let exe = std::env::current_exe()?;
     let out = std::process::Command::new(exe)
         .arg("smoke-shm-verify")

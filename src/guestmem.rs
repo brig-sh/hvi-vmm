@@ -101,7 +101,8 @@ impl GuestRam {
         let mut i = 0;
         while i + needle.len() <= self.len {
             if hay[i] == first && &hay[i..i + needle.len()] == needle {
-                // Host offsets are contiguous; guest-physical addresses are not.
+                // Host offsets are contiguous; guest-physical addresses are
+                // not.
                 out.push(if i < self.low_len {
                     self.ram_base + i as u64
                 } else {

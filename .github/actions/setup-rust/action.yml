@@ -14,8 +14,8 @@ inputs:
     default: ""
   nightly:
     description: >-
-      Install a nightly toolchain with rustfmt, needed by the `cargo +nightly
-      fmt` comment-reflow step in tools/tidy.sh.
+      Install the nightly toolchain pinned in pins.env with rustfmt, needed by
+      the comment-reflow step in tools/tidy.sh.
     required: false
     default: "false"
   cache-key:
@@ -43,9 +43,11 @@ runs:
     - name: Install nightly rustfmt (comment reflow)
       if: inputs.nightly == 'true'
       shell: bash
-      run: >-
-        rustup toolchain install nightly --profile minimal
-        --component rustfmt --no-self-update
+      # pins.env sits at the repo root, this action's default directory.
+      run: |
+        . ./pins.env
+        rustup toolchain install "$RUSTFMT_NIGHTLY" --profile minimal \
+          --component rustfmt --no-self-update
 
     - name: Cache cargo build and installed binaries
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

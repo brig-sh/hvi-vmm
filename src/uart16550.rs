@@ -85,7 +85,8 @@ impl Uart16550 {
             IER_DLM if self.dlab() => self.dlm,
             IER_DLM => self.ier,
             IIR_FCR => {
-                // IIR: report the highest-priority pending interrupt, else "none".
+                // IIR: report the highest-priority pending interrupt, else
+                // "none".
                 if self.ier & IER_RDA != 0 && !self.rx.is_empty() {
                     0x04 // received data available
                 } else if self.ier & IER_THRE != 0 {
@@ -116,7 +117,8 @@ impl Uart16550 {
         match off {
             RBR_THR_DLL if self.dlab() => self.dll = val,
             RBR_THR_DLL => {
-                // Transmit: straight to host stdout (raw; guest owns formatting).
+                // Transmit: straight to host stdout (raw; guest owns
+                // formatting).
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(&[val]);
                 let _ = out.flush();

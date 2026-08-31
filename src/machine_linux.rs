@@ -310,7 +310,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // Place the GIC regions (the device itself was created above, before the
     // DTB). The address-type constants differ per version, and v2 takes a CPU
-    // interface where v3 takes a redistributor. NR_IRQS + INIT follow the vCPUs.
+    // interface where v3 takes a redistributor. NR_IRQS + INIT follow the
+    // vCPUs.
     match version {
         GicVersion::V3 => {
             set_gic_addr(&gicfd, KVM_VGIC_V3_ADDR_TYPE_DIST, gic.gicd_base)?;
@@ -381,9 +382,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
 
     // Arm the seccomp filters before the first thread is spawned. This compiles
-    // both allowlists and fails the boot if either will not, so a bad list is an
-    // error here rather than a SIGSYS inside a device thread later. Nothing is
-    // filtered yet: each thread installs its own as it starts (see `seccomp`).
+    // both allowlists and fails the boot if either will not, so a bad list is
+    // an error here rather than a SIGSYS inside a device thread later.
+    // Nothing is filtered yet: each thread installs its own as it starts
+    // (see `seccomp`).
     if cfg.sandbox {
         crate::seccomp::arm()?;
     }
@@ -463,8 +465,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 /// A single vCPU thread: KVM_RUN loop with MMIO/PSCI handling.
 fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
     // The tight filter, installed before this thread touches anything the guest
-    // controls: MMIO exits are serviced inline here, so the virtio device models
-    // -- the code that parses guest descriptors -- run on this thread.
+    // controls: MMIO exits are serviced inline here, so the virtio device
+    // models -- the code that parses guest descriptors -- run on this
+    // thread.
     crate::seccomp::install_thread(crate::seccomp::Thread::Vcpu);
     // SAFETY: pthread_self is always valid on the current thread.
     let tid = unsafe { libc::pthread_self() } as u64;

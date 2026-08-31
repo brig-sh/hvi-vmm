@@ -286,8 +286,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // vCPUs. Each gets KVM's supported CPUID (the guest reads it for feature
     // detection — without it early boot faults). We ensure RDRAND (leaf 1 ECX
-    // bit 30) and RDSEED (leaf 7 EBX bit 18) are advertised so the guest's early
-    // KASLR/entropy path has a source (the host must support them).
+    // bit 30) and RDSEED (leaf 7 EBX bit 18) are advertised so the guest's
+    // early KASLR/entropy path has a source (the host must support them).
     // The BSP enters in long mode; APs wait for the guest's SIPI.
     let mut cpuid = kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?;
     for e in cpuid.as_mut_slice() {
@@ -339,9 +339,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
 
     // Arm the seccomp filters before the first thread is spawned. This compiles
-    // both allowlists and fails the boot if either will not, so a bad list is an
-    // error here rather than a SIGSYS inside a device thread later. Nothing is
-    // filtered yet: each thread installs its own as it starts (see `seccomp`).
+    // both allowlists and fails the boot if either will not, so a bad list is
+    // an error here rather than a SIGSYS inside a device thread later.
+    // Nothing is filtered yet: each thread installs its own as it starts
+    // (see `seccomp`).
     if cfg.sandbox {
         crate::seccomp::arm()?;
     }
@@ -506,8 +507,9 @@ fn write_boot_gdt(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
 /// A single vCPU thread: KVM_RUN loop with PIO (serial) + MMIO (virtio).
 fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
     // The tight filter, installed before this thread touches anything the guest
-    // controls: MMIO exits are serviced inline here, so the virtio device models
-    // -- the code that parses guest descriptors -- run on this thread.
+    // controls: MMIO exits are serviced inline here, so the virtio device
+    // models -- the code that parses guest descriptors -- run on this
+    // thread.
     crate::seccomp::install_thread(crate::seccomp::Thread::Vcpu);
     // SAFETY: pthread_self is valid on the current thread.
     let tid = unsafe { libc::pthread_self() } as u64;

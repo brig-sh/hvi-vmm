@@ -853,7 +853,8 @@ mod capacity_tests {
         let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
         mem.write_u32(hdr, typ).unwrap();
         mem.write_u64(hdr + 8, sector).unwrap();
-        mem.write_u8(status, 0xff).unwrap(); // poison, so "untouched" is visible
+        // poison, so "untouched" is visible
+        mem.write_u8(status, 0xff).unwrap();
 
         let write_flag = if typ == VIRTIO_BLK_T_IN {
             VIRTQ_DESC_F_WRITE

@@ -755,7 +755,8 @@ mod session_tests {
             "every forged header was dropped"
         );
 
-        // The same packet, unmutated, still works -- the checks are not blanket.
+        // The same packet, unmutated, still works -- the checks are not
+        // blanket.
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"STOLEN"));
         assert_eq!(recv(&mut peer, 6).as_deref(), Some(&b"STOLEN"[..]));
     }

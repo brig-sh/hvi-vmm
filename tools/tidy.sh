@@ -38,6 +38,10 @@ done
 
 cd "$(dirname "$0")/.."
 
+# The pinned nightly for the comment-reflow check lives in pins.env.
+# shellcheck disable=SC1091 # pins.env is a committed sibling, sourced at runtime
+. ./pins.env
+
 # Echo each command before running it, so a failure is reproducible by hand.
 run() {
   echo "+ $*"
@@ -45,12 +49,12 @@ run() {
 }
 
 # rustfmt's comment reflow (wrap_comments) is nightly-only, so the reflow pass
-# is a second `cargo +nightly fmt` over the tree the stable pass just formatted.
-# It is skipped, loudly, when no nightly is installed: a missing nightly should
-# not block a local tidy, but CI installs one so the check is never skipped
-# there.
+# is a second `cargo fmt` on the pinned nightly (pins.env) over the tree the
+# stable pass just formatted. It is skipped, loudly, when that nightly is not
+# installed: a missing nightly should not block a local tidy, but CI installs
+# it so the check is never skipped there.
 have_nightly() {
-  rustup toolchain list 2>/dev/null | grep -q '^nightly'
+  rustup toolchain list 2>/dev/null | grep -q "^$RUSTFMT_NIGHTLY"
 }
 
 TARGET_ARGS=""
@@ -65,18 +69,18 @@ if [ "$LINT_ONLY" = 1 ]; then
 elif [ "$CHECK" = 1 ]; then
   run cargo fmt --all -- --check
   if have_nightly; then
-    run cargo +nightly fmt --all -- \
+    run cargo "+$RUSTFMT_NIGHTLY" fmt --all -- \
       --config wrap_comments=true,comment_width=80 --check
   else
-    echo "tidy: no nightly toolchain, skipping the comment-reflow check" >&2
+    echo "tidy: $RUSTFMT_NIGHTLY not installed, skipping the comment-reflow check" >&2
   fi
 else
   run cargo fmt --all
   if have_nightly; then
-    run cargo +nightly fmt --all -- \
+    run cargo "+$RUSTFMT_NIGHTLY" fmt --all -- \
       --config wrap_comments=true,comment_width=80
   else
-    echo "tidy: no nightly toolchain, skipping the comment reflow" >&2
+    echo "tidy: $RUSTFMT_NIGHTLY not installed, skipping the comment reflow" >&2
   fi
 fi
 

@@ -145,8 +145,8 @@ mod tests {
     #[test]
     fn rejects_malformed_macs() {
         // Too few groups, too many, non-hex, and unpadded octets: urunc builds
-        // this string from the veth, so a silent misparse would put the guest on
-        // the wrong address and drop every redirected reply.
+        // this string from the veth, so a silent misparse would put the guest
+        // on the wrong address and drop every redirected reply.
         for bad in [
             "",
             "52:54:00:12:34",
