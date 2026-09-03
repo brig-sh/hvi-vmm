@@ -123,10 +123,11 @@ A tool can live in its own crate, which depends on this one:
 
 ```toml
 [dependencies]
-hvi = { git = "https://github.com/nofireai/hvi", tag = "v0.1.0" }
+hvi = { git = "https://github.com/brig-sh/hvi-vmm", rev = "<commit>" }
 ```
 
 and ship its own binary with its own CLI, constructing a `BootConfig` and
-calling `hvi::machine::boot`. Pin a tag rather than a branch: `hvi --version`
-reports the VMM core a binary was built against, and that is only worth printing
-if the core is a fixed thing.
+calling `hvi::machine::boot`. Pin a fixed point rather than a branch:
+`hvi --version` reports the VMM core a binary was built against, and that is
+only worth printing if the core is a fixed thing. No tag is published yet, so
+the example pins a `rev`; make it a `tag` once the first one is cut.

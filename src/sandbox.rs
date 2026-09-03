@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Seatbelt confinement for the macOS backend (NOFireAI/hvi#67).
+//! Seatbelt confinement for the macOS backend.
 //!
 //! The virtio backends are guest-facing and they run in the same process as the
 //! vCPU threads, so a bug in one of them is a bug in something holding the
-//! host's full ambient authority. On Linux the answer is a seccomp filter
-//! (#65); on macOS there is no equivalent in rust-vmm, so this is ours.
+//! host's full ambient authority. On Linux the answer is a seccomp filter;
+//! on macOS there is no equivalent in rust-vmm, so this is ours.
 //!
 //! What this is *not*: Seatbelt is not a syscall filter. It is a policy engine
 //! over named operations on resources -- opening files, creating sockets,
 //! looking up Mach services, exec'ing -- evaluated in the kernel by the
 //! Sandbox kext. A syscall that touches no policed resource is not filtered by
-//! it at all. So this is the macOS counterpart to #65's *goal*
+//! it at all. So this is the macOS counterpart to the seccomp filter's *goal*
 //! (confine the VMM's authority over the host) rather than to its mechanism.
 //!
 //! # Why a deny-default profile can be this small
@@ -52,8 +52,7 @@
 //!
 //! The vCPU threads are created *after* this point and that is fine:
 //! `hv_vcpu_create` and `hv_vcpu_run` on a fresh thread work under a bare
-//! `(deny default)` profile. That was measured, not assumed (see the PR for
-//! #67); it is also what
+//! `(deny default)` profile. That was measured, not assumed; it is also what
 //! [`selftest`](crate::sandbox::selftest) re-proves on every CI run.
 //!
 //! # The deprecation caveat
@@ -64,7 +63,7 @@
 //! "deprecated" here means "unsupported but load-bearing" rather than "removed
 //! next release". Apple's supported path is App Sandbox entitlements, which is
 //! a larger question for hvi because it has to coexist with
-//! `com.apple.security.hypervisor`; #67 leaves that as a spike, not this
+//! `com.apple.security.hypervisor`; that is left as a spike, not this
 //! change. The practical consequence of the deprecation is that this profile
 //! has to be re-proven per OS release, which is what the CI selftest is for.
 
