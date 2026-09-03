@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.77"
 description = "A small microVMM for Linux guests — Hypervisor.framework (macOS) and KVM (Linux) backends"
 license = "Apache-2.0"
-repository = "https://github.com/nofireai/hvi"
+repository = "https://github.com/brig-sh/hvi-vmm"
 
 # The backend is chosen by target:
 #   macOS + aarch64  -> Apple Hypervisor.framework (applevisor)
