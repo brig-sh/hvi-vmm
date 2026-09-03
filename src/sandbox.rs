@@ -1,3 +1,17 @@
+// Copyright (c) 2026, NOFire AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Seatbelt confinement for the macOS backend (NOFireAI/hvi#67).
 //!
 //! The virtio backends are guest-facing and they run in the same process as the
@@ -9,8 +23,8 @@
 //! over named operations on resources -- opening files, creating sockets,
 //! looking up Mach services, exec'ing -- evaluated in the kernel by the
 //! Sandbox kext. A syscall that touches no policed resource is not filtered by
-//! it at all. So this is the macOS counterpart to #65's *goal* (confine the
-//! VMM's authority over the host) rather than to its mechanism.
+//! it at all. So this is the macOS counterpart to #65's *goal*
+//! (confine the VMM's authority over the host) rather than to its mechanism.
 //!
 //! # Why a deny-default profile can be this small
 //!
@@ -39,8 +53,8 @@
 //! The vCPU threads are created *after* this point and that is fine:
 //! `hv_vcpu_create` and `hv_vcpu_run` on a fresh thread work under a bare
 //! `(deny default)` profile. That was measured, not assumed (see the PR for
-//! #67); it is also what [`selftest`](crate::sandbox::selftest) re-proves on every CI
-//! run.
+//! #67); it is also what
+//! [`selftest`](crate::sandbox::selftest) re-proves on every CI run.
 //!
 //! # The deprecation caveat
 //!
