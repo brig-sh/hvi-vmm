@@ -1235,7 +1235,7 @@ impl VirtioFs {
         // `/etc`; on the host it resolves to `/private/etc/ssl/certs`, which
         // is outside any export. Containment stays with the Seatbelt profile
         // until the path layer resolves relative to a descriptor instead
-        // (NOFireAI/hvi-vmm#30), which makes it structural rather than a
+        // (#30), which makes it structural rather than a
         // check that can be asked the wrong question.
         note_host_op();
         if !fs::metadata(parent).map_err(io_errno)?.is_dir() {
@@ -2800,13 +2800,13 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
 ///
 /// Descriptors are a budget this device already spends: it pins one per open
 /// guest handle, and exhausting them reaches the guest as EMFILE
-/// (NOFireAI/hvi-vmm#34). `fdlimit::raise_open_file_limit` lifts the soft
+/// (#34). `fdlimit::raise_open_file_limit` lifts the soft
 /// limit to the hard one at startup, so the ceiling is not macOS's bare 256 --
 /// but "not 256" is not "unlimited", and a cache that grows with the guest's
 /// directory count is a way to spend the whole budget on lookups. Bounded
 /// instead, small enough to leave the handle budget alone and large enough
 /// that a build's working set of directories stays resident.
-// Unused on purpose: this is stage one of NOFireAI/hvi-vmm#30, landing the
+// Unused on purpose: this is stage one of #30, landing the
 // resolver and its tests before the call sites move onto it. The next stage
 // removes this attribute along with the first path-based caller.
 #[allow(dead_code)]
@@ -2814,7 +2814,7 @@ const DIR_CACHE_LIMIT: usize = 128;
 
 /// Directory descriptors for the export, keyed by node.
 ///
-/// This is the resolver Option B is built on (NOFireAI/hvi-vmm#30). Nothing
+/// This is the resolver Option B is built on (#30). Nothing
 /// calls it yet: it lands first, with its tests, so the 120-odd call sites
 /// that follow are mechanical against a primitive that has already been
 /// argued about.
@@ -2826,7 +2826,7 @@ const DIR_CACHE_LIMIT: usize = 128;
 /// `/usr/lib/ssl/certs -> /etc/ssl/certs` -- names the guest's `/etc`, and
 /// the host reads the same bytes as its own. Refusing what that resolves to
 /// refuses ordinary guest paths, which is what broke booting a stock image
-/// and what NOFireAI/hvi-vmm#40 removed.
+/// and what #40 removed.
 ///
 /// Descending by descriptor asks no such question. Each component is opened
 /// relative to the one before it with `O_NOFOLLOW`, so a symlink cannot
@@ -3631,7 +3631,7 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// The same, relative to a directory descriptor (NOFireAI/hvi-vmm#30).
+/// The same, relative to a directory descriptor (#30).
 ///
 /// `name` is the single component the guest asked for, so nothing here can
 /// resolve anywhere but inside the directory the descriptor already names.
