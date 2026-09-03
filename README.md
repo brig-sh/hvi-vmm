@@ -186,3 +186,25 @@ The limits worth knowing before you build on it:
   modes and arbitrary guest owners therefore survive a backend restart.
   Protect a shared OCI cache with `--share-ro`, or give `--share-rw` an
   instance-owned APFS clone.
+
+## Security
+
+The boundary hvi is built to hold is the one around the guest. We assume the
+guest is hostile, and the VMM's job is to keep it inside its own VM: away from
+the host, and away from any other sandbox on the same machine. The VMM itself
+runs confined, so a bug in a device backend is not automatically a bug with the
+host's full authority behind it. [Confinement](#confinement) describes what that
+looks like and how to see what was installed.
+
+What we do not claim to defend against: a guest that wastes or hangs the VM it
+was given, and side channels that come from sharing a CPU with something else,
+such as speculative execution and cache timing. Those are the platform's to
+mitigate, and a small VMM cannot honestly promise otherwise.
+
+hvi is young and has had no external security audit. CI exercises every backend
+on real hardware, and the confinement selftests check both directions of the
+profile and the filters, but testing is not assurance. Weigh that before you put
+something valuable behind it.
+
+If you think you have found a way past that boundary, please report it
+privately: [SECURITY.md](SECURITY.md) explains how, and what happens next.
