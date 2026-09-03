@@ -48,7 +48,11 @@ jobs:
   litmus:
     name: Used-ring litmus
     # A fork that enables Actions would otherwise file issues in the fork.
-    if: github.repository == 'NOFireAI/hvi-vmm'
+    # Both names are listed so this lane keeps running across the move to
+    # brig-sh; drop the NOFireAI entry once the transfer has landed.
+    if: >-
+      github.repository == 'NOFireAI/hvi-vmm'
+      || github.repository == 'brig-sh/hvi-vmm'
     #
     # The runner must be arm64. A strongly ordered host, such as x86, does
     # not tear even when the fence is absent. The test then passes whether

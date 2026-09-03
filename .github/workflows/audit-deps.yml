@@ -44,7 +44,11 @@ jobs:
     name: Weekly dependency audit
     # A fork that enables Actions would otherwise run this against its own
     # lockfile and file issues in the fork.
-    if: github.repository == 'NOFireAI/hvi-vmm'
+    # Both names are listed so this lane keeps running across the move to
+    # brig-sh; drop the NOFireAI entry once the transfer has landed.
+    if: >-
+      github.repository == 'NOFireAI/hvi-vmm'
+      || github.repository == 'brig-sh/hvi-vmm'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
