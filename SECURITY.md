@@ -11,7 +11,8 @@ repository and choose **Report a vulnerability**. That opens a private advisory
 that only the maintainers can see, and it keeps the report, the fix and the
 disclosure in one place.
 
-Do not open a public issue for something you believe is exploitable.
+Do not open a public issue for something you believe is exploitable. If you
+cannot use GitHub for some reason, mail <ananos@nofire.ai> instead.
 
 What to expect:
 
