@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `hvi` — an observable microVMM for Linux guests, with three host
+//! `hvi` -- a small microVMM for Linux guests, with three host
 //! backends behind one entry point:
 //!
 //! - **macOS / Apple silicon** — Apple's Hypervisor.framework (the `applevisor`
