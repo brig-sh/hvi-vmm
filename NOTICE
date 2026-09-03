@@ -1,0 +1,28 @@
+hvi
+Copyright (c) 2026, NOFire AI
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE.
+
+Third-party material
+--------------------
+
+Parts of the x86-64 backend follow Firecracker
+(https://github.com/firecracker-microvm/firecracker), Copyright Amazon.com,
+Inc. or its affiliates, licensed under the Apache License, Version 2.0. The
+files that do so say where, in their module documentation:
+
+  src/boot_x86.rs    mirrors the arch::x86_64 kernel loader
+  src/layout_x86.rs  the same guest memory layout constants
+  src/machine_x86.rs the same vCPU and machine bring-up shape
+  src/mptable.rs     an MP table of the same small shape (MP spec 1.4)
+  src/virtio.rs      the virtio queue and descriptor conventions
+  src/sandbox.rs     the confinement goal, by a different mechanism
+
+Confinement on Linux uses seccompiler, the rust-vmm crate extracted from
+Firecracker, under the Apache License, Version 2.0. The filter files in
+resources/seccomp/ are written in seccompiler's JSON schema. Their content is
+ours: resources/seccomp/README.md explains what we deliberately did not carry
+over from Firecracker's filters, and why.
+
+The remaining dependencies and their licences are resolved by Cargo and
+checked in CI by cargo-deny; see deny.toml and Cargo.toml.
