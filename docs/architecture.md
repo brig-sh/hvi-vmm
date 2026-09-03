@@ -1,11 +1,9 @@
 # hvi architecture
 
-`hvi` is a small, observable microVMM for Linux guests. It runs an unmodified
-Linux kernel under one of three host backends behind a single CLI, and — since
-it is *itself* the virtio backend — captures every disk and network boundary
-event with no guest cooperation, including DNS names and TLS SNI. Everything is
-emitted as `RawEvent` NDJSON
-so a guest on macOS produces the same telemetry stream as one on Linux/KVM.
+`hvi` is a small microVMM for Linux guests, and the substrate brig runs its
+sandboxes on. It runs an unmodified Linux kernel under one of three host
+backends behind a single CLI, and it is *itself* the virtio backend, so a
+sandbox gets the same device model on macOS and on Linux.
 
 This document describes how the pieces fit together. For attaching a tool of
 your own, see [`plugins.md`](plugins.md).

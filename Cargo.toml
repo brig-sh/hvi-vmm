@@ -3,7 +3,7 @@ name = "hvi"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
-description = "A small microVMM for Linux guests — Hypervisor.framework (macOS) and KVM (Linux) backends"
+description = "The microVMM that runs brig's sandboxes -- Hypervisor.framework (macOS) and KVM (Linux) backends"
 license = "Apache-2.0"
 repository = "https://github.com/brig-sh/hvi-vmm"
 

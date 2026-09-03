@@ -1,7 +1,7 @@
 # hvi
 
-An **observable** microVMM for **Linux guests** (arm64 and x86-64), with three
-host backends behind one CLI:
+A small microVMM for **Linux guests** (arm64 and x86-64), and the substrate
+brig runs its sandboxes on, with three host backends behind one CLI:
 
 | Guest | Host | Backend | Status |
 | --- | --- | --- | --- |
@@ -10,13 +10,11 @@ host backends behind one CLI:
 | x86-64 | Linux | **KVM** | boots to userspace + virtio-blk/net + SMP (live in CI) |
 
 See [`docs/architecture.md`](docs/architecture.md) for how the pieces fit
-together (backends, boot protocols, device model, the event ledger, the
-extension seam).
+together (backends, boot protocols, device model, the extension seam).
 
-hvi owns guest RAM and the vCPUs. Because it *is* the virtio backend, it sees
-every disk and network boundary event without guest cooperation — including DNS
-names and TLS SNI — and emits them as `RawEvent` NDJSON, so a guest on macOS
-produces the same telemetry stream as the KVM/Linux path.
+hvi owns guest RAM and the vCPUs, and it is its own virtio backend, so a
+sandbox gets the same device model on macOS and on Linux. That is what lets
+brig run the same workload on either host without the guest noticing.
 
 ## Layout
 
@@ -35,7 +33,7 @@ src/
   pl011.rs                    PL011 UART (arm64)
   plugin.rs                  the extension seam (Plugin / VmHandle / CpuHandle / IoSink)
   plugins.rs                tools built on it: memory dump, I/O trace
-  events.rs                   RawEvent NDJSON ledger
+  events.rs                   the event log written by `--events`
   smoke.rs                    M0 hvf smoke test (macOS only)
 docs/                         architecture + writing a tool
 tools/mk-initramfs.py
@@ -120,7 +118,7 @@ in [`src/plugins.rs`](src/plugins.rs) are short enough to read as the worked
 examples, and between them they use every part of it.
 
 - **macOS** needs the `com.apple.security.hypervisor` entitlement and an
-  interactive host (AMFI). The boundary telemetry lands in `--events <path>` as
+  interactive host (AMFI). Device events land in `--events <path>` as
   `RawEvent` NDJSON.
 - **Linux** needs `/dev/kvm`. On arm64 the guest GIC version follows the host's:
   a GICv3 host gets vGICv3, a GIC-400 host gets vGICv2 (capped at 8 vCPUs, a
