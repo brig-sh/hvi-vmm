@@ -486,6 +486,22 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let _ = j.join();
     }
 
+    // What the guest actually spent, reported once on the way out. #34 asks
+    // for this number before any limit is tightened: a ceiling picked without
+    // knowing what a real build needs is a ceiling that breaks one.
+    for (index, fs) in shared.fs.iter().enumerate() {
+        let dev = fs.dev.lock();
+        let dev = match dev {
+            Ok(d) => d,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        eprintln!(
+            "[hvi] virtio-fs[{index}]: peak {} of {} guest handles",
+            dev.peak_handles(),
+            dev.handle_limit()
+        );
+    }
+
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
     Ok(stop)
 }

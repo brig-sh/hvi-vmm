@@ -37,6 +37,62 @@
 //! So: ask for as much as the kernel will give, once, at startup. virtiofsd
 //! does the same thing and exposes it as `--rlimit-nofile`.
 
+/// Descriptors held back for everything in the VMM that is not virtio-fs.
+///
+/// The descriptor table belongs to the process, not to one device: the block
+/// device, the event ledger, the control socket, the vsock bridge and stdio
+/// all draw on it. A guest that spends the last descriptor therefore breaks
+/// parts of the VMM it never talks to, and only virtio-fs translates the
+/// failure into an errno the guest can understand -- everything else fails
+/// with no clear cause (#34).
+///
+/// So the guest never gets the last of them. This is the reserve.
+const RESERVED_FOR_THE_VMM: u64 = 128;
+
+/// How many host descriptors a virtio-fs export may pin for guest handles.
+///
+/// Derived from the limit actually in force rather than written down, which
+/// is the point: a fixed number is either so low that it breaks a real build
+/// -- the measured working set of one is ~2134 descriptors, see above -- or
+/// so high that it is not a limit. This one is whatever the process was
+/// granted, less the reserve, so raising `RLIMIT_NOFILE` raises it too.
+///
+/// The guest sees ENFILE on the request that would have crossed it, which is
+/// the errno for "the host is out", and the VMM keeps working.
+///
+/// One caveat, written down rather than hidden: this is a per-export budget
+/// and the table is per-process, so two exports can each stay inside it and
+/// still exhaust the process together. hvi runs a handful of shares at most
+/// and the reserve absorbs that, but a shared budget is the honest fix if the
+/// share count ever grows.
+#[must_use]
+pub fn guest_handle_budget() -> usize {
+    let soft = current_open_file_limit().unwrap_or(256);
+    usize::try_from(soft.saturating_sub(RESERVED_FOR_THE_VMM))
+        .unwrap_or(usize::MAX)
+        .max(64)
+}
+
+/// The soft `RLIMIT_NOFILE` in force right now.
+fn current_open_file_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into a struct we own and fully initialised.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return None;
+        }
+        Some(lim.rlim_cur)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Raises the soft open-file limit to the hard limit, and reports what was
 /// obtained.
 ///

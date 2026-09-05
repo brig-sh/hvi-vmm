@@ -380,6 +380,20 @@ pub struct VirtioFs {
     handles: HashMap<u64, FileHandle>,
     dir_handles: HashMap<u64, DirHandle>,
     next_handle: u64,
+    /// Most guest handles this export will hold open at once (#34).
+    ///
+    /// Each OPEN pins a host `File` in `handles` and each OPENDIR one in
+    /// `dir_handles`, released only when the guest sends RELEASE or
+    /// RELEASEDIR -- so how much of the process's descriptor table the guest
+    /// spends was, until now, the guest's decision alone. See
+    /// [`crate::fdlimit::guest_handle_budget`] for why the number is derived
+    /// rather than written down.
+    handle_limit: usize,
+    /// The most handles this export has held at once, for the report when the
+    /// VM stops. The issue asks for this before any limit is tightened: a
+    /// number chosen without knowing what a real build needs is a number that
+    /// breaks one.
+    peak_handles: usize,
     next_tmpfile: u64,
     /// How many READs and WRITEs took the zero-copy `preadv`/`pwritev` path.
     ///
@@ -465,6 +479,8 @@ impl VirtioFs {
             handles: HashMap::new(),
             dir_handles: HashMap::new(),
             next_handle: 1,
+            handle_limit: crate::fdlimit::guest_handle_budget(),
+            peak_handles: 0,
             next_tmpfile: 1,
             zero_copy_reads: AtomicU64::new(0),
             zero_copy_writes: AtomicU64::new(0),
@@ -1608,6 +1624,15 @@ impl VirtioFs {
         if !directory && !meta.is_file() {
             return Err(EPERM);
         }
+        // Before anything is opened. Each handle pins a host descriptor until
+        // the guest releases it, and the descriptor table is the process's,
+        // not this device's -- so a guest that spends the last one breaks the
+        // block device, the ledger and the control socket, none of which can
+        // tell the guest anything (#34). ENFILE is the errno for "the host is
+        // out", as distinct from the EMFILE the host itself would raise.
+        if self.open_handle_count() >= self.handle_limit {
+            return Err(ENFILE);
+        }
         let fh = if directory {
             self.insert_dir_handle(&path)?
         } else {
@@ -1811,6 +1836,30 @@ impl VirtioFs {
         fh
     }
 
+    /// Host descriptors this export currently pins for guest handles.
+    fn open_handle_count(&self) -> usize {
+        self.handles.len() + self.dir_handles.len()
+    }
+
+    /// Records the high-water mark, so the stop report can name it. The issue
+    /// asks for the measurement before the limit is tightened, and this is
+    /// where the number comes from.
+    fn note_handle_peak(&mut self) {
+        self.peak_handles = self.peak_handles.max(self.open_handle_count());
+    }
+
+    /// The most handles this export has held at once.
+    #[must_use]
+    pub fn peak_handles(&self) -> usize {
+        self.peak_handles
+    }
+
+    /// The ceiling those handles are counted against.
+    #[must_use]
+    pub fn handle_limit(&self) -> usize {
+        self.handle_limit
+    }
+
     fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf) -> u64 {
         let fh = self.next_handle();
         self.handles.insert(
@@ -1822,6 +1871,7 @@ impl VirtioFs {
                 temporary_path: None,
             },
         );
+        self.note_handle_peak();
         fh
     }
 
@@ -1875,6 +1925,7 @@ impl VirtioFs {
         );
         let fh = self.next_handle();
         self.dir_handles.insert(fh, DirHandle { file, entries });
+        self.note_handle_peak();
         Ok(fh)
     }
 
@@ -2584,6 +2635,26 @@ impl VirtioFs {
                     // place a node can start referring to something the cache
                     // does not describe. A repeat lookup of an already-known
                     // path keeps its cache, which is the hot path.
+                    // Bounded (#34). A guest that hard-links one inode under
+                    // many names, then looks each up, reaches this push every
+                    // time and nothing ever shrank the list. `node_path`
+                    // walks it on every resolution, so it costs lookups as
+                    // well as memory.
+                    //
+                    // Evict a name that no longer resolves to this inode
+                    // before one that does: a stale entry is already skipped
+                    // by `node_path`, so losing it costs nothing, while
+                    // losing a live one takes away a name the guest may still
+                    // be using. Only when every name is live does the oldest
+                    // go.
+                    if remembered.paths.len() >= MAX_NODE_ALIASES {
+                        let stale = remembered.paths.iter().position(|candidate| {
+                            Stat::lstat(candidate)
+                                .map(|meta| (meta.dev(), meta.ino()) != key)
+                                .unwrap_or(true)
+                        });
+                        remembered.paths.remove(stale.unwrap_or(0));
+                    }
                     remembered.paths.push(path);
                     remembered.guest_attr = None;
                 }
@@ -2847,6 +2918,24 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
 // removes this attribute along with the first path-based caller.
 #[allow(dead_code)]
 const DIR_CACHE_LIMIT: usize = 128;
+
+/// Most paths one node will remember at once (#34).
+///
+/// A node keeps every path that resolves to its inode, because a hard link
+/// gives the same file another name and the guest may use any of them.
+/// Nothing removed one, so the list only ever grew, and `node_path` walks it
+/// on every resolution.
+///
+/// A guest reaches this by hard-linking one inode under many names and
+/// looking each one up. A guest *rename* does not: `rewrite_node_paths`
+/// updates the existing entry in place. Host-side churn inside the export
+/// reaches it too, since a new name for a known inode is a new alias however
+/// it was made.
+///
+/// Sixteen is well past what a real tree needs -- a file with sixteen live
+/// hard links is already unusual -- and small enough that the walk stays
+/// cheap.
+const MAX_NODE_ALIASES: usize = 16;
 
 /// Directory descriptors for the export, keyed by node.
 ///
@@ -7471,6 +7560,136 @@ mod tests {
         dev.drain_notified(&mem);
         assert_eq!(dev.nodes.len(), before, "the reply-less LOOKUP was refused");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A guest cannot spend the host's whole descriptor table on open
+    /// handles. The cap is per export and derived from the process limit, so
+    /// the test sets a small one rather than opening thousands of files.
+    #[test]
+    fn opens_stop_at_the_handle_limit() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..8 {
+            fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        dev.handle_limit = 4;
+
+        let mut opened = 0;
+        for i in 0..8 {
+            let node = lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            let mut input = vec![0u8; 8];
+            input[0..4].copy_from_slice(&0u32.to_le_bytes()); // O_RDONLY
+            let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+            match get_u32(&out, 4).map(|e| e as i32) {
+                Some(0) => opened += 1,
+                Some(e) => {
+                    assert_eq!(-e, ENFILE, "the refusal is ENFILE, not something opaque");
+                    break;
+                }
+                None => panic!("no status"),
+            }
+        }
+        assert_eq!(opened, 4, "exactly the limit was served");
+        assert_eq!(dev.open_handle_count(), 4);
+        assert_eq!(dev.peak_handles(), 4, "the high-water mark was recorded");
+
+        // Releasing one lets the next through, so the limit is a ceiling on
+        // what is held at once and not on what a guest may ever open.
+        let fh = 1u64;
+        let mut input = vec![0u8; 24];
+        input[0..8].copy_from_slice(&fh.to_le_bytes());
+        dev.handle_fuse(&request(RELEASE, FUSE_ROOT_ID, &input), 4096);
+        assert!(dev.open_handle_count() < 4, "the release freed a slot");
+
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f7");
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&0u32.to_le_bytes()); // O_RDONLY
+        let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "an open after a release succeeds"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A node's alias list is bounded, driven the way a guest reaches it.
+    ///
+    /// Every hard link is another name for the same inode, and looking the
+    /// new name up is what records the alias. A guest can do that in a loop.
+    /// A guest *rename* cannot: `rewrite_node_paths` updates the existing
+    /// entry in place, so LINK is what grows this list.
+    #[test]
+    fn a_nodes_alias_list_is_bounded() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), b"x").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
+
+        for i in 0..(MAX_NODE_ALIASES * 3) {
+            let name = format!("link-{i:04}");
+            let mut payload = node.to_le_bytes().to_vec();
+            payload.extend_from_slice(name.as_bytes());
+            payload.push(0);
+            let out = dev.handle_fuse(&request(LINK, FUSE_ROOT_ID, &payload), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "LINK {name} failed");
+            let same = lookup_node(&mut dev, FUSE_ROOT_ID, name.as_bytes());
+            assert_eq!(same, node, "the link resolves to the same inode");
+        }
+
+        let aliases = dev
+            .nodes
+            .get(&node)
+            .expect("the node is resident")
+            .paths
+            .len();
+        assert!(
+            aliases <= MAX_NODE_ALIASES,
+            "the alias list grew to {aliases}, past the {MAX_NODE_ALIASES} cap"
+        );
+        // A bounded list still has to be a usable one.
+        assert!(
+            dev.node_path(node).is_ok(),
+            "no remaining alias resolves to the node"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Eviction drops a name that no longer resolves before one that does,
+    /// so a cap cannot take away the name a guest is still using.
+    #[test]
+    fn a_stale_alias_is_evicted_before_a_live_one() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("target"), b"x").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
+
+        let link = |dev: &mut VirtioFs, name: &str| {
+            let mut payload = node.to_le_bytes().to_vec();
+            payload.extend_from_slice(name.as_bytes());
+            payload.push(0);
+            dev.handle_fuse(&request(LINK, FUSE_ROOT_ID, &payload), 4096);
+            lookup_node(dev, FUSE_ROOT_ID, name.as_bytes());
+        };
+
+        // Fill to one short of the cap, all live.
+        for i in 0..(MAX_NODE_ALIASES - 1) {
+            link(&mut dev, &format!("keep-{i:04}"));
+        }
+        // Break one behind the device's back: still remembered, no longer
+        // resolving.
+        fs::remove_file(dir.join("keep-0003")).unwrap();
+        // One more alias forces an eviction.
+        link(&mut dev, "one-more");
+
+        let paths = &dev.nodes.get(&node).expect("resident").paths;
+        assert!(paths.len() <= MAX_NODE_ALIASES);
+        assert!(
+            !paths.iter().any(|p| p.ends_with("keep-0003")),
+            "the stale name should have been the one dropped"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("target")),
+            "the original live name survived"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
