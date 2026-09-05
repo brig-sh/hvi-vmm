@@ -414,6 +414,9 @@ impl VirtioFs {
         // compared against it, and a mix of resolved and unresolved forms
         // would make that comparison depend on how the caller spelled the
         // path.
+        // The export root, resolved once when the share is built. Everything
+        // below it resolves relative to a descriptor instead; see clippy.toml.
+        #[allow(clippy::disallowed_methods)]
         let root = fs::canonicalize(&root)?;
         let mut nodes = HashMap::new();
         let root_meta = Stat::lstat(&root).map_err(io::Error::from_raw_os_error)?;
@@ -4705,6 +4708,9 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 }
 
 #[cfg(test)]
+// Test fixtures resolve their own temporary directories, which is setup
+// rather than the per-request path the ban in clippy.toml is about.
+#[allow(clippy::disallowed_methods)]
 mod tests {
 
     /// Descriptor exhaustion must reach the guest as EMFILE, not EIO.

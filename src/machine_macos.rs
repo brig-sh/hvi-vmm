@@ -24,6 +24,10 @@
 //! The exit-loop's timer/WFI/PC handling and the SMP hand-off are the
 //! boot-debug frontier.
 
+// Resolved once while the machine is built, before any guest request;
+// see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 

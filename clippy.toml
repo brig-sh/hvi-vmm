@@ -1,0 +1,23 @@
+# Host path resolution inside the virtio-fs device is banned.
+#
+# This encodes the lesson of #30. A containment check called
+# `fs::canonicalize` on the parent of every LOOKUP and every mutation, which
+# more than doubled the cost of the metadata path. It reached `main` because
+# nothing could see it: the exact host-operation budget the tests pin counts
+# calls made through this module's own syscall wrappers, and `std::fs` is not
+# one of them, so the change spent a full path resolution per request while
+# adding zero counted operations.
+#
+# It is also wrong on its own terms. Paths are resolved relative to a
+# directory descriptor now, with O_NOFOLLOW on every component, so containment
+# is a property of how the descriptor was obtained rather than something asked
+# afterwards. Resolving a path string host-side reintroduces both the cost and
+# the TOCTOU race that design removed.
+#
+# Two places may still call it, and both say so with an explicit
+# `#[allow(clippy::disallowed_methods)]`: the export root, resolved once when
+# a share is constructed, and test setup.
+disallowed-methods = [
+    { path = "std::fs::canonicalize", reason = "resolve relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::canonicalize", reason = "resolve relative to a directory descriptor instead; see clippy.toml" },
+]
