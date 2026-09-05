@@ -278,6 +278,35 @@ mod tests {
         assert!(ram.read_u32(base + 0x0ffe).is_err());
     }
 
+    /// `contains` is what every device calls to bounds-check a virtqueue
+    /// before it will service it, and until now it was only ever reached
+    /// indirectly through `rings_fit`. The edge that matters is the length:
+    /// `gpa + len` is guest-controlled on both halves, so a length that
+    /// carries the range past the end -- or wraps a `u64` outright -- has to
+    /// be refused rather than folded back into the mapping.
+    #[test]
+    fn contains_bounds_the_length_as_well_as_the_address() {
+        let mut backing = vec![0u8; 0x1000];
+        let base = 0x4000_0000u64;
+        let ram = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let len = backing.len() as u64;
+
+        assert!(ram.contains(base, len), "the whole mapping is in");
+        assert!(ram.contains(base + len - 1, 1), "the last byte is in");
+        assert!(ram.contains(base, 0), "an empty range at a valid address");
+
+        assert!(!ram.contains(base, len + 1), "one byte past the end");
+        assert!(!ram.contains(base + len - 1, 2), "straddling the end");
+        assert!(!ram.contains(base - 1, 1), "below the base");
+        assert!(!ram.contains(base + len, 1), "at the end");
+
+        // The wrap edge. `base + u64::MAX` overflows, and `u64::MAX` also
+        // exceeds a `usize` on a 32-bit host, so both arms have to refuse it.
+        assert!(!ram.contains(base, u64::MAX));
+        assert!(!ram.contains(u64::MAX, 1));
+        assert!(!ram.contains(u64::MAX, u64::MAX));
+    }
+
     #[test]
     fn scan_finds_guest_physical_addresses() {
         let mut backing = vec![0u8; 0x1000];
