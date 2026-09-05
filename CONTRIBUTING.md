@@ -104,10 +104,6 @@ the change does, why, and how it was tested. Keep one logical change per pull
 request -- a drive-by fix in an unrelated file slows the review and complicates
 the revert.
 
-If an LLM or AI assistant helped, say so in the description. The author is
-accountable for every line regardless of how it was produced, so review it as
-if you had typed it.
-
 A pull request is mergeable when CI is green (including the commit-message
 lint), the approvals are in place, the branch is rebased on `main`, and every
 commit is signed off. We rebase-and-merge, so the commits land in `main`
@@ -184,3 +180,7 @@ External actions are pinned to commit SHAs, with the version in a comment.
 Renovate keeps those pins, the Cargo dependencies and the commitlint tooling
 updated (`.github/renovate.json`). The cargo-deny pin is an action input
 rather than a `uses:` ref, so a custom manager in that file covers it.
+
+## AI policy
+
+AI-assisted development is welcome in hvi-vmm. See [AI_POLICY.md](AI_POLICY.md).
