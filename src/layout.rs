@@ -122,6 +122,34 @@ impl GicLayout {
     /// GICv2 addresses at most 8 CPU interfaces, so a v2 guest cannot exceed
     /// eight vCPUs.
     pub const V2_MAX_CPUS: u32 = 8;
+
+    /// Where the guest's GIC regions go for `vcpus`, under the version the
+    /// host negotiated -- or why that pair cannot be served at all.
+    ///
+    /// The version is not a free choice (see [`GicVersion`]), so both
+    /// consequences of landing on v2 are decided here rather than by the
+    /// caller. Under v3 the redistributor region is one frame per vCPU. Under
+    /// v2 the CPU interface is a single shared window that does not scale, and
+    /// eight is the most CPU interfaces the architecture can address, so a
+    /// larger guest is refused instead of being built with a GIC that cannot
+    /// reach its own vCPUs.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `vcpus` exceeds [`Self::V2_MAX_CPUS`] on a v2 host.
+    pub fn for_vcpus(version: GicVersion, vcpus: u32) -> Result<GicLayout, String> {
+        match version {
+            GicVersion::V3 => Ok(GicLayout {
+                gicr_size: u64::from(vcpus) * Self::QEMU_VIRT.gicr_size,
+                ..Self::QEMU_VIRT
+            }),
+            GicVersion::V2 if vcpus > Self::V2_MAX_CPUS => Err(format!(
+                "this host offers only vGICv2, which supports at most {} vCPUs (asked for {vcpus})",
+                Self::V2_MAX_CPUS
+            )),
+            GicVersion::V2 => Ok(Self::QEMU_VIRT_V2),
+        }
+    }
 }
 
 /// Rounds `v` up to the next multiple of `align` (a power of two).
@@ -219,6 +247,50 @@ mod tests {
         assert_eq!(align_up(1, 0x1000), 0x1000);
         assert_eq!(align_up(0x1000, 0x1000), 0x1000);
         assert_eq!(align_up(0x1001, 0x20_0000), 0x20_0000);
+    }
+
+    /// The refusal that no CI job reaches: the Pi 5 lane is the only host that
+    /// negotiates vGICv2 and it never asks for more than four vCPUs, so the
+    /// cap was only ever going to be exercised here.
+    #[test]
+    fn a_v2_host_refuses_more_than_eight_vcpus() {
+        for n in 1..=GicLayout::V2_MAX_CPUS {
+            let gic = GicLayout::for_vcpus(GicVersion::V2, n)
+                .unwrap_or_else(|e| panic!("{n} vCPUs should fit under v2: {e}"));
+            assert_eq!(gic.version, GicVersion::V2);
+            assert_eq!(
+                gic.gicr_size,
+                GicLayout::QEMU_VIRT_V2.gicr_size,
+                "the v2 CPU interface is one shared window, not one per vCPU"
+            );
+        }
+        for n in [GicLayout::V2_MAX_CPUS + 1, 16, 64, u32::MAX] {
+            let err = GicLayout::for_vcpus(GicVersion::V2, n)
+                .expect_err("a vGICv2 cannot address this many vCPUs");
+            assert!(
+                err.contains("vGICv2"),
+                "the reason names the version: {err}"
+            );
+        }
+    }
+
+    /// The v3 sizing the same call does, which no CI host reaches either: KVM
+    /// derives the redistributor count from the vCPU count, so the region has
+    /// to be one frame per vCPU and nothing else.
+    #[test]
+    fn a_v3_host_sizes_one_redistributor_frame_per_vcpu() {
+        let frame = GicLayout::QEMU_VIRT.gicr_size;
+        for n in [1, 2, 8, 9, 64] {
+            let gic = GicLayout::for_vcpus(GicVersion::V3, n).expect("v3 has no cap here");
+            assert_eq!(gic.version, GicVersion::V3);
+            assert_eq!(gic.gicr_size, u64::from(n) * frame);
+            assert_eq!(gic.gicd_base, GicLayout::QEMU_VIRT.gicd_base);
+            assert_eq!(gic.gicr_base, GicLayout::QEMU_VIRT.gicr_base);
+            assert!(
+                gic.gicr_base >= gic.gicd_base + gic.gicd_size,
+                "the redistributor region must not overlap the distributor"
+            );
+        }
     }
 
     #[test]
