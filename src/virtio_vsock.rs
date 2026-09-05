@@ -581,8 +581,8 @@ mod tests {
 
     #[test]
     fn silences_unused_ops() {
-        // Keep the credit-request/event constants referenced.
-        assert_ne!(OP_CREDIT_REQUEST, OP_RW);
+        // Keep the event constant referenced. The credit-request one is
+        // exercised for real by `credit_request_answers_only_a_live_session`.
         assert_eq!(EVENT_QUEUE, 2);
     }
 }
@@ -773,6 +773,58 @@ mod session_tests {
         // blanket.
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"STOLEN"));
         assert_eq!(recv(&mut peer, 6).as_deref(), Some(&b"STOLEN"[..]));
+    }
+
+    /// A credit request is answered only for a session the guest accepted.
+    ///
+    /// The reply is what makes this interesting: it names a host port, so a
+    /// guest that got an answer for a port it was never offered would learn
+    /// that the port exists. New, Offered and absent ports must therefore all
+    /// stay silent, and only a Connected one gets its credit update.
+    #[test]
+    fn credit_request_answers_only_a_live_session() {
+        let mut backing = vec![0u8; 0x1000];
+        let mem = mem_of(&mut backing);
+        let mut dev = VirtioVsock::new();
+
+        // One session in each state the guest can observe.
+        let (new_dev, _new_peer) = UnixStream::pair().unwrap();
+        let new_port = dev.add_conn(new_dev); // registered, never offered
+        let (offered_dev, _offered_peer) = UnixStream::pair().unwrap();
+        let offered_port = dev.add_conn(offered_dev);
+        dev.connect(&mem, offered_port); // offered, never accepted
+        let (live_dev, _live_peer) = UnixStream::pair().unwrap();
+        let live_port = dev.add_conn(live_dev);
+        dev.connect(&mem, live_port);
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, live_port, &[]));
+
+        // The two offers are pending packets in their own right. Drop them, so
+        // whatever is pending after this point came from a credit request.
+        dev.pending.clear();
+
+        let absent_port = live_port + 1000;
+        assert!(!dev.conns.contains_key(&absent_port));
+        for port in [new_port, offered_port, absent_port] {
+            dev.handle_pkt(&mem, &pkt(OP_CREDIT_REQUEST, port, &[]));
+        }
+        assert!(
+            dev.pending.is_empty(),
+            "a credit request was answered for a session the guest never accepted"
+        );
+
+        // The live session still gets its answer, so the gate is not a blanket
+        // refusal.
+        dev.handle_pkt(&mem, &pkt(OP_CREDIT_REQUEST, live_port, &[]));
+        let reply = dev
+            .pending
+            .pop_front()
+            .expect("the connected session got no credit update");
+        let hdr = Hdr::parse(&reply).expect("the reply parses");
+        assert_eq!(hdr.op, OP_CREDIT_UPDATE);
+        assert_eq!(hdr.src_port, live_port);
+        assert_eq!(hdr.dst_port, AGENT_PORT);
+        assert_eq!(hdr.buf_alloc, OUR_BUF_ALLOC);
+        assert!(dev.pending.is_empty(), "exactly one reply");
     }
 
     /// A session the guest was never offered cannot be torn down by it.
