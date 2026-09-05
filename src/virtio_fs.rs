@@ -721,8 +721,27 @@ impl VirtioFs {
             }
             desc = next;
         }
-        if total_in < IN_HEADER_LEN || output.is_empty() {
+        if total_in < IN_HEADER_LEN {
             return 0;
+        }
+        // A chain with nothing device-writable is not necessarily malformed.
+        // FORGET and BATCH_FORGET carry no reply, and Linux sends them with
+        // `virtqueue_add_outbuf` -- one out-only descriptor and nothing
+        // writable at all -- on the hiprio queue. Refusing every reply-less
+        // chain therefore discarded every one of them, and `forget` is the
+        // only thing that removes entries from `nodes` and `inode_ids`, so
+        // those tables only ever grew for the life of the guest.
+        //
+        // Read the opcode before deciding. Anything that does reply still
+        // needs somewhere to put the reply, so it is still refused.
+        if output.is_empty() {
+            let mut opcode = [0u8; 4];
+            if gather(mem, &input, 4, &mut opcode).is_err() {
+                return 0;
+            }
+            if !matches!(u32::from_le_bytes(opcode), FORGET | BATCH_FORGET) {
+                return 0;
+            }
         }
         let max_out: usize = output.iter().map(|(_, len)| *len as usize).sum();
         match self.handle_fuse_desc(mem, &input, &output, max_out) {
@@ -7396,6 +7415,63 @@ mod tests {
         h[8..16].copy_from_slice(&unique.to_le_bytes());
         h[16..24].copy_from_slice(&nodeid.to_le_bytes());
         h
+    }
+
+    /// FORGET, driven the way a guest actually sends it: one out-only
+    /// descriptor and nothing device-writable.
+    ///
+    /// The test above this one calls `handle_fuse` directly, so it never
+    /// reaches the guard in `handle_chain` that discarded the request. This
+    /// one goes through the queue, which is where the defect was: every
+    /// FORGET was dropped, `forget` never ran, and `nodes` and `inode_ids`
+    /// only ever grew.
+    ///
+    /// The device serves every queue through `handle_chain`, so this is the
+    /// same path a FORGET takes on the hiprio queue Linux sends it on.
+    #[test]
+    fn forget_arrives_without_a_writable_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        assert!(dev.nodes.contains_key(&issue), "the node is resident");
+
+        let mut backing = vec![0u8; 0x10000];
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let (desc, avail, used, in_buf) = (base, base + 0x100, base + 0x200, base + 0x1000);
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+
+        // fuse_forget_in is one u64, so the request is header + 8 bytes.
+        let mut req = fuse_in_header((IN_HEADER_LEN + 8) as u32, FORGET, 0xf0, issue);
+        req.extend_from_slice(&1u64.to_le_bytes());
+        mem.write(in_buf, &req).unwrap();
+
+        // One descriptor, readable only. No DESC_WRITE anywhere in the chain.
+        write_desc(&mem, desc, 0, in_buf, req.len() as u32, 0, 0);
+        notify_head(&mut dev, &mem, avail, 0);
+
+        assert!(
+            !dev.nodes.contains_key(&issue),
+            "the node survived a FORGET that arrived with no writable descriptor"
+        );
+        // The descriptor still has to come back, with a zero-length reply.
+        assert_eq!(used_len(&mem, used), 0);
+        assert_eq!(mem.read_u32(used + 4).unwrap(), 0, "head 0 was returned");
+
+        // A request that does expect a reply is still refused when the guest
+        // gives it nowhere to put one, so this is not a blanket relaxation.
+        let before = dev.nodes.len();
+        let mut req = fuse_in_header(IN_HEADER_LEN as u32 + 6, LOOKUP, 0xf1, etc);
+        req.extend_from_slice(b"issue\0");
+        mem.write(in_buf, &req).unwrap();
+        write_desc(&mem, desc, 0, in_buf, req.len() as u32, 0, 0);
+        mem.write_u16(avail + 2, 2).unwrap();
+        mem.write_u16(avail + 6, 0).unwrap();
+        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.drain_notified(&mem);
+        assert_eq!(dev.nodes.len(), before, "the reply-less LOOKUP was refused");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
