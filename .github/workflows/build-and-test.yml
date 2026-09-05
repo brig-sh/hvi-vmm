@@ -1,0 +1,492 @@
+name: Build and test
+
+# Build and run what a hosted runner can actually run: the unit suites on both
+# host backends, and a live boot on each of the three backends.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every job sets a `timeout-minutes` far below the six-hour default. This
+# matters most for the self-hosted jobs: each runs on the only runner of its
+# kind, so one stuck job blocks that runner for everything else.
+
+# Name bash for every run block. The default shell runs `bash -e` without
+# pipefail, so a command that fails in front of a `tee` or a search can pass
+# unseen. An explicit `shell: bash` runs `bash -eo pipefail`.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Unit tests for the shared core on a cheap x86 Linux runner. Neither the
+  # macOS nor the arm64 backend compiles here (both are gated by target), so
+  # this proves the hypervisor-agnostic logic passes anywhere.
+  test-portable:
+    name: Test portable
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - run: cargo test
+
+  # The seccomp filters, proved without a hypervisor. `seccomp-selftest`
+  # installs the allowlists that actually ship in child processes and checks
+  # both directions: the syscalls a filtered thread must keep, and the ones it
+  # must lose. It needs no /dev/kvm and no privileges, so a hosted runner can
+  # fail a bad list even though it cannot boot a guest — which matters, because
+  # a filter that is too tight is a crash at run time, not a build error.
+  seccomp-x86:
+    name: Seccomp filters (x86-64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: seccomp-x86
+      - run: cargo build --release
+      - name: selftest
+        run: ./target/release/hvi seccomp-selftest
+
+  # macOS / Apple silicon backend: Hypervisor.framework build and unit tests,
+  # plus the ad-hoc signing step, since an unsigned binary cannot create a VM.
+  # A live boot additionally needs an interactive host (AMFI), so CI stops at
+  # build, test and sign.
+  build-and-test-macos:
+    name: Build and test macos/hvf
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf
+      - name: build
+        run: cargo build
+      - name: test
+        run: cargo test
+      - name: sign (ad-hoc, entitlement)
+        run: |
+          cargo build --release
+          codesign --sign - --entitlements hvi.entitlements --force --options runtime target/release/hvi
+          codesign -dv --entitlements - target/release/hvi 2>&1 | grep -i hypervisor
+      # The Seatbelt counterpart of the seccomp selftest above. It installs
+      # the production profile in its own process, then probes every right
+      # the VMM must keep and every right it must lose. It needs no
+      # hypervisor entitlement, so a hosted runner can run it.
+      #
+      # sandbox_init(3) is deprecated, and its implicit denials are not
+      # contractual between OS releases. This step proves the profile again
+      # on each release that CI sees.
+      - name: seatbelt selftest
+        run: |
+          # On a target that hvi does not cover, such as an Intel mac, the
+          # binary prints a notice and exits zero. A change of runner image
+          # could therefore make this step do nothing. Assert the success
+          # line, so the step cannot pass unless the probes ran.
+          ./target/release/hvi sandbox-selftest | tee selftest.log
+          grep -q "every probe matched the profile" selftest.log
+
+  # Live boot (x86/KVM): boot a real Linux kernel under the x86 backend and
+  # assert it reaches the kernel + the userspace / no-rootfs VFS gate. Booting
+  # with --cpus 2 also exercises SMP: the BSP enters long mode and the guest
+  # brings the AP online with INIT-SIPI-SIPI serviced by the in-kernel LAPIC, so
+  # we additionally assert both processors activate. Needs a runner with
+  # /dev/kvm; skips cleanly otherwise.
+  #
+  # Self-hosted rather than GitHub-hosted, which is a change of runner and not
+  # of what is tested. The `guest kernel` step below installs a package, and on
+  # the hosted image that fetch wedged five times in one afternoon -- once for
+  # 55 minutes -- against a normal two, on unrelated pull requests, while
+  # GitHub reported no incident. Every time, cancelling and re-running cleared
+  # it, so it is a stuck fetch rather than a slow one (#49).
+  #
+  # A persistent runner also installs that kernel once instead of on every run,
+  # so the flaky dependency is off the path for all but the first job, and the
+  # boot itself is on bare metal rather than in a hosted VM. The arm64 KVM jobs
+  # below are already self-hosted for a harder reason -- no hosted arm64 runner
+  # exposes /dev/kvm at all -- so this is the same shape, not a new one.
+  boot-x86:
+    name: Boot x86
+    # A fork's pull request is untrusted code. These runners are persistent
+    # machines we own, not ephemeral VMs, so a malicious pull request would not
+    # merely run once -- it could leave something behind for the next job. The
+    # hosted lanes above already cover a fork's build and unit tests; the live
+    # boots are what we withhold. Pushes, dispatches and same-repo pull
+    # requests are trusted and still run.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: x86-live
+      - id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then echo "ok=yes" >> "$GITHUB_OUTPUT"; ls -l /dev/kvm; \
+          else echo "ok=no" >> "$GITHUB_OUTPUT"; echo "::warning::/dev/kvm absent — skipping live boot"; fi
+      - name: build
+        if: steps.kvm.outputs.ok == 'yes'
+        run: cargo build --release
+      - name: guest kernel
+        if: steps.kvm.outputs.ok == 'yes'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual
+      - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          # Use find, not ls. SC2012 refuses a script that parses the
+          # output of ls, and it is correct to do so.
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1); echo "kernel: $KIMG"
+          # 2>&1: the VMM's own lines (including what it says about seccomp)
+          # go to stderr, and asserting on them means capturing them.
+          sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot.log || true
+          grep -q "Linux version" boot.log || { echo "::error::kernel did not boot"; exit 1; }
+          # The filters are on by default, so a boot that says otherwise is a
+          # regression in the default, not just a missing log line.
+          grep -qa "seccomp: on" boot.log \
+            || { echo "::error::booted without seccomp enforcement"; exit 1; }
+          echo "seccomp enforced during the live boot ✓"
+          grep -qE "Unable to mount root fs|Run /init" boot.log || { echo "::error::did not reach the userspace/VFS gate"; exit 1; }
+          echo "boot gate reached ✓"
+          grep -qE "Total of 2 processors activated|smp: Brought up 1 node, 2 CPUs" boot.log \
+            || { echo "::error::AP did not come online — SMP bringup failed"; exit 1; }
+          echo "SMP: 2 processors online ✓"
+      # backing_len's BLKGETSIZE64 branch self-skips when no block device is
+      # openable, which is every unprivileged run — so nothing exercised it
+      # live. A loop device over a sparse file is exactly the shape that broke
+      # (metadata().len() == 0), and HVI_BLOCK_DEV points the test at it so a
+      # skip cannot pass for coverage. Loop devices need root, not KVM, but the
+      # build above is gated on KVM, so gate the same way.
+      - name: virtio-blk sizing against a real block device
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          truncate -s 64M blk.img
+          LOOP=$(sudo losetup --find --show blk.img)
+          echo "loop device: $LOOP"
+          # Build the test binary as the runner user, so the cargo caches stay
+          # unowned by root; only the test itself needs sudo to open the device.
+          BIN=$(cargo test --release --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true
+                            and .target.name=="hvi" and (.target.kind|contains(["bin"])))
+                     | .executable')
+          echo "test binary: $BIN"
+          sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
+            virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture
+          sudo losetup -d "$LOOP"
+      # The searches above keep only the lines they match. When the job
+      # fails, the full log answers what those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-x86-logs
+          path: boot.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  boot-arm64-hvf:
+    name: Boot arm64/hvf
+    # Withheld from fork pull requests; see the note on boot-x86.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Install the pinned toolchain and restore the cargo cache. Do not
+      # rely on a rustup that someone installed in the home directory of the
+      # runner user; see the note on the arm64/KVM job below.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf-live
+      - name: build and sign
+        run: |
+          # The entitlement is what lets an ad-hoc signed binary call HVF; the
+          # signature must be applied to the binary that actually runs, since
+          # copying a signed Mach-O invalidates it.
+          cargo build --release
+          codesign --sign - --entitlements hvi.entitlements --force target/release/hvi
+          codesign -dv --entitlements - target/release/hvi 2>&1 | grep -qi hypervisor
+      - name: hvf smoke
+        run: |
+          # Fail fast and legibly if the runner cannot use HVF, rather than
+          # leaving a boot timeout to explain it.
+          ./target/release/hvi smoke
+          ./target/release/hvi smoke --shm
+      - name: guest kernel
+        env:
+          # This image is public, so the pull needs no credentials -- but
+          # oras still consults the credential helper for any registry
+          # named in ~/.docker/config.json, and on the macOS runners that
+          # helper reads the login keychain. A runner is a background
+          # service with no interactive session, so the keychain is locked
+          # and cannot be prompted: the pull fails on authentication it
+          # never needed. Point oras at an empty config instead.
+          DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          # An uncompressed arm64 Image, published as an OCI artifact by
+          # urunc-images. `oras` is on the runner for the image work already.
+          oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
+          ls -l guest/Image && file guest/Image | grep -qi "MS-DOS\|data\|ARM64\|Linux"
+      - name: keep-alive initramfs
+        run: |
+          # Unattended: hold userspace long enough for a few snapshots, then
+          # power off, instead of dropping to a shell that would block.
+          python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
+          ls -l target/initramfs.cpio
+      - name: boot to userspace
+        run: |
+          # The alarm bounds a stuck boot, as `timeout 180` does on the KVM
+          # jobs. macOS supplies no coreutils `timeout`. The alarm stays
+          # through the exec and stops the VMM when it occurs.
+          perl -e 'alarm shift; exec @ARGV' 180 \
+            ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --mem-mib 1024 --events ev.ndjson \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > run.log 2>&1 || true
+          tail -25 run.log
+          grep -q "Linux version" run.log \
+            || { echo "::error::the arm64 guest did not boot"; exit 1; }
+          grep -q "HVI-INITRAMFS-UP" run.log \
+            || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+      # The tail above keeps 25 lines. When the job fails, the full log and
+      # the event ledger answer what those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-arm64-hvf-logs
+          path: |
+            run.log
+            ev.ndjson
+          retention-days: 7
+          if-no-files-found: ignore
+  # Live boot (arm64/KVM): the last backend with no live cover. Runs on a
+  # self-hosted arm64 runner. Hosted arm64 Linux runners expose no /dev/kvm,
+  # so this cannot be done any other way.
+  #
+  # Which vGIC the guest gets is the host's to decide, not ours: hvi asks KVM
+  # for the one the host can serve, so a GICv3 host yields vGICv3 while a
+  # GIC-400 host yields vGICv2 and refuses a vGICv3 with ENODEV. Those are
+  # different code paths in the FDT and in interrupt delivery, so both hosts
+  # are run, each pinned by label rather than left to whichever arm64 machine
+  # happens to be free.
+  boot-arm64-kvm:
+    name: Boot arm64/kvm (${{ matrix.vgic }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: nbfc
+            vgic: vGICv2
+            expect_gicv3: "no"
+          - runner: gicv3
+            vgic: vGICv3
+            expect_gicv3: "yes"
+    # Withheld from fork pull requests; see the note on boot-x86.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, ARM64, "${{ matrix.runner }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: kvm availability
+        run: |
+          # Fail fast and legibly if the runner lost /dev/kvm access, rather
+          # than leaving a boot timeout to explain it. The runner user must be
+          # in the kvm group; a group added after the runner started does not
+          # reach it until the runner is restarted.
+          test -w /dev/kvm \
+            || { echo "::error::runner cannot write /dev/kvm (kvm group? runner restarted?)"; exit 1; }
+          grep -m1 GICv /proc/interrupts || true
+      # Install the toolchain rather than trusting one to be pre-provisioned
+      # in the runner user's home. That assumption held while a single machine
+      # served this job and broke as soon as it did not: the runner user is
+      # not the one who set the host up, its $HOME is not the one rustup was
+      # installed into, and the failure surfaces as a bare
+      # "cargo: command not found" at the build step.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-arm64-${{ matrix.runner }}
+      - name: build
+        run: cargo build --release
+      # The aarch64 allowlist is a different file from the x86 one, and the
+      # hosted seccomp job cannot run it. This is the only place it is
+      # exercised rather than merely compiled.
+      - name: seccomp filters (aarch64)
+        run: ./target/release/hvi seccomp-selftest
+      - name: guest kernel
+        env:
+          # This image is public, so the pull needs no credentials -- but
+          # oras still consults the credential helper for any registry
+          # named in ~/.docker/config.json, and on the macOS runners that
+          # helper reads the login keychain. A runner is a background
+          # service with no interactive session, so the keychain is locked
+          # and cannot be prompted: the pull fails on authentication it
+          # never needed. Point oras at an empty config instead.
+          DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
+          ls -l guest/Image
+      - name: keep-alive initramfs
+        run: |
+          python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
+          ls -l target/initramfs.cpio
+      - name: boot to userspace
+        run: |
+          # --cpus 2 also asserts SMP secondary bring-up through the guest's
+          # own in-kernel PSCI CPU_ON.
+          timeout 180 ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --mem-mib 1024 --cpus 2 --events ev.ndjson \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > run.log 2>&1 || true
+          grep -aE "vGICv3|vCPU\(s\)" run.log || true
+          # The label claims which interrupt controller this host has; the
+          # guest console reports which one it actually got. Cross-check, so a
+          # relabelled or replaced runner fails here rather than quietly
+          # turning this matrix into two runs of the same path.
+          if grep -qa "GICv3:" run.log; then SAW=yes; else SAW=no; fi
+          [ "$SAW" = "${{ matrix.expect_gicv3 }}" ] \
+            || { echo "::error::expected GICv3=${{ matrix.expect_gicv3 }}, guest reported GICv3=$SAW"; exit 1; }
+          # aarch64 has its own allowlist, so "the filters work" has to be
+          # asserted on an arm64 host and not inferred from the x86 run.
+          grep -qa "seccomp: on" run.log \
+            || { echo "::error::booted without seccomp enforcement"; exit 1; }
+          echo "seccomp enforced during the live boot ✓"
+          tail -25 run.log
+          grep -q "Linux version" run.log \
+            || { echo "::error::the arm64 guest did not boot under KVM"; exit 1; }
+          grep -q "HVI-INITRAMFS-UP" run.log \
+            || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+          grep -q "SMP: Total of 2 processors activated" run.log \
+            || { echo "::error::the second vCPU never came up"; exit 1; }
+      # The tap attach is the urunc integration path: urunc creates the tap and
+      # hvi only opens it, so a CI tap created with `ip tuntap` stands in for
+      # urunc exactly. Creating one needs CAP_NET_ADMIN, and the runner user's
+      # privileges are not a given -- so unlike /dev/kvm above (which the job
+      # cannot do anything without) this probes and skips with a warning rather
+      # than going red on an unprivileged runner.
+      # The negative half of the tap behavior: an unusable --net-tap must
+      # refuse the boot, not warn and fall back -- that is the change 9b5b77b
+      # makes, and only a live boot runs that arm. Opening a tap that does not
+      # exist needs no privileges, so unlike the positive boot below this runs
+      # on every runner, probe or no probe.
+      - name: an unusable tap refuses to boot
+        run: |
+          set +e
+          timeout 30 ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --mem-mib 1024 --net-tap hvi-ci-nope \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > tap-refuse.log 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -ne 0 ] \
+            || { echo "::error::a boot with an unusable tap succeeded"; tail -10 tap-refuse.log; exit 1; }
+          grep -q "hvi-ci-nope" tap-refuse.log \
+            || { echo "::error::the boot error does not name the tap"; tail -10 tap-refuse.log; exit 1; }
+          echo "an unusable tap fails the boot and names the interface"
+      - name: tap network probe
+        id: tap
+        run: |
+          # A leftover tap from a crashed earlier run would make the probe
+          # misread "File exists" as "no privileges", so clear it first.
+          ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true
+          # `user` lets the unprivileged hvi process attach to the device;
+          # `vnet_hdr` matches how urunc creates it (TUNTAP_VNET_HDR).
+          if ip tuntap add mode tap name hvi-ci-tap user "$(id -un)" vnet_hdr 2>/dev/null; then
+            NET=""
+          elif sudo -n ip tuntap add mode tap name hvi-ci-tap user "$(id -un)" vnet_hdr 2>/dev/null; then
+            NET="sudo -n"
+          else
+            echo "ok=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::cannot create a tap (needs CAP_NET_ADMIN or passwordless sudo) -- skipping the tap network boot"
+            exit 0
+          fi
+          $NET ip addr add 172.30.0.1/24 dev hvi-ci-tap
+          $NET ip link set hvi-ci-tap up
+          ip -d link show hvi-ci-tap
+          echo "ok=yes" >> "$GITHUB_OUTPUT"
+      - name: boot with the container network on a real tap
+        if: steps.tap.outputs.ok == 'yes'
+        run: |
+          # The whole tap path in one assertion: attach to a pre-existing tap,
+          # present the override MAC, and have the guest ping the host side of
+          # the tap. The neighbor entry the ping leaves behind proves frames
+          # on the tap carried the --net-mac address. The asserts run while
+          # the guest sits in its keep-alive window: detaching drops carrier,
+          # and the kernel may then evict the neighbor entry
+          # (arp_evict_nocarrier defaults on).
+          python3 tools/mk-initramfs.py --out target/initramfs-tap.cpio \
+            --keep-alive 45 --net-static 172.30.0.2/24,172.30.0.1
+          ./target/release/hvi boot \
+            --kernel guest/Image --initramfs target/initramfs-tap.cpio \
+            --mem-mib 1024 --net-tap hvi-ci-tap --net-mac 52:54:00:c1:5c:01 \
+            --cmdline "earlycon console=ttyAMA0 panic=-1" \
+            </dev/null > tap.log 2>&1 &
+          # The init pings before it prints the userspace marker, so once the
+          # marker is up the pings are done.
+          for _ in $(seq 1 60); do
+            grep -q "HVI-INITRAMFS-UP" tap.log 2>/dev/null && break
+            sleep 1
+          done
+          grep -q "HVI-INITRAMFS-UP" tap.log \
+            || { echo "::error::the guest did not reach userspace with --net-tap"; tail -20 tap.log; exit 1; }
+          grep -q "bytes from 172.30.0.1" tap.log \
+            || { echo "::error::the guest could not ping the host across the tap"; tail -20 tap.log; exit 1; }
+          ip neigh show dev hvi-ci-tap
+          ip neigh show dev hvi-ci-tap | grep -qi "52:54:00:c1:5c:01" \
+            || { echo "::error::no traffic with the assigned MAC reached the tap"; exit 1; }
+          pkill -f "target/release/hvi boot" || true
+          echo "tap network: the guest pinged the host with the override MAC over hvi-ci-tap"
+      # The tails above keep 20 to 25 lines. When the job fails, the full
+      # logs and the event ledger answer what those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-arm64-kvm-${{ matrix.vgic }}-logs
+          path: |
+            run.log
+            ev.ndjson
+            tap.log
+            tap-refuse.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: tap teardown
+        if: always()
+        run: |
+          # The tap is host state that would outlive the job on this
+          # persistent runner; remove it however it was created. (The probe's
+          # pre-clean also covers a crashed run, so best-effort is enough.)
+          pkill -f "target/release/hvi boot" 2>/dev/null || true
+          ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true

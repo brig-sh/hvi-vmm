@@ -1,0 +1,8 @@
+# Labels of the self-hosted runners, so actionlint does not flag them as
+# unknown. The GIC labels pin the two arm64/KVM hosts by their interrupt
+# controller; see the boot-arm64-kvm matrix in build-and-test.yml.
+self-hosted-runner:
+  labels:
+    - kvm
+    - nbfc
+    - gicv3

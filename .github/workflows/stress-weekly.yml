@@ -1,0 +1,167 @@
+name: Stress tests (weekly)
+
+# Runs the used-ring litmus test, which is the only test that can catch a
+# lost fence in `Queue::push_used`.
+#
+# The test carries `#[ignore]` because it depends on timing and can deadlock,
+# so it must never gate a pull request. This lane runs it on a schedule
+# instead, and reports rather than blocks: a failure files or updates one
+# tracking issue, and leaves `main` green.
+
+on:
+  schedule:
+    # Weekly, Monday 06:43 UTC, offset from the dependency audit so the two
+    # lanes do not report on top of each other.
+    - cron: "43 6 * * 1"
+  workflow_dispatch:
+
+# `issues: write` is what the failure routing needs to file, comment on or
+# close the tracking issue; nothing else is granted.
+permissions:
+  contents: read
+  issues: write
+
+# The failure path reads the issue tracker and then writes to it. A manual
+# dispatch overlapping the scheduled run would otherwise let both find no
+# open issue and both file one. Queue rather than cancel: a cancelled run
+# reports nothing at all.
+concurrency:
+  group: stress-weekly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Label carried by the tracking issue this lane files, and the key it
+  # dedups on.
+  ISSUE_LABEL: stress-tests
+  # Deterministic (no run id): both the issue title and the dedup key, so a
+  # recurring failure maps to one open issue.
+  MARKER: "Weekly used-ring litmus test is red"
+
+# Explicit bash, so run blocks get `-o pipefail` and a failure in front of a
+# `tee` cannot pass unseen.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  litmus:
+    name: Used-ring litmus
+    # A fork that enables Actions would otherwise file issues in the fork.
+    # Both names are listed so this lane keeps running across the move to
+    # brig-sh; drop the NOFireAI entry once the transfer has landed.
+    if: >-
+      github.repository == 'NOFireAI/hvi-vmm'
+      || github.repository == 'brig-sh/hvi-vmm'
+    #
+    # The runner must be arm64. A strongly ordered host, such as x86, does
+    # not tear even when the fence is absent. The test then passes whether
+    # or not `Queue::push_used` still has its `fence(Release)`, and its
+    # control arm says so and prints "Run it on arm64."
+    #
+    # There is no machine label. This is a userspace threading test, and it
+    # has no interest in KVM or in the interrupt controller of the host, so
+    # either arm64 Linux runner serves. It runs weekly and takes seconds.
+    # The timeouts below bound a deadlock.
+    runs-on: [self-hosted, Linux, ARM64]
+    # The recorded failure mode is a deadlock, not a slow pass. Cap the job
+    # well under the runaway, far over the normal run.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: stress-arm64
+      - name: run the ignored litmus test
+        id: litmus
+        run: |
+          # Build the test binary, then run it directly. `timeout` signals
+          # the process it starts, so a wrapper around cargo would leave a
+          # deadlocked test binary running as an orphan. A deadlock is the
+          # case this bound exists for.
+          BIN=$(cargo test --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true
+                            and .target.name=="hvi" and (.target.kind|contains(["lib"])))
+                     | .executable')
+          test -n "$BIN" || { echo "::error::could not resolve the test binary"; exit 1; }
+          echo "test binary: $BIN"
+          # Use --include-ignored, not --ignored. `--ignored` runs ignored
+          # tests only. If this test loses its `#[ignore]`, the filter still
+          # matches it but `--ignored` then excludes it, and the step
+          # reports "running 0 tests" and exits zero.
+          timeout --foreground -k 30 600 "$BIN" \
+            used_ring_litmus::push_used_is_never_observed_torn \
+            --exact --include-ignored --nocapture 2>&1 | tee litmus.log
+          # A filter that matches nothing also exits zero. Assert that one
+          # test ran, or the lane cannot tell a pass from a test that never
+          # started.
+          grep -qE "^test result: ok\. 1 passed" litmus.log \
+            || { echo "::error::the litmus test did not run"; exit 1; }
+      - name: keep the litmus output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: litmus-log
+          path: litmus.log
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: File or update the tracking issue
+        # File an issue for a test failure only. A checkout or toolchain
+        # error must not report a memory-fence regression that nothing
+        # looked for.
+        if: failure() && steps.litmus.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Best-effort: make sure the label exists so `gh issue create
+          # --label` cannot fail on a missing label. Ignores "already exists".
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Weekly ignored stress-test failures" \
+            2>/dev/null || true
+          # The lookup has no `|| true`. A failed or rate-limited query
+          # must stop the step, because "no result" then files a duplicate.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
+          body=$(cat <<EOF
+          The weekly run of the ignored used-ring litmus test failed.
+
+          - Run: $run_url
+          - Test: \`src/used_ring_litmus.rs\`, on an arm64 runner
+
+          A torn read points at a missing or reordered fence on the used-ring
+          publish path. A timeout points at the flow-control deadlock the
+          test's doc comment records. Either way this is a real finding, not
+          flake to retry: the test exists to show the defect exists and to
+          show a fix removes it. The run's \`litmus-log\` artifact has the
+          full output, including the control arm that says whether this host
+          can detect the race at all.
+
+          This issue closes itself on the next green run of the lane.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi
+      - name: Close the tracking issue once the lane is green
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Close the issue, or the title keeps matching an issue that is
+          # already resolved. The next real failure then arrives as a
+          # comment on a closed subject instead of as a new issue.
+          for number in $(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[].number'); do
+            gh issue close "$number" \
+              --comment "The weekly used-ring litmus lane is green again as of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo "closed #$number"
+          done

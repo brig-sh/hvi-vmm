@@ -1,0 +1,45 @@
+# Configuration for cargo-deny. CI runs `cargo deny check` over the
+# lockfile: RUSTSEC advisories, licenses, duplicate versions and registry
+# sources.
+#
+# The graph holds 21 external crates, and several are inside the trusted
+# computing base: applevisor, kvm-ioctls, seccompiler and libc. A change to
+# this file is therefore a change to what that base can contain.
+
+[graph]
+# Audit the dependencies of every feature, not of the default set alone.
+# The crate declares no features today, so this changes nothing now. It
+# keeps the first feature that gates a dependency from dropping that
+# dependency out of the audited graph.
+all-features = true
+
+[advisories]
+version = 2
+# The author of a yanked crate withdrew it. Report that, do not record it
+# as a footnote.
+yanked = "deny"
+# Each entry must name the advisory and say why it does not apply here. An
+# entry with no reason does not pass review.
+ignore = []
+
+[licenses]
+version = 2
+# The list holds what the current tree needs and nothing more. Add a license
+# when a dependency carries it, not before.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+[bans]
+# The lockfile holds two versions of bitflags today. Report a duplicate
+# instead of failing on it. With 21 crates the report stays short, and a new
+# duplicate that arrives with an update is visible in the log.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,143 @@
+name: Validate code
+
+# Lint only, read-only: format, comment reflow, clippy and rustdoc, once per
+# backend. Building and testing is build-and-test.yml.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The shared, hypervisor-agnostic core plus the x86-64/KVM backend, on a cheap
+  # x86 Linux runner. This is the job that owns formatting for the whole tree:
+  # rustfmt does not evaluate cfg, so it reaches every module, including the
+  # backends this runner cannot build.
+  tidy-portable:
+    name: Tidy portable + x86
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          nightly: "true"
+      - run: tools/tidy.sh --check
+
+  # The arm64/KVM backend, cross compile-checked from the x86 runner: clippy and
+  # rustdoc need no cross-linker, and GitHub-hosted arm64 runners expose no
+  # /dev/kvm anyway, so a live boot of this backend happens out of band.
+  tidy-linux-aarch64:
+    name: Tidy linux/aarch64
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: aarch64-unknown-linux-gnu
+          cache-key: aarch64-linux
+      - run: tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
+
+  # Lints the workflows. The build-and-test jobs hold a lot of bash: loop
+  # devices, taps and boot-log searches. A quoting or expression error there
+  # costs a self-hosted runner cycle to find.
+  #
+  # actionlint parses every workflow and runs shellcheck over each run
+  # block. Both binaries are pinned by version and verified by sha256, which
+  # is the download equivalent of the commit-SHA pins on the `uses:` steps.
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+      SHELLCHECK_VERSION: v0.10.0
+      SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned shellcheck and actionlint
+        run: |
+          bin_dir="${RUNNER_TEMP}/lint-bin"
+          mkdir -p "$bin_dir"
+
+          # Verify each archive's sha256 before extracting, then place the
+          # binary on PATH for the steps below.
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$bin_dir/shellcheck"
+
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          mv actionlint "$bin_dir/actionlint"
+
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Assert shellcheck is available
+        run: |
+          # actionlint exits zero when shellcheck is absent, and lints less
+          # without saying so. Fail here instead, so an absent sub-checker
+          # cannot pass for a clean run.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck not on PATH; actionlint would skip its shell checks and still pass"
+            exit 1
+          fi
+          shellcheck --version
+      - name: Lint workflow files
+        run: |
+          # Give no path arguments. actionlint finds every workflow under
+          # .github/workflows/ by itself, so it covers a new workflow with
+          # no change here.
+          actionlint -color -shellcheck=shellcheck
+
+  # Examines the dependency graph against deny.toml: RUSTSEC advisories,
+  # licenses, duplicate versions and registry sources.
+  #
+  # The graph holds 21 external crates, and several are inside the trusted
+  # computing base: applevisor, kvm-ioctls, seccompiler and libc. This job
+  # reports a new advisory, a change of license, or a new transitive crate
+  # that arrives with an update.
+  #
+  # It reads the lockfile and builds nothing, so it needs no cargo cache and
+  # takes well under a minute.
+  #
+  # The weekly audit-deps.yml lane runs the same composite against the same
+  # lockfile, for advisories that arrive between changes.
+  check-deps:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cargo-deny
+
+  # The Hypervisor.framework backend. Needs macOS 15+: the in-kernel GICv3 API
+  # (hv_gic_*) it links against was added there.
+  tidy-macos-hvf:
+    name: Tidy macos/hvf
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf
+      - run: tools/tidy.sh --check --lint-only
