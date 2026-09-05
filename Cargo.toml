@@ -43,6 +43,10 @@ libc = "0.2"
 seccompiler = { version = "0.5", features = ["json"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+# The 16550 register file, maintained upstream. Only the x86 backend has a
+# COM1; pl011 (arm64) and the MC146818 CMOS have no equivalent in the crate,
+# so those stay ours.
+vm-superio = "0.8.1"
 kvm-ioctls = "0.25"
 # fam-wrappers gives the CpuId FAM wrapper for KVM_GET_SUPPORTED_CPUID / SET_CPUID2.
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
