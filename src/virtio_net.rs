@@ -854,6 +854,39 @@ mod tests {
         net.mmio(mem, reg::QUEUE_READY, true, 1);
     }
 
+    /// A TX chain that points back at itself must run out of budget rather
+    /// than spin. The ring size is the only bound on the walk, so the shape
+    /// to test is a cycle of *writable* descriptors: they contribute nothing
+    /// to the frame, so the `MAX_TX_FRAME` ceiling can never end it.
+    #[test]
+    fn a_tx_descriptor_cycle_runs_out_of_budget() {
+        const BASE: u64 = 0x4000_0000;
+        let mut backing = vec![0u8; 0x8000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mut net = VirtioNet::new();
+        program_queue(&mut net, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+
+        // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
+        mem.write_u64(BASE, BASE + 0x4000).unwrap();
+        mem.write_u32(BASE + 8, 64).unwrap();
+        mem.write_u16(BASE + 12, 2 | 1).unwrap();
+        mem.write_u16(BASE + 14, 0).unwrap();
+        assert_eq!(net.read_tx_frame(&mem, 0), None);
+
+        // A `next` outside the ring ends the walk too. The descriptor one
+        // past the ring is a valid readable one carrying real bytes, so an
+        // unbounded walk would return a frame instead of None.
+        mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
+        mem.write_u16(BASE + 12, 1).unwrap();
+        mem.write_u16(BASE + 14, 8).unwrap(); // == the ring size
+        mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
+        mem.write_u32(BASE + 136, 8).unwrap();
+        mem.write_u16(BASE + 140, 0).unwrap();
+        mem.write_u16(BASE + 142, 0).unwrap();
+        assert_eq!(net.read_tx_frame(&mem, 0), None);
+        assert_eq!(net.read_tx_frame(&mem, 8), None, "an out-of-ring head");
+    }
+
     /// One TX frame through the whole device path in tap mode: the tap gets a
     /// zero `virtio_net_hdr_v1` plus the frame, and the flow ledger still
     /// records the flow -- attaching a tap must not blind the boundary
