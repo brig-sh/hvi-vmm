@@ -67,6 +67,11 @@
 //! change. The practical consequence of the deprecation is that this profile
 //! has to be re-proven per OS release, which is what the CI selftest is for.
 
+// The Seatbelt profile names export roots by their resolved path, because
+// that is the form the kernel matches on. Resolving them here is the point,
+// not an accident; see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::{Path, PathBuf};

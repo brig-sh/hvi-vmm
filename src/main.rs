@@ -25,6 +25,10 @@
 //! can link this one and supply its own [`hvi::plugin::Plugin`] the same way
 //! -- see `docs/plugins.md`.
 
+// Share paths given on the command line are resolved once, before any
+// guest runs; see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use hvi::plugins::{Chain, IoTrace, MemoryDump};
