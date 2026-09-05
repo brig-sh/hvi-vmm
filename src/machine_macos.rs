@@ -45,6 +45,7 @@ use crate::layout::{
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
+use crate::sync::lock_or_recover;
 use crate::virtio::{reg, VirtioBlk};
 use crate::virtio_fs::VirtioFs;
 use crate::virtio_net::VirtioNet;
@@ -490,13 +491,33 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     Ok(stop)
 }
 
+thread_local! {
+    /// The reason this thread's vCPU last left the guest.
+    ///
+    /// Recorded so the panic report in [`run_cpu`] can name it. `catch_unwind`
+    /// runs on the thread that panicked, so a thread-local survives the unwind
+    /// and is readable there, and it costs the other vCPU threads nothing.
+    static LAST_EXIT: std::cell::Cell<Option<ExitReason>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// What this thread's vCPU last exited for, if it has run at all.
+fn last_exit() -> Option<ExitReason> {
+    LAST_EXIT.with(std::cell::Cell::get)
+}
+
 /// A single vCPU: create it, position it (boot entry, or wait for CPU_ON), and
 /// run its exit loop until the VM stops.
 fn run_cpu(cpu_id: u32, sh: Shared) {
     let vcpu = match sh.vm.vcpu_create() {
         Ok(v) => v,
         Err(e) => {
+            // Returning alone left every other thread waiting on a vCPU that
+            // will never exist: the secondaries block for a CPU_ON that
+            // cannot arrive and the join in `boot` never returns. A vCPU that
+            // cannot be created ends the VM (#35).
             eprintln!("[hvi] cpu{cpu_id}: vcpu_create failed: {e:?}");
+            stop_all(&sh);
             return;
         }
     };
@@ -533,104 +554,152 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     }
 
     let is_boot = cpu_id == 0;
-    while sh.running.load(Ordering::SeqCst) {
-        // Safe point for every vCPU: park here while cpu0 lets a plugin
-        // look at the guest.
-        sh.quiesce.checkpoint();
-        // The plugin runs on cpu0, between guest entries, because only this
-        // thread can read this vCPU's registers. It is on the hot path: with
-        // no plugin this is a null check.
-        if is_boot {
-            if let Some(obs) = sh.plugin.clone() {
-                obs.safepoint(&Cpu {
-                    vcpu: &vcpu,
-                    sh: &sh,
-                });
+    // The loop runs inside `catch_unwind` so a panic ends the VM with a
+    // report rather than leaving it alive with one thread missing. A panic
+    // in a plugin hook is the case that matters: those run between guest
+    // entries with the other vCPUs parked in `checkpoint`, and nothing was
+    // releasing them (#35).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while sh.running.load(Ordering::SeqCst) {
+            // Safe point for every vCPU: park here while cpu0 lets a plugin
+            // look at the guest.
+            sh.quiesce.checkpoint();
+            // The plugin runs on cpu0, between guest entries, because only this
+            // thread can read this vCPU's registers. It is on the hot path:
+            // with no plugin this is a null check.
+            if is_boot {
+                if let Some(obs) = sh.plugin.clone() {
+                    obs.safepoint(&Cpu {
+                        vcpu: &vcpu,
+                        sh: &sh,
+                    });
+                }
             }
-        }
 
-        if vcpu.run().is_err() {
-            break;
-        }
-        let exit = vcpu.get_exit_info();
-        match exit.reason {
-            ExitReason::EXCEPTION => {
-                let syn = exit.exception.syndrome;
-                match Ec::from_syndrome(syn) {
-                    Ec::Hvc | Ec::Smc => {
-                        if service_psci(&vcpu, &sh) {
-                            break; // SYSTEM_OFF/RESET
+            if let Err(e) = vcpu.run() {
+                // Same shape as the four paths in #35, and not listed there:
+                // breaking alone left `running` true and the VM hung.
+                eprintln!("[hvi] cpu{cpu_id}: vcpu run failed: {e:?}");
+                stop_all(&sh);
+                break;
+            }
+            let exit = vcpu.get_exit_info();
+            LAST_EXIT.with(|last| last.set(Some(exit.reason)));
+            match exit.reason {
+                ExitReason::EXCEPTION => {
+                    let syn = exit.exception.syndrome;
+                    match Ec::from_syndrome(syn) {
+                        Ec::Hvc | Ec::Smc => {
+                            if service_psci(&vcpu, &sh) {
+                                break; // SYSTEM_OFF/RESET
+                            }
+                            // Not restartable: the saved PC is already past
+                            // HVC/SMC.
                         }
-                        // Not restartable: the saved PC is already past
-                        // HVC/SMC.
-                    }
-                    Ec::DataAbort => {
-                        let ipa = exit.exception.physical_address;
-                        if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
-                            service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
-                            advance_pc(&vcpu);
-                        } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
-                            if let Some(dev) = &sh.virtio {
-                                service_dev(&vcpu, &sh, dev, VIRTIO_INTID, ipa - VIRTIO_BASE, syn);
+                        Ec::DataAbort => {
+                            let ipa = exit.exception.physical_address;
+                            if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
+                                service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
+                                advance_pc(&vcpu);
+                            } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
+                                if let Some(dev) = &sh.virtio {
+                                    service_dev(
+                                        &vcpu,
+                                        &sh,
+                                        dev,
+                                        VIRTIO_INTID,
+                                        ipa - VIRTIO_BASE,
+                                        syn,
+                                    );
+                                }
+                                advance_pc(&vcpu);
+                            } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE)
+                                .contains(&ipa)
+                            {
+                                if let Some(dev) = &sh.net {
+                                    service_net(&vcpu, &sh, dev, ipa - VIRTIO_NET_BASE, syn);
+                                }
+                                advance_pc(&vcpu);
+                            } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE)
+                                .contains(&ipa)
+                            {
+                                if let Some(dev) = &sh.vsock {
+                                    service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
+                                }
+                                advance_pc(&vcpu);
+                            } else if let Some(fs) = sh
+                                .fs
+                                .iter()
+                                .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
+                            {
+                                service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
+                                advance_pc(&vcpu);
+                            } else {
+                                eprintln!(
+                                    "[hvi] cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
+                                    vcpu.get_reg(Reg::PC).unwrap_or(0)
+                                );
+                                // Any vCPU, not only the boot one: a secondary
+                                // that gave up left the VM running with one
+                                // fewer
+                                // vCPU and nothing said so (#35).
+                                stop_all(&sh);
+                                break;
+                            }
+                        }
+                        Ec::SysReg => {
+                            // RAZ/WI: unmodeled system register.
+                            let iss = syn & 0x1ff_ffff;
+                            if iss & 1 == 1 {
+                                write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, 0);
                             }
                             advance_pc(&vcpu);
-                        } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
-                            if let Some(dev) = &sh.net {
-                                service_net(&vcpu, &sh, dev, ipa - VIRTIO_NET_BASE, syn);
-                            }
-                            advance_pc(&vcpu);
-                        } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE)
-                            .contains(&ipa)
-                        {
-                            if let Some(dev) = &sh.vsock {
-                                service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
-                            }
-                            advance_pc(&vcpu);
-                        } else if let Some(fs) = sh
-                            .fs
-                            .iter()
-                            .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
-                        {
-                            service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
-                            advance_pc(&vcpu);
-                        } else {
+                        }
+                        Ec::Other(0x01) => {} // WFx: hvf handled the wait.
+                        other => {
                             eprintln!(
-                                "[hvi] cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
+                                "[hvi] cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
                                 vcpu.get_reg(Reg::PC).unwrap_or(0)
                             );
-                            if is_boot {
-                                stop_all(&sh);
-                            }
+                            stop_all(&sh);
                             break;
                         }
                     }
-                    Ec::SysReg => {
-                        // RAZ/WI: unmodeled system register.
-                        let iss = syn & 0x1ff_ffff;
-                        if iss & 1 == 1 {
-                            write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, 0);
-                        }
-                        advance_pc(&vcpu);
-                    }
-                    Ec::Other(0x01) => {} // WFx: hvf handled the wait.
-                    other => {
-                        eprintln!(
-                            "[hvi] cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
-                            vcpu.get_reg(Reg::PC).unwrap_or(0)
-                        );
-                        if is_boot {
-                            stop_all(&sh);
-                        }
-                        break;
-                    }
+                }
+                ExitReason::VTIMER_ACTIVATED => {
+                    let _ = vcpu.set_vtimer_mask(true);
+                }
+                ExitReason::CANCELED => {} // kicked for a snapshot or a stop
+                ExitReason::UNKNOWN => {
+                    // hvf could not say why it exited, so there is nothing to
+                    // resume into. Breaking alone left `running` true, so the
+                    // secondaries kept waiting and `boot` never joined (#35).
+                    eprintln!(
+                        "[hvi] cpu{cpu_id}: unknown exit reason (pc {:#x})",
+                        vcpu.get_reg(Reg::PC).unwrap_or(0)
+                    );
+                    stop_all(&sh);
+                    break;
                 }
             }
-            ExitReason::VTIMER_ACTIVATED => {
-                let _ = vcpu.set_vtimer_mask(true);
-            }
-            ExitReason::CANCELED => {} // kicked for a snapshot or a stop
-            ExitReason::UNKNOWN => break,
         }
+    }));
+
+    if let Err(payload) = outcome {
+        // Name the thread, where the guest was, and what it last did, so the
+        // report is usable without a debugger. `payload` carries the panic
+        // message for the two types a `panic!` produces.
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown payload".to_string());
+        eprintln!(
+            "[hvi] cpu{cpu_id}: panicked ({what}); last exit {:?}, pc {:#x}",
+            last_exit(),
+            vcpu.get_reg(Reg::PC).unwrap_or(0)
+        );
+        stop_all(&sh);
     }
 }
 
@@ -819,6 +888,10 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
 /// Signals all vCPUs to stop and kicks them out of `run()`.
 fn stop_all(sh: &Shared) {
     sh.running.store(false, Ordering::SeqCst);
+    // Nobody may still be parked at a checkpoint once the VM is stopping. A
+    // plugin that panicked between `request` and `release` left every other
+    // vCPU waiting there with no one left to release them (#35).
+    sh.quiesce.release();
     if let Ok(handles) = sh.handles.lock() {
         let _ = sh.vm.vcpus_exit(handles.as_slice());
     }
@@ -834,7 +907,7 @@ fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
         return;
     }
     let level = {
-        let mut p = sh.pl011.lock().unwrap();
+        let mut p = lock_or_recover(&sh.pl011);
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             p.mmio(offset, true, v);
@@ -862,7 +935,7 @@ fn service_dev(
         return;
     }
     let (level, events) = {
-        let mut d = dev.lock().unwrap();
+        let mut d = lock_or_recover(dev);
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.mem, offset, true, v);
@@ -873,7 +946,7 @@ fn service_dev(
         (d.irq_level(), d.take_events())
     };
     if !events.is_empty() {
-        let mut e = sh.emit.lock().unwrap();
+        let mut e = lock_or_recover(&sh.emit);
         for ev in &events {
             e.captured(ev);
         }
@@ -888,7 +961,7 @@ fn service_net(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioNet>>, offset: u6
         return;
     }
     let (level, events) = {
-        let mut d = dev.lock().unwrap();
+        let mut d = lock_or_recover(dev);
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.mem, offset, true, v);
@@ -899,7 +972,7 @@ fn service_net(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioNet>>, offset: u6
         (d.irq_level(), d.take_events())
     };
     if !events.is_empty() {
-        let mut e = sh.emit.lock().unwrap();
+        let mut e = lock_or_recover(&sh.emit);
         for ev in &events {
             e.captured(ev);
         }
@@ -921,7 +994,7 @@ fn service_vsock(
         return;
     }
     let level = {
-        let mut d = dev.lock().unwrap();
+        let mut d = lock_or_recover(dev);
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.mem, offset, true, v);
@@ -959,7 +1032,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
     }
     let is_notify = da.is_write && offset == reg::QUEUE_NOTIFY;
     {
-        let mut d = fs.dev.lock().unwrap();
+        let mut d = lock_or_recover(&fs.dev);
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.mem, offset, true, v);
@@ -989,7 +1062,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
         // worker, which is where a deep queue belongs: the handoff is
         // amortised and the vCPU gets to run the guest while it drains.
         let (remaining, level) = {
-            let mut d = fs.dev.lock().unwrap();
+            let mut d = lock_or_recover(&fs.dev);
             let remaining = d.drain_notified_bounded(&sh.mem, FS_INLINE_BUDGET);
             (remaining, d.irq_level())
         };
@@ -1021,7 +1094,7 @@ fn spawn_vsock_bridge(
             };
 
             // Register the connection and send the guest agent a REQUEST.
-            let mut d = dev.lock().unwrap();
+            let mut d = lock_or_recover(&dev);
             let port = d.add_conn(stream);
             d.connect(&mem, port);
             let level = d.irq_level();
@@ -1043,7 +1116,7 @@ fn spawn_vsock_bridge(
                         Ok(n) => n,
                     };
                     let level = {
-                        let mut d = dev2.lock().unwrap();
+                        let mut d = lock_or_recover(&dev2);
                         d.host_data(&mem2, port, &buf[..n]);
                         d.irq_level()
                     };
@@ -1051,7 +1124,7 @@ fn spawn_vsock_bridge(
                     kick_all(&vm2, &handles2);
                 }
                 let level = {
-                    let mut d = dev2.lock().unwrap();
+                    let mut d = lock_or_recover(&dev2);
                     d.host_closed(&mem2, port);
                     d.irq_level()
                 };
@@ -1089,7 +1162,7 @@ fn spawn_net_gateway_reader(
                 break;
             }
             let level = {
-                let mut d = dev.lock().unwrap();
+                let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, &frame);
                 d.irq_level()
             };
@@ -1138,7 +1211,7 @@ fn spawn_fs_worker(
     std::thread::spawn(move || loop {
         wake.park();
         {
-            let mut d = dev.lock().unwrap();
+            let mut d = lock_or_recover(&dev);
             d.drain_notified(&mem);
             // Raised under the same mutex the vCPU's INTERRUPT_ACK takes, so
             // the two cannot interleave into a low line over a non-empty
@@ -1187,7 +1260,7 @@ fn spawn_input_thread(
                 }
             }
             let level = {
-                let mut p = pl011.lock().unwrap();
+                let mut p = lock_or_recover(&pl011);
                 p.push_rx(byte[0]);
                 p.irq_level()
             };
