@@ -276,6 +276,94 @@ mod tests {
         }
     }
 
+    /// The stated isolation property, tested the way an attacker would: the
+    /// backing object is unlinked as soon as it exists, so nothing that was
+    /// not handed the descriptor can reach the guest's RAM.
+    ///
+    /// The two platforms make the guarantee differently, so the test does
+    /// too. On macOS the object is a named POSIX shared-memory segment and
+    /// the name is derived from the pid, which an attacker knows -- so probe
+    /// every name this process could have used and require all of them to be
+    /// gone. On Linux it is a `memfd`, which has no name in any filesystem
+    /// namespace at all, and the check is that its `/proc` link is a memfd
+    /// rather than a path anything could open.
+    ///
+    /// Note for whoever changes `create_object`: the macOS half reconstructs
+    /// the name format, so a change to that format has to change this test
+    /// with it, or the probe stops probing anything.
+    #[test]
+    fn the_backing_object_is_not_reachable_by_name() {
+        let ram = SharedRam::new(PAGE).expect("allocate");
+        // SAFETY: the mapping is live for the length reported.
+        unsafe { ram.as_ptr().write(0x5a) };
+
+        #[cfg(target_os = "macos")]
+        {
+            let pid = std::process::id();
+            let open_by_name = |name: &std::ffi::CStr| -> i32 {
+                // SAFETY: a valid NUL-terminated name; no O_CREAT, so this
+                // only ever opens something that already exists.
+                unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0 as libc::c_uint) }
+            };
+
+            // Positive control first. Without it a change to the name format
+            // would leave the probe below passing on names nothing ever used.
+            let control = std::ffi::CString::new(format!("/hvi-ram-{pid}-ctl")).unwrap();
+            // SAFETY: a valid NUL-terminated name we own.
+            let made = unsafe {
+                libc::shm_open(
+                    control.as_ptr(),
+                    libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                    0o600 as libc::c_uint,
+                )
+            };
+            assert!(made >= 0, "the control object could not be created");
+            let found = open_by_name(&control);
+            assert!(found >= 0, "shm_open cannot see a linked object");
+            // SAFETY: descriptors and a name this test created.
+            unsafe {
+                libc::close(found);
+                libc::shm_unlink(control.as_ptr());
+            }
+            assert!(
+                open_by_name(&control) < 0,
+                "an unlinked object is still reachable, so the probe proves nothing"
+            );
+            // SAFETY: a descriptor this test created.
+            unsafe { libc::close(made) };
+
+            // Now the real thing. The sequence number is process-wide and
+            // every allocation increments it once, so this range covers every
+            // name the test binary can have produced.
+            for seq in 0..1024 {
+                let name = std::ffi::CString::new(format!("/hvi-ram-{pid}-{seq}")).unwrap();
+                let fd = open_by_name(&name);
+                assert!(
+                    fd < 0,
+                    "guest RAM is reachable by name as {name:?}, which defeats the whole point"
+                );
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // A memfd has no filesystem name. Its /proc link records the
+            // creation name for diagnostics and is not a path: opening it
+            // fails, which is what "unreachable by name" means here.
+            let link = std::fs::read_link(format!("/proc/self/fd/{}", ram.fd()))
+                .expect("the descriptor has a /proc link");
+            let link = link.to_string_lossy().into_owned();
+            assert!(
+                link.starts_with("/memfd:"),
+                "guest RAM is backed by {link}, not an anonymous memfd"
+            );
+            assert!(
+                std::fs::File::open(&link).is_err(),
+                "the memfd link {link} opens, so guest RAM has a reachable name"
+            );
+        }
+    }
+
     /// Two objects can be alive in one process at once, and they are distinct.
     ///
     /// On macOS the backing object is named, and a name that is unique only per
