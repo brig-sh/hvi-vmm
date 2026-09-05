@@ -53,12 +53,18 @@ use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
-const VIRTIO_NET_ID: u64 = 1;
-const F_VERSION_1_HI: u32 = 1; // feature bit 32 (high word bit 0)
-const F_MAC_LO: u32 = 1 << 5; // VIRTIO_NET_F_MAC (low word bit 5)
+const VIRTIO_NET_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_NET as u64;
+/// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
+const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
+const F_MAC_LO: u32 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 
-/// virtio-net header length with VIRTIO_F_VERSION_1 (`virtio_net_hdr_v1`).
-pub const NET_HDR_LEN: usize = 12;
+/// virtio-net header length with `VIRTIO_F_VERSION_1`.
+///
+/// Taken from the header layout rather than written down: this is the number
+/// of bytes the device prepends to every frame, so a guest and a host that
+/// disagree about it misalign every packet.
+pub const NET_HDR_LEN: usize =
+    std::mem::size_of::<virtio_bindings::virtio_net::virtio_net_hdr_v1>();
 
 /// Ceiling on the frame a transmit chain may assemble.
 ///

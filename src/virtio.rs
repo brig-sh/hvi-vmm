@@ -37,55 +37,65 @@ use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
 
 /// virtio-mmio register offsets (subset we implement). Shared with virtio-net.
+///
+/// The values come from `virtio-bindings`, which is bindgen output from the
+/// kernel headers, so the offsets stop being ours to get right. They are
+/// re-exported as `u64` because that is what an MMIO dispatch matches on, and
+/// under our own names where the kernel's differ: the spec calls the second and
+/// third rings *driver* and *device*, which is what the register names say,
+/// while the kernel header still calls them *avail* and *used*.
 pub(crate) mod reg {
-    pub const MAGIC: u64 = 0x000; // "virt"
-    pub const VERSION: u64 = 0x004; // 2
-    pub const DEVICE_ID: u64 = 0x008;
-    pub const VENDOR_ID: u64 = 0x00c;
-    pub const DEVICE_FEATURES: u64 = 0x010;
-    pub const DEVICE_FEATURES_SEL: u64 = 0x014;
-    pub const DRIVER_FEATURES: u64 = 0x020;
-    pub const DRIVER_FEATURES_SEL: u64 = 0x024;
-    pub const QUEUE_SEL: u64 = 0x030;
-    pub const QUEUE_NUM_MAX: u64 = 0x034;
-    pub const QUEUE_NUM: u64 = 0x038;
-    pub const QUEUE_READY: u64 = 0x044;
-    pub const QUEUE_NOTIFY: u64 = 0x050;
-    pub const INTERRUPT_STATUS: u64 = 0x060;
-    pub const INTERRUPT_ACK: u64 = 0x064;
-    pub const STATUS: u64 = 0x070;
-    pub const QUEUE_DESC_LOW: u64 = 0x080;
-    pub const QUEUE_DESC_HIGH: u64 = 0x084;
-    pub const QUEUE_DRIVER_LOW: u64 = 0x090; // avail ring
-    pub const QUEUE_DRIVER_HIGH: u64 = 0x094;
-    pub const QUEUE_DEVICE_LOW: u64 = 0x0a0; // used ring
-    pub const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
-    pub const CONFIG: u64 = 0x100;
+    use virtio_bindings::virtio_mmio::*;
+
+    pub const MAGIC: u64 = VIRTIO_MMIO_MAGIC_VALUE as u64; // "virt"
+    pub const VERSION: u64 = VIRTIO_MMIO_VERSION as u64; // 2
+    pub const DEVICE_ID: u64 = VIRTIO_MMIO_DEVICE_ID as u64;
+    pub const VENDOR_ID: u64 = VIRTIO_MMIO_VENDOR_ID as u64;
+    pub const DEVICE_FEATURES: u64 = VIRTIO_MMIO_DEVICE_FEATURES as u64;
+    pub const DEVICE_FEATURES_SEL: u64 = VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64;
+    pub const DRIVER_FEATURES: u64 = VIRTIO_MMIO_DRIVER_FEATURES as u64;
+    pub const DRIVER_FEATURES_SEL: u64 = VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64;
+    pub const QUEUE_SEL: u64 = VIRTIO_MMIO_QUEUE_SEL as u64;
+    pub const QUEUE_NUM_MAX: u64 = VIRTIO_MMIO_QUEUE_NUM_MAX as u64;
+    pub const QUEUE_NUM: u64 = VIRTIO_MMIO_QUEUE_NUM as u64;
+    pub const QUEUE_READY: u64 = VIRTIO_MMIO_QUEUE_READY as u64;
+    pub const QUEUE_NOTIFY: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
+    pub const INTERRUPT_STATUS: u64 = VIRTIO_MMIO_INTERRUPT_STATUS as u64;
+    pub const INTERRUPT_ACK: u64 = VIRTIO_MMIO_INTERRUPT_ACK as u64;
+    pub const STATUS: u64 = VIRTIO_MMIO_STATUS as u64;
+    pub const QUEUE_DESC_LOW: u64 = VIRTIO_MMIO_QUEUE_DESC_LOW as u64;
+    pub const QUEUE_DESC_HIGH: u64 = VIRTIO_MMIO_QUEUE_DESC_HIGH as u64;
+    pub const QUEUE_DRIVER_LOW: u64 = VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
+    pub const QUEUE_DRIVER_HIGH: u64 = VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
+    pub const QUEUE_DEVICE_LOW: u64 = VIRTIO_MMIO_QUEUE_USED_LOW as u64;
+    pub const QUEUE_DEVICE_HIGH: u64 = VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
+    pub const CONFIG: u64 = VIRTIO_MMIO_CONFIG as u64;
 }
 
 const MAGIC_VALUE: u64 = 0x7472_6976; // "virt" little-endian
-const VIRTIO_BLK_ID: u64 = 2;
+const VIRTIO_BLK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK as u64;
 const VENDOR: u64 = 0x4649_4f4e; // "NOIF"
 
-/// `VIRTIO_F_VERSION_1` (feature bit 32) — required for a modern device.
-const F_VERSION_1_HI: u32 = 1; // bit 0 of the high 32-bit word
-/// `VIRTIO_BLK_F_FLUSH` (feature bit 9, low word): the guest may issue explicit
-/// cache-flush requests. Advertising and honouring it gives correct durability
-/// semantics for `fsync`/`end_fsync` workloads instead of the guest guessing.
-const F_BLK_FLUSH_LO: u32 = 1 << 9;
+/// `VIRTIO_F_VERSION_1` -- required for a modern device. It is feature bit 32,
+/// so it lands in bit 0 of the high 32-bit word the driver selects.
+const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
+/// `VIRTIO_BLK_F_FLUSH` (low word): the guest may issue explicit cache-flush
+/// requests. Advertising and honouring it gives correct durability semantics
+/// for `fsync`/`end_fsync` workloads instead of the guest guessing.
+const F_BLK_FLUSH_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
 
 /// Descriptor flags.
-const VIRTQ_DESC_F_NEXT: u16 = 1;
-const VIRTQ_DESC_F_WRITE: u16 = 2;
+const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
+const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
 
 /// virtio-blk request types.
-const VIRTIO_BLK_T_IN: u32 = 0; // read disk -> guest
-const VIRTIO_BLK_T_OUT: u32 = 1; // guest -> write disk
-const VIRTIO_BLK_T_FLUSH: u32 = 4; // flush the device cache
+const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
+const VIRTIO_BLK_T_OUT: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT; // guest -> write disk
+const VIRTIO_BLK_T_FLUSH: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_FLUSH; // flush the cache
 
 /// virtio-blk status byte.
-const VIRTIO_BLK_S_OK: u8 = 0;
-const VIRTIO_BLK_S_IOERR: u8 = 1;
+const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
+const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8;
 
 const SECTOR: u64 = 512;
 
