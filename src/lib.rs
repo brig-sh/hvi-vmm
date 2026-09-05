@@ -103,6 +103,8 @@ pub mod sandbox;
 pub mod seccomp;
 /// Guest RAM backed by a shareable object, so another process can map it.
 pub mod sharedmem;
+/// Taking a lock whose last holder panicked.
+pub mod sync;
 /// The tap side of virtio-net, and the portable vnet-header framing.
 pub mod tap;
 /// 16550A UART (x86 console).
