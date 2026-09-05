@@ -794,6 +794,61 @@ mod queue_tests {
         }
     }
 
+    /// A chain that points back at itself must run out of budget rather than
+    /// spin. The only bound on the walk is the ring size, so the shape to
+    /// test is a cycle of *writable* descriptors: nothing accumulates, so
+    /// no other limit can end it.
+    #[test]
+    fn a_descriptor_cycle_runs_out_of_budget() {
+        let mut backing = vec![0u8; 0x4000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mut blk = dev();
+        program(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
+
+        // desc[0] -> desc[0]: a one-hop cycle, writable and F_NEXT set.
+        mem.write_u64(BASE, BASE + 0x3000).unwrap();
+        mem.write_u32(BASE + 8, 16).unwrap();
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+            .unwrap();
+        mem.write_u16(BASE + 14, 0).unwrap();
+
+        // Terminating at all is the property. Nothing readable came out of the
+        // walk, so there is no request to serve either.
+        assert_eq!(blk.handle_chain(&mem, 0), 0);
+    }
+
+    /// A `next` that leaves the ring ends the walk, rather than reading a
+    /// descriptor the driver never programmed.
+    ///
+    /// The descriptor one past the ring is deliberately a valid, writable one
+    /// here. Without the bound the walk would find it, `writable` would be
+    /// non-empty and the request would be serviced -- so this fails loudly
+    /// rather than passing on an empty walk.
+    #[test]
+    fn a_next_index_outside_the_ring_ends_the_walk() {
+        let mut backing = vec![0u8; 0x4000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mut blk = dev();
+        program(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
+
+        // desc[0]: readable, chaining to index 4 -- one past a 4-entry ring.
+        mem.write_u64(BASE, BASE + 0x3000).unwrap();
+        mem.write_u32(BASE + 8, 16).unwrap();
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
+        mem.write_u16(BASE + 14, 4).unwrap();
+
+        // "desc[4]": in guest RAM, outside the ring, and writable, so it is
+        // exactly what an unbounded walk would pick up.
+        mem.write_u64(BASE + 64, BASE + 0x3100).unwrap();
+        mem.write_u32(BASE + 72, 16).unwrap();
+        mem.write_u16(BASE + 76, VIRTQ_DESC_F_WRITE).unwrap();
+        mem.write_u16(BASE + 78, 0).unwrap();
+
+        assert_eq!(blk.handle_chain(&mem, 0), 0, "the walk stopped at the ring");
+        assert_eq!(blk.handle_chain(&mem, 4), 0, "an out-of-ring head as well");
+        assert_eq!(blk.handle_chain(&mem, u16::MAX), 0);
+    }
+
     #[test]
     fn descriptor_index_outside_the_ring_is_refused() {
         let mut q = Queue::default();

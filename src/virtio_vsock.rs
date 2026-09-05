@@ -693,6 +693,56 @@ mod session_tests {
         );
     }
 
+    /// The same bound on the vsock transmit walker. A cycle of writable
+    /// descriptors accumulates nothing, so `MAX_TX_PACKET` cannot end it and
+    /// the ring size is all that stands between a hostile ring and a spin.
+    #[test]
+    fn a_tx_descriptor_cycle_runs_out_of_budget() {
+        const BASE: u64 = 0x4000_0000;
+        let mut backing = vec![0u8; 0x8000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mut dev = VirtioVsock::new();
+        dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
+        dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
+        dev.mmio(&mem, reg::QUEUE_DESC_LOW, true, BASE & 0xffff_ffff);
+        dev.mmio(&mem, reg::QUEUE_DESC_HIGH, true, BASE >> 32);
+        dev.mmio(
+            &mem,
+            reg::QUEUE_DRIVER_LOW,
+            true,
+            (BASE + 0x1000) & 0xffff_ffff,
+        );
+        dev.mmio(&mem, reg::QUEUE_DRIVER_HIGH, true, (BASE + 0x1000) >> 32);
+        dev.mmio(
+            &mem,
+            reg::QUEUE_DEVICE_LOW,
+            true,
+            (BASE + 0x2000) & 0xffff_ffff,
+        );
+        dev.mmio(&mem, reg::QUEUE_DEVICE_HIGH, true, (BASE + 0x2000) >> 32);
+        dev.mmio(&mem, reg::QUEUE_READY, true, 1);
+
+        // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
+        mem.write_u64(BASE, BASE + 0x4000).unwrap();
+        mem.write_u32(BASE + 8, 64).unwrap();
+        mem.write_u16(BASE + 12, 2 | 1).unwrap();
+        mem.write_u16(BASE + 14, 0).unwrap();
+        assert_eq!(dev.read_tx(&mem, 0), None);
+
+        // A `next` outside the ring ends the walk. The descriptor one past
+        // the ring is a valid readable one carrying a whole header, so an
+        // unbounded walk would return a packet instead of None.
+        mem.write_u32(BASE + 8, 8).unwrap();
+        mem.write_u16(BASE + 12, 1).unwrap();
+        mem.write_u16(BASE + 14, 8).unwrap(); // == the ring size
+        mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
+        mem.write_u32(BASE + 136, HDR_LEN as u32).unwrap();
+        mem.write_u16(BASE + 140, 0).unwrap();
+        mem.write_u16(BASE + 142, 0).unwrap();
+        assert_eq!(dev.read_tx(&mem, 0), None);
+        assert_eq!(dev.read_tx(&mem, 8), None, "an out-of-ring head");
+    }
+
     /// Regression for the cross-session injection: session B is registered and
     /// offered, but the guest never accepted it, so its bytes must not flow.
     #[test]
