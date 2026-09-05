@@ -758,6 +758,42 @@ mod queue_tests {
         assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
     }
 
+    /// A driver that has validated its rings must not be able to move them and
+    /// keep the queue live. Every setter that feeds `rings_fit` drops `ready`,
+    /// so the bounds are re-checked before the device services anything; this
+    /// pins that, because otherwise a guest could pass the check on one set of
+    /// addresses and then be serviced on another.
+    #[test]
+    fn re_programming_a_ready_queue_clears_ready() {
+        let mut backing = vec![0u8; 0x4000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+
+        // Each value is deliberately a legal one, and for QUEUE_NUM a
+        // non-zero one: `is_ready` is false whenever the size is zero, so
+        // writing 0 there would pass this test without `ready` ever being
+        // cleared. What has to drop the queue is the write itself.
+        for (r, v) in [
+            (reg::QUEUE_NUM, 128),
+            (reg::QUEUE_DESC_LOW, 0),
+            (reg::QUEUE_DESC_HIGH, 0),
+            (reg::QUEUE_DRIVER_LOW, 0),
+            (reg::QUEUE_DRIVER_HIGH, 0),
+            (reg::QUEUE_DEVICE_LOW, 0),
+            (reg::QUEUE_DEVICE_HIGH, 0),
+        ] {
+            let mut blk = dev();
+            program(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
+            assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
+
+            blk.mmio(&mem, r, true, v);
+            assert_eq!(
+                blk.mmio(&mem, reg::QUEUE_READY, false, 0),
+                0,
+                "writing {r:#05x} left the queue ready"
+            );
+        }
+    }
+
     #[test]
     fn descriptor_index_outside_the_ring_is_refused() {
         let mut q = Queue::default();
