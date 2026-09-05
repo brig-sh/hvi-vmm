@@ -295,6 +295,40 @@ jobs:
   # different code paths in the FDT and in interrupt delivery, so both hosts
   # are run, each pinned by label rather than left to whichever arm64 machine
   # happens to be free.
+  # The gate against a change that makes virtio-fs slower (#38).
+  #
+  # No test in the unit suite can see one. Every test drives the FUSE handlers
+  # and asserts on what they return, so a handler that returns the same answer
+  # twice as slowly passes all of them -- which is how #30 reached main.
+  #
+  # This runs on the dedicated runner rather than the hosted one: the
+  # measurement is a comparison of two builds, and a shared machine changes
+  # speed between them. It is withheld from fork pull requests for the same
+  # reason every other self-hosted lane is.
+  #
+  # `fetch-depth: 0` is required and not incidental: the job compares the
+  # branch against its own merge base, and a shallow clone has no merge base
+  # to find.
+  perf-virtiofs:
+    name: virtio-fs performance gate
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-perf
+      - name: measure the branch against its merge base
+        env:
+          PERF_GATE_BASE: origin/${{ github.event.pull_request.base.ref }}
+        run: tools/perf-gate.sh
+
   boot-arm64-kvm:
     name: Boot arm64/kvm (${{ matrix.vgic }})
     strategy:

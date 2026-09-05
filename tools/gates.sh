@@ -21,12 +21,25 @@
 # the closing line. A run with a skip never reports a plain "ok", because a
 # reader must not take a skipped check for one that passed.
 #
+# The virtio-fs performance gate (build-and-test / perf-virtiofs) is not in
+# that list because it builds the merge base as well as the branch, so it
+# costs more than everything above put together. Pass --with-perf to include
+# it; it is macOS-only, since that is where the device compiles.
+#
 # Three CI checks cannot run here on any machine: the backend of the other
 # host, because only the host target compiles; the live boots, which need
 # /dev/kvm or the hypervisor entitlement on a self-hosted runner; and the
 # commit-message lint, which reads the commit range of a pull request.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+with_perf=no
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --with-perf) with_perf=yes; shift ;;
+        *) echo "usage: $0 [--with-perf]" >&2; exit 2 ;;
+    esac
+done
 
 skipped=()
 
@@ -70,6 +83,13 @@ if command -v typos >/dev/null 2>&1; then
     typos --config .github/linters/typos.toml
 else
     skipped+=("spell check (cargo install typos-cli)")
+fi
+
+# The performance gate, opt-in: see the note at the top.
+if [ "$with_perf" = yes ]; then
+    tools/perf-gate.sh
+else
+    skipped+=("virtio-fs performance gate (tools/gates.sh --with-perf)")
 fi
 
 if [ ${#skipped[@]} -eq 0 ]; then
