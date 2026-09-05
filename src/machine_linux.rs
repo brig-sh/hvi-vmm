@@ -83,11 +83,6 @@ const REQUEST_KEY: u8 = 0x1d;
 /// Signal used to break a vCPU out of `KVM_RUN` (snapshot / shutdown).
 const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 
-/// GICv3 architectural region sizes (KVM derives redist count from vCPUs, but
-/// the DTB `reg` must describe the whole region).
-const GICD_SIZE: u64 = 0x1_0000;
-const GICR_FRAME: u64 = 0x2_0000; // per-vCPU redistributor frame
-
 /// KVM GSI for SPI `spi` (our layout SPI number; INTID = 32 + spi).
 fn spi_gsi(spi: u32) -> u32 {
     const KVM_ARM_IRQ_TYPE_SPI: u32 = 1;
@@ -176,26 +171,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
     };
 
-    // Placement (QEMU virt values; the DTB and KVM must agree). Under v3 the
-    // redistributor region spans one 128 KiB frame per vCPU; under v2 the CPU
-    // interface is a single fixed window shared by every vCPU.
-    let gic = match version {
-        GicVersion::V3 => GicLayout {
-            version,
-            gicd_base: GicLayout::QEMU_VIRT.gicd_base,
-            gicd_size: GICD_SIZE,
-            gicr_base: GicLayout::QEMU_VIRT.gicr_base,
-            gicr_size: u64::from(num_cpus) * GICR_FRAME,
-        },
-        GicVersion::V2 => GicLayout::QEMU_VIRT_V2,
-    };
-    if version == GicVersion::V2 && num_cpus > GicLayout::V2_MAX_CPUS {
-        return Err(format!(
-            "this host offers only vGICv2, which supports at most {} vCPUs (asked for {num_cpus})",
-            GicLayout::V2_MAX_CPUS
-        )
-        .into());
-    }
+    // Placement (QEMU virt values; the DTB and KVM must agree). Sizing and the
+    // v2 vCPU cap both live in `for_vcpus`, so they are unit-testable on a host
+    // with no KVM at all.
+    let gic = GicLayout::for_vcpus(version, num_cpus)?;
     eprintln!(
         "[hvi/kvm] {num_cpus} vCPU(s)  {:?}  GICD {:#x}+{:#x}  {} {:#x}+{:#x}",
         version,
