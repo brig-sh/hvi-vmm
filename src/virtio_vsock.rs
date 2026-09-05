@@ -33,8 +33,9 @@ use std::os::unix::net::UnixStream;
 use crate::guestmem::GuestRam;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
-const VIRTIO_VSOCK_ID: u64 = 19;
-const F_VERSION_1_HI: u32 = 1;
+const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
+/// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
+const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
 
 pub const HOST_CID: u64 = 2;
 pub const GUEST_CID: u64 = 3;
