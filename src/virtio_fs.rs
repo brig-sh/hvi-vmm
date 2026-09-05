@@ -26,7 +26,6 @@
 //! an immutable OCI cache to remain protected while an instance-owned APFS
 //! clone or an explicit volume is exported without a block image.
 
-use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -35,7 +34,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirEntryExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::config::CachePolicy;
 use crate::guestmem::GuestRam;
@@ -336,16 +335,27 @@ pub struct VirtioFs {
     /// Bitmask of queue indices notified since the last drain: bit `i` set
     /// means queue `i` had a `QUEUE_NOTIFY` land on it. Set by the vCPU
     /// thread in `mmio`, cleared by `take_notified`/`drain_notified`, which
-    /// only the worker thread calls. Both sides only ever touch it with the
-    /// device mutex held (this struct sits behind `Arc<Mutex<VirtioFs>>` in
-    /// `machine_macos`), so a plain `u32` is enough -- no atomic needed. A
-    /// notify that lands while the worker is mid-drain just sets a bit the
-    /// worker's next `take_notified` in the same drain pass will see (this
-    /// field is a bitmask, not a count, so a queue notified twice before a
-    /// drain still only costs one `process_queue` call); the worker's
-    /// post-drain recheck (see `spawn_fs_worker`) is what catches a notify
-    /// that lands after the drain but before the worker parks again.
-    notified: u32,
+    /// only the worker thread calls.
+    ///
+    /// This was a plain `u32`, and it was sound only because every caller
+    /// held the device mutex. #32 has to stop holding that mutex across a
+    /// syscall that blocks, and the moment it does, two threads reach this
+    /// field at once and a plain `u32` is a data race the compiler says
+    /// nothing about. Making it atomic is independent of that work and
+    /// correct either way, so it goes first.
+    ///
+    /// The orderings carry the notify itself. The vCPU fills the descriptor
+    /// table and the avail ring before it sets a bit, so the set is a
+    /// release; the worker must not see the bit before those writes, so the
+    /// take is an acquire.
+    ///
+    /// A notify that lands while the worker is mid-drain just sets a bit the
+    /// worker's next `take_notified` in the same drain pass will see. This is
+    /// a bitmask, not a count, so a queue notified twice before a drain still
+    /// costs one `process_queue` call. The worker's post-drain recheck (see
+    /// `spawn_fs_worker`) catches a notify that lands after the drain but
+    /// before the worker parks again.
+    notified: AtomicU32,
     nodes: HashMap<u64, Node>,
     inode_ids: HashMap<(u64, u64), u64>,
     next_node: u64,
@@ -376,9 +386,14 @@ pub struct VirtioFs {
     /// Both direct paths fall back to the buffered one by returning `None`,
     /// which is correct but indistinguishable from the fast path by result
     /// alone -- so without a counter a regression that disables zero-copy
-    /// entirely still passes every behavioural test. `Cell` because
-    /// `read_direct` only needs `&self`.
-    zero_copy: Cell<(u64, u64)>,
+    /// entirely still passes every behavioural test.
+    ///
+    /// Atomic for the same reason as `notified`: a `Cell` is sound only while
+    /// one mutex serializes every caller, and #32 removes that. These are
+    /// diagnostics rather than a synchronisation signal -- nothing reads them
+    /// to decide anything -- so relaxed is enough.
+    zero_copy_reads: AtomicU64,
+    zero_copy_writes: AtomicU64,
     /// Directory descriptors for resolving without paths (#30). Read
     /// operations resolve through this; the rest of the device still joins
     /// path strings and moves over a stage at a time.
@@ -441,7 +456,7 @@ impl VirtioFs {
             queue_sel: 0,
             queues: std::array::from_fn(|_| Queue::default()),
             interrupt_status: 0,
-            notified: 0,
+            notified: AtomicU32::new(0),
             nodes,
             inode_ids,
             next_node: FUSE_ROOT_ID + 1,
@@ -451,7 +466,8 @@ impl VirtioFs {
             dir_handles: HashMap::new(),
             next_handle: 1,
             next_tmpfile: 1,
-            zero_copy: Cell::new((0, 0)),
+            zero_copy_reads: AtomicU64::new(0),
+            zero_copy_writes: AtomicU64::new(0),
             dirs,
         })
     }
@@ -459,17 +475,18 @@ impl VirtioFs {
     /// `(reads, writes)` served zero-copy since boot.
     #[cfg(test)]
     fn zero_copy_counts(&self) -> (u64, u64) {
-        self.zero_copy.get()
+        (
+            self.zero_copy_reads.load(Ordering::Relaxed),
+            self.zero_copy_writes.load(Ordering::Relaxed),
+        )
     }
 
     fn note_zero_copy_read(&self) {
-        let (r, w) = self.zero_copy.get();
-        self.zero_copy.set((r + 1, w));
+        self.zero_copy_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     fn note_zero_copy_write(&self) {
-        let (r, w) = self.zero_copy.get();
-        self.zero_copy.set((r, w + 1));
+        self.zero_copy_writes.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -513,7 +530,7 @@ impl VirtioFs {
                     }
                 }
                 reg::QUEUE_NOTIFY if (v as usize) < NUM_QUEUES => {
-                    self.notified |= 1 << v;
+                    self.notified.fetch_or(1 << v, Ordering::Release);
                 }
                 reg::INTERRUPT_ACK => self.interrupt_status &= !v,
                 reg::STATUS => self.status = v,
@@ -589,7 +606,7 @@ impl VirtioFs {
     /// Only `drain_notified` calls this; kept separate so a test can
     /// observe the bitmask `mmio` left behind without also draining it.
     pub(crate) fn take_notified(&mut self) -> u32 {
-        std::mem::take(&mut self.notified)
+        self.notified.swap(0, Ordering::Acquire)
     }
 
     /// Drains every queue flagged by a `QUEUE_NOTIFY` since the last drain.
@@ -620,7 +637,7 @@ impl VirtioFs {
             if mask & (1 << idx) != 0 && self.process_queue_bounded(mem, idx, budget) {
                 // Re-flag: the queue still has chains the budget did not
                 // cover, and `take_notified` has already cleared the bit.
-                self.notified |= 1 << idx;
+                self.notified.fetch_or(1 << idx, Ordering::Release);
                 remaining = true;
             }
         }
