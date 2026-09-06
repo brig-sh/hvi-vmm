@@ -36,7 +36,30 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
+      # On a pull request the suite runs plainly. On a push to main it runs
+      # once under llvm-cov instead, which produces the same pass or fail plus
+      # the profile the coverage badge reads. Only main publishes that number,
+      # so a pull request does not pay for the instrumentation.
       - run: cargo test
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+      - name: Install cargo-llvm-cov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-llvm-cov
+      - name: Test and measure coverage
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo llvm-cov --locked --lcov --output-path lcov.info
+      # Renders the README badge and the per-file view on codecov.io. Never
+      # fails the run: a coverage service that cannot be reached is not a
+      # reason to call a green commit broken.
+      - name: Upload coverage to Codecov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
 
   # The seccomp filters, proved without a hypervisor. `seccomp-selftest`
   # installs the allowlists that actually ship in child processes and checks
