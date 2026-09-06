@@ -19,3 +19,8 @@ jobs:
   build-and-test:
     name: Build and test
     uses: ./.github/workflows/build-and-test.yml
+    # A called workflow gets none of the caller's secrets unless told, and the
+    # coverage upload in it reads CODECOV_TOKEN. Without this the upload runs
+    # tokenless, never fails, and the badge stays at "unknown" with nothing in
+    # the log to say why.
+    secrets: inherit

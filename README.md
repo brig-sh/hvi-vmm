@@ -1,5 +1,10 @@
 # hvi
 
+[![CI](https://github.com/brig-sh/hvi-vmm/actions/workflows/main-build-and-verify.yml/badge.svg)](https://github.com/brig-sh/hvi-vmm/actions/workflows/main-build-and-verify.yml)
+[![Coverage](https://codecov.io/gh/brig-sh/hvi-vmm/graph/badge.svg)](https://codecov.io/gh/brig-sh/hvi-vmm)
+[![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbrig-sh%2Fhvi-vmm%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)](rust-toolchain.toml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A small microVMM for **Linux guests** (arm64 and x86-64), and the substrate
 brig runs its sandboxes on, with three host backends behind one CLI:
 
