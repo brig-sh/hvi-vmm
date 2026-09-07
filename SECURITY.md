@@ -17,15 +17,13 @@ cannot use GitHub for some reason, mail <ananos@nofire.ai> instead.
 What to expect:
 
 - We aim to acknowledge a report within three working days.
-- We will tell you whether we consider it in scope, and why, rather than going
-  quiet.
+- We will tell you whether we consider it in scope, and why.
 - If it is a real vulnerability we fix it on `main` first, publish a GitHub
   Security Advisory, and request a CVE through GitHub as the numbering
   authority.
 - We are happy to credit you in the advisory. Tell us how you want to be named.
 
-There is no bounty programme. We are a small team and we would rather be honest
-about that than imply otherwise.
+There is no bounty programme.
 
 ## What is in scope
 

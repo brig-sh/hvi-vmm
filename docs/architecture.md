@@ -18,9 +18,9 @@ selected at compile time by target triple:
 
 | Guest arch | Host | Backend module | Hypervisor API | Live status |
 | --- | --- | --- | --- | --- |
-| aarch64 | macOS / Apple silicon | `machine_macos.rs` | Hypervisor.framework (`applevisor`) | boots + benchmarked |
-| aarch64 | Linux | `machine_linux.rs` | KVM (`kvm-ioctls`) | boots to userspace + SMP |
-| x86-64 | Linux | `machine_x86.rs` | KVM (`kvm-ioctls`) | boots to userspace + virtio-blk/net + SMP |
+| aarch64 | macOS / Apple silicon | `machine_macos.rs` | Hypervisor.framework (`applevisor`) | boots + benchmarked; virtio-fs shares; live in CI |
+| aarch64 | Linux | `machine_linux.rs` | KVM (`kvm-ioctls` 0.25) | boots to userspace + SMP + tap; live in CI on vGICv2 and vGICv3 hosts |
+| x86-64 | Linux | `machine_x86.rs` | KVM (`kvm-ioctls` 0.25) | boots to userspace + virtio-blk/net + SMP; live in CI on a KVM host |
 
 The design point is that **only the `machine_*` modules differ**. Boot-image
 parsing, the guest memory layout, the virtio device models, the event ledger
@@ -31,7 +31,7 @@ the shared device dispatch.
 ```mermaid
 flowchart TB
     subgraph host["Host process (hvi)"]
-        cli["main.rs — CLI: boot / dump-fdt / smoke<br/>parses flags → BootConfig"]
+        cli["main.rs — CLI: boot / dump-fdt / smoke / selftests<br/>parses flags → BootConfig"]
         subgraph backend["machine::boot(BootConfig) → Stop  (one of three, cfg-selected)"]
             direction LR
             m1["machine_macos.rs<br/>Hypervisor.framework"]
@@ -41,9 +41,10 @@ flowchart TB
         subgraph shared["Shared, host-neutral core"]
             direction LR
             boot_["boot / boot_x86<br/>layout / layout_x86<br/>fdt / mptable"]
-            dev["virtio / virtio_net<br/>virtio_vsock<br/>pl011 / uart16550"]
-            obs["plugin: the seam<br/>plugins · events ledger"]
-            gm["guestmem: GuestRam"]
+            dev["virtio / virtio_net / tap<br/>virtio_vsock / virtio_fs<br/>pl011 / uart16550 / rtc_cmos"]
+            obs["plugin: the seam<br/>plugins · events ledger<br/>quiesce"]
+            conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
+            gm["guestmem: GuestRam<br/>sharedmem: memfd / POSIX shm"]
         end
         cli --> backend
         backend --> shared
@@ -73,9 +74,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
 `BootConfig` (`config.rs`) carries the kernel/initramfs bytes, `mem_bytes`,
-`cmdline`, device requests (`disk`, `net`, `net_gateway`, `agent_sock`),
-`vcpus`, the ledger sink (`events`, `sandbox_id`), and an optional `plugin`
-(§6).
+`cmdline`, device requests (`disk`, `net`, `net_gateway`, `net_tap`, `net_mac`,
+`agent_sock`, `fs_shares` with a `ShareMode` and `CachePolicy` each, `fs_uid`,
+`fs_gid`), `vcpus`, the ledger sink (`events`, `sandbox_id`), the `sandbox`
+switch, and an optional `plugin` (§6).
 `Stop` is `enum { SystemOff, SystemReset }` — how the guest asked to halt.
 
 On any other host triple the crate builds to a small stub, so the workspace and
@@ -91,12 +93,20 @@ flowchart LR
     subgraph neutral["Host- & arch-neutral"]
         config["config.rs — BootConfig / Stop"]
         guestmem["guestmem.rs — GuestRam (Send+Sync raw-ptr, scan)"]
+        sharedmem["sharedmem.rs — memfd / POSIX-shm guest RAM"]
         virtio["virtio.rs — mmio transport, Queue, VirtioBlk"]
         vnet["virtio_net.rs — user stack + gateway relay + SNI"]
+        tap["tap.rs — vnet-header framing, tap attach (Linux)"]
         vsock["virtio_vsock.rs — agent exec bridge"]
         plugin["plugin.rs — Plugin / VmHandle / CpuHandle / IoSink"]
         plugins["plugins.rs — memory dump, I/O trace"]
+        quiesce["quiesce.rs — park every vCPU at a safe point"]
+        sync["sync.rs — lock_or_recover"]
         events["events.rs — RawEvent NDJSON ledger"]
+    end
+    subgraph confine["Confinement (per host)"]
+        sandbox["sandbox.rs — Seatbelt profile + selftest (macOS)"]
+        seccomp["seccomp.rs — seccomp-bpf filters + selftest (Linux)"]
     end
     subgraph arm["aarch64 guest support"]
         boot["boot.rs — Arm64Image parse"]
@@ -104,12 +114,15 @@ flowchart LR
         fdt["fdt.rs — devicetree builder"]
         pl011["pl011.rs — PL011 UART"]
         esr["esr.rs — ESR_EL2 decode"]
+        vfs["virtio_fs.rs — FUSE server over virtio-mmio (macOS)"]
+        fdlimit["fdlimit.rs — raise RLIMIT_NOFILE"]
     end
     subgraph x86mods["x86-64 guest support"]
         bootx["boot_x86.rs — bzImage + boot_params + e820"]
         layoutx["layout_x86.rs — memory map"]
         mptable["mptable.rs — Intel MP table"]
-        uart["uart16550.rs — 16550 COM1"]
+        uart["uart16550.rs — COM1, vm-superio Serial"]
+        rtc["rtc_cmos.rs — MC146818 CMOS RTC"]
     end
     subgraph backends["Backends (one compiled)"]
         macos["machine_macos.rs (+ smoke.rs)"]
@@ -120,21 +133,38 @@ flowchart LR
     linux --- arm
     x86 --- x86mods
     backends --- neutral
+    backends --- confine
 ```
 
 - **Neutral** modules compile and unit-test on every host.
-- **aarch64 support** (`boot`, `layout`, `fdt`, `pl011`, `esr`) is used by both
-  the macOS and Linux/arm64 backends; it is inert (dead code) on x86.
-- **x86-64 support** (`boot_x86`, `layout_x86`, `mptable`, `uart16550`) is used
-  only by `machine_x86`.
+- **aarch64 support** (`boot`, `layout`, `fdt`, `pl011`, `esr`, `fdlimit`) is
+  compiled for both the macOS and Linux/arm64 backends and gated off x86.
+  `virtio_fs` is gated to macOS.
+- **x86-64 support** (`boot_x86`, `layout_x86`, `mptable`, `uart16550`,
+  `rtc_cmos`) is used only by `machine_x86`.
+- **Confinement** is per host: `sandbox` (Seatbelt) on macOS, `seccomp` on
+  Linux. Each carries the selftest the CLI exposes.
 - The three `machine_*.rs` files are the only real backend split. `smoke.rs` is a
-  macOS-only M0 hvf sanity test (single page, `HVC #0`).
+  macOS-only M0 hvf sanity test (single page, `HVC #0`); `smoke --shm` runs it
+  over shared guest RAM.
+- `used_ring_litmus.rs` is a `#[cfg(test)]`, `#[ignore]`d concurrency test for
+  the used-ring publish; CI runs it weekly on arm64.
+
+Feature bits, device ids, the virtio-mmio register map and the
+`virtio_net_hdr_v1` length come from `virtio-bindings` (bindgen output from
+the kernel headers), re-exported under hvi's names as `u64` for the MMIO
+dispatch. The vsock op codes, packet header and CIDs are hvi's own.
 
 `GuestRam` (`guestmem.rs`) is what makes the device models host-neutral: a
-`Send + Sync` accessor over the host's guest-RAM mapping (the `applevisor`
-allocation on macOS, the `mmap` region registered with KVM on Linux) offering
-`read*/write*`, a physical `scan()`, and bounds-checked `offset()`. Every device
-reads and writes guest memory only through it.
+`Send + Sync` accessor over the host's guest-RAM mapping offering
+`read*/write*`, a physical `scan()`, bounds-checked `offset()`, and `host_ptr`,
+a bounds-checked raw pointer for the iovec paths (it replaced a `&mut [u8]`
+borrow that a guest could alias by pointing two descriptors at one address).
+Every device reads and writes guest memory only through it. The mapping is
+allocated by `sharedmem.rs` from a memfd on Linux or a POSIX shared-memory
+object on macOS (mapped with `hv_vm_map` on hvi's own pointer), unlinked from
+the namespace once mapped, so an out-of-process tool handed the descriptor
+can map the same pages read-only and nothing else can open them by name.
 
 ---
 
@@ -169,7 +199,7 @@ EL1.
 | virtio-blk | `0x0200_0000` (size `0x200`) | SPI 2 → INTID 34 |
 | virtio-net | `0x0200_0200` | SPI 3 → INTID 35 |
 | virtio-vsock | `0x0200_0400` | SPI 4 → INTID 36 |
-| virtio-fs | `0x0200_0600` | SPI 5 → INTID 37 |
+| virtio-fs (share `i`) | `0x0200_0600 + i * 0x200` | SPI 5 + `i` → INTID 37 + `i` |
 | GIC distributor | `0x0800_0000` (size `0x1_0000`) | — |
 | GIC redistributor | `0x080A_0000` (per-vCPU frame) | — |
 | kernel / dtb / initrd | packed up from RAM base | — |
@@ -244,7 +274,7 @@ line changed, inject it.
 sequenceDiagram
     participant G as Guest vCPU
     participant B as Backend run loop
-    participant D as Device (blk/net/vsock)
+    participant D as Device (blk/net/vsock/fs)
     participant M as GuestRam
     participant L as Event ledger
     G->>B: MMIO/PIO exit @ device window
@@ -266,37 +296,127 @@ Interrupt injection is the one device-facing thing that differs by backend:
 - **virtio-blk** (`virtio.rs`, device id 2) — backs `--disk`; advertises
   `VIRTIO_BLK_F_FLUSH` and honours flush with a real `sync_data()`. Every
   request emits a `block` boundary event (LBA, length, r/w).
-- **virtio-net** (`virtio_net.rs`, device id 1) — two modes:
+- **virtio-net** (`virtio_net.rs`, device id 1) — three modes:
   - *Built-in user-space stack* (`--net`): no `vmnet`, no entitlement. Answers
     ARP/ICMP/DHCP (guest `10.0.2.15`, gw `10.0.2.2`, DNS `10.0.2.3`) and resolves
-    DNS through the host, capturing the queried name.
+    DNS through the host, capturing the queried name. A DNS question that ends
+    before its type and class is refused.
   - *Gateway relay* (`--net-gateway <sock>`): `VirtioNet::with_gateway` connects
     a Unix socket to an external gvisor-tap process and relays frames with a
-    4-byte big-endian length prefix (QEMU stream protocol). A
-    `spawn_net_gateway_reader` thread pumps gateway→guest frames and raises the
-    net IRQ.
+    4-byte big-endian length prefix (QEMU stream protocol); the gateway's own
+    DHCP/DNS/NAT give the guest `10.87.0.2` with `10.87.0.1` as gateway and
+    DNS. A `spawn_net_gateway_reader` thread pumps gateway→guest frames and
+    raises the net IRQ. An unreachable socket logs a warning and falls back to
+    the built-in stack.
+  - *Tap* (`--net-tap <dev>`, Linux only): attaches to an existing tap with
+    `IFF_VNET_HDR` and no offloads (`tap.rs`), so each frame carries an
+    all-zero `virtio_net_hdr_v1`. The tap is created and bridged by whoever
+    owns the network namespace (urunc, in brig's case); hvi only opens it. A
+    tap that cannot be opened fails the boot and names the interface. macOS
+    refuses the flag. `--net-mac` sets the guest MAC in every mode.
   - Either way, `observe_tx` parses **TLS SNI** out of the ClientHello and
     every flow emits a `net` boundary event (five-tuple, direction, bytes, SNI/DNS).
+    The frame a transmit chain may assemble is bounded.
 - **virtio-vsock** (`virtio_vsock.rs`, device id 19) — the exec channel. With
   `--agent-sock`, `spawn_vsock_bridge` stands up a host `UnixListener`; each
   accept opens a vsock stream to the guest agent (host CID 2, guest CID 3, port
   1024), relaying bytes both ways and raising the vsock IRQ.
-- **virtio-fs** (`virtio_fs.rs`, device id 26, macOS arm64) — exports one
-  canonical host directory per repeated `--share-ro <path> <tag>` or
-  `--share-rw <path> <tag>`. HVI answers
-  the guest's FUSE messages directly over hiprio + request virtqueues; no macFUSE
-  mount, block image, or DAX window is involved. Lookup, attributes, links,
-  directory traversal and reads are supported, and real host file handles keep
-  open files valid across rename/unlink. Writable exports add create, write,
-  truncate, metadata and xattr updates, locks, allocation, seek/copy, directory
-  handles/readdirplus, atomic rename variants, tmpfiles, removal and sync;
-  read-only exports return `EROFS` for mutations. Writable exports advertise
-  zero cache timeouts for coherence with concurrent host edits. Guest root is
-  mapped to the macOS uid/gid running HVI. Seatbelt independently grants
-  `file-read*` or `file-read* file-write*` only below each exported subtree.
+- **virtio-fs** (`virtio_fs.rs`, device id 26, macOS arm64) — one device per
+  repeated `--share-ro <path> <tag>` or `--share-rw <path> <tag>`, at
+  `virtio_fs_base(i)` / `virtio_fs_spi(i)`. hvi answers the guest's FUSE
+  messages directly over a hiprio and a request virtqueue; no macFUSE mount,
+  block image, DAX window or indirect descriptors. Lookup, attributes, links,
+  directory traversal, reads, `READLINK`, `ACCESS`, `STATFS`, `STATX` and
+  `FORGET`/`BATCH_FORGET` are served on every share; real host file handles
+  keep open files valid across rename/unlink. Writable exports add create,
+  write, truncate, metadata and xattr updates, OFD locks, allocation,
+  seek/copy_file_range, directory handles/readdirplus, atomic rename variants,
+  tmpfiles, FIFOs, Unix sockets (held in the device, never on the host),
+  removal and sync; read-only exports return `EROFS` for mutations.
+  - *Resolution by descriptor.* Every host operation is relative to the
+    parent directory's descriptor with `O_NOFOLLOW` on each component
+    (`openat`, `fstatat`, `mkdirat`, `symlinkat`, `unlinkat`, `linkat`,
+    `renameat`/`renameatx_np`, `readlinkat`, `faccessat`, `fstatvfs`,
+    `fsetxattr`/`fgetxattr` on an `O_SYMLINK` descriptor for a link's own
+    attributes). Containment follows from how the descriptor was obtained;
+    no path string is resolved host-side afterwards, and clippy's
+    `disallowed-methods` refuses `canonicalize` in the device. A symlink
+    stored in a share is resolved the guest's way: an absolute target restarts
+    at the export root, a relative one continues from where it was found, a
+    climbing target is clamped at the root, and a cycle ends as `ELOOP`.
+    Descriptors are cached per relative path (LRU, root pinned); removals and
+    renames invalidate the path and everything beneath it; `cache=none`
+    bypasses the cache.
+  - *Cache policy.* Per share, `cache=auto|always|none`. `auto` (default)
+    advertises a one-second attribute and entry timeout and keeps the page
+    cache across opens, with `FUSE_AUTO_INVAL_DATA`; `none` advertises zero
+    timeouts; `always` adds the writeback cache. `FUSE_PARALLEL_DIROPS` is
+    negotiated.
+  - *Ownership.* Linux mode, uid, gid and device numbers live in a private
+    host xattr under `com.nofire.hvi.`, cached per node and dropped when a new
+    path resolves to an already-known inode (inode reuse or a new hard link).
+    The host inode keeps owner access for the VMM. `--fs-uid`/`--fs-gid`
+    (default 0) map the host user to a guest identity in both directions.
+  - *Dispatch.* Each device has a worker thread. `mmio` records the notified
+    queue in a bitmask; the vCPU drains up to an inline budget of chains in
+    the exit and wakes the worker for the rest, which raises the SPI once per
+    pass under the device mutex and kicks the vCPUs. `READ` and `WRITE` use
+    `preadv`/`pwritev` over iovecs built from `GuestRam::host_ptr` when the
+    declared size matches the descriptors; otherwise the buffered handler
+    re-validates. `notified` and the zero-copy counters are atomics.
+  - *Host resources.* `fdlimit` raises the soft `RLIMIT_NOFILE` to the hard
+    limit at startup. An export refuses `OPEN` past its budget (the process
+    limit less a reserve of 128) with `ENFILE`, and reports its peak handle
+    count on a clean stop. A node holds at most sixteen alias paths. Host
+    errnos are named to the guest instead of collapsing to `EIO`. `OPEN`
+    refuses anything but a regular file, because opening a FIFO under the
+    device mutex blocked the VM.
+  - *Confinement.* Seatbelt independently grants `file-read*` or
+    `file-read* file-write*` only below each exported subtree, by the resolved
+    root path.
 
 The serial console is a **PL011** (`pl011.rs`, MMIO) on arm64 and a **16550**
-(`uart16550.rs`, PIO `0x3f8`) on x86.
+(`uart16550.rs`, PIO `0x3f8`) on x86. The x86 one wraps `vm-superio`'s
+`Serial`, which is edge-triggered; hvi drives COM1 as a level line, so the
+wrapper computes the level from the interrupt conditions (received data
+enabled and a byte waiting, or THR-empty enabled), not from the IIR, which
+`vm-superio` clears on read. The guest now detects a `U6_16550A` with a FIFO
+where the hand-rolled device presented a `16450`.
+
+### Used-ring ordering
+
+`Queue::push_used` writes the used element and then the index. Completions
+happen on worker threads (virtio-fs, virtio-net delivery, vsock RX) while the
+guest runs on another core, so the publish carries a release fence per drain
+pass: free on x86, `dmb` on arm64. Without it an arm64 guest observed the
+bumped index before the element and broke its virtqueue ("id 65 is not a
+head!"). `used_ring_litmus.rs` drives the real `push_used` against a consumer
+that behaves like the driver; it demonstrates the defect and the fix but does
+not reliably catch a regression, so it is `#[ignore]`d and run weekly.
+
+Every descriptor-chain walker (`handle_chain`, `read_tx_frame`, `read_tx`)
+refuses an index outside the ring and caps the walk at the ring size, so a
+cycle runs out of budget. Re-programming any queue register clears `ready`.
+
+### Confinement
+
+The VMM confines itself before it services guest I/O: a Seatbelt profile on
+macOS (`sandbox.rs`), two seccomp-bpf allowlists on Linux (`seccomp.rs`,
+`resources/seccomp/{x86_64,aarch64}.json` in seccompiler's schema, `vcpu` and
+`vmm` per thread). Both are on by default, `--no-sandbox` turns them off, and
+`HVI_SECCOMP=log` on Linux records mismatches instead of trapping. Each has a
+selftest subcommand that installs the shipped profile or filters and probes
+both directions; CI runs them on the hosted runners.
+
+### Failure handling (macOS backend)
+
+Every path that ends the run loop calls `stop_all`, which also releases the
+quiesce so no vCPU stays parked. The vCPU loop runs under `catch_unwind`; a
+panic reports the vCPU, its last exit reason (from a thread-local written once
+per exit) and its program counter, then stops the VM. Device and ledger
+mutexes go through `sync::lock_or_recover`, which takes a poisoned lock: the
+panic that poisoned it is reported where it happened, once. The Linux and x86
+backends still use `.lock().unwrap()`.
 
 ---
 
@@ -311,9 +431,10 @@ tests:
 {"sandbox_id":"hvi","ts":…,"provenance":"boundary","source":"net","payload":{"five_tuple":{…},"direction":"egress","guest_initiated":true,"bytes":72,"sni":"example.com"}}
 ```
 
-`--events <path>` sinks the ledger. Because hvi *is* the virtio backend, these
-are observed rather than reported: the guest cannot decline to be seen at a
-device it has to use, and nothing in the guest has to cooperate.
+`--events <path>` sinks the ledger, and the ledger is drained on a cadence, not
+only at exit. Because hvi *is* the virtio backend, these are observed, not
+reported: the guest cannot decline to be seen at a device it has to use, and
+nothing in the guest has to cooperate.
 
 ---
 
@@ -362,13 +483,19 @@ x86 never lands at all.
 
 | What | Where | Notes |
 | --- | --- | --- |
-| Portable core (fmt/clippy/unit tests) | `ubuntu-latest` | backend-agnostic modules; runs anywhere |
-| Linux/arm64 backend | `ubuntu-latest` (cross `cargo check` + clippy) | no arm64 runner; live boot needs an arm64/KVM host |
-| macOS/hvf backend | `macos-15` | builds + tests + ad-hoc signs (needs macOS 15 `hv_gic_*`) |
-| x86 live boot (+ SMP) | `ubuntu-latest` (`/dev/kvm`) | boots to the userspace/VFS gate, asserts 2 vCPUs online |
-| arm64 live boot | self-hosted arm64 runners | boots to userspace on hvf and on KVM |
+| Portable core (fmt/reflow/clippy/rustdoc/unit tests) | `ubuntu-latest` | reflow on the nightly pinned in `pins.env` |
+| Workflow lint, dependency audit | `ubuntu-latest` | actionlint + shellcheck; `cargo deny check` |
+| seccomp selftest | `ubuntu-latest` | x86-64 filters, no KVM needed |
+| Linux/arm64 backend | `ubuntu-latest` (cross clippy + rustdoc) | unit tests of the arm64-Linux modules run nowhere |
+| macOS/hvf backend | `macos-15` | build, test, ad-hoc sign, Seatbelt selftest |
+| x86 live boot (+ SMP) | self-hosted x86 runner with `/dev/kvm` | userspace/VFS gate, 2 vCPUs online; skips with a warning without KVM |
+| arm64/hvf live boot | self-hosted Apple silicon | `smoke`, `smoke --shm`, boot to userspace |
+| arm64/KVM live boot | self-hosted arm64, vGICv2 (`nbfc`) and vGICv3 (`gicv3`) | aarch64 seccomp selftest, boot, tap boot when a tap can be created, unusable-tap refusal |
+| virtio-fs perf gate | self-hosted Apple silicon, same-repo PRs | `tools/perf-gate.sh`: host ops equal, time within 1.5x of the merge base |
+| Scheduled | `ubuntu-latest`, self-hosted arm64 | weekly `cargo deny`, weekly used-ring litmus, monthly reflow-nightly drift; each files a tracking issue |
 
-The GitHub-hosted x86 `ubuntu-latest` runners expose `/dev/kvm` (nested virt), so
-the x86 live boot actually runs in CI. GitHub-hosted arm64 runners do **not**
-expose KVM, so both arm64 backends are compile-checked in CI and boot-tested on
-self-hosted runners.
+The self-hosted lanes are withheld from pull requests opened from a fork. No
+GitHub-hosted arm64 runner exposes `/dev/kvm`, and a live macOS boot needs the
+entitlement on an interactive host, so the live boots run on runners the
+project owns. Every job has a `timeout-minutes` cap and the boot jobs upload
+logs and the ledger on failure.

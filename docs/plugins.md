@@ -114,8 +114,18 @@ wrong the rest of it is.
 
 Note that guest RAM is not necessarily one span. The x86 backend puts a hole in
 it for MMIO, so `ram_regions()` returns two. A tool that assumes one region
-reads nothing above the hole and looks like it found an empty guest, rather than
-like it has a bug.
+reads nothing above the hole and looks like it found an empty guest instead of
+looking like it has a bug.
+
+Guest RAM is allocated from a memfd on Linux and a POSIX shared-memory object
+on macOS (`sharedmem.rs`), unlinked once mapped, so `ram_fd()` is a descriptor
+another process can map. `hvi smoke --shm` proves that path on macOS.
+
+**A panic in a hook stops the VM.** On the macOS backend the vCPU loop runs
+under `catch_unwind`: a panic in `attach`, `safepoint` or a sink is reported
+with the vCPU, its last exit reason and program counter, the quiesce is
+released so no vCPU stays parked, and the VM stops. A poisoned device or ledger
+mutex is recovered, not propagated, so the one report names the cause.
 
 ## Shipping one out of tree
 
@@ -127,7 +137,7 @@ hvi = { git = "https://github.com/brig-sh/hvi-vmm", rev = "<commit>" }
 ```
 
 and ship its own binary with its own CLI, constructing a `BootConfig` and
-calling `hvi::machine::boot`. Pin a fixed point rather than a branch:
+calling `hvi::machine::boot`. Pin a fixed point, not a branch:
 `hvi --version` reports the VMM core a binary was built against, and that is
 only worth printing if the core is a fixed thing. No tag is published yet, so
 the example pins a `rev`; make it a `tag` once the first one is cut.
