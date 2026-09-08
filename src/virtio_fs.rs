@@ -1210,7 +1210,18 @@ impl VirtioFs {
             #[cfg(target_os = "macos")]
             {
                 if !current_meta.is_symlink() {
-                    let host_mode = host_creation_mode(new_mode, current_meta.is_dir());
+                    // The host copy of a setuid or setgid bit is left exactly
+                    // as found. The guest-visible mode lives in the private
+                    // xattr, so the host bit carries no meaning here, and an
+                    // image unpacked with its setuid bits intact (every
+                    // /usr/bin/passwd, su and sudo) has them on the host.
+                    // Clearing such a bit is a distinct seatbelt operation,
+                    // file-write-setugid, which the sandbox profile does not
+                    // grant: fchmodat fails with EPERM and every chmod the
+                    // guest makes on the file fails with it, dpkg's
+                    // chmod-before-unlink of the old binary included.
+                    let host_mode = host_creation_mode(new_mode, current_meta.is_dir())
+                        | (current_meta.mode() & 0o6000);
                     if let Some(handle) = handle {
                         handle
                             .file
@@ -6927,6 +6938,30 @@ mod tests {
         assert_eq!(meta.mtime(), 1_700_000_002);
         assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 68), Some(0));
         assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 72), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn setattr_leaves_host_setugid_bits_alone() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("etc/passwd-bin"), b"x").unwrap();
+        fs::set_permissions(dir.join("etc/passwd-bin"), Permissions::from_mode(0o4755)).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let node = lookup_node(&mut dev, etc, b"passwd-bin");
+        let mut input = vec![0u8; 88];
+        input[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+        input[68..72].copy_from_slice(&0o600u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        // The guest sees the mode it asked for; the host keeps its setuid bit.
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 60).unwrap() & 0o7777,
+            0o600
+        );
+        let host = fs::metadata(dir.join("etc/passwd-bin")).unwrap().mode();
+        assert_eq!(host & 0o6000, 0o4000);
+        assert_eq!(host & 0o777, 0o600);
         let _ = fs::remove_dir_all(dir);
     }
 
