@@ -5,7 +5,9 @@
 	<!-- Required for any Hypervisor.framework use (hv_vm_create et al). -->
 	<key>com.apple.security.hypervisor</key>
 	<true/>
-	<!-- M2 adds the vmnet-backed virtio-net backend; uncomment then.
+	<!-- Not needed: virtio-net runs a user-space stack, a gvisor-tap relay or a
+	     Linux tap, none of which touches vmnet. Uncomment only for a vmnet
+	     backend, which would also need a Developer ID signature.
 	<key>com.apple.vm.networking</key>
 	<true/>
 	-->

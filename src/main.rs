@@ -155,7 +155,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected `boot`, `dump-fdt`, `smoke` or `--version`"
+            "unknown subcommand {other:?}; expected `boot`, `dump-fdt`, `smoke`, \
+             `sandbox-selftest`, `seccomp-selftest` or `--version`"
         )
         .into()),
     }
