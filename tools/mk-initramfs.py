@@ -4,13 +4,20 @@
 Transcodes an Alpine aarch64 minirootfs tarball straight into a newc cpio in
 memory -- no root, no `cpio`/`mknod` (macOS can't create device nodes without
 root, and the cpio format carries them as metadata anyway). Injects an `/init`
-that mounts the pseudo-filesystems, prints a userspace banner, and powers off
-via PSCI (there is no PL011 input path yet, so an interactive shell would just
-block).
+that mounts the pseudo-filesystems, configures eth0 for the built-in network
+stack when there is one, prints a userspace banner and drops to a shell on the
+console; hvi feeds host stdin to the guest UART, and Ctrl-] is reserved for
+the plugin request key. When the shell exits, init powers off via PSCI.
 
 Usage:
     tools/mk-initramfs.py [--out target/initramfs.cpio]
                           [--alpine-version 3.20.10] [--cache <dir>]
+                          [--keep-alive SECS] [--net-static ADDR/PLEN,GW]
+
+--keep-alive replaces the shell with a "HVI-INITRAMFS-UP" line, a sleep of
+SECS and a power-off, for an unattended run such as CI. --net-static replaces
+the eth0 block with a static address, a default route via GW and three pings
+of it, for a tap boot where GW is the host side of the tap. CI uses both.
 
 The tarball is fetched once and cached (default: alongside --out).
 """
