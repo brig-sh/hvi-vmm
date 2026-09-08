@@ -7,7 +7,11 @@
 # Usage:
 #   tools/fsbench/run.sh --hvi <binary> --kernel <Image> --busybox <binary> \
 #                        --tree <dir> [--workload walk|write|concurrent] \
-#                        [--cache auto|always|none] [--mem-mib N] [--cpus N]
+#                        [--cache auto|always|none] [--mem-mib N] [--cpus N] \
+#                        [--timeout SECS]
+#
+# --timeout (default 300) kills the VM when the workload has not finished by
+# then; the run then fails for want of a BENCHMARK_END line.
 #
 # --tree is shared read-write as tag "bench" and IS WRITTEN TO (the workloads
 # create and delete files under _scratch). Point it at a copy, not at anything
@@ -45,7 +49,7 @@ while [ $# -gt 0 ]; do
 	--mem-mib) MEM_MIB=$2; shift 2 ;;
 	--cpus) CPUS=$2; shift 2 ;;
 	--timeout) TIMEOUT=$2; shift 2 ;;
-	-h | --help) sed -n '2,28p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done

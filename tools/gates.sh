@@ -16,9 +16,11 @@
 #   typos --config .github/linters/typos.toml
 #                                            validate-commits / check-spelling
 #
-# The last four need tools that the pinned Rust toolchain does not supply.
-# The script skips a check when its tool is absent, and names every skip in
-# the closing line. A run with a skip never reports a plain "ok", because a
+# tidy.sh and cargo test always run. The other four need something the
+# pinned Rust toolchain does not supply: the aarch64 target for the
+# cross-lint, and the cargo-deny, actionlint plus shellcheck, and typos
+# binaries. The script skips a check when its tool is absent, and names
+# every skip in the closing line. A run with a skip never reports a plain "ok", because a
 # reader must not take a skipped check for one that passed.
 #
 # The virtio-fs performance gate (build-and-test / perf-virtiofs) is not in

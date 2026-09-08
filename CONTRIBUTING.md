@@ -19,10 +19,12 @@ missed.
 
 `tools/gates.sh` runs the CI checks a developer machine can run, in one
 command: `tidy.sh --check`, the aarch64 cross-lint, `cargo test`, `cargo deny
-check`, the workflow lint and the spell check. The last four need tools
-outside the pinned toolchain, so each is skipped when its tool is missing and
-every skip is named in the closing line -- the script never reports a bare
-`ok` when something did not run. `--with-perf` adds the virtio-fs performance
+check`, the workflow lint and the spell check. `tidy.sh` and `cargo test`
+always run. The other four need something the pinned toolchain does not
+supply (the `aarch64-unknown-linux-gnu` target, `cargo-deny`, `actionlint`
+plus `shellcheck`, `typos`), so each is skipped when it is missing and every
+skip is named in the closing line -- the script never reports a bare `ok`
+when something did not run. `--with-perf` adds the virtio-fs performance
 gate (`tools/perf-gate.sh`, macOS only), which builds the merge base as well
 as the branch and so costs more than every other check together. The live
 boots, the other host's backend and the commit-message lint stay CI's job.
@@ -145,7 +147,11 @@ commits on `main` verbatim):
 
 `build-and-test.yml`:
 
-- **test-portable**: `cargo test` on x86 Linux.
+- **test-portable**: `cargo test` on x86 Linux. On a push to `main` the
+  suite runs once under `cargo llvm-cov` instead, which gives the same pass
+  or fail plus an lcov profile that is uploaded to Codecov for the README
+  badge; the upload never fails the run. A pull request does not pay for the
+  instrumentation.
 - **seccomp-x86**: `hvi seccomp-selftest` on x86 Linux, which installs the
   shipped filters in child processes and needs no KVM.
 - **build-and-test-macos**: build, test and ad-hoc sign with the entitlement on

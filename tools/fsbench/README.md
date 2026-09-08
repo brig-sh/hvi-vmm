@@ -32,6 +32,10 @@ tools/fsbench/run.sh \
     --workload walk
 ```
 
+`--mem-mib` and `--cpus` size the guest (2048 MiB, 2 vCPUs by default);
+`--timeout <secs>` (default 300) kills the VM if the workload has not
+finished by then, which counts as a failed run.
+
 **A rebuild invalidates the code signature**, and an unsigned binary cannot
 create a VM. Re-sign after every `cargo build`.
 
@@ -76,8 +80,9 @@ results says nothing about the fourth. This predates the inline-budget work
 property of the workload rather than of the dispatch path, and its cause is
 still open. Take at least five samples of that line and compare the *fast*
 mode, or you will attribute a mode flip to whatever you happened to change --
-a sweep of FS_INLINE_BUDGET over 1, 4 and 8 looked like a clear win for 4
-until the sixth sample of 4 came back at 2.03s.
+a sweep of `FS_INLINE_BUDGET` (the per-notify inline drain budget, a
+constant in `src/machine_macos.rs`) over 1, 4 and 8 looked like a clear win
+for 4 until the sixth sample of 4 came back at 2.03s.
 
 ## Interpreting
 

@@ -25,7 +25,7 @@ brig run the same workload on either host without the guest noticing.
 
 ```
 src/
-  main.rs                     CLI (boot | dump-fdt | smoke | sandbox-selftest | seccomp-selftest)
+  main.rs                     CLI (boot | dump-fdt | smoke | sandbox-selftest | seccomp-selftest | version)
   config.rs                   BootConfig / Stop / FsShare / CachePolicy (shared by all backends)
   machine_macos.rs            Hypervisor.framework backend (macOS + aarch64)
   machine_linux.rs            KVM backend (Linux + aarch64)
@@ -39,13 +39,14 @@ src/
   virtio.rs                   virtio-mmio transport, Queue, virtio-blk
   virtio_net.rs tap.rs        virtio-net: user-space stack, gvisor-tap gateway relay, Linux tap
   virtio_vsock.rs             virtio-vsock agent bridge
-  virtio_fs.rs fdlimit.rs     virtio-fs directory shares (macOS) and the open-file limit they need
+  virtio_fs.rs                virtio-fs directory shares (macOS)
+  fdlimit.rs                  raise RLIMIT_NOFILE at startup (aarch64, both hosts; virtio-fs spends it)
   sandbox.rs seccomp.rs       Seatbelt profile (macOS) and seccomp-bpf filters (Linux), with selftests
   quiesce.rs sync.rs          vCPU park/resume; taking a lock whose holder panicked
   plugin.rs                   the extension seam (Plugin / VmHandle / CpuHandle / IoSink)
   plugins.rs                  tools built on it: memory dump, I/O trace
   events.rs                   the event log written by `--events`
-  smoke.rs                    M0 hvf smoke test (macOS only), plus `--shm`
+  smoke.rs                    M0 hvf smoke test (macOS only), plus `--shm` and its child `smoke-shm-verify`
   used_ring_litmus.rs         concurrency litmus for the used-ring publish (#[ignore], weekly in CI)
 resources/seccomp/            one seccompiler JSON allowlist per architecture, plus a README
 docs/                         architecture + writing a tool
@@ -54,7 +55,7 @@ tools/
   gates.sh                    the CI checks a developer machine can run, in one command
   perf-gate.sh                virtio-fs performance gate: branch against its merge base
   fsbench/                    virtio-fs benchmarks in a real guest (walk / write / concurrent)
-  mk-initramfs.py
+  mk-initramfs.py             Alpine arm64 initramfs for a boot test, no root or cpio needed
 pins.env                      the nightly rustfmt the comment reflow runs on
 deny.toml                     cargo-deny policy (advisories, licences, duplicates, sources)
 LICENSE NOTICE                Apache-2.0; credit for the Firecracker-derived parts
@@ -102,12 +103,28 @@ hvi boot --kernel <arm64 Image | x86-64 bzImage> \
   [--events <ledger.ndjson>] [--sandbox-id <id>] [--no-sandbox] \
   [--dump-memory <path> [--dump-after <secs>]] [--trace-io <path>]
 
-hvi dump-fdt --kernel <Image> [--out fdt.dtb]   # pre-boot pipeline, no hypervisor (arm64)
+hvi dump-fdt --kernel <Image> [--initramfs <cpio>] [--mem-mib N] [--cmdline <str>] [--out fdt.dtb]
+                                                 # pre-boot pipeline, no hypervisor (arm64); the
+                                                 # extra flags change the layout the DTB describes
 hvi smoke [--shm]                                # macOS-only M0 hvf test; --shm over shared guest RAM
+hvi smoke-shm-verify <shm-name> <hex>            # child half of `smoke --shm`; not for direct use
 hvi sandbox-selftest                             # macOS: prove the Seatbelt profile
 hvi seccomp-selftest                             # Linux: prove the seccomp filters
-hvi --version
+hvi version                                      # also --version, -V: the crate version and the VMM core
 ```
+
+`smoke --shm` spawns `smoke-shm-verify` itself, as a second process that
+never touched the hypervisor, to read the shared guest RAM back by name; the
+subcommand exists so that child has something to run.
+
+Environment variables the binary reads:
+
+| Variable | Effect |
+| --- | --- |
+| `HVI_SECCOMP=log` | Linux: keep the seccomp allowlists but log a mismatch instead of killing the process (see [Confinement](#confinement)) |
+| `HVI_X86_TRACE=1` | x86 backend: log the first 80 I/O and MMIO exits of each vCPU, dump registers on a shutdown, and kick cpu0 four times at two-second intervals so a stuck guest still dumps its registers |
+| `HVI_BLK_TRACE=1` | log every virtio-blk request on stderr as `[virtio-blk]` lines. Off by default: it is a synchronous write per request. The ledger records every request either way |
+| `HVI_BLOCK_DEV=<dev>` | test-only: points the virtio-blk sizing test at a real block device; the CI boot-x86 job sets it to a loop device. Not read by the VMM |
 
 Every backend logs what it set up on stderr with a `[hvi]` prefix: the vCPU
 count and GIC layout, each device, the open-file limit it obtained, the
@@ -228,6 +245,9 @@ the host-operation count of the metadata workload exactly, and
 `tools/perf-gate.sh` runs in CI on every same-repo pull request: it builds the
 branch and its merge base on the same runner, requires the host-operation
 count to be equal, and fails a branch that is more than 1.5x slower.
+`--base <ref>`, `--samples <n>` and `--limit <ratio>` (or `PERF_GATE_BASE`,
+`PERF_GATE_SAMPLES`, `PERF_GATE_LIMIT`) override the merge base, the five
+samples per side and the 1.5x ceiling.
 
 Protect a shared OCI cache with `--share-ro`, or give `--share-rw` an
 instance-owned APFS clone.
@@ -306,8 +326,10 @@ runs `main-build-and-verify.yml`. Both call the same reusable workflows:
   rustdoc for the arm64/KVM backend cross-checked from the same runner and for
   the hvf backend on `macos-15`; actionlint plus shellcheck over the workflows;
   `cargo deny check` over the lockfile.
-- **build-and-test**: unit tests on x86 Linux; the seccomp selftest on x86
-  Linux; build, test, entitlement sign and the Seatbelt selftest on
+- **build-and-test**: unit tests on x86 Linux (on a push to `main` the
+  suite runs once under `cargo llvm-cov` instead, and the profile goes to
+  Codecov, which is what the coverage badge reads); the seccomp selftest on
+  x86 Linux; build, test, entitlement sign and the Seatbelt selftest on
   `macos-15`; then the live boots.
 - **boot-x86**: a real Linux kernel under the x86/KVM backend to the
   userspace/VFS gate with `--cpus 2`, on a self-hosted runner with `/dev/kvm`
