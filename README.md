@@ -244,7 +244,12 @@ instance-owned APFS clone.
   offloads. Linux only; macOS refuses the flag and names `--net-gateway`. A
   tap that cannot be opened fails the boot with the interface named in the
   error.
-- `--net-mac` sets the guest MAC.
+- `--net-mac <aa:bb:cc:dd:ee:ff>` sets the guest MAC, and only under
+  `--net-tap`: the redirect hands hvi the veth's frames unchanged, so the
+  guest has to answer to the veth's MAC. The Linux backends read it there and
+  nowhere else (`src/machine_linux.rs`, `src/machine_x86.rs`); the macOS
+  backend, `--net` and `--net-gateway` ignore it, and a value that does not
+  parse logs a warning and keeps the default.
 
 Every mode parses TLS SNI out of the ClientHello and emits a `net` record per
 flow into the ledger. Transmit chains are bounded to a maximum frame, and a

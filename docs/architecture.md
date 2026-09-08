@@ -313,7 +313,11 @@ Interrupt injection is the one device-facing thing that differs by backend:
     all-zero `virtio_net_hdr_v1`. The tap is created and bridged by whoever
     owns the network namespace (urunc, in brig's case); hvi only opens it. A
     tap that cannot be opened fails the boot and names the interface. macOS
-    refuses the flag. `--net-mac` sets the guest MAC in every mode.
+    refuses the flag. `--net-mac` sets the guest MAC in this mode only: the
+    tap branch of `machine_linux.rs` and `machine_x86.rs` is the one place
+    that reads `BootConfig::net_mac`, because the redirect hands hvi the
+    veth's frames unchanged and the guest has to answer to the veth's MAC.
+    The built-in stack, the gateway relay and `machine_macos.rs` ignore it.
   - Either way, `observe_tx` parses **TLS SNI** out of the ClientHello and
     every flow emits a `net` boundary event (five-tuple, direction, bytes, SNI/DNS).
     The frame a transmit chain may assemble is bounded.
