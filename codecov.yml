@@ -1,0 +1,10 @@
+# Coverage is measured on pushes to main only (build-and-test.yml), so
+# Codecov compares each main commit with its parent. The default patch
+# status then fails a commit whose only new lines are untested strings:
+# 46d5908 changed one error message in src/main.rs and got "0.00% of diff
+# hit". Keep the patch view, but as information, not a red mark on main.
+coverage:
+  status:
+    patch:
+      default:
+        informational: true
