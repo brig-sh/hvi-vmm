@@ -51,9 +51,9 @@ flowchart TB
         shared --> gm
     end
     guest["Guest: unmodified Linux kernel + initramfs/rootfs"]
-    collector["log collector / OTel pipeline"]
+    ledger["--events path: RawEvent NDJSON file"]
     backend -. "vCPU run loop, guest RAM" .-> guest
-    obs -- "RawEvent NDJSON" --> collector
+    obs -- "one JSON object per line" --> ledger
 ```
 
 ### Entry point
@@ -65,19 +65,23 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
 `main::boot_guest` parses CLI flags into a `BootConfig`, then calls
-`machine::boot(cfg)`. `main.rs` aliases the right backend to `mod machine`:
+`hvi::machine::boot(cfg)`. The library root, `lib.rs`, aliases the right
+backend to `pub mod machine`, so a crate that links hvi gets the same entry
+point the CLI uses:
 
 ```rust
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))] #[path = "machine_macos.rs"] mod machine;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))] #[path = "machine_linux.rs"] mod machine;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]  #[path = "machine_x86.rs"]  mod machine;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))] #[path = "machine_macos.rs"] pub mod machine;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))] #[path = "machine_linux.rs"] pub mod machine;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]  #[path = "machine_x86.rs"]  pub mod machine;
 ```
 
 `BootConfig` (`config.rs`) carries the kernel/initramfs bytes, `mem_bytes`,
 `cmdline`, device requests (`disk`, `net`, `net_gateway`, `net_tap`, `net_mac`,
-`agent_sock`, `fs_shares` with a `ShareMode` and `CachePolicy` each, `fs_uid`,
-`fs_gid`), `vcpus`, the ledger sink (`events`, `sandbox_id`), the `sandbox`
-switch, and an optional `plugin` (§6).
+`agent_sock`, `fs_shares` with a `ShareMode` and `CachePolicy` each), `vcpus`,
+the ledger sink (`events`, `sandbox_id`), the `sandbox` switch, and an
+optional `plugin` (§6). `--fs-uid` and `--fs-gid` are not in it: `main` sets
+them once for the process through `virtio_fs::set_guest_ids` before the boot,
+because every share reads the same pair.
 `Stop` is `enum { SystemOff, SystemReset }` — how the guest asked to halt.
 
 On any other host triple the crate builds to a small stub, so the workspace and
@@ -157,9 +161,12 @@ dispatch. The vsock op codes, packet header and CIDs are hvi's own.
 
 `GuestRam` (`guestmem.rs`) is what makes the device models host-neutral: a
 `Send + Sync` accessor over the host's guest-RAM mapping offering
-`read*/write*`, a physical `scan()`, bounds-checked `offset()`, and `host_ptr`,
-a bounds-checked raw pointer for the iovec paths (it replaced a `&mut [u8]`
-borrow that a guest could alias by pointing two descriptors at one address).
+`read*/write*`, a physical `scan()`, `contains()` for a range check, and
+`host_ptr`, a bounds-checked raw pointer for the iovec paths (it replaced a
+`&mut [u8]` borrow that a guest could alias by pointing two descriptors at one
+address). The translation from guest-physical address to host offset is
+private; every public accessor goes through it and fails with an `io::Error`
+on a range the guest does not own.
 Every device reads and writes guest memory only through it. The mapping is
 allocated by `sharedmem.rs` from a memfd on Linux or a POSIX shared-memory
 object on macOS (mapped with `hv_vm_map` on hvi's own pointer), unlinked from
@@ -179,12 +186,14 @@ largest arch-specific surface.
 flowchart TB
     A["Arm64Image::parse(kernel)<br/>magic 0x644d5241 @0x38, text_offset, image_size"] --> B
     B["GuestLayout::new<br/>kernel@RAM_BASE+text_offset<br/>dtb@align2M(kernel_end)<br/>initrd@align4K(dtb_end)"] --> C
-    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus<br/>/timer /intc(GICv3) /pl011<br/>virtio_mmio@… per device"] --> D
+    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus<br/>/timer /intc (GICv3 or v2) /pl011<br/>virtio_mmio@… per device"] --> D
     D["copy kernel+dtb+initrd into GuestRam<br/>x0=dtb_addr, pc=kernel_addr<br/>vCPU: EL1, PSCI enabled"]
 ```
 
 `fdt.rs` builds the devicetree the kernel reads at `x0`: PSCI (`method=hvc`) for
-power/SMP, a GICv3 interrupt controller, the ARM generic timer PPIs, the PL011
+power/SMP, the interrupt controller the backend chose (`GicVersion::V3` emits
+`arm,gic-v3`, `GicVersion::V2` emits `arm,cortex-a15-gic`, the compatible
+QEMU virt advertises for its vGICv2), the ARM generic timer PPIs, the PL011
 console (`stdout-path`), and one `virtio_mmio@…` node per backed device. The DTB
 length feeds initrd placement, so `main` builds it twice (provisional slot →
 settled layout). No firmware, no bootloader — hvi drops the kernel straight into
@@ -200,9 +209,14 @@ EL1.
 | virtio-net | `0x0200_0200` | SPI 3 → INTID 35 |
 | virtio-vsock | `0x0200_0400` | SPI 4 → INTID 36 |
 | virtio-fs (share `i`) | `0x0200_0600 + i * 0x200` | SPI 5 + `i` → INTID 37 + `i` |
-| GIC distributor | `0x0800_0000` (size `0x1_0000`) | — |
-| GIC redistributor | `0x080A_0000` (per-vCPU frame) | — |
+| GIC distributor | `0x0800_0000` (size `0x1_0000`), both versions | — |
+| GIC redistributor (v3) or CPU interface (v2) | `0x080A_0000` (one `0x2_0000` frame per vCPU) under `GicLayout::QEMU_VIRT`; `0x0801_0000` (one shared `0x1_0000` window) under `GicLayout::QEMU_VIRT_V2` | — |
 | kernel / dtb / initrd | packed up from RAM base | — |
+
+`GicLayout::for_vcpus(version, vcpus)` picks the map. The version is not a
+choice: KVM offers the vGIC that matches the host, so a GIC-400 host gets v2
+and refuses more than `V2_MAX_CPUS` (8) vCPUs, a GICv3 host gets v3, and the
+macOS backend is always v3 because Apple's `hv_gic` is one.
 
 ### 3.2 x86-64 — Linux 64-bit boot protocol
 
@@ -288,7 +302,7 @@ sequenceDiagram
 Interrupt injection is the one device-facing thing that differs by backend:
 
 - **macOS/arm64:** `gic_set_spi(INTID, level)` on the in-kernel GICv3.
-- **Linux/arm64:** `vm.set_irq_line(spi_gsi(SPI), level)`, `spi_gsi(spi) = SPI_type | (32 + spi)`.
+- **Linux/arm64:** `vm.set_irq_line(spi_gsi(SPI), level)`, `spi_gsi(spi) = SPI_type | (32 + spi)`, the same call for vGICv2 and vGICv3.
 - **x86:** `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC (GSIs 4–7).
 
 ### Devices
