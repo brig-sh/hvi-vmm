@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Boot an x86-64 Linux guest on KVM (Linux host), SMP-capable.
+//! The x86-64 guest on KVM, SMP-capable.
 //!
 //! The x86 counterpart of `machine_linux`. KVM gives us an in-kernel LAPIC +
 //! IOAPIC + PIT (`create_irq_chip`/`create_pit2`), so SMP is just: enter the
@@ -40,7 +40,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment, kvm_userspace_memory_region};
+use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::boot_x86::{self, BootPlan};
@@ -89,11 +89,9 @@ struct Shared {
     quiesce: Arc<crate::quiesce::Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
-    /// Guest RAM's shareable descriptor, and the two halves either side of the
-    /// MMIO hole, for a plugin that hands the same pages to another process.
+    /// Guest RAM's shareable descriptor, for a plugin that hands the same
+    /// pages to another process.
     ram_fd: std::os::fd::RawFd,
-    low_bytes: u64,
-    high_bytes: u64,
     sandbox_id: String,
     /// vCPU count, so a pause knows how many threads must park.
     num_cpus: u32,
@@ -155,38 +153,25 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     vm.set_tss_address(0xfffb_d000)?;
     vm.set_identity_map_address(0xfffb_c000)?;
 
-    // Guest RAM, split around the sub-4 GiB MMIO hole (see MMIO_GAP_START). The
-    // host mapping stays one contiguous object; only the guest-physical view
-    // has a gap, so the high half is just the bytes after the low half.
-    let size = cfg.mem_bytes as usize;
+    // Guest RAM, split around the sub-4 GiB MMIO hole (see MMIO_GAP_START):
+    // the backing object is one contiguous memfd, and the high half is the
+    // bytes after the low half, mapped at HIGH_RAM_BASE. The object is
+    // shareable so an out-of-process plugin can map the same pages; KVM only
+    // needs a valid host address, so the guest is unaffected.
     let low_bytes = cfg.mem_bytes.min(MMIO_GAP_START);
     let high_bytes = cfg.mem_bytes.saturating_sub(low_bytes);
-    // Guest RAM comes from a shareable object (a memfd) rather than an
-    // anonymous private mapping, so an out-of-process plugin can map
-    // the same pages. KVM only needs a valid host address, so the guest is
-    // unaffected.
-    let guest_ram = crate::sharedmem::SharedRam::new(size)?;
-    let host = guest_ram.as_ptr().cast::<libc::c_void>();
-    let region = kvm_userspace_memory_region {
-        slot: 0,
-        flags: 0, // no dirty tracking
-        guest_phys_addr: RAM_BASE,
-        memory_size: low_bytes,
-        userspace_addr: host as u64,
-    };
-    // SAFETY: `host` maps `size` bytes and outlives the VM.
-    unsafe { vm.set_user_memory_region(region)? };
+    let shared_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
+    let mut regions = vec![MemRegion {
+        gpa: RAM_BASE,
+        size: low_bytes,
+        file_offset: 0,
+    }];
     if high_bytes > 0 {
-        let high = kvm_userspace_memory_region {
-            slot: 1,
-            flags: 0,
-            guest_phys_addr: HIGH_RAM_BASE,
-            memory_size: high_bytes,
-            userspace_addr: host as u64 + low_bytes,
-        };
-        // SAFETY: the high half is within the same `size`-byte mapping, at
-        // offset `low_bytes`, and outlives the VM.
-        unsafe { vm.set_user_memory_region(high)? };
+        regions.push(MemRegion {
+            gpa: HIGH_RAM_BASE,
+            size: high_bytes,
+            file_offset: low_bytes,
+        });
         eprintln!(
             "[hvi/x86] RAM {} MiB: {} MiB at {:#x} + {} MiB at {HIGH_RAM_BASE:#x}",
             cfg.mem_bytes >> 20,
@@ -195,13 +180,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             high_bytes >> 20
         );
     }
-    let ram = Arc::new(GuestRam::new_split(
-        host.cast::<u8>(),
-        RAM_BASE,
-        low_bytes as usize,
-        HIGH_RAM_BASE,
-        high_bytes as usize,
-    ));
+    let ram = Arc::new(GuestRam::new(&shared_ram, &regions)?);
+    ram.register_kvm_slots(&vm)?;
 
     // In-kernel LAPIC + IOAPIC + PIT.
     vm.create_irq_chip()?;
@@ -339,9 +319,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         stop: Arc::new(Mutex::new(None)),
         quiesce: Arc::new(crate::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
-        ram_fd: guest_ram.fd(),
-        low_bytes,
-        high_bytes,
+        ram_fd: shared_ram.fd(),
         sandbox_id: cfg.sandbox_id.clone(),
         num_cpus,
     };
@@ -821,19 +799,7 @@ impl VmHandle for Shared {
         // Both halves. Reporting only the low one leaves a plugin mapping
         // less than the guest has and reading nothing above the MMIO hole --
         // which looks like an empty guest, not like a missing region.
-        let mut r = vec![MemRegion {
-            gpa: RAM_BASE,
-            size: self.low_bytes,
-            file_offset: 0,
-        }];
-        if self.high_bytes > 0 {
-            r.push(MemRegion {
-                gpa: HIGH_RAM_BASE,
-                size: self.high_bytes,
-                file_offset: self.low_bytes,
-            });
-        }
-        r
+        self.mem.regions()
     }
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {

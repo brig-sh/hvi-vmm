@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Boot an arm64 Linux guest on KVM (Linux host) and run it, SMP-capable.
+//! The arm64 guest on KVM, SMP-capable.
 //!
 //! The Linux counterpart of `machine_macos`. KVM gives us an **in-kernel
 //! GIC** and **in-kernel PSCI**, so this backend is structurally simpler than
@@ -36,11 +36,11 @@ use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
     kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
-    kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_userspace_memory_region, kvm_vcpu_init,
-    KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_DEV_ARM_VGIC_CTRL_INIT,
-    KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
-    KVM_SYSTEM_EVENT_RESET, KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST,
-    KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
+    kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF,
+    KVM_ARM_VCPU_PSCI_0_2, KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR,
+    KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_SYSTEM_EVENT_RESET,
+    KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST,
+    KVM_VGIC_V3_ADDR_TYPE_REDIST,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 
@@ -118,10 +118,9 @@ struct Shared {
     quiesce: Arc<crate::quiesce::Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
-    /// Guest RAM's shareable descriptor and extent, for a plugin that hands
-    /// the same pages to another process.
+    /// Guest RAM's shareable descriptor, for a plugin that hands the same
+    /// pages to another process.
     ram_fd: std::os::fd::RawFd,
-    ram_len: u64,
     sandbox_id: String,
     /// vCPU count, so a pause knows how many threads must park.
     num_cpus: u32,
@@ -188,25 +187,15 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         gic.gicr_size
     );
 
-    // Guest RAM: one anonymous mmap registered as a KVM memory slot; GuestRam
-    // wraps its host pointer for shared access across threads.
-    let size = cfg.mem_bytes as usize;
-    // Guest RAM comes from a shareable object (a memfd) rather than an
-    // anonymous private mapping, so an out-of-process plugin can map
-    // the same pages. KVM only needs a valid host address, so the guest is
-    // unaffected.
-    let guest_ram = crate::sharedmem::SharedRam::new(size)?;
-    let host = guest_ram.as_ptr().cast::<libc::c_void>();
-    let region = kvm_userspace_memory_region {
-        slot: 0,
-        flags: 0,
-        guest_phys_addr: RAM_BASE,
-        memory_size: cfg.mem_bytes,
-        userspace_addr: host as u64,
-    };
-    // SAFETY: `host` is a valid mapping of `size` bytes that outlives the VM.
-    unsafe { vm.set_user_memory_region(region)? };
-    let ram = Arc::new(GuestRam::new(host.cast::<u8>(), RAM_BASE, size));
+    // Guest RAM: one region at RAM_BASE, backed by a shareable object (a
+    // memfd) so an out-of-process plugin can map the same pages. KVM only
+    // needs a valid host address, so the guest is unaffected.
+    let shared_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
+    let ram = Arc::new(GuestRam::new(
+        &shared_ram,
+        &[shared_ram.region_at(RAM_BASE)],
+    )?);
+    ram.register_kvm_slots(&vm)?;
 
     // Devices (same modules as the macOS backend).
     let virtio = match &cfg.disk {
@@ -362,8 +351,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         stop: Arc::new(Mutex::new(None)),
         quiesce: Arc::new(crate::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
-        ram_fd: guest_ram.fd(),
-        ram_len: guest_ram.len() as u64,
+        ram_fd: shared_ram.fd(),
         sandbox_id: cfg.sandbox_id.clone(),
         num_cpus,
     };
@@ -700,13 +688,7 @@ impl VmHandle for Shared {
     }
 
     fn ram_regions(&self) -> Vec<MemRegion> {
-        // One region: this backend maps all of guest RAM at RAM_BASE from the
-        // start of the shareable object.
-        vec![MemRegion {
-            gpa: RAM_BASE,
-            size: self.ram_len,
-            file_offset: 0,
-        }]
+        self.mem.regions()
     }
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {

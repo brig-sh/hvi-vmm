@@ -91,9 +91,7 @@ fn publish_unfenced(_q: &Queue, mem: &GuestRam, used: u64, head: u16, len: u32) 
 /// not `ITERS` when the time budget ended the run first.
 fn run(publish: fn(&Queue, &GuestRam, u64, u16, u32)) -> (u32, u32, u32) {
     let start = std::time::Instant::now();
-    let mut backing = vec![0u8; 0x8000];
-    let host = backing.as_mut_ptr();
-    let mem = GuestRam::new(host, BASE, backing.len());
+    let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
     let used = BASE + 0x1000;
 
     let mut q = Queue::default();
@@ -118,8 +116,7 @@ fn run(publish: fn(&Queue, &GuestRam, u64, u16, u32)) -> (u32, u32, u32) {
     let consumed = AtomicU32::new(0);
     let bad_head = AtomicU32::new(0);
     // used.idx as the guest sees it: an acquire load, not a plain read.
-    let idx_off = (used - BASE) as usize + 2;
-    let idx_addr = host as usize + idx_off;
+    let idx_addr = mem.host_ptr(used + 2, 2).unwrap() as usize;
 
     std::thread::scope(|s| {
         let start = &start;

@@ -249,8 +249,8 @@ pub struct SelftestFixtures {
     /// A Unix listener bound before entry (stands in for the control socket and
     /// the agent bridge).
     pre_bound: std::os::unix::net::UnixListener,
-    /// A shared-memory mapping made before entry (stands in for guest RAM).
-    pre_mapped: crate::sharedmem::SharedRam,
+    /// Guest RAM mapped from a shared-memory object before entry.
+    pre_mapped: crate::guestmem::GuestRam,
     /// A pty opened before entry, standing in for the guest console. The VMM
     /// puts the user's terminal into raw mode before entry and restores it on
     /// the way out, i.e. *after* entry -- so if Seatbelt policed `tcsetattr` on
@@ -492,14 +492,9 @@ fn probes() -> Vec<Probe> {
             what: "read and write guest RAM mapped before entry",
             expect_ok: true,
             run: |f| {
-                // SAFETY: the mapping is live for `len` bytes and owned by the
-                // fixture; nothing else touches it during the selftest.
-                unsafe {
-                    let p = f.pre_mapped.as_ptr();
-                    std::ptr::write_volatile(p, 0xa5);
-                    if std::ptr::read_volatile(p) != 0xa5 {
-                        return Err(io::Error::other("guest RAM readback mismatch"));
-                    }
+                f.pre_mapped.write_u32(0, 0xa5a5_a5a5)?;
+                if f.pre_mapped.read_u32(0)? != 0xa5a5_a5a5 {
+                    return Err(io::Error::other("guest RAM readback mismatch"));
                 }
                 Ok(())
             },
@@ -632,7 +627,11 @@ pub fn selftest() -> io::Result<usize> {
             let _ = std::fs::remove_file(&path);
             std::os::unix::net::UnixListener::bind(&path)?
         },
-        pre_mapped: crate::sharedmem::SharedRam::new(0x4000)?,
+        pre_mapped: {
+            let shared_ram =
+                crate::sharedmem::SharedRam::new(crate::guestmem::MemRegion::ALIGN as usize)?;
+            crate::guestmem::GuestRam::new(&shared_ram, &[shared_ram.region_at(0)])?
+        },
         pre_tty: open_pty()?,
         dir: dir.clone(),
         export: export.clone(),

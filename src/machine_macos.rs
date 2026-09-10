@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Boot an arm64 Linux guest and run it, SMP-capable.
+//! The arm64 guest on Hypervisor.framework, SMP-capable.
 //!
 //! One thread per vCPU (an `applevisor::Vcpu` is thread-bound). cpu0 boots at
 //! the kernel entry; secondaries park until the guest brings them up via PSCI
-//! `CPU_ON`. Guest RAM is a `Send + Sync` `GuestRam` over the host mapping;
-//! devices, the event emitter, and the vCPU-handle list are shared behind
-//! locks. A plugin, if the caller supplied one, is called on cpu0 between
-//! guest entries — see [`crate::plugin`].
+//! `CPU_ON`. Guest RAM is a `GuestRam` shared by every vCPU thread; devices,
+//! the event emitter, and the vCPU-handle list are shared behind locks. A
+//! plugin, if the caller supplied one, is called on cpu0 between guest
+//! entries — see [`crate::plugin`].
 //!
 //! The exit-loop's timer/WFI/PC handling and the SMP hand-off are the
 //! boot-debug frontier.
@@ -54,6 +54,7 @@ use crate::virtio::{reg, VirtioBlk};
 use crate::virtio_fs::VirtioFs;
 use crate::virtio_net::VirtioNet;
 use crate::virtio_vsock::VirtioVsock;
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
 type VmGic = VirtualMachineInstance<GicEnabled>;
@@ -163,10 +164,9 @@ struct Shared {
     quiesce: Arc<crate::quiesce::Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
-    /// Guest RAM's shareable descriptor and extent, for a plugin that hands
-    /// the same pages to another process.
+    /// Guest RAM's shareable descriptor, for a plugin that hands the same
+    /// pages to another process.
     ram_fd: std::os::fd::RawFd,
-    ram_len: u64,
     sandbox_id: String,
 }
 
@@ -198,29 +198,36 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     gic_config.set_redistributor_base(gic.gicr_base)?;
     let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config)?;
 
-    // Guest RAM: one region mapped at RAM_BASE, allocated from a shareable
-    // object rather than by applevisor, so an out-of-process plugin can
-    // map the same pages. applevisor's memory_create uses hv_vm_allocate, which
-    // hands back a pointer with no nameable backing object; hv_vm_map accepts
-    // any page-aligned host pointer, so we allocate and map it ourselves. This
-    // is the path `hvi smoke --shm` exercises.
-    let guest_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
-    // SAFETY: `mem` is a live, page-aligned mapping of `mem.len()` bytes that
-    // outlives the VM (dropped at the end of `boot`).
-    let ret = unsafe {
-        applevisor_sys::hv_vm_map(
-            guest_ram.as_ptr().cast::<std::ffi::c_void>(),
-            RAM_BASE,
-            guest_ram.len(),
-            applevisor_sys::HV_MEMORY_READ
-                | applevisor_sys::HV_MEMORY_WRITE
-                | applevisor_sys::HV_MEMORY_EXEC,
-        )
-    };
-    if ret != 0 {
-        return Err(format!("hv_vm_map(guest RAM -> {RAM_BASE:#x}) failed: {ret:#x}").into());
+    // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
+    // rather than allocated by applevisor, so an out-of-process plugin can
+    // map the same pages. applevisor's memory_create uses hv_vm_allocate,
+    // which hands back a pointer with no nameable backing object; hv_vm_map
+    // accepts any page-aligned host pointer, so the guest gets the mapping
+    // `GuestRam` made of the object. This is the path `hvi smoke --shm`
+    // exercises.
+    let shared_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
+    let ram = Arc::new(GuestRam::new(
+        &shared_ram,
+        &[shared_ram.region_at(RAM_BASE)],
+    )?);
+    for region in ram.memory().iter() {
+        let ipa = region.start_addr().raw_value();
+        // SAFETY: the region is a live, page-aligned mapping of `len()` bytes
+        // that lives as long as `ram`, which outlives the VM.
+        let ret = unsafe {
+            applevisor_sys::hv_vm_map(
+                region.as_ptr().cast::<std::ffi::c_void>(),
+                ipa,
+                region.len() as usize,
+                applevisor_sys::HV_MEMORY_READ
+                    | applevisor_sys::HV_MEMORY_WRITE
+                    | applevisor_sys::HV_MEMORY_EXEC,
+            )
+        };
+        if ret != 0 {
+            return Err(format!("hv_vm_map(guest RAM -> {ipa:#x}) failed: {ret:#x}").into());
+        }
     }
-    let ram = Arc::new(GuestRam::new(guest_ram.as_ptr(), RAM_BASE, guest_ram.len()));
 
     let virtio = match &cfg.disk {
         Some(path) => {
@@ -410,8 +417,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         dtb_addr: layout.dtb_addr,
         quiesce: Arc::new(crate::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
-        ram_fd: guest_ram.fd(),
-        ram_len: guest_ram.len() as u64,
+        ram_fd: shared_ram.fd(),
         sandbox_id: cfg.sandbox_id.clone(),
         num_cpus,
     };
@@ -742,13 +748,7 @@ impl VmHandle for Shared {
     }
 
     fn ram_regions(&self) -> Vec<MemRegion> {
-        // One region: this backend maps all of guest RAM at RAM_BASE from the
-        // start of the shareable object.
-        vec![MemRegion {
-            gpa: RAM_BASE,
-            size: self.ram_len,
-            file_offset: 0,
-        }]
+        self.mem.regions()
     }
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {

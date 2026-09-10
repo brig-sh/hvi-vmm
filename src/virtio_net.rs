@@ -867,8 +867,7 @@ mod tests {
     #[test]
     fn a_tx_descriptor_cycle_runs_out_of_budget() {
         const BASE: u64 = 0x4000_0000;
-        let mut backing = vec![0u8; 0x8000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut net = VirtioNet::new();
         program_queue(&mut net, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
 
@@ -908,8 +907,7 @@ mod tests {
         let mut net = VirtioNet::with_tap(std::fs::File::from(std::os::fd::OwnedFd::from(tap_dev)));
 
         const BASE: u64 = 0x4000_0000;
-        let mut backing = vec![0u8; 0x8000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
         program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
 
@@ -963,8 +961,7 @@ mod tests {
     /// address, dropping every redirected reply in tap mode.
     #[test]
     fn config_space_reports_the_override_mac() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), 0x4000_0000, backing.len());
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
         let mut net = VirtioNet::new();
         let mac = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
         net.set_mac(mac);
@@ -1025,8 +1022,7 @@ mod tests {
     fn an_oversized_transmit_chain_is_refused() {
         let mut net = VirtioNet::new();
         const BASE: u64 = 0x4000_0000;
-        let mut backing = vec![0u8; 0x20000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x20000)]);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
         program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
 
