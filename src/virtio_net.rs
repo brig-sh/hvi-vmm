@@ -371,21 +371,50 @@ impl VirtioNet {
         let Ok(head) = mem.read_u16(slot) else {
             return;
         };
-        // First writable descriptor of the chain (RX buffers are large/single).
-        let Some(da) = rx.desc_addr(head) else {
-            return;
-        };
-        let (Ok(addr), Ok(len)) = (mem.read_u64(da), mem.read_u32(da + 8)) else {
-            return;
-        };
         let mut out = vec![0u8; NET_HDR_LEN];
         out[10] = 1; // num_buffers = 1
         out.extend_from_slice(frame);
-        let n = out.len().min(len as usize);
-        if mem.write(addr, &out[..n]).is_err() {
+        // Spread the header and frame over the *whole* writable chain. Linux
+        // posts one buffer big enough for both, so writing only the first
+        // descriptor was indistinguishable from correct; Unikraft posts the
+        // virtio-net header and the frame as two descriptors, and filling only
+        // the first delivered a 12-byte packet its driver rejected outright
+        // ("Received invalid packet size: 12") before the frame ever arrived.
+        let mut written = 0usize;
+        let mut d = head;
+        for _ in 0..rx.size() {
+            let Some(da) = rx.desc_addr(d) else {
+                return;
+            };
+            let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
+                mem.read_u64(da),
+                mem.read_u32(da + 8),
+                mem.read_u16(da + 12),
+                mem.read_u16(da + 14),
+            ) else {
+                return;
+            };
+            // Bit 1 is device-writable, bit 0 is "chain continues".
+            if flags & 2 != 0 && written < out.len() {
+                let n = (len as usize).min(out.len() - written);
+                if mem.write(addr, &out[written..written + n]).is_err() {
+                    return;
+                }
+                written += n;
+            }
+            if flags & 1 == 0 {
+                break;
+            }
+            d = next;
+        }
+        // num_buffers is 1, so a frame that does not fit the posted chain
+        // cannot be split across the next one. Drop it and leave the buffer
+        // posted rather than complete a truncated packet the guest would have
+        // to reject.
+        if written < out.len() {
             return;
         }
-        self.queues[RX_QUEUE as usize].push_used(mem, head, n as u32);
+        self.queues[RX_QUEUE as usize].push_used(mem, head, written as u32);
         self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
         self.interrupt_status |= 1;
     }
@@ -891,6 +920,79 @@ mod tests {
         mem.write_u16(BASE + 142, 0).unwrap();
         assert_eq!(net.read_tx_frame(&mem, 0), None);
         assert_eq!(net.read_tx_frame(&mem, 8), None, "an out-of-ring head");
+    }
+
+    /// Unikraft posts its RX buffers as a two-descriptor chain -- the
+    /// virtio-net header in one, the frame in the next -- where Linux posts a
+    /// single buffer holding both. Filling only the head descriptor completed
+    /// a 12-byte packet, which the guest's driver rejected before the frame
+    /// arrived, so DHCP never finished and the guest never got an address.
+    #[test]
+    fn rx_fills_a_split_header_and_frame_chain() {
+        const BASE: u64 = 0x4000_0000;
+        let mut backing = vec![0u8; 0x8000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mut net = VirtioNet::new();
+        let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
+        let (hdr_buf, data_buf) = (BASE + 0x3000, BASE + 0x4000);
+        program_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
+
+        // desc[0]: NET_HDR_LEN bytes for the header, chained to desc[1].
+        mem.write_u64(desc, hdr_buf).unwrap();
+        mem.write_u32(desc + 8, NET_HDR_LEN as u32).unwrap();
+        mem.write_u16(desc + 12, 2 | 1).unwrap(); // writable, next
+        mem.write_u16(desc + 14, 1).unwrap();
+        // desc[1]: the frame buffer, end of chain.
+        mem.write_u64(desc + 16, data_buf).unwrap();
+        mem.write_u32(desc + 24, 2048).unwrap();
+        mem.write_u16(desc + 28, 2).unwrap(); // writable, no next
+        mem.write_u16(desc + 30, 0).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
+        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
+
+        let udp = udp_datagram(9999, 1234, b"a reply the guest must see");
+        let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
+        let frame = eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip);
+        net.deliver(&mem, &frame);
+
+        // The used ring reports header + frame, not just the head descriptor.
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "one buffer completed");
+        assert_eq!(
+            mem.read_u32(used + 8).unwrap() as usize,
+            NET_HDR_LEN + frame.len(),
+            "used length must cover the whole chain"
+        );
+        // And the frame really landed in the second descriptor.
+        let mut got = vec![0u8; frame.len()];
+        mem.read(data_buf, &mut got).unwrap();
+        assert_eq!(got, frame, "the frame, unmangled, in the data descriptor");
+    }
+
+    /// A chain too small for the frame cannot be split across the next buffer
+    /// (num_buffers is 1), so the device must drop the frame and leave the
+    /// buffer posted rather than complete a truncated packet.
+    #[test]
+    fn rx_drops_a_frame_that_does_not_fit() {
+        const BASE: u64 = 0x4000_0000;
+        let mut backing = vec![0u8; 0x8000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mut net = VirtioNet::new();
+        let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
+        program_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
+
+        // A single writable descriptor with room for the header alone.
+        mem.write_u64(desc, BASE + 0x3000).unwrap();
+        mem.write_u32(desc + 8, NET_HDR_LEN as u32).unwrap();
+        mem.write_u16(desc + 12, 2).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap();
+        mem.write_u16(avail + 4, 0).unwrap();
+
+        let udp = udp_datagram(9999, 1234, b"too big for one header buffer");
+        let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
+        net.deliver(&mem, &eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip));
+
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 0, "nothing completed");
     }
 
     /// One TX frame through the whole device path in tap mode: the tap gets a
