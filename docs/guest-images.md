@@ -12,7 +12,7 @@ the guest needs a root filesystem from somewhere.
 | Guest | Format | What hvi checks |
 | --- | --- | --- |
 | aarch64 | Uncompressed `Image` | The magic `0x644d5241` at offset 0x38, then `text_offset` and `image_size` from the 64-byte header. |
-| x86-64 | `bzImage` | `0xAA55` at offset 0x1fe and `HdrS` at 0x202, then the setup header. |
+| x86-64 | `bzImage` | `0xAA55` at offset 0x1fe, `HdrS` at 0x202, a boot protocol of 2.00 or later and `LOADED_HIGH`, then the setup header. |
 
 A compressed `Image.gz` does not work on arm64. Decompress it first.
 

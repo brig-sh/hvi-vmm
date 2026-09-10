@@ -220,12 +220,13 @@ Not having the GICv2 cap is not unlimited capacity. Other limits still apply.
 
 ### 3.2 x86-64: the Linux 64-bit boot protocol
 
-There is no devicetree. hvi implements the boot protocol directly.
+There is no devicetree. hvi fills the boot protocol's structures with
+`linux-loader`'s `BzImage` loader and `LinuxBootConfigurator`.
 
 ```mermaid
 flowchart TB
-    A["boot_x86::prepare(bzImage)<br/>0xAA55 @0x1fe, 'HdrS' @0x202<br/>strip real-mode setup"] --> B
-    B["zero page @0x7000<br/>setup hdr 0x1f1..0x268 copied verbatim<br/>type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 + ramdisk image/size"] --> C
+    A["linux-loader BzImage::load<br/>0xAA55, 'HdrS', protocol ≥ 2.00, LOADED_HIGH<br/>kernel@code32_start (1 MiB), entry +0x200"] --> B
+    B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
     C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
     E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID +RDRAND +RDSEED"] --> F

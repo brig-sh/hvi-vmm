@@ -19,8 +19,8 @@
 //! BSP in long mode and run every vCPU thread — the guest brings up APs with
 //! INIT-SIPI-SIPI, handled in-kernel. We build the initial long-mode state
 //! (identity page tables, flat 64-bit segments, CR0/CR3/CR4/EFER), load the
-//! bzImage + `boot_params` (see `boot_x86`), and enter at the 64-bit entry with
-//! RSI -> the zero page.
+//! bzImage and write `boot_params` (see `boot_x86`), and enter at the 64-bit
+//! entry with RSI -> the zero page.
 //!
 //! Devices are the shared virtio-mmio blk/net/vsock (serviced on
 //! `KVM_EXIT_MMIO`) plus a 16550 serial on port I/O (`KVM_EXIT_IO`).
@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 
-use crate::boot_x86::{self, BootPlan};
+use crate::boot_x86;
 use crate::config::{BootConfig, Stop};
 use crate::events::{CapturedEvent, Emitter};
 use crate::guestmem::GuestRam;
@@ -260,14 +260,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
     let cmdline = splice_kernel_args(cfg.cmdline.trim(), &ours);
 
-    // Parse the bzImage and lay out boot_params/kernel/initrd + MP table.
+    // Load the bzImage, write boot_params and the command line, then place
+    // the initrd and the MP table.
     let initrd_len = cfg.initramfs.as_ref().map_or(0, |v| v.len() as u64);
-    let plan: BootPlan =
-        boot_x86::prepare(&cfg.kernel, &cmdline, initrd_len, low_bytes, high_bytes)?;
-    ram.write(plan.kernel_load, &plan.kernel_image)?;
-    ram.write(plan.zero_page_addr, &plan.zero_page)?;
-    ram.write(plan.cmdline_addr, &plan.cmdline)?;
-    if let (Some(addr), Some(initramfs)) = (plan.initrd_addr, &cfg.initramfs) {
+    let kernel = boot_x86::LoadedKernel::load(ram.memory(), &cfg.kernel, &cmdline, initrd_len)?;
+    if let (Some(addr), Some(initramfs)) = (kernel.initrd_addr, &cfg.initramfs) {
         ram.write(addr, initramfs)?;
     }
     ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
@@ -275,7 +272,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     write_boot_gdt(&ram)?;
     eprintln!(
         "[hvi/x86] {num_cpus} vCPU(s)  kernel@{:#x} entry@{:#x}",
-        plan.kernel_load, plan.entry
+        kernel.kernel_load, kernel.entry
     );
 
     // vCPUs. Each gets KVM's supported CPUID (the guest reads it for feature
@@ -296,7 +293,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let vcpu = vm.create_vcpu(u64::from(id))?;
         vcpu.set_cpuid2(&cpuid)?;
         if id == 0 {
-            setup_long_mode(&vcpu, plan.entry, plan.zero_page_addr)?;
+            setup_long_mode(&vcpu, kernel.entry, kernel.zero_page_addr)?;
         }
         vcpus.push(vcpu);
     }
