@@ -222,7 +222,7 @@ Every backend logs what it set up on stderr before the guest runs. On macOS:
 
 ```text
 booting Image with 1024 MiB ...
-[hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0x1000000
+[hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
 [hvi] virtio-blk: /path/to/disk.img
 [hvi] virtio-net: user-space (guest 10.0.2.15, gw 10.0.2.2, DHCP)
 [hvi] open-file limit: 1048576
