@@ -54,7 +54,7 @@ flowchart TB
             dev["virtio / virtio_net / tap<br/>virtio_vsock / virtio_fs<br/>pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugins · events ledger<br/>quiesce"]
             conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
-            gm["guestmem: GuestRam<br/>sharedmem: memfd / POSIX shm"]
+            gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
         end
         cli --> backend
         backend --> shared
@@ -87,26 +87,28 @@ environment variables. See
 ## 2. Guest memory
 
 `GuestRam` (`guestmem.rs`) is what makes the device models host-neutral: a
-`Send + Sync` accessor over the host's mapping of guest RAM. Every device
-reads and writes guest memory only through it.
+wrapper over a `vm-memory` `GuestMemoryMmap` whose regions are the guest's
+RAM. Every device reads and writes guest memory only through it, and
+`memory()` returns the collection for the rust-vmm crates that take guest
+memory.
 
-The translation from guest-physical address to host offset is private. Every
-accessor that takes a guest address goes through it and fails with an
-`io::Error` on a range the guest does not own. Two methods do not take a guest
-address and so do not: `scan()` walks the host mapping directly and maps its
-hits back through the same split, and `host_addr()` returns the unchecked base
-pointer for the zero-copy paths.
+Every accessor that takes a guest address resolves it through the wrapper's
+table of the collection's regions and fails with an `io::Error` on a range the
+guest does not own. A range that would cross from one region into the next is
+refused. `scan()` takes no guest address: it walks each region's host mapping
+and maps its hits back to guest addresses.
 
-`host_ptr` is a bounds-checked raw pointer for the iovec paths. It replaced a
-`&mut [u8]` borrow that a guest could alias by pointing two descriptors at one
-address.
+`host_ptr` is a bounds-checked raw pointer into one region for the iovec
+paths. It is a raw pointer rather than a `&mut [u8]` because a guest can point
+two descriptors at one address, which would alias the borrow.
 
-The mapping is allocated by `sharedmem.rs` from a memfd on Linux or a POSIX
-shared-memory object on macOS, mapped `MAP_SHARED` and then handed to the
-hypervisor: `hv_vm_map` on hvi's own pointer, or a KVM memory slot. It is
-unlinked from the namespace once mapped, so an out-of-process tool handed the
-descriptor can map the same pages read-only and nothing else can open them by
-name.
+The backing object comes from `sharedmem.rs`: a memfd on Linux or a POSIX
+shared-memory object on macOS, unlinked from the namespace as soon as it is
+created. An out-of-process tool given the descriptor can map the same pages
+read-only; no other process can open them by name. Each region is a
+`MAP_SHARED` mapping of that object at its file offset, and the hypervisor gets
+it as a KVM memory slot or through `hv_vm_map`. A region's address, size and
+file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
 ### Guest memory maps
 
@@ -171,8 +173,9 @@ Guest RAM cannot be one contiguous span from zero. Two fixed things live under
   outright with `EEXIST`, and the VM does not start. A loud failure.
 
 RAM stops at the device window, the lower of the two, and the remainder
-resumes at 4 GiB as a second KVM slot into the same memfd. The host mapping
-stays contiguous. Only the guest-physical view has a gap.
+resumes at 4 GiB as a second KVM slot into the same memfd, at file offset
+`low_bytes`. The two host mappings are separate, so the high half's address
+cannot be derived from the low half's.
 
 A tool reading guest memory must therefore read `ram_regions()` rather than
 assume a count. It returns one region on arm64, and on x86-64 one region up to

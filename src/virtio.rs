@@ -704,8 +704,7 @@ mod queue_tests {
     /// `u32` and zero as a `u16`, so the old code divided by zero on notify.
     #[test]
     fn queue_num_65536_is_rejected_instead_of_panicking() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
         program(&mut blk, &mem, 0x10000, BASE, BASE + 0x1000, BASE + 0x2000);
         mem.write_u16(BASE + 0x1000 + 2, 1).unwrap(); // avail.idx = 1
@@ -717,8 +716,7 @@ mod queue_tests {
 
     #[test]
     fn queue_rejects_zero_non_power_of_two_and_over_max() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         for bad in [0, 3, 100, QUEUE_NUM_MAX + 1, 0x1_0000, u32::MAX] {
             let mut q = Queue::default();
             q.set_num(bad);
@@ -737,8 +735,7 @@ mod queue_tests {
     /// driver cannot point them at unbacked addresses.
     #[test]
     fn queue_rejects_rings_outside_guest_ram() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
 
         // desc table for 256 entries is 4 KiB, so this one runs off the end.
@@ -775,8 +772,7 @@ mod queue_tests {
     /// addresses and then be serviced on another.
     #[test]
     fn re_programming_a_ready_queue_clears_ready() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
 
         // Each value is deliberately a legal one, and for QUEUE_NUM a
         // non-zero one: `is_ready` is false whenever the size is zero, so
@@ -810,8 +806,7 @@ mod queue_tests {
     /// no other limit can end it.
     #[test]
     fn a_descriptor_cycle_runs_out_of_budget() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
         program(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
 
@@ -836,8 +831,7 @@ mod queue_tests {
     /// rather than passing on an empty walk.
     #[test]
     fn a_next_index_outside_the_ring_ends_the_walk() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
         program(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
 
@@ -874,8 +868,7 @@ mod queue_tests {
     /// 65535 chain walks.
     #[test]
     fn avail_idx_beyond_the_ring_is_refused() {
-        let mut backing = vec![0u8; 0x4000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut q = Queue::default();
         q.set_num(8);
         q.set_avail_lo((BASE + 0x1000) as u32);
@@ -899,8 +892,7 @@ mod queue_tests {
         std::fs::write(&path, &disk).unwrap();
         let mut blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
 
-        let mut backing = vec![0u8; 0x8000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
         let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
 
@@ -939,7 +931,6 @@ mod capacity_tests {
 
     struct Rig {
         path: std::path::PathBuf,
-        backing: Vec<u8>,
     }
 
     impl Drop for Rig {
@@ -953,13 +944,7 @@ mod capacity_tests {
         let path = std::env::temp_dir().join(format!("hvi-cap-{tag}-{}.img", std::process::id()));
         std::fs::write(&path, [0xabu8; 512]).unwrap();
         let blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
-        (
-            Rig {
-                path,
-                backing: vec![0u8; 0x8000],
-            },
-            blk,
-        )
+        (Rig { path }, blk)
     }
 
     /// Submits one request and returns the status byte the device wrote.
@@ -1006,8 +991,8 @@ mod capacity_tests {
     /// Regression for the guest writing outside the disk it was advertised.
     #[test]
     fn write_past_the_advertised_capacity_is_refused() {
-        let (mut r, mut blk) = rig("out");
-        let mem = GuestRam::new(r.backing.as_mut_ptr(), BASE, r.backing.len());
+        let (r, mut blk) = rig("out");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         assert_eq!(blk.capacity_sectors, 1);
 
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 131_072, 16);
@@ -1024,8 +1009,8 @@ mod capacity_tests {
 
     #[test]
     fn read_past_the_advertised_capacity_is_refused() {
-        let (mut r, mut blk) = rig("in");
-        let mem = GuestRam::new(r.backing.as_mut_ptr(), BASE, r.backing.len());
+        let (_r, mut blk) = rig("in");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 9_999, 512);
         assert_eq!(st, VIRTIO_BLK_S_IOERR);
     }
@@ -1034,8 +1019,8 @@ mod capacity_tests {
     /// back into the file (release builds used to wrap silently).
     #[test]
     fn sector_offset_overflow_is_refused() {
-        let (mut r, mut blk) = rig("ovf");
-        let mem = GuestRam::new(r.backing.as_mut_ptr(), BASE, r.backing.len());
+        let (r, mut blk) = rig("ovf");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, u64::MAX / 256, 16);
         assert_eq!(st, VIRTIO_BLK_S_IOERR);
         assert_eq!(std::fs::metadata(&r.path).unwrap().len(), 512);
@@ -1045,8 +1030,8 @@ mod capacity_tests {
     /// off by one.
     #[test]
     fn a_request_inside_the_capacity_still_succeeds() {
-        let (mut r, mut blk) = rig("ok");
-        let mem = GuestRam::new(r.backing.as_mut_ptr(), BASE, r.backing.len());
+        let (_r, mut blk) = rig("ok");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512);
         assert_eq!(st, VIRTIO_BLK_S_OK, "sector 0 of a 1-sector disk is valid");
         let mut got = [0u8; 4];

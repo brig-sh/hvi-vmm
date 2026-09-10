@@ -594,8 +594,8 @@ mod session_tests {
     use std::io::Read;
     use std::time::Duration;
 
-    fn mem_of(backing: &mut Vec<u8>) -> GuestRam {
-        GuestRam::new(backing.as_mut_ptr(), 0x4000_0000, backing.len())
+    fn mem_of(len: usize) -> GuestRam {
+        GuestRam::from_ranges(&[(0x4000_0000, len)])
     }
 
     /// A well-formed packet from the guest agent to host port `dst_port`.
@@ -629,8 +629,7 @@ mod session_tests {
     #[test]
     fn an_oversized_transmit_chain_is_refused() {
         const BASE: u64 = 0x4000_0000;
-        let mut backing = vec![0u8; 0x20000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x20000);
         let mut dev = VirtioVsock::new();
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
 
@@ -665,8 +664,7 @@ mod session_tests {
     fn a_full_size_guest_packet_is_carried() {
         const BASE: u64 = 0x4000_0000;
         const PAYLOAD: usize = 64 * 1024;
-        let mut backing = vec![0u8; 0x30000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x30000);
         let mut dev = VirtioVsock::new();
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
 
@@ -700,8 +698,7 @@ mod session_tests {
     #[test]
     fn a_tx_descriptor_cycle_runs_out_of_budget() {
         const BASE: u64 = 0x4000_0000;
-        let mut backing = vec![0u8; 0x8000];
-        let mem = GuestRam::new(backing.as_mut_ptr(), BASE, backing.len());
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut dev = VirtioVsock::new();
         dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
         dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
@@ -748,8 +745,7 @@ mod session_tests {
     /// offered, but the guest never accepted it, so its bytes must not flow.
     #[test]
     fn rw_for_a_session_the_guest_never_accepted_is_dropped() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
 
         let (a_dev, _a) = UnixStream::pair().unwrap();
@@ -769,8 +765,7 @@ mod session_tests {
     /// was never made to it.
     #[test]
     fn response_for_an_unoffered_session_is_dropped() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
 
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
@@ -787,8 +782,7 @@ mod session_tests {
     /// all dropped, even on an otherwise live session.
     #[test]
     fn packets_not_addressed_to_us_are_dropped() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side);
@@ -834,8 +828,7 @@ mod session_tests {
     /// stay silent, and only a Connected one gets its credit update.
     #[test]
     fn credit_request_answers_only_a_live_session() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
 
         // One session in each state the guest can observe.
@@ -881,8 +874,7 @@ mod session_tests {
     /// A session the guest was never offered cannot be torn down by it.
     #[test]
     fn shutdown_of_an_unoffered_session_is_dropped() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side);
@@ -898,8 +890,7 @@ mod session_tests {
     /// The happy path is intact: offer, accept, relay both ways.
     #[test]
     fn an_accepted_session_still_relays() {
-        let mut backing = vec![0u8; 0x1000];
-        let mem = mem_of(&mut backing);
+        let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side);

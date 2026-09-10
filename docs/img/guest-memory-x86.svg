@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 540" width="720" height="540" role="img" aria-labelledby="t d">
   <title id="t">Why x86-64 guest RAM has a hole</title>
-  <desc id="d">The x86-64 guest's RAM is not one contiguous span. It starts at address zero and stops at 0xd0000000, where the virtio-mmio device window begins. RAM laid over that window would shadow the device registers, so KVM would service the access from memory and the guest would silently lose its devices. RAM laid over the in-kernel LAPIC page at 0xfee00000 would be refused outright with EEXIST. The hole starts at the lower of the two. Any remaining RAM resumes at 4 GiB as a second KVM memory slot into the same memfd, so the host mapping stays contiguous and only the guest-physical view has a gap.</desc>
+  <desc id="d">The x86-64 guest's RAM is not one contiguous span. It starts at address zero and stops at 0xd0000000, where the virtio-mmio device window begins. RAM laid over that window would shadow the device registers, so KVM would service the access from memory and the guest would silently lose its devices. RAM laid over the in-kernel LAPIC page at 0xfee00000 would be refused outright with EEXIST. The hole starts at the lower of the two. Any remaining RAM resumes at 4 GiB as a second KVM memory slot into the same memfd at a later file offset, with its own host mapping.</desc>
 
   <rect x="0" y="0" width="720" height="540" fill="#f6f7f9"/>
 

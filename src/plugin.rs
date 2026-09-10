@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;
+pub use crate::guestmem::MemRegion;
 
 /// The guest architecture a backend is running, so a tool can interpret
 /// [`RegsView`] correctly without guessing it from the host.
@@ -49,18 +50,6 @@ pub enum GuestArch {
     Aarch64,
     /// x86-64 guest (KVM on Linux).
     X86_64,
-}
-
-/// A guest-physical span of the VM's RAM and where it sits in the backing
-/// object, so a process that maps the same object sees the same bytes.
-#[derive(Debug, Clone, Copy)]
-pub struct MemRegion {
-    /// Guest-physical address this span starts at.
-    pub gpa: u64,
-    /// Length in bytes.
-    pub size: u64,
-    /// Offset of `gpa` within the shareable backing object.
-    pub file_offset: u64,
 }
 
 /// A parked vCPU's register state, as much of it as a tool outside the exit

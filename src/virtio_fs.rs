@@ -7565,9 +7565,8 @@ mod tests {
         let issue = lookup_node(&mut dev, etc, b"issue");
         assert!(dev.nodes.contains_key(&issue), "the node is resident");
 
-        let mut backing = vec![0u8; 0x10000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, in_buf) = (base, base + 0x100, base + 0x200, base + 0x1000);
         program_queue(&mut dev, &mem, 8, desc, avail, used);
 
@@ -7742,9 +7741,8 @@ mod tests {
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"big");
         let fh = open_rw(&mut dev, node);
 
-        let mut backing = vec![0u8; 0x10000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, in_buf, out1, out2) = (
             base,
             base + 0x100,
@@ -7794,9 +7792,8 @@ mod tests {
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"short");
         let fh = open_rw(&mut dev, node);
 
-        let mut backing = vec![0u8; 0x10000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, in_buf, out) = (
             base,
             base + 0x100,
@@ -7846,9 +7843,8 @@ mod tests {
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
         let fh = open_rw(&mut dev, node);
 
-        let mut backing = vec![0u8; 0x10000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, hdr_buf, payload1, payload2, out) = (
             base,
             base + 0x100,
@@ -7907,9 +7903,8 @@ mod tests {
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"target");
         let fh = open_rw(&mut dev, node);
 
-        let mut backing = vec![0u8; 0x10000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, hdr_buf, payload, out) = (
             base,
             base + 0x100,
@@ -7967,9 +7962,8 @@ mod tests {
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
         let fh = open_rw(&mut dev, node);
 
-        let mut backing = vec![0u8; 0x10000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, in_buf, out) = (
             base,
             base + 0x100,
@@ -8030,9 +8024,8 @@ mod tests {
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
         let fh = open_rw(&mut dev, node);
 
-        let mut backing = vec![0u8; 0x20000];
         let base = 0x4000_0000u64;
-        let mem = GuestRam::new(backing.as_mut_ptr(), base, backing.len());
+        let mem = GuestRam::from_ranges(&[(base, 0x20000)]);
         let (desc, avail, used) = (base, base + 0x100, base + 0x200);
         program_queue(&mut dev, &mem, 8, desc, avail, used);
 
@@ -8127,9 +8120,8 @@ mod tests {
         let (dir, dev) = fixture();
         let dev = Arc::new(Mutex::new(dev));
 
-        let mut backing = vec![0u8; 0x20000];
         let base = 0x4000_0000u64;
-        let mem = Arc::new(GuestRam::new(backing.as_mut_ptr(), base, backing.len()));
+        let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
         let (desc, avail, used) = (base, base + 0x1000, base + 0x2000);
         let bufs = base + 0x4000;
 

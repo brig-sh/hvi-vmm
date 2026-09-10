@@ -84,12 +84,13 @@ wrong the rest of it is.
 Guest RAM is not always one span. `ram_regions()` returns one region on arm64.
 On x86-64 it returns one region up to 3328 MiB of guest RAM and two above
 that, because RAM stops at the MMIO hole and resumes at 4 GiB. Read
-`ram_regions()`. Do not assume a count.
+`ram_regions()`. Do not assume a count. Each region's `gpa`, `size` and
+`file_offset` are multiples of 1 MiB.
 
 Guest RAM is allocated from a memfd on Linux and a POSIX shared-memory object
-on macOS, unlinked once mapped, so `ram_fd()` is a descriptor another process
-can map and nothing else can open by name. `hvi smoke --shm` proves that path
-on macOS.
+on macOS, unlinked as soon as it is created, so `ram_fd()` is a descriptor
+another process can map and no other process can open by name.
+`hvi smoke --shm` proves that path on macOS.
 
 `RegsView::root` is the architectural translation-base register, TTBR1_EL1 on
 arm64 or CR3 on x86-64. The traits hand over access and deliberately no more.

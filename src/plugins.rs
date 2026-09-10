@@ -418,17 +418,19 @@ mod tests {
     /// the writable side wrote -- the property the dumper depends on.
     #[test]
     fn a_read_only_view_sees_the_writable_side() {
-        let ram = crate::sharedmem::SharedRam::new(crate::sharedmem::PAGE).expect("ram");
-        // SAFETY: writing one byte into our own mapping.
-        unsafe { *ram.as_ptr() = 0xAB };
+        let ram = crate::sharedmem::SharedRam::new(MemRegion::ALIGN as usize).expect("ram");
         let regions = [MemRegion {
             gpa: 0x4000_0000,
-            size: crate::sharedmem::PAGE as u64,
+            size: MemRegion::ALIGN,
             file_offset: 0,
         }];
+        crate::guestmem::GuestRam::new(&ram, &regions)
+            .expect("writable side")
+            .write_u8(0x4000_0000, 0xAB)
+            .expect("write");
         let view = ReadOnlyRam::map(ram.fd(), &regions).expect("map");
         assert_eq!(view.slice(0)[0], 0xAB);
-        assert_eq!(view.slice(0).len(), crate::sharedmem::PAGE);
+        assert_eq!(view.slice(0).len(), MemRegion::ALIGN as usize);
     }
 
     /// A trace writes one line per event, in the order the device saw them.

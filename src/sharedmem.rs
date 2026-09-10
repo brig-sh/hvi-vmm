@@ -14,102 +14,75 @@
 
 //! Guest RAM in a form another process can map.
 //!
-//! A plugin only reads guest memory, and reading it does not need
-//! the hypervisor -- so it does not need to live in the VMM process at all.
-//! That is only true if the RAM is backed by something *nameable*, though: a
-//! private anonymous mapping cannot be handed to anyone. This module allocates
-//! it from a shareable object instead, so an out-of-process plugin can
-//! map the same pages read-only.
+//! Guest RAM is allocated as an object another process can open, so a
+//! plugin that only reads guest memory can run outside the VMM process; a
+//! private anonymous mapping could not be shared that way.
 //!
 //! - **Linux** uses a `memfd`, which is passed to the plugin over the control
 //!   socket with `SCM_RIGHTS`. KVM only requires that `userspace_addr` be a
 //!   valid host address in the creating process, so backing it with a
 //!   `MAP_SHARED` memfd instead of anonymous memory changes nothing about how
-//!   the guest sees it. This is what vhost-user VMMs do anyway.
+//!   the guest sees it. vhost-user VMMs back guest RAM the same way.
 //! - **macOS** has no `memfd`, so it uses a POSIX shared-memory object. The
-//!   guest mapping is then established by calling `hv_vm_map` on our own
-//!   pointer, rather than letting `applevisor` allocate. `hvi smoke --shm`
+//!   guest mapping is then established by calling `hv_vm_map` on the region's
+//!   host pointer, rather than letting `applevisor` allocate. `hvi smoke --shm`
 //!   proves that path end to end.
 //!
-//! The object is unlinked from the namespace as soon as it is mapped. It stays
-//! alive through the open descriptor, so the RAM cannot outlive the VMM or be
-//! opened by name by anything that was not handed the descriptor.
+//! The object is unlinked from the namespace as soon as it is created. It
+//! stays alive through the open descriptor, so the RAM cannot outlive the VMM
+//! or be opened by name by a process that was not given the descriptor.
 
+use std::fs::File;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::sync::Arc;
 
-/// Page size the guest mapping must be aligned to. Apple silicon uses 16 KiB,
-/// which `hv_vm_map` enforces on the address, the IPA and the length.
-#[cfg(target_os = "macos")]
-pub const PAGE: usize = 0x4000;
-/// Page size the guest mapping must be aligned to.
-#[cfg(not(target_os = "macos"))]
-pub const PAGE: usize = 0x1000;
+use crate::guestmem::MemRegion;
 
-/// A shareable guest-RAM allocation: a descriptor plus the mapping we made from
-/// it. Dropping it unmaps the region and closes the descriptor.
+/// A shareable guest-RAM allocation, the descriptor of an unlinked object
+/// sized to hold the guest. The object lives as long as any mapping of it or
+/// this value does.
 pub struct SharedRam {
-    host: *mut u8,
+    /// The unlinked object, shared with every mapping of it.
+    file: Arc<File>,
+    /// Object length in bytes.
     len: usize,
-    fd: i32,
 }
 
-// SAFETY: `SharedRam` is just an owned mapping; the pointer is valid for `len`
-// bytes for as long as the value lives, and the vCPU threads already coordinate
-// their access to guest RAM through `GuestRam`.
-unsafe impl Send for SharedRam {}
-unsafe impl Sync for SharedRam {}
-
 impl SharedRam {
-    /// Allocates `len` bytes of shareable memory, rounded up to [`PAGE`].
+    /// Allocates `len` bytes of shareable memory.
     ///
     /// The backing object is unlinked immediately, so it is reachable only
     /// through the returned descriptor.
     pub fn new(len: usize) -> io::Result<Self> {
-        let len = len.next_multiple_of(PAGE);
-        let fd = Self::create_object(len)?;
-
-        // SAFETY: `fd` is a descriptor sized to exactly `len` bytes.
-        let host = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if host == libc::MAP_FAILED {
-            let e = io::Error::last_os_error();
-            // SAFETY: closing a descriptor we own and have not handed out.
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
+        let file = Self::create_object(len)?;
         Ok(Self {
-            host: host.cast::<u8>(),
+            file: Arc::new(file),
             len,
-            fd,
         })
     }
 
     /// Creates the (already unlinked) backing object, sized to `len`.
-    fn create_object(len: usize) -> io::Result<i32> {
+    ///
+    /// The returned `File` owns the descriptor from creation, so an early
+    /// error closes it.
+    fn create_object(len: usize) -> io::Result<File> {
         #[cfg(target_os = "linux")]
         {
             let name = c"hvi-guest-ram";
             // SAFETY: a valid NUL-terminated name; MFD_CLOEXEC keeps the
-            // descriptor out of anything we spawn that has no business with it.
+            // descriptor out of child processes.
             let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: `fd` is a descriptor this function created and owns.
+            let file = unsafe { File::from_raw_fd(fd) };
             // SAFETY: sizing a descriptor we just created.
-            if unsafe { libc::ftruncate(fd, len as libc::off_t) } != 0 {
-                let e = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(e);
+            if unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) } != 0 {
+                return Err(io::Error::last_os_error());
             }
-            Ok(fd)
+            Ok(file)
         }
         #[cfg(target_os = "macos")]
         {
@@ -119,11 +92,9 @@ impl SharedRam {
             // mapping.
             //
             // The name carries a per-allocation counter as well as the pid,
-            // because the pid alone is not unique within a process: the window
-            // between shm_open and the shm_unlink below is open to any other
-            // allocation in flight, which is a live collision whenever one
-            // process holds two guest-RAM objects (and is what made the unit
-            // tests, which allocate on several threads, flake).
+            // because the pid alone is not unique within a process: between
+            // shm_open and the shm_unlink below, a second allocation in the
+            // same process would collide.
             static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = std::ffi::CString::new(format!("/hvi-ram-{}-{seq}", std::process::id()))
@@ -139,92 +110,89 @@ impl SharedRam {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: `fd` is a descriptor this function created and owns.
+            let file = unsafe { File::from_raw_fd(fd) };
             // Unlink now: the descriptor keeps it alive, and nothing can reach
             // it by name afterwards.
             // SAFETY: unlinking a name we just created.
             unsafe { libc::shm_unlink(name.as_ptr()) };
             // SAFETY: sizing a descriptor we just created.
-            if unsafe { libc::ftruncate(fd, len as libc::off_t) } != 0 {
-                let e = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(e);
+            if unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) } != 0 {
+                return Err(io::Error::last_os_error());
             }
-            Ok(fd)
+            Ok(file)
         }
     }
 
-    /// Host pointer to the mapping.
+    /// Returns the region that maps the whole object at `gpa`.
     #[must_use]
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.host
+    pub fn region_at(&self, gpa: u64) -> MemRegion {
+        MemRegion {
+            gpa,
+            size: self.len as u64,
+            file_offset: 0,
+        }
     }
 
-    /// Length of the mapping, rounded up to [`PAGE`].
+    /// Returns the backing object, shared with every region mapped from it.
+    #[must_use]
+    pub fn file(&self) -> &Arc<File> {
+        &self.file
+    }
+
+    /// Returns the object length.
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Whether the mapping is empty (never true in practice; present so `len`
-    /// does not read as a lint violation).
+    /// Returns whether the object is empty.
+    ///
+    /// Never true after `new`; it pairs with `len` for the
+    /// `len_without_is_empty` lint.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// The backing descriptor, to be sent to a plugin with `SCM_RIGHTS`.
-    /// Borrowed, not owned: the caller must not close it.
+    /// Returns the backing descriptor, which stays owned here and must not be
+    /// closed.
     #[must_use]
-    pub fn fd(&self) -> i32 {
-        self.fd
-    }
-}
-
-impl Drop for SharedRam {
-    fn drop(&mut self) {
-        // SAFETY: unmapping and closing exactly what we created in `new`.
-        unsafe {
-            libc::munmap(self.host.cast::<libc::c_void>(), self.len);
-            libc::close(self.fd);
-        }
+    pub fn fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guestmem::GuestRam;
 
-    /// The allocation is usable memory of at least the requested size.
+    const BASE: u64 = 0x4000_0000;
+    // The smallest object one region can map.
+    const LEN: usize = MemRegion::ALIGN as usize;
+
+    /// Maps the whole object as one region at `BASE`.
+    fn view(ram: &SharedRam) -> GuestRam {
+        GuestRam::new(ram, &[ram.region_at(BASE)]).expect("map")
+    }
+
     #[test]
     fn allocates_and_reads_back() {
-        let ram = SharedRam::new(PAGE).expect("allocate");
-        assert!(ram.len() >= PAGE);
+        let ram = SharedRam::new(LEN).expect("allocate");
+        assert_eq!(ram.len(), LEN);
         assert!(!ram.is_empty());
-        // SAFETY: writing inside a mapping we own.
-        unsafe {
-            ram.as_ptr().write(0xab);
-            assert_eq!(ram.as_ptr().read(), 0xab);
-        }
+        let mem = view(&ram);
+        mem.write_u8(BASE, 0xab).expect("write");
+        assert_eq!(mem.read_u32(BASE).expect("read") & 0xff, 0xab);
     }
 
-    /// A short request is rounded up to a whole page, since the guest mapping
-    /// APIs require it.
-    #[test]
-    fn rounds_up_to_a_page() {
-        let ram = SharedRam::new(1).expect("allocate");
-        assert_eq!(ram.len(), PAGE);
-    }
-
-    /// End to end: what a VMM writes through `GuestRam` is what a tool reads
-    /// from its own mapping of the same object -- the property a read-only
-    /// view depends on.
+    // The read-only plugin view depends on this.
     #[test]
     fn guest_ram_writes_are_visible_to_a_second_mapping() {
-        const BASE: u64 = 0x4000_0000;
-        let ram = SharedRam::new(PAGE).expect("allocate");
-        // The mapping is live and covers `len` bytes from `as_ptr`.
-        let view = crate::guestmem::GuestRam::new(ram.as_ptr(), BASE, ram.len());
-        view.write(BASE + 128, b"HVI-SHARED")
+        let ram = SharedRam::new(LEN).expect("allocate");
+        view(&ram)
+            .write(BASE + 128, b"HVI-SHARED")
             .expect("write guest RAM");
 
         // SAFETY: a second, read-only view of the same object.
@@ -246,56 +214,17 @@ mod tests {
         unsafe { libc::munmap(other, ram.len()) };
     }
 
-    /// The point of the type: the same pages are reachable through a second
-    /// mapping of the descriptor, which is what a plugin does.
-    #[test]
-    fn is_visible_through_a_second_mapping() {
-        let ram = SharedRam::new(PAGE).expect("allocate");
-        // SAFETY: mapping the same descriptor again, read-only, as a separate
-        // view of the same object.
-        let second = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                ram.len(),
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                ram.fd(),
-                0,
-            )
-        };
-        assert_ne!(second, libc::MAP_FAILED, "second mapping failed");
-        // SAFETY: both mappings are live and cover the same object.
-        unsafe {
-            ram.as_ptr().add(64).write(0x5a);
-            assert_eq!(
-                second.cast::<u8>().add(64).read(),
-                0x5a,
-                "a write through the owner was not visible in the second mapping"
-            );
-            libc::munmap(second, ram.len());
-        }
-    }
-
-    /// The stated isolation property, tested the way an attacker would: the
-    /// backing object is unlinked as soon as it exists, so nothing that was
-    /// not handed the descriptor can reach the guest's RAM.
-    ///
-    /// The two platforms make the guarantee differently, so the test does
-    /// too. On macOS the object is a named POSIX shared-memory segment and
-    /// the name is derived from the pid, which an attacker knows -- so probe
-    /// every name this process could have used and require all of them to be
-    /// gone. On Linux it is a `memfd`, which has no name in any filesystem
-    /// namespace at all, and the check is that its `/proc` link is a memfd
-    /// rather than a path anything could open.
-    ///
-    /// Note for whoever changes `create_object`: the macOS half reconstructs
-    /// the name format, so a change to that format has to change this test
-    /// with it, or the probe stops probing anything.
+    // The two platforms give the guarantee differently. On macOS the object is
+    // a named POSIX shared-memory segment whose name derives from the pid, so
+    // every name this process could have used is probed and must be gone. On
+    // Linux a memfd has no filesystem name; its /proc link must be a memfd,
+    // not an openable path.
+    //
+    // The macOS half reconstructs the name format, so a change to that format
+    // must change this test too.
     #[test]
     fn the_backing_object_is_not_reachable_by_name() {
-        let ram = SharedRam::new(PAGE).expect("allocate");
-        // SAFETY: the mapping is live for the length reported.
-        unsafe { ram.as_ptr().write(0x5a) };
+        let ram = SharedRam::new(LEN).expect("allocate");
 
         #[cfg(target_os = "macos")]
         {
@@ -332,7 +261,7 @@ mod tests {
             // SAFETY: a descriptor this test created.
             unsafe { libc::close(made) };
 
-            // Now the real thing. The sequence number is process-wide and
+            // The probe itself. The sequence number is process-wide and
             // every allocation increments it once, so this range covers every
             // name the test binary can have produced.
             for seq in 0..1024 {
@@ -362,37 +291,33 @@ mod tests {
                 "the memfd link {link} opens, so guest RAM has a reachable name"
             );
         }
+        // Alive through the probes above, on both platforms.
+        drop(ram);
     }
 
-    /// Two objects can be alive in one process at once, and they are distinct.
-    ///
-    /// On macOS the backing object is named, and a name that is unique only per
-    /// process collides with any allocation still inside the window between its
-    /// shm_open and its shm_unlink. Allocating from several threads at once is
-    /// the shape that hit it.
+    // On macOS the object name is unique only per process; two allocations
+    // inside the shm_open/shm_unlink window would collide.
     #[test]
     fn concurrent_allocations_do_not_collide() {
-        // Collected before any join, so the allocations really do overlap.
+        // Collected before any join, so the allocations overlap.
         let handles: Vec<_> = (0..8)
-            .map(|_| std::thread::spawn(|| SharedRam::new(PAGE)))
+            .map(|_| std::thread::spawn(|| SharedRam::new(LEN)))
             .collect();
         let rams: Vec<_> = handles
             .into_iter()
             .map(|h| h.join().expect("thread").expect("allocate"))
             .collect();
         // Distinct objects: a write through one must not appear in another.
-        // SAFETY: every mapping is live and at least PAGE long.
-        unsafe {
-            for (i, ram) in rams.iter().enumerate() {
-                ram.as_ptr().write(i as u8 + 1);
-            }
-            for (i, ram) in rams.iter().enumerate() {
-                assert_eq!(
-                    ram.as_ptr().read(),
-                    i as u8 + 1,
-                    "allocation {i} shares storage with another"
-                );
-            }
+        let views: Vec<_> = rams.iter().map(view).collect();
+        for (i, mem) in views.iter().enumerate() {
+            mem.write_u8(BASE, i as u8 + 1).expect("write");
+        }
+        for (i, mem) in views.iter().enumerate() {
+            assert_eq!(
+                mem.read_u32(BASE).expect("read") & 0xff,
+                u32::from(i as u8 + 1),
+                "allocation {i} shares storage with another"
+            );
         }
     }
 }

@@ -24,6 +24,11 @@ vm-fdt = "0.3.0"
 # does the portable stub build, since the shared device code and its unit tests
 # compile everywhere.
 virtio-bindings = "0.2.7"
+# Guest RAM as a region collection, the type the rust-vmm crates take as guest
+# memory. `backend-mmap` maps each region from the shareable object in
+# `sharedmem`. The device code and its unit tests compile everywhere, so this
+# is portable too.
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = "1.0.0"
