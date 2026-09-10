@@ -27,27 +27,47 @@
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
 
-/// PL011 UART MMIO base and size. Placed *below* the GIC (which sits at
-/// `0x0800_0000`+) rather than at QEMU virt's `0x0900_0000`: Apple's `hv_gic`
-/// reports a much larger redistributor region than QEMU's, and that region —
-/// which Linux reserves from the DTB `reg` — extends up past `0x0900_0000` and
-/// steals the UART's MMIO range, so `ttyAMA0` fails to bind (`amba_device_add
-/// -16`). `0x0100_0000` is safely clear of both the GIC and guest RAM.
-pub const UART_BASE: u64 = 0x0100_0000;
+/// The window a guest with a *static* boot page table maps as device memory.
+///
+/// Linux maps MMIO from the DTB and accepts it anywhere. A Unikraft/arm64
+/// build without `CONFIG_PAGING` enables the MMU from a table written at link
+/// time, and what that table covers is per platform: QEMU-virt maps
+/// `0x0800_0000`–`0x4000_0000` plus windows at 256 and 512 GiB
+/// (`plat/kvm/arm/qemu_bpt64.S`), Firecracker maps the low 2 GiB, and
+/// `CONFIG_PAGING` remaps on demand from the device tree
+/// (`drivers/ukbus/platform/platform_bus.c`). The guests we boot are the
+/// first case, so every device window has to sit in the range below; outside
+/// it the guest faults before it has a console.
+pub const DEVICE_WINDOW_BASE: u64 = 0x0800_0000;
+pub const DEVICE_WINDOW_END: u64 = RAM_BASE;
+
+/// PL011 UART MMIO base and size.
+///
+/// Sits *above* the GIC rather than at QEMU virt's `0x0900_0000`: Apple's
+/// `hv_gic` reports a far larger redistributor region, which Linux reserves
+/// from the DTB `reg` and which would swallow `0x0900_0000`, leaving
+/// `ttyAMA0` unable to bind (`amba_device_add -16`). Clearance is measured
+/// from the top of the GIC, not the distributor base.
+///
+/// Apple silicon (M3, M4) reports a 32 MiB redistributor region ending at
+/// `0x0a0a_0000` at 1, 4 and 8 vCPUs, so this leaves about 31 MiB spare. The
+/// framework sizes that region, so the machine refuses to boot if it ever
+/// reaches here.
+pub const UART_BASE: u64 = 0x0c00_0000;
 pub const UART_SIZE: u64 = 0x1000;
 /// UART interrupt as a GIC SPI number (INTID = 32 + SPI = 33).
 pub const UART_SPI: u32 = 1;
 
-/// virtio-mmio device windows and interrupts, below the GIC and clear of the
+/// virtio-mmio device windows and interrupts, above the GIC and clear of the
 /// UART. Slot 0 = virtio-blk, slot 1 = virtio-net; each is one 0x200 page.
 pub const VIRTIO_SIZE: u64 = 0x0200;
-pub const VIRTIO_BASE: u64 = 0x0200_0000;
+pub const VIRTIO_BASE: u64 = 0x0d00_0000;
 pub const VIRTIO_SPI: u32 = 2;
-pub const VIRTIO_NET_BASE: u64 = 0x0200_0200;
+pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
 pub const VIRTIO_NET_SPI: u32 = 3;
-pub const VIRTIO_VSOCK_BASE: u64 = 0x0200_0400;
+pub const VIRTIO_VSOCK_BASE: u64 = 0x0d00_0400;
 pub const VIRTIO_VSOCK_SPI: u32 = 4;
-pub const VIRTIO_FS_BASE: u64 = 0x0200_0600;
+pub const VIRTIO_FS_BASE: u64 = 0x0d00_0600;
 pub const VIRTIO_FS_SPI: u32 = 5;
 
 /// Placement of the `index`th virtio-fs device. Each export gets an
@@ -123,6 +143,14 @@ impl GicLayout {
     /// eight vCPUs.
     pub const V2_MAX_CPUS: u32 = 8;
 
+    /// Most vCPUs whose v3 redistributors still fit below [`UART_BASE`].
+    ///
+    /// The region grows by one frame per vCPU from a fixed base. The macOS
+    /// backend re-checks the overlap at boot; the KVM backends do not, so the
+    /// bound belongs where the count is decided.
+    pub const V3_MAX_CPUS: u32 =
+        ((UART_BASE - Self::QEMU_VIRT.gicr_base) / Self::QEMU_VIRT.gicr_size) as u32;
+
     /// Where the guest's GIC regions go for `vcpus`, under the version the
     /// host negotiated -- or why that pair cannot be served at all.
     ///
@@ -139,6 +167,10 @@ impl GicLayout {
     /// Errors when `vcpus` exceeds [`Self::V2_MAX_CPUS`] on a v2 host.
     pub fn for_vcpus(version: GicVersion, vcpus: u32) -> Result<GicLayout, String> {
         match version {
+            GicVersion::V3 if vcpus > Self::V3_MAX_CPUS => Err(format!(
+                "{vcpus} vCPUs would push the GIC redistributors into the UART at {UART_BASE:#x}; at most {} fit",
+                Self::V3_MAX_CPUS
+            )),
             GicVersion::V3 => Ok(GicLayout {
                 gicr_size: u64::from(vcpus) * Self::QEMU_VIRT.gicr_size,
                 ..Self::QEMU_VIRT
@@ -249,6 +281,22 @@ mod tests {
         assert_eq!(align_up(0x1001, 0x20_0000), 0x20_0000);
     }
 
+    // Nothing on the KVM backends catches a redistributor region laid over
+    // the UART, so the bound has to hold here.
+    #[test]
+    fn a_v3_gic_never_grows_into_the_uart() {
+        let max = GicLayout::V3_MAX_CPUS;
+        let gic = GicLayout::for_vcpus(GicVersion::V3, max).expect("the last fitting count");
+        assert!(
+            gic.gicr_base + gic.gicr_size <= UART_BASE,
+            "{max} vCPUs must stay below the UART"
+        );
+        assert!(
+            GicLayout::for_vcpus(GicVersion::V3, max + 1).is_err(),
+            "one vCPU more must be refused, not overlapped"
+        );
+    }
+
     /// The refusal that no CI job reaches: the Pi 5 lane is the only host that
     /// negotiates vGICv2 and it never asks for more than four vCPUs, so the
     /// cap was only ever going to be exercised here.
@@ -310,5 +358,53 @@ mod tests {
         // 8 MiB RAM cannot hold a 16 MiB kernel.
         let l = GuestLayout::new(8 << 20, RAM_BASE, 16 << 20, 0x2000, 0);
         assert!(l.validate().is_err());
+    }
+
+    // Shares are placed one after another above a redistributor region far
+    // larger on Apple than on QEMU, so a share count can walk out of either
+    // bound.
+    #[test]
+    fn virtio_fs_windows_clear_a_large_gic() {
+        // What `hv_gic` reports on this host: a 32 MiB redistributor region,
+        // where QEMU virt would have 128 KiB per vCPU.
+        let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
+        assert!(
+            gic_end < VIRTIO_FS_BASE,
+            "the GIC ends below the fs windows"
+        );
+        for index in 0..16 {
+            let base = virtio_fs_base(index).expect("a placement");
+            let end = base + VIRTIO_SIZE;
+            assert!(base >= gic_end, "fs {index} at {base:#x} runs into the GIC");
+            assert!(
+                end <= DEVICE_WINDOW_END,
+                "fs {index} escapes the device map"
+            );
+        }
+    }
+
+    // A device outside the static boot map is unreachable before the guest
+    // has a console to complain with.
+    #[test]
+    fn devices_live_in_the_static_boot_map() {
+        // Not QEMU's per-vCPU frame: the bound that applies on the backend
+        // this move is for is the whole region `hv_gic` reports, which is
+        // 32 MiB on this host. Sizing the check from `V2_MAX_CPUS` would
+        // check a GIC far smaller than the one the windows must clear.
+        let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
+        let windows = [
+            ("uart", UART_BASE, UART_SIZE),
+            ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
+            ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
+            ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
+            ("virtio-fs", VIRTIO_FS_BASE, VIRTIO_SIZE),
+        ];
+        for (name, base, size) in windows {
+            assert!(
+                base >= DEVICE_WINDOW_BASE && base + size <= DEVICE_WINDOW_END,
+                "{name} at {base:#x} escapes the static device map"
+            );
+            assert!(base >= gic_end, "{name} at {base:#x} overlaps the GIC");
+        }
     }
 }

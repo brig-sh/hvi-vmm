@@ -123,7 +123,7 @@ hvi prints what it set up, then hands the console to the guest:
 
 ```text
 booting target/Image with 1024 MiB ...
-[hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0x1000000
+[hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
 [hvi] seatbelt sandbox: on (deny default)
 [    0.000000] Booting Linux on physical CPU 0x0000000000 [0x610f0000]
 [    0.000000] Linux version 6.12.95 ...

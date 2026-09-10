@@ -274,9 +274,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!contains(&absent, "virtio_mmio@2000600"));
-        assert!(contains(&present, "virtio_mmio@2000600"));
-        assert!(contains(&present, "virtio_mmio@2000800"));
+        let first = format!("virtio_mmio@{:x}", crate::layout::VIRTIO_FS_BASE);
+        let second = format!(
+            "virtio_mmio@{:x}",
+            crate::layout::VIRTIO_FS_BASE + crate::layout::VIRTIO_SIZE
+        );
+        assert!(!contains(&absent, &first));
+        assert!(contains(&present, &first));
+        assert!(contains(&present, &second));
     }
 
     /// Returns true if `needle` appears in the blob's strings/structure, which
