@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 520" width="720" height="520" role="img" aria-labelledby="t d">
+  <title id="t">arm64 guest physical address space</title>
+  <desc id="d">Address-ordered map of the arm64 guest. Devices sit low: the PL011 UART at 0x01000000, a virtio-mmio window of 0x200-byte device pages starting at 0x02000000 (block, net, vsock, then one page per virtio-fs share), and the GIC at 0x08000000. Guest RAM is one contiguous span starting at 0x40000000, with the kernel, devicetree blob and initramfs packed upward from its base. Addresses are ordered but not to scale.</desc>
+
+  <rect x="0" y="0" width="720" height="520" fill="#f6f7f9"/>
+
+  <text x="24" y="34" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="16" font-weight="600" fill="#1f2937">arm64 guest physical address space</text>
+  <text x="24" y="54" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#6b7280">Ordered by address, not to scale. Devices low, RAM at 1 GiB.</text>
+
+  <!-- RAM block -->
+  <rect x="24" y="76" width="380" height="120" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="40" y="99" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#1e3a8a">Guest RAM</text>
+  <text x="40" y="120" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x4000_0000  RAM_BASE (1 GiB)</text>
+  <text x="40" y="140" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">  + kernel   (at text_offset, 2 MiB aligned)</text>
+  <text x="40" y="158" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">  + dtb      (2 MiB aligned after kernel)</text>
+  <text x="40" y="176" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">  + initramfs (4 KiB aligned after dtb)</text>
+
+  <text x="420" y="120" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">One contiguous span. Its size is</text>
+  <text x="420" y="137" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">
+    <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">--mem-mib</tspan>. The three images are
+  </text>
+  <text x="420" y="154" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">packed upward from the base.</text>
+
+  <!-- break -->
+  <line x1="24" y1="212" x2="404" y2="212" stroke="#9ca3af" stroke-width="1" stroke-dasharray="5 4"/>
+  <text x="412" y="216" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#9ca3af">unmapped</text>
+
+  <!-- GIC -->
+  <rect x="24" y="230" width="380" height="76" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="40" y="250" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#5b21b6">Interrupt controller (GIC)</text>
+  <text x="40" y="269" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x0800_0000  distributor, 0x1_0000</text>
+  <text x="40" y="286" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x080A_0000  redistributor  (v3)</text>
+  <text x="40" y="300" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x0801_0000  CPU interface  (v2)</text>
+
+  <text x="420" y="250" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">The version follows the host, not</text>
+  <text x="420" y="267" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">a flag. GICv2 caps the guest at</text>
+  <text x="420" y="284" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">8 vCPUs. On macOS the framework</text>
+  <text x="420" y="301" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">sizes the redistributor region.</text>
+
+  <!-- virtio window -->
+  <rect x="24" y="322" width="380" height="112" rx="6" fill="#dcfce7" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="40" y="344" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#166534">virtio-mmio window, 0x200 per device</text>
+  <text x="40" y="364" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0200_0000  virtio-blk           SPI 2  INTID 34</text>
+  <text x="40" y="382" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0200_0200  virtio-net           SPI 3  INTID 35</text>
+  <text x="40" y="400" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0200_0400  virtio-vsock         SPI 4  INTID 36</text>
+  <text x="40" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0200_0600  virtio-fs share i    SPI 5+i INTID 37+i</text>
+
+  <text x="420" y="364" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">One 0x200 page per device.</text>
+  <text x="420" y="381" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">virtio-fs shares extend the</text>
+  <text x="420" y="398" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">window: share <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i</tspan> at base</text>
+  <text x="420" y="415" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">+ <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i * 0x200</tspan>. macOS only.</text>
+
+  <!-- UART -->
+  <rect x="24" y="450" width="380" height="48" rx="6" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="40" y="470" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#92400e">Console</text>
+  <text x="40" y="489" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#b45309">0x0100_0000  PL011 UART, 0x1000   SPI 1  INTID 33</text>
+
+  <text x="420" y="478" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">
+    <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">stdout-path</tspan> in the devicetree.
+  </text>
+
+  <!-- address axis -->
+  <text x="694" y="92" text-anchor="end" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#9ca3af">high</text>
+  <text x="694" y="496" text-anchor="end" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#9ca3af">low</text>
+  <line x1="690" y1="100" x2="690" y2="486" stroke="#d1d5db" stroke-width="1"/>
+  <polygon points="690,96 686,104 694,104" fill="#d1d5db"/>
+</svg>

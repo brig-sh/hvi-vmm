@@ -1,23 +1,26 @@
-# fsbench -- virtio-fs benchmarks in a real guest
+# fsbench
 
-The unit tests in `src/virtio_fs.rs` drive the FUSE handlers directly: no
-guest, no virtqueue, no VM exits. That is the right shape for correctness, and
-it is blind to everything that decides how fast the filesystem actually feels.
-A change that made small writes 2.6x slower passed every one of them.
+Boots a guest, mounts one virtio-fs share, runs a workload, and prints how
+long each phase took. macOS only, because that is where the device compiles.
 
-This boots a guest, mounts one share, runs a workload, and prints how long each
-phase took.
+The unit tests in `src/virtio_fs.rs` drive the FUSE handlers directly, with no
+guest and no virtqueue. That is right for correctness and blind to speed: a
+change that made small writes 2.6 times slower passed every one of them. This
+is what sees that.
 
-## Running
+**[docs/benchmarking.md](../../docs/benchmarking.md) is the guide**: what to
+measure, how to compare two builds, the known bimodal result, and the CI
+performance gate. Read it before drawing a conclusion from a number here.
 
-Needs a static aarch64 busybox for the guest. hull's `container-initrd` carries
-one:
+## Running it
+
+Needs a static aarch64 busybox. hull's `container-initrd` carries one:
 
 ```sh
 mkdir -p /tmp/ci && (cd /tmp/ci && cpio -idm < /path/to/container-initrd)
 ```
 
-Then, from the repo root:
+Then, from the repository root:
 
 ```sh
 cargo build --release
@@ -32,68 +35,31 @@ tools/fsbench/run.sh \
     --workload walk
 ```
 
-`--mem-mib` and `--cpus` size the guest (2048 MiB, 2 vCPUs by default);
-`--timeout <secs>` (default 300) kills the VM if the workload has not
-finished by then, which counts as a failed run.
+CAUTION: `--tree` is shared read-write and the workloads write to it. Point it
+at a copy.
 
-**A rebuild invalidates the code signature**, and an unsigned binary cannot
-create a VM. Re-sign after every `cargo build`.
+A rebuild leaves the binary unsigned, and an unsigned binary cannot create a
+VM. Re-sign after every `cargo build`.
 
-**`--tree` is shared read-write and is written to.** Point it at a copy.
+## Flags
 
-## Workloads
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--hvi <path>` | required | The binary to measure. |
+| `--kernel <Image>` | required | arm64 kernel. |
+| `--busybox <path>` | required | Static aarch64 busybox for the guest. |
+| `--tree <dir>` | required | The tree to work on. Written to. |
+| `--workload <name>` | required | `walk`, `write` or `concurrent`. |
+| `--cache <policy>` | `auto` | `auto`, `always` or `none`. |
+| `--mem-mib <N>` | 2048 | Guest RAM. |
+| `--cpus <N>` | 2 | vCPUs. |
+| `--timeout <secs>` | 300 | Kills the VM if the workload has not finished, which counts as a failed run. |
 
-| `--workload` | what it measures |
+| Workload | What it measures |
 | --- | --- |
-| `walk` | metadata: `find`, `ls -lR`, a repeat walk, `stat` of every file, small-file create and unlink |
-| `write` | writes at 4k / 64k / 1M block sizes, then a sequential read |
-| `concurrent` | the same walk split across 4 and 8 processes, plus 4 concurrent read streams |
+| `walk` | Metadata: `find`, `ls -lR`, a repeat walk, `stat` of every file, small-file create and unlink. |
+| `write` | Writes at 4k, 64k and 1M block sizes, then a sequential read. |
+| `concurrent` | The same walk across 4 and 8 processes, plus 4 concurrent read streams. |
 
-Run `walk` and `concurrent` together, never one instead of the other: a
-single-threaded walk cannot exercise queue depth, so it cannot tell you whether
-a dispatch change helped or hurt. The `write` sweep is equally load-bearing --
-per-request cost only shows up at a small block size, and the data path only at
-a large one.
-
-`--cache auto|always|none` selects the share's cache policy. `none` is the
-useful one when attributing a change: it stops the guest's own caching from
-hiding what the device is doing.
-
-## Comparing two builds
-
-Run each twice, alternating, so host cache warmth does not favour whichever
-went second:
-
-```sh
-for i in 1 2; do
-    tools/fsbench/run.sh --hvi ./hvi-before ... --workload walk
-    tools/fsbench/run.sh --hvi ./hvi-after  ... --workload walk
-done
-```
-
-Numbers move by 10-20% run to run; anything smaller than that is not a result.
-
-`write_bs_4k` is worse than noisy, it is **bimodal**: it lands either around
-0.85s or around 2.1s, with nothing in between, and a run of three identical
-results says nothing about the fourth. This predates the inline-budget work
-(the pre-worker build does it too, 1.54 / 0.88 / 0.88 / 0.89), so it is a
-property of the workload rather than of the dispatch path, and its cause is
-still open. Take at least five samples of that line and compare the *fast*
-mode, or you will attribute a mode flip to whatever you happened to change --
-a sweep of `FS_INLINE_BUDGET` (the per-notify inline drain budget, a
-constant in `src/machine_macos.rs`) over 1, 4 and 8 looked like a clear win
-for 4 until the sixth sample of 4 came back at 2.03s.
-
-## Interpreting
-
-Host-side cost is usually not the limit. Measured on an M-series host over
-APFS, a 4 KiB write costs ~7us of host time inside a ~23us request, so most of
-it is the VM exit and the dispatch around it. Two consequences worth keeping in
-mind before optimising:
-
-- Making each request cheaper moves the guest very little. Making the guest
-  send *fewer* requests -- attribute and entry timeouts, page-cache retention
-  -- moves it enormously.
-- A read-only share already had long timeouts before the cache policy existed,
-  so it will not show a change that only affects writable shares. Benchmark
-  `--share-rw`, which is what a development workload uses.
+Run `walk` and `concurrent` together. A single-threaded walk cannot exercise
+queue depth, so on its own it cannot tell you whether a dispatch change helped.
