@@ -178,14 +178,15 @@ fn print_version() {
     );
 }
 
+/// Runs `dump-fdt`, which reads the kernel header, computes the guest layout,
+/// builds the DTB and prints the layout.
+///
 /// `dump-fdt --kernel <Image> [--initramfs <cpio>] [--mem-mib N] [--cmdline S]
-/// [--out <file>]`: parse the kernel header, compute the guest layout, build
-/// the DTB, and print the layout (writing the blob out if `--out` is given).
-/// Pure — no hypervisor — so it runs anywhere the binary does.
+/// [--out <file>]`. `--out` also writes the blob. Pure, no hypervisor, so it
+/// runs anywhere the binary does.
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use boot::Arm64Image;
-    use layout::{GicLayout, GuestLayout};
+    use layout::GicLayout;
 
     let mut kernel = None;
     let mut initramfs = None;
@@ -209,8 +210,6 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let kernel_path = kernel.ok_or("dump-fdt needs --kernel <Image>")?;
     let kernel_bytes = std::fs::read(&kernel_path)?;
-    let img = Arm64Image::parse(&kernel_bytes)?;
-    let kernel_size = img.reserved_size(kernel_bytes.len() as u64);
     let initrd_size = match &initramfs {
         Some(p) => std::fs::metadata(p)?.len(),
         None => 0,
@@ -218,30 +217,20 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let ram_size = mem_mib << 20;
     let gic = GicLayout::QEMU_VIRT;
-
-    // Two passes: the DTB's own length feeds the initramfs placement, so build
-    // once with a provisional slot, then rebuild at the settled layout.
-    let provisional = GuestLayout::new(ram_size, img.text_offset, kernel_size, 0x4000, initrd_size);
-    let dtb0 = fdt::build(
-        &provisional,
+    let kernel = boot::LoadedKernel::from_header(&kernel_bytes)?;
+    let boot::Plan { layout, dtb } = kernel.plan(
+        ram_size,
+        initrd_size,
         &gic,
         1,
         &cmdline,
         fdt::VirtioDevices::default(),
     )?;
-    let layout = GuestLayout::new(
-        ram_size,
-        img.text_offset,
-        kernel_size,
-        dtb0.len() as u64,
-        initrd_size,
-    );
-    let dtb = fdt::build(&layout, &gic, 1, &cmdline, fdt::VirtioDevices::default())?;
-    layout.validate()?;
 
     println!(
-        "kernel {kernel_path}: text_offset={:#x} reserved_size={kernel_size:#x} (file {} bytes)",
-        img.text_offset,
+        "kernel {kernel_path}: kernel@{:#x} reserved_size={:#x} (file {} bytes)",
+        kernel.addr,
+        kernel.size,
         kernel_bytes.len()
     );
     println!("RAM   {:#x} + {mem_mib} MiB", layout.ram_base);

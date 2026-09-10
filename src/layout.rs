@@ -162,10 +162,11 @@ pub fn align_up(v: u64, align: u64) -> u64 {
 /// The resolved placement of the three images the loader writes into guest RAM:
 /// the kernel, the flattened devicetree, and (optionally) the initramfs.
 ///
-/// The kernel lands at `RAM_BASE + text_offset`; the DTB follows it 2 MiB-
-/// aligned; the initramfs follows the DTB page-aligned. Keeping them packed
-/// from the bottom of RAM makes the layout independent of total RAM size, and
-/// [`GuestLayout::validate`] checks nothing runs past the end of RAM.
+/// The kernel sits where the loader put it (`RAM_BASE + text_offset`); the DTB
+/// follows its reserved size 2 MiB-aligned; the initramfs follows the DTB
+/// page-aligned. Keeping them packed from the bottom of RAM makes the layout
+/// independent of total RAM size, and [`GuestLayout::validate`] checks nothing
+/// runs past the end of RAM.
 #[derive(Debug, Clone, Copy)]
 pub struct GuestLayout {
     pub ram_base: u64,
@@ -182,20 +183,19 @@ impl GuestLayout {
     /// 2 MiB kernel alignment required by the arm64 boot protocol.
     const KERNEL_ALIGN: u64 = 0x20_0000;
 
-    /// Computes the layout from the kernel `text_offset`/size, the built DTB
-    /// length, and the optional initramfs length. `dtb_size` is the actual
-    /// finished-blob length; the loader builds the DTB first (it needs the
-    /// initrd address for `/chosen`, so pass `initrd_size` to reserve the slot,
-    /// then rebuild once the address is known — see `boot::load`).
+    /// Computes the layout from the loaded kernel's address and reserved size,
+    /// the DTB length, and the optional initramfs length.
+    ///
+    /// `dtb_size` may be a provisional value while the DTB is still being
+    /// built.
     #[must_use]
     pub fn new(
         ram_size: u64,
-        text_offset: u64,
+        kernel_addr: u64,
         kernel_size: u64,
         dtb_size: u64,
         initrd_size: u64,
     ) -> Self {
-        let kernel_addr = RAM_BASE + text_offset;
         let dtb_addr = align_up(kernel_addr + kernel_size, Self::KERNEL_ALIGN);
         let initrd_addr = align_up(dtb_addr + dtb_size, 0x1000);
         GuestLayout {
@@ -295,8 +295,8 @@ mod tests {
 
     #[test]
     fn layout_packs_without_overlap() {
-        // 512 MiB RAM, text_offset 0, 16 MiB kernel, 8 KiB dtb, 4 MiB initrd.
-        let l = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 4 << 20);
+        // 512 MiB RAM, 16 MiB kernel at RAM_BASE, 8 KiB dtb, 4 MiB initrd.
+        let l = GuestLayout::new(512 << 20, RAM_BASE, 16 << 20, 0x2000, 4 << 20);
         assert_eq!(l.kernel_addr, RAM_BASE);
         assert!(l.dtb_addr >= l.kernel_addr + l.kernel_size);
         assert_eq!(l.dtb_addr % 0x20_0000, 0, "dtb must be 2 MiB-aligned");
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn layout_detects_overflow() {
         // 8 MiB RAM cannot hold a 16 MiB kernel.
-        let l = GuestLayout::new(8 << 20, 0, 16 << 20, 0x2000, 0);
+        let l = GuestLayout::new(8 << 20, RAM_BASE, 16 << 20, 0x2000, 0);
         assert!(l.validate().is_err());
     }
 }

@@ -44,14 +44,14 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 
-use crate::boot::Arm64Image;
+use crate::boot;
 use crate::config::{BootConfig, Stop};
 use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
-    GicLayout, GicVersion, GuestLayout, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
-    VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
@@ -134,10 +134,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
     install_kick_handler();
+    // Refuse a kernel that is not a flat Image before the VM, its RAM, the
+    // devices and the event ledger exist.
+    boot::LoadedKernel::from_header(&cfg.kernel)?;
 
-    let img = Arm64Image::parse(&cfg.kernel)?;
-    let kernel_size = img.reserved_size(cfg.kernel.len() as u64);
-    let initrd_len = cfg.initramfs.as_ref().map_or(0, |v| v.len() as u64);
     let num_cpus = cfg.vcpus.max(1);
 
     let kvm = Kvm::new()?;
@@ -265,30 +265,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
-    // Two DTB passes (its length feeds the initramfs placement).
-    let provisional = GuestLayout::new(
-        cfg.mem_bytes,
-        img.text_offset,
-        kernel_size,
-        0x4000,
-        initrd_len,
-    );
-    let dtb0 = fdt::build(&provisional, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
-    let layout = GuestLayout::new(
-        cfg.mem_bytes,
-        img.text_offset,
-        kernel_size,
-        dtb0.len() as u64,
-        initrd_len,
-    );
-    let dtb = fdt::build(&layout, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
-    layout.validate()?;
-
-    ram.write(layout.kernel_addr, &cfg.kernel)?;
-    ram.write(layout.dtb_addr, &dtb)?;
-    if let Some(initramfs) = &cfg.initramfs {
-        ram.write(layout.initrd_addr, initramfs)?;
+    let layout = boot::Payload {
+        kernel: &cfg.kernel,
+        initramfs: cfg.initramfs.as_deref(),
+        cmdline: &cfg.cmdline,
     }
+    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
 
     // Place the GIC regions (the device itself was created above, before the
     // DTB). The address-type constants differ per version, and v2 takes a CPU

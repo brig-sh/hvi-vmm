@@ -41,6 +41,7 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "linux-loader",
  "seccompiler",
  "serde",
  "serde_json",
@@ -82,6 +83,15 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "linux-loader"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
+dependencies = [
+ "vm-memory",
+]
 
 [[package]]
 name = "memchr"

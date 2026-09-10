@@ -187,10 +187,10 @@ assume a count. It returns one region on arm64, and on x86-64 one region up to
 
 ```mermaid
 flowchart TB
-    A["Arm64Image::parse(kernel)<br/>magic 0x644d5241 @0x38, text_offset, image_size"] --> B
-    B["GuestLayout::new<br/>kernel@RAM_BASE+text_offset<br/>dtb@align2M(kernel_end)<br/>initrd@align4K(dtb_end)"] --> C
+    A["Payload::load: linux-loader PE::load(kernel)<br/>magic check, kernel@RAM_BASE+text_offset<br/>image_size read from the header"] --> B
+    B["LoadedKernel::plan: GuestLayout::new<br/>dtb@align2M(kernel+image_size)<br/>initrd@align4K(dtb_end)"] --> C
     C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011<br/>virtio_mmio@… per device"] --> D
-    D["copy kernel+dtb+initrd into GuestRam<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
+    D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
 ```
 
 `fdt.rs` builds the devicetree the kernel reads at `x0`. It emits PSCI with
@@ -206,9 +206,9 @@ to bind.
 `enable-method = "psci"` is emitted on the cpu nodes only when there is more
 than one vCPU.
 
-The DTB's own length feeds initrd placement, so it is built twice: once
-against a provisional `0x4000` slot, then again at the settled layout. Both
-backends do this, and `dump-fdt` repeats it in `main`.
+The DTB's own length feeds initrd placement, so `LoadedKernel::plan` builds it
+twice: once against a provisional `0x4000` slot, then again at the settled
+layout. Both backends and `dump-fdt` call it.
 
 No firmware and no bootloader. hvi drops the kernel straight into EL1.
 

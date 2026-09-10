@@ -29,6 +29,11 @@ virtio-bindings = "0.2.7"
 # `sharedmem`. The device code and its unit tests compile everywhere, so this
 # is portable too.
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+# Kernel image loaders and boot configurators over that memory: the arm64
+# `Image` loader with the devicetree configurator, and the x86 `bzImage`
+# loader with the Linux boot-protocol configurator. The crate gates each
+# loader on the target architecture itself.
+linux-loader = { version = "0.14.0", features = ["bzimage"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = "1.0.0"
