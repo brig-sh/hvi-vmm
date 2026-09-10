@@ -14,6 +14,7 @@ three things a reader should not have to guess between:
 | The backend is chosen at compile time by target triple. | There is no runtime flag to pick one. Cross-compiling checks a backend, it does not produce a runnable one for this host. | Design |
 | virtio-fs is macOS only. | The Linux backends carry no directory sharing at all. Use a disk image. | Design |
 | A non-backend host builds a stub. | The shared code and unit tests compile everywhere. That build cannot run a guest. | Design |
+| The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
 | The arm64/KVM backend has no unit tests. | `src/machine_linux.rs` carries no `#[cfg(test)]` module, and no job runs a suite on arm64 Linux, so writing tests would also need a runner. The full suite runs on x86 Linux and macOS only. The weekly used-ring litmus does run one test binary on an arm64 Linux runner. | Defect |
 
