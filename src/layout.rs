@@ -242,10 +242,26 @@ impl GuestLayout {
         }
     }
 
+    /// Returns the end of the initrd as advertised to the guest, rounded up
+    /// to a page.
+    ///
+    /// A guest that turns `linux,initrd-*` into a memory-region descriptor may
+    /// require whole pages; Unikraft asserts `pg_count * PAGE_SIZE == len`.
+    /// Linux stops at the archive's own end marker, so the rounding costs it
+    /// nothing. The padding is real, zeroed RAM: the initrd is placed last and
+    /// [`Self::validate`] counts the rounded end against the end of RAM.
+    #[must_use]
+    pub fn initrd_end(&self) -> u64 {
+        if self.initrd_size == 0 {
+            return self.initrd_addr;
+        }
+        align_up(self.initrd_addr + self.initrd_size, 0x1000)
+    }
+
     /// End of the last placed image; everything below must fit in RAM.
     #[must_use]
     pub fn top(&self) -> u64 {
-        self.initrd_addr + self.initrd_size
+        self.initrd_end()
     }
 
     /// Errors if the packed images would run past the end of guest RAM.
@@ -381,6 +397,29 @@ mod tests {
                 "fs {index} escapes the device map"
             );
         }
+    }
+
+    // A ragged initrd range kills a guest that turns it into a
+    // memory-region descriptor.
+    #[test]
+    fn the_advertised_initrd_covers_whole_pages() {
+        // A ragged length: one and three quarter pages.
+        let l = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 7168);
+        assert_eq!(l.initrd_addr % 0x1000, 0, "placement is page-aligned");
+        assert_eq!(l.initrd_end() % 0x1000, 0, "so is the advertised end");
+        assert!(
+            l.initrd_end() >= l.initrd_addr + 7168,
+            "the whole archive is inside the advertised range"
+        );
+        assert!(
+            l.initrd_end() - l.initrd_addr < 7168 + 0x1000,
+            "at most one page of padding"
+        );
+        assert_eq!(l.top(), l.initrd_end(), "and RAM is checked against it");
+
+        // No initrd, no range: top() must not gain a page out of nowhere.
+        let none = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 0);
+        assert_eq!(none.initrd_end(), none.initrd_addr);
     }
 
     // A device outside the static boot map is unreachable before the guest
