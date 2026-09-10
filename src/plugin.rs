@@ -207,8 +207,10 @@ pub trait Plugin: Send + Sync {
     }
 
     /// An out-of-band trigger asked for an observation now — the console's
-    /// interrupt key today. The VMM only calls this; deciding what "now" means
-    /// (and kicking the vCPUs, via [`VmHandle::kick`]) is the plugin's.
+    /// interrupt key today. Deciding what "now" means is the plugin's; the
+    /// kick is not, because every backend kicks immediately after this
+    /// returns. A plugin that triggers itself from its own thread still owes
+    /// the [`VmHandle::kick`], since nothing else is about to make one.
     fn request(&self) {}
 }
 
@@ -217,9 +219,11 @@ pub trait Plugin: Send + Sync {
 /// The VMM already records these in its ledger; a sink is for a tool that wants
 /// them live and unaggregated, as [`crate::plugins::IoTrace`] does. Every
 /// method is called with the device lock held, so an implementation must not
-/// block. [`IoSink::block`] and the egress side of [`IoSink::net`] run on a
-/// vCPU thread; an ingress frame reaches [`IoSink::net`] from the tap or
-/// gateway reader thread instead.
+/// block. [`IoSink::block`] and the egress side of [`IoSink::net`] always run
+/// on a vCPU thread. An ingress frame reaches [`IoSink::net`] from the tap or
+/// gateway reader thread under those two backends, and from a vCPU thread
+/// under the built-in stack, which generates its replies inside the transmit
+/// path.
 pub trait IoSink: Send + Sync {
     /// A virtio-blk request: starting `sector`, `length` data bytes, and
     /// direction. `disk_id` distinguishes backing devices.

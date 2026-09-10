@@ -39,8 +39,9 @@
 //! 3. A thread of your own sets its flag and *then* calls
 //!    [`VmHandle::kick`](hvi::plugin::VmHandle::kick). An idle guest sits in
 //!    WFI or HLT and never reaches `safepoint` on its own.
-//! 4. An [`IoSink`](hvi::plugin::IoSink) is called from the vCPU thread with
-//!    the device lock held, so it must not block. Count in the sink; do the
+//! 4. An [`IoSink`](hvi::plugin::IoSink) is called with the device lock held,
+//!    so it must not block. Which thread it runs on depends on the device and
+//!    the networking mode, so do not assume one. Count in the sink; do the
 //!    writing at the safe point.
 
 #[cfg(any(
@@ -63,8 +64,9 @@ mod watcher {
         net_frames: AtomicU64,
     }
 
-    /// Rule 4: called from the vCPU thread with the device lock held. Two
-    /// relaxed adds and nothing else -- no allocation, no `write(2)`, no lock.
+    /// Rule 4: called with the device lock held, from a vCPU thread or from a
+    /// tap or gateway reader thread depending on the mode. Two relaxed adds
+    /// and nothing else -- no allocation, no `write(2)`, no lock.
     impl IoSink for Counters {
         fn block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
             self.block_requests.fetch_add(1, Ordering::Relaxed);
@@ -165,8 +167,9 @@ mod watcher {
             );
         }
 
-        /// The console's interrupt key (Ctrl-]) reached us. Same flag; the VMM
-        /// is already at a safe point, so this one needs no kick.
+        /// The console's interrupt key (Ctrl-]) reached us, on the console
+        /// input thread. Same flag, and no kick here: every backend kicks
+        /// immediately after it calls this.
         fn request(&self) {
             self.pending.store(true, Ordering::SeqCst);
         }
