@@ -356,6 +356,7 @@ how it works.
 
 | Area | Files |
 | --- | --- |
+| Crate root and backend selection | `lib.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
 | Backends | `machine_macos.rs`, `machine_linux.rs`, `machine_x86.rs`, `smoke.rs` |
 | arm64 guest support | `boot.rs`, `layout.rs`, `fdt.rs`, `pl011.rs`, `esr.rs`, `fdlimit.rs` |

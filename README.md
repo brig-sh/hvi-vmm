@@ -24,10 +24,13 @@ flag to select one.
 | aarch64 | Linux | KVM | none | `--net`, `--net-gateway`, `--net-tap` |
 | x86-64 | Linux | KVM | none | `--net`, `--net-gateway`, `--net-tap` |
 
-All three boot Linux to userspace in CI on real hardware, with virtio-blk,
-virtio-net and virtio-vsock. virtio-fs is macOS only. On any other host the
-crate builds without a backend, so the shared code and its unit tests still
-compile. That stub is not a runnable backend.
+All three carry virtio-blk, virtio-net and virtio-vsock. virtio-fs is macOS
+only. CI boots each backend on real hardware: the two arm64 lanes reach
+userspace, and the x86 lane reaches the userspace or root-filesystem gate.
+No boot job attaches a disk or a vsock agent, so those devices are covered by
+unit tests rather than by a live boot. On any other host the crate builds
+without a backend, so the shared code and its unit tests still compile. That
+stub is not a runnable backend.
 
 ## Build
 

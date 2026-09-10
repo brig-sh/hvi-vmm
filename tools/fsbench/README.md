@@ -49,7 +49,7 @@ VM. Re-sign after every `cargo build`.
 | `--kernel <Image>` | required | arm64 kernel. |
 | `--busybox <path>` | required | Static aarch64 busybox for the guest. |
 | `--tree <dir>` | required | The tree to work on. Written to. |
-| `--workload <name>` | required | `walk`, `write` or `concurrent`. |
+| `--workload <name>` | `walk` | `walk`, `write` or `concurrent`. |
 | `--cache <policy>` | `auto` | `auto`, `always` or `none`. |
 | `--mem-mib <N>` | 2048 | Guest RAM. |
 | `--cpus <N>` | 2 | vCPUs. |
