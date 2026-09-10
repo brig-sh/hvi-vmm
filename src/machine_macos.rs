@@ -43,9 +43,9 @@ use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI,
-    VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE,
-    VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
+    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
@@ -192,6 +192,27 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         "[hvi] {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
         gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
     );
+    // Every device window has to clear the GIC, and only here is it known how
+    // much GIC there is: the framework sizes the redistributor region, and it
+    // is far larger than QEMU's. The fixed windows are checked once, the
+    // virtio-fs ones again below as each share is placed, because those climb
+    // with the share count.
+    let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
+    for (name, base, size) in [
+        ("UART", UART_BASE, UART_SIZE),
+        ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
+        ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
+        ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
+    ] {
+        let end = base.saturating_add(size);
+        if base < gic_end || end > DEVICE_WINDOW_END {
+            return Err(format!(
+                "{name} at {base:#x}..{end:#x} does not fit between the GIC \
+                 (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
+            )
+            .into());
+        }
+    }
 
     let mut gic_config = GicConfig::new();
     gic_config.set_distributor_base(gic.gicd_base)?;
@@ -301,8 +322,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let end = base
             .checked_add(VIRTIO_SIZE)
             .ok_or("virtio-fs MMIO address overflow")?;
-        if end > gic.gicd_base {
-            return Err("virtio-fs MMIO devices would overlap the GIC".into());
+        // Same two bounds as the fixed windows above; these move with the
+        // share count, so they are checked per share.
+        if base < gic_end || end > DEVICE_WINDOW_END {
+            return Err(format!(
+                "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
+                 between the GIC (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
+            )
+            .into());
         }
         let root = std::fs::canonicalize(&share.path)?;
         let access = if share.mode.writable() {
