@@ -301,8 +301,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let end = base
             .checked_add(VIRTIO_SIZE)
             .ok_or("virtio-fs MMIO address overflow")?;
-        if end > gic.gicd_base {
-            return Err("virtio-fs MMIO devices would overlap the GIC".into());
+        // The device windows sit above the GIC, not below it, so the bound
+        // that matters is the top of the redistributor region and the top of
+        // the window a static boot map covers. `gicr_size` here is the whole
+        // region Apple reports, not one frame.
+        let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
+        if base < gic_end || end > crate::layout::DEVICE_WINDOW_END {
+            return Err(format!(
+                "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
+                 between the GIC (ends {gic_end:#x}) and {:#x}",
+                crate::layout::DEVICE_WINDOW_END
+            )
+            .into());
         }
         let root = std::fs::canonicalize(&share.path)?;
         let access = if share.mode.writable() {

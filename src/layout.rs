@@ -27,27 +27,41 @@
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
 
-/// PL011 UART MMIO base and size. Placed *below* the GIC (which sits at
-/// `0x0800_0000`+) rather than at QEMU virt's `0x0900_0000`: Apple's `hv_gic`
-/// reports a much larger redistributor region than QEMU's, and that region —
-/// which Linux reserves from the DTB `reg` — extends up past `0x0900_0000` and
-/// steals the UART's MMIO range, so `ttyAMA0` fails to bind (`amba_device_add
-/// -16`). `0x0100_0000` is safely clear of both the GIC and guest RAM.
-pub const UART_BASE: u64 = 0x0100_0000;
+/// The window a guest with a *static* boot page table maps as device memory.
+///
+/// Linux builds its early mapping from the DTB, so it accepts MMIO anywhere.
+/// Unikraft/arm64 does not: it enables the MMU from a link-time page table
+/// that maps exactly `0x0800_0000`–`0x4000_0000` as device memory. MMIO
+/// outside that range faults on first access and faults again in the handler,
+/// so the guest dies silently, before any console output, with no vCPU exit to
+/// show for it. Every device window below therefore lives inside this range —
+/// it costs a Linux guest nothing and is the difference between booting and
+/// not for a unikernel.
+pub const DEVICE_WINDOW_BASE: u64 = 0x0800_0000;
+pub const DEVICE_WINDOW_END: u64 = RAM_BASE;
+
+/// PL011 UART MMIO base and size. Placed *above* the GIC (which starts at
+/// [`DEVICE_WINDOW_BASE`]) rather than at QEMU virt's `0x0900_0000`: Apple's
+/// `hv_gic` reports a much larger redistributor region than QEMU's, and that
+/// region — which Linux reserves from the DTB `reg` — extends up past
+/// `0x0900_0000` and steals the UART's MMIO range, so `ttyAMA0` fails to bind
+/// (`amba_device_add -16`). `0x0c00_0000` clears the GIC with 64 MiB to spare
+/// and still sits inside [`DEVICE_WINDOW_BASE`]–[`DEVICE_WINDOW_END`].
+pub const UART_BASE: u64 = 0x0c00_0000;
 pub const UART_SIZE: u64 = 0x1000;
 /// UART interrupt as a GIC SPI number (INTID = 32 + SPI = 33).
 pub const UART_SPI: u32 = 1;
 
-/// virtio-mmio device windows and interrupts, below the GIC and clear of the
+/// virtio-mmio device windows and interrupts, above the GIC and clear of the
 /// UART. Slot 0 = virtio-blk, slot 1 = virtio-net; each is one 0x200 page.
 pub const VIRTIO_SIZE: u64 = 0x0200;
-pub const VIRTIO_BASE: u64 = 0x0200_0000;
+pub const VIRTIO_BASE: u64 = 0x0d00_0000;
 pub const VIRTIO_SPI: u32 = 2;
-pub const VIRTIO_NET_BASE: u64 = 0x0200_0200;
+pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
 pub const VIRTIO_NET_SPI: u32 = 3;
-pub const VIRTIO_VSOCK_BASE: u64 = 0x0200_0400;
+pub const VIRTIO_VSOCK_BASE: u64 = 0x0d00_0400;
 pub const VIRTIO_VSOCK_SPI: u32 = 4;
-pub const VIRTIO_FS_BASE: u64 = 0x0200_0600;
+pub const VIRTIO_FS_BASE: u64 = 0x0d00_0600;
 pub const VIRTIO_FS_SPI: u32 = 5;
 
 /// Placement of the `index`th virtio-fs device. Each export gets an
@@ -310,5 +324,54 @@ mod tests {
         // 8 MiB RAM cannot hold a 16 MiB kernel.
         let l = GuestLayout::new(8 << 20, RAM_BASE, 16 << 20, 0x2000, 0);
         assert!(l.validate().is_err());
+    }
+
+    /// Every virtio-fs window has to clear the GIC and stay inside the
+    /// device map too. Apple's redistributor region is far larger than
+    /// QEMU's, and the shares are placed one after another, so this is the
+    /// pair of bounds a share count can walk out of.
+    #[test]
+    fn virtio_fs_windows_clear_a_large_gic() {
+        // What `hv_gic` reports on this host: a 32 MiB redistributor region,
+        // where QEMU virt would have 128 KiB per vCPU.
+        let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
+        assert!(
+            gic_end < VIRTIO_FS_BASE,
+            "the GIC ends below the fs windows"
+        );
+        for index in 0..16 {
+            let base = virtio_fs_base(index).expect("a placement");
+            let end = base + VIRTIO_SIZE;
+            assert!(base >= gic_end, "fs {index} at {base:#x} runs into the GIC");
+            assert!(
+                end <= DEVICE_WINDOW_END,
+                "fs {index} escapes the device map"
+            );
+        }
+    }
+
+    /// A guest whose boot page table is fixed at link time only reaches MMIO
+    /// inside `DEVICE_WINDOW_BASE`..`DEVICE_WINDOW_END`; a device placed
+    /// outside it is unreachable before the guest has a console to complain
+    /// with. Unikraft/arm64 is the guest that enforces this.
+    #[test]
+    fn devices_live_in_the_static_boot_map() {
+        let gic = GicLayout::QEMU_VIRT;
+        // The redistributor frame is per-vCPU; check the largest VM we allow.
+        let gic_end = gic.gicr_base + gic.gicr_size * u64::from(GicLayout::V2_MAX_CPUS);
+        let windows = [
+            ("uart", UART_BASE, UART_SIZE),
+            ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
+            ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
+            ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
+            ("virtio-fs", VIRTIO_FS_BASE, VIRTIO_SIZE),
+        ];
+        for (name, base, size) in windows {
+            assert!(
+                base >= DEVICE_WINDOW_BASE && base + size <= DEVICE_WINDOW_END,
+                "{name} at {base:#x} escapes the static device map"
+            );
+            assert!(base >= gic_end, "{name} at {base:#x} overlaps the GIC");
+        }
     }
 }
