@@ -84,8 +84,10 @@ jobs:
 
   # macOS / Apple silicon backend: Hypervisor.framework build and unit tests,
   # plus the ad-hoc signing step, since an unsigned binary cannot create a VM.
-  # A live boot additionally needs an interactive host (AMFI), so CI stops at
-  # build, test and sign.
+  # A live boot additionally needs a host that can actually call
+  # Hypervisor.framework, which the hosted macOS image does not provide, so CI
+  # stops at build, test and sign here. The live boot runs on the self-hosted
+  # Apple-silicon runner below.
   build-and-test-macos:
     name: Build and test macos/hvf
     runs-on: macos-15
@@ -246,9 +248,10 @@ jobs:
           cache-key: macos-hvf-live
       - name: build and sign
         run: |
-          # The entitlement is what lets an ad-hoc signed binary call HVF; the
-          # signature must be applied to the binary that actually runs, since
-          # copying a signed Mach-O invalidates it.
+          # The entitlement is what lets an ad-hoc signed binary call HVF, and
+          # it must be on the binary that actually runs. Sign after every
+          # build: each build writes a fresh unsigned binary. (Copying a signed
+          # Mach-O preserves its signature; rebuilding replaces it.)
           cargo build --release
           codesign --sign - --entitlements hvi.entitlements --force target/release/hvi
           codesign -dv --entitlements - target/release/hvi 2>&1 | grep -qi hypervisor
