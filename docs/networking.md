@@ -82,15 +82,28 @@ hvi boot --kernel <Image> --net-gateway /run/hvi/gateway.qemu
 ```
 
 If the socket cannot be reached, hvi does not fail. It warns and falls back to
-the built-in stack, so a guest can come up with no egress and no error:
+the built-in stack, so a guest can come up with no egress and no error.
+
+The warning text differs by backend. On macOS:
 
 ```text
 [hvi] WARNING: cannot reach gateway /run/hvi/gateway.qemu (No such file or
 directory (os error 2)); falling back to built-in stack
 ```
 
-Read that line. A socket path is also subject to the platform's `sockaddr_un`
-length limit, and an over-long path fails the same way.
+On Linux, from `[hvi/kvm]` on arm64 and `[hvi/x86]` on x86-64:
+
+```text
+[hvi/kvm] WARNING: gateway /run/hvi/gateway.qemu unreachable (No such file or
+directory (os error 2)); built-in stack
+```
+
+Read that line. To detect this in a log pipeline across platforms, match the
+substring `built-in stack`, which all three carry, rather than either full
+sentence.
+
+A socket path is also subject to the platform's `sockaddr_un` length limit,
+and an over-long path fails the same way.
 
 CAUTION: The gateway enforces whatever egress policy it enforces. hvi does not
 filter egress in this mode. Do not describe traffic through an external

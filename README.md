@@ -41,9 +41,10 @@ The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 cargo build --release
 ```
 
-On macOS, Hypervisor.framework refuses to start without the
-`com.apple.security.hypervisor` entitlement, so sign the binary after every
-build:
+On macOS you need macOS 15 or newer, because the backend uses the `hv_gic_*`
+in-kernel interrupt controller calls introduced there. Hypervisor.framework
+also refuses to start without the `com.apple.security.hypervisor` entitlement,
+so sign the binary after every build:
 
 ```sh
 codesign --sign - --entitlements hvi.entitlements --force \

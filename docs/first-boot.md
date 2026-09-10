@@ -14,9 +14,11 @@ You need:
   [README](../README.md#platforms). No other host can run a guest.
 - The Rust toolchain pinned in [`rust-toolchain.toml`](../rust-toolchain.toml).
   `rustup` installs it from the file.
-- On macOS: the Xcode command line tools, for the linker. hvi enforces no
-  minimum macOS version. CI builds and boots on macOS 15 and newer, and that
-  is the range these instructions are tested against.
+- On macOS: the Xcode command line tools, for the linker, and **macOS 15 or
+  newer**. The backend drives Apple's in-kernel interrupt controller through
+  the `hv_gic_*` calls, which arrived in macOS 15, so an older host has no
+  such symbols. hvi does not check the version itself and fails when it first
+  reaches the framework rather than with a clear message.
 - On Linux: read and write access to `/dev/kvm`. Add yourself to the `kvm`
   group. A group you join does not reach a running shell, so start a new one.
 - `python3`, for the initramfs builder.

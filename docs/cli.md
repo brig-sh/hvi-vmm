@@ -70,13 +70,23 @@ Three things about the parser are worth knowing, because none of them warns.
 accumulate. A second `--disk` replaces the first.
 
 **A value-taking flag at the end of the line silently takes none.** These
-flags accept a missing value as "not set" rather than erroring: `--initramfs`,
-`--disk`, `--net-gateway`, `--net-tap`, `--net-mac`, `--events`,
-`--agent-sock`, `--dump-memory`, `--trace-io`. So `hvi boot --kernel Image
---disk` boots with no disk.
+flags accept a missing value as "not set" rather than erroring: `--kernel`,
+`--initramfs`, `--disk`, `--net-gateway`, `--net-tap`, `--net-mac`,
+`--events`, `--agent-sock`, `--dump-memory`, `--trace-io`. So `hvi boot
+--kernel Image --disk` boots with no disk.
 
-The rest do error: `--mem-mib`, `--cmdline`, `--fs-uid`, `--fs-gid`,
-`--share-ro`, `--share-rw`, `--sandbox-id`, `--cpus`, `--dump-after`.
+`--kernel` is the one where that matters, because it is required. It is not
+caught by the parser. A trailing `hvi boot --kernel` parses to "not set" and
+then fails the later required check, with the same message as omitting the
+flag altogether:
+
+```text
+hvi: boot needs --kernel <Image>
+```
+
+The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
+`--fs-gid`, `--share-ro`, `--share-rw`, `--sandbox-id`, `--cpus`,
+`--dump-after`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
