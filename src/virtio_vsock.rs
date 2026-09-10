@@ -24,7 +24,7 @@
 //!
 //! Simplifications (interactive exec, low volume): credit is advertised
 //! generously and tracked loosely; out-of-order host data is buffered until the
-//! guest accepts the connection. NOT boot-tested.
+//! guest accepts the connection.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};

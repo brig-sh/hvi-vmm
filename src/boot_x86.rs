@@ -12,244 +12,403 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! x86-64 Linux boot preparation: parse a `bzImage`, build the `boot_params`
-//! "zero page" (setup header + e820 + cmdline/initrd pointers), and say where
-//! the 64-bit kernel and its entry go. The machine writes the bytes into guest
-//! RAM and enters the vCPU in long mode at
-//! [`BootPlan::entry`](crate::boot_x86::BootPlan::entry) with `RSI` pointing at
-//! the zero page — the Linux 64-bit boot protocol.
+//! x86-64 Linux boot preparation, from a `bzImage` to a written `boot_params`
+//! zero page, command line and entry point.
 //!
-//! Mirrors Firecracker's `arch::x86_64` loader at the level we need.
+//! `linux-loader` reads the setup header, checks the boot protocol version and
+//! copies the protected-mode kernel to its `code32_start`. hvi fills in the
+//! header fields a boot loader owns, the e820 map from the RAM regions and the
+//! command line. The vCPU then enters in long mode at the kernel entry with
+//! `RSI` pointing at the zero page: the Linux 64-bit boot protocol.
+//!
+//! This module mirrors Firecracker's `arch::x86_64` loader.
 
-use crate::layout_x86::{CMDLINE_ADDR, HIGH_MEM_START, HIGH_RAM_BASE, KERNEL_ENTRY_OFF, ZERO_PAGE};
+use std::io::Cursor;
 
-// setup_header field offsets within the boot image / boot_params.
-const HDR_SETUP_SECTS: usize = 0x1f1;
-const HDR_BOOT_FLAG: usize = 0x1fe; // 0xAA55
-const HDR_MAGIC: usize = 0x202; // "HdrS"
-const HDR_TYPE_OF_LOADER: usize = 0x210;
-const HDR_RAMDISK_IMAGE: usize = 0x218;
-const HDR_RAMDISK_SIZE: usize = 0x21c;
-const HDR_CMD_LINE_PTR: usize = 0x228;
-const HDR_END: usize = 0x268; // copy the setup header through here
-                              // boot_params e820.
-const BP_E820_ENTRIES: usize = 0x1e8; // u8 count
-const BP_E820_TABLE: usize = 0x2d0; // array of 20-byte entries
+use linux_loader::configurator::linux::LinuxBootConfigurator;
+use linux_loader::configurator::{BootConfigurator, BootParams};
+use linux_loader::loader::bootparam::{boot_e820_entry, boot_params};
+use linux_loader::loader::bzimage::BzImage;
+use linux_loader::loader::{load_cmdline, Cmdline, KernelLoader};
+use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
+
+use crate::layout_x86::{
+    CMDLINE_ADDR, CMDLINE_MAX, EBDA_START, HIGH_MEM_START, KERNEL_ENTRY_OFF, RAM_BASE, ZERO_PAGE,
+};
+
+/// The e820 type of usable RAM (`E820_TYPE_RAM`); the bindings carry the table
+/// but not the type constants.
 const E820_RAM: u32 = 1;
 
-/// What to place in guest RAM and how to enter the vCPU.
-pub struct BootPlan {
+/// The boot sector signature every bzImage ends its first sector with.
+const BOOT_FLAG: u16 = 0xaa55;
+
+/// The loaded kernel and how to enter it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadedKernel {
     /// Guest-physical load address of the 64-bit kernel.
     pub kernel_load: u64,
-    /// The 64-bit protected-mode kernel (bzImage minus the real-mode setup).
-    pub kernel_image: Vec<u8>,
-    /// The 4 KiB `boot_params` zero page and where it goes.
-    pub zero_page: Vec<u8>,
+    /// Where the `boot_params` zero page was written.
     pub zero_page_addr: u64,
-    /// NUL-terminated kernel command line and where it goes.
-    pub cmdline: Vec<u8>,
-    pub cmdline_addr: u64,
     /// Guest-physical address to place the initramfs, if any.
     pub initrd_addr: Option<u64>,
     /// 64-bit entry point (RIP).
     pub entry: u64,
 }
 
-/// Parses `kernel` (a bzImage) and builds the boot plan.
+impl LoadedKernel {
+    /// Loads `kernel` (a bzImage) into `mem` along with its zero page and
+    /// command line, and reserves a slot for the initramfs.
+    ///
+    /// The e820 map is the region list of `mem`: the region at address 0 is low
+    /// RAM, split around the EBDA, and every further region is one entry.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `kernel` is not a bzImage with boot protocol 2.00 or later,
+    /// when `mem` has no region at address 0, when the kernel or the command
+    /// line does not fit, when the initramfs would overlap the kernel in
+    /// low RAM or does not fit its 32-bit header fields, or when the e820
+    /// table is full.
+    pub fn load<M: GuestMemoryBackend>(
+        mem: &M,
+        kernel: &[u8],
+        cmdline: &str,
+        initrd_len: u64,
+    ) -> Result<Self, String> {
+        // The zero page, the boot structures and the kernel all live in the
+        // region at address 0; without it nothing below can be written.
+        let low_end = mem
+            .find_region(GuestAddress(RAM_BASE))
+            .ok_or("guest RAM has no region at address 0")?
+            .len();
+        let loaded = BzImage::load(
+            mem,
+            None,
+            &mut Cursor::new(kernel),
+            Some(GuestAddress(HIGH_MEM_START)),
+        )
+        .map_err(|e| format!("loading the bzImage: {e}"))?;
+        let kernel_load = loaded.kernel_load.raw_value();
+        let mut params = boot_params {
+            hdr: loaded
+                .setup_header
+                .ok_or("the bzImage loader returned no setup header")?,
+            ..Default::default()
+        };
+        // The loader checks the magic and the protocol version but not the boot
+        // sector signature; a file that fails it is not a bzImage.
+        if params.hdr.boot_flag != BOOT_FLAG {
+            return Err("loading the bzImage: the boot sector signature is not 0xAA55".into());
+        }
+        params.hdr.type_of_loader = 0xff; // undefined boot loader
+
+        let cmdline = Cmdline::try_from(cmdline, CMDLINE_MAX)
+            .map_err(|e| format!("kernel command line: {e}"))?;
+        load_cmdline(mem, GuestAddress(CMDLINE_ADDR), &cmdline)
+            .map_err(|e| format!("writing the kernel command line: {e}"))?;
+        params.hdr.cmd_line_ptr = CMDLINE_ADDR as u32;
+
+        // e820: RAM below the EBDA, then from 1 MiB to the end of the low
+        // region, then every further region as it is. The guest treats
+        // anything omitted as not memory, so the hole is left out:
+        // described as RAM, it would be allocated over the devices.
+        for region in mem.iter() {
+            let start = region.start_addr().raw_value();
+            if start == RAM_BASE {
+                add_e820(&mut params, RAM_BASE, EBDA_START.min(low_end))?;
+                if low_end > HIGH_MEM_START {
+                    add_e820(&mut params, HIGH_MEM_START, low_end - HIGH_MEM_START)?;
+                }
+            } else {
+                add_e820(&mut params, start, region.len())?;
+            }
+        }
+
+        // initrd placement: 2 MiB-aligned near the top of *low* RAM, above the
+        // room the kernel decompresses into. It has to be low RAM regardless of
+        // guest size, because the header field that points at it is 32 bits
+        // wide.
+        let initrd_addr = if initrd_len > 0 {
+            let kernel_room = loaded
+                .kernel_end
+                .max(kernel_load + u64::from(params.hdr.init_size));
+            let addr = low_end.saturating_sub(initrd_len) & !0x1f_ffff;
+            if addr < kernel_room {
+                return Err(format!(
+                    "initramfs ({initrd_len:#x} bytes) does not fit above the kernel \
+                 (needs RAM through {kernel_room:#x}) in low RAM ({low_end:#x})"
+                ));
+            }
+            params.hdr.ramdisk_image = u32::try_from(addr).map_err(|_| {
+                format!("initramfs address {addr:#x} exceeds the 32-bit ramdisk_image field")
+            })?;
+            params.hdr.ramdisk_size = u32::try_from(initrd_len).map_err(|_| {
+                format!("initramfs ({initrd_len:#x} bytes) exceeds the 32-bit ramdisk_size field")
+            })?;
+            Some(addr)
+        } else {
+            None
+        };
+
+        LinuxBootConfigurator::write_bootparams(
+            &BootParams::new(&params, GuestAddress(ZERO_PAGE)),
+            mem,
+        )
+        .map_err(|e| format!("writing boot_params: {e}"))?;
+
+        Ok(LoadedKernel {
+            kernel_load,
+            zero_page_addr: ZERO_PAGE,
+            initrd_addr,
+            entry: kernel_load + KERNEL_ENTRY_OFF,
+        })
+    }
+}
+
+/// Appends a usable-RAM e820 entry of `size` bytes at `addr`.
 ///
-/// RAM is described in two pieces because a guest larger than the MMIO hole
-/// cannot be contiguous in guest-physical space: `low_bytes` sits at 0 and
-/// `high_bytes` (often zero) resumes at [`HIGH_RAM_BASE`]. See
-/// [`MMIO_GAP_START`](crate::layout_x86::MMIO_GAP_START) for why the hole has
-/// to be there.
-pub fn prepare(
-    kernel: &[u8],
-    cmdline: &str,
-    initrd_len: u64,
-    low_bytes: u64,
-    high_bytes: u64,
-) -> Result<BootPlan, String> {
-    if kernel.len() < HDR_END {
-        return Err("kernel too small for a bzImage setup header".into());
+/// # Errors
+///
+/// Errors when the table's 128 entries are used.
+fn add_e820(params: &mut boot_params, addr: u64, size: u64) -> Result<(), String> {
+    let i = params.e820_entries as usize;
+    if i == params.e820_table.len() {
+        return Err("the e820 table is full".into());
     }
-    if kernel[HDR_BOOT_FLAG] != 0x55 || kernel[HDR_BOOT_FLAG + 1] != 0xaa {
-        return Err("bad bzImage boot flag (0xAA55)".into());
-    }
-    if &kernel[HDR_MAGIC..HDR_MAGIC + 4] != b"HdrS" {
-        return Err("bad bzImage magic (HdrS)".into());
-    }
-
-    let setup_sects = if kernel[HDR_SETUP_SECTS] == 0 {
-        4
-    } else {
-        kernel[HDR_SETUP_SECTS] as usize
+    params.e820_table[i] = boot_e820_entry {
+        addr,
+        size,
+        r#type: E820_RAM,
     };
-    let setup_size = (setup_sects + 1) * 512;
-    if kernel.len() < setup_size {
-        return Err("bzImage shorter than its setup area".into());
-    }
-    let kernel_image = kernel[setup_size..].to_vec();
-
-    // Zero page: copy the setup header from the image, then override the loader
-    // fields we own.
-    let mut zp = vec![0u8; 4096];
-    zp[HDR_SETUP_SECTS..HDR_END].copy_from_slice(&kernel[HDR_SETUP_SECTS..HDR_END]);
-    zp[HDR_TYPE_OF_LOADER] = 0xff; // undefined bootloader
-    put_u32(&mut zp, HDR_CMD_LINE_PTR, CMDLINE_ADDR as u32);
-
-    // initrd placement: 2 MiB-aligned near the top of *low* RAM, above the
-    // kernel. It has to be low RAM regardless of guest size, because the header
-    // field that points at it is 32 bits wide.
-    let initrd_addr = if initrd_len > 0 {
-        let addr = (low_bytes - initrd_len) & !0x1f_ffff;
-        put_u32(&mut zp, HDR_RAMDISK_IMAGE, addr as u32);
-        put_u32(&mut zp, HDR_RAMDISK_SIZE, initrd_len as u32);
-        Some(addr)
-    } else {
-        None
-    };
-
-    // e820: RAM below the EBDA, then from 1 MiB to the MMIO hole, then whatever
-    // was displaced by the hole, above 4 GiB. Anything omitted here the guest
-    // will not touch as memory, which is the point: the hole must not be
-    // described as RAM or the guest will allocate over the devices.
-    let mut count = 0u8;
-    add_e820(&mut zp, &mut count, 0, 0x9_fc00, E820_RAM);
-    if low_bytes > HIGH_MEM_START {
-        add_e820(
-            &mut zp,
-            &mut count,
-            HIGH_MEM_START,
-            low_bytes - HIGH_MEM_START,
-            E820_RAM,
-        );
-    }
-    if high_bytes > 0 {
-        add_e820(&mut zp, &mut count, HIGH_RAM_BASE, high_bytes, E820_RAM);
-    }
-    zp[BP_E820_ENTRIES] = count;
-
-    let mut cmd = cmdline.as_bytes().to_vec();
-    cmd.push(0);
-
-    Ok(BootPlan {
-        kernel_load: HIGH_MEM_START,
-        kernel_image,
-        zero_page: zp,
-        zero_page_addr: ZERO_PAGE,
-        cmdline: cmd,
-        cmdline_addr: CMDLINE_ADDR,
-        initrd_addr,
-        entry: HIGH_MEM_START + KERNEL_ENTRY_OFF,
-    })
-}
-
-fn put_u32(buf: &mut [u8], off: usize, v: u32) {
-    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-fn add_e820(zp: &mut [u8], count: &mut u8, addr: u64, size: u64, typ: u32) {
-    let base = BP_E820_TABLE + (*count as usize) * 20;
-    zp[base..base + 8].copy_from_slice(&addr.to_le_bytes());
-    zp[base + 8..base + 16].copy_from_slice(&size.to_le_bytes());
-    zp[base + 16..base + 20].copy_from_slice(&typ.to_le_bytes());
-    *count += 1;
+    params.e820_entries += 1;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout_x86::MMIO_GAP_START;
+    use crate::guestmem::GuestRam;
+    use crate::layout_x86::{HIGH_RAM_BASE, MMIO_GAP_START};
+    use linux_loader::loader::bootparam::setup_header;
+    use vm_memory::{ByteValued, Bytes};
 
-    /// A minimal bzImage: the boot flag, the `HdrS` magic and one setup
-    /// sector, which is all `prepare` reads (the same trick as the arm64
-    /// `boot` tests' synthetic Image header).
-    fn synth_bzimage() -> Vec<u8> {
+    /// The setup header sits at this offset of the image and of the zero page.
+    const SETUP_HEADER_OFFSET: usize = 0x1f1;
+
+    /// The setup header magic, "HdrS" read as a little-endian `u32`.
+    const HEADER_MAGIC: u32 = 0x5372_6448;
+
+    /// Builds a minimal bzImage, one setup sector carrying the fields the
+    /// loader checks (boot flag, `HdrS`, protocol 2.15, `LOADED_HIGH`, the
+    /// 1 MiB `code32_start`) and a protected-mode body with a recognisable
+    /// pattern.
+    fn synthetic_bzimage() -> Vec<u8> {
+        let hdr = setup_header {
+            setup_sects: 1, // setup area = (1 + 1) * 512 bytes
+            boot_flag: BOOT_FLAG,
+            header: HEADER_MAGIC,
+            version: 0x020f,
+            loadflags: 1, // LOADED_HIGH
+            code32_start: HIGH_MEM_START as u32,
+            ..Default::default()
+        };
         let mut k = vec![0u8; 0x1000];
-        k[HDR_SETUP_SECTS] = 1; // setup area = (1 + 1) * 512 bytes
-        k[HDR_BOOT_FLAG] = 0x55;
-        k[HDR_BOOT_FLAG + 1] = 0xaa;
-        k[HDR_MAGIC..HDR_MAGIC + 4].copy_from_slice(b"HdrS");
+        k[SETUP_HEADER_OFFSET..SETUP_HEADER_OFFSET + size_of::<setup_header>()]
+            .copy_from_slice(hdr.as_slice());
+        for (i, b) in k[0x400..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
         k
     }
 
-    /// The RAM split exactly as `machine_x86::boot` derives it from the
-    /// requested guest size, so the tests feed `prepare` realistic inputs.
-    fn ram_split(mem_bytes: u64) -> (u64, u64) {
+    /// Builds guest RAM of `mem_bytes` split around the MMIO hole as the x86
+    /// machine splits it.
+    ///
+    /// The mappings are anonymous and lazily backed, so a 4 GiB guest costs
+    /// address space, not memory.
+    fn guest_ram(mem_bytes: u64) -> GuestRam {
         let low = mem_bytes.min(MMIO_GAP_START);
-        (low, mem_bytes - low)
+        let mut regions = vec![(RAM_BASE, low as usize)];
+        if mem_bytes > low {
+            regions.push((HIGH_RAM_BASE, (mem_bytes - low) as usize));
+        }
+        GuestRam::from_ranges(&regions)
     }
 
-    /// The e820 table from a built zero page, as (addr, size, type) rows.
-    fn e820(zp: &[u8]) -> Vec<(u64, u64, u32)> {
-        let u64_at = |o: usize| u64::from_le_bytes(zp[o..o + 8].try_into().unwrap());
-        let u32_at = |o: usize| u32::from_le_bytes(zp[o..o + 4].try_into().unwrap());
-        (0..zp[BP_E820_ENTRIES] as usize)
-            .map(|i| {
-                let o = BP_E820_TABLE + i * 20;
-                (u64_at(o), u64_at(o + 8), u32_at(o + 16))
-            })
+    /// Reads the written `boot_params` back from the zero page.
+    fn zero_page(ram: &GuestRam) -> boot_params {
+        ram.memory().read_obj(GuestAddress(ZERO_PAGE)).unwrap()
+    }
+
+    /// Returns the e820 table from the written zero page as (addr, size,
+    /// type) rows.
+    fn e820(ram: &GuestRam) -> Vec<(u64, u64, u32)> {
+        let params = zero_page(ram);
+        params.e820_table[..params.e820_entries as usize]
+            .iter()
+            .map(|e| (e.addr, e.size, e.r#type))
             .collect()
     }
 
-    /// A guest bigger than the low-RAM cap must get its remainder described
-    /// above 4 GiB. Omitting the entry loses the memory silently; describing
-    /// the hole as RAM makes the guest allocate over the devices.
     #[test]
-    fn a_large_guest_gets_a_high_e820_entry() {
-        let (low, high) = ram_split(4096 << 20);
-        assert!(high > 0, "a 4 GiB guest must split");
-        let plan = prepare(&synth_bzimage(), "console=ttyS0", 0, low, high).expect("prepare");
+    fn kernel_lands_at_code32_start_with_its_header_in_the_zero_page() {
+        let ram = guest_ram(1024 << 20);
+        let image = synthetic_bzimage();
+        let kernel = LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0).expect("load");
+        assert_eq!(kernel.kernel_load, HIGH_MEM_START);
+        assert_eq!(kernel.entry, HIGH_MEM_START + KERNEL_ENTRY_OFF);
+        assert_eq!(kernel.initrd_addr, None);
 
-        let map = e820(&plan.zero_page);
+        let mut body = vec![0u8; image.len() - 0x400];
+        ram.read(kernel.kernel_load, &mut body).unwrap();
+        assert_eq!(body, image[0x400..], "the setup sectors are stripped");
+
+        // Copies, since `boot_params` is packed.
+        let hdr = zero_page(&ram).hdr;
+        let (header, type_of_loader, cmd_line_ptr, ramdisk_image) = (
+            hdr.header,
+            hdr.type_of_loader,
+            hdr.cmd_line_ptr,
+            hdr.ramdisk_image,
+        );
+        assert_eq!(header, HEADER_MAGIC, "the image's header is carried over");
+        assert_eq!(type_of_loader, 0xff);
+        assert_eq!(u64::from(cmd_line_ptr), CMDLINE_ADDR);
+        assert_eq!(ramdisk_image, 0);
+    }
+
+    // Both a header-sized and a shorter file are refused.
+    #[test]
+    fn rejects_an_image_without_a_setup_header() {
+        let ram = guest_ram(1024 << 20);
+        let err = LoadedKernel::load(ram.memory(), &[0u8; 0x1000], "console=ttyS0", 0)
+            .expect_err("no HdrS");
+        assert!(err.contains("bzImage"), "{err}");
+        let err = LoadedKernel::load(ram.memory(), &[0u8; 16], "console=ttyS0", 0)
+            .expect_err("too short");
+        assert!(err.contains("bzImage"), "{err}");
+    }
+
+    // The loader's own checks pass; the signature check is hvi's.
+    #[test]
+    fn rejects_a_bzimage_without_the_boot_sector_signature() {
+        let ram = guest_ram(1024 << 20);
+        let mut image = synthetic_bzimage();
+        image[0x1fe] = 0;
+        image[0x1ff] = 0;
+        let err =
+            LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0).expect_err("no 0xAA55");
+        assert!(err.contains("boot sector"), "{err}");
+    }
+
+    // `Cmdline` parses `--` into init arguments; the guest must still see the
+    // spliced line unchanged.
+    #[test]
+    fn cmdline_with_init_args_is_written_verbatim() {
+        let ram = guest_ram(1024 << 20);
+        let line = "console=ttyS0 rdinit=/init -- --flag value";
+        LoadedKernel::load(ram.memory(), &synthetic_bzimage(), line, 0).expect("load");
+        let mut back = vec![0u8; line.len() + 1];
+        ram.read(CMDLINE_ADDR, &mut back).unwrap();
+        assert_eq!(&back[..line.len()], line.as_bytes());
+        assert_eq!(back[line.len()], 0, "NUL-terminated");
+    }
+
+    // Omitting the high entry loses the memory silently; describing the hole
+    // as RAM puts allocations over the devices.
+    #[test]
+    fn large_guest_gets_a_high_e820_entry() {
+        let ram = guest_ram(4096 << 20);
+        let regions = ram.regions();
+        assert_eq!(regions.len(), 2, "a 4 GiB guest must split");
+        LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0).expect("load");
+
+        let map = e820(&ram);
         assert_eq!(map.len(), 3, "e820: {map:x?}");
         assert_eq!(
             map[2],
-            (HIGH_RAM_BASE, high, E820_RAM),
+            (HIGH_RAM_BASE, regions[1].size, E820_RAM),
             "the displaced remainder must resume at the high base"
         );
         // The low entry must stop at the hole, not run through it.
-        assert_eq!(map[1], (HIGH_MEM_START, low - HIGH_MEM_START, E820_RAM));
+        assert_eq!(
+            map[1],
+            (HIGH_MEM_START, regions[0].size - HIGH_MEM_START, E820_RAM)
+        );
     }
 
-    /// The header field pointing at the initrd is 32 bits wide, so no matter
-    /// how big the guest is the initrd must be placed in low RAM.
+    // The header's initrd pointer is 32 bits wide.
     #[test]
-    fn the_initrd_stays_below_4gib() {
-        let (low, high) = ram_split(4096 << 20);
+    fn initrd_stays_below_4gib() {
+        let ram = guest_ram(4096 << 20);
+        let low = ram.regions()[0].size;
         let initrd_len = 8 << 20;
-        let plan =
-            prepare(&synth_bzimage(), "console=ttyS0", initrd_len, low, high).expect("prepare");
+        let kernel = LoadedKernel::load(
+            ram.memory(),
+            &synthetic_bzimage(),
+            "console=ttyS0",
+            initrd_len,
+        )
+        .expect("load");
 
-        let addr = plan.initrd_addr.expect("an initrd must get an address");
-        let field = u32::from_le_bytes(
-            plan.zero_page[HDR_RAMDISK_IMAGE..HDR_RAMDISK_IMAGE + 4]
-                .try_into()
-                .unwrap(),
+        let addr = kernel.initrd_addr.expect("an initrd must get an address");
+        let params = zero_page(&ram);
+        assert_eq!(
+            u64::from(params.hdr.ramdisk_image),
+            addr,
+            "header must point at the placement"
         );
-        assert_eq!(u64::from(field), addr, "header must point at the placement");
+        assert_eq!(u64::from(params.hdr.ramdisk_size), initrd_len);
         assert!(
             addr + initrd_len <= low,
             "initrd @ {addr:#x}+{initrd_len:#x} spills past low RAM ({low:#x})"
         );
-        assert!(u64::from(field) < HIGH_RAM_BASE);
+        assert!(addr < HIGH_RAM_BASE);
     }
 
-    /// A guest that fits under the hole keeps the pre-split layout: two RAM
-    /// entries and nothing above 4 GiB.
     #[test]
-    fn a_small_guest_is_unsplit() {
-        let (low, high) = ram_split(1024 << 20);
-        assert_eq!(high, 0);
-        let plan = prepare(&synth_bzimage(), "console=ttyS0", 0, low, high).expect("prepare");
+    fn initrd_that_would_overlap_the_kernel_is_refused() {
+        let ram = guest_ram(3 << 20);
+        let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 2 << 20)
+            .expect_err("2 MiB initrd in 3 MiB of low RAM lands on the kernel");
+        assert!(err.contains("initramfs"), "{err}");
+    }
 
-        let map = e820(&plan.zero_page);
+    #[test]
+    fn small_guest_is_unsplit() {
+        let ram = guest_ram(1024 << 20);
+        assert_eq!(ram.regions().len(), 1);
+        LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0).expect("load");
+
         assert_eq!(
-            map,
+            e820(&ram),
             vec![
-                (0, 0x9_fc00, E820_RAM),
-                (HIGH_MEM_START, low - HIGH_MEM_START, E820_RAM),
+                (RAM_BASE, EBDA_START, E820_RAM),
+                (HIGH_MEM_START, (1024 << 20) - HIGH_MEM_START, E820_RAM),
             ]
         );
+    }
+
+    // The zero page and the real-mode structures live in the region at
+    // address 0.
+    // The header's size field is 32 bits wide; a larger initramfs is refused
+    // rather than written with a truncated size.
+    #[test]
+    fn initramfs_beyond_the_ramdisk_size_field_is_refused() {
+        // Low RAM of 5 GiB is not a layout the machine builds; it is the one
+        // shape in which a 4 GiB initramfs passes the placement check.
+        let ram = GuestRam::from_ranges(&[(0, 5 << 30)]);
+        let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 1 << 32)
+            .expect_err("4 GiB initramfs");
+        assert!(err.contains("ramdisk_size"), "{err}");
+    }
+
+    #[test]
+    fn ram_without_a_low_region_is_refused() {
+        let ram = GuestRam::from_ranges(&[(HIGH_RAM_BASE, 32 << 20)]);
+        let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0)
+            .expect_err("nothing at address 0");
+        assert!(err.contains("address 0"), "{err}");
     }
 }

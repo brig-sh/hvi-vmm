@@ -28,8 +28,10 @@ pub const ZERO_PAGE: u64 = 0x7000;
 /// Kernel command line.
 pub const CMDLINE_ADDR: u64 = 0x2_0000;
 pub const CMDLINE_MAX: usize = 0x1_0000;
+/// Start of the EBDA, where usable low RAM ends.
+pub const EBDA_START: u64 = 0x9_fc00;
 /// Minimal MP floating pointer + config table, in the EBDA.
-pub const MPTABLE_ADDR: u64 = 0x9_fc00;
+pub const MPTABLE_ADDR: u64 = EBDA_START;
 /// Boot page tables (PML4/PDPT/PD) for the initial long-mode identity map.
 pub const PML4_ADDR: u64 = 0x9000;
 pub const PDPT_ADDR: u64 = 0xa000;

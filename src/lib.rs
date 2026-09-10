@@ -22,7 +22,7 @@
 //! - **Linux / x86-64** — KVM, x86-64 guest.
 //!
 //! All three share everything above the hypervisor: the guest memory layout
-//! (`layout`), kernel image parse (`boot`, `boot_x86`), devicetree
+//! (`layout`), kernel image loading (`boot`, `boot_x86`), devicetree
 //! builder (`fdt`), virtio devices ([`virtio`], [`virtio_net`],
 //! [`virtio_vsock`]), the serial ports (`pl011`, `uart16550`) and the
 //! `RawEvent` ledger ([`events`]). On any other host the crate builds without a
