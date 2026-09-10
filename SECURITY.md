@@ -32,7 +32,7 @@ Anything that lets a guest reach past its own VM. For instance:
 - a guest escaping into the VMM process, or executing code on the host;
 - a guest reaching host resources the confinement layer is supposed to deny,
   whether that is the Seatbelt profile on macOS or the seccomp filters on Linux
-  (see [Confinement](README.md#confinement));
+  (see [Confinement](docs/security.md#confinement));
 - one sandbox reading or influencing another, or the host, through a device
   backend, a share or the network stack;
 - the VMM mishandling host paths or host state in a way a guest can steer, for

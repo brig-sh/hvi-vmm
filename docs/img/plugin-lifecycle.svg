@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 470" width="760" height="470" role="img" aria-labelledby="t d">
+  <title id="t">When a plugin is called, and on which thread</title>
+  <desc id="d">A plugin is called at three points. Attach runs once on the main thread before any vCPU starts, and is where the plugin takes guest RAM and installs device sinks. Safepoint runs on the boot vCPU thread between guest entries, with that vCPU parked; it is the hot path, so the nothing-to-do case must be one atomic load and a return. Request runs when the console interrupt key is pressed, and only sets a flag. An IoSink is called from a vCPU thread with the device lock held and must not block. A plugin thread of its own must set its flag and then call kick, because an idle guest sits in WFI or HLT and never reaches a safe point on its own.</desc>
+
+  <rect x="0" y="0" width="760" height="470" fill="#f6f7f9"/>
+
+  <text x="24" y="32" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="16" font-weight="600" fill="#1f2937">When a plugin is called, and on which thread</text>
+
+  <!-- thread lanes -->
+  <rect x="24" y="52" width="712" height="88" rx="6" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="36" y="72" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#3730a3">Main thread</text>
+
+  <rect x="24" y="150" width="712" height="184" rx="6" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="36" y="170" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#065f46">Boot vCPU thread</text>
+
+  <rect x="24" y="344" width="712" height="104" rx="6" fill="#fffbeb" stroke="#fde68a"/>
+  <text x="36" y="364" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#92400e">Your own thread, and the console</text>
+
+  <!-- attach -->
+  <rect x="140" y="82" width="180" height="46" rx="5" fill="#c7d2fe" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="230" y="102" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="600" fill="#312e81">attach(VmHandle)</text>
+  <text x="230" y="119" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#4338ca">once, before any vCPU runs</text>
+
+  <text x="336" y="98" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">Take guest RAM and its descriptor, install</text>
+  <text x="336" y="115" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">sinks, start your threads. An error here fails the boot.</text>
+
+  <!-- run loop -->
+  <rect x="60" y="188" width="120" height="42" rx="5" fill="#a7f3d0" stroke="#10b981" stroke-width="1.5"/>
+  <text x="120" y="214" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#065f46">enter guest</text>
+
+  <rect x="220" y="188" width="120" height="42" rx="5" fill="#a7f3d0" stroke="#10b981" stroke-width="1.5"/>
+  <text x="280" y="214" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#065f46">exit</text>
+
+  <rect x="380" y="180" width="200" height="58" rx="5" fill="#34d399" stroke="#059669" stroke-width="1.5"/>
+  <text x="480" y="201" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="600" fill="#064e3b">safepoint(CpuHandle)</text>
+  <text x="480" y="218" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#065f46">this vCPU is parked</text>
+  <text x="480" y="232" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#064e3b">HOT PATH</text>
+
+  <!-- arrows in loop -->
+  <line x1="180" y1="209" x2="216" y2="209" stroke="#059669" stroke-width="1.5" marker-end="url(#ag)"/>
+  <line x1="340" y1="209" x2="376" y2="209" stroke="#059669" stroke-width="1.5" marker-end="url(#ag)"/>
+  <path d="M580 209 L610 209 L610 252 L120 252 L120 234" fill="none" stroke="#059669" stroke-width="1.5" marker-end="url(#ag)"/>
+
+  <text x="624" y="199" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">Nothing to do?</text>
+  <text x="624" y="215" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">One atomic load,</text>
+  <text x="624" y="231" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">then return.</text>
+
+  <!-- pause/resume -->
+  <rect x="380" y="268" width="200" height="52" rx="5" fill="#d1fae5" stroke="#059669" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="480" y="288" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#064e3b">pause() &#8594; true &#8594; resume()</text>
+  <text x="480" y="306" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#b91c1c">exactly one resume, on every path out</text>
+  <line x1="480" y1="238" x2="480" y2="264" stroke="#059669" stroke-width="1.5" marker-end="url(#ag)"/>
+
+  <rect x="60" y="268" width="290" height="52" rx="5" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+  <text x="76" y="288" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="600" fill="#064e3b">IoSink::block() / IoSink::net()</text>
+  <text x="76" y="306" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#b91c1c">device lock held &#8212; must not block</text>
+
+  <text x="624" y="284" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">A <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">false</tspan> owes
+  </text>
+  <text x="624" y="300" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">nothing: already</text>
+  <text x="624" y="316" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">released.</text>
+
+  <!-- your thread -->
+  <rect x="60" y="378" width="200" height="52" rx="5" fill="#fde68a" stroke="#d97706" stroke-width="1.5"/>
+  <text x="160" y="398" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#78350f">1. set your flag</text>
+  <text x="160" y="417" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="600" fill="#78350f">2. VmHandle::kick()</text>
+
+  <rect x="330" y="378" width="170" height="52" rx="5" fill="#fde68a" stroke="#d97706" stroke-width="1.5"/>
+  <text x="415" y="398" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="600" fill="#78350f">request()</text>
+  <text x="415" y="416" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#92400e">console key, Ctrl-]</text>
+
+  <path d="M160 374 L160 340 L480 340 L480 324" fill="none" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ao)"/>
+  <path d="M415 374 L415 346 L470 346" fill="none" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <text x="516" y="392" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#b91c1c">Without the kick, nothing happens.</text>
+  <text x="516" y="409" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">An idle guest sits in WFI or HLT and</text>
+  <text x="516" y="426" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">never reaches a safe point on its own.</text>
+
+  <defs>
+    <marker id="ag" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 z" fill="#059669"/>
+    </marker>
+    <marker id="ao" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 z" fill="#d97706"/>
+    </marker>
+  </defs>
+</svg>

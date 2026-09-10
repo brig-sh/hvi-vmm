@@ -23,8 +23,10 @@ check`, the workflow lint and the spell check. `tidy.sh` and `cargo test`
 always run. The other four need something the pinned toolchain does not
 supply (the `aarch64-unknown-linux-gnu` target, `cargo-deny`, `actionlint`
 plus `shellcheck`, `typos`), so each is skipped when it is missing and every
-skip is named in the closing line -- the script never reports a bare `ok`
-when something did not run. `--with-perf` adds the virtio-fs performance
+skip it probes for is named in the closing line. One skip is not counted
+there: `tidy.sh` drops the comment-reflow pass when the pinned nightly is
+missing, says so on stderr, and `gates.sh` still prints `ok`. Install that
+nightly, or CI finds what you missed. `--with-perf` adds the virtio-fs performance
 gate (`tools/perf-gate.sh`, macOS only), which builds the merge base as well
 as the branch and so costs more than every other check together. The live
 boots, the other host's backend and the commit-message lint stay CI's job.
@@ -42,8 +44,10 @@ tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
 anyway, and runs just clippy and rustdoc for that target.
 
 The toolchain is pinned in `rust-toolchain.toml`, so everyone lints against the
-same compiler. `rust-version` in `Cargo.toml` is a different thing: the MSRV
-floor, not the build pin.
+same compiler. `rust-version` in `Cargo.toml` (1.77) is a different thing: the
+MSRV floor, a compatibility claim rather than the build pin. No CI job builds
+at that floor, so nothing enforces it. Treat a change that raises it as
+something a reviewer has to notice.
 
 ## Branches
 
@@ -115,103 +119,53 @@ verbatim -- which is why each one is linted and expected to stand alone.
 
 ## What CI checks, and what it deliberately doesn't
 
+[docs/testing.md](docs/testing.md) is the full account: which jobs run on
+which runners, what each boot job asserts, the toolchain versions, and the
+performance gate. What matters when you open a pull request:
+
 A pull request runs `.github/workflows/pr-build-and-verify.yml` and a push to
 `main` runs `main-build-and-verify.yml`. Both are thin entry workflows calling
-the same reusable ones. The shared `.github/actions/setup-rust` composite
-installs the pinned toolchain, adds any cross target and restores the cargo
-cache.
+the same reusable ones.
 
-`validate-commits.yml` (pull requests only, since a rebase-and-merge lands the
-commits on `main` verbatim):
+- **validate-commits** (pull requests only, since a rebase-and-merge lands the
+  commits on `main` verbatim): the commit conventions above, per commit and
+  reported by short SHA, plus a spell check over the tree and over the
+  messages the pull request adds.
+- **validate-code**: `tools/tidy.sh --check` on x86 Linux, which owns
+  formatting for the whole tree because rustfmt does not evaluate `cfg` and so
+  reaches modules that runner cannot build. Then clippy and rustdoc for the
+  arm64/KVM backend cross-checked from the same runner and for the hvf backend
+  on `macos-15`, actionlint with shellcheck over the workflows, and
+  `cargo deny check` over the lockfile.
+- **build-and-test**: the unit suite on x86 Linux and on `macos-15`, the two
+  confinement selftests, and then the live boots on the self-hosted runners.
 
-- **lint-commit-messages**: the conventions above, per commit, reported by short
-  SHA so you know which one to fix.
-- **check-spelling**: the tree and the commit messages the pull request adds.
+`tools/gates.sh` runs everything in that list a developer machine can run.
+Three checks cannot run anywhere but CI: the other host's backend, the live
+boots, and the commit-message lint, which needs a pull request's commit range.
 
-`validate-code.yml` (lint, read-only):
+The self-hosted lanes, which are the three live boots and the performance
+gate, are withheld from pull requests opened from a fork, because they run on
+persistent machines the project owns rather than ephemeral VMs. A fork still
+gets every hosted job.
 
-- **tidy-portable**: `tools/tidy.sh --check` on x86 Linux. This job owns
-  formatting for the whole tree -- rustfmt does not evaluate `cfg`, so it
-  reaches every module, including the backends that runner cannot build.
-- **tidy-linux-aarch64**: clippy and rustdoc for `aarch64-unknown-linux-gnu`,
-  cross-checked from the x86 runner. No cross-linker is needed for either.
-- **tidy-macos-hvf**: the same two on `macos-15`, for the
-  Hypervisor.framework backend.
-- **lint-workflows**: actionlint plus shellcheck over the workflows
-  themselves, with both binaries version-pinned and sha256-verified. The
-  self-hosted runner labels live in `.github/actionlint.yaml`.
-- **check-deps**: `cargo deny check` over the lockfile: RUSTSEC advisories,
-  licenses, duplicate versions and registry sources, per `deny.toml`. The
-  tool pin and the invocation live in the `.github/actions/cargo-deny`
-  composite, shared with the weekly lane below.
+Every job carries a `timeout-minutes` cap. The boot jobs upload their logs as
+artifacts when they fail, and the two arm64 boots also upload the event
+ledger.
 
-`build-and-test.yml`:
+One known gap: the arm64/KVM backend has no unit tests. `src/machine_linux.rs`
+carries no test module, and no job runs a suite on arm64 Linux, so closing the
+gap needs tests and a runner for them. This waits on a decision about the
+runner pool.
 
-- **test-portable**: `cargo test` on x86 Linux. On a push to `main` the
-  suite runs once under `cargo llvm-cov` instead, which gives the same pass
-  or fail plus an lcov profile that is uploaded to Codecov for the README
-  badge; the upload never fails the run. A pull request does not pay for the
-  instrumentation.
-- **seccomp-x86**: `hvi seccomp-selftest` on x86 Linux, which installs the
-  shipped filters in child processes and needs no KVM.
-- **build-and-test-macos**: build, test and ad-hoc sign with the entitlement on
-  `macos-15`, which is where the in-kernel GICv3 API (`hv_gic_*`) exists, then
-  `hvi sandbox-selftest`, asserting its success line so an Intel runner image
-  cannot turn the step into a no-op.
-- **boot-x86**: a live boot of a real Linux kernel to the userspace/VFS gate
-  with `--cpus 2`, so SMP AP bringup is asserted too, on a self-hosted x86
-  runner with real `/dev/kvm` (label `kvm`). The job skips itself with a
-  warning if the runner has no KVM.
-- **boot-arm64-hvf**: `hvi smoke`, `hvi smoke --shm` (which spawns
-  `smoke-shm-verify` in a child process and fails when that child fails), and a
-  live boot on a self-hosted Apple-silicon runner, under an alarm wrapper
-  because macOS ships no `timeout`.
-- **boot-arm64-kvm**: a matrix over two self-hosted arm64 hosts, vGICv2
-  (`nbfc`) and vGICv3 (`gicv3`). Each runs the aarch64 seccomp selftest, a live
-  boot, a boot on a real tap when the runner can create one (skipped with a
-  warning otherwise), and a check that an unusable tap refuses to boot and names
-  the interface in the error.
-- **perf-virtiofs**: `tools/perf-gate.sh` on the Apple-silicon runner, for
-  same-repo pull requests only. It builds the branch and its merge base on the
-  same machine in the same run, requires the metadata workload's host-operation
-  count to be equal, and fails when the branch is more than 1.5x slower.
-
-The three boot jobs and the perf gate run on persistent machines the project
-owns, so they are withheld from pull requests opened from a fork; a fork still
-gets every hosted job. The arm64 boots need self-hosted runners because no
-GitHub-hosted arm64 runner exposes `/dev/kvm` and a live macOS boot needs the
-hypervisor entitlement plus an interactive host (AMFI). The x86 boot moved to a
-self-hosted runner because the hosted image's kernel package fetch wedged
-repeatedly; a persistent runner installs it once.
-
-Every job carries a `timeout-minutes` cap, so a wedged job cannot hold a
-self-hosted runner for the six-hour default. The boot jobs upload their logs
-and the event ledger as artifacts when they fail.
-
-One known gap: the unit tests of the arm64-Linux modules run nowhere. `cargo
-test` runs on x86 Linux and on macOS only, and the arm64/KVM jobs build and
-boot without a test step. Those modules are cross-linted, not unit-tested.
-This waits on a decision about the runner pool.
-
-Three scheduled workflows run outside the two entry points. Each reports
-through a tracking issue and leaves `main` green: a failure files or updates
-one issue, and the next green run closes it. They are the only workflows
-granted `issues: write`.
-
-- `audit-deps.yml`: `cargo deny check` against the lockfile on `main` every
-  Monday, for advisories that arrive between changes. Nothing about a new
-  advisory is fixed by reverting, so a red `main` would be noise.
-- `stress-weekly.yml`: the `#[ignore]`d used-ring litmus test on a self-hosted
-  arm64 runner every Monday. It demonstrates the ordering defect and the fence
-  that removes it; it is not reliable enough to gate a pull request.
-- `schedule-reflow-drift.yml`: monthly, runs the comment reflow on the latest
-  nightly and compares it with the pinned one in `pins.env`, so the pin is
-  advanced deliberately when the two disagree.
+Three scheduled workflows run outside the two entry points, each reporting
+through a tracking issue so `main` stays green: the weekly dependency audit,
+the weekly used-ring litmus on arm64, and a monthly check that the pinned
+reflow nightly still agrees with the latest one.
 
 External actions are pinned to commit SHAs, with the version in a comment.
 Renovate keeps those pins, the Cargo dependencies and the commitlint tooling
-updated (`.github/renovate.json`). The cargo-deny pin is an action input, not
-a `uses:` ref, so a custom manager in that file covers it.
+updated (`.github/renovate.json`).
 
 ## AI policy
 

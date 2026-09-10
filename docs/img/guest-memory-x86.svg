@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 540" width="720" height="540" role="img" aria-labelledby="t d">
+  <title id="t">Why x86-64 guest RAM has a hole</title>
+  <desc id="d">The x86-64 guest's RAM is not one contiguous span. It starts at address zero and stops at 0xd0000000, where the virtio-mmio device window begins. RAM laid over that window would shadow the device registers, so KVM would service the access from memory and the guest would silently lose its devices. RAM laid over the in-kernel LAPIC page at 0xfee00000 would be refused outright with EEXIST. The hole starts at the lower of the two. Any remaining RAM resumes at 4 GiB as a second KVM memory slot into the same memfd, so the host mapping stays contiguous and only the guest-physical view has a gap.</desc>
+
+  <rect x="0" y="0" width="720" height="540" fill="#f6f7f9"/>
+
+  <text x="24" y="34" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="16" font-weight="600" fill="#1f2937">Why x86-64 guest RAM has a hole</text>
+  <text x="24" y="54" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#6b7280">Ordered by address, not to scale. Two fixed things under 4 GiB cannot be covered by RAM.</text>
+
+  <!-- high RAM -->
+  <rect x="24" y="76" width="400" height="56" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="40" y="98" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#1e3a8a">Guest RAM, high half (only if it does not fit below)</text>
+  <text x="40" y="120" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x1_0000_0000 (4 GiB) upward</text>
+  <text x="440" y="106" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">A second KVM memory slot into</text>
+  <text x="440" y="123" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">the same memfd.</text>
+
+  <!-- LAPIC -->
+  <rect x="24" y="148" width="400" height="46" rx="6" fill="#fee2e2" stroke="#ef4444" stroke-width="1.5"/>
+  <text x="40" y="168" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#b91c1c">0xfee0_0000  LAPIC   (in-kernel)</text>
+  <text x="40" y="186" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#b91c1c">0xfec0_0000  IOAPIC  (in-kernel)</text>
+  <text x="440" y="168" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#b91c1c" font-weight="600">RAM here is refused</text>
+  <text x="440" y="185" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">KVM answers <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">EEXIST</tspan>; the VM
+  </text>
+  <text x="440" y="201" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">does not start. A loud failure.</text>
+
+  <!-- the hole -->
+  <rect x="24" y="210" width="400" height="96" rx="6" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="40" y="232" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#4b5563">MMIO hole — no RAM</text>
+  <text x="40" y="253" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0000  virtio-blk    GSI 5</text>
+  <text x="40" y="271" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0200  virtio-net    GSI 6</text>
+  <text x="40" y="289" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0400  virtio-vsock  GSI 7</text>
+
+  <text x="440" y="240" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#b91c1c" font-weight="600">RAM here is worse: silent</text>
+  <text x="440" y="257" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">RAM shadows the registers, so</text>
+  <text x="440" y="274" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">KVM serves the access from</text>
+  <text x="440" y="291" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">memory and never exits to hvi.</text>
+  <text x="440" y="308" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">The guest just finds no disk.</text>
+
+  <!-- boundary callout -->
+  <line x1="24" y1="316" x2="424" y2="316" stroke="#f59e0b" stroke-width="2"/>
+  <text x="40" y="333" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#b45309">
+    MMIO_GAP_START = 0xd000_0000 — RAM stops at the lower of the two
+  </text>
+
+  <!-- low RAM -->
+  <rect x="24" y="344" width="400" height="172" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="40" y="366" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#1e3a8a">Guest RAM, low half</text>
+  <text x="40" y="386" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x10_0200  64-bit kernel entry</text>
+  <text x="40" y="404" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x10_0000  kernel load (1 MiB)</text>
+  <text x="40" y="422" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x9_fc00   MP table (EBDA)</text>
+  <text x="40" y="440" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x2_0000   kernel command line</text>
+  <text x="40" y="458" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0xc000     boot GDT</text>
+  <text x="40" y="476" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x9000/a000/b000  PML4 / PDPT / PD</text>
+  <text x="40" y="494" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x7000     boot_params (zero page)</text>
+  <text x="40" y="512" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#1e40af">0x6ff0     boot stack   |   0x0  RAM_BASE</text>
+
+  <text x="440" y="392" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">No devicetree here. hvi fills a</text>
+  <text x="440" y="409" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563"><tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">boot_params</tspan> zero page and an
+  </text>
+  <text x="440" y="426" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">MP table instead, and enters</text>
+  <text x="440" y="443" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">the kernel already in long mode.</text>
+  <text x="440" y="469" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">The COM1 UART is at PIO</text>
+  <text x="440" y="486" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563"><tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">0x3f8</tspan> (GSI 4), the CMOS RTC
+  </text>
+  <text x="440" y="503" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">at <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">0x70</tspan>/<tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">0x71</tspan> — ports, not memory.
+  </text>
+
+  <!-- address axis -->
+  <text x="700" y="92" text-anchor="end" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#9ca3af">high</text>
+  <text x="700" y="516" text-anchor="end" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#9ca3af">low</text>
+  <line x1="700" y1="100" x2="700" y2="506" stroke="#d1d5db" stroke-width="1"/>
+  <polygon points="700,96 696,104 704,104" fill="#d1d5db"/>
+</svg>
