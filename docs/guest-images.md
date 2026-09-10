@@ -2,7 +2,8 @@
 
 hvi boots an unmodified Linux kernel. It supplies no firmware and no
 bootloader: it parses the kernel image itself, places it in guest RAM, and
-enters it directly.
+enters it directly. A Unikraft unikernel boots the same way, because Unikraft
+links its arm64 images with the same 64-byte Linux boot header.
 
 That means the image format has to match the guest architecture exactly, and
 the guest needs a root filesystem from somewhere.
@@ -84,6 +85,50 @@ device exists rather than something you configure.
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.
+
+## Unikernel guests (Unikraft)
+
+A Unikraft/arm64 image is an arm64 `Image` as far as the loader is concerned,
+so `--kernel` takes it unchanged. Two build options are not optional, and
+neither is discoverable from a failure -- both kill the guest before it has a
+console to complain with.
+
+**GICv3.** Apple's `hv_gic` is GICv3 only. The stock `qemu-arm64` defconfig
+sets `CONFIG_LIBUKINTCTLR_GICV2=y` and leaves v3 off, because
+`plat/kvm/Config.uk` has `KVM_VMM_QEMU imply GICV2`. The two drivers are
+independent bools and `uk_intctlr_probe()` matches on the devicetree
+`compatible`, so building both is fine and the image still boots under QEMU.
+
+**No PCI.** hvi has no PCI bus and emits no PCI node. Unikraft's arm64 PCI
+driver probes a hardcoded ECAM window anyway, and the data abort lands in
+`arch_pci_probe` before the banner:
+
+```text
+CRIT: [libkvmplat] <traps_arm64.c @ 210> EL1 sync trap caught
+CRIT: [libkvmplat] <traps_arm64.c @ 176>  FAR_EL1  : 0x0000000000008000
+```
+
+So, on top of a stock `defconfigs/qemu-arm64`:
+
+```text
+CONFIG_LIBUKINTCTLR_GICV3=y         # Apple's hv_gic is GICv3-only
+# CONFIG_LIBVIRTIO_PCI is not set   # hvi is virtio-mmio only
+# CONFIG_LIBUKBUS_PCI is not set
+CONFIG_LWIP_DHCP=y                  # --net answers DHCP
+```
+
+Then:
+
+```bash
+hvi boot --kernel httpreply_qemu-arm64 --mem-mib 256 --net
+```
+
+There is one more constraint on the hvi side, and it is why the device windows
+sit where they do. Unikraft/arm64 enables the MMU from a page table fixed at
+link time, which maps exactly `0x0800_0000`-`0x4000_0000` as device memory.
+Linux builds its early map from the devicetree and accepts MMIO anywhere;
+Unikraft does not. Every hvi device window is inside that range, so this costs
+a Linux guest nothing (see `DEVICE_WINDOW_BASE` in `src/layout.rs`).
 
 ## The kernel command line
 
