@@ -136,8 +136,12 @@ pub trait VmHandle: Send + Sync {
     /// Feeds every virtio-net frame to `sink`. No-op with no net device.
     fn set_net_sink(&self, sink: Arc<dyn IoSink>);
 
-    /// Breaks every vCPU out of the hypervisor so each reaches its next safe
-    /// point promptly.
+    /// Breaks the vCPU that runs [`Plugin::safepoint`] out of the hypervisor
+    /// so it reaches its next safe point promptly.
+    ///
+    /// How wide that is differs by backend: the macOS backend kicks every
+    /// vCPU, while the Linux and x86 backends kick the boot vCPU alone, which
+    /// is the one that reaches the hook.
     ///
     /// A plugin that sets a pending flag from its own thread **must** call
     /// this afterwards: an idle guest sits in WFI/HLT indefinitely, and
@@ -211,9 +215,11 @@ pub trait Plugin: Send + Sync {
 /// A per-request feed of a virtio device's I/O.
 ///
 /// The VMM already records these in its ledger; a sink is for a tool that wants
-/// them live and unaggregated, as [`crate::plugins::IoTrace`] does. Both
-/// methods are called from the vCPU thread with the device lock held, so an
-/// implementation must not block.
+/// them live and unaggregated, as [`crate::plugins::IoTrace`] does. Every
+/// method is called with the device lock held, so an implementation must not
+/// block. [`IoSink::block`] and the egress side of [`IoSink::net`] run on a
+/// vCPU thread; an ingress frame reaches [`IoSink::net`] from the tap or
+/// gateway reader thread instead.
 pub trait IoSink: Send + Sync {
     /// A virtio-blk request: starting `sector`, `length` data bytes, and
     /// direction. `disk_id` distinguishes backing devices.

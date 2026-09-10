@@ -35,14 +35,16 @@ impl ShareMode {
 /// re-checking the host.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CachePolicy {
-    /// Metadata cached for a second and page cache retained across opens, with
-    /// the guest revalidating on size/mtime change. Matches virtiofsd's
-    /// default.
+    /// Metadata cached for a second on a writable share, and for a minute on
+    /// a read-only one, which cannot go stale from the guest's own writes. The
+    /// page cache is retained across opens either way, with the guest
+    /// revalidating on a size or mtime change. Matches virtiofsd's default.
     #[default]
     Auto,
-    /// Additionally lets the guest own the page cache for writes, batching them
-    /// into large aligned WRITEs. Only correct when the guest is the sole
-    /// writer.
+    /// On a writable share, additionally lets the guest own the page cache for
+    /// writes, batching them into large aligned WRITEs. Only correct when the
+    /// guest is the sole writer. On a read-only share it negotiates no
+    /// writeback cache and behaves as [`CachePolicy::Auto`].
     ///
     /// A trade, not a straight win, and which way it goes depends entirely on
     /// how the workload writes. Measured with `tools/fsbench` writing 256 MiB:
@@ -98,8 +100,10 @@ pub struct BootConfig {
     /// A plugin attached to this guest, or `None` to run it with none.
     ///
     /// This is the whole of the VMM's observation surface: see
-    /// [`crate::plugin`]. The `hvi` binary never sets it — a plugin comes
-    /// from a caller that links this crate as a library.
+    /// [`crate::plugin`]. The `hvi` binary sets it only for `--dump-memory`
+    /// and `--trace-io`, which it chains into a single plugin; with neither
+    /// flag it stays `None`. Any other plugin comes from a caller that links
+    /// this crate as a library.
     pub plugin: Option<std::sync::Arc<dyn crate::plugin::Plugin>>,
     /// Confine the VMM process before it services any guest I/O: a Seatbelt
     /// profile on macOS (the `sandbox` module), seccomp-bpf allowlists on
