@@ -577,8 +577,9 @@ mod tests {
 
     /// Both filters must compile for the architecture the binary is built for.
     /// A typo in a syscall name, or a name that does not exist on this arch
-    /// (`poll` is x86-only, aarch64 spells it `ppoll`), is a startup failure in
-    /// production; here it is a test failure on any Linux host.
+    /// (`poll` is the one that differs: x86-64 has both `poll` and `ppoll`,
+    /// aarch64 has `ppoll` alone), is a startup failure in production; here it
+    /// is a test failure on any Linux host.
     #[test]
     fn filters_compile_for_this_arch() {
         for thread in [Thread::Vmm, Thread::Vcpu] {
