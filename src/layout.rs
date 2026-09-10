@@ -224,10 +224,28 @@ impl GuestLayout {
         }
     }
 
+    /// End of the initrd as advertised to the guest, rounded up to a page.
+    ///
+    /// A guest that turns `linux,initrd-*` into a memory-region descriptor and
+    /// requires whole pages cannot accept a ragged one. Unikraft asserts
+    /// `pg_count * PAGE_SIZE == len`, and the carve-out leaves the free region
+    /// next to it ragged too, so it dies in the boot allocator before the
+    /// console is up. Linux takes the range as it comes and stops at the
+    /// archive's own end marker, so the rounding costs it nothing. The padding
+    /// is real, zeroed RAM: the initrd is the last image placed, and
+    /// [`Self::validate`] counts the rounded end against the end of RAM.
+    #[must_use]
+    pub fn initrd_end(&self) -> u64 {
+        if self.initrd_size == 0 {
+            return self.initrd_addr;
+        }
+        align_up(self.initrd_addr + self.initrd_size, 0x1000)
+    }
+
     /// End of the last placed image; everything below must fit in RAM.
     #[must_use]
     pub fn top(&self) -> u64 {
-        self.initrd_addr + self.initrd_size
+        self.initrd_end()
     }
 
     /// Errors if the packed images would run past the end of guest RAM.
@@ -324,6 +342,30 @@ mod tests {
         // 8 MiB RAM cannot hold a 16 MiB kernel.
         let l = GuestLayout::new(8 << 20, 0, 16 << 20, 0x2000, 0);
         assert!(l.validate().is_err());
+    }
+
+    /// The initrd range handed to the guest must cover whole pages, or a
+    /// guest that turns it into a memory-region descriptor gets a ragged one
+    /// and dies in its boot allocator.
+    #[test]
+    fn the_advertised_initrd_covers_whole_pages() {
+        // 7168 bytes is the nginx rootfs cpio: one and three quarter pages.
+        let l = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 7168);
+        assert_eq!(l.initrd_addr % 0x1000, 0, "placement is page-aligned");
+        assert_eq!(l.initrd_end() % 0x1000, 0, "so is the advertised end");
+        assert!(
+            l.initrd_end() >= l.initrd_addr + 7168,
+            "the whole archive is inside the advertised range"
+        );
+        assert!(
+            l.initrd_end() - l.initrd_addr < 7168 + 0x1000,
+            "at most one page of padding"
+        );
+        assert_eq!(l.top(), l.initrd_end(), "and RAM is checked against it");
+
+        // No initrd, no range: top() must not gain a page out of nowhere.
+        let none = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 0);
+        assert_eq!(none.initrd_end(), none.initrd_addr);
     }
 
     /// A guest whose boot page table is fixed at link time only reaches MMIO
