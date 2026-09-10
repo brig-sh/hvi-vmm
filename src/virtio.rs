@@ -85,8 +85,8 @@ const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSI
 const F_BLK_FLUSH_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
 
 /// Descriptor flags.
-const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
-const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
+pub(crate) const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
+pub(crate) const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
 
 /// virtio-blk request types.
 const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
