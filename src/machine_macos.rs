@@ -36,16 +36,16 @@ use applevisor::prelude::{
     VirtualMachineConfig, VirtualMachineInstance,
 };
 
-use crate::boot::Arm64Image;
+use crate::boot;
 use crate::config::{BootConfig, Stop};
 use crate::esr::{DataAbort, Ec};
 use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, GuestLayout, RAM_BASE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI,
+    VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE,
+    VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
@@ -172,9 +172,9 @@ struct Shared {
 
 /// Boots `cfg` and runs until the guest powers off.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
-    let img = Arm64Image::parse(&cfg.kernel)?;
-    let kernel_size = img.reserved_size(cfg.kernel.len() as u64);
-    let initrd_len = cfg.initramfs.as_ref().map_or(0, |v| v.len() as u64);
+    // Refuse a kernel that is not a flat Image before the VM, its RAM, the
+    // devices and the event ledger exist.
+    boot::LoadedKernel::from_header(&cfg.kernel)?;
     let num_cpus = cfg.vcpus.max(1);
 
     // In-kernel GICv3; sizes from the framework so the DTB matches hv_gic.
@@ -368,30 +368,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
 
-    // Two DTB passes: its length feeds the initramfs placement.
-    let provisional = GuestLayout::new(
-        cfg.mem_bytes,
-        img.text_offset,
-        kernel_size,
-        0x4000,
-        initrd_len,
-    );
-    let dtb0 = fdt::build(&provisional, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
-    let layout = GuestLayout::new(
-        cfg.mem_bytes,
-        img.text_offset,
-        kernel_size,
-        dtb0.len() as u64,
-        initrd_len,
-    );
-    let dtb = fdt::build(&layout, &gic, num_cpus, &cfg.cmdline, fdt_devices)?;
-    layout.validate()?;
-
-    ram.write(layout.kernel_addr, &cfg.kernel)?;
-    ram.write(layout.dtb_addr, &dtb)?;
-    if let Some(initramfs) = &cfg.initramfs {
-        ram.write(layout.initrd_addr, initramfs)?;
+    let layout = boot::Payload {
+        kernel: &cfg.kernel,
+        initramfs: cfg.initramfs.as_deref(),
+        cmdline: &cfg.cmdline,
     }
+    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
 
     let secondaries: Vec<Secondary> = (0..num_cpus)
         .map(|_| Secondary {

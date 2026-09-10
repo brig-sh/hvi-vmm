@@ -198,7 +198,7 @@ hvi dump-fdt --kernel target/Image --mem-mib 1024 --out target/fdt.dtb
 ```
 
 ```text
-kernel target/Image: text_offset=0x0 reserved_size=0x33c0000 (file 53412352 bytes)
+kernel target/Image: kernel@0x40000000 reserved_size=0x33c0000 (file 53412352 bytes)
 RAM   0x40000000 + 1024 MiB
 kernel@0x40000000 dtb@0x43400000 (+0x503) initrd@0x43401000 (+0x0)  top=0x43401000
 cmdline: earlycon console=ttyAMA0 panic=-1
