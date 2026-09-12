@@ -139,8 +139,9 @@ hvi is young. Read these before you build on it.
 - **The event ledger is per packet and egress only.** It is not aggregated per
   flow, and it is not a tamper-proof record.
 - **The arm64/KVM backend has no unit tests.** `src/machine_linux.rs` carries
-  none, and no job would run a suite on arm64 Linux if it did. That backend is
-  cross-linted and booted, not unit-tested.
+  none. The suite does run on the arm64/KVM runners, so a test added there
+  would be executed; that backend is cross-linted and booted, not
+  unit-tested.
 
 [docs/limitations.md](docs/limitations.md) has the full list with the
 consequences.

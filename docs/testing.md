@@ -59,7 +59,7 @@ Where it actually runs in CI:
 | --- | --- |
 | x86-64 Linux (`ubuntu-latest`) | The full suite. On a push to `main` it runs once under `cargo llvm-cov` instead, and the profile goes to Codecov, which is what the coverage badge reads. |
 | macOS 15 | The full suite, including the macOS backend and virtio-fs. |
-| arm64 Linux | No suite. The weekly litmus job builds and runs one test binary there. |
+| arm64 Linux | The full suite in the release profile, on both self-hosted arm64/KVM runners, reusing the live boot's build. |
 
 `src/machine_x86.rs` has unit tests and they run on `ubuntu-latest`, so the
 x86-64/KVM backend is unit-tested. `src/machine_linux.rs` has none.
@@ -90,9 +90,9 @@ console log:
 
 | Job | Runner | Asserts |
 | --- | --- | --- |
-| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`. Also runs the virtio-blk sizing test against a real loop device. |
+| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. Also runs the virtio-blk sizing test against a real loop device. |
 | `boot-arm64-hvf` | self-hosted Apple silicon | `hvi smoke`, `hvi smoke --shm`, then a boot reaching `Linux version` and `HVI-INITRAMFS-UP`. |
-| `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each does the aarch64 seccomp selftest, a boot, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
+| `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the aarch64 seccomp selftest, a boot, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
 
 `boot-x86` skips itself with a warning when the runner has no `/dev/kvm`. A
 skip is not a pass.
