@@ -424,7 +424,7 @@ jobs:
           perl -e 'alarm shift; exec @ARGV' 120 \
             ./target/release/hvi boot \
             --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 \
-            --net --share-ro share-probe probe --cmdline httpreply \
+            --net-stub --share-ro share-probe probe --cmdline httpreply \
             </dev/null > unikraft.log 2>&1 || true
           tail -25 unikraft.log
           grep -aq "Powered by" unikraft.log \
@@ -456,7 +456,7 @@ jobs:
           # what urunc emits; arm64 has a PL011 and ignores it.
           perl -e 'alarm shift; exec @ARGV' 120 \
             ./target/release/hvi boot \
-            --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 --net \
+            --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 --net-stub \
             --cmdline "Unikraft console=ttyS0 netdev.ip=10.0.2.99/24:10.0.2.2:10.0.2.3 -- httpreply" \
             </dev/null > unikraft-static.log 2>&1 || true
           tail -25 unikraft-static.log
@@ -478,13 +478,13 @@ jobs:
           head -c 512 /dev/zero >> initrd-ragged
           [ "$(wc -c < initrd-ragged)" -eq 8704 ] \
             || { echo "::error::the pinned initrd changed size; re-check the padding"; exit 1; }
-          # --net so the guest has a device to bring up; without it nginx has
+          # --net-stub so the guest has a device to bring up; without it nginx has
           # nothing to bind and the console is silent past the banner.
           perl -e 'alarm shift; exec @ARGV' 120 \
             ./target/release/hvi boot \
             --kernel guest-nginx/unikraft/bin/kernel \
             --initramfs initrd-ragged --mem-mib 512 \
-            --net --cmdline nginx \
+            --net-stub --cmdline nginx \
             </dev/null > unikraft-initrd.log 2>&1 || true
           tail -25 unikraft-initrd.log
           grep -aq "Powered by" unikraft-initrd.log \

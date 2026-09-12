@@ -88,7 +88,7 @@ cargo build --release --example watch_guest
 | `cmdline` | `String` | The backend appends what its own devices need. |
 | `disk` | `Option<String>` | One virtio-blk backing file. |
 | `fs_shares` | `Vec<FsShare>` | virtio-fs exports. macOS only: a non-empty vector **fails the boot** on either Linux backend. |
-| `net` | `bool` | The built-in stack. |
+| `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |
 | `net_mac` | `Option<[u8; 6]>` | Guest MAC, applied on every backend and mode. |
@@ -145,7 +145,7 @@ handshake.
 | Thing | Who creates it | What hvi does |
 | --- | --- | --- |
 | Agent socket | hvi creates the host listener | Relays bytes to guest CID 3 port 1024. |
-| Gateway socket | an external gvisor-tap process | Connects as a client. Warns and falls back to the built-in stack if it cannot. |
+| Gateway socket | an external gvisor-tap process | Connects as a client. Warns and falls back to the built-in stub stack if it cannot. |
 | Tap device | whoever owns the network namespace | Opens it. Never creates, configures or brings one up. Fails the boot if it cannot open it. |
 
 ## Platform gating

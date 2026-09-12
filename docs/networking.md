@@ -4,12 +4,12 @@ hvi gives a guest one virtio-net device, or none. There is no second NIC and
 no hotplug.
 
 Three modes back that device. They are selected by flag, and the first one
-given wins: `--net-tap`, then `--net-gateway`, then `--net`. Passing more than
-one is not an error, so pass one.
+given wins: `--net-tap`, then `--net-gateway`, then `--net-stub`. Passing more
+than one is not an error, so pass one.
 
 ## Mode comparison
 
-| | `--net` | `--net-gateway <sock>` | `--net-tap <dev>` |
+| | `--net-stub` | `--net-gateway <sock>` | `--net-tap <dev>` |
 | --- | --- | --- | --- |
 | Platforms | all three | all three | Linux only |
 | Real egress | no | yes | yes |
@@ -20,11 +20,13 @@ one is not an error, so pass one.
 | TLS SNI recorded | no | yes | yes |
 | `--net-mac` honoured | yes | yes | yes |
 
-## The built-in stack: `--net`
+## The built-in stub stack: `--net-stub`
 
-`--net` runs a small user-space network stack inside the VMM. It needs no
-privileges, no entitlement and no host configuration, which makes it the right
-choice for a first boot and for tests. It is not a way onto the network.
+`--net-stub` runs a small user-space network stack inside the VMM. It is a stub
+in the sense that matters: it answers, and it forwards nothing. `--net` is kept
+as a deprecated alias. It needs no privileges, no entitlement and no host
+configuration, which makes it the right choice for a first boot and for tests.
+It is not a way onto the network.
 
 It answers four things, and each is narrower than "supports the protocol":
 
@@ -82,25 +84,21 @@ hvi boot --kernel <Image> --net-gateway /run/hvi/gateway.qemu
 ```
 
 If the socket cannot be reached, hvi does not fail. It warns and falls back to
-the built-in stack, so a guest can come up with no egress and no error.
+the built-in stub stack, so a guest can come up with no egress and no error.
 
-The warning text differs by backend. On macOS:
-
-```text
-[hvi] WARNING: cannot reach gateway /run/hvi/gateway.qemu (No such file or
-directory (os error 2)); falling back to built-in stack
-```
-
-On Linux, from `[hvi/kvm]` on arm64 and `[hvi/x86]` on x86-64:
+All three backends word it the same, differing only in the tag -- `[hvi]` on
+macOS, `[hvi/kvm]` on arm64 Linux, `[hvi/x86]` on x86-64:
 
 ```text
 [hvi/kvm] WARNING: gateway /run/hvi/gateway.qemu unreachable (No such file or
-directory (os error 2)); built-in stack
+directory (os error 2)); falling back to the built-in stub stack (guest
+10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
 ```
 
-Read that line. To detect this in a log pipeline across platforms, match the
-substring `built-in stack`, which all three carry, rather than either full
-sentence.
+To detect this in a log pipeline, match `falling back to`. Do not match
+`built-in stub stack`: a deliberate `--net-stub` boot announces itself with
+the same words, so that substring fires on every stub guest rather than only
+on a failed gateway.
 
 A socket path is also subject to the platform's `sockaddr_un` length limit,
 and an over-long path fails the same way.
@@ -173,8 +171,8 @@ A record looks like this:
 ## What TLS SNI observation establishes
 
 Under `--net-tap` and `--net-gateway`, hvi parses the server name out of a TLS
-ClientHello and puts it in the record. The built-in `--net` stack does not do
-this at all.
+ClientHello and puts it in the record. The built-in `--net-stub` stack does
+not do this at all.
 
 An SNI value tells you one thing: **this guest sent a packet that claimed to
 be starting a TLS session with that name.** It is a useful signal. It is not

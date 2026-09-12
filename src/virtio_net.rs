@@ -58,6 +58,22 @@ const VIRTIO_NET_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_NET as u64;
 const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
 const F_MAC_LO: u32 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 
+/// Name the built-in stack goes by on the console.
+///
+/// It answers ARP, ICMP, DNS and DHCP and forwards nothing either way, so a
+/// guest on it looks online and carries no traffic. The name says so.
+pub const STUB_STACK: &str = "built-in stub stack";
+
+/// Returns the line a backend prints when a guest is on the built-in stack.
+///
+/// Built from the addressing constants the stack itself uses, so the line
+/// cannot drift from them, and shared by all three backends so the same guest
+/// is announced the same way wherever it runs.
+#[must_use]
+pub fn stub_stack_line() -> String {
+    format!("{STUB_STACK} (guest {GUEST_IP}, gw {GW_IP}, DHCP; no egress, no inbound)")
+}
+
 /// virtio-net header length with `VIRTIO_F_VERSION_1`.
 ///
 /// Taken from the header layout rather than written down: this is the number

@@ -53,7 +53,7 @@ not as modules, unless your initramfs carries the modules and loads them.
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_MMIO=y
 CONFIG_VIRTIO_BLK=y                 # --disk
-CONFIG_VIRTIO_NET=y                 # --net, --net-gateway, --net-tap
+CONFIG_VIRTIO_NET=y                 # --net-stub, --net-gateway, --net-tap
 CONFIG_VSOCKETS=y                   # --agent-sock
 CONFIG_VIRTIO_VSOCKETS=y
 CONFIG_FUSE_FS=y                    # --share-ro, --share-rw
@@ -116,13 +116,13 @@ So, on top of a stock `defconfigs/qemu-arm64`:
 CONFIG_LIBUKINTCTLR_GICV3=y         # Apple's hv_gic is GICv3-only
 # CONFIG_LIBVIRTIO_PCI is not set   # hvi is virtio-mmio only
 # CONFIG_LIBUKBUS_PCI is not set
-CONFIG_LWIP_DHCP=y                  # --net answers DHCP
+CONFIG_LWIP_DHCP=y                  # --net-stub answers DHCP
 ```
 
 Then:
 
 ```bash
-hvi boot --kernel httpreply_qemu-arm64 --mem-mib 256 --net --cmdline httpreply
+hvi boot --kernel httpreply_qemu-arm64 --mem-mib 256 --net-stub --cmdline httpreply
 ```
 
 There is one more constraint on the hvi side, and it is why the device windows
