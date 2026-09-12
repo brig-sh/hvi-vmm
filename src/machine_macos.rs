@@ -273,6 +273,23 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // The guest's MAC identifies it to whatever serves the network. A gateway
+    // keys its DHCP leases by it, so two guests presenting the built-in
+    // default are one host as far as the gateway is concerned: the second
+    // lease overwrites the first, and the guest that is not being addressed
+    // goes quiet. The other two backends already honour this on their tap
+    // path; here it matters for the gateway, which is how a macOS guest
+    // reaches a network at all.
+    if let Some(dev) = &net {
+        match cfg.net_mac.as_deref().map(crate::tap::parse_mac) {
+            Some(Some(mac)) => crate::sync::lock_or_recover(dev).set_mac(mac),
+            Some(None) => {
+                eprintln!("[hvi] WARNING: unparsable --net-mac; keeping the default");
+            }
+            None => {}
+        }
+    }
+
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
         eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
         Arc::new(Mutex::new(VirtioVsock::new()))
