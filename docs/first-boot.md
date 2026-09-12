@@ -164,9 +164,9 @@ gives it vGICv2, which caps the guest at 8 vCPUs.
 
 ### Linux, x86-64
 
-The kernel format and the console differ. hvi boots a `bzImage`, not an
-`Image`, and the console is a 16550 at port `0x3f8` rather than a PL011. A
-distribution kernel works:
+The kernel format and the console differ. hvi boots a `bzImage` or an
+uncompressed `vmlinux`, not an `Image`, and the console is a 16550 at port
+`0x3f8` rather than a PL011. A distribution kernel works:
 
 ```sh
 sudo apt-get install -y --no-install-recommends linux-image-virtual

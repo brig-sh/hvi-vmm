@@ -13,6 +13,7 @@ the guest needs a root filesystem from somewhere.
 | --- | --- | --- |
 | aarch64 | Uncompressed `Image` | The magic `0x644d5241` at offset 0x38, then `text_offset` and `image_size` from the 64-byte header. |
 | x86-64 | `bzImage` | `0xAA55` at offset 0x1fe, `HdrS` at 0x202, a boot protocol of 2.00 or later and `LOADED_HIGH`, then the setup header. |
+| x86-64 | Uncompressed `vmlinux` | The ELF magic at offset 0. Each segment loads at its physical address and the kernel is entered at `e_entry`. It skips the decompressor, so it boots without KASLR. |
 
 A compressed `Image.gz` does not work on arm64. Decompress it first.
 
@@ -39,7 +40,8 @@ sudo apt-get install -y --no-install-recommends linux-image-virtual
 ls /boot/vmlinuz-*
 ```
 
-Debian and Ubuntu ship a `bzImage` at `/boot/vmlinuz-*`. Pass it directly.
+Debian and Ubuntu ship a `bzImage` at `/boot/vmlinuz-*`. Pass it directly. The
+`vmlinux` from a kernel build tree also boots.
 
 ### Building your own
 

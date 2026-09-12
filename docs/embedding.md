@@ -82,7 +82,7 @@ cargo build --release --example watch_guest
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `kernel` | `Vec<u8>` | The image bytes. arm64 `Image` or x86-64 `bzImage`, matching the target. |
+| `kernel` | `Vec<u8>` | The image bytes. arm64 `Image`, x86-64 `bzImage` or uncompressed `vmlinux`, matching the target. |
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |

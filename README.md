@@ -115,8 +115,8 @@ There is no `--help`. [docs/cli.md](docs/cli.md) is the flag reference.
 Every backend speaks virtio-mmio, which avoids a PCI host bridge and lets one
 set of device models serve all three. The `machine_*` modules hold the
 hypervisor differences. The boot protocol differs too, and by more: arm64 uses
-an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage`,
-`boot_params`, an e820 map and an MP table.
+an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or an
+uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
 
 [docs/architecture.md](docs/architecture.md) describes the whole design.
 

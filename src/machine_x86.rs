@@ -19,8 +19,8 @@
 //! BSP in long mode and run every vCPU thread — the guest brings up APs with
 //! INIT-SIPI-SIPI, handled in-kernel. We build the initial long-mode state
 //! (identity page tables, flat 64-bit segments, CR0/CR3/CR4/EFER), load the
-//! bzImage and write `boot_params` (see `boot_x86`), and enter at the 64-bit
-//! entry with RSI -> the zero page.
+//! bzImage or vmlinux and write `boot_params` (see `boot_x86`), and enter at
+//! the 64-bit entry with RSI -> the zero page.
 //!
 //! Devices are the shared virtio-mmio blk/net/vsock (serviced on
 //! `KVM_EXIT_MMIO`) plus a 16550 serial on port I/O (`KVM_EXIT_IO`).
@@ -260,7 +260,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
     let cmdline = splice_kernel_args(cfg.cmdline.trim(), &ours);
 
-    // Load the bzImage, write boot_params and the command line, then place
+    // Load the kernel, write boot_params and the command line, then place
     // the initrd and the MP table.
     let initrd_len = cfg.initramfs.as_ref().map_or(0, |v| v.len() as u64);
     let kernel = boot_x86::LoadedKernel::load(ram.memory(), &cfg.kernel, &cmdline, initrd_len)?;
@@ -271,8 +271,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
     eprintln!(
-        "[hvi/x86] {num_cpus} vCPU(s)  kernel@{:#x} entry@{:#x}",
-        kernel.kernel_load, kernel.entry
+        "[hvi/x86] {num_cpus} vCPU(s)  {} entry@{:#x}",
+        kernel.format, kernel.entry
     );
 
     // vCPUs. Each gets KVM's supported CPUID (the guest reads it for feature

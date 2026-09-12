@@ -27,9 +27,10 @@ usual mistake:
   mapping guest RAM, running vCPUs, injecting interrupts, and confinement.
 - **Guest-architecture differences** live in the boot and layout modules, and
   they are larger. An arm64 guest gets an `Image`, a devicetree and PSCI. An
-  x86-64 guest gets a `bzImage`, a `boot_params` page, an e820 map and an MP
-  table. Some devices are architecture-specific too: PL011 against 16550, and
-  a CMOS RTC that only x86 needs.
+  x86-64 guest gets a `bzImage` or an uncompressed `vmlinux` with a
+  `boot_params` page, an e820 map and an MP table. Some devices are
+  architecture-specific too: PL011 against 16550, and a CMOS RTC that only x86
+  needs.
 
 Porting to a new host backend means one new `machine_*` file. Porting to a new
 guest architecture is a much larger job.
@@ -154,7 +155,7 @@ running VM logs a redistributor region that does not match the table:
 | boot GDT | `0xc000` |
 | kernel command line | `0x2_0000` |
 | MP table (EBDA) | `0x9_fc00` |
-| kernel load / 64-bit entry | `0x10_0000` / `0x10_0200` |
+| `bzImage` load / 64-bit entry | `0x10_0000` / `0x10_0200` (a `vmlinux` enters at its `e_entry`) |
 | RAM, low half | `0x0` to `0xd000_0000` |
 | virtio-blk / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
 | COM1 UART | PIO `0x3f8`, GSI 4 |
@@ -221,16 +222,20 @@ Not having the GICv2 cap is not unlimited capacity. Other limits still apply.
 ### 3.2 x86-64: the Linux 64-bit boot protocol
 
 There is no devicetree. hvi fills the boot protocol's structures with
-`linux-loader`'s `BzImage` loader and `LinuxBootConfigurator`.
+`linux-loader`'s loaders and `LinuxBootConfigurator`. A `bzImage` is entered at
+`code32_start + 0x200` and its setup header is taken from the image. For an
+uncompressed `vmlinux` ELF, the segments load at their physical addresses, the
+entry is `e_entry`, and the setup header is synthesized. A `vmlinux` skips the
+decompressor, so it boots without KASLR.
 
 ```mermaid
 flowchart TB
-    A["linux-loader BzImage::load<br/>0xAA55, 'HdrS', protocol ≥ 2.00, LOADED_HIGH<br/>kernel@code32_start (1 MiB), entry +0x200"] --> B
-    B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
+    A["linux-loader BzImage::load: 0xAA55, 'HdrS', protocol ≥ 2.00, LOADED_HIGH<br/>kernel@code32_start (1 MiB), entry +0x200<br/>or Elf::load(vmlinux): PT_LOADs @p_paddr, entry e_entry"] --> B
+    B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image or synthesized; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
     C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
     E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID +RDRAND +RDSEED"] --> F
-    F["BSP: rip=0x100200, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
+    F["BSP: rip=entry, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
 ```
 
 Three details are load-bearing and were each the difference between a boot and
