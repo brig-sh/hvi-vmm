@@ -690,9 +690,13 @@ impl VirtioNet {
     }
 
     /// Wraps an IPv4 payload for delivery to the guest.
+    ///
+    /// Addresses the frame to `self.mac`, not to the built-in default: the
+    /// guest takes its address from config space, so a reply framed to the
+    /// default is a mismatched unicast its IP stack drops.
     fn ipv4_to_guest(&self, src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
         let ip = ipv4_packet(src, dst, proto, payload);
-        eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip)
+        eth_frame(self.mac, OUR_MAC, ETH_IPV4, &ip)
     }
 }
 
@@ -841,6 +845,20 @@ mod tests {
 
     /// Programs a queue the way the Linux virtio-mmio driver does: select it,
     /// size it, set the three ring addresses, then READY last.
+    // A minimal BOOTP DISCOVER: op/htype/hlen, the client's chaddr, the magic
+    // cookie, and option 53 = 1. Shared so the two DHCP tests cannot drift
+    // apart the first time one of them grows an option.
+    fn bootp_discover(chaddr: [u8; 6]) -> Vec<u8> {
+        let mut bootp = vec![0u8; 240];
+        bootp[0] = 1; // op = request
+        bootp[1] = 1; // htype = ethernet
+        bootp[2] = 6; // hlen
+        bootp[28..34].copy_from_slice(&chaddr);
+        bootp[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+        bootp.extend_from_slice(&[53, 1, 1, 255]);
+        bootp
+    }
+
     fn program_queue(
         net: &mut VirtioNet,
         mem: &GuestRam,
@@ -955,6 +973,28 @@ mod tests {
         assert!(net.irq_level(), "the used-buffer interrupt was raised");
     }
 
+    // Config space alone cannot catch a reply framed to the wrong MAC, so
+    // drive a real DISCOVER through the frame path and check the L2
+    // destination of what comes back.
+    #[test]
+    fn stub_answers_dhcp_to_the_override_mac() {
+        let mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        let mut net = VirtioNet::new();
+        net.set_mac(mac);
+
+        let udp = udp_datagram(68, 67, &bootp_discover(mac));
+        let ip = ipv4_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, IP_UDP, &udp);
+        let frame = eth_frame([0xff; 6], mac, ETH_IPV4, &ip);
+
+        let replies = net.handle_frame(&frame);
+        assert_eq!(replies.len(), 1, "the stack answered the DISCOVER");
+        assert_eq!(
+            &replies[0][0..6],
+            &mac,
+            "the OFFER is addressed to the guest's actual MAC, not the default"
+        );
+    }
+
     /// After `set_mac`, the guest must read the override from config space
     /// (bytes 0..6) -- and the device must offer VIRTIO_NET_F_MAC, or the
     /// driver would never look at config space and would invent a random
@@ -984,12 +1024,7 @@ mod tests {
     #[test]
     fn dhcp_offers_guest_ip() {
         let mut net = VirtioNet::new();
-        // Minimal DISCOVER: 240-byte BOOTP with the magic cookie, then option
-        // 53 = 1 (DISCOVER) and the end marker.
-        let mut bootp = vec![0u8; 240];
-        bootp[0] = 1; // op = request
-        bootp[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
-        bootp.extend_from_slice(&[53, 1, 1, 255]);
+        let bootp = bootp_discover(GUEST_MAC);
         let frame = net.handle_dhcp(&bootp).expect("an OFFER frame");
         // Ethernet(14) + IPv4(20) + UDP(8) = 42, then BOOTP; yiaddr at +16.
         assert_eq!(frame[42], 2, "op = reply");

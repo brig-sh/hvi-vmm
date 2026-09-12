@@ -273,6 +273,19 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // A gateway keys its DHCP leases by MAC, so two guests presenting the
+    // built-in default are one host to it and the second lease displaces the
+    // first. Applies to whichever device the run produced.
+    if let Some(dev) = &net {
+        match cfg.net_mac.as_deref().map(crate::tap::parse_mac) {
+            Some(Some(mac)) => crate::sync::lock_or_recover(dev).set_mac(mac),
+            Some(None) => {
+                eprintln!("[hvi] WARNING: unparsable --net-mac; keeping the default");
+            }
+            None => {}
+        }
+    }
+
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
         eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
         Arc::new(Mutex::new(VirtioVsock::new()))
