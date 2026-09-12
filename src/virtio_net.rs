@@ -58,6 +58,23 @@ const VIRTIO_NET_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_NET as u64;
 const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
 const F_MAC_LO: u32 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 
+/// How a run announces the built-in stack, in the one line it gets.
+///
+/// The device answers ARP, ICMP, DNS and DHCP and forwards nothing in either
+/// direction, so a guest on it looks online and carries no traffic. Naming
+/// that at boot is cheaper than the alternative, which is an operator
+/// concluding the VMM cannot route when it was never asked to.
+pub const STUB_STACK: &str = "built-in stub stack";
+
+/// The whole announcement: what the stack is, the addresses it hands out, and
+/// what it will not do. Built from the constants the stack actually uses, so
+/// the line cannot drift from the addressing, and shared by all three
+/// backends so a guest on the stub is announced the same way wherever it runs.
+#[must_use]
+pub fn stub_stack_line() -> String {
+    format!("{STUB_STACK} (guest {GUEST_IP}, gw {GW_IP}, DHCP; no egress, no inbound)")
+}
+
 /// virtio-net header length with `VIRTIO_F_VERSION_1`.
 ///
 /// Taken from the header layout rather than written down: this is the number

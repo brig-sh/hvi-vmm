@@ -241,11 +241,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Err(_) => None,
             },
             Err(e) => {
-                eprintln!("[hvi/kvm] WARNING: gateway {sock} unreachable ({e}); built-in stack");
+                eprintln!(
+                    "[hvi/kvm] WARNING: gateway {sock} unreachable ({e}); using the {}",
+                    crate::virtio_net::stub_stack_line()
+                );
                 Some(Arc::new(Mutex::new(VirtioNet::new())))
             }
         }
     } else if cfg.net {
+        eprintln!(
+            "[hvi/kvm] virtio-net: {}",
+            crate::virtio_net::stub_stack_line()
+        );
         Some(Arc::new(Mutex::new(VirtioNet::new())))
     } else {
         None
