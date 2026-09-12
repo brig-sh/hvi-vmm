@@ -173,7 +173,7 @@ jobs:
         run: cargo build --release
       - name: guest kernel
         if: steps.kvm.outputs.ok == 'yes'
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual zstd binutils
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
         if: steps.kvm.outputs.ok == 'yes'
         run: |
@@ -195,6 +195,44 @@ jobs:
           grep -qE "Total of 2 processors activated|smp: Brought up 1 node, 2 CPUs" boot.log \
             || { echo "::error::AP did not come online — SMP bringup failed"; exit 1; }
           echo "SMP: 2 processors online ✓"
+      # The distribution vmlinuz is a bzImage. scripts/extract-vmlinux from the
+      # kernel tree, fetched by tag and checked by hash, unpacks the ELF inside
+      # it, which is the other x86 format hvi boots.
+      - name: boot the uncompressed vmlinux
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          curl -sSfL -o extract-vmlinux https://raw.githubusercontent.com/torvalds/linux/v6.18/scripts/extract-vmlinux
+          echo "aacb6bb09af227a6cf508f5283458f001722a39abd9c4cfb026bc97c31624910  extract-vmlinux" | sha256sum -c -
+          sudo install -m 644 "$KIMG" vmlinuz
+          bash extract-vmlinux vmlinuz > vmlinux
+          # The script exits 0 whether or not it found a kernel.
+          if ! { test -s vmlinux && head -c4 vmlinux | grep -q $'\x7fELF'; }; then
+            echo "::error::extract-vmlinux did not produce an ELF"; exit 1
+          fi
+          ls -l vmlinux
+          sudo timeout 90 ./target/release/hvi boot --kernel vmlinux --mem-mib 1024 --cpus 2 \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-vmlinux.log || true
+          grep -q "vmlinux entry@" boot-vmlinux.log || { echo "::error::the image was not loaded as a vmlinux"; exit 1; }
+          grep -q "Linux version" boot-vmlinux.log || { echo "::error::the vmlinux did not boot"; exit 1; }
+          grep -qE "Unable to mount root fs|Run /init" boot-vmlinux.log || { echo "::error::did not reach the userspace/VFS gate"; exit 1; }
+          echo "vmlinux boot gate reached ✓"
+      # RAM past the MMIO hole is a second region at 4 GiB. The guest's own
+      # e820 must show the split, not the hole described as RAM.
+      - name: boot with 4096 MiB, RAM split around the MMIO hole
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 4096 --cpus 1 \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-4g.log || true
+          grep -q "Linux version" boot-4g.log || { echo "::error::the 4 GiB guest did not boot"; exit 1; }
+          for range in "0x0000000000000000-0x000000000009fbff" \
+                       "0x0000000000100000-0x00000000cfffffff" \
+                       "0x0000000100000000-0x000000012fffffff"; do
+            grep -q "BIOS-e820: \[mem $range\] usable" boot-4g.log \
+              || { echo "::error::e820 lacks the usable range $range"; exit 1; }
+          done
+          echo "e820 split around the MMIO hole ✓"
       # backing_len's BLKGETSIZE64 branch self-skips when no block device is
       # openable, which is every unprivileged run — so nothing exercised it
       # live. A loop device over a sparse file is exactly the shape that broke
@@ -224,7 +262,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: boot-x86-logs
-          path: boot.log
+          path: |
+            boot.log
+            boot-vmlinux.log
+            boot-4g.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -397,6 +438,12 @@ jobs:
           cache-key: linux-arm64-${{ matrix.runner }}
       - name: build
         run: cargo build --release
+      # The hosted test job has 4 KiB pages. Guest-memory mapping constraints
+      # follow the host page size, and these runners are where another size
+      # appears in CI, so the suite runs here too. `--release` reuses the
+      # build above.
+      - name: unit suite
+        run: cargo test --release
       # The aarch64 allowlist is a different file from the x86 one, and the
       # hosted seccomp job cannot run it. This is the only place it is
       # exercised rather than merely compiled.
