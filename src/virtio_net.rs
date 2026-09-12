@@ -690,9 +690,15 @@ impl VirtioNet {
     }
 
     /// Wraps an IPv4 payload for delivery to the guest.
+    ///
+    /// The L2 destination is `self.mac`, not the built-in default: the guest
+    /// takes its address from config space, so once a caller overrides the
+    /// MAC a reply addressed to the default is a mismatched unicast and the
+    /// guest's NIC drops it. That would cost the DHCP OFFER and leave the
+    /// guest with no lease -- the one failure this stack exists to avoid.
     fn ipv4_to_guest(&self, src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
         let ip = ipv4_packet(src, dst, proto, payload);
-        eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip)
+        eth_frame(self.mac, OUR_MAC, ETH_IPV4, &ip)
     }
 }
 
@@ -953,6 +959,50 @@ mod tests {
         assert_eq!(*dst, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(*dst_port, 9999);
         assert!(net.irq_level(), "the used-buffer interrupt was raised");
+    }
+
+    /// The built-in stack must address its synthesized replies to the MAC the
+    /// guest was actually given, not the compile-time default.
+    ///
+    /// The guest takes its address from config space, so under `--net-mac` it
+    /// brings its NIC up with the override and filters unicast against it. A
+    /// DHCP OFFER framed to the default is a mismatched unicast: the NIC drops
+    /// it, no lease ever arrives, and the guest goes quiet -- indistinguishable
+    /// from the stack being broken. Config space alone cannot catch this, so
+    /// this drives a real DISCOVER through the frame path and inspects the
+    /// reply's L2 destination.
+    #[test]
+    fn the_stub_answers_dhcp_to_the_override_mac() {
+        let mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        let mut net = VirtioNet::new();
+        net.set_mac(mac);
+
+        // A minimal BOOTP DISCOVER: op/htype/hlen, the client's chaddr, the
+        // magic cookie, and option 53 = 1.
+        let mut bootp = vec![0u8; 240];
+        bootp[0] = 1; // op = request
+        bootp[1] = 1; // htype = ethernet
+        bootp[2] = 6; // hlen
+        bootp[28..34].copy_from_slice(&mac); // chaddr
+        bootp[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+        bootp.extend_from_slice(&[53, 1, 1, 255]);
+
+        let udp = udp_datagram(68, 67, &bootp);
+        let ip = ipv4_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, IP_UDP, &udp);
+        let frame = eth_frame([0xff; 6], mac, ETH_IPV4, &ip);
+
+        let replies = net.handle_frame(&frame);
+        assert_eq!(replies.len(), 1, "the stack answered the DISCOVER");
+        assert_eq!(
+            &replies[0][0..6],
+            &mac,
+            "the OFFER is addressed to the guest's actual MAC"
+        );
+        assert_ne!(
+            &replies[0][0..6],
+            &GUEST_MAC,
+            "and not to the compile-time default"
+        );
     }
 
     /// After `set_mac`, the guest must read the override from config space
