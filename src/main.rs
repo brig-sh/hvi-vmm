@@ -251,11 +251,12 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `boot --kernel <Image|bzImage> [flags]`: boot a Linux guest on the active
-/// backend (hvf/arm64 on macOS, KVM/arm64 or KVM/x86-64 on Linux).
+/// Runs `boot`, which starts a Linux guest on the active backend (hvf/arm64 on
+/// macOS, KVM/arm64 or KVM/x86-64 on Linux).
 ///
-/// `--dump-memory <path>` writes guest RAM on the interrupt key (or after
-/// `--dump-after <secs>`); `--trace-io <path>` logs every virtio request.
+/// `boot --kernel <Image|bzImage|vmlinux> [flags]`. `--dump-memory <path>`
+/// writes guest RAM on the interrupt key (or after `--dump-after <secs>`);
+/// `--trace-io <path>` logs every virtio request.
 #[cfg(any(
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
     all(target_arch = "x86_64", target_os = "linux")
@@ -290,11 +291,11 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
-            // Who the host's files belong to inside the guest. Defaults to
-            // root, which suits a guest whose workload runs as root; a guest
-            // running as anyone else needs its own uid here, or every write to
-            // a shared directory is refused by the guest kernel before it
-            // reaches us. See virtio_fs::set_guest_ids.
+            // The uid and gid the host's files carry inside the guest. The
+            // default is root, which suits a guest whose workload runs as
+            // root; a guest running as another user needs its own uid here,
+            // or the guest kernel refuses every write to a shared directory.
+            // See `virtio_fs::set_guest_ids`.
             "--fs-uid" => fs_uid = it.next().ok_or("--fs-uid needs a value")?.parse()?,
             "--fs-gid" => fs_gid = it.next().ok_or("--fs-gid needs a value")?.parse()?,
             "--share-ro" | "--share-rw" => {
@@ -318,8 +319,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return Err(format!("duplicate virtio-fs tag {tag:?}").into());
                 }
-                // Optional trailing `cache=auto|always|none`; anything else is
-                // the next flag and is left for the outer loop to consume.
+                // An optional trailing `cache=auto|always|none`; any other
+                // token is the next flag and is left to the outer loop.
                 let mut cache = config::CachePolicy::Auto;
                 if let Some(spec) = it.clone().next().and_then(|s| s.strip_prefix("cache=")) {
                     cache = match spec {
@@ -385,13 +386,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let kernel_path = kernel.ok_or("boot needs --kernel <Image>")?;
-    // Set before any share is served: the mapping is read on every attribute
-    // reply, and a device already answering with the old identity would hand
-    // the guest a home it cannot write.
+    // Set before any share is served: every attribute reply reads the mapping,
+    // and a device already answering with the old identity would leave the
+    // guest with files it cannot write.
     //
     // macOS only, because virtio_fs is: the Linux backend has no in-process
-    // file server to tell. The flags still parse there so a command line is
-    // portable, they simply have nothing to configure.
+    // file server. The flags still parse there so a command line is portable;
+    // on Linux they configure nothing.
     #[cfg(target_os = "macos")]
     hvi::virtio_fs::set_guest_ids(fs_uid, fs_gid);
     #[cfg(not(target_os = "macos"))]
@@ -413,8 +414,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         vcpus,
         agent_sock,
         sandbox,
-        // `None` rather than an empty chain, so with no tools asked for the
-        // hooks stay a null check.
+        // `None` rather than an empty chain, so without tools the hooks stay a
+        // null check.
         plugin: if tools.is_empty() {
             None
         } else {

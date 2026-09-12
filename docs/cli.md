@@ -40,7 +40,7 @@ including a typo, silently runs the plain test.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--kernel <path>` | required | arm64 `Image` or x86-64 `bzImage`, read whole into memory. |
+| `--kernel <path>` | required | arm64 `Image`, x86-64 `bzImage` or uncompressed `vmlinux`, read whole into memory. |
 | `--initramfs <path>` | none | Read whole into memory. |
 | `--mem-mib <N>` | 512 | Guest RAM. On x86-64 it is split around the MMIO hole. |
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
