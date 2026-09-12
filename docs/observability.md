@@ -18,7 +18,7 @@ only you can read, and delete them when the investigation ends.
 ## The event ledger
 
 ```sh
-hvi boot --kernel <Image> --disk disk.img --net --events ledger.ndjson
+hvi boot --kernel <Image> --disk disk.img --net-stub --events ledger.ndjson
 ```
 
 One compact JSON object per line:
@@ -51,7 +51,7 @@ That is the normal result, not a failure.
 ## The I/O trace
 
 ```sh
-hvi boot --kernel <Image> --disk disk.img --net --trace-io io.trace
+hvi boot --kernel <Image> --disk disk.img --net-stub --trace-io io.trace
 ```
 
 ```text

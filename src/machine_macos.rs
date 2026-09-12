@@ -284,12 +284,15 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 }
             },
             Err(e) => {
-                eprintln!("[hvi] WARNING: cannot reach gateway {sock} ({e}); falling back to built-in stack");
+                eprintln!(
+                    "[hvi] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
+                    crate::virtio_net::stub_stack_line()
+                );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        eprintln!("[hvi] virtio-net: user-space (guest 10.0.2.15, gw 10.0.2.2, DHCP)");
+        eprintln!("[hvi] virtio-net: {}", crate::virtio_net::stub_stack_line());
         Some(VirtioNet::new())
     } else {
         None

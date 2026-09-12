@@ -50,7 +50,7 @@ including a typo, silently runs the plain test.
 | `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
 | `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
-| `--net` | off | The built-in user-space stack. |
+| `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
@@ -121,12 +121,12 @@ Unknown flags are the one class caught before anything prints.
 
 ### Networking precedence
 
-`--net-tap`, then `--net-gateway`, then `--net`. The first that matches wins
-and the rest are ignored with no message. See
+`--net-tap`, then `--net-gateway`, then `--net-stub`. The first that matches
+wins and the rest are ignored with no message. See
 [networking.md](networking.md).
 
-An unreachable `--net-gateway` warns and falls back to the built-in stack. An
-unopenable `--net-tap` fails the boot.
+An unreachable `--net-gateway` warns and falls back to the built-in stub stack.
+An unopenable `--net-tap` fails the boot.
 
 ### Parse-time validation
 
@@ -159,9 +159,9 @@ hvi dump-fdt --kernel Image --mem-mib 1024 --out fdt.dtb
 
 It always builds a **one-vCPU devicetree with no virtio devices**, using the
 fixed QEMU virt GIC layout rather than whatever a host would negotiate. It has
-no `--cpus`, `--disk` or `--net`. Use it to check the kernel header, the guest
-layout and the placement arithmetic. It cannot show you the device set a real
-boot would describe.
+no `--cpus`, `--disk` or `--net-stub`. Use it to check the kernel header, the
+guest layout and the placement arithmetic. It cannot show you the device set
+a real boot would describe.
 
 ## Environment variables
 
@@ -221,7 +221,7 @@ Every backend logs what it set up on stderr before the guest runs. On macOS:
 booting Image with 1024 MiB ...
 [hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
 [hvi] virtio-blk: /path/to/disk.img
-[hvi] virtio-net: user-space (guest 10.0.2.15, gw 10.0.2.2, DHCP)
+[hvi] virtio-net: built-in stub stack (guest 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
 [hvi] open-file limit: 1048576
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)
 [hvi] event ledger: /path/to/ledger.ndjson

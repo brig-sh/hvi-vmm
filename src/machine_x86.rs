@@ -218,14 +218,24 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                     net_reader = Some(reader);
                     Some(VirtioNet::with_gateway(stream))
                 }
-                Err(_) => None,
+                Err(e) => {
+                    eprintln!("[hvi/x86] WARNING: cannot clone gateway socket ({e}); net disabled");
+                    None
+                }
             },
             Err(e) => {
-                eprintln!("[hvi/x86] WARNING: gateway {sock} unreachable ({e}); built-in stack");
+                eprintln!(
+                    "[hvi/x86] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
+                    crate::virtio_net::stub_stack_line()
+                );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
+        eprintln!(
+            "[hvi/x86] virtio-net: {}",
+            crate::virtio_net::stub_stack_line()
+        );
         Some(VirtioNet::new())
     } else {
         None
