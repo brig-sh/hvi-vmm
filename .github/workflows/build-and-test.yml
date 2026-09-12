@@ -376,6 +376,104 @@ jobs:
   # `fetch-depth: 0` is required and not incidental: the job compares the
   # branch against its own merge base, and a shallow clone has no merge base
   # to find.
+  boot-unikraft-hvf:
+    name: Boot Unikraft arm64/hvf
+    # Withheld from fork pull requests; see the note on boot-x86.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-hvf-unikraft
+      - name: build and sign
+        run: |
+          cargo build --release
+          codesign --sign - --entitlements hvi.entitlements --force target/release/hvi
+          codesign -dv --entitlements - target/release/hvi 2>&1 | grep -qi hypervisor
+      - name: guest unikernels
+        run: |
+          # Two public images, pulled without credentials. These are ordinary
+          # OCI images rather than the single-file artifact the Linux guest
+          # comes from, so read the layer digests out of the manifest and
+          # untar them. That needs curl, tar and python3, which every runner
+          # has, instead of a registry client.
+          pull() {
+            repo=$1; tag=$2; out=$3
+            token=$(curl -fsSL \
+              "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+            layers=$(curl -fsSL -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${repo}/manifests/${tag}" \
+              | python3 -c 'import sys,json;[print(l["digest"]) for l in json.load(sys.stdin)["layers"]]')
+            mkdir -p "$out"
+            for d in $layers; do
+              curl -fsSL -H "Authorization: Bearer $token" \
+                "https://ghcr.io/v2/${repo}/blobs/${d}" | tar xz -C "$out"
+            done
+          }
+          pull brig-sh/unikraft-httpreply 0.18.0-hvi-arm64 guest-httpreply
+          pull brig-sh/unikraft-nginx 0.18.0-hvi-arm64 guest-nginx
+          file guest-httpreply/unikraft/bin/kernel
+      - name: boot a unikernel, and give it an address
+        run: |
+          # The strict case the Linux guests cannot cover. Unikraft maps its
+          # devices from a page table fixed at link time, so a device window
+          # outside that map leaves the guest silent: no console, no exit, no
+          # clue. The banner is the whole assertion.
+          # The share is not for the guest, which has no virtio-fs driver. It
+          # is for the VMM: attaching one makes it place a virtio-fs device,
+          # which is the placement the device windows have to leave room for.
+          # Nothing else in CI attaches a share, so nothing else checks it.
+          mkdir -p share-probe
+          perl -e 'alarm shift; exec @ARGV' 120 \
+            ./target/release/hvi boot \
+            --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 \
+            --net --share-ro share-probe probe --cmdline httpreply \
+            </dev/null > unikraft.log 2>&1 || true
+          tail -25 unikraft.log
+          grep -q "Powered by" unikraft.log \
+            || { echo "::error::the Unikraft guest did not reach its banner"; exit 1; }
+          # It posts the virtio-net header and the frame as two descriptors,
+          # where Linux posts one buffer, so a device that fills only the head
+          # of the chain drops every reply and DHCP never completes.
+          grep -q "Set IPv4 address 10.0.2.15" unikraft.log \
+            || { echo "::error::the Unikraft guest never took an address"; exit 1; }
+      - name: boot a unikernel with a root filesystem
+        run: |
+          # The cpio is not a whole number of pages. A guest that turns the
+          # initrd range into a memory-region descriptor and requires whole
+          # pages dies in its boot allocator on the ragged one.
+          perl -e 'alarm shift; exec @ARGV' 120 \
+            ./target/release/hvi boot \
+            --kernel guest-nginx/unikraft/bin/kernel \
+            --initramfs guest-nginx/unikraft/bin/initrd --mem-mib 512 \
+            --cmdline "-c /nginx/conf/nginx.conf" \
+            </dev/null > unikraft-initrd.log 2>&1 || true
+          tail -25 unikraft-initrd.log
+          grep -q "Powered by" unikraft-initrd.log \
+            || { echo "::error::the Unikraft guest did not boot with an initrd"; exit 1; }
+          ! grep -q "Assertion failure" unikraft-initrd.log \
+            || { echo "::error::the guest asserted on its memory regions"; exit 1; }
+      # The searches above keep only the lines they match. When the job
+      # fails, the full log answers what those lines cannot.
+      - name: keep the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: boot-unikraft-logs
+          path: |
+            unikraft.log
+            unikraft-initrd.log
+          retention-days: 7
+          if-no-files-found: ignore
+
   perf-virtiofs:
     name: virtio-fs performance gate
     if: >-
