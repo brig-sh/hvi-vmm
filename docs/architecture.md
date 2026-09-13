@@ -113,24 +113,28 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
 ### Guest memory maps
 
-<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: PL011 UART at 0x01000000, virtio-mmio window from 0x02000000, GIC at 0x08000000, RAM at 0x40000000" width="720">
+<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, virtio-mmio window from 0x0d000000, RAM at 0x40000000" width="720">
 
-**aarch64** (`layout.rs`). Devices sit low, RAM at 1 GiB.
+**aarch64** (`layout.rs`). Devices sit above the GIC, RAM at 1 GiB.
 
 | Region | Address | Size | IRQ |
 | --- | --- | --- | --- |
-| PL011 UART | `0x0100_0000` | `0x1000` | SPI 1, INTID 33 |
-| virtio-blk | `0x0200_0000` | `0x200` | SPI 2, INTID 34 |
-| virtio-net | `0x0200_0200` | `0x200` | SPI 3, INTID 35 |
-| virtio-vsock | `0x0200_0400` | `0x200` | SPI 4, INTID 36 |
-| virtio-fs share `i` | `0x0200_0600 + i * 0x200` | `0x200` | SPI `5 + i`, INTID `37 + i` |
 | GIC distributor | `0x0800_0000` | `0x1_0000` | |
+| PL011 UART | `0x0c00_0000` | `0x1000` | SPI 1, INTID 33 |
+| virtio-blk | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
+| virtio-net | `0x0d00_0200` | `0x200` | SPI 3, INTID 35 |
+| virtio-vsock | `0x0d00_0400` | `0x200` | SPI 4, INTID 36 |
+| virtio-fs share `i` | `0x0d00_0600 + i * 0x200` | `0x200` | SPI `5 + i`, INTID `37 + i` |
 | GIC redistributor (v3) | `0x080A_0000` | `0x2_0000` per vCPU | |
 | GIC CPU interface (v2) | `0x0801_0000` | `0x1_0000` shared | |
 | RAM | `0x4000_0000` | `--mem-mib` | |
 
-INTID is `32 + SPI` on both backends. The UART is deliberately not at QEMU
-virt's `0x0900_0000`, because `hv_gic`'s redistributor region extends past it.
+INTID is `32 + SPI` on both backends. Every device window sits inside
+`DEVICE_WINDOW_BASE`..`DEVICE_WINDOW_END` (`0x0800_0000`..`0x4000_0000`),
+because a guest whose boot page table is fixed at link time maps only that
+range as device memory and cannot reach MMIO outside it. They sit above the
+GIC rather than below because `hv_gic`'s redistributor region is far larger
+than QEMU's and extends past QEMU virt's `0x0900_0000`.
 
 Those GIC values are the constants in `layout.rs`, and the Linux/KVM backend
 uses them through `GicLayout::for_vcpus`. **The macOS backend does not.** It
@@ -140,7 +144,7 @@ getters. A macOS guest is told whatever the framework reported, which is why a
 running VM logs a redistributor region that does not match the table:
 
 ```text
-[hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0x1000000
+[hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
 ```
 
 <img src="img/guest-memory-x86.svg" alt="x86-64 guest memory: RAM from 0 to the MMIO hole at 0xd0000000, devices in the hole, RAM resuming at 4 GiB" width="720">
