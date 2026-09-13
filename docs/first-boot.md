@@ -216,7 +216,7 @@ This is a check of the pre-boot pipeline. It is not a boot, and a successful
 | `Permission denied` opening `/dev/kvm` | Linux: you are not in the `kvm` group, or the shell predates the change. |
 | The console stops after `Run /init as init process` | The initramfs has no working `/init`, or it is built for the wrong architecture. |
 | The kernel panics at `Unable to mount root fs` | No initramfs and no `--disk`. Expected without a root filesystem. |
-| `--net` gives the guest an address but no name resolution | Expected while confined. See [networking.md](networking.md#dns). |
+| `--net-stub` gives the guest an address but no name resolution | Expected while confined. See [networking.md](networking.md#dns). |
 
 ## Next
 

@@ -50,7 +50,7 @@ including a typo, silently runs the plain test.
 | `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
 | `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
-| `--net` | off | The built-in user-space stack. |
+| `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Read only under `--net-tap`. |
@@ -162,7 +162,7 @@ hvi dump-fdt --kernel Image --mem-mib 1024 --out fdt.dtb
 
 It always builds a **one-vCPU devicetree with no virtio devices**, using the
 fixed QEMU virt GIC layout rather than whatever a host would negotiate. It has
-no `--cpus`, `--disk` or `--net`. Use it to check the kernel header, the guest
+no `--cpus`, `--disk` or `--net-stub`. Use it to check the kernel header, the guest
 layout and the placement arithmetic. It cannot show you the device set a real
 boot would describe.
 
