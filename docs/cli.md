@@ -53,7 +53,7 @@ including a typo, silently runs the plain test.
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
-| `--net-mac <mac>` | none | Guest MAC. Read only under `--net-tap`. |
+| `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
@@ -104,7 +104,6 @@ are three behaviours, not two.
 | `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored silently** | **ignored silently** |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
-| `--net-mac` | **ignored silently** | only under `--net-tap` | only under `--net-tap` |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | everything else | acted on | acted on | acted on |
 
@@ -140,8 +139,9 @@ hvi: --dump-after needs --dump-memory <path>
 hvi: unknown boot arg "--nope"
 ```
 
-`--net-mac` is **not** validated at parse time. A malformed value only warns
-inside the tap branch that reads it.
+`--net-mac` is **not** validated at parse time. A malformed value warns and
+keeps the default once the backend applies it, after the boot line has
+printed.
 
 ## `dump-fdt`
 
