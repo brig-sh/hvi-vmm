@@ -20,9 +20,11 @@ one is not an error, so pass one.
 | TLS SNI recorded | no | yes | yes |
 | `--net-mac` honoured | no | no | yes |
 
-## The built-in stack: `--net`
+## The built-in stub stack: `--net-stub`
 
-`--net` runs a small user-space network stack inside the VMM. It needs no
+`--net-stub` runs a small user-space network stack inside the VMM. It is a
+stub in the sense that matters: it answers, and it forwards nothing. `--net`
+is kept as a deprecated alias. It needs no
 privileges, no entitlement and no host configuration, which makes it the right
 choice for a first boot and for tests. It is not a way onto the network.
 
@@ -169,7 +171,7 @@ A record looks like this:
 ## What TLS SNI observation establishes
 
 Under `--net-tap` and `--net-gateway`, hvi parses the server name out of a TLS
-ClientHello and puts it in the record. The built-in `--net` stack does not do
+ClientHello and puts it in the record. The built-in `--net-stub` stack does not do
 this at all.
 
 An SNI value tells you one thing: **this guest sent a packet that claimed to

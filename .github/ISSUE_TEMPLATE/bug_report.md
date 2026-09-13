@@ -20,7 +20,7 @@ duplicates.
 
 <!--
 The exact steps. Include the full `hvi boot` command line and any relevant
-flags (--kernel, --disk, --net, --cpus, --events).
+flags (--kernel, --disk, --net-stub, --cpus, --events).
 -->
 
 1.

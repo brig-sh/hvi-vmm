@@ -236,6 +236,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             }
         }
     } else if cfg.net {
+        eprintln!(
+            "[hvi/x86] virtio-net: {}",
+            crate::virtio_net::stub_stack_line()
+        );
         Some(Arc::new(Mutex::new(VirtioNet::new())))
     } else {
         None

@@ -96,7 +96,7 @@ and exits.
 ## More commands
 
 ```sh
-hvi boot --kernel <Image> --disk disk.img --net           # block device and a NIC
+hvi boot --kernel <Image> --disk disk.img --net-stub      # block device and a NIC
 hvi boot --kernel <Image> --share-ro ./src code           # a read-only share (macOS)
 hvi boot --kernel <Image> --events ledger.ndjson          # record device I/O
 hvi dump-fdt --kernel <Image>                             # arm64 devicetree, no hypervisor
@@ -124,7 +124,7 @@ uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
 
 hvi is young. Read these before you build on it.
 
-- **No egress from the built-in network stack.** `--net` answers ARP for the
+- **No egress from the built-in network stack.** `--net-stub` answers ARP for the
   gateway and DNS addresses, ICMP echo requests, and DHCP, all inside the VMM.
   TCP is seen but not forwarded. Real egress needs `--net-gateway`, or
   `--net-tap` on Linux.

@@ -349,7 +349,14 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     cache,
                 });
             }
-            "--net" => net = true,
+            "--net-stub" => net = true,
+            // The old name. It read as "networking", which is what the flag
+            // is not: the stack it selects forwards nothing in either
+            // direction. Kept working, with one line saying where it went.
+            "--net" => {
+                eprintln!("[hvi] note: --net is now --net-stub; the old name still works");
+                net = true;
+            }
             "--net-gateway" => net_gateway = it.next().cloned(),
             "--net-tap" => net_tap = it.next().cloned(),
             "--net-mac" => net_mac = it.next().cloned(),

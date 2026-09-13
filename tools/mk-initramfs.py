@@ -35,7 +35,7 @@ INIT = b"""#!/bin/sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 # Static network config (matches the user-space virtio-net backend); harmless
-# if there is no eth0 (booted without --net).
+# if there is no eth0 (booted without --net-stub).
 if [ -e /sys/class/net/eth0 ]; then
 	/bin/busybox ip link set eth0 up
 	/bin/busybox ip addr add 10.0.2.15/24 dev eth0
