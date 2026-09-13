@@ -45,7 +45,7 @@ use std::fs::File;
 use std::io::Write;
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::guestmem::GuestRam;
 
@@ -89,6 +89,20 @@ const ETH_IPV4: u16 = 0x0800;
 const IP_ICMP: u8 = 1;
 const IP_TCP: u8 = 6;
 const IP_UDP: u8 = 17;
+
+/// Wraps a freshly built device for sharing, applying the guest MAC override.
+///
+/// Every backend ends its device selection with this, so the override reaches
+/// the tap, gateway and stub devices alike and the three cannot drift apart.
+/// Applied before the device is shared, while nothing else can hold it.
+pub fn share(dev: Option<VirtioNet>, mac: Option<[u8; 6]>) -> Option<Arc<Mutex<VirtioNet>>> {
+    dev.map(|mut dev| {
+        if let Some(mac) = mac {
+            dev.set_mac(mac);
+        }
+        Arc::new(Mutex::new(dev))
+    })
+}
 
 /// A virtio-net device with a user-space capture backend.
 pub struct VirtioNet {
@@ -159,9 +173,11 @@ impl VirtioNet {
         }
     }
 
-    /// Overrides the MAC presented to the guest. Required in tap mode: urunc
-    /// redirects the veth's frames to us unchanged, so the guest must own the
-    /// veth's address.
+    /// Overrides the MAC presented to the guest.
+    ///
+    /// It decides what the guest reads from config space, and on the built-in
+    /// stack it also decides the L2 destination of every synthesized reply, so
+    /// it is not a tap-only concern.
     pub fn set_mac(&mut self, mac: [u8; 6]) {
         self.mac = mac;
     }

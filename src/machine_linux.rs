@@ -219,37 +219,30 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
         eprintln!("[hvi/kvm] virtio-net: tap {ifname}");
         net_tap_reader = Some(reader);
-        let mut dev = VirtioNet::with_tap(file);
-        // The redirect hands us the veth's frames unchanged, so the guest has
-        // to answer to the veth's MAC.
-        match cfg.net_mac.as_deref().map(crate::tap::parse_mac) {
-            Some(Some(mac)) => dev.set_mac(mac),
-            Some(None) => {
-                eprintln!("[hvi/kvm] WARNING: unparsable --net-mac; keeping the default");
-            }
-            None => {}
-        }
-        Some(Arc::new(Mutex::new(dev)))
+        Some(VirtioNet::with_tap(file))
     } else if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
             Ok(stream) => match stream.try_clone() {
                 Ok(reader) => {
                     eprintln!("[hvi/kvm] virtio-net: gvisor-tap gateway relay via {sock}");
                     net_reader = Some(reader);
-                    Some(Arc::new(Mutex::new(VirtioNet::with_gateway(stream))))
+                    Some(VirtioNet::with_gateway(stream))
                 }
                 Err(_) => None,
             },
             Err(e) => {
                 eprintln!("[hvi/kvm] WARNING: gateway {sock} unreachable ({e}); built-in stack");
-                Some(Arc::new(Mutex::new(VirtioNet::new())))
+                Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        Some(Arc::new(Mutex::new(VirtioNet::new())))
+        Some(VirtioNet::new())
     } else {
         None
     };
+
+    let net = crate::virtio_net::share(net, cfg.net_mac);
+
     let vsock = cfg
         .agent_sock
         .as_ref()

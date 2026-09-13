@@ -352,7 +352,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--net" => net = true,
             "--net-gateway" => net_gateway = it.next().cloned(),
             "--net-tap" => net_tap = it.next().cloned(),
-            "--net-mac" => net_mac = it.next().cloned(),
+            "--net-mac" => {
+                let v = it.next().ok_or("--net-mac needs a value")?;
+                net_mac = Some(
+                    hvi::tap::parse_mac(v)
+                        .ok_or_else(|| format!("--net-mac is not a MAC address: {v}"))?,
+                );
+            }
             "--events" => events = it.next().cloned(),
             "--sandbox-id" => {
                 sandbox_id = it.next().ok_or("--sandbox-id needs a value")?.clone();

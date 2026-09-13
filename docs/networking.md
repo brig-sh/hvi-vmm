@@ -18,7 +18,7 @@ one is not an error, so pass one.
 | DNS server | 10.0.2.3 | 10.87.0.1 | external |
 | Who runs it | hvi | an external gvisor-tap process | whoever owns the netns |
 | TLS SNI recorded | no | yes | yes |
-| `--net-mac` honoured | no | no | yes |
+| `--net-mac` honoured | yes | yes | yes |
 
 ## The built-in stack: `--net`
 
@@ -131,22 +131,26 @@ hvi: --net-tap tap0: no /dev/net/tun on macOS; use --net-gateway
 
 ### `--net-mac`
 
-`--net-mac` sets the MAC the guest NIC presents, and **only under
-`--net-tap`**. It is read in the tap branch of the two Linux backends and
-nowhere else.
+`--net-mac` sets the MAC the guest NIC presents. Every backend honours it, on
+every networking mode, and a value that does not parse fails the boot at
+argument-parsing time, like every other malformed flag.
 
-It exists because a `tc mirred` redirect hands hvi the veth's frames
-unchanged, so the guest has to answer to the veth's address or every reply is
-dropped as not addressed to it.
+Two modes need it for different reasons. Under `--net-tap`, a `tc mirred`
+redirect hands hvi the veth's frames unchanged, so the guest has to answer to
+the veth's address or every reply is dropped as not addressed to it. Under
+`--net-gateway`, the gateway keys its DHCP leases by MAC: two guests
+presenting the same one are a single host as far as it is concerned, the
+second lease overwrites the first, and the guest that is not being addressed
+goes quiet. That is why running more than one guest against one gateway
+needs it.
 
-Two consequences that are easy to miss:
+Two things that are easy to miss:
 
-- Under `--net`, `--net-gateway`, or on macOS, the value is accepted and
-  discarded. There is no message.
-- A value that does not parse warns and keeps the default, but only in the tap
-  branch that reads it. Elsewhere a malformed value is silent too.
 - Omitting it under `--net-tap` is accepted. The guest keeps the default MAC,
   which under a redirect usually means it receives nothing.
+- The built-in stack addresses its synthesized replies to whatever MAC the
+  guest was given, so an override there is consistent rather than merely
+  advertised.
 
 ## What the ledger records
 

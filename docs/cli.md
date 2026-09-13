@@ -53,7 +53,7 @@ including a typo, silently runs the plain test.
 | `--net` | off | The built-in user-space stack. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
-| `--net-mac <mac>` | none | Guest MAC. Read only under `--net-tap`. |
+| `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
@@ -71,9 +71,10 @@ accumulate. A second `--disk` replaces the first.
 
 **A value-taking flag at the end of the line silently takes none.** These
 flags accept a missing value as "not set" rather than erroring: `--kernel`,
-`--initramfs`, `--disk`, `--net-gateway`, `--net-tap`, `--net-mac`,
-`--events`, `--agent-sock`, `--dump-memory`, `--trace-io`. So `hvi boot
---kernel Image --disk` boots with no disk.
+`--initramfs`, `--disk`, `--net-gateway`, `--net-tap`, `--events`,
+`--agent-sock`, `--dump-memory`, `--trace-io`. So `hvi boot --kernel Image
+--disk` boots with no disk. `--net-mac` is not among them: it is parsed where
+it is read, so a missing or malformed value fails the boot.
 
 `--kernel` is the one where that matters, because it is required. It is not
 caught by the parser. A trailing `hvi boot --kernel` parses to "not set" and
@@ -104,7 +105,6 @@ are three behaviours, not two.
 | `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored silently** | **ignored silently** |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
-| `--net-mac` | **ignored silently** | only under `--net-tap` | only under `--net-tap` |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | everything else | acted on | acted on | acted on |
 
@@ -139,9 +139,6 @@ hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>
 hvi: unknown boot arg "--nope"
 ```
-
-`--net-mac` is **not** validated at parse time. A malformed value only warns
-inside the tap branch that reads it.
 
 ## `dump-fdt`
 
