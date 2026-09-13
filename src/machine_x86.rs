@@ -209,17 +209,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
         eprintln!("[hvi/x86] virtio-net: tap {ifname}");
         net_tap_reader = Some(reader);
-        let mut dev = VirtioNet::with_tap(file);
-        // The redirect hands us the veth's frames unchanged, so the guest has
-        // to answer to the veth's MAC.
-        match cfg.net_mac.as_deref().map(crate::tap::parse_mac) {
-            Some(Some(mac)) => dev.set_mac(mac),
-            Some(None) => {
-                eprintln!("[hvi/x86] WARNING: unparsable --net-mac; keeping the default");
-            }
-            None => {}
-        }
-        Some(Arc::new(Mutex::new(dev)))
+        Some(Arc::new(Mutex::new(VirtioNet::with_tap(file))))
     } else if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
             Ok(stream) => match stream.try_clone() {
@@ -240,6 +230,24 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Whichever backend the run ended up with, the guest answers to this
+    // address. On the tap path the redirect hands us the veth's frames
+    // unchanged, so the guest has to carry the veth's MAC or see none of
+    // them. On the gateway path the gateway keys its DHCP leases by MAC, so
+    // two guests presenting the built-in default are one host as far as it is
+    // concerned: the second lease overwrites the first and the guest that is
+    // not being addressed goes quiet. Applying it in one place is what keeps
+    // those two from drifting apart.
+    if let Some(dev) = &net {
+        match cfg.net_mac.as_deref().map(crate::tap::parse_mac) {
+            Some(Some(mac)) => crate::sync::lock_or_recover(dev).set_mac(mac),
+            Some(None) => {
+                eprintln!("[hvi/x86] WARNING: unparsable --net-mac; keeping the default");
+            }
+            None => {}
+        }
+    }
+
     let vsock = cfg
         .agent_sock
         .as_ref()

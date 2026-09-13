@@ -26,7 +26,6 @@ three things a reader should not have to guess between:
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |
-| `--net-mac` is read only in the tap branch. | Under `--net`, `--net-gateway` or on macOS it is accepted and discarded, with no message, even when malformed. | Design |
 | An unreachable `--net-gateway` falls back to the built-in stack. | A guest comes up with no egress and exit status zero. The warning line is the only signal. | Design |
 | The gateway reader skips an over-long framed length without consuming its payload. | A frame above 64 KiB loses alignment on the stream. See [#93](https://github.com/brig-sh/hvi-vmm/issues/93). | Defect |
 | virtio-fs: one request queue per share, no DAX, no indirect descriptors. | Throughput ceiling per share. | Design |
