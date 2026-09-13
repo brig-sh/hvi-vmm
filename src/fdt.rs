@@ -82,7 +82,7 @@ pub fn build(
     fdt.property_string("stdout-path", &format!("/pl011@{UART_BASE:x}"))?;
     if layout.initrd_size != 0 {
         fdt.property_u64("linux,initrd-start", layout.initrd_addr)?;
-        fdt.property_u64("linux,initrd-end", layout.initrd_addr + layout.initrd_size)?;
+        fdt.property_u64("linux,initrd-end", layout.initrd_end())?;
     }
     fdt.end_node(chosen)?;
 
@@ -274,9 +274,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!contains(&absent, "virtio_mmio@2000600"));
-        assert!(contains(&present, "virtio_mmio@2000600"));
-        assert!(contains(&present, "virtio_mmio@2000800"));
+        let first = format!("virtio_mmio@{:x}", crate::layout::VIRTIO_FS_BASE);
+        let second = format!(
+            "virtio_mmio@{:x}",
+            crate::layout::VIRTIO_FS_BASE + crate::layout::VIRTIO_SIZE
+        );
+        assert!(!contains(&absent, &first));
+        assert!(contains(&present, &first));
+        assert!(contains(&present, &second));
     }
 
     /// Returns true if `needle` appears in the blob's strings/structure, which
