@@ -87,10 +87,13 @@ pub struct BootConfig {
     /// container netns and redirects the veth to it, so the guest gets the
     /// container's own network identity rather than a private stack.
     pub net_tap: Option<String>,
-    /// MAC the guest NIC presents. With urunc's tc mirred redirect the inbound
-    /// frames carry the veth's destination MAC, so the guest has to answer to
-    /// that address or every reply is dropped as not-for-us.
-    pub net_mac: Option<String>,
+    /// MAC the guest NIC presents, on whichever backend the run selects.
+    ///
+    /// A tap needs it because a tc mirred redirect carries the veth's
+    /// destination MAC, so the guest must answer to that address. A gateway
+    /// needs it to tell two guests apart, since it keys DHCP leases by MAC.
+    /// The built-in stub frames its synthesized replies to it.
+    pub net_mac: Option<[u8; 6]>,
     pub events: Option<String>,
     pub sandbox_id: String,
     /// Number of vCPUs (>= 1).

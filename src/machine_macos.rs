@@ -255,7 +255,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Ok(reader) => {
                     eprintln!("[hvi] virtio-net: gvisor-tap gateway relay via {sock} (guest 10.87.0.2, gw/DNS 10.87.0.1)");
                     net_reader = Some(reader);
-                    Some(Arc::new(Mutex::new(VirtioNet::with_gateway(stream))))
+                    Some(VirtioNet::with_gateway(stream))
                 }
                 Err(e) => {
                     eprintln!("[hvi] WARNING: cannot clone gateway socket ({e}); net disabled");
@@ -264,27 +264,17 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             },
             Err(e) => {
                 eprintln!("[hvi] WARNING: cannot reach gateway {sock} ({e}); falling back to built-in stack");
-                Some(Arc::new(Mutex::new(VirtioNet::new())))
+                Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
         eprintln!("[hvi] virtio-net: user-space (guest 10.0.2.15, gw 10.0.2.2, DHCP)");
-        Some(Arc::new(Mutex::new(VirtioNet::new())))
+        Some(VirtioNet::new())
     } else {
         None
     };
-    // A gateway keys its DHCP leases by MAC, so two guests presenting the
-    // built-in default are one host to it and the second lease displaces the
-    // first. Applies to whichever device the run produced.
-    if let Some(dev) = &net {
-        match cfg.net_mac.as_deref().map(crate::tap::parse_mac) {
-            Some(Some(mac)) => crate::sync::lock_or_recover(dev).set_mac(mac),
-            Some(None) => {
-                eprintln!("[hvi] WARNING: unparsable --net-mac; keeping the default");
-            }
-            None => {}
-        }
-    }
+
+    let net = crate::virtio_net::share(net, cfg.net_mac);
 
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
         eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");

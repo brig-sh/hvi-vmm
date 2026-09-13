@@ -91,7 +91,7 @@ cargo build --release --example watch_guest
 | `net` | `bool` | The built-in stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |
-| `net_mac` | `Option<String>` | Read only in the tap branch. Ignored everywhere else. |
+| `net_mac` | `Option<[u8; 6]>` | Guest MAC, applied on every backend and mode. |
 | `events` | `Option<String>` | The ledger path. |
 | `sandbox_id` | `String` | Written into every ledger record. |
 | `vcpus` | `u32` | 1 or more. A GICv2 arm64 host refuses more than 8. |
