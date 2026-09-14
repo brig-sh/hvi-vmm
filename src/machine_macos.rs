@@ -28,8 +28,10 @@
 // see clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use applevisor::prelude::{
     ExitReason, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
@@ -50,6 +52,7 @@ use crate::layout::{
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
+use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
 use crate::virtio::{reg, VirtioBlk};
 use crate::virtio_fs::VirtioFs;
 use crate::virtio_net::VirtioNet;
@@ -61,6 +64,8 @@ type VmGic = VirtualMachineInstance<GicEnabled>;
 
 /// Host key that asks the plugin for an observation now: Ctrl-] (GS, 0x1d).
 const REQUEST_KEY: u8 = 0x1d;
+/// The signal that ends the console reader's blocking read at stop.
+const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 /// GIC INTIDs: SPIs start at 32.
 const UART_INTID: u32 = 32 + UART_SPI;
 const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
@@ -103,14 +108,23 @@ struct SharedFs {
 /// worker's post-drain recheck and it actually parking is observed rather
 /// than lost -- see `spawn_fs_worker` for the full argument.
 struct FsWake {
-    woken: Mutex<bool>,
+    state: Mutex<FsWakeState>,
     ready: Condvar,
+}
+
+/// The flags behind [`FsWake`].
+#[derive(Default)]
+struct FsWakeState {
+    /// A notify arrived since the worker last drained.
+    woken: bool,
+    /// The stop has been requested.
+    stopped: bool,
 }
 
 impl FsWake {
     fn new() -> Self {
         Self {
-            woken: Mutex::new(false),
+            state: Mutex::new(FsWakeState::default()),
             ready: Condvar::new(),
         }
     }
@@ -119,20 +133,29 @@ impl FsWake {
     /// parked -- a signal that arrives mid-drain is simply picked up on the
     /// worker's next pass, never lost.
     fn wake(&self) {
-        let mut woken = self.woken.lock().unwrap();
-        *woken = true;
+        let mut state = lock_or_recover(&self.state);
+        state.woken = true;
         self.ready.notify_one();
     }
 
-    /// Blocks until the next [`FsWake::wake`], then clears the flag. Never
-    /// called with the virtio-fs device mutex held -- this is purely the
-    /// wake signal, independent of the device's own lock.
-    fn park(&self) {
-        let mut woken = self.woken.lock().unwrap();
-        while !*woken {
-            woken = self.ready.wait(woken).unwrap();
+    /// Requests that the worker exit at its next pass.
+    fn stop(&self) {
+        let mut state = lock_or_recover(&self.state);
+        state.stopped = true;
+        self.ready.notify_one();
+    }
+
+    /// Blocks until the next [`FsWake::wake`] or [`FsWake::stop`].
+    ///
+    /// Clears the wake flag on return and returns `false` once stopped. Must
+    /// not be called with the virtio-fs device mutex held.
+    fn park(&self) -> bool {
+        let mut state = lock_or_recover(&self.state);
+        while !state.woken && !state.stopped {
+            state = self.ready.wait(state).unwrap();
         }
-        *woken = false;
+        state.woken = false;
+        !state.stopped
     }
 }
 
@@ -164,13 +187,18 @@ struct Shared {
     quiesce: Arc<crate::quiesce::Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
-    /// Guest RAM's shareable descriptor, for a plugin that hands the same
-    /// pages to another process.
-    ram_fd: std::os::fd::RawFd,
+    /// The object backing guest RAM, for a plugin that hands the same pages to
+    /// another process.
+    ram_file: Arc<std::fs::File>,
     sandbox_id: String,
 }
 
 /// Boots `cfg` and runs until the guest powers off.
+///
+/// Every thread this call itself starts has exited when it returns, or the call
+/// returns an error naming the one that did not stop within
+/// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
+/// plugin kept, in a field or on a thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
@@ -306,16 +334,20 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     });
     // Bind before Seatbelt is installed. Accepting on this already-open
     // listener remains allowed afterwards; acquiring a new socket does not.
+    // It is non-blocking so the bridge can poll it beside the stop token.
     let agent_listener = match &cfg.agent_sock {
         Some(path) => {
             let _ = std::fs::remove_file(path);
-            Some(
-                std::os::unix::net::UnixListener::bind(path)
-                    .map_err(|e| format!("bind agent socket {path}: {e}"))?,
-            )
+            let listener = std::os::unix::net::UnixListener::bind(path)
+                .map_err(|e| format!("bind agent socket {path}: {e}"))?;
+            listener.set_nonblocking(true)?;
+            Some(listener)
         }
         None => None,
     };
+    // The stop source's socket pair is created before Seatbelt for the same
+    // reason.
+    let stop_source = StopSource::new()?;
     let mut fs = Vec::with_capacity(cfg.fs_shares.len());
     let mut fs_access = Vec::with_capacity(cfg.fs_shares.len());
     let mut fs_tags = std::collections::HashSet::new();
@@ -432,7 +464,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         dtb_addr: layout.dtb_addr,
         quiesce: Arc::new(crate::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
-        ram_fd: shared_ram.fd(),
+        ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),
         num_cpus,
     };
@@ -443,52 +475,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         obs.attach(Arc::new(shared.clone()) as Arc<dyn VmHandle>)?;
     }
 
-    // Host-side helper: keystrokes -> UART RX. Kicks vCPUs via the shared
-    // handle list (never touches guest RAM).
-    spawn_input_thread(
-        vm.clone(),
-        Arc::clone(&shared.pl011),
-        shared.plugin.clone(),
-        Arc::clone(&shared.handles),
-    );
-    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
-        spawn_vsock_bridge(
-            listener,
-            Arc::clone(dev),
-            Arc::clone(&shared.mem),
-            vm.clone(),
-            Arc::clone(&shared.handles),
-        );
-    }
-    if let (Some(reader), Some(dev)) = (net_reader, &shared.net) {
-        spawn_net_gateway_reader(
-            reader,
-            Arc::clone(dev),
-            Arc::clone(&shared.mem),
-            vm.clone(),
-            Arc::clone(&shared.handles),
-        );
-    }
-    // Stage A: each virtio-fs device gets its own worker thread so FUSE
-    // servicing (every host pread/pwrite/stat/getxattr the guest's requests
-    // need) never runs on a vCPU thread. See `spawn_fs_worker`.
-    for fs in &shared.fs {
-        spawn_fs_worker(
-            Arc::clone(&fs.dev),
-            fs.intid,
-            Arc::clone(&shared.mem),
-            vm.clone(),
-            Arc::clone(&shared.handles),
-            Arc::clone(&fs.wake),
-        );
-    }
     let _raw = RawTerm::enable();
 
-    // Confine the process. Deliberately the last line before the guest runs:
-    // everything above acquires host authority (the VM, the guest-RAM mapping,
-    // the block file, the ledger, the gateway connection, the listeners, the
-    // terminal), everything below only services guest I/O with what is already
-    // open. See `sandbox`.
+    // Confine the process before the first helper thread exists: everything
+    // above acquires host authority (the VM, the guest-RAM mapping, the block
+    // file, the ledger, the gateway connection, the listeners, the terminal),
+    // everything below only services guest I/O with what is already open, and
+    // an error here returns with nothing to stop. See `sandbox`.
     //
     // Failing closed: a profile that will not install is a profile nobody has
     // tested, and continuing would hand a guest-facing process the host's full
@@ -501,6 +494,60 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         eprintln!("[hvi] seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority");
     }
 
+    // Helper threads. Each polls its stop token beside its own descriptor, or
+    // takes the stop through its `FsWake`, and is joined after the vCPUs.
+    install_kick_handler();
+    let input = spawn_input_thread(
+        vm.clone(),
+        Arc::clone(&shared.pl011),
+        shared.plugin.clone(),
+        Arc::clone(&shared.handles),
+        stop_source.token(),
+    );
+    let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
+    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
+        helpers.push((
+            "agent bridge",
+            spawn_vsock_bridge(
+                listener,
+                Arc::clone(dev),
+                Arc::clone(&shared.mem),
+                vm.clone(),
+                Arc::clone(&shared.handles),
+                stop_source.token(),
+            ),
+        ));
+    }
+    if let (Some(reader), Some(dev)) = (net_reader, &shared.net) {
+        helpers.push((
+            "gateway relay",
+            spawn_net_gateway_reader(
+                reader,
+                Arc::clone(dev),
+                Arc::clone(&shared.mem),
+                vm.clone(),
+                Arc::clone(&shared.handles),
+                stop_source.token(),
+            ),
+        ));
+    }
+    // Stage A: each virtio-fs device gets its own worker thread so FUSE
+    // servicing (every host pread/pwrite/stat/getxattr the guest's requests
+    // need) never runs on a vCPU thread. See `spawn_fs_worker`.
+    for fs in &shared.fs {
+        helpers.push((
+            "virtio-fs worker",
+            spawn_fs_worker(
+                Arc::clone(&fs.dev),
+                fs.intid,
+                Arc::clone(&shared.mem),
+                vm.clone(),
+                Arc::clone(&shared.handles),
+                Arc::clone(&fs.wake),
+            ),
+        ));
+    }
+
     // One thread per vCPU; join them all (cpu0 ends on PSCI SYSTEM_OFF and
     // stops the rest).
     let mut joins = Vec::new();
@@ -511,6 +558,24 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     for j in joins {
         let _ = j.join();
     }
+
+    // The guest has stopped. End the helper threads (see `teardown`) and write
+    // out the ledger tail, which the flush cadence alone would leave in the
+    // buffer.
+    stop_source.request_stop();
+    for fs in &shared.fs {
+        fs.wake.stop();
+    }
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    kick_until_finished(&input, deadline);
+    let mut stuck = None;
+    for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
+        if let Err(e) = join_by(name, thread, deadline) {
+            eprintln!("[hvi] {e}; left running");
+            stuck.get_or_insert(e);
+        }
+    }
+    lock_or_recover(&shared.emit).flush();
 
     // What the guest actually spent, reported once on the way out. #34 asks
     // for this number before any limit is tightened: a ceiling picked without
@@ -528,6 +593,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
 
+    if let Some(e) = stuck {
+        return Err(e.into());
+    }
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
     Ok(stop)
 }
@@ -758,8 +826,8 @@ impl VmHandle for Shared {
         &self.mem
     }
 
-    fn ram_fd(&self) -> std::os::fd::RawFd {
-        self.ram_fd
+    fn ram_fd(&self) -> BorrowedFd<'_> {
+        self.ram_file.as_fd()
     }
 
     fn ram_regions(&self) -> Vec<MemRegion> {
@@ -1113,17 +1181,39 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// 1024) and relayed both ways by a per-connection reader thread. After any
 /// host->guest injection the vsock GIC line is raised and the vCPUs kicked so
 /// the guest drains its RX queue promptly.
+///
+/// The listener is non-blocking, so the accept loop can poll it beside the stop
+/// token. The per-connection readers poll the same token, and the listener
+/// thread joins the ones still running before it exits.
 fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
-) {
+    stop: StopToken,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         eprintln!("[hvi] vsock bridge: listening");
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
+        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        loop {
+            match stop.wait(listener.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!("[hvi] vsock bridge: {e}; no longer accepting");
+                    break;
+                }
+            }
+            let Ok((stream, _)) = listener.accept() else {
+                continue;
+            };
+            // The device writes to this socket and must block, or a full send
+            // buffer would split a frame. On macOS an accepted socket inherits
+            // the listener's non-blocking flag, so blocking mode is set here.
+            if stream.set_nonblocking(false).is_err() {
+                continue;
+            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
@@ -1142,10 +1232,22 @@ fn spawn_vsock_bridge(
             let mem2 = Arc::clone(&mem);
             let vm2 = vm.clone();
             let handles2 = Arc::clone(&handles);
-            std::thread::spawn(move || {
+            let stop2 = stop.clone();
+            readers.retain(|handle| !handle.is_finished());
+            readers.push(std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
                 loop {
+                    match stop2.wait(reader.as_fd()) {
+                        Ok(true) => {}
+                        // A stop ends the connection like a peer close, so the
+                        // device releases it.
+                        Ok(false) => break,
+                        Err(e) => {
+                            eprintln!("[hvi] vsock bridge: {e}; connection closed");
+                            break;
+                        }
+                    }
                     let n = match crate::virtio_vsock::read_host(&mut reader, &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
@@ -1165,26 +1267,36 @@ fn spawn_vsock_bridge(
                 };
                 let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, level);
                 kick_all(&vm2, &handles2);
-            });
+            }));
         }
-    });
+        for reader in readers {
+            let _ = reader.join();
+        }
+    })
 }
 
 /// Reads gateway->guest Ethernet frames (4-byte big-endian length prefix, the
 /// gvisor-tap-vsock QEMU stream protocol) and injects each into the guest RX
 /// queue under the device lock, raising the net GIC line and kicking the vCPUs.
-/// Exits when the gateway closes the connection.
+/// Exits when the gateway closes the connection or the stop is requested.
+///
+/// A stop request is checked before each frame. A gateway that stalls in the
+/// middle of one holds the thread until it sends the rest or closes.
 fn spawn_net_gateway_reader(
     mut reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
-) {
+    stop: StopToken,
+) -> JoinHandle<()> {
     use std::io::Read;
     std::thread::spawn(move || {
         let mut hdr = [0u8; 4];
         loop {
+            if !stop.wait(reader.as_fd()).unwrap_or(false) {
+                break;
+            }
             if reader.read_exact(&mut hdr).is_err() {
                 break; // gateway closed
             }
@@ -1204,7 +1316,7 @@ fn spawn_net_gateway_reader(
             let _ = vm.gic_set_spi(VIRTIO_NET_INTID, level);
             kick_all(&vm, &handles);
         }
-    });
+    })
 }
 
 /// Runs a virtio-fs device's FUSE servicing off the vCPU thread (Stage A of
@@ -1232,9 +1344,9 @@ fn spawn_net_gateway_reader(
 /// observed by the next `park()` call. The device mutex is held only for
 /// the drain itself, never across `park()`.
 ///
-/// Shutdown: like the vsock bridge and the net gateway reader, this runs
-/// until the process exits. There is no VM teardown path today for any of
-/// the host-side bridge threads to hook into, so this does not invent one.
+/// Shutdown: `boot` calls [`FsWake::stop`] once the vCPUs have exited, and the
+/// worker leaves its loop at the next `park`. It then drains the chains
+/// announced by a wake that arrived with the stop.
 fn spawn_fs_worker(
     dev: Arc<Mutex<VirtioFs>>,
     intid: u32,
@@ -1242,21 +1354,28 @@ fn spawn_fs_worker(
     vm: VmGic,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
     wake: Arc<FsWake>,
-) {
-    std::thread::spawn(move || loop {
-        wake.park();
-        {
-            let mut d = lock_or_recover(&dev);
-            d.drain_notified(&mem);
-            // Raised under the same mutex the vCPU's INTERRUPT_ACK takes, so
-            // the two cannot interleave into a low line over a non-empty
-            // used ring -- see the matching comment in `service_fs`.
-            let _ = vm.gic_set_spi(intid, d.irq_level());
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while wake.park() {
+            {
+                let mut d = lock_or_recover(&dev);
+                d.drain_notified(&mem);
+                // Raised under the same mutex the vCPU's INTERRUPT_ACK takes,
+                // so the two cannot interleave into a low line over a non-empty
+                // used ring. See the matching comment in `service_fs`.
+                let _ = vm.gic_set_spi(intid, d.irq_level());
+            }
+            // Outside the lock: `kick_all` takes the vCPU-handle mutex, and it
+            // does not need to be atomic with the line, only to follow it.
+            kick_all(&vm, &handles);
         }
-        // Outside the lock: `kick_all` takes the vCPU-handle mutex, and it
-        // does not need to be atomic with the line, only to follow it.
-        kick_all(&vm, &handles);
-    });
+        // A wake that arrived with the stop was cleared by that last `park`,
+        // and the chains it announced are still in the ring. `stop` runs only
+        // after every vCPU has been joined, so no further wake can come and
+        // nothing else touches the device. One unbounded pass drains every
+        // remaining chain, and no vCPU is left to interrupt.
+        lock_or_recover(&dev).drain_notified(&mem);
+    })
 }
 
 /// Zero-extension mask for a load of `width` bytes.
@@ -1265,6 +1384,42 @@ fn width_mask(width: u8) -> u64 {
         u64::MAX
     } else {
         (1u64 << (width * 8)) - 1
+    }
+}
+
+/// Sends the kick signal to `thread` until it has exited or `deadline` passes.
+///
+/// The console reader can be blocked in a read of stdin, a descriptor it shares
+/// with the rest of the process, where the stop token cannot reach it. The
+/// signal ends the read with `EINTR`; it is repeated because a signal that
+/// lands before the read blocks is lost. A wait the signal cannot end, such as
+/// a plugin blocking in `request`, ends the loop at the deadline instead.
+fn kick_until_finished(thread: &JoinHandle<()>, deadline: std::time::Instant) {
+    use std::os::unix::thread::JoinHandleExt;
+    while !thread.is_finished() && std::time::Instant::now() < deadline {
+        // SAFETY: the handle has not been joined, so its thread id is live;
+        // the handler is a no-op. The cast is for musl, where std and libc
+        // spell `pthread_t` differently.
+        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, KICK_SIGNAL) };
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Installs a no-op handler for the kick signal.
+///
+/// The handler is installed without `SA_RESTART`, so a blocking call the signal
+/// interrupts returns `EINTR` instead of resuming: the console reader's read of
+/// stdin.
+fn install_kick_handler() {
+    extern "C" fn noop(_: libc::c_int) {}
+    // SAFETY: installing a trivial signal handler before the helper threads
+    // exist.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = noop as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(KICK_SIGNAL, &sa, std::ptr::null_mut());
     }
 }
 
@@ -1279,11 +1434,26 @@ fn spawn_input_thread(
     pl011: Arc<Mutex<Pl011>>,
     plugin: Option<Arc<dyn Plugin>>,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
-) {
+    stop: StopToken,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        let stdin = std::io::stdin();
         let mut byte = [0u8; 1];
         loop {
+            match stop.wait(stdin.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!("[hvi] console: {e}; console input stopped");
+                    break;
+                }
+            }
+            // SAFETY: reading one byte from fd 0.
             let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                // The kick signal: the stop is seen at the top of the loop.
+                continue;
+            }
             if n <= 0 {
                 break;
             }
@@ -1301,7 +1471,7 @@ fn spawn_input_thread(
             };
             let _ = vm.gic_set_spi(UART_INTID, level);
         }
-    });
+    })
 }
 
 /// Kicks every registered vCPU out of `run()`.

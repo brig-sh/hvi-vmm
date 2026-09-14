@@ -115,10 +115,8 @@ struct FiveTuple {
 /// [`Emitter::emit_payload`], so it is one interval *of continued traffic*,
 /// not one interval of wall time. The last events before a quiet period stay
 /// in the buffer until something else is emitted, which is exactly the case a
-/// `kill` at the end of a run hits. Closing that needs a drain driven by
-/// something other than the event stream, and the natural place for it is a
-/// thread this VMM can also shut down, which it currently cannot do for any of
-/// its threads.
+/// `kill` at the end of a run hits. [`Emitter::flush`] empties the buffer at
+/// the end of a run.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Writes `RawEvent` NDJSON to a file (one line per event). Disabled unless a

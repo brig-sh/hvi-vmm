@@ -35,7 +35,7 @@
 //! on a cold path, the devices hold no sink, and no guest memory is read for
 //! any purpose but running the guest.
 
-use std::os::fd::RawFd;
+use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Mutex};
 
 use crate::events::Emitter;
@@ -84,8 +84,9 @@ pub struct RegsView {
 /// if it intends to share it with another process) and installs its device
 /// sinks.
 ///
-/// It is handed over as an `Arc`, so a plugin that runs its own threads --
-/// a timer, a doorbell -- can keep it and call [`VmHandle::kick`] from them.
+/// It is handed over as an `Arc`, so a plugin that runs its own threads (a
+/// timer, a doorbell) can keep it and call [`VmHandle::kick`] from them. A
+/// handle kept past the end of `boot` keeps the VM and its devices alive.
 pub trait VmHandle: Send + Sync {
     /// The guest architecture this VM is running.
     fn arch(&self) -> GuestArch;
@@ -96,14 +97,16 @@ pub trait VmHandle: Send + Sync {
     /// Accessor over the guest's RAM. Valid for the lifetime of the VM.
     fn ram(&self) -> &GuestRam;
 
-    /// Descriptor of the object backing guest RAM.
+    /// Descriptor of the object backing guest RAM, borrowed from this handle.
     ///
     /// Guest RAM is allocated from something nameable (see
     /// [`crate::sharedmem`]), so a tool can map its own view of it rather than
     /// borrowing the VMM's. [`crate::plugins::MemoryDump`] maps a read-only
     /// one, which is what makes it structurally unable to corrupt the guest it
-    /// is dumping.
-    fn ram_fd(&self) -> RawFd;
+    /// is dumping. The descriptor stays open as long as the handle does; a
+    /// plugin that needs it past the borrow, on a thread of its own or across a
+    /// `SCM_RIGHTS` send, keeps a duplicate from `try_clone_to_owned`.
+    fn ram_fd(&self) -> BorrowedFd<'_>;
 
     /// Where the guest's RAM sits, in guest-physical terms and in the backing
     /// object. More than one region on backends that punt a hole in RAM.
@@ -200,6 +203,10 @@ pub trait Plugin: Send + Sync {
     /// kick is not, because every backend kicks immediately after this
     /// returns. A plugin that triggers itself from its own thread still owes
     /// the [`VmHandle::kick`], since nothing else is about to make one.
+    ///
+    /// Runs on the VMM's console thread and must return promptly. The stop
+    /// waits for that thread; a `request` still running when `STOP_TIMEOUT`
+    /// passes leaves its thread running, and `boot` returns an error naming it.
     fn request(&self) {}
 }
 

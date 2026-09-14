@@ -192,8 +192,9 @@ wants a reboot calls it again.
 ### Signals and the terminal
 
 There is no `SIGINT`, `SIGTERM` or `SIGHUP` handler. `SIGUSR1` is used
-internally to break a vCPU out of `KVM_RUN` on the Linux backends and is not a
-control interface.
+internally. It breaks a vCPU out of `KVM_RUN` on the Linux backends and ends
+the console reader's read of stdin when the guest stops. It is not a control
+interface.
 
 hvi puts the terminal into raw mode when stdin is a TTY and restores it when
 the boot returns normally. That restore is a destructor, and a destructor does

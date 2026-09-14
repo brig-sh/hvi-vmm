@@ -2065,7 +2065,9 @@ impl VirtioFs {
             if opcode == SETLK {
                 operation |= libc::LOCK_NB;
             }
-            let result = unsafe { libc::flock(handle.file.as_raw_fd(), operation) };
+            // SAFETY: flock on a file this handle owns, with a valid operation.
+            let result =
+                retry_on_interrupt(|| unsafe { libc::flock(handle.file.as_raw_fd(), operation) });
             if result != 0 {
                 return Err(io_errno(io::Error::last_os_error()));
             }
@@ -2096,7 +2098,11 @@ impl VirtioFs {
             SETLKW => libc::F_OFD_SETLKW,
             _ => return Err(EINVAL),
         };
-        let result = unsafe { libc::fcntl(handle.file.as_raw_fd(), command, &mut host_lock) };
+        // SAFETY: fcntl on a file this handle owns, with a lock struct that
+        // outlives the call.
+        let result = retry_on_interrupt(|| unsafe {
+            libc::fcntl(handle.file.as_raw_fd(), command, &mut host_lock)
+        });
         if result != 0 {
             return Err(io_errno(io::Error::last_os_error()));
         }
@@ -4791,6 +4797,20 @@ fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
+    }
+}
+
+/// Repeats a blocking lock call that a signal interrupted.
+///
+/// The kick signal that ends the console reader's read at stop has a handler,
+/// so a lock wait on the worker thread can return `EINTR` too.
+fn retry_on_interrupt(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
+    loop {
+        let result = call();
+        if result != 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return result;
     }
 }
 
