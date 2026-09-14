@@ -127,7 +127,9 @@ wants them off must make sure they are unset in the process it runs in. See
 
 With `agent_sock` set, hvi stands up a host `UnixListener` at that path. Each
 accepted connection opens a vsock stream to the guest and relays bytes both
-ways.
+ways. When either side closes, the other reads EOF: a host client that closes
+ends the guest stream, and a guest that closes, or a guest driver that resets
+the device, ends the host connection.
 
 The contract the guest side must satisfy:
 
