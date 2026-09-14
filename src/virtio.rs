@@ -152,6 +152,16 @@ impl Queue {
         self.ready && self.num != 0
     }
 
+    /// Clears the size, ready flag, ring addresses and consumed index.
+    ///
+    /// A driver initializing the device again programs fresh rings whose
+    /// `avail.idx` starts at 0. A consumed index kept from the previous
+    /// programming would make [`Queue::pending`] refuse every notify, and a
+    /// ready flag kept from it would make the driver's probe refuse the queue.
+    pub(crate) fn reset(&mut self) {
+        *self = Queue::default();
+    }
+
     /// Split-virtqueue ring extents: descriptor table `16*n`, avail ring
     /// `6+2*n`, used ring `6+8*n` (each includes the 2-byte event suffix).
     fn rings_fit(&self, mem: &GuestRam) -> bool {
@@ -362,7 +372,8 @@ impl VirtioBlk {
                 reg::QUEUE_READY => self.queue.set_ready(v, mem),
                 reg::QUEUE_NOTIFY => self.process_queue(mem),
                 reg::INTERRUPT_ACK => self.interrupt_status &= !v,
-                reg::STATUS => self.status = v, // 0 = driver reset
+                reg::STATUS if v == 0 => self.reset(),
+                reg::STATUS => self.status = v,
                 reg::QUEUE_DESC_LOW => self.queue.set_desc_lo(v),
                 reg::QUEUE_DESC_HIGH => self.queue.set_desc_hi(v),
                 reg::QUEUE_DRIVER_LOW => self.queue.set_avail_lo(v),
@@ -403,6 +414,14 @@ impl VirtioBlk {
                 _ => 0,
             }
         }
+    }
+
+    /// Resets the device, as a write of 0 to STATUS requests.
+    fn reset(&mut self) {
+        self.queue.reset();
+        self.interrupt_status = 0;
+        self.status = 0;
+        self.dev_feat_sel = 0;
     }
 
     /// Processes every buffer the driver has made available on queue 0.
@@ -685,7 +704,14 @@ mod queue_tests {
 
     /// Programs a queue the way the Linux virtio-mmio driver does: size, then
     /// the three ring addresses, then READY last.
-    fn program(blk: &mut VirtioBlk, mem: &GuestRam, num: u32, desc: u64, avail: u64, used: u64) {
+    fn program_queue(
+        blk: &mut VirtioBlk,
+        mem: &GuestRam,
+        num: u32,
+        desc: u64,
+        avail: u64,
+        used: u64,
+    ) {
         blk.mmio(mem, reg::QUEUE_NUM, true, u64::from(num));
         blk.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
         blk.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
@@ -706,7 +732,7 @@ mod queue_tests {
     fn queue_num_65536_is_rejected_instead_of_panicking() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
-        program(&mut blk, &mem, 0x10000, BASE, BASE + 0x1000, BASE + 0x2000);
+        program_queue(&mut blk, &mem, 0x10000, BASE, BASE + 0x1000, BASE + 0x2000);
         mem.write_u16(BASE + 0x1000 + 2, 1).unwrap(); // avail.idx = 1
 
         assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0, "not ready");
@@ -739,7 +765,7 @@ mod queue_tests {
         let mut blk = dev();
 
         // desc table for 256 entries is 4 KiB, so this one runs off the end.
-        program(
+        program_queue(
             &mut blk,
             &mem,
             256,
@@ -750,7 +776,7 @@ mod queue_tests {
         assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0);
 
         // Below the RAM base is refused too.
-        program(
+        program_queue(
             &mut blk,
             &mem,
             256,
@@ -761,7 +787,7 @@ mod queue_tests {
         assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0);
 
         // The same size, in bounds, is accepted.
-        program(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
+        program_queue(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
         assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
     }
 
@@ -788,7 +814,7 @@ mod queue_tests {
             (reg::QUEUE_DEVICE_HIGH, 0),
         ] {
             let mut blk = dev();
-            program(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
+            program_queue(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
             assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
 
             blk.mmio(&mem, r, true, v);
@@ -808,7 +834,7 @@ mod queue_tests {
     fn a_descriptor_cycle_runs_out_of_budget() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
-        program(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
+        program_queue(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
 
         // desc[0] -> desc[0]: a one-hop cycle, writable and F_NEXT set.
         mem.write_u64(BASE, BASE + 0x3000).unwrap();
@@ -833,7 +859,7 @@ mod queue_tests {
     fn a_next_index_outside_the_ring_ends_the_walk() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = dev();
-        program(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
+        program_queue(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
 
         // desc[0]: readable, chaining to index 4 -- one past a 4-entry ring.
         mem.write_u64(BASE, BASE + 0x3000).unwrap();
@@ -885,7 +911,7 @@ mod queue_tests {
     /// The happy path still works: a conforming driver's read request is
     /// serviced, the data lands in guest RAM and the status byte is written.
     #[test]
-    fn a_conforming_queue_still_services_a_request() {
+    fn conforming_queue_still_services_a_request() {
         let path = std::env::temp_dir().join(format!("hvi-q-{}.img", std::process::id()));
         let mut disk = vec![0u8; 1024];
         disk[..5].copy_from_slice(b"HELLO");
@@ -894,23 +920,11 @@ mod queue_tests {
 
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
-        let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
+        let buffers = BASE + 0x4000;
+        publish_read(&mem, desc, avail, buffers);
+        let data = buffers + 0x100;
 
-        mem.write_u32(hdr, VIRTIO_BLK_T_IN).unwrap();
-        mem.write_u64(hdr + 8, 0).unwrap(); // sector 0
-        let d = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
-            mem.write_u64(desc + i * 16, addr).unwrap();
-            mem.write_u32(desc + i * 16 + 8, len).unwrap();
-            mem.write_u16(desc + i * 16 + 12, flags).unwrap();
-            mem.write_u16(desc + i * 16 + 14, next).unwrap();
-        };
-        d(0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
-        d(1, data, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
-        d(2, status, 1, VIRTQ_DESC_F_WRITE, 0);
-        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
-        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
-
-        program(&mut blk, &mem, 256, desc, avail, used);
+        program_queue(&mut blk, &mem, 8, desc, avail, used);
         assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1, "ready");
         blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
         let _ = std::fs::remove_file(&path);
@@ -920,6 +934,117 @@ mod queue_tests {
         assert_eq!(&got, b"HELLO", "the sector reached guest memory");
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "used.idx advanced");
         assert!(blk.irq_level(), "used-buffer interrupt asserted");
+    }
+
+    /// Publishes one read of sector 0 on `avail`, as the next entry of an
+    /// 8-entry ring at `desc`.
+    ///
+    /// The request header is at `buffers`, the data at `buffers + 0x100` and
+    /// the status byte at `buffers + 0x400`, poisoned to `0xff` so an untouched
+    /// byte is visible.
+    fn publish_read(mem: &GuestRam, desc: u64, avail: u64, buffers: u64) {
+        let (hdr, data, status) = (buffers, buffers + 0x100, buffers + 0x400);
+        mem.write_u32(hdr, VIRTIO_BLK_T_IN).unwrap();
+        mem.write_u64(hdr + 8, 0).unwrap();
+        mem.write_u8(status, 0xff).unwrap();
+        let write_descriptor = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
+            mem.write_u64(desc + i * 16, addr).unwrap();
+            mem.write_u32(desc + i * 16 + 8, len).unwrap();
+            mem.write_u16(desc + i * 16 + 12, flags).unwrap();
+            mem.write_u16(desc + i * 16 + 14, next).unwrap();
+        };
+        write_descriptor(0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
+        write_descriptor(1, data, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
+        write_descriptor(2, status, 1, VIRTQ_DESC_F_WRITE, 0);
+        let avail_idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(avail_idx % 8) * 2, 0)
+            .unwrap();
+        mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
+    }
+
+    // The re-programmed queue sits at fresh ring pages with `avail.idx` back
+    // at 0.
+    #[test]
+    fn status_reset_lets_the_re_programmed_queue_service_a_request() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = dev();
+
+        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
+        publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
+        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
+        assert_eq!(
+            mem.read_u16(BASE + 0x2000 + 2).unwrap(),
+            1,
+            "used.idx before the reset"
+        );
+
+        blk.mmio(&mem, reg::STATUS, true, 0);
+        program_queue(
+            &mut blk,
+            &mem,
+            8,
+            BASE + 0x3000,
+            BASE + 0x4000,
+            BASE + 0x5000,
+        );
+        publish_read(&mem, BASE + 0x3000, BASE + 0x4000, BASE + 0x7000);
+        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
+        assert_eq!(
+            mem.read_u16(BASE + 0x5000 + 2).unwrap(),
+            1,
+            "the request published after the reset was serviced"
+        );
+        // `dev()` backs the disk with `/dev/null`, so the read fails with
+        // IOERR. A written status byte shows the chain was walked.
+        assert_eq!(
+            mem.read_u16(BASE + 0x7000 + 0x400).unwrap() as u8,
+            VIRTIO_BLK_S_IOERR
+        );
+    }
+
+    // Linux `vm_setup_vq` refuses a queue whose QUEUE_READY reads non-zero, so
+    // a stale bit fails the probe that follows a reset.
+    #[test]
+    fn status_reset_clears_queue_ready() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = dev();
+        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
+        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
+
+        blk.mmio(&mem, reg::STATUS, true, 0);
+        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0);
+        assert_eq!(blk.mmio(&mem, reg::STATUS, false, 0), 0);
+    }
+
+    #[test]
+    fn status_reset_selects_the_first_feature_page() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = dev();
+        blk.mmio(&mem, reg::DEVICE_FEATURES_SEL, true, 1);
+        assert_eq!(
+            blk.mmio(&mem, reg::DEVICE_FEATURES, false, 0),
+            u64::from(F_VERSION_1_HI)
+        );
+
+        blk.mmio(&mem, reg::STATUS, true, 0);
+        assert_eq!(
+            blk.mmio(&mem, reg::DEVICE_FEATURES, false, 0),
+            u64::from(F_BLK_FLUSH_LO)
+        );
+    }
+
+    #[test]
+    fn status_reset_clears_the_pending_interrupt() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = dev();
+        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
+        publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
+        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
+        assert!(blk.irq_level());
+
+        blk.mmio(&mem, reg::STATUS, true, 0);
+        assert!(!blk.irq_level());
+        assert_eq!(blk.mmio(&mem, reg::INTERRUPT_STATUS, false, 0), 0);
     }
 }
 

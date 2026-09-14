@@ -236,6 +236,17 @@ impl VirtioNet {
         &mut self.queues[(self.queue_sel & 1) as usize]
     }
 
+    /// Resets the device, as a write of 0 to STATUS requests.
+    fn reset(&mut self) {
+        for queue in &mut self.queues {
+            queue.reset();
+        }
+        self.interrupt_status = 0;
+        self.status = 0;
+        self.dev_feat_sel = 0;
+        self.queue_sel = 0;
+    }
+
     /// Services one MMIO access. On a transmit-queue notify, drains the guest's
     /// TX frames (capturing them) and injects any replies into the RX queue.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
@@ -249,6 +260,7 @@ impl VirtioNet {
                 reg::QUEUE_READY => self.queue().set_ready(v, mem),
                 reg::QUEUE_NOTIFY if v as u16 == TX_QUEUE => self.process_tx(mem),
                 reg::INTERRUPT_ACK => self.interrupt_status &= !v,
+                reg::STATUS if v == 0 => self.reset(),
                 reg::STATUS => self.status = v,
                 reg::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
                 reg::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),

@@ -300,6 +300,11 @@ Interrupt injection is the one device-facing thing that differs by backend:
   messages itself over a hiprio and a request queue. See
   [storage-and-sharing.md](storage-and-sharing.md).
 
+A write of 0 to a device's STATUS register resets it: every queue returns to
+its unprogrammed state, the interrupt is withdrawn, and state the driver
+created goes with them (vsock sessions, the virtio-fs FUSE session). A driver
+that binds again after that starts from a device in its boot state.
+
 The serial console is a **PL011** on arm64 and a **16550** on x86. The x86 one
 wraps `vm-superio`'s `Serial`, which is edge-triggered, and hvi drives COM1 as
 a level line: the wrapper recomputes the level from the interrupt conditions

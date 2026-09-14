@@ -67,8 +67,8 @@ thread as that thread's first act:
 
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
-| `vcpu` | the vCPU threads, where guest descriptors are parsed | 36 syscalls | 37 syscalls |
-| `vmm` | the main thread and the host-side I/O threads | 46 syscalls | 47 syscalls |
+| `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
+| `vmm` | the main thread and the host-side I/O threads | 47 syscalls | 48 syscalls |
 
 `vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
 action of `trap`, so an off-list syscall raises `SIGSYS` and kills the

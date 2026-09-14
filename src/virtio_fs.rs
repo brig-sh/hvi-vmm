@@ -228,6 +228,20 @@ struct FileHandle {
     temporary_path: Option<PathBuf>,
 }
 
+impl FileHandle {
+    /// Removes the host file behind a tmpfile the guest never linked, if this
+    /// handle holds one.
+    fn remove_temporary(self) -> io::Result<()> {
+        let Some(path) = self.temporary_path else {
+            return Ok(());
+        };
+        match fs::remove_file(path) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// What a handler produced. `Direct` means the handler already placed its
 /// payload in the guest's output descriptors, past the reply header, and
 /// `handle_chain` has nothing left to copy.
@@ -334,8 +348,8 @@ pub struct VirtioFs {
     interrupt_status: u32,
     /// Bitmask of queue indices notified since the last drain: bit `i` set
     /// means queue `i` had a `QUEUE_NOTIFY` land on it. Set by the vCPU
-    /// thread in `mmio`, cleared by `take_notified`/`drain_notified`, which
-    /// only the worker thread calls.
+    /// thread in `mmio`, cleared by `take_notified`/`drain_notified` on the
+    /// worker thread and by `reset` on the vCPU thread.
     ///
     /// This was a plain `u32`, and it was sound only because every caller
     /// held the device mutex. #32 has to stop holding that mutex across a
@@ -522,15 +536,41 @@ impl VirtioFs {
         self.queues.get_mut(self.queue_sel as usize)
     }
 
+    /// Resets the device, as a write of 0 to STATUS requests.
+    ///
+    /// The FUSE session ends with the queues. Open handles, the nodes the guest
+    /// looked up and the sockets it bound exist only for the driver that
+    /// created them, so they are dropped; the root node stays, since every
+    /// session starts from `FUSE_ROOT_ID`. Closing the handles and removing
+    /// unlinked tmpfiles touches the host filesystem on the vCPU thread, once
+    /// per reset and bounded by the handle limit.
+    fn reset(&mut self) {
+        for queue in &mut self.queues {
+            queue.reset();
+        }
+        self.interrupt_status = 0;
+        self.status = 0;
+        self.dev_feat_sel = 0;
+        self.queue_sel = 0;
+        self.notified.store(0, Ordering::Release);
+        for (_, handle) in self.handles.drain() {
+            let _ = handle.remove_temporary();
+        }
+        self.dir_handles.clear();
+        self.sockets.clear();
+        self.nodes.retain(|&node, _| node == FUSE_ROOT_ID);
+        self.inode_ids.retain(|_, &mut node| node == FUSE_ROOT_ID);
+        self.next_node = FUSE_ROOT_ID + 1;
+    }
+
     /// Services a virtio-mmio register access.
     ///
     /// `QUEUE_NOTIFY` never runs a FUSE request here: it only records the
     /// queue index in `notified` and returns. That is what keeps the vCPU
     /// off the host filesystem -- `spawn_fs_worker` (`machine_macos.rs`) is
     /// the thread that actually calls `process_queue`, off the exit path
-    /// entirely. Every other register (status, queue programming, config
-    /// reads, `INTERRUPT_ACK`) is cheap and stays handled inline here, same
-    /// as before.
+    /// entirely. Every other register is handled inline here; `reset` is the
+    /// one whose work reaches the host filesystem.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
@@ -552,6 +592,7 @@ impl VirtioFs {
                     self.notified.fetch_or(1 << v, Ordering::Release);
                 }
                 reg::INTERRUPT_ACK => self.interrupt_status &= !v,
+                reg::STATUS if v == 0 => self.reset(),
                 reg::STATUS => self.status = v,
                 reg::QUEUE_DESC_LOW => {
                     if let Some(queue) = self.queue() {
@@ -629,10 +670,10 @@ impl VirtioFs {
     }
 
     /// Drains every queue flagged by a `QUEUE_NOTIFY` since the last drain.
-    /// This is the worker thread's side of Stage A: `mmio` (the vCPU thread)
-    /// only ever sets bits in `notified`, and this is the only thing that
-    /// clears them and actually calls `process_queue`. Always called with
-    /// the device mutex held, and never from the vCPU thread.
+    ///
+    /// The worker thread's half of the notify split: it takes the bits `mmio`
+    /// set in `notified` and calls `process_queue` for each. Always called
+    /// with the device mutex held, and never from the vCPU thread.
     pub(crate) fn drain_notified(&mut self, mem: &GuestRam) {
         self.drain_notified_bounded(mem, u16::MAX);
     }
@@ -747,9 +788,9 @@ impl VirtioFs {
         // FORGET and BATCH_FORGET carry no reply, and Linux sends them with
         // `virtqueue_add_outbuf` -- one out-only descriptor and nothing
         // writable at all -- on the hiprio queue. Refusing every reply-less
-        // chain therefore discarded every one of them, and `forget` is the
-        // only thing that removes entries from `nodes` and `inode_ids`, so
-        // those tables only ever grew for the life of the guest.
+        // chain therefore discarded every one of them, and `forget` is what
+        // removes entries from `nodes` and `inode_ids` between resets, so
+        // those tables only ever grew for the life of a session.
         //
         // Read the opcode before deciding. Anything that does reply still
         // needs somewhere to put the reply, so it is still refused.
@@ -1953,13 +1994,7 @@ impl VirtioFs {
                 return Err(io_errno(io::Error::last_os_error()));
             }
         }
-        if let Some(path) = handle.temporary_path {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(io_errno(err)),
-            }
-        }
+        handle.remove_temporary().map_err(io_errno)?;
         Ok(Vec::new())
     }
 
@@ -7600,6 +7635,43 @@ mod tests {
         dev.drain_notified(&mem);
         assert_eq!(dev.nodes.len(), before, "the reply-less LOOKUP was refused");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Includes an unlinked tmpfile, which must leave the host with its handle,
+    // and a lookup by the next session against the surviving root node.
+    #[test]
+    fn status_reset_releases_handles_and_nodes() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"x").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let input = vec![0u8; 8]; // O_RDONLY
+        let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "the open succeeded");
+
+        let mut input = vec![0u8; 16];
+        input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        input[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        let out = dev.handle_fuse(&request(TMPFILE, FUSE_ROOT_ID, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "the tmpfile was created");
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+        let temporary = dev.handles[&fh].temporary_path.clone().unwrap();
+        assert!(temporary.exists());
+        assert_eq!(dev.open_handle_count(), 2);
+
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        dev.mmio(&mem, reg::STATUS, true, 0);
+        assert_eq!(dev.open_handle_count(), 0, "the handles were released");
+        assert!(!temporary.exists(), "the unlinked tmpfile was removed");
+        assert!(!dev.nodes.contains_key(&node), "the node was dropped");
+        assert_eq!(dev.nodes.len(), 1, "only the root remains");
+        assert_eq!(dev.inode_ids.len(), 1);
+
+        let again = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        assert!(
+            dev.nodes.contains_key(&again),
+            "a new session can look it up"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

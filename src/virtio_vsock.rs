@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
 use crate::guestmem::GuestRam;
@@ -146,7 +147,10 @@ enum ConnState {
 
 /// One exec session: a host Unix stream mapped to a guest vsock stream.
 struct Conn {
-    stream: UnixStream, // write half (guest -> host); reader thread clones it
+    // Write half (guest -> host). A clone of it is read elsewhere, so ending a
+    // session takes `shutdown`; a drop alone leaves the clone and the peer
+    // open.
+    stream: UnixStream,
     state: ConnState,
     rx_cnt: u32,          // bytes we've received from the guest (our fwd_cnt)
     pending_out: Vec<u8>, // host bytes buffered until the guest accepts
@@ -188,6 +192,24 @@ impl VirtioVsock {
 
     fn queue(&mut self) -> &mut Queue {
         &mut self.queues[(self.queue_sel % 3) as usize]
+    }
+
+    /// Resets the device, as a write of 0 to STATUS requests.
+    ///
+    /// Every session is dropped with the queues, since the guest agent that
+    /// initializes the device again has never seen their `OP_REQUEST`.
+    fn reset(&mut self) {
+        for queue in &mut self.queues {
+            queue.reset();
+        }
+        self.interrupt_status = 0;
+        self.status = 0;
+        self.dev_feat_sel = 0;
+        self.queue_sel = 0;
+        self.pending.clear();
+        for (_, conn) in self.conns.drain() {
+            let _ = conn.stream.shutdown(Shutdown::Both);
+        }
     }
 
     /// Registers a new host connection, returning its assigned local port.
@@ -296,6 +318,7 @@ impl VirtioVsock {
                     _ => {}
                 },
                 reg::INTERRUPT_ACK => self.interrupt_status &= !v,
+                reg::STATUS if v == 0 => self.reset(),
                 reg::STATUS => self.status = v,
                 reg::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
                 reg::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
@@ -594,6 +617,8 @@ mod session_tests {
     use std::io::Read;
     use std::time::Duration;
 
+    use crate::virtio::VIRTQ_DESC_F_WRITE;
+
     fn mem_of(len: usize) -> GuestRam {
         GuestRam::from_ranges(&[(0x4000_0000, len)])
     }
@@ -615,6 +640,103 @@ mod session_tests {
         p
     }
 
+    /// Programs `queue` the way the Linux virtio-mmio driver does: select,
+    /// size, the three ring addresses, then READY last.
+    fn program_queue(
+        dev: &mut VirtioVsock,
+        mem: &GuestRam,
+        queue: u16,
+        desc: u64,
+        avail: u64,
+        used: u64,
+    ) {
+        dev.mmio(mem, reg::QUEUE_SEL, true, u64::from(queue));
+        dev.mmio(mem, reg::QUEUE_NUM, true, 8);
+        dev.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        dev.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
+        dev.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        dev.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        dev.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        dev.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
+        dev.mmio(mem, reg::QUEUE_READY, true, 1);
+    }
+
+    /// Posts descriptor `idx`, a 64-byte writable buffer at `buffer`, as the
+    /// next entry of an 8-entry avail ring.
+    fn post_rx_buffer(mem: &GuestRam, desc: u64, avail: u64, idx: u16, buffer: u64) {
+        let descriptor = desc + u64::from(idx) * 16;
+        mem.write_u64(descriptor, buffer).unwrap();
+        mem.write_u32(descriptor + 8, 64).unwrap();
+        mem.write_u16(descriptor + 12, VIRTQ_DESC_F_WRITE).unwrap();
+        mem.write_u16(descriptor + 14, 0).unwrap();
+        let avail_idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(avail_idx % 8) * 2, idx)
+            .unwrap();
+        mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
+    }
+
+    // A packet queued before the reset must not reach the ring the guest
+    // programs after it.
+    #[test]
+    fn status_reset_drops_the_sessions_and_closes_their_host_ends() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = mem_of(0x8000);
+        let mut dev = VirtioVsock::new();
+        program_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+        post_rx_buffer(&mem, BASE, BASE + 0x1000, 0, BASE + 0x3000);
+
+        let (first, mut first_peer) = UnixStream::pair().unwrap();
+        let (second, mut second_peer) = UnixStream::pair().unwrap();
+        // The clones stand in for the reader thread's copies of the sockets.
+        // Timeouts are set before the reset, since macOS refuses the option on
+        // a socket whose peer has shut down.
+        let mut first_reader = first.try_clone().unwrap();
+        let mut second_reader = second.try_clone().unwrap();
+        for socket in [&first_peer, &second_peer, &first_reader, &second_reader] {
+            socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+        }
+        let first_port = dev.add_conn(first);
+        dev.connect(&mem, first_port);
+        assert_eq!(
+            mem.read_u16(BASE + 0x2000 + 2).unwrap(),
+            1,
+            "the first REQUEST took the one RX buffer"
+        );
+        // No buffer is left, so this REQUEST waits in `pending`.
+        let second_port = dev.add_conn(second);
+        dev.connect(&mem, second_port);
+
+        dev.mmio(&mem, reg::STATUS, true, 0);
+        for socket in [
+            &mut first_reader,
+            &mut second_reader,
+            &mut first_peer,
+            &mut second_peer,
+        ] {
+            assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0, "the socket saw EOF");
+        }
+
+        program_queue(
+            &mut dev,
+            &mem,
+            RX_QUEUE,
+            BASE + 0x4000,
+            BASE + 0x5000,
+            BASE + 0x6000,
+        );
+        post_rx_buffer(&mem, BASE + 0x4000, BASE + 0x5000, 0, BASE + 0x7000);
+        post_rx_buffer(&mem, BASE + 0x4000, BASE + 0x5000, 1, BASE + 0x7100);
+        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(RX_QUEUE));
+        dev.host_data(&mem, first_port, b"late");
+        assert_eq!(
+            mem.read_u16(BASE + 0x6000 + 2).unwrap(),
+            0,
+            "nothing from before the reset reached the fresh ring"
+        );
+    }
+
     fn recv(s: &mut UnixStream, n: usize) -> Option<Vec<u8>> {
         s.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
@@ -627,21 +749,13 @@ mod session_tests {
     /// packet this device carries must be refused before anything is
     /// allocated.
     #[test]
-    fn an_oversized_transmit_chain_is_refused() {
+    fn oversized_transmit_chain_is_refused() {
         const BASE: u64 = 0x4000_0000;
         let mem = mem_of(0x20000);
         let mut dev = VirtioVsock::new();
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
 
-        dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
-        dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
-        dev.mmio(&mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        dev.mmio(&mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        dev.mmio(&mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        dev.mmio(&mem, reg::QUEUE_READY, true, 1);
+        program_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
 
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
@@ -661,22 +775,14 @@ mod session_tests {
     /// one here would report a successful write to a guest whose bytes were
     /// discarded.
     #[test]
-    fn a_full_size_guest_packet_is_carried() {
+    fn full_size_guest_packet_is_carried() {
         const BASE: u64 = 0x4000_0000;
         const PAYLOAD: usize = 64 * 1024;
         let mem = mem_of(0x30000);
         let mut dev = VirtioVsock::new();
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
 
-        dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
-        dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
-        dev.mmio(&mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        dev.mmio(&mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        dev.mmio(&mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        dev.mmio(&mem, reg::QUEUE_READY, true, 1);
+        program_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
 
         let full = pkt(OP_RW, 40000, &vec![0xa5u8; PAYLOAD]);
         assert_eq!(full.len(), HDR_LEN + PAYLOAD);
@@ -696,29 +802,11 @@ mod session_tests {
     /// descriptors accumulates nothing, so `MAX_TX_PACKET` cannot end it and
     /// the ring size is all that stands between a hostile ring and a spin.
     #[test]
-    fn a_tx_descriptor_cycle_runs_out_of_budget() {
+    fn tx_descriptor_cycle_runs_out_of_budget() {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut dev = VirtioVsock::new();
-        dev.mmio(&mem, reg::QUEUE_SEL, true, u64::from(TX_QUEUE));
-        dev.mmio(&mem, reg::QUEUE_NUM, true, 8);
-        dev.mmio(&mem, reg::QUEUE_DESC_LOW, true, BASE & 0xffff_ffff);
-        dev.mmio(&mem, reg::QUEUE_DESC_HIGH, true, BASE >> 32);
-        dev.mmio(
-            &mem,
-            reg::QUEUE_DRIVER_LOW,
-            true,
-            (BASE + 0x1000) & 0xffff_ffff,
-        );
-        dev.mmio(&mem, reg::QUEUE_DRIVER_HIGH, true, (BASE + 0x1000) >> 32);
-        dev.mmio(
-            &mem,
-            reg::QUEUE_DEVICE_LOW,
-            true,
-            (BASE + 0x2000) & 0xffff_ffff,
-        );
-        dev.mmio(&mem, reg::QUEUE_DEVICE_HIGH, true, (BASE + 0x2000) >> 32);
-        dev.mmio(&mem, reg::QUEUE_READY, true, 1);
+        program_queue(&mut dev, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
 
         // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
