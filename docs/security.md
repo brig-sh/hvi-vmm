@@ -51,11 +51,11 @@ happen says so:
 
 ### macOS: Seatbelt
 
-One process-wide profile, entered as the last step before the first vCPU
-starts. It is deny-default, with one static allow rule for `file-ioctl` on
-`/dev/tty`, plus one rule per virtio-fs export by resolved root path:
-`file-read*` for a read-only share, `file-read* file-write*` for a writable
-one.
+One process-wide profile, entered once every host resource is open and before
+the first helper thread or vCPU starts. It is deny-default, with one static
+allow rule for `file-ioctl` on `/dev/tty`, plus one rule per virtio-fs export by
+resolved root path: `file-read*` for a read-only share, `file-read* file-write*`
+for a writable one.
 
 Because it is process-wide and goes up before any vCPU exists, no thread
 touches guest data unconfined.
@@ -84,7 +84,8 @@ Failure behaviour differs by install site, and all three fail closed:
 - A worker thread that cannot install its filter prints `[hvi] FATAL` and
   aborts the process.
 - The main thread installs its own filter after the vCPUs are running, so a
-  failure there exits the process with an error.
+  failure there stops the guest, waits for every thread and returns the error
+  from `boot`.
 
 ### `HVI_SECCOMP=log` turns enforcement off
 
@@ -104,7 +105,7 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 16 probes, 9 expect a SIGSYS trap, 7 expect success
+hvi seccomp-selftest    # Linux: 19 probes, 9 expect a SIGSYS trap, 10 expect success
 ```
 
 Both install the profile or the filters that actually ship and check both

@@ -242,18 +242,20 @@ unsafe impl Send for ReadOnlyRam {}
 unsafe impl Sync for ReadOnlyRam {}
 
 impl ReadOnlyRam {
-    fn map(fd: std::os::fd::RawFd, regions: &[MemRegion]) -> std::io::Result<Self> {
+    fn map(fd: std::os::fd::BorrowedFd<'_>, regions: &[MemRegion]) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
         let mut maps = Vec::with_capacity(regions.len());
         for r in regions {
-            // SAFETY: mapping `size` bytes at `file_offset` of a descriptor the
-            // VMM owns and keeps open for the VM's lifetime.
+            // SAFETY: mapping `size` bytes at `file_offset` of a descriptor
+            // that is open for the duration of the call; the mapping does not
+            // need it afterwards.
             let p = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
                     r.size as usize,
                     libc::PROT_READ,
                     libc::MAP_SHARED,
-                    fd,
+                    fd.as_raw_fd(),
                     r.file_offset as libc::off_t,
                 )
             };
@@ -378,6 +380,7 @@ impl IoSink for TraceSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
 
     /// A chain forwards each hook to every member, in order.
     #[test]
@@ -432,7 +435,7 @@ mod tests {
             .expect("writable side")
             .write_u8(0x4000_0000, 0xAB)
             .expect("write");
-        let view = ReadOnlyRam::map(ram.fd(), &regions).expect("map");
+        let view = ReadOnlyRam::map(ram.file().as_fd(), &regions).expect("map");
         assert_eq!(view.slice(0)[0], 0xAB);
         assert_eq!(view.slice(0).len(), MemRegion::ALIGN as usize);
     }
