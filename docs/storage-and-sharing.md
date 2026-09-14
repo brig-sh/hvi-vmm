@@ -131,8 +131,9 @@ tested, not as proven.
 
 ### Limits worth knowing before you share real data
 
-- **The node table has no cap.** `FORGET` is what shrinks it. A guest that
-  never sends one grows the table for the life of the VM.
+- **The node table has no cap.** `FORGET` is what shrinks it between device
+  resets. A guest that never sends one grows the table until it resets the
+  device.
 - **`SETLKW` blocks under the device mutex.** A guest waiting on a lock stalls
   that whole device, and stalls the vCPU that issued the request whenever the
   queue was shallow enough to be drained inline.
