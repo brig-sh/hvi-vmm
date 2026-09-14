@@ -483,7 +483,9 @@ impl VirtioVsock {
                     .get(&port)
                     .is_some_and(|c| c.state != ConnState::New) =>
             {
-                self.conns.remove(&port);
+                if let Some(conn) = self.conns.remove(&port) {
+                    let _ = conn.stream.shutdown(Shutdown::Both);
+                }
             }
             OP_REQUEST => {
                 // Guest-initiated connect: not supported here — reset it.
@@ -973,6 +975,30 @@ mod session_tests {
         dev.connect(&mem, port);
         dev.handle_pkt(&mem, &pkt(OP_SHUTDOWN, port, &[]));
         assert!(!dev.conns.contains_key(&port), "its own session closes");
+    }
+
+    // The clone stands in for the reader thread's copy of the socket, which
+    // must see EOF too.
+    #[test]
+    fn guest_close_shuts_down_the_host_end() {
+        let mem = mem_of(0x1000);
+        let mut dev = VirtioVsock::new();
+        let (dev_side, mut peer) = UnixStream::pair().unwrap();
+        let mut reader = dev_side.try_clone().unwrap();
+        for socket in [&peer, &reader] {
+            socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+        }
+        let port = dev.add_conn(dev_side);
+        dev.connect(&mem, port);
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+
+        dev.handle_pkt(&mem, &pkt(OP_SHUTDOWN, port, &[]));
+        assert!(!dev.conns.contains_key(&port));
+        for socket in [&mut reader, &mut peer] {
+            assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0, "the socket saw EOF");
+        }
     }
 
     /// The happy path is intact: offer, accept, relay both ways.
