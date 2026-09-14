@@ -57,7 +57,7 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| The ledger is not lossless. | It drains when a new event arrives more than 100 ms after the last drain. Events before a quiet period stay buffered. A killed VMM loses the tail. | Design |
+| The ledger is not lossless. | It drains when a new event arrives more than 100 ms after the last drain. Events before a quiet period stay buffered. A killed VMM loses the tail; a guest that stops on its own does not, because `boot` flushes before it returns. | Design |
 | The ledger is not tamper-proof. | An ordinary file written by the VMM. Nothing signs or chains it. | Design |
 | `net` records are per packet and egress only. | No flow aggregation. `direction` and `guest_initiated` are constants, not observations. Inbound frames produce no record. | Design |
 | `ts` is host wall-clock. | It is not monotonic and can move backwards. | Design |

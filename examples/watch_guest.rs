@@ -30,7 +30,7 @@
 //!
 //! On Linux the signing step does not apply; the binary needs `/dev/kvm`.
 //!
-//! The four rules it demonstrates are the four that fail quietly:
+//! It demonstrates the first four rules that fail quietly:
 //!
 //! 1. `safepoint` runs between guest entries, so the nothing-to-do case is one
 //!    atomic load and a return.

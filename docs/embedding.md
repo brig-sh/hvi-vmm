@@ -37,7 +37,22 @@ CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,
 call `boot` again yourself.
 
-The call blocks until the guest stops. One process runs one guest.
+The call blocks until the guest stops. It reads the process's stdin for the
+whole run, one byte at a time, as the guest console; nothing else in the process
+should read stdin while `boot` runs. Before it returns, the ledger is flushed,
+the agent listener and every accepted agent connection are closed, and every
+thread it started itself has exited, with one exception: a helper thread still
+running one second after the stop is left running and `boot` returns an error
+naming it. The waits it cannot interrupt are a plugin blocking in `request` and
+a virtio-fs worker waiting on a host file lock. A plugin that keeps the `Arc<dyn
+VmHandle>` it was given keeps the VM alive until it drops the handle. The handle
+holds guest RAM, the VM, the ledger file, and each device. The tap under
+`--net-tap` keeps its carrier up. The connection to the gateway under
+`--net-gateway` and the disk stay open. The handle also holds the plugin, so a
+handle stored in a plugin field is never dropped. A thread the plugin started
+from `attach` is not joined either, and holds the handle for as long as it runs.
+On macOS a second `boot` fails while such a handle exists, because
+Hypervisor.framework allows one VM per process.
 
 ## A minimal caller
 
