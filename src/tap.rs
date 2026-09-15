@@ -66,9 +66,10 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
 /// Checks the interface name fits an `ifreq`: 1..=15 bytes (`IFNAMSIZ` minus
 /// the terminating NUL). Pure, so the check is testable without
 /// `/dev/net/tun` -- which is also why it is only *called* on Linux.
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_name(name: &str) -> std::io::Result<()> {
-    if name.is_empty() || name.len() >= 16 {
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "tap name must be 1..15 bytes",
@@ -86,20 +87,14 @@ mod attach {
 
     use super::NET_HDR_LEN;
 
-    const IFF_TAP: i16 = 0x0002;
-    const IFF_NO_PI: i16 = 0x1000;
-    const IFF_VNET_HDR: i16 = 0x4000;
-    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-    const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
-
     /// `virtio_net_hdr_v1`, the header hvi speaks (VIRTIO_F_VERSION_1). tun
     /// would otherwise assume the 10-byte legacy `virtio_net_hdr`.
     const VNET_HDR_SZ: libc::c_int = NET_HDR_LEN as libc::c_int;
 
-    /// `struct ifreq`: a 16-byte name followed by a 24-byte union.
+    /// `struct ifreq`: an `IFNAMSIZ`-byte name followed by a 24-byte union.
     #[repr(C)]
     struct IfReq {
-        name: [u8; 16],
+        name: [u8; libc::IFNAMSIZ],
         flags: i16,
         _pad: [u8; 22],
     }
@@ -122,19 +117,19 @@ mod attach {
         // path out of this function, including the ioctl error below.
         let file = unsafe { File::from_raw_fd(fd) };
         let mut req = IfReq {
-            name: [0; 16],
-            flags: IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
+            name: [0; libc::IFNAMSIZ],
+            flags: (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as i16,
             _pad: [0; 22],
         };
         req.name[..name.len()].copy_from_slice(name.as_bytes());
         // SAFETY: fd is a tun character device and req is a correctly shaped
         // ifreq.
-        if unsafe { libc::ioctl(fd, TUNSETIFF, std::ptr::addr_of_mut!(req)) } < 0 {
+        if unsafe { libc::ioctl(fd, libc::TUNSETIFF, std::ptr::addr_of_mut!(req)) } < 0 {
             return Err(io::Error::last_os_error());
         }
         let mut sz: libc::c_int = VNET_HDR_SZ;
         // SAFETY: fd is an attached tap and sz is a live c_int for the call.
-        if unsafe { libc::ioctl(fd, TUNSETVNETHDRSZ, std::ptr::addr_of_mut!(sz)) } < 0 {
+        if unsafe { libc::ioctl(fd, libc::TUNSETVNETHDRSZ, std::ptr::addr_of_mut!(sz)) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(file)
@@ -146,7 +141,9 @@ pub use attach::open;
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mac, prepend_vnet_hdr, strip_vnet_hdr, validate_name, NET_HDR_LEN};
+    #[cfg(unix)]
+    use super::validate_name;
+    use super::{parse_mac, prepend_vnet_hdr, strip_vnet_hdr, NET_HDR_LEN};
 
     #[test]
     fn parses_a_mac() {
@@ -192,12 +189,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn tap_names_are_length_checked() {
-        // The name lands in a fixed 16-byte ifreq field, NUL included: empty
-        // names and names past IFNAMSIZ-1 must be refused before any ioctl,
-        // and a bad name is a boot error (not a fallback), so the message is
-        // what an operator sees.
+        // The name lands in a fixed `IFNAMSIZ`-byte ifreq field, NUL included:
+        // empty names and names past IFNAMSIZ-1 must be refused before any
+        // ioctl, and a bad name is a boot error (not a fallback), so
+        // the message is what an operator sees.
         assert!(validate_name("").is_err(), "empty");
         assert!(
             validate_name("0123456789abcdef").is_err(),
