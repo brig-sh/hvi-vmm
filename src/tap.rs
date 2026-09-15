@@ -99,17 +99,24 @@ mod attach {
         _pad: [u8; 22],
     }
 
-    /// Opens `/dev/net/tun` and attaches it to the existing tap named `name`.
+    /// Opens `/dev/net/tun` non-blocking and attaches it to the existing tap
+    /// named `name`.
     ///
     /// The flags have to match how urunc created the device (it passes
     /// `TUNTAP_VNET_HDR`), otherwise `TUNSETIFF` fails with `EINVAL`. Carrier
     /// comes up as soon as this succeeds, which is what lets the guest ARP its
     /// gateway.
+    ///
+    /// The descriptor is non-blocking so the reader thread's `read` returns
+    /// `WouldBlock` on an empty queue and one wakeup can drain it. The flag
+    /// covers the device's writer as well, which shares the open file
+    /// description: a write into a full send buffer fails with `WouldBlock`
+    /// instead of blocking the vCPU.
     pub fn open(name: &str) -> io::Result<File> {
         super::validate_name(name)?;
         // SAFETY: a plain open(2) of a character device with a NUL-terminated
         // path.
-        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
+        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }

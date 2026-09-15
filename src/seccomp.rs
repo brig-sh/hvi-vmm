@@ -461,6 +461,18 @@ fn probes() -> Vec<Probe> {
             },
         },
         Probe {
+            what: "receive without blocking on an inherited descriptor (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            // The gateway relay drains its socket with `recv(MSG_DONTWAIT)`.
+            run: || {
+                // SAFETY: a zero-length receive on fd 1, which we inherited,
+                // so a stream socket loses nothing. The filter has passed the
+                // call before the kernel looks at the length.
+                unsafe { libc::recv(1, std::ptr::null_mut(), 0, libc::MSG_DONTWAIT) };
+            },
+        },
+        Probe {
             what: "signal a thread of this process (vmm)",
             thread: Thread::Vmm,
             expect_ok: true,

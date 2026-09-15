@@ -13,7 +13,7 @@
             {"syscall": "fdatasync", "comment": "virtio-blk flush: what File::sync_data calls"},
             {"syscall": "fsync", "comment": "safety net: sync_all, if a flush ever needs metadata"},
             {"syscall": "close", "comment": "accepted connections, dropped descriptors"},
-            {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end; the stop request"},
+            {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end; the stop request; the gateway relay ending"},
             {"syscall": "fcntl", "comment": "set_nonblocking on accepted sockets"},
             {"syscall": "ioctl", "comment": "KVM_RUN and friends; TUNSETIFF is pre-filter"},
             {"syscall": "accept4", "comment": "control socket and the agent bridge"},

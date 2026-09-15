@@ -42,7 +42,7 @@
 //!   in this mode too.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -82,14 +82,27 @@ pub fn stub_stack_line() -> String {
 pub const NET_HDR_LEN: usize =
     std::mem::size_of::<virtio_bindings::virtio_net::virtio_net_hdr_v1>();
 
+/// The largest frame the readers accept.
+///
+/// It is also the size of the tap and gateway read buffers, and the frame part
+/// of [`MAX_TX_FRAME`].
+const MAX_FRAME_LEN: usize = 65_536;
+
 /// Ceiling on the frame a transmit chain may assemble.
 ///
 /// Descriptor lengths are guest-controlled, so without a ceiling the guest
-/// decides how much the host allocates and zeroes for one frame. The gateway
-/// relay already refuses anything longer than 64 KiB and no MTU this device
-/// serves comes near it, so a chain claiming more is either broken or
-/// deliberate.
-const MAX_TX_FRAME: usize = NET_HDR_LEN + 65536;
+/// decides how much the host allocates and zeroes for one frame. No MTU this
+/// device serves comes near [`MAX_FRAME_LEN`], so a longer chain is rejected.
+const MAX_TX_FRAME: usize = NET_HDR_LEN + MAX_FRAME_LEN;
+
+/// The size of the length prefix on each frame of the gateway stream, a
+/// big-endian `u32`.
+const FRAME_LEN_PREFIX: usize = std::mem::size_of::<u32>();
+
+/// Reads a relay makes after one wakeup before it checks for a stop again.
+///
+/// Bounds how long a stop request waits under continuous traffic.
+const DRAIN_BURST: usize = 256;
 
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
@@ -120,6 +133,239 @@ pub fn share(dev: Option<VirtioNet>, mac: Option<[u8; 6]>) -> Option<Arc<Mutex<V
     })
 }
 
+/// The frames of the gateway stream, reassembled from whatever each receive
+/// returns.
+///
+/// The stream carries each frame as a 4-byte big-endian length followed by the
+/// frame, as [`VirtioNet::relay_to_gateway`] writes it. A zero length is a
+/// keepalive and is skipped.
+#[derive(Default)]
+struct GatewayFrames {
+    buf: Vec<u8>,
+    /// Offset of the first byte not yet consumed.
+    start: usize,
+}
+
+impl GatewayFrames {
+    /// Appends bytes read from the stream.
+    fn push(&mut self, bytes: &[u8]) {
+        // Compacting once the consumed part reaches half the buffer keeps it
+        // bounded without copying the pending bytes on every push.
+        if self.start >= self.buf.len() - self.start {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Returns the next complete frame, or `None` until more bytes arrive.
+    ///
+    /// A length above [`MAX_FRAME_LEN`] leaves the rest of the stream
+    /// unparsable, so parsing ends on it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when a length exceeds [`MAX_FRAME_LEN`].
+    fn next_frame(&mut self) -> io::Result<Option<&[u8]>> {
+        loop {
+            let pending = &self.buf[self.start..];
+            let Some(len) = pending.get(..FRAME_LEN_PREFIX) else {
+                return Ok(None);
+            };
+            let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
+            if len == 0 {
+                self.start += FRAME_LEN_PREFIX;
+                continue;
+            }
+            if len > MAX_FRAME_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("gateway frame of {len} bytes exceeds {MAX_FRAME_LEN}"),
+                ));
+            }
+            if pending.len() < FRAME_LEN_PREFIX + len {
+                return Ok(None);
+            }
+            let frame = self.start + FRAME_LEN_PREFIX..self.start + FRAME_LEN_PREFIX + len;
+            self.start += FRAME_LEN_PREFIX + len;
+            return Ok(Some(&self.buf[frame]));
+        }
+    }
+}
+
+/// Receives what the socket holds without blocking, whichever mode the socket
+/// is in.
+///
+/// The gateway socket stays blocking, because the device's writes must not
+/// split a frame, so this call passes `MSG_DONTWAIT` per receive.
+///
+/// # Errors
+///
+/// Errors with `WouldBlock` when nothing is queued, and otherwise as `recv`
+/// does.
+fn try_recv(stream: &UnixStream, buf: &mut [u8]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a live socket and a buffer of the stated length.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+/// One relay from the gateway socket to the guest, run on the reader thread.
+///
+/// The relay owns the socket's read side, the frame parser and the receive
+/// buffer for as long as it runs.
+#[cfg(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+))]
+pub(crate) struct GatewayRelay {
+    reader: UnixStream,
+    frames: GatewayFrames,
+    buf: Vec<u8>,
+}
+
+#[cfg(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+))]
+impl GatewayRelay {
+    /// Creates a relay over `reader`, the read side of the gateway socket.
+    #[must_use]
+    pub(crate) fn new(reader: UnixStream) -> Self {
+        Self {
+            reader,
+            frames: GatewayFrames::default(),
+            buf: vec![0u8; MAX_FRAME_LEN],
+        }
+    }
+
+    /// Relays frames to `deliver` until the gateway closes or the stop is
+    /// requested.
+    ///
+    /// After each wakeup it receives what the socket holds without blocking and
+    /// hands every complete frame to `deliver`. At most [`DRAIN_BURST`]
+    /// receives run per wakeup, so a stop request is seen between bursts
+    /// however long the traffic lasts. The socket is shut down as the relay
+    /// ends, whatever ended it, so the device's next write fails instead of
+    /// blocking on a peer nobody reads anymore. macOS refuses the shutdown once
+    /// the peer has half-closed, so a gateway that stops sending but keeps the
+    /// socket open still accepts the device's writes there until its buffer
+    /// fills.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the gateway sends a frame above [`MAX_FRAME_LEN`] or the
+    /// socket fails. A gateway that closes the connection ends the relay with
+    /// `Ok(())`.
+    pub(crate) fn run(
+        &mut self,
+        stop: &crate::teardown::StopToken,
+        mut deliver: impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        use std::os::fd::AsFd;
+        let relayed = 'relay: loop {
+            match stop.wait(self.reader.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+            for _ in 0..DRAIN_BURST {
+                match try_recv(&self.reader, &mut self.buf) {
+                    Ok(0) => break 'relay Ok(()),
+                    Ok(n) => self.frames.push(&self.buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => break 'relay Err(e),
+                }
+                loop {
+                    match self.frames.next_frame() {
+                        Ok(Some(frame)) => deliver(frame),
+                        Ok(None) => break,
+                        Err(e) => break 'relay Err(e),
+                    }
+                }
+            }
+        };
+        let _ = self.reader.shutdown(std::net::Shutdown::Both);
+        relayed
+    }
+}
+
+/// One relay from the tap to the guest, run on the reader thread.
+///
+/// One `read` returns exactly one frame, preceded by the `virtio_net_hdr` the
+/// tap was created with, which [`crate::tap::strip_vnet_hdr`] drops before
+/// delivery. The read buffer is [`MAX_FRAME_LEN`] bytes, so the tap accepts
+/// `NET_HDR_LEN` bytes less than the gateway.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) struct TapRelay {
+    reader: File,
+    buf: Vec<u8>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl TapRelay {
+    /// Creates a relay over `reader`, a non-blocking clone of the tap.
+    #[must_use]
+    pub(crate) fn new(reader: File) -> Self {
+        Self {
+            reader,
+            buf: vec![0u8; MAX_FRAME_LEN],
+        }
+    }
+
+    /// Relays frames to `deliver` until the tap is gone or the stop is
+    /// requested.
+    ///
+    /// After each wakeup it reads until the queue is empty or until it has read
+    /// [`DRAIN_BURST`] frames, so a burst costs one `poll` and a stop request
+    /// is still seen while frames keep arriving.
+    ///
+    /// # Errors
+    ///
+    /// Errors when a read fails with anything but `WouldBlock`. A read of zero
+    /// bytes means the tap is gone and ends the relay with `Ok(())`.
+    pub(crate) fn run(
+        &mut self,
+        stop: &crate::teardown::StopToken,
+        mut deliver: impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        loop {
+            if !stop.wait(self.reader.as_fd())? {
+                return Ok(());
+            }
+            for _ in 0..DRAIN_BURST {
+                let n = match self.reader.read(&mut self.buf) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                };
+                if let Some(frame) = crate::tap::strip_vnet_hdr(&self.buf, n) {
+                    deliver(frame);
+                }
+            }
+        }
+    }
+}
+
 /// A virtio-net device with a user-space capture backend.
 pub struct VirtioNet {
     status: u32,
@@ -134,6 +380,9 @@ pub struct VirtioNet {
     /// machine holds a clone of the read side on a reader thread (see
     /// `spawn_net_gateway_reader`).
     gw: Option<UnixStream>,
+    /// Whether a tap write has already failed, so only the first failure is
+    /// reported.
+    tap_write_reported: bool,
     /// When set, frames go to this tap instead: the container's real NIC path.
     /// The machine keeps a cloned fd on a reader thread
     /// (`spawn_net_tap_reader`).
@@ -157,6 +406,7 @@ impl VirtioNet {
             interrupt_status: 0,
             events: Vec::new(),
             gw: None,
+            tap_write_reported: false,
             tap: None,
             mac: GUEST_MAC,
             sink: None,
@@ -321,6 +571,8 @@ impl VirtioNet {
                 // observe_tx is IPv4-only by design, while a reader with its
                 // own stack should get ARP, IPv6 and anything
                 // else too.
+                // The ledger records the frame before the write, so a frame the
+                // tap's full send buffer refuses still appears in it.
                 if let Some(sink) = self.sink.as_ref() {
                     sink.net(&frame, true);
                 }
@@ -480,9 +732,9 @@ impl VirtioNet {
                 .and_then(|()| sock.write_all(frame))
                 .is_err()
             {
-                // Gateway gone: drop the relay so a stopped gateway doesn't
-                // wedge the vCPU thread. The link stays set;
-                // the RX reader will exit.
+                // The gateway is gone, or `GatewayRelay::run` ended and shut
+                // the socket down. The write fails at once and the frame is
+                // dropped.
             }
         }
     }
@@ -492,9 +744,31 @@ impl VirtioNet {
     /// [`crate::tap::prepend_vnet_hdr`]).
     fn write_to_tap(&mut self, frame: &[u8]) {
         if let Some(tap) = self.tap.as_mut() {
-            if tap.write_all(&crate::tap::prepend_vnet_hdr(frame)).is_err() {
-                // A wedged tap must not block the vCPU thread; the RX reader
-                // will see the same error and exit.
+            match tap.write_all(&crate::tap::prepend_vnet_hdr(frame)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // The tap's send buffer is full. The tap is non-blocking
+                    // (see `tap::open`), so the write fails here instead of
+                    // holding the device lock while the vCPU waits.
+                    if !self.tap_write_reported {
+                        self.tap_write_reported = true;
+                        eprintln!(
+                            "[hvi] virtio-net: the tap's send buffer is full; frames are dropped \
+                             while it stays full"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // The tap is detached (`EBADFD`), its interface is down
+                    // (`EIO`), the kernel could not allocate the frame, or it
+                    // rejected the frame's header. The frame is dropped.
+                    if !self.tap_write_reported {
+                        self.tap_write_reported = true;
+                        eprintln!(
+                            "[hvi] virtio-net: writing to the tap failed ({e}); frames are dropped"
+                        );
+                    }
+                }
             }
         }
     }
@@ -920,6 +1194,272 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    /// Returns `frames` as the device writes them to the gateway, framed by
+    /// `relay_to_gateway`.
+    fn relayed(frames: &[&[u8]]) -> Vec<u8> {
+        let (ours, theirs) = UnixStream::pair().expect("pair");
+        let mut dev = VirtioNet::with_gateway(ours);
+        for frame in frames {
+            dev.relay_to_gateway(frame);
+        }
+        drop(dev);
+        let mut theirs = theirs;
+        let mut out = Vec::new();
+        theirs.read_to_end(&mut out).expect("read");
+        out
+    }
+
+    #[test]
+    fn gateway_frames_reassemble_across_chunk_boundaries() {
+        let bytes = relayed(&[b"first", b"second frame"]);
+        let mut frames = GatewayFrames::default();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for chunk in bytes.chunks(3) {
+            frames.push(chunk);
+            while let Some(frame) = frames.next_frame().expect("well formed") {
+                got.push(frame.to_vec());
+            }
+        }
+        assert_eq!(got, vec![b"first".to_vec(), b"second frame".to_vec()]);
+        assert!(frames.next_frame().expect("well formed").is_none());
+    }
+
+    #[test]
+    fn gateway_frames_skip_keepalives() {
+        let mut frames = GatewayFrames::default();
+        frames.push(&[0, 0, 0, 0]);
+        frames.push(&relayed(&[b"after"]));
+        assert_eq!(
+            frames.next_frame().expect("well formed"),
+            Some(&b"after"[..])
+        );
+    }
+
+    #[test]
+    fn gateway_frames_reject_oversized_length() {
+        let mut frames = GatewayFrames::default();
+        frames.push(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes());
+        assert!(frames.next_frame().is_err());
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+        all(target_arch = "x86_64", target_os = "linux")
+    ))]
+    mod relay {
+        use super::*;
+        use crate::teardown::StopSource;
+
+        #[test]
+        fn delivers_until_the_gateway_closes() {
+            let source = StopSource::new().expect("pair");
+            let (mut ours, theirs) = UnixStream::pair().expect("pair");
+            ours.write_all(&relayed(&[b"one", b"two"])).expect("write");
+            drop(ours);
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            GatewayRelay::new(theirs)
+                .run(&source.token(), |frame| got.push(frame.to_vec()))
+                .expect("relay");
+            assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec()]);
+        }
+
+        #[test]
+        fn returns_when_stopped() {
+            let source = StopSource::new().expect("pair");
+            let (_ours, theirs) = UnixStream::pair().expect("pair");
+            let token = source.token();
+            let relay = std::thread::spawn(move || GatewayRelay::new(theirs).run(&token, |_| {}));
+            source.request_stop();
+            relay.join().expect("thread").expect("relay");
+        }
+
+        // A framing error ends the relay and shuts the socket down, so the
+        // device's writes fail instead of queueing for a peer nobody reads.
+        #[test]
+        fn framing_error_shuts_the_socket_down() {
+            use std::io::Read;
+            let source = StopSource::new().expect("pair");
+            let (hvi, mut gateway) = UnixStream::pair().expect("pair");
+            let mut dev = VirtioNet::with_gateway(hvi.try_clone().expect("clone"));
+            gateway
+                .write_all(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes())
+                .expect("write");
+            let relayed = GatewayRelay::new(hvi).run(&source.token(), |_| {});
+            assert!(relayed.is_err());
+            dev.relay_to_gateway(b"after");
+            let mut buf = [0u8; 16];
+            assert_eq!(
+                gateway.read(&mut buf).expect("read"),
+                0,
+                "the gateway sees EOF"
+            );
+        }
+
+        // A gateway that stops sending but keeps the socket open ends the relay
+        // too, and the device's writes fail rather than queue for it. macOS
+        // refuses the shutdown once the peer has half-closed, so the write goes
+        // through there.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn half_closed_gateway_shuts_the_socket_down() {
+            use std::io::Read;
+            let source = StopSource::new().expect("pair");
+            let (hvi, mut gateway) = UnixStream::pair().expect("pair");
+            let mut dev = VirtioNet::with_gateway(hvi.try_clone().expect("clone"));
+            gateway
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown");
+            GatewayRelay::new(hvi)
+                .run(&source.token(), |_| {})
+                .expect("relay");
+            dev.relay_to_gateway(b"after");
+            let mut buf = [0u8; 16];
+            assert_eq!(
+                gateway.read(&mut buf).expect("read"),
+                0,
+                "the gateway sees EOF"
+            );
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod tap_relay {
+        use super::*;
+        use crate::teardown::StopSource;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+
+        /// Returns a datagram pair that stands in for the tap.
+        ///
+        /// One `read` returns one frame, and the relay's end is non-blocking as
+        /// `tap::open` makes it. The host end is non-blocking too, so a queue
+        /// too small for a test's frames fails the send instead of blocking it.
+        /// The send buffer is raised above the host's default.
+        fn tap_pair() -> (UnixDatagram, File) {
+            use std::os::fd::AsRawFd;
+            let (host, dev) = UnixDatagram::pair().expect("pair");
+            dev.set_nonblocking(true).expect("nonblocking");
+            host.set_nonblocking(true).expect("nonblocking");
+            let bytes: libc::c_int = 1 << 20;
+            // SAFETY: setsockopt on a socket this test owns, with a live
+            // c_int and its size.
+            let set = unsafe {
+                libc::setsockopt(
+                    host.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::addr_of!(bytes).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "SO_SNDBUF");
+            (host, File::from(OwnedFd::from(dev)))
+        }
+
+        // The device drops a frame the full queue refuses and keeps the tap:
+        // once the queue drains, the next frame goes through.
+        #[test]
+        fn tap_refusing_a_write_drops_the_frame() {
+            let (host, dev) = tap_pair();
+            let mut net = VirtioNet::with_tap(dev);
+            let frame = [0u8; 1514];
+            // Nothing reads the other end, so the queue fills.
+            const WRITTEN: usize = 10_000;
+            for _ in 0..WRITTEN {
+                net.write_to_tap(&frame);
+            }
+            let mut buf = [0u8; 2048];
+            let mut delivered = 0;
+            while host.recv(&mut buf).is_ok() {
+                delivered += 1;
+            }
+            assert!(delivered > 0, "the tap received nothing");
+            assert!(delivered < WRITTEN, "the full queue never refused a write");
+            net.write_to_tap(&frame);
+            assert!(
+                host.recv(&mut buf).is_ok(),
+                "the tap is unusable after a refused write"
+            );
+        }
+
+        #[test]
+        fn delivers_frames_without_their_headers() {
+            let source = StopSource::new().expect("pair");
+            let (host, dev) = tap_pair();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let token = source.token();
+            let relay = std::thread::spawn(move || {
+                TapRelay::new(dev).run(&token, |frame| tx.send(frame.to_vec()).expect("send"))
+            });
+            host.send(&crate::tap::prepend_vnet_hdr(b"one"))
+                .expect("send");
+            host.send(&crate::tap::prepend_vnet_hdr(b"two"))
+                .expect("send");
+            let wait = std::time::Duration::from_secs(5);
+            assert_eq!(rx.recv_timeout(wait).expect("first"), b"one".to_vec());
+            assert_eq!(rx.recv_timeout(wait).expect("second"), b"two".to_vec());
+            source.request_stop();
+            relay.join().expect("thread").expect("relay");
+        }
+
+        // Pins the burst size from both sides: the wakeup neither stops short
+        // of `DRAIN_BURST` nor runs past it. The stop is requested from the
+        // first delivery, so the wakeup still drains its whole burst, and the
+        // wait that follows sees the stop before the frames left over.
+        #[test]
+        fn delivers_one_burst_per_wakeup() {
+            let source = StopSource::new().expect("pair");
+            let (host, dev) = tap_pair();
+            let frame = crate::tap::prepend_vnet_hdr(b"x");
+            let mut queued = 0;
+            while host.send(&frame).is_ok() {
+                queued += 1;
+            }
+            assert!(
+                queued > DRAIN_BURST,
+                "the socket holds {queued} frames, the test needs more than one burst"
+            );
+            let mut delivered = 0;
+            TapRelay::new(dev)
+                .run(&source.token(), |_| {
+                    delivered += 1;
+                    if delivered == 1 {
+                        source.request_stop();
+                    }
+                })
+                .expect("relay");
+            assert_eq!(delivered, DRAIN_BURST);
+        }
+
+        #[test]
+        fn returns_when_stopped() {
+            let source = StopSource::new().expect("pair");
+            let (_host, dev) = tap_pair();
+            let token = source.token();
+            let relay = std::thread::spawn(move || TapRelay::new(dev).run(&token, |_| {}));
+            source.request_stop();
+            relay.join().expect("thread").expect("relay");
+        }
+    }
+
+    #[test]
+    fn try_recv_reports_empty_socket_without_blocking() {
+        let (mut ours, theirs) = UnixStream::pair().expect("pair");
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            try_recv(&theirs, &mut buf)
+                .expect_err("nothing queued")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        ours.write_all(b"abc").expect("write");
+        assert_eq!(try_recv(&theirs, &mut buf).expect("queued"), 3);
+    }
 
     /// Programs a queue the way the Linux virtio-mmio driver does: select it,
     /// size it, set the three ring addresses, then READY last.
@@ -1209,7 +1749,7 @@ mod tests {
 
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
-        let oversized = (NET_HDR_LEN + 65536 + 1) as u32;
+        let oversized = (MAX_TX_FRAME + 1) as u32;
         mem.write_u64(desc, data).unwrap();
         mem.write_u32(desc + 8, oversized).unwrap();
         mem.write_u16(desc + 12, 0).unwrap();
