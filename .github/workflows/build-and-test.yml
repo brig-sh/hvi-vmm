@@ -1,7 +1,7 @@
 name: Build and test
 
 # Build and run what a hosted runner can actually run: the unit suites on both
-# host backends, and a live boot on each of the three backends.
+# host backends and on musl, and a live boot on each of the three backends.
 
 on:
   workflow_call:
@@ -81,6 +81,29 @@ jobs:
       - run: cargo build --release
       - name: selftest
         run: ./target/release/hvi seccomp-selftest
+
+  # The x86-64/KVM backend linked against musl, the libc of the published
+  # static binary: build, the unit suite on that target, then the seccomp
+  # selftest on the musl binary. The allowlists were measured under glibc,
+  # and musl can reach a different syscall than glibc for the same library
+  # call, so the selftest on this binary is what catches a gap for musl. Like
+  # the job above it needs no /dev/kvm.
+  test-linux-musl:
+    name: Test linux/musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: x86_64-unknown-linux-musl
+          cache-key: x86_64-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo test --target x86_64-unknown-linux-musl
+      - name: selftest
+        run: ./target/x86_64-unknown-linux-musl/release/hvi seccomp-selftest
 
   # macOS / Apple silicon backend: Hypervisor.framework build and unit tests,
   # plus the ad-hoc signing step, since an unsigned binary cannot create a VM.
@@ -247,14 +270,22 @@ jobs:
           echo "loop device: $LOOP"
           # Build the test binary as the runner user, so the cargo caches stay
           # unowned by root; only the test itself needs sudo to open the device.
+          # The test is in the library, so pick the lib test artifact: the bin
+          # artifact lists no test by this name, and the harness exits 0 on a
+          # filter that matches nothing, so the step is also held to one pass.
+          # The loop device is detached before that check, so a failing test
+          # does not leave it behind on the runner.
           BIN=$(cargo test --release --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true
-                            and .target.name=="hvi" and (.target.kind|contains(["bin"])))
+                            and .target.name=="hvi" and (.target.kind|contains(["lib"])))
                      | .executable')
           echo "test binary: $BIN"
           sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
-            virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture
+            virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture \
+            | tee blk.log || true
           sudo losetup -d "$LOOP"
+          grep -q "test result: ok. 1 passed" blk.log \
+            || { echo "::error::the block-device size test did not pass"; exit 1; }
       # The searches above keep only the lines they match. When the job
       # fails, the full log answers what those lines cannot.
       - name: keep the boot evidence
@@ -266,6 +297,7 @@ jobs:
             boot.log
             boot-vmlinux.log
             boot-4g.log
+            blk.log
           retention-days: 7
           if-no-files-found: ignore
 
