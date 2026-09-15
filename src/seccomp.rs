@@ -32,16 +32,19 @@
 //! What is deliberately *not* reused is the content of Firecracker's filters,
 //! and that is worth writing down because it is the opposite of what you would
 //! expect. Firecracker ships `x86_64-unknown-linux-musl.json` and
-//! `aarch64-unknown-linux-musl.json` -- musl only -- and drives its devices
-//! with epoll and io_uring. hvi is glibc and uses blocking reads on dedicated
-//! threads. Their lists therefore carry `open`, `stat`, `io_uring_*` and
-//! `epoll_*`, which we never call, and omit `openat`, `statx`, `rseq`,
-//! `set_robust_list`, `sched_getaffinity` and `clone3`, without which a glibc
-//! Rust binary dies before it reaches `main`. Vendoring them would have been
-//! simultaneously too loose and fatally too tight. So the lists are measured
-//! from hvi under `strace -f`, and the entries that our trace did *not* show
-//! are marked in the JSON as safety nets taken from their production experience
-//! -- which is the part of Firecracker's work that actually transfers.
+//! `aarch64-unknown-linux-musl.json`, musl only, and drives its devices with
+//! epoll and io_uring. hvi's lists were measured on a glibc build, and hvi
+//! uses blocking reads on dedicated threads. Their lists therefore carry
+//! `open`, `stat`, `io_uring_*` and `epoll_*`, which we never call, and omit
+//! `openat`, `statx`, `rseq`, `set_robust_list`, `sched_getaffinity` and
+//! `clone3`, without which a glibc Rust binary dies before it reaches `main`.
+//! Vendoring them would have been simultaneously too loose and fatally too
+//! tight. So the lists are measured from hvi under `strace -f`, and the entries
+//! that our trace did *not* show are marked in the JSON as safety nets taken
+//! from their production experience, which is the part of Firecracker's work
+//! that transfers. The musl build shares the lists. musl can reach a different
+//! syscall than glibc for the same library call, so `hvi seccomp-selftest` run
+//! on the musl binary is the check for that.
 //!
 //! Firecracker's *jailer* is a different question and the answer is no. It is a
 //! launcher binary -- chroot, cgroups, netns, uid drop -- not a library, so
@@ -447,6 +450,16 @@ fn probes() -> Vec<Probe> {
             // the filter is in.
             run: || {
                 let _ = std::thread::spawn(|| 0u8).join();
+            },
+        },
+        // The debug watchdog sleeps under the vmm filter, and which syscall
+        // a sleep reaches depends on std and the libc.
+        Probe {
+            what: "sleep (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            run: || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             },
         },
     ]

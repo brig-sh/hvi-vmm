@@ -32,19 +32,23 @@ obvious first move. They were measured instead, and that is a deliberate
 deviation rather than an oversight.
 
 Firecracker ships `x86_64-unknown-linux-musl.json` and
-`aarch64-unknown-linux-musl.json` -- musl only -- and drives its devices with
-epoll and io_uring. hvi is glibc and uses blocking reads on dedicated threads.
-So their lists carry `open`, `stat`, `io_uring_*` and `epoll_*`, which we never
-call, and omit `openat`, `statx`, `rseq`, `set_robust_list`,
-`sched_getaffinity` and `clone3`, without which a glibc Rust binary does not
-reach `main`. Copying them would have been simultaneously too loose and fatally
-too tight, so no code or list of theirs is included here and no attribution is
-owed.
+`aarch64-unknown-linux-musl.json`, musl only, and drives its devices with epoll
+and io_uring. hvi's lists were measured on a glibc build, and hvi uses blocking
+reads on dedicated threads. So their lists carry `open`, `stat`, `io_uring_*`
+and `epoll_*`, which we never call, and omit `openat`, `statx`, `rseq`,
+`set_robust_list`, `sched_getaffinity` and `clone3`, without which a glibc Rust
+binary does not reach `main`. Copying them would have been simultaneously too
+loose and fatally too tight, so no code or list of theirs is included here and
+no attribution is owed.
 
 What does transfer is their production experience about the rare paths a single
 trace never shows. Entries our own trace did not produce are marked
 `"comment": "safety net: ..."`, and most of those came from reading their
 lists.
+
+The musl build shares the lists. musl can reach a different syscall than glibc
+for the same library call, so `hvi seccomp-selftest` run on the musl binary is
+the check for that.
 
 ## Changing a list
 
