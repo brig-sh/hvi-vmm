@@ -300,8 +300,9 @@ fn backing_len(file: &File) -> std::io::Result<u64> {
         use std::os::unix::io::AsRawFd;
 
         if meta.file_type().is_block_device() {
-            // BLKGETSIZE64: _IOR(0x12, 114, size_t), the size in bytes.
-            const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+            // The device size in bytes; BLKGETSIZE counts 512-byte sectors.
+            // libc declares no BLKGETSIZE64, so the request is built here.
+            const BLKGETSIZE64: libc::Ioctl = libc::_IOR::<usize>(0x12, 114);
             let mut size: u64 = 0;
             // SAFETY: `file` is an open block device and `size` is a live u64
             // that the ioctl writes exactly one u64 into.
