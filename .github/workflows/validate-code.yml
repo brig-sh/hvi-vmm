@@ -1,7 +1,8 @@
 name: Validate code
 
 # Lint only, read-only: format, comment reflow, clippy and rustdoc, once per
-# backend. Building and testing is build-and-test.yml.
+# backend and once for the musl libc. Building and testing is
+# build-and-test.yml.
 
 on:
   workflow_call:
@@ -46,6 +47,26 @@ jobs:
           target: aarch64-unknown-linux-gnu
           cache-key: aarch64-linux
       - run: tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
+
+  # The x86-64/KVM backend against musl, the libc of the published static
+  # binary. The two libcs type the `ioctl` request differently (`c_int` on
+  # musl, `c_ulong` on glibc), so a request constant written with the glibc
+  # type passes every other lint here and fails only in a downstream static
+  # build. Lint only, like the aarch64 job: clippy and rustdoc need no musl
+  # linker.
+  tidy-linux-musl:
+    name: Tidy linux/musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: x86_64-unknown-linux-musl
+          cache-key: x86_64-musl
+      - run: tools/tidy.sh --check --lint-only --target x86_64-unknown-linux-musl
 
   # Lints the workflows. The build-and-test jobs hold a lot of bash: loop
   # devices, taps and boot-log searches. A quoting or expression error there
