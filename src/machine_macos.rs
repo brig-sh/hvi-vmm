@@ -1283,41 +1283,29 @@ fn spawn_vsock_bridge(
 /// queue under the device lock, raising the net GIC line and kicking the vCPUs.
 /// Exits when the gateway closes the connection or the stop is requested.
 ///
-/// A stop request is checked before each frame. A gateway that stalls in the
-/// middle of one holds the thread until it sends the rest or closes.
+/// [`crate::virtio_net::GatewayRelay`] owns the wait, the drain and the
+/// framing. This thread supplies the delivery under the device lock, the
+/// interrupt and the kick.
 fn spawn_net_gateway_reader(
-    mut reader: std::os::unix::net::UnixStream,
+    reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
     handles: Arc<Mutex<Vec<VcpuHandle>>>,
     stop: StopToken,
 ) -> JoinHandle<()> {
-    use std::io::Read;
     std::thread::spawn(move || {
-        let mut hdr = [0u8; 4];
-        loop {
-            if !stop.wait(reader.as_fd()).unwrap_or(false) {
-                break;
-            }
-            if reader.read_exact(&mut hdr).is_err() {
-                break; // gateway closed
-            }
-            let len = u32::from_be_bytes(hdr) as usize;
-            if len == 0 || len > 65_536 {
-                continue; // ignore keepalives / implausible frames
-            }
-            let mut frame = vec![0u8; len];
-            if reader.read_exact(&mut frame).is_err() {
-                break;
-            }
+        let relayed = crate::virtio_net::GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
-                d.deliver(&mem, &frame);
+                d.deliver(&mem, frame);
                 d.irq_level()
             };
             let _ = vm.gic_set_spi(VIRTIO_NET_INTID, level);
             kick_all(&vm, &handles);
+        });
+        if let Err(e) = relayed {
+            eprintln!("[hvi] virtio-net: {e}; gateway relay stopped");
         }
     })
 }
