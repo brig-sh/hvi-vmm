@@ -56,6 +56,14 @@ else
     skipped+=("aarch64-linux cross-lint (rustup target add aarch64-unknown-linux-gnu)")
 fi
 
+# The x86-64/KVM backend against musl, the libc the published static binary
+# links. Lint only, like the cross-check above, so no musl linker is needed.
+if rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl; then
+    tools/tidy.sh --check --lint-only --target x86_64-unknown-linux-musl
+else
+    skipped+=("x86_64-musl lint (rustup target add x86_64-unknown-linux-musl)")
+fi
+
 # The unit suite for this host's backend plus the portable core.
 cargo test
 
