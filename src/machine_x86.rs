@@ -1172,81 +1172,58 @@ fn spawn_vsock_bridge(
     })
 }
 
-/// Pumps frames from the tap into the guest.
+/// Injects tap frames into the guest.
 ///
-/// Unlike the gateway stream there is no length prefix: one `read` returns
-/// exactly one frame, preceded by the `virtio_net_hdr` the tap was created
-/// with, which `tap::strip_vnet_hdr` drops before delivering.
+/// [`crate::virtio_net::TapRelay`] owns the wait and the drain. This thread
+/// supplies the delivery under the device lock and the interrupt.
 fn spawn_net_tap_reader(
-    mut reader: std::fs::File,
+    reader: std::fs::File,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
-    use std::io::Read;
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let mut buf = vec![0u8; 65_536];
-        loop {
-            if !stop.wait(reader.as_fd()).unwrap_or(false) {
-                break;
-            }
-            let n = match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            let Some(frame) = crate::tap::strip_vnet_hdr(&buf, n) else {
-                continue;
-            };
+        let relayed = crate::virtio_net::TapRelay::new(reader).run(&stop, |frame| {
             let level = {
-                let mut d = dev.lock().unwrap();
+                let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);
                 d.irq_level()
             };
             let _ = vm.set_irq_line(VIRTIO_NET_GSI, level);
+        });
+        if let Err(e) = relayed {
+            eprintln!("[hvi/x86] virtio-net: {e}; tap relay stopped");
         }
     })
 }
 
-/// Reads gateway->guest frames (4-byte BE length prefix) and injects them.
+/// Injects gateway frames into the guest, each prefixed by a 4-byte big-endian
+/// length.
 ///
-/// A stop request is checked before each frame. A gateway that stalls in the
-/// middle of one holds the thread until it sends the rest or closes.
+/// [`crate::virtio_net::GatewayRelay`] owns the wait, the drain and the
+/// framing. This thread supplies the delivery under the device lock and the
+/// interrupt.
 fn spawn_net_gateway_reader(
-    mut reader: std::os::unix::net::UnixStream,
+    reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
-    use std::io::Read;
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let mut hdr = [0u8; 4];
-        loop {
-            if !stop.wait(reader.as_fd()).unwrap_or(false) {
-                break;
-            }
-            if reader.read_exact(&mut hdr).is_err() {
-                break;
-            }
-            let len = u32::from_be_bytes(hdr) as usize;
-            if len == 0 || len > 65_536 {
-                continue;
-            }
-            let mut frame = vec![0u8; len];
-            if reader.read_exact(&mut frame).is_err() {
-                break;
-            }
+        let relayed = crate::virtio_net::GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
-                let mut d = dev.lock().unwrap();
-                d.deliver(&mem, &frame);
+                let mut d = lock_or_recover(&dev);
+                d.deliver(&mem, frame);
                 d.irq_level()
             };
             let _ = vm.set_irq_line(VIRTIO_NET_GSI, level);
+        });
+        if let Err(e) = relayed {
+            eprintln!("[hvi/x86] virtio-net: {e}; gateway relay stopped");
         }
     })
 }

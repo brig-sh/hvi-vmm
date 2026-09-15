@@ -47,11 +47,12 @@ naming it. The waits it cannot interrupt are a plugin blocking in `request` and
 a virtio-fs worker waiting on a host file lock. A plugin that keeps the `Arc<dyn
 VmHandle>` it was given keeps the VM alive until it drops the handle. The handle
 holds guest RAM, the VM, the ledger file, and each device. The tap under
-`--net-tap` keeps its carrier up. The connection to the gateway under
-`--net-gateway` and the disk stay open. The handle also holds the plugin, so a
-handle stored in a plugin field is never dropped. A thread the plugin started
-from `attach` is not joined either, and holds the handle for as long as it runs.
-On macOS a second `boot` fails while such a handle exists, because
+`--net-tap` keeps its carrier up. The disk stays open. The gateway connection
+under `--net-gateway` stays on the handle, but the relay shut it down as it
+ended, so it carries nothing. The handle also holds the plugin, so a handle
+stored in a plugin field is never dropped. A thread the plugin started from
+`attach` is not joined either, and holds the handle for as long as it runs. On
+macOS a second `boot` fails while such a handle exists, because
 Hypervisor.framework allows one VM per process.
 
 ## A minimal caller
