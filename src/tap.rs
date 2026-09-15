@@ -86,20 +86,14 @@ mod attach {
 
     use super::NET_HDR_LEN;
 
-    const IFF_TAP: i16 = 0x0002;
-    const IFF_NO_PI: i16 = 0x1000;
-    const IFF_VNET_HDR: i16 = 0x4000;
-    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-    const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
-
     /// `virtio_net_hdr_v1`, the header hvi speaks (VIRTIO_F_VERSION_1). tun
     /// would otherwise assume the 10-byte legacy `virtio_net_hdr`.
     const VNET_HDR_SZ: libc::c_int = NET_HDR_LEN as libc::c_int;
 
-    /// `struct ifreq`: a 16-byte name followed by a 24-byte union.
+    /// `struct ifreq`: an `IFNAMSIZ`-byte name followed by a 24-byte union.
     #[repr(C)]
     struct IfReq {
-        name: [u8; 16],
+        name: [u8; libc::IFNAMSIZ],
         flags: i16,
         _pad: [u8; 22],
     }
@@ -122,19 +116,19 @@ mod attach {
         // path out of this function, including the ioctl error below.
         let file = unsafe { File::from_raw_fd(fd) };
         let mut req = IfReq {
-            name: [0; 16],
-            flags: IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
+            name: [0; libc::IFNAMSIZ],
+            flags: (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as i16,
             _pad: [0; 22],
         };
         req.name[..name.len()].copy_from_slice(name.as_bytes());
         // SAFETY: fd is a tun character device and req is a correctly shaped
         // ifreq.
-        if unsafe { libc::ioctl(fd, TUNSETIFF, std::ptr::addr_of_mut!(req)) } < 0 {
+        if unsafe { libc::ioctl(fd, libc::TUNSETIFF, std::ptr::addr_of_mut!(req)) } < 0 {
             return Err(io::Error::last_os_error());
         }
         let mut sz: libc::c_int = VNET_HDR_SZ;
         // SAFETY: fd is an attached tap and sz is a live c_int for the call.
-        if unsafe { libc::ioctl(fd, TUNSETVNETHDRSZ, std::ptr::addr_of_mut!(sz)) } < 0 {
+        if unsafe { libc::ioctl(fd, libc::TUNSETVNETHDRSZ, std::ptr::addr_of_mut!(sz)) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(file)
