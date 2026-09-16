@@ -37,7 +37,7 @@ use applevisor::prelude::{
 };
 
 use crate::boot;
-use crate::config::{BootConfig, Stop};
+use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::esr::{DataAbort, Ec};
 use crate::events::Emitter;
 use crate::fdt;
@@ -175,6 +175,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
     boot::LoadedKernel::from_header(&cfg.kernel)?;
+    // And exports that contradict each other, for the same reason: this is a
+    // statement about the configuration, decidable before anything is built.
+    check_export_overlap(&cfg.fs_shares)?;
     let num_cpus = cfg.vcpus.max(1);
 
     // In-kernel GICv3; sizes from the framework so the DTB matches hv_gic.
