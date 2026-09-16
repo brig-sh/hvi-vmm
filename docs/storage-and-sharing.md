@@ -49,6 +49,12 @@ Each share becomes its own device, with its own access mode and cache policy.
 Repeat the flag for more. A tag is 1 to 36 bytes, carries no NUL, and must be
 unique.
 
+Two shares may not cover the same host directory, or one the other's parent,
+while disagreeing on write permission. The guest reaches the same inodes
+through either tag, so the read-only one would promise something the writable
+one hands back. A boot that asks for both is refused, with the pair named.
+Nesting with the same mode is fine.
+
 ### Access modes
 
 A read-only share answers `EROFS` to every mutation:

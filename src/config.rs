@@ -67,6 +67,82 @@ pub struct FsShare {
     pub cache: CachePolicy,
 }
 
+/// Refuses two exports of the same host subtree that disagree on whether the
+/// guest may write it.
+///
+/// A read-only export is a statement about the host directory, not about the
+/// tag: a guest that mounts both tags reaches the same inodes either way, and
+/// through the writable one it writes them. Read-only then means nothing,
+/// which is worse than not offering it, so a boot that asks for both does not
+/// start. On macOS the Seatbelt profile says the same thing out loud -- a
+/// writable grant on a parent subsumes the read-only grant on its child.
+///
+/// Nesting with the same mode is left alone: two writable views of one tree,
+/// or two read-only ones, promise the guest nothing they do not deliver.
+///
+/// Paths are canonicalized first, so two spellings of one directory compare
+/// equal, and then compared component-wise, so `/srv/ab` is not inside
+/// `/srv/a`.
+///
+/// # Errors
+///
+/// Returns the pair and their modes when one export is the same directory as
+/// another, or sits underneath it, and the two disagree on write permission.
+pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
+    // A path that does not resolve is not this check's to report: the backend
+    // opens it a moment later and fails with the real reason. Compare what was
+    // asked for instead.
+    // Export roots, resolved once before any guest runs; see clippy.toml.
+    #[allow(clippy::disallowed_methods)]
+    let roots: Vec<PathBuf> = shares
+        .iter()
+        .map(|share| std::fs::canonicalize(&share.path).unwrap_or_else(|_| share.path.clone()))
+        .collect();
+    let name = |m: ShareMode| if m.writable() { "rw" } else { "ro" };
+    for (i, a) in shares.iter().enumerate() {
+        for (j, b) in shares.iter().enumerate().skip(i + 1) {
+            if a.mode == b.mode {
+                continue;
+            }
+            // `starts_with` is true for equal paths, which would otherwise
+            // read as a directory nested inside itself.
+            if roots[i] == roots[j] {
+                return Err(format!(
+                    "exports {} (tag {:?}, {}) and {} (tag {:?}, {}) are the \
+                     same host directory and disagree on write permission",
+                    a.path.display(),
+                    a.tag,
+                    name(a.mode),
+                    b.path.display(),
+                    b.tag,
+                    name(b.mode),
+                ));
+            }
+            let nested = if roots[i].starts_with(&roots[j]) {
+                Some((a, b))
+            } else if roots[j].starts_with(&roots[i]) {
+                Some((b, a))
+            } else {
+                None
+            };
+            if let Some((inner, outer)) = nested {
+                return Err(format!(
+                    "export {} (tag {:?}, {}) is nested inside export {} (tag \
+                     {:?}, {}): overlapping exports with conflicting write \
+                     permission are refused",
+                    inner.path.display(),
+                    inner.tag,
+                    name(inner.mode),
+                    outer.path.display(),
+                    outer.tag,
+                    name(outer.mode),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Inputs for a boot. Populated by `main::boot_guest` from the CLI and handed
 /// to the active backend's `boot()`.
 pub struct BootConfig {
@@ -124,4 +200,136 @@ pub struct BootConfig {
 pub enum Stop {
     SystemOff,
     SystemReset,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_export_overlap, CachePolicy, FsShare, ShareMode};
+    use std::path::{Path, PathBuf};
+
+    fn shares(pairs: &[(&str, ShareMode)]) -> Vec<FsShare> {
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (path, mode))| FsShare {
+                path: PathBuf::from(path),
+                tag: format!("tag{i}"),
+                mode: *mode,
+                cache: CachePolicy::Auto,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn read_only_export_inside_a_writable_one_is_refused() {
+        let err = check_export_overlap(&shares(&[
+            ("/srv/root", ShareMode::ReadWrite),
+            ("/srv/root/etc", ShareMode::ReadOnly),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.contains("/srv/root/etc (tag \"tag1\", ro) is nested inside"),
+            "{err}"
+        );
+        assert!(err.contains("/srv/root (tag \"tag0\", rw)"), "{err}");
+    }
+
+    #[test]
+    fn writable_export_inside_a_read_only_one_is_refused() {
+        let err = check_export_overlap(&shares(&[
+            ("/srv/root", ShareMode::ReadOnly),
+            ("/srv/root/var", ShareMode::ReadWrite),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.contains("/srv/root/var (tag \"tag1\", rw) is nested inside"),
+            "{err}"
+        );
+        assert!(err.contains("/srv/root (tag \"tag0\", ro)"), "{err}");
+    }
+
+    /// `Path::starts_with` is true of a path and itself, so the nesting arm
+    /// would describe a directory as sitting inside itself. Equal paths get
+    /// their own sentence.
+    #[test]
+    fn one_directory_exported_twice_with_different_modes_is_refused() {
+        let err = check_export_overlap(&shares(&[
+            ("/srv/root", ShareMode::ReadWrite),
+            ("/srv/root", ShareMode::ReadOnly),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("are the same host directory"), "{err}");
+        assert!(!err.contains("nested inside"), "{err}");
+    }
+
+    /// An embedder reaches `boot` without going through the argument parser,
+    /// so the two exports need not be spelled the same way. Canonicalizing
+    /// first is what makes a symlink and its target one directory here.
+    #[test]
+    fn two_spellings_of_one_directory_are_refused() {
+        let dir = std::env::temp_dir().join(format!("hvi-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+
+        let err = check_export_overlap(&[
+            FsShare {
+                path: dir.join("real"),
+                tag: "real".into(),
+                mode: ShareMode::ReadWrite,
+                cache: CachePolicy::Auto,
+            },
+            FsShare {
+                path: dir.join("link"),
+                tag: "link".into(),
+                mode: ShareMode::ReadOnly,
+                cache: CachePolicy::Auto,
+            },
+        ])
+        .unwrap_err();
+        assert!(err.contains("are the same host directory"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nesting_with_the_same_mode_is_allowed() {
+        check_export_overlap(&shares(&[
+            ("/srv/root", ShareMode::ReadWrite),
+            ("/srv/root/var", ShareMode::ReadWrite),
+        ]))
+        .expect("two writable views of one tree stay allowed");
+        check_export_overlap(&shares(&[
+            ("/srv/root", ShareMode::ReadOnly),
+            ("/srv/root/var", ShareMode::ReadOnly),
+        ]))
+        .expect("two read-only views of one tree stay allowed");
+    }
+
+    #[test]
+    fn exports_that_share_no_subtree_are_allowed() {
+        check_export_overlap(&shares(&[
+            ("/srv/root", ShareMode::ReadWrite),
+            ("/srv/other", ShareMode::ReadOnly),
+            ("/tmp/payload", ShareMode::ReadWrite),
+        ]))
+        .expect("exports that share no subtree are unrelated");
+    }
+
+    /// Component-wise, not textually: `/srv/ab` is a sibling of `/srv/a`.
+    #[test]
+    fn shared_name_prefix_is_not_nesting() {
+        check_export_overlap(&shares(&[
+            ("/srv/ab", ShareMode::ReadWrite),
+            ("/srv/a", ShareMode::ReadOnly),
+        ]))
+        .expect("/srv/ab is a sibling of /srv/a, not a child");
+        assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    #[test]
+    fn single_export_never_conflicts_with_itself() {
+        check_export_overlap(&shares(&[("/srv/root", ShareMode::ReadWrite)]))
+            .expect("one export is fine");
+        check_export_overlap(&[]).expect("no exports at all is fine");
+    }
 }
