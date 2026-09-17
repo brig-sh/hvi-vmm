@@ -224,6 +224,16 @@ const EDQUOT: i32 = 122;
 struct FileHandle {
     file: File,
     writable: bool,
+    /// The flags the guest opened with, kept so that a descriptor parked when
+    /// this handle is released is only reused for an open asking for the same.
+    open_flags: u32,
+    /// What the file read as when this handle was opened: `(dev, ino)`, mode,
+    /// uid and gid. Parking the descriptor needs them, and taking them from
+    /// the open that already had to look means the release path asks the host
+    /// nothing. They can go stale while the handle is open -- a guest chmod
+    /// through this device does that -- and a stale set only costs the next
+    /// open its reuse, because the parked descriptor then fails its check.
+    attrs: HandleAttrs,
     path: PathBuf,
     temporary_path: Option<PathBuf>,
     /// The FUSE node this handle was opened for. A node the guest unlinks
@@ -244,6 +254,48 @@ impl FileHandle {
             _ => Ok(()),
         }
     }
+}
+
+/// What an open was decided on, carried from the open to the park.
+#[derive(Clone, Copy)]
+struct HandleAttrs {
+    key: (u64, u64),
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl HandleAttrs {
+    fn of(meta: &Stat) -> Self {
+        Self {
+            key: (meta.dev(), meta.ino()),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }
+    }
+}
+
+/// A host descriptor kept after the guest closed the file, so that the next
+/// open of the same node does not pay for another host open.
+///
+/// A build opens the same files over and over: the macro workload's report has
+/// 726,175 OPENs over a tree of 87,101 files, and the host open is 8.4 us of
+/// the 10.6 us each one cost. What the guest closes is therefore parked here
+/// rather than closed, and handed back when the same node is opened again the
+/// same way.
+///
+/// The attributes are what the open would have been decided on. A host open
+/// consults the file's mode, owner and group; if all three still read the same
+/// and the name still leads to the same inode, the open the device is skipping
+/// would have succeeded and returned this descriptor.
+struct ParkedFd {
+    file: File,
+    /// The open flags this descriptor carries, masked to the ones that change
+    /// what reads and writes through it do. A descriptor is reused only for an
+    /// open that asks for exactly these.
+    flags: u32,
+    attrs: HandleAttrs,
 }
 
 /// What a handler produced. `Direct` means the handler already placed its
@@ -412,6 +464,26 @@ pub struct VirtioFs {
     /// number chosen without knowing what a real build needs is a number that
     /// breaks one.
     peak_handles: usize,
+    /// Descriptors the guest has closed, kept for its next open of the same
+    /// node. Bounded by `parked_limit` and evicted oldest-first.
+    parked: HashMap<u64, ParkedFd>,
+    /// Park order, oldest first, so eviction has something to pick.
+    ///
+    /// Entries are left behind when a descriptor is taken or dropped, because
+    /// removing one by value is a scan of the whole queue and this is the
+    /// path a build spends its requests on -- 698,000 of 726,000 opens on the
+    /// macro workload were served from here, and a scan of 8,000 parked
+    /// entries on each of them cost more than the host open it replaced.
+    /// Eviction skips the ids it no longer finds, and the queue is compacted
+    /// once the stale ones outnumber the live.
+    parked_order: VecDeque<u64>,
+    /// How many descriptors may sit parked at once. They are host descriptors
+    /// like any other, so this comes out of the same budget as the guest's own
+    /// handles (#34) rather than adding to it.
+    parked_limit: usize,
+    /// Opens served from `parked`, and opens that had to reach the host.
+    parked_hits: u64,
+    parked_misses: u64,
     next_tmpfile: u64,
     /// How many READs and WRITEs took the zero-copy `preadv`/`pwritev` path.
     ///
@@ -501,6 +573,14 @@ impl VirtioFs {
             dir_handles: HashMap::new(),
             next_handle: 1,
             handle_limit: crate::fdlimit::guest_handle_budget(),
+            parked: HashMap::new(),
+            parked_order: VecDeque::new(),
+            // A quarter of the guest's own budget: enough for the working set
+            // of headers a compiler reopens, small enough that the guest can
+            // still hold the handles it is entitled to.
+            parked_limit: crate::fdlimit::guest_handle_budget() / 4,
+            parked_hits: 0,
+            parked_misses: 0,
             peak_handles: 0,
             next_tmpfile: 1,
             zero_copy_reads: AtomicU64::new(0),
@@ -1670,7 +1750,14 @@ impl VirtioFs {
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         let mut out = self.entry_out(node, &path, &meta);
-        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path, node);
+        let fh = self.insert_handle(
+            file,
+            flags & LINUX_O_ACCMODE != 0,
+            flags,
+            HandleAttrs::of(&meta),
+            path,
+            node,
+        );
         put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
@@ -1710,8 +1797,14 @@ impl VirtioFs {
         // block device, the ledger and the control socket, none of which can
         // tell the guest anything (#34). ENFILE is the errno for "the host is
         // out", as distinct from the EMFILE the host itself would raise.
+        //
+        // Parked descriptors are this device's to give back, so they go first
+        // and the guest reaches the limit later than it used to, never sooner.
         if self.open_handle_count() >= self.handle_limit {
-            return Err(ENFILE);
+            self.drain_parked();
+            if self.open_handle_count() >= self.handle_limit {
+                return Err(ENFILE);
+            }
         }
         let fh = if directory {
             self.insert_dir_handle(&path)?
@@ -1728,29 +1821,49 @@ impl VirtioFs {
             // stopping the VM. A guest kernel opens a FIFO, socket or device
             // node on a FUSE mount itself and never sends OPEN for one, so
             // refusing costs it nothing.
-            let file = {
-                let (dirfd, name) = self.entry_at(node)?;
-                match open_host_file_at(dirfd, &name, flags, false, 0) {
-                    Ok(file) => file,
-                    // O_NOFOLLOW turns a symlink into ELOOP, and a special
-                    // file fails its own way, so the errno the guest saw when
-                    // the type was checked ahead of the open is restored
-                    // here. Only a failed open pays for it.
-                    Err(err) => return Err(open_failure_errno(&path, err)),
+            let reused = if self.may_reuse_descriptor(flags, open_flags) {
+                self.take_parked(node, flags)
+            } else {
+                None
+            };
+            let (file, attrs) = match reused {
+                Some(reused) => {
+                    // Parked descriptors are only ever taken from a successful
+                    // open of a regular file, and the file it refers to cannot
+                    // change under it, so the type checks below have already
+                    // been made about this descriptor.
+                    self.parked_hits += 1;
+                    reused
+                }
+                None => {
+                    self.parked_misses += 1;
+                    let file = {
+                        let (dirfd, name) = self.entry_at(node)?;
+                        match open_host_file_at(dirfd, &name, flags, false, 0) {
+                            Ok(file) => file,
+                            // O_NOFOLLOW turns a symlink into ELOOP, and a
+                            // special file fails its own way, so the errno the
+                            // guest saw when the type was checked ahead of the
+                            // open is restored here. Only a failed open pays
+                            // for it.
+                            Err(err) => return Err(open_failure_errno(&path, err)),
+                        }
+                    };
+                    let meta = Stat::of_file(&file)?;
+                    if meta.is_dir() {
+                        return Err(EISDIR);
+                    }
+                    if !meta.is_file() {
+                        return Err(EPERM);
+                    }
+                    (file, HandleAttrs::of(&meta))
                 }
             };
-            let meta = Stat::of_file(&file)?;
-            if meta.is_dir() {
-                return Err(EISDIR);
-            }
-            if !meta.is_file() {
-                return Err(EPERM);
-            }
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
                 clear_suid_sgid(&path, &file)?;
                 self.invalidate_guest_attr(node);
             }
-            self.insert_handle(file, wants_write, path, node)
+            self.insert_handle(file, wants_write, flags, attrs, path, node)
         };
         let mut out = Vec::with_capacity(16);
         put_open_out(
@@ -1966,13 +2079,141 @@ impl VirtioFs {
         self.handle_limit
     }
 
-    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf, node: u64) -> u64 {
+    /// The open flags that decide what reads and writes through a descriptor
+    /// do. A parked descriptor is reused only for an open asking for exactly
+    /// these, so the guest never gets an append-only descriptor where it asked
+    /// for a plain one, or the other way round.
+    fn parked_flag_key(flags: u32) -> u32 {
+        flags & (LINUX_O_ACCMODE | LINUX_O_APPEND)
+    }
+
+    /// Whether an open may be served from a parked descriptor at all.
+    ///
+    /// O_TRUNC has to reach the host, because reuse would skip the truncation.
+    /// Killing suid needs the open's own path too. Under `cache=none` nothing
+    /// is parked: that policy's contract is that the host is consulted for
+    /// every request, and a descriptor opened a while ago is the opposite of
+    /// that.
+    fn may_reuse_descriptor(&self, flags: u32, open_flags: u32) -> bool {
+        self.cache_policy != CachePolicy::None
+            && flags & LINUX_O_TRUNC == 0
+            && open_flags & FUSE_OPEN_KILL_SUIDGID == 0
+    }
+
+    /// Hands back a descriptor the guest closed earlier, if the file it refers
+    /// to is still the file this open would have reached.
+    ///
+    /// The check costs one `fstatat` against the host open it replaces. The
+    /// name must still lead to the same inode, so a file replaced on the host
+    /// is not served from the descriptor of the file it replaced; and the
+    /// mode, owner and group must be unchanged, so an open the host would now
+    /// refuse is not answered from a descriptor it granted earlier.
+    fn take_parked(&mut self, node: u64, flags: u32) -> Option<(File, HandleAttrs)> {
+        let wanted = Self::parked_flag_key(flags);
+        if self.parked.get(&node).map(|p| p.flags) != Some(wanted) {
+            return None;
+        }
+        let meta = {
+            let (dirfd, name) = self.entry_at(node).ok()?;
+            Stat::at(dirfd, &name).ok()?
+        };
+        let parked = self.parked.get(&node)?;
+        let current = HandleAttrs::of(&meta);
+        if current.key != parked.attrs.key
+            || current.mode != parked.attrs.mode
+            || current.uid != parked.attrs.uid
+            || current.gid != parked.attrs.gid
+        {
+            self.drop_parked(node);
+            return None;
+        }
+        let parked = self.parked.remove(&node)?;
+        Some((parked.file, parked.attrs))
+    }
+
+    /// Keeps a descriptor the guest has finished with, for its next open.
+    ///
+    /// Only a descriptor that refers to exactly what its node names is worth
+    /// keeping: an unlinked file's would pin an inode the host has otherwise
+    /// finished with, and one whose node is gone could never be matched again.
+    fn park_descriptor(&mut self, node: u64, flags: u32, attrs: HandleAttrs, file: File) {
+        if !self.nodes.contains_key(&node) || self.is_orphan(node) {
+            return;
+        }
+        self.drop_parked(node);
+        if self.parked_limit == 0 {
+            return;
+        }
+        while self.parked.len() >= self.parked_limit {
+            let before = self.parked.len();
+            self.evict_one_parked();
+            if self.parked.len() == before {
+                return;
+            }
+        }
+        self.parked.insert(
+            node,
+            ParkedFd {
+                file,
+                flags: Self::parked_flag_key(flags),
+                attrs,
+            },
+        );
+        self.parked_order.push_back(node);
+    }
+
+    /// Closes any descriptor parked for `node`.
+    fn drop_parked(&mut self, node: u64) {
+        self.parked.remove(&node);
+    }
+
+    /// Drops the oldest parked descriptor, skipping ids that are no longer
+    /// parked, and compacts the queue when those have taken it over.
+    fn evict_one_parked(&mut self) {
+        while let Some(oldest) = self.parked_order.pop_front() {
+            if self.parked.remove(&oldest).is_some() {
+                break;
+            }
+        }
+        if self.parked_order.len() > 4 * self.parked.len().max(1) {
+            let live = std::mem::take(&mut self.parked_order);
+            self.parked_order = live
+                .into_iter()
+                .filter(|id| self.parked.contains_key(id))
+                .collect();
+        }
+    }
+
+    /// Closes every parked descriptor, for the paths that need the host
+    /// descriptor table back rather than the speed.
+    fn drain_parked(&mut self) {
+        self.parked.clear();
+        self.parked_order.clear();
+    }
+
+    /// Opens served from a parked descriptor, and opens that reached the host.
+    #[must_use]
+    pub fn descriptor_cache_stats(&self) -> (u64, u64, usize) {
+        (self.parked_hits, self.parked_misses, self.parked.len())
+    }
+
+    fn insert_handle(
+        &mut self,
+        file: File,
+        writable: bool,
+        open_flags: u32,
+        attrs: HandleAttrs,
+        path: PathBuf,
+        node: u64,
+    ) -> u64 {
         let fh = self.next_handle();
         self.handles.insert(
             fh,
             FileHandle {
                 file,
                 writable,
+                open_flags,
+                attrs,
                 path,
                 temporary_path: None,
                 node,
@@ -2056,7 +2297,17 @@ impl VirtioFs {
                 return Err(io_errno(io::Error::last_os_error()));
             }
         }
-        handle.remove_temporary().map_err(io_errno)?;
+        if handle.temporary_path.is_some() {
+            handle.remove_temporary().map_err(io_errno)?;
+            return Ok(Vec::new());
+        }
+        // The descriptor is kept for the guest's next open of the same file
+        // rather than closed here. A descriptor that carried a lock is not:
+        // the unlock above is this device's word that the lock is gone, and
+        // keeping the descriptor that held it open invites the argument.
+        if self.cache_policy != CachePolicy::None && flags & FUSE_RELEASE_FLOCK_UNLOCK == 0 {
+            self.park_descriptor(handle.node, handle.open_flags, handle.attrs, handle.file);
+        }
         Ok(Vec::new())
     }
 
@@ -2336,6 +2587,8 @@ impl VirtioFs {
             FileHandle {
                 file,
                 writable: true,
+                open_flags: flags,
+                attrs: HandleAttrs::of(&meta),
                 path: path.clone(),
                 temporary_path: Some(path),
                 node,
@@ -2842,6 +3095,9 @@ impl VirtioFs {
         let Some(node_id) = self.inode_ids.get(&key).copied() else {
             return;
         };
+        // Whatever happens to the node below, the name this descriptor was
+        // parked under no longer leads to the file it refers to.
+        self.drop_parked(node_id);
         let mut empty = false;
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.paths.retain(|candidate| candidate != path);
@@ -7958,6 +8214,221 @@ mod tests {
     /// A guest cannot spend the host's whole descriptor table on open
     /// handles. The cap is per export and derived from the process limit, so
     /// the test sets a small one rather than opening thousands of files.
+    /// Opens `node` read-only and returns the handle, or the errno.
+    fn try_open(dev: &mut VirtioFs, node: u64, flags: u32) -> Result<u64, i32> {
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&flags.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+        match get_u32(&out, 4).map(|e| e as i32) {
+            Some(0) => Ok(get_u64(&out, OUT_HEADER_LEN).unwrap()),
+            Some(e) => Err(-e),
+            None => panic!("no status"),
+        }
+    }
+
+    fn release_handle(dev: &mut VirtioFs, node: u64, fh: u64) {
+        let mut input = vec![0u8; 24];
+        input[0..8].copy_from_slice(&fh.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RELEASE failed");
+    }
+
+    fn read_handle(dev: &mut VirtioFs, node: u64, fh: u64, len: u32) -> Vec<u8> {
+        let mut input = vec![0u8; 40];
+        input[0..8].copy_from_slice(&fh.to_le_bytes());
+        input[16..20].copy_from_slice(&len.to_le_bytes());
+        let out = dev.handle_fuse(&request(READ, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "READ failed");
+        out[OUT_HEADER_LEN..].to_vec()
+    }
+
+    /// The point of parking a descriptor: the second open of the same file
+    /// does not reach the host for one.
+    #[test]
+    fn a_reopened_file_is_served_from_the_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(
+            dev.descriptor_cache_stats().2,
+            1,
+            "the descriptor is parked"
+        );
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(hits_after, hits_before + 1, "the reopen was served from it");
+        assert_eq!(read_handle(&mut dev, node, fh, 5), b"first");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file replaced on the host between the close and the reopen is not
+    /// served from the descriptor of the file it replaced.
+    #[test]
+    fn a_file_replaced_on_the_host_is_not_served_from_the_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+
+        // What a host-side editor does: write a new file and rename it over.
+        fs::write(dir.join("new"), b"other").unwrap();
+        fs::rename(dir.join("new"), dir.join("f")).unwrap();
+
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        assert_eq!(
+            read_handle(&mut dev, node, fh, 5),
+            b"other",
+            "the reopen reached the file that is there now"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An open the host would now refuse is not answered from a descriptor it
+    /// granted before the mode changed.
+    #[test]
+    fn a_mode_change_on_the_host_retires_the_parked_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(dev.descriptor_cache_stats().2, 1);
+
+        fs::set_permissions(dir.join("f"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        let result = try_open(&mut dev, node, 0);
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(
+            hits_after, hits_before,
+            "the parked descriptor was not reused"
+        );
+        // Running as root defeats the mode, so the open may still succeed.
+        // What this pins is that the descriptor cache did not decide it.
+        if let Ok(fh) = result {
+            release_handle(&mut dev, node, fh);
+        }
+        let _ = fs::set_permissions(dir.join("f"), fs::Permissions::from_mode(0o644));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An unlinked file's descriptor is closed rather than parked, so the
+    /// host reclaims the inode when the guest is done with it.
+    #[test]
+    fn unlinking_a_file_closes_its_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(dev.descriptor_cache_stats().2, 1);
+
+        let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"f\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "UNLINK failed");
+        assert_eq!(
+            dev.descriptor_cache_stats().2,
+            0,
+            "the descriptor went with the name"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// O_TRUNC has to reach the host, or the file the guest asked to empty
+    /// keeps its contents.
+    #[test]
+    fn an_o_trunc_open_is_not_served_from_a_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, LINUX_O_RDWR).unwrap();
+        release_handle(&mut dev, node, fh);
+
+        let fh = try_open(&mut dev, node, LINUX_O_RDWR | LINUX_O_TRUNC).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(
+            fs::read(dir.join("f")).unwrap(),
+            Vec::<u8>::new(),
+            "the truncation happened"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A descriptor parked for reading does not answer an open for writing.
+    #[test]
+    fn a_parked_descriptor_does_not_widen_access() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        let fh = try_open(&mut dev, node, LINUX_O_RDWR).unwrap();
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(
+            hits_after, hits_before,
+            "a read-only descriptor did not serve a read-write open"
+        );
+        release_handle(&mut dev, node, fh);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `cache=none` promises the host is consulted for every request, and a
+    /// descriptor opened earlier is the opposite of that.
+    #[test]
+    fn nothing_is_parked_under_cache_none() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(
+            dev.descriptor_cache_stats().2,
+            0,
+            "no descriptor was kept behind the guest's back"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Parked descriptors are this device's to give back, so the guest reaches
+    /// the handle limit no sooner than it did before they existed.
+    #[test]
+    fn parked_descriptors_are_given_back_before_the_guest_is_refused() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..8 {
+            fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        dev.handle_limit = 4;
+        dev.parked_limit = 4;
+
+        // Fill the parked set: open and release four different files.
+        for i in 0..4 {
+            let node = lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            let fh = try_open(&mut dev, node, 0).unwrap();
+            release_handle(&mut dev, node, fh);
+        }
+        assert_eq!(dev.descriptor_cache_stats().2, 4, "four are parked");
+
+        // The guest is still entitled to its whole budget.
+        let mut opened = 0;
+        for i in 4..8 {
+            let node = lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            if try_open(&mut dev, node, 0).is_ok() {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 4, "the guest got its four handles");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn opens_stop_at_the_handle_limit() {
         let (dir, mut dev) = fixture_with_access(true);
