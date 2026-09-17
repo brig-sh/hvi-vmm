@@ -1899,8 +1899,42 @@ impl VirtioFs {
             }
             self.forget_node_path(&new_path, &meta);
         }
-        self.rewrite_node_paths(&old_path, &new_path);
+        self.rewrite_renamed_paths(&old_path, &new_path, &old_meta);
         Ok(Vec::new())
+    }
+
+    /// Moves the recorded paths of whatever was renamed.
+    ///
+    /// Renaming a directory moves every path beneath it, and finding those
+    /// means looking at all of them. Renaming anything else moves exactly one
+    /// path of one node, and that node is the one the inode index already
+    /// names -- so the common case, a compiler renaming a temporary over its
+    /// object, does not walk the table. The walk cost 15 ms per rename on a
+    /// tree of 87,101 files, which was the most expensive request the macro
+    /// workload made.
+    fn rewrite_renamed_paths(&mut self, old: &Path, new: &Path, old_meta: &Stat) {
+        if old_meta.is_dir() {
+            self.rewrite_node_paths(old, new);
+            return;
+        }
+        // The stat above reads whatever the old name led to at that moment,
+        // which is not always the file the guest looked up: a host process can
+        // replace it within the guest's attribute validity window. The index
+        // then names no node for this inode, and the node that still records
+        // the old path would keep it and answer ENOENT.
+        let node_id = self
+            .inode_ids
+            .get(&(old_meta.dev(), old_meta.ino()))
+            .copied();
+        let Some(node) = node_id.and_then(|id| self.nodes.get_mut(&id)) else {
+            self.rewrite_node_paths(old, new);
+            return;
+        };
+        for path in &mut node.paths {
+            if path == old {
+                *path = new.to_owned();
+            }
+        }
     }
 
     fn rewrite_node_paths(&mut self, old: &Path, new: &Path) {
@@ -6644,6 +6678,64 @@ mod tests {
     // Read rounds come from the same helper as the budget test, so the
     // test and both benchmarks always measure one workload.
     //
+    // What a compiler does at the end of every object it writes: rename a
+    // temporary over the previous one.
+    //
+    // The macro workload's report has RENAME at 118 requests and 1,816 ms --
+    // 15 ms each, the most expensive call in it by a wide margin. The cost is
+    // not the host rename; it is what the device does to its own node table
+    // afterwards, which is why this benchmark fills that table first.
+    //
+    // Run with:
+    //   cargo test --release -- --ignored --nocapture bench_rename_workload
+    #[test]
+    #[ignore]
+    fn bench_rename_workload() {
+        const NODES: usize = 4000;
+        const RENAMES: usize = 200;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        for i in 0..NODES {
+            fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
+        }
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+        // Look every file up, so the node table is the size a build reaches.
+        for i in 0..NODES {
+            lookup_node(&mut dev, tree_node, format!("file-{i:04}").as_bytes());
+        }
+
+        for i in 0..RENAMES {
+            fs::write(tree.join(format!("obj-{i:04}.tmp")), b"objbytes").unwrap();
+            lookup_node(&mut dev, tree_node, format!("obj-{i:04}.tmp").as_bytes());
+        }
+
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let before = spent();
+        let start = std::time::Instant::now();
+        for i in 0..RENAMES {
+            let mut input = Vec::new();
+            put_u64(&mut input, tree_node);
+            input.extend_from_slice(format!("obj-{i:04}.tmp\0").as_bytes());
+            input.extend_from_slice(format!("obj-{i:04}\0").as_bytes());
+            let out = dev.handle_fuse(&request(RENAME, tree_node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "BENCH rename: {} renames over {NODES} nodes in {:.3} ms => {:.2} us/rename",
+            RENAMES,
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / RENAMES as f64
+        );
+        println!(
+            "BENCH rename: {:.2} host ops per rename",
+            (spent() - before) as f64 / RENAMES as f64
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // What a build spends most of its requests on: opening the same files
     // again and again.
     //
@@ -6661,8 +6753,12 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_open_workload() {
-        const FILES: usize = 200;
-        const ROUNDS: usize = 20;
+        // Enough files that the parked set is the size a real build reaches.
+        // At 200 this benchmark could not see an eviction order that was
+        // scanned on every hit; at 4,000 that cost 9.5 us of the 9.7 us an
+        // open took, and the macro workload agreed to within 4 percent.
+        const FILES: usize = 4000;
+        const ROUNDS: usize = 3;
         const DEPTH: usize = 8;
 
         let (dir, mut dev) = fixture_with_access(true);
@@ -7081,6 +7177,72 @@ mod tests {
         assert_eq!(fs::read(dir.join("created")).unwrap(), b"\0\0\0hello");
         let mode = fs::metadata(dir.join("created")).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o640);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The fast path stats the old name, which is not always the file the guest
+    // looked up: a host process can replace it inside the attribute validity
+    // window. The index then names no node for that inode, and the node that
+    // still records the old path has to be found by the walk instead.
+    #[test]
+    fn rename_of_a_replaced_name_still_moves_the_node() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("obj.tmp"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"obj.tmp");
+
+        // What a host-side build step does: write a new file and rename it
+        // over.
+        fs::write(dir.join("other"), b"second").unwrap();
+        fs::rename(dir.join("other"), dir.join("obj.tmp")).unwrap();
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"obj.tmp\0obj\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+
+        let out = dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the node kept a path the rename moved away"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Renaming a directory moves the recorded path of everything under it,
+    // not just its own.
+    //
+    // A file rename takes a fast path that touches one node; a directory
+    // rename cannot, and this is what says so.
+    #[test]
+    fn renaming_a_directory_moves_the_paths_of_the_nodes_beneath_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("a/deep")).unwrap();
+        fs::write(dir.join("a/deep/f"), b"x").unwrap();
+
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let deep = lookup_node(&mut dev, a, b"deep");
+        let f = lookup_node(&mut dev, deep, b"f");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"a\0b\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+
+        let root = fs::canonicalize(&dir).unwrap();
+        assert_eq!(dev.node_path(a).unwrap(), root.join("b"));
+        assert_eq!(
+            dev.node_path(deep).unwrap(),
+            root.join("b/deep"),
+            "the directory beneath the renamed one moved with it"
+        );
+        assert_eq!(
+            dev.node_path(f).unwrap(),
+            root.join("b/deep/f"),
+            "so did the file two levels down"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
