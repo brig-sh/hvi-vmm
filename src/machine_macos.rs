@@ -526,6 +526,39 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             dev.peak_handles(),
             dev.handle_limit()
         );
+        let names = |o: u32| match o {
+            1 => "LOOKUP",
+            2 => "FORGET",
+            3 => "GETATTR",
+            4 => "SETATTR",
+            5 => "READLINK",
+            14 => "OPEN",
+            15 => "READ",
+            16 => "WRITE",
+            18 => "RELEASE",
+            20 => "FSYNC",
+            25 => "FLUSH",
+            26 => "INIT",
+            27 => "OPENDIR",
+            28 => "READDIR",
+            29 => "RELEASEDIR",
+            42 => "BATCH_FORGET",
+            44 => "READDIRPLUS",
+            52 => "STATX",
+            _ => "?",
+        };
+        let hist: Vec<String> = dev
+            .op_stats()
+            .into_iter()
+            .map(|(o, c, n)| format!("{}({})={}/{:.1}ms", names(o), o, c, n as f64 / 1e6))
+            .collect();
+        eprintln!("[hvi] virtio-fs[{index}] ops: {}", hist.join(" "));
+        // Said out loud because it used not to be true: READ and WRITE take
+        // a direct descriptor path that returns before the generic handler,
+        // and for a while that left them out of the line above.
+        eprintln!(
+            "[hvi] virtio-fs[{index}] ops-note: counted at dispatch, READ and WRITE included"
+        );
     }
 
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
