@@ -5447,6 +5447,37 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Opens, reads and closes every file once, the way a compiler reads a
+    /// header it has read before. Returns the host operations it spent.
+    fn open_round_cost(dev: &mut VirtioFs, files: &[u64]) -> u64 {
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let start = spent();
+        for &node in files {
+            let mut input = vec![0u8; 8];
+            input[0..4].copy_from_slice(&0u32.to_le_bytes()); // O_RDONLY
+            let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "OPEN failed");
+            let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+            let mut read = vec![0u8; 40];
+            read[0..8].copy_from_slice(&fh.to_le_bytes());
+            read[16..20].copy_from_slice(&8u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(READ, node, &read), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "READ failed");
+
+            let mut flush = vec![0u8; 24];
+            flush[0..8].copy_from_slice(&fh.to_le_bytes());
+            let out = dev.handle_fuse(&request(FLUSH, node, &flush), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "FLUSH failed");
+
+            let mut release = vec![0u8; 24];
+            release[0..8].copy_from_slice(&fh.to_le_bytes());
+            let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "RELEASE failed");
+        }
+        spent() - start
+    }
+
     /// Runs one mutation phase of the build workload. For every
     /// `MUTATE_EVERY`-th file it writes an object the way a compiler does:
     /// create a temporary, fill it, close it, then rename it over the
@@ -5519,6 +5550,69 @@ mod tests {
     /// Read rounds come from the same helper as the budget test, so the
     /// test and both benchmarks always measure one workload.
     ///
+    /// What a build spends most of its requests on: opening the same files
+    /// again and again.
+    ///
+    /// The macro workload's exit report has OPEN at 726,175 requests and
+    /// 12.9 s of service time against 730,167 RELEASE requests costing 0.67 s, on a
+    /// tree of 87,101 files. Eight opens per file is a compiler re-reading
+    /// the same headers, and each one pays for a host open and a host close.
+    /// This drives that shape with no guest in the way.
+    ///
+    /// The tree is nested `DEPTH` directories deep, because the open path
+    /// resolves a full path and a deep one costs more than a shallow one.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_open_workload
+    #[test]
+    #[ignore]
+    fn bench_open_workload() {
+        const FILES: usize = 200;
+        const ROUNDS: usize = 20;
+        const DEPTH: usize = 8;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut tree = dir.join("tree");
+        for i in 0..DEPTH {
+            tree = tree.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&tree).unwrap();
+        for i in 0..FILES {
+            fs::write(tree.join(format!("file-{i:04}")), b"xxxxxxxx").unwrap();
+        }
+        let mut node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+        for i in 0..DEPTH {
+            node = lookup_node(&mut dev, node, format!("d{i}").as_bytes());
+        }
+        let files: Vec<u64> = (0..FILES)
+            .map(|i| lookup_node(&mut dev, node, format!("file-{i:04}").as_bytes()))
+            .collect();
+
+        // One open-read-close of every file, so the host's name cache and the
+        // device's directory descriptors are warm before the clock starts.
+        open_round_cost(&mut dev, &files);
+
+        let start = std::time::Instant::now();
+        let mut cost = 0u64;
+        for _ in 0..ROUNDS {
+            cost = open_round_cost(&mut dev, &files);
+        }
+        let elapsed = start.elapsed();
+        let opens = (FILES * ROUNDS) as u64;
+        println!(
+            "BENCH open: {} opens in {:.3} ms => {:.2} us/open",
+            opens,
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / opens as f64
+        );
+        println!(
+            "BENCH open: {} host ops per round ({:.2} per open x {FILES})",
+            cost,
+            cost as f64 / FILES as f64,
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// Run with:
     ///   cargo test --release -- --ignored --nocapture bench_build_workload
     #[test]
