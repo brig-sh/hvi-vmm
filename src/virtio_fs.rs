@@ -177,6 +177,9 @@ const DT_SOCK: u32 = 12;
 // Linux errno values. Host errno numbers are not portable from macOS to the
 // Linux guest, so errors are translated explicitly.
 const ENOENT: i32 = 2;
+
+/// Wire size of `struct fuse_attr`: six 64-bit fields and ten 32-bit ones.
+const FUSE_ATTR_LEN: usize = 6 * 8 + 10 * 4;
 const EPERM: i32 = 1;
 const EIO: i32 = 5;
 const ENXIO: i32 = 6;
@@ -1053,7 +1056,24 @@ impl VirtioFs {
             self.remember_lookup(node);
             return Ok(socket_entry_out(node, socket));
         }
-        let meta = self.stat_in_export(&path)?;
+        let meta = match self.stat_in_export(&path) {
+            Ok(meta) => meta,
+            // A name that is not there. Under a caching policy the guest is
+            // told so in a reply it may cache, rather than with ENOENT, which
+            // it may not -- this is virtiofsd's negative_timeout. A build
+            // spends most of its lookups on names that do not exist (the
+            // compiler walking an include path, make stat'ing every implicit
+            // rule), and without this every one of them is a fresh round trip.
+            // The trade is the one the entry timeout already makes: a name
+            // created on the host, behind the guest's back, stays invisible
+            // for up to the validity. Names the guest creates itself are not
+            // affected -- its own kernel drops the negative dentry on the
+            // create.
+            Err(err) if err == ENOENT && self.cache_seconds() > 0 => {
+                return Ok(negative_entry_out(self.cache_seconds()))
+            }
+            Err(err) => return Err(err),
+        };
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &path, &meta))
@@ -2883,6 +2903,23 @@ fn put_socket_attr(out: &mut Vec<u8>, node: u64, socket: SocketNode) {
     put_u32(out, 0); // rdev
     put_u32(out, 4096); // blksize
     put_u32(out, 0);
+}
+
+/// The reply for a name that does not exist, valid for `cache_seconds`.
+///
+/// A nodeid of zero is how FUSE spells "no such entry" in a reply the guest is
+/// allowed to cache; the attribute block is present because the wire format
+/// has a fixed size, and ignored because there is no inode to describe.
+fn negative_entry_out(cache_seconds: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    put_u64(&mut out, 0); // nodeid: the name is absent
+    put_u64(&mut out, 0); // generation
+    put_u64(&mut out, cache_seconds);
+    put_u64(&mut out, 0); // no attributes to keep
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    out.resize(out.len() + FUSE_ATTR_LEN, 0);
+    out
 }
 
 fn socket_entry_out(node: u64, socket: SocketNode) -> Vec<u8> {
@@ -5104,10 +5141,13 @@ mod tests {
         let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"gone.sock\0"), 4096);
         assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), 0);
 
+        // The fixture caches, so the absence comes back as a negative entry
+        // rather than ENOENT; either way the name resolves to nothing.
         let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"gone.sock\0"), 4096);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), 0);
         assert_eq!(
-            i32::from_le_bytes(out[4..8].try_into().unwrap()),
-            -ENOENT,
+            get_u64(&out, OUT_HEADER_LEN).unwrap(),
+            0,
             "the socket outlived its unlink"
         );
 
@@ -5624,6 +5664,36 @@ mod tests {
         let issue = lookup_node(&mut dev, etc, b"issue");
         let opened = dev.handle_fuse(&request(OPEN, issue, &open), 4096);
         assert_eq!(get_u32(&opened, OUT_HEADER_LEN + 8), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A build asks for far more names than exist. Under a caching policy the
+    /// absence is an answer the guest may keep; under `None` it is an error it
+    /// must ask about again.
+    #[test]
+    fn lookup_of_a_missing_name_is_cacheable_under_auto_and_enoent_under_none() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::Auto);
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"nope\0"), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "a negative entry is a reply, not an error"
+        );
+        assert_eq!(
+            get_u64(&out, OUT_HEADER_LEN).unwrap(),
+            0,
+            "nodeid zero is how the reply says the name is absent"
+        );
+        let entry_valid = get_u64(&out, OUT_HEADER_LEN + 16).unwrap();
+        assert!(
+            entry_valid > 0,
+            "the guest may cache the miss: {entry_valid}"
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"nope\0"), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| -(e as i32)), Some(ENOENT));
         let _ = fs::remove_dir_all(dir);
     }
 
