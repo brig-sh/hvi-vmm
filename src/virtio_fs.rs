@@ -5762,6 +5762,18 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Creates `path` on the host and returns the node for it, looking up
+    /// each component from the export root the way a guest does.
+    fn lookup_node_or_create(dev: &mut VirtioFs, root: &Path, path: &Path) -> u64 {
+        fs::create_dir_all(path).unwrap();
+        let relative = path.strip_prefix(root).expect("inside the export");
+        let mut node = FUSE_ROOT_ID;
+        for part in relative.components() {
+            node = lookup_node(dev, node, part.as_os_str().as_bytes());
+        }
+        node
+    }
+
     /// Opens, reads and closes every file once, the way a compiler reads a
     /// header it has read before. Returns the host operations it spent.
     fn open_round_cost(dev: &mut VirtioFs, files: &[u64]) -> u64 {
@@ -5947,23 +5959,34 @@ mod tests {
         const FILES: usize = 4000;
         const ROUNDS: usize = 3;
         const DEPTH: usize = 8;
+        /// More than `DIR_CACHE_LIMIT`, so resolving a path costs what it
+        /// costs in a real tree rather than always hitting a warm cache.
+        const DIRS: usize = 200;
 
         let (dir, mut dev) = fixture_with_access(true);
-        let mut tree = dir.join("tree");
+        let mut root = dir.join("tree");
         for i in 0..DEPTH {
-            tree = tree.join(format!("d{i}"));
+            root = root.join(format!("d{i}"));
         }
-        fs::create_dir_all(&tree).unwrap();
-        for i in 0..FILES {
-            fs::write(tree.join(format!("file-{i:04}")), b"xxxxxxxx").unwrap();
+        // Spread over more directories than the descriptor cache holds, the
+        // way a source tree is. One directory keeps that cache permanently
+        // warm and hides what resolving a path costs.
+        let mut tree_node = lookup_node_or_create(&mut dev, &dir, &root);
+        let mut files = Vec::with_capacity(FILES);
+        for d in 0..DIRS {
+            let sub = root.join(format!("sub-{d:04}"));
+            fs::create_dir_all(&sub).unwrap();
+            let sub_node = lookup_node(&mut dev, tree_node, format!("sub-{d:04}").as_bytes());
+            for i in 0..FILES / DIRS {
+                fs::write(sub.join(format!("file-{i:04}")), b"xxxxxxxx").unwrap();
+                files.push(lookup_node(
+                    &mut dev,
+                    sub_node,
+                    format!("file-{i:04}").as_bytes(),
+                ));
+            }
         }
-        let mut node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
-        for i in 0..DEPTH {
-            node = lookup_node(&mut dev, node, format!("d{i}").as_bytes());
-        }
-        let files: Vec<u64> = (0..FILES)
-            .map(|i| lookup_node(&mut dev, node, format!("file-{i:04}").as_bytes()))
-            .collect();
+        let _ = &mut tree_node;
 
         // One open-read-close of every file, so the host's name cache and the
         // device's directory descriptors are warm before the clock starts.
