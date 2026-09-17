@@ -671,7 +671,7 @@ impl VirtioFs {
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
         // Opened before `root` is moved into the struct, and once: every walk
         // starts from this descriptor.
-        let dirs = DirCache::new(&root, DIR_CACHE_LIMIT, cache_policy != CachePolicy::None)?;
+        let dirs = DirCache::new(&root, dir_cache_limit(), cache_policy != CachePolicy::None)?;
         Ok(Self {
             root,
             writable,
@@ -1858,7 +1858,7 @@ impl VirtioFs {
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         let meta = Stat::at(dirfd, &entry)?;
         unlink_at(dirfd, &entry, directory)?;
-        self.invalidate_dirs(&path);
+        self.invalidate_dirs_by_type(&path, meta.is_dir());
         self.forget_node_path(&path, &meta);
         Ok(Vec::new())
     }
@@ -1887,8 +1887,10 @@ impl VirtioFs {
         host_rename(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name, flags)?;
         // Both ends now refer to something other than they did, and for a
         // directory that is true of everything beneath them too.
-        self.invalidate_dirs(&old_path);
-        self.invalidate_dirs(&new_path);
+        let moves_directories =
+            old_meta.is_dir() || replaced.map(|meta| meta.is_dir()).unwrap_or(false);
+        self.invalidate_dirs_by_type(&old_path, moves_directories);
+        self.invalidate_dirs_by_type(&new_path, moves_directories);
         if flags & RENAME_EXCHANGE != 0 {
             self.exchange_node_paths(&old_path, &new_path);
             return Ok(Vec::new());
@@ -2051,17 +2053,36 @@ impl VirtioFs {
                 return Err(ENOTDIR);
             }
         }
+        // A descriptor this device already holds costs the budget nothing when
+        // the guest opens it again: it moves from `parked` to a handle. Taking
+        // it before the gate below is what keeps a working set larger than the
+        // budget from spending the caches on every open.
+        let reused = if !directory && self.may_reuse_descriptor(flags, open_flags) {
+            self.take_parked(node, flags)
+        } else {
+            None
+        };
         // Before anything is opened. Each handle pins a host descriptor until
-        // the guest releases it, and the descriptor table is the process's,
-        // not this device's -- so a guest that spends the last one breaks the
-        // block device, the ledger and the control socket, none of which can
-        // tell the guest anything (#34). ENFILE is the errno for "the host is
-        // out", as distinct from the EMFILE the host itself would raise.
+        // the guest releases it, and the descriptor table is the process's
+        // rather than this device's, so a guest that spends the last one breaks
+        // the block device, the ledger and the control socket, none of which
+        // can tell the guest anything (#34). ENFILE is the errno for
+        // "the host is out", as distinct from the EMFILE the host
+        // itself would raise.
         //
-        // Parked descriptors are this device's to give back, so they go first
-        // and the guest reaches the limit later than it used to, never sooner.
-        if self.open_handle_count() >= self.handle_limit {
-            self.drain_parked();
+        // Both caches are this device's to give back, so they yield first and
+        // the guest reaches the limit no sooner than it did before they
+        // existed. One descriptor at a time, and only while the budget
+        // is spent: emptying them whole let the next open refill the
+        // directory cache and empty it again, so neither cache held
+        // anything and every open paid the host for a walk it had
+        // already made.
+        if reused.is_none() {
+            while self.descriptors_held() >= self.handle_limit {
+                if !self.evict_one_parked() && !self.dirs.evict_one() {
+                    break;
+                }
+            }
             if self.open_handle_count() >= self.handle_limit {
                 return Err(ENFILE);
             }
@@ -2088,11 +2109,6 @@ impl VirtioFs {
             //
             // `host_open_flags` also passes O_NONBLOCK, so a FIFO that does get
             // here comes back at once rather than stopping the VM.
-            let reused = if self.may_reuse_descriptor(flags, open_flags) {
-                self.take_parked(node, flags)
-            } else {
-                None
-            };
             let (file, attrs) = match reused {
                 Some(reused) => {
                     // Parked descriptors are only ever taken from a successful
@@ -2412,6 +2428,16 @@ impl VirtioFs {
     /// Host descriptors this export currently pins for guest handles.
     fn open_handle_count(&self) -> usize {
         self.handles.len() + self.dir_handles.len()
+    }
+
+    /// Returns how many host descriptors this device is holding, the guest's
+    /// and its own.
+    ///
+    /// The guest's entitlement is the whole budget, so the caches cannot be
+    /// spent on top of it: what they hold counts here, and they are emptied
+    /// before the guest is told the host is out.
+    fn descriptors_held(&self) -> usize {
+        self.open_handle_count() + self.parked.len() + self.dirs.held()
     }
 
     /// Records the high-water mark, so the stop report can name it. The issue
@@ -3395,6 +3421,31 @@ impl VirtioFs {
         }
     }
 
+    /// Drops any cached descriptor for a path known not to be a directory.
+    ///
+    /// Only a directory can have cached descriptors beneath it, so only a
+    /// directory needs the subtree scan -- and that scan looks at every entry
+    /// in the cache, which is the size of a build's directory working set.
+    /// Anything else can only be cached under its own name, which a hash
+    /// lookup settles. Dropping that name rather than skipping the call keeps
+    /// an entry left over from when the path was a directory from outliving
+    /// the mutation.
+    fn invalidate_dir_entry(&mut self, path: &Path) {
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            let relative = relative.to_owned();
+            self.dirs.forget(&relative);
+        }
+    }
+
+    /// Drops what a mutation of `path` invalidates, by what it is.
+    fn invalidate_dirs_by_type(&mut self, path: &Path, is_dir: bool) {
+        if is_dir {
+            self.invalidate_dirs(path);
+        } else {
+            self.invalidate_dir_entry(path);
+        }
+    }
+
     /// Both ends of a two-path operation, resolved together.
     ///
     /// Returns each parent's descriptor owned rather than borrowed, because
@@ -3930,21 +3981,23 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
     put_u32(out, 0); // backing_id (signed on the wire, zero means none)
 }
 
-/// How many directory descriptors [`DirCache`] keeps open.
+/// Returns how many directory descriptors [`DirCache`] keeps open.
 ///
 /// Descriptors are a budget this device already spends: it pins one per open
 /// guest handle, and exhausting them reaches the guest as EMFILE
 /// (#34). `fdlimit::raise_open_file_limit` lifts the soft
-/// limit to the hard one at startup, so the ceiling is not macOS's bare 256 --
-/// but "not 256" is not "unlimited", and a cache that grows with the guest's
-/// directory count is a way to spend the whole budget on lookups. Bounded
-/// instead, small enough to leave the handle budget alone and large enough
-/// that a build's working set of directories stays resident.
-// Unused on purpose: this is stage one of #30, landing the
-// resolver and its tests before the call sites move onto it. The next stage
-// removes this attribute along with the first path-based caller.
-#[allow(dead_code)]
-const DIR_CACHE_LIMIT: usize = 128;
+/// limit to the hard one at startup, so the ceiling is not macOS's bare 256.
+/// That is still not unlimited, and a cache that grows with the guest's
+/// directory count is a way to spend the whole budget on lookups.
+///
+/// What the cache holds counts against the guest's descriptor budget, so the
+/// bound is a quarter of it at most. The floor of 128 is otherwise the whole
+/// budget on a 256-descriptor soft limit, which would let the cache meet the
+/// handle limit with no guest handle open at all.
+fn dir_cache_limit() -> usize {
+    let budget = crate::fdlimit::guest_handle_budget();
+    (budget / 16).clamp(128, 4096).min(budget / 4)
+}
 
 /// Seconds a writable share's attribute and entry replies stay valid in the
 /// guest. The guest answers `stat` and `lookup` from its own cache for this
@@ -4315,6 +4368,18 @@ impl DirCache {
     #[cfg(test)]
     fn resident(&self) -> usize {
         self.open.len()
+    }
+
+    /// Returns how many host descriptors this cache is holding.
+    fn held(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Closes all of them, for when the descriptors are worth more than the
+    /// resolutions they save.
+    fn release_all(&mut self) {
+        self.open.clear();
+        self.lru.clear();
     }
 }
 
@@ -6734,6 +6799,53 @@ mod tests {
     // Read rounds come from the same helper as the budget test, so the
     // test and both benchmarks always measure one workload.
     //
+    // Removing files, with the directory cache as full as a build makes it.
+    //
+    // Every removal invalidates cached directory descriptors, and finding
+    // which ones used to mean looking at all of them -- so this benchmark is
+    // only honest with a cache that holds what a real tree puts in it.
+    //
+    // Run with:
+    //   cargo test --release -- --ignored --nocapture bench_unlink_workload
+    #[test]
+    #[ignore]
+    fn bench_unlink_workload() {
+        const DIRS: usize = 1500;
+        const FILES: usize = 300;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+
+        // Fill the directory cache the way a build does.
+        for d in 0..DIRS {
+            let name = format!("sub-{d:04}");
+            fs::create_dir_all(tree.join(&name)).unwrap();
+            let sub = lookup_node(&mut dev, tree_node, name.as_bytes());
+            fs::write(tree.join(&name).join("f"), b"x").unwrap();
+            lookup_node(&mut dev, sub, b"f");
+        }
+        for i in 0..FILES {
+            fs::write(tree.join(format!("gone-{i:04}")), b"x").unwrap();
+            lookup_node(&mut dev, tree_node, format!("gone-{i:04}").as_bytes());
+        }
+
+        let start = std::time::Instant::now();
+        for i in 0..FILES {
+            let mut input = format!("gone-{i:04}").into_bytes();
+            input.push(0);
+            let out = dev.handle_fuse(&request(UNLINK, tree_node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "UNLINK failed");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "BENCH unlink: {FILES} removals with {DIRS} directories cached => {:.2} us/unlink",
+            elapsed.as_secs_f64() * 1e6 / FILES as f64
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // What a compiler does at the end of every object it writes: rename a
     // temporary over the previous one.
     //
@@ -7272,6 +7384,49 @@ mod tests {
             get_u32(&out, 4),
             Some(0),
             "the node kept a path the rename moved away"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Moving a directory away drops the cached descriptors of the
+    // directories under it, so a path rebuilt at the same name does not
+    // resolve through the descriptor of the directory that used to be there.
+    #[test]
+    fn renaming_a_directory_retires_the_cached_descriptors_beneath_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/f"), b"x").unwrap();
+
+        // Resolving these is what puts "a" and "a/b" in the descriptor cache.
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let b = lookup_node(&mut dev, a, b"b");
+        lookup_node(&mut dev, b, b"f");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"a\0moved\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+
+        // A different tree at the same names. Its file is not in the one that
+        // was moved away, so a stale descriptor cannot find it.
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/g"), b"y").unwrap();
+
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let b = lookup_node(&mut dev, a, b"b");
+        let mut payload = b"g".to_vec();
+        payload.push(0);
+        let out = dev.handle_fuse(&request(LOOKUP, b, &payload), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "LOOKUP failed");
+        // Under a caching policy a name that is not there comes back as a
+        // successful reply with node zero, so the node is what says whether
+        // the name resolved.
+        assert_ne!(
+            get_u64(&out, OUT_HEADER_LEN),
+            Some(0),
+            "the rebuilt directory resolved through a fresh descriptor, \
+             not the one cached for the directory that was moved away"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -8962,7 +9117,7 @@ mod tests {
         fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
         fs::create_dir_all(dir.join("etc")).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        let cache = DirCache::new(&dir, DIR_CACHE_LIMIT, true).unwrap();
+        let cache = DirCache::new(&dir, dir_cache_limit(), true).unwrap();
         (dir, cache)
     }
 
@@ -10380,6 +10535,68 @@ mod tests {
             "the descriptor was reused across a metadata change"
         );
         release_handle(&mut dev, node, fh);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A reuse costs the budget nothing, so it is taken before the gate. The
+    // gate ran first and emptied both caches whole, which closed every parked
+    // descriptor a spent budget was about to serve an open from: the reopen
+    // then found nothing and paid the host, round after round.
+    //
+    // The limits keep production's proportions, where the two caches are a
+    // quarter of the budget each and cannot meet it on their own.
+    #[test]
+    fn reuse_is_taken_before_the_budget_empties_the_caches() {
+        const FILES: usize = 4;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        for d in 0..FILES {
+            let sub = dir.join(format!("d{d}"));
+            fs::create_dir(&sub).unwrap();
+            fs::write(sub.join("f"), b"x").unwrap();
+        }
+        // Set before the lookups below, so the directory cache is never larger
+        // than its bound.
+        dev.parked_limit = FILES;
+        dev.dirs.limit = 2;
+        // What the two caches hold together once they are full, so every open
+        // below finds the budget spent.
+        dev.handle_limit = FILES + 2;
+
+        let mut nodes = Vec::new();
+        for d in 0..FILES {
+            let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, format!("d{d}").as_bytes());
+            nodes.push(lookup_node(&mut dev, sub_node, b"f"));
+        }
+
+        // One round to fill them.
+        for node in &nodes {
+            let fh = try_open(&mut dev, *node, 0).unwrap();
+            release_handle(&mut dev, *node, fh);
+        }
+        assert_eq!(dev.descriptor_cache_stats().2, FILES, "all four are parked");
+        assert!(
+            dev.descriptors_held() >= dev.handle_limit,
+            "the budget is spent, so the gate runs"
+        );
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        for _ in 0..2 {
+            for node in &nodes {
+                let fh = try_open(&mut dev, *node, 0).unwrap();
+                release_handle(&mut dev, *node, fh);
+            }
+        }
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(
+            hits_after - hits_before,
+            (2 * FILES) as u64,
+            "a spent budget closed the descriptors the reopens were served from"
+        );
+        assert!(
+            dev.dirs.held() > 0,
+            "the directory cache was emptied instead of yielding one entry"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
