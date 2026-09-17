@@ -1223,7 +1223,24 @@ impl VirtioFs {
             self.remember_lookup(node);
             return Ok(socket_entry_out(node, socket));
         }
-        let meta = self.stat_in_export(&path)?;
+        let meta = match self.stat_in_export(&path) {
+            Ok(meta) => meta,
+            // A name that is not there. Under a caching policy the guest is
+            // told so in a reply it may cache, rather than with ENOENT, which
+            // it may not. A build spends most of its lookups on names that do
+            // not exist (the compiler walking an include path, make stat'ing
+            // every implicit rule), and without this every one of them is a
+            // fresh round trip.
+            //
+            // The cost is a name created on the host that stays invisible to
+            // the guest until the entry expires, which is why this validity is
+            // capped rather than taken from `cache_seconds`. See
+            // [`NEGATIVE_CACHE_SECS`].
+            Err(ENOENT) if self.negative_cache_seconds() > 0 => {
+                return Ok(negative_entry_out(self.negative_cache_seconds()))
+            }
+            Err(err) => return Err(err),
+        };
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &path, &meta))
@@ -3081,6 +3098,15 @@ impl VirtioFs {
         }
     }
 
+    /// Returns the seconds a reply saying a name is missing stays valid in the
+    /// guest.
+    ///
+    /// Capped at [`NEGATIVE_CACHE_SECS`] on both share modes. `None` disables
+    /// it, as it disables every other timeout.
+    fn negative_cache_seconds(&self) -> u64 {
+        self.cache_seconds().min(NEGATIVE_CACHE_SECS)
+    }
+
     /// Returns the attribute reply for `node`.
     ///
     /// Every caller already resolved `path` for the stat that produced
@@ -3174,20 +3200,27 @@ fn put_socket_attr(out: &mut Vec<u8>, node: u64, socket: SocketNode) {
     put_u32(out, 0);
 }
 
+/// Returns the reply for a name that does not exist, valid for
+/// `cache_seconds`.
+///
+/// A nodeid of zero is how FUSE spells "no such entry" in a reply the guest is
+/// allowed to cache. The attribute block is present because the wire format
+/// has a fixed size, and zero because there is no inode to describe.
+fn negative_entry_out(cache_seconds: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    put_entry_head(&mut out, 0, 0, cache_seconds, 0);
+    out.resize(out.len() + FUSE_ATTR_LEN, 0);
+    out
+}
+
 fn socket_entry_out(node: u64, socket: SocketNode) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
-    put_u64(&mut out, node);
-    put_u64(&mut out, 1); // generation
-
     // No entry/attribute caching. The guest kernel is the only thing that can
     // tell us a socket has gone, and it does that with UNLINK, so there is
     // nothing to rediscover by expiring the entry -- but a zero timeout keeps
     // the guest asking us rather than trusting a cached negative if a lookup
     // and an unlink race.
-    put_u64(&mut out, 0);
-    put_u64(&mut out, 0);
-    put_u32(&mut out, 0);
-    put_u32(&mut out, 0);
+    put_entry_head(&mut out, node, 1, 0, 0);
     put_socket_attr(&mut out, node, socket);
     out
 }
@@ -3210,14 +3243,28 @@ fn attr_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Vec
     out
 }
 
+/// Writes the fields every `fuse_entry_out` carries ahead of its attributes.
+///
+/// The three replies that use it differ only in what follows and in the
+/// validity they claim, so the layout is written once here.
+fn put_entry_head(
+    out: &mut Vec<u8>,
+    node: u64,
+    generation: u64,
+    entry_valid: u64,
+    attr_valid: u64,
+) {
+    put_u64(out, node);
+    put_u64(out, generation);
+    put_u64(out, entry_valid);
+    put_u64(out, attr_valid);
+    put_u32(out, 0); // entry_valid_nsec
+    put_u32(out, 0); // attr_valid_nsec
+}
+
 fn entry_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
-    put_u64(&mut out, node);
-    put_u64(&mut out, 1); // generation
-    put_u64(&mut out, cache_seconds);
-    put_u64(&mut out, cache_seconds);
-    put_u32(&mut out, 0);
-    put_u32(&mut out, 0);
+    put_entry_head(&mut out, node, 1, cache_seconds, cache_seconds);
     put_attr(&mut out, node, meta, guest);
     out
 }
@@ -3270,11 +3317,28 @@ const DIR_CACHE_LIMIT: usize = 128;
 /// macOS.
 const WRITABLE_CACHE_SECS: u64 = 5;
 
-/// The same for a read-only share, which the guest cannot make stale itself.
-/// Only the host can change the tree underneath it, so the window costs
-/// nothing a writable share does not already pay, and it is a minute rather
-/// than [`WRITABLE_CACHE_SECS`].
+/// The same for a read-only share. The guest cannot change what it sees, so
+/// the only thing that can make an entry stale is the host, and a minute is
+/// the window that buys. This covers entries and attributes, both of which
+/// name a file that exists; a name that does not is
+/// [`NEGATIVE_CACHE_SECS`].
 const READ_ONLY_CACHE_SECS: u64 = 60;
+
+/// Seconds the guest may remember that a name was missing.
+///
+/// Shorter than [`READ_ONLY_CACHE_SECS`], and the same on both share modes,
+/// because a cached absence fails differently from a cached presence. A stale
+/// positive entry corrects itself the moment the guest uses it: the open
+/// reaches this server and gets ENOENT. A stale negative dentry is answered
+/// by the guest kernel, so the open fails there and this server never hears
+/// about it until the entry expires.
+///
+/// The read-only argument does not transfer either. A read-only share is one
+/// the guest cannot write, which is what makes a long positive validity safe
+/// -- but the host can still create the name, and on a read-only share the
+/// guest cannot create it itself and drop the dentry that way. The window is
+/// longest exactly where the guest has no way out of it.
+const NEGATIVE_CACHE_SECS: u64 = WRITABLE_CACHE_SECS;
 
 /// Most paths one node will remember at once (#34).
 ///
@@ -4912,6 +4976,13 @@ fn validate_mutation_name(name: &[u8]) -> Result<(), i32> {
     }
 }
 
+/// Wire size of `struct fuse_attr`: six 64-bit fields and ten 32-bit ones.
+///
+/// Only a reply with no inode to describe needs this, to pad out a block it
+/// has nothing to fill. `fuse_attr_len_matches_put_attr` holds it to what
+/// [`put_attr`] writes.
+const FUSE_ATTR_LEN: usize = 6 * 8 + 10 * 4;
+
 fn put_attr(out: &mut Vec<u8>, node: u64, meta: &Stat, guest: GuestAttr) {
     put_u64(out, node);
     put_u64(out, meta.size());
@@ -5566,10 +5637,13 @@ mod tests {
         let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"gone.sock\0"), 4096);
         assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), 0);
 
+        // The fixture caches, so the absence comes back as a negative entry
+        // rather than ENOENT; either way the name resolves to nothing.
         let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"gone.sock\0"), 4096);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), 0);
         assert_eq!(
-            i32::from_le_bytes(out[4..8].try_into().unwrap()),
-            -ENOENT,
+            get_u64(&out, OUT_HEADER_LEN).unwrap(),
+            0,
             "the socket outlived its unlink"
         );
 
@@ -6088,6 +6162,117 @@ mod tests {
         let opened = dev.handle_fuse(&request(OPEN, issue, &open), 4096);
         assert_eq!(get_u32(&opened, OUT_HEADER_LEN + 8), Some(0));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // A build asks for far more names than exist. Under a caching policy the
+    // absence is an answer the guest may keep; under `None` it is an error it
+    // must ask about again.
+    #[test]
+    fn lookup_of_a_missing_name_is_cacheable_under_auto_and_enoent_under_none() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::Auto);
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"nope\0"), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "a negative entry is a reply, not an error"
+        );
+        assert_eq!(
+            get_u64(&out, OUT_HEADER_LEN).unwrap(),
+            0,
+            "nodeid zero is how the reply says the name is absent"
+        );
+        let entry_valid = get_u64(&out, OUT_HEADER_LEN + 16).unwrap();
+        assert!(
+            entry_valid > 0,
+            "the guest may cache the miss: {entry_valid}"
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"nope\0"), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| -(e as i32)), Some(ENOENT));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A read-only share claims a minute for a name that exists. A name that
+    // does not must not inherit that: the guest cannot create it to drop the
+    // dentry, so nothing shortens the window from its side.
+    #[test]
+    fn a_missing_name_is_cached_for_the_same_short_window_on_both_share_modes() {
+        for writable in [true, false] {
+            let (dir, mut dev) = fixture_with_cache(writable, CachePolicy::Auto);
+            let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"nope\0"), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0));
+            assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(0));
+            assert_eq!(
+                get_u64(&out, OUT_HEADER_LEN + 16),
+                Some(NEGATIVE_CACHE_SECS),
+                "writable={writable}: a miss is valid for {NEGATIVE_CACHE_SECS}s"
+            );
+            // The rest of the reply says there is nothing to describe. A
+            // nonzero attribute validity would invite the guest to keep an
+            // attribute block that was never filled in.
+            assert_eq!(
+                get_u64(&out, OUT_HEADER_LEN + 24),
+                Some(0),
+                "writable={writable}: no attribute validity on a miss"
+            );
+            assert_eq!(get_u32(&out, OUT_HEADER_LEN + 32), Some(0));
+            assert_eq!(get_u32(&out, OUT_HEADER_LEN + 36), Some(0));
+            assert!(
+                out[OUT_HEADER_LEN + 40..].iter().all(|byte| *byte == 0),
+                "writable={writable}: the attribute block is zeroed"
+            );
+            assert_eq!(
+                out.len(),
+                OUT_HEADER_LEN + 40 + FUSE_ATTR_LEN,
+                "writable={writable}: a negative entry is a full fuse_entry_out"
+            );
+
+            // A name that is there still gets the share's own validity.
+            let out = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"etc\0"), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0));
+            let expected = if writable {
+                WRITABLE_CACHE_SECS
+            } else {
+                READ_ONLY_CACHE_SECS
+            };
+            assert_eq!(get_u64(&out, OUT_HEADER_LEN + 16), Some(expected));
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    // The negative reply pads an attribute block it has nothing to fill, so
+    // the padding has to stay the size of the block `put_attr` writes.
+    #[test]
+    fn fuse_attr_len_matches_put_attr() {
+        let mut written = Vec::new();
+        put_attr(
+            &mut written,
+            1,
+            &Stat::lstat(Path::new("/")).unwrap(),
+            GuestAttr {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        );
+        assert_eq!(written.len(), FUSE_ATTR_LEN);
+        assert_eq!(
+            negative_entry_out(0).len(),
+            entry_out(
+                1,
+                &Stat::lstat(Path::new("/")).unwrap(),
+                0,
+                GuestAttr {
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+            .len(),
+            "a negative entry is the same size on the wire as a positive one"
+        );
     }
 
     #[test]
