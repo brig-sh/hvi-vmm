@@ -552,7 +552,7 @@ impl VirtioFs {
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
         // Opened before `root` is moved into the struct, and once: every walk
         // starts from this descriptor.
-        let dirs = DirCache::new(&root, DIR_CACHE_LIMIT, cache_policy != CachePolicy::None)?;
+        let dirs = DirCache::new(&root, dir_cache_limit(), cache_policy != CachePolicy::None)?;
         Ok(Self {
             root,
             writable,
@@ -1642,7 +1642,7 @@ impl VirtioFs {
         let meta = Stat::lstat(&path)?;
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         unlink_at(dirfd, &entry, directory)?;
-        self.invalidate_dirs(&path);
+        self.invalidate_dirs_by_type(&path, meta.is_dir());
         self.forget_node_path(&path, &meta);
         Ok(Vec::new())
     }
@@ -1671,8 +1671,10 @@ impl VirtioFs {
         host_rename(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name, flags)?;
         // Both ends now refer to something other than they did, and for a
         // directory that is true of everything beneath them too.
-        self.invalidate_dirs(&old_path);
-        self.invalidate_dirs(&new_path);
+        let moves_directories =
+            old_meta.is_dir() || replaced.map(|meta| meta.is_dir()).unwrap_or(false);
+        self.invalidate_dirs_by_type(&old_path, moves_directories);
+        self.invalidate_dirs_by_type(&new_path, moves_directories);
         if flags & RENAME_EXCHANGE != 0 {
             self.exchange_node_paths(&old_path, &new_path);
             return Ok(Vec::new());
@@ -1701,7 +1703,11 @@ impl VirtioFs {
             self.rewrite_node_paths(old, new);
             return;
         }
-        let Some(node_id) = self.inode_ids.get(&(old_meta.dev(), old_meta.ino())).copied() else {
+        let Some(node_id) = self
+            .inode_ids
+            .get(&(old_meta.dev(), old_meta.ino()))
+            .copied()
+        else {
             return;
         };
         let Some(node) = self.nodes.get_mut(&node_id) else {
@@ -1825,10 +1831,13 @@ impl VirtioFs {
         // tell the guest anything (#34). ENFILE is the errno for "the host is
         // out", as distinct from the EMFILE the host itself would raise.
         //
-        // Parked descriptors are this device's to give back, so they go first
-        // and the guest reaches the limit later than it used to, never sooner.
-        if self.open_handle_count() >= self.handle_limit {
+        // Both caches are this device's to give back, so they go first and the
+        // guest reaches the limit no sooner than it did before they existed.
+        if self.descriptors_held() >= self.handle_limit {
             self.drain_parked();
+            if self.descriptors_held() >= self.handle_limit {
+                self.dirs.release_all();
+            }
             if self.open_handle_count() >= self.handle_limit {
                 return Err(ENFILE);
             }
@@ -2085,6 +2094,15 @@ impl VirtioFs {
     /// Host descriptors this export currently pins for guest handles.
     fn open_handle_count(&self) -> usize {
         self.handles.len() + self.dir_handles.len()
+    }
+
+    /// Every host descriptor this device is holding, the guest's and its own.
+    ///
+    /// The guest's entitlement is the whole budget, so the caches cannot be
+    /// spent on top of it: what they hold counts here, and they are emptied
+    /// before the guest is told the host is out.
+    fn descriptors_held(&self) -> usize {
+        self.open_handle_count() + self.parked.len() + self.dirs.held()
     }
 
     /// Records the high-water mark, so the stop report can name it. The issue
@@ -2933,6 +2951,31 @@ impl VirtioFs {
         }
     }
 
+    /// The same, for a mutation whose target is known not to be a directory.
+    ///
+    /// Only a directory can have cached descriptors beneath it, so only a
+    /// directory needs the subtree scan -- and that scan looks at every entry
+    /// in the cache, which is the size of a build's directory working set.
+    /// Anything else can only be cached under its own name, which a hash
+    /// lookup settles. Dropping that name rather than skipping the call keeps
+    /// an entry left over from when the path was a directory from outliving
+    /// the mutation.
+    fn invalidate_dir_entry(&mut self, path: &Path) {
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            let relative = relative.to_owned();
+            self.dirs.forget(&relative);
+        }
+    }
+
+    /// Drops what a mutation of `path` invalidates, by what it is.
+    fn invalidate_dirs_by_type(&mut self, path: &Path, is_dir: bool) {
+        if is_dir {
+            self.invalidate_dirs(path);
+        } else {
+            self.invalidate_dir_entry(path);
+        }
+    }
+
     /// Both ends of a two-path operation, resolved together.
     ///
     /// Returns each parent's descriptor owned rather than borrowed, because
@@ -3352,7 +3395,9 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
 // resolver and its tests before the call sites move onto it. The next stage
 // removes this attribute along with the first path-based caller.
 #[allow(dead_code)]
-const DIR_CACHE_LIMIT: usize = 128;
+fn dir_cache_limit() -> usize {
+    (crate::fdlimit::guest_handle_budget() / 16).clamp(128, 4096)
+}
 
 /// Most paths one node will remember at once (#34).
 ///
@@ -3687,6 +3732,18 @@ impl DirCache {
     #[cfg(test)]
     fn resident(&self) -> usize {
         self.open.len()
+    }
+
+    /// How many host descriptors this cache is holding.
+    fn held(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Closes all of them, for when the descriptors are worth more than the
+    /// resolutions they save.
+    fn release_all(&mut self) {
+        self.open.clear();
+        self.lru.clear();
     }
 }
 
@@ -5921,6 +5978,53 @@ mod tests {
     /// Read rounds come from the same helper as the budget test, so the
     /// test and both benchmarks always measure one workload.
     ///
+    /// Removing files, with the directory cache as full as a build makes it.
+    ///
+    /// Every removal invalidates cached directory descriptors, and finding
+    /// which ones used to mean looking at all of them -- so this benchmark is
+    /// only honest with a cache that holds what a real tree puts in it.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_unlink_workload
+    #[test]
+    #[ignore]
+    fn bench_unlink_workload() {
+        const DIRS: usize = 1500;
+        const FILES: usize = 300;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+
+        // Fill the directory cache the way a build does.
+        for d in 0..DIRS {
+            let name = format!("sub-{d:04}");
+            fs::create_dir_all(tree.join(&name)).unwrap();
+            let sub = lookup_node(&mut dev, tree_node, name.as_bytes());
+            fs::write(tree.join(&name).join("f"), b"x").unwrap();
+            lookup_node(&mut dev, sub, b"f");
+        }
+        for i in 0..FILES {
+            fs::write(tree.join(format!("gone-{i:04}")), b"x").unwrap();
+            lookup_node(&mut dev, tree_node, format!("gone-{i:04}").as_bytes());
+        }
+
+        let start = std::time::Instant::now();
+        for i in 0..FILES {
+            let mut input = format!("gone-{i:04}").into_bytes();
+            input.push(0);
+            let out = dev.handle_fuse(&request(UNLINK, tree_node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "UNLINK failed");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "BENCH unlink: {FILES} removals with {DIRS} directories cached => {:.2} us/unlink",
+            elapsed.as_secs_f64() * 1e6 / FILES as f64
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// What a compiler does at the end of every object it writes: rename a
     /// temporary over the previous one.
     ///
@@ -5983,10 +6087,10 @@ mod tests {
     /// again and again.
     ///
     /// The macro workload's exit report has OPEN at 726,175 requests and
-    /// 12.9 s of service time against 730,167 RELEASE requests costing 0.67 s, on a
-    /// tree of 87,101 files. Eight opens per file is a compiler re-reading
-    /// the same headers, and each one pays for a host open and a host close.
-    /// This drives that shape with no guest in the way.
+    /// 12.9 s of service time against 730,167 RELEASE requests costing 0.67 s,
+    /// on a tree of 87,101 files. Eight opens per file is a compiler
+    /// re-reading the same headers, and each one pays for a host open and a
+    /// host close. This drives that shape with no guest in the way.
     ///
     /// The tree is nested `DEPTH` directories deep, because the open path
     /// resolves a full path and a deep one costs more than a shallow one.
@@ -6320,6 +6424,49 @@ mod tests {
         assert_eq!(fs::read(dir.join("created")).unwrap(), b"\0\0\0hello");
         let mode = fs::metadata(dir.join("created")).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o640);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Moving a directory away drops the cached descriptors of the
+    /// directories under it, so a path rebuilt at the same name does not
+    /// resolve through the descriptor of the directory that used to be there.
+    #[test]
+    fn renaming_a_directory_retires_the_cached_descriptors_beneath_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/f"), b"x").unwrap();
+
+        // Resolving these is what puts "a" and "a/b" in the descriptor cache.
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let b = lookup_node(&mut dev, a, b"b");
+        lookup_node(&mut dev, b, b"f");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"a\0moved\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+
+        // A different tree at the same names. Its file is not in the one that
+        // was moved away, so a stale descriptor cannot find it.
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/g"), b"y").unwrap();
+
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let b = lookup_node(&mut dev, a, b"b");
+        let mut payload = b"g".to_vec();
+        payload.push(0);
+        let out = dev.handle_fuse(&request(LOOKUP, b, &payload), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "LOOKUP failed");
+        // Under a caching policy a name that is not there comes back as a
+        // successful reply with node zero, so the node is what says whether
+        // the name resolved.
+        assert_ne!(
+            get_u64(&out, OUT_HEADER_LEN),
+            Some(0),
+            "the rebuilt directory resolved through a fresh descriptor, \
+             not the one cached for the directory that was moved away"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7424,7 +7571,7 @@ mod tests {
         fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
         fs::create_dir_all(dir.join("etc")).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        let cache = DirCache::new(&dir, DIR_CACHE_LIMIT, true).unwrap();
+        let cache = DirCache::new(&dir, dir_cache_limit(), true).unwrap();
         (dir, cache)
     }
 
