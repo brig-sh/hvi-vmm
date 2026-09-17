@@ -608,6 +608,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             })
             .collect();
         eprintln!("[hvi] virtio-fs[{index}] ops: {}", hist.join(" "));
+        let (hits, waits, misses) = dev.readahead_stats();
+        eprintln!("[hvi] virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}");
     }
 
     if let Some(e) = stuck {
