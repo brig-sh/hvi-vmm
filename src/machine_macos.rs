@@ -594,6 +594,20 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             dev.peak_handles(),
             dev.handle_limit()
         );
+        let hist: Vec<String> = dev
+            .op_stats()
+            .into_iter()
+            .map(|(o, c, n)| {
+                format!(
+                    "{}({})={}/{:.1}ms",
+                    crate::virtio_fs::opcode_name(o),
+                    o,
+                    c,
+                    n as f64 / 1e6
+                )
+            })
+            .collect();
+        eprintln!("[hvi] virtio-fs[{index}] ops: {}", hist.join(" "));
     }
 
     if let Some(e) = stuck {

@@ -111,6 +111,69 @@ const COPY_FILE_RANGE: u32 = 47;
 const SYNCFS: u32 = 50;
 const TMPFILE: u32 = 51;
 const STATX: u32 = 52;
+/// Refused rather than served: a regular file can use the libc fallbacks.
+const IOCTL: u32 = 39;
+/// The DAX mapping window, which this device does not offer.
+const SETUPMAPPING: u32 = 48;
+const REMOVEMAPPING: u32 = 49;
+
+/// Returns the name of a FUSE opcode, or `"?"` for one this device never
+/// dispatches.
+///
+/// Beside the constants so that a new opcode is named where it is defined,
+/// rather than in whichever caller happens to print a report.
+pub fn opcode_name(opcode: u32) -> &'static str {
+    match opcode {
+        LOOKUP => "LOOKUP",
+        FORGET => "FORGET",
+        GETATTR => "GETATTR",
+        SETATTR => "SETATTR",
+        READLINK => "READLINK",
+        SYMLINK => "SYMLINK",
+        MKNOD => "MKNOD",
+        MKDIR => "MKDIR",
+        UNLINK => "UNLINK",
+        RMDIR => "RMDIR",
+        RENAME => "RENAME",
+        LINK => "LINK",
+        OPEN => "OPEN",
+        READ => "READ",
+        WRITE => "WRITE",
+        STATFS => "STATFS",
+        RELEASE => "RELEASE",
+        FSYNC => "FSYNC",
+        SETXATTR => "SETXATTR",
+        GETXATTR => "GETXATTR",
+        LISTXATTR => "LISTXATTR",
+        REMOVEXATTR => "REMOVEXATTR",
+        FLUSH => "FLUSH",
+        INIT => "INIT",
+        OPENDIR => "OPENDIR",
+        READDIR => "READDIR",
+        RELEASEDIR => "RELEASEDIR",
+        FSYNCDIR => "FSYNCDIR",
+        GETLK => "GETLK",
+        SETLK => "SETLK",
+        SETLKW => "SETLKW",
+        ACCESS => "ACCESS",
+        CREATE => "CREATE",
+        DESTROY => "DESTROY",
+        POLL => "POLL",
+        BATCH_FORGET => "BATCH_FORGET",
+        FALLOCATE => "FALLOCATE",
+        READDIRPLUS => "READDIRPLUS",
+        RENAME2 => "RENAME2",
+        LSEEK => "LSEEK",
+        COPY_FILE_RANGE => "COPY_FILE_RANGE",
+        SYNCFS => "SYNCFS",
+        TMPFILE => "TMPFILE",
+        STATX => "STATX",
+        IOCTL => "IOCTL",
+        SETUPMAPPING => "SETUPMAPPING",
+        REMOVEMAPPING => "REMOVEMAPPING",
+        _ => "?",
+    }
+}
 
 // Linux open flags carried on the wire. They must never be passed directly to
 // macOS, whose constants differ.
@@ -425,6 +488,9 @@ pub struct VirtioFs {
     /// to decide anything -- so relaxed is enough.
     zero_copy_reads: AtomicU64,
     zero_copy_writes: AtomicU64,
+    /// FUSE requests received, by opcode. Diagnostic only.
+    op_counts: [AtomicU64; 64],
+    op_nanos: [AtomicU64; 64],
     /// Directory descriptors for resolving without paths (#30). Read
     /// operations resolve through this; the rest of the device still joins
     /// path strings and moves over a stage at a time.
@@ -525,6 +591,8 @@ impl VirtioFs {
             next_tmpfile: 1,
             zero_copy_reads: AtomicU64::new(0),
             zero_copy_writes: AtomicU64::new(0),
+            op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            op_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             dirs,
             dirty: false,
             host_syncs: AtomicU64::new(0),
@@ -544,6 +612,41 @@ impl VirtioFs {
     #[cfg(test)]
     fn host_sync_count(&self) -> u64 {
         self.host_syncs.load(Ordering::Relaxed)
+    }
+
+    /// Returns `(opcode, count, total_nanos)` for every opcode seen since boot.
+    pub fn op_stats(&self) -> Vec<(u32, u64, u64)> {
+        self.op_counts
+            .iter()
+            .zip(self.op_nanos.iter())
+            .enumerate()
+            .map(|(i, (c, n))| {
+                (
+                    i as u32,
+                    c.load(Ordering::Relaxed),
+                    n.load(Ordering::Relaxed),
+                )
+            })
+            .filter(|(_, c, _)| *c > 0)
+            .collect()
+    }
+
+    /// Records that a request with `opcode` arrived.
+    fn count_op(&self, opcode: u32) {
+        if let Some(slot) = self.op_counts.get(opcode as usize) {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records what a request with `opcode` spent, measured from `start`.
+    ///
+    /// Separate from `count_op` because a request is counted when it arrives
+    /// and timed when it leaves, and the two points are not in the same
+    /// function for every opcode.
+    fn note_op_time(&self, opcode: u32, start: std::time::Instant) {
+        if let Some(slot) = self.op_nanos.get(opcode as usize) {
+            slot.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     fn note_zero_copy_read(&self) {
@@ -895,6 +998,7 @@ impl VirtioFs {
         let opcode = get_u32(&header, 4).unwrap_or(0);
         let unique = get_u64(&header, 8).unwrap_or(0);
 
+        let direct_start = std::time::Instant::now();
         let direct = match opcode {
             READ => self.read_direct(mem, unique, declared, input, output, max_out),
             WRITE => {
@@ -904,12 +1008,22 @@ impl VirtioFs {
             _ => None,
         };
         if let Some(reply) = direct {
+            // READ and WRITE leave through the direct descriptor path, which
+            // returns before `handle_fuse`, so they are recorded here. They
+            // are the two opcodes a data workload is mostly made of.
+            self.count_op(opcode);
+            self.note_op_time(opcode, direct_start);
             return reply;
         }
 
         let total: usize = input.iter().map(|(_, len)| *len as usize).sum();
         let mut request = vec![0u8; total];
         if gather(mem, input, 0, &mut request).is_err() {
+            // The opcode is known by now, so the failure is attributable and
+            // the report accounts for the request. A header that could not be
+            // gathered at all, above, has no opcode to attribute it to.
+            self.count_op(opcode);
+            self.note_op_time(opcode, direct_start);
             return Reply::Buffered(error_response(unique, EIO));
         }
         Reply::Buffered(self.handle_fuse(&request, max_out))
@@ -920,24 +1034,38 @@ impl VirtioFs {
         let opcode = get_u32(raw, 4).unwrap_or(0);
         let unique = get_u64(raw, 8).unwrap_or(0);
         let nodeid = get_u64(raw, 16).unwrap_or(0);
+        self.count_op(opcode);
+        let op_start = std::time::Instant::now();
         let request_context = RequestContext {
             uid: get_u32(raw, 24).unwrap_or(0),
             gid: get_u32(raw, 28).unwrap_or(0),
         };
         if declared < IN_HEADER_LEN || declared > raw.len() {
+            self.note_op_time(opcode, op_start);
             return error_response(unique, EINVAL);
         }
         let payload = &raw[IN_HEADER_LEN..declared];
-        let result = match opcode {
+        // FORGET, BATCH_FORGET and DESTROY are answered with nothing at all,
+        // so they leave before the response encoder below. Timing them here
+        // is what keeps them out of the report as a count at 0.0 ms: FORGET
+        // is the most frequent request a build sends.
+        let no_reply = match opcode {
             FORGET => {
                 self.forget(nodeid, payload);
-                return Vec::new();
+                true
             }
             BATCH_FORGET => {
                 self.batch_forget(payload);
-                return Vec::new();
+                true
             }
-            DESTROY => return Vec::new(),
+            DESTROY => true,
+            _ => false,
+        };
+        if no_reply {
+            self.note_op_time(opcode, op_start);
+            return Vec::new();
+        }
+        let result = match opcode {
             INIT => self.init(payload),
             LOOKUP => self.lookup(nodeid, payload),
             GETATTR => self.getattr(nodeid, payload),
@@ -989,10 +1117,11 @@ impl VirtioFs {
             SYNCFS => self.syncfs(),
             TMPFILE => self.tmpfile(nodeid, payload, request_context),
             STATX => self.statx(nodeid, payload),
-            39 => Err(ENOTTY), // IOCTL: regular files can use libc fallbacks.
-            48 | 49 => Err(EOPNOTSUPP), // No DAX mapping window.
+            IOCTL => Err(ENOTTY),
+            SETUPMAPPING | REMOVEMAPPING => Err(EOPNOTSUPP),
             _ => Err(ENOSYS),
         };
+        self.note_op_time(opcode, op_start);
         match result {
             Ok(payload) => success_response(unique, &payload),
             Err(errno) => error_response(unique, errno),
@@ -6582,6 +6711,119 @@ mod tests {
         release[0..8].copy_from_slice(&fh.to_le_bytes());
         dev.handle_fuse(&request(RELEASE, issue_node, &release), 4096);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // FORGET, BATCH_FORGET and DESTROY are answered with nothing and leave
+    // before the response encoder, which is where the timing used to sit.
+    // They appeared in the report with a count and 0.0 ms, and FORGET is the
+    // most frequent request a build sends.
+    #[test]
+    fn every_counted_opcode_is_also_timed() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+
+        let mut forget = Vec::new();
+        put_u64(&mut forget, 0);
+        for _ in 0..200 {
+            dev.handle_fuse(&request(FORGET, issue, &forget), 4096);
+        }
+        let mut batch = Vec::new();
+        put_u32(&mut batch, 1);
+        put_u32(&mut batch, 0);
+        put_u64(&mut batch, issue);
+        put_u64(&mut batch, 0);
+
+        // A request that is short enough to be refused before dispatch is
+        // still a request the device spent time on.
+        let mut truncated = request(GETATTR, issue, &[0u8; 16]);
+        truncated[0..4].copy_from_slice(&4u32.to_le_bytes());
+
+        // Each of these is repeated because the assertion below is that the
+        // total is nonzero, and one pass through a handler that does almost
+        // nothing can fall inside a single tick of the timebase -- 24 MHz on
+        // Apple silicon, so about 42 ns.
+        for _ in 0..200 {
+            dev.handle_fuse(&request(BATCH_FORGET, 0, &batch), 4096);
+            dev.handle_fuse(&request(DESTROY, 0, &[]), 4096);
+            dev.handle_fuse(&truncated, 4096);
+        }
+
+        let stats = dev.op_stats();
+        for (opcode, count, nanos) in &stats {
+            assert!(
+                *nanos > 0,
+                "{} counted {count} times and timed at 0 ns",
+                opcode_name(*opcode)
+            );
+        }
+        let seen: Vec<u32> = stats.iter().map(|(o, _, _)| *o).collect();
+        for opcode in [FORGET, BATCH_FORGET, DESTROY, GETATTR] {
+            assert!(
+                seen.contains(&opcode),
+                "{} missing from the report",
+                opcode_name(opcode)
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The report used to name 18 of the 44 opcodes this device dispatches,
+    // and printed `?` for the rest.
+    #[test]
+    fn every_dispatched_opcode_has_a_name() {
+        for opcode in [
+            LOOKUP,
+            FORGET,
+            GETATTR,
+            SETATTR,
+            READLINK,
+            SYMLINK,
+            MKNOD,
+            MKDIR,
+            UNLINK,
+            RMDIR,
+            RENAME,
+            LINK,
+            OPEN,
+            READ,
+            WRITE,
+            STATFS,
+            RELEASE,
+            FSYNC,
+            SETXATTR,
+            GETXATTR,
+            LISTXATTR,
+            REMOVEXATTR,
+            FLUSH,
+            INIT,
+            OPENDIR,
+            READDIR,
+            RELEASEDIR,
+            FSYNCDIR,
+            GETLK,
+            SETLK,
+            SETLKW,
+            ACCESS,
+            CREATE,
+            DESTROY,
+            POLL,
+            BATCH_FORGET,
+            FALLOCATE,
+            READDIRPLUS,
+            RENAME2,
+            LSEEK,
+            COPY_FILE_RANGE,
+            SYNCFS,
+            TMPFILE,
+            STATX,
+            IOCTL,
+            SETUPMAPPING,
+            REMOVEMAPPING,
+        ] {
+            assert_ne!(opcode_name(opcode), "?", "opcode {opcode} prints as `?`");
+        }
+        assert_eq!(opcode_name(9999), "?");
     }
 
     #[test]
