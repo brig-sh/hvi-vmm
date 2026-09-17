@@ -281,6 +281,9 @@ struct DirHandle {
     entries: Vec<DirEntryInfo>,
 }
 
+/// Listings paged through with fh 0 that the device keeps at once.
+const FH0_LISTINGS_MAX: usize = 64;
+
 /// A guest-created Unix socket, held in the device rather than on the host.
 /// See `VirtioFs::sockets`.
 #[derive(Clone, Copy)]
@@ -393,6 +396,15 @@ pub struct VirtioFs {
     next_socket_ino: u64,
     handles: HashMap<u64, FileHandle>,
     dir_handles: HashMap<u64, DirHandle>,
+    /// Listings guests page through with fh 0, by node. A guest that
+    /// stopped opening directories pages through a listing over several
+    /// requests, and a walk reads a subdirectory before it finishes its
+    /// parent, so several are open at once. Each is read once and kept
+    /// across the guest's own changes, as a handle's snapshot is, so the
+    /// offsets the guest holds stay valid. The oldest goes when there are
+    /// more than [`FH0_LISTINGS_MAX`].
+    fh0_listings: HashMap<u64, Vec<DirEntryInfo>>,
+    fh0_order: VecDeque<u64>,
     next_handle: u64,
     /// Most guest handles this export will hold open at once (#34).
     ///
@@ -495,6 +507,8 @@ impl VirtioFs {
             next_socket_ino: 1,
             handles: HashMap::new(),
             dir_handles: HashMap::new(),
+            fh0_listings: HashMap::new(),
+            fh0_order: VecDeque::new(),
             next_handle: 1,
             handle_limit: crate::fdlimit::guest_handle_budget(),
             peak_handles: 0,
@@ -513,7 +527,6 @@ impl VirtioFs {
             self.zero_copy_writes.load(Ordering::Relaxed),
         )
     }
-
 
     fn note_zero_copy_read(&self) {
         self.zero_copy_reads.fetch_add(1, Ordering::Relaxed);
@@ -2335,9 +2348,8 @@ impl VirtioFs {
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
         let limit = requested.min(capacity);
         let dir = self.node_path(node)?.to_owned();
-        note_host_op();
-        if !fs::metadata(&dir).map_err(io_errno)?.is_dir() {
-            return Err(ENOTDIR);
+        if fh != 0 && !self.dir_handles.contains_key(&fh) {
+            return Err(EBADF);
         }
         // Resolving the directory is what OPENDIR used to do, and everything
         // the guest does with the entries afterwards -- a lookup, an open, a
@@ -2356,11 +2368,17 @@ impl VirtioFs {
         } else {
             dir.parent().unwrap_or(&self.root).to_owned()
         };
-        let parent_meta = Stat::lstat(&parent_path)?;
-        let parent_node = if plus {
-            self.node_for(parent_path.clone(), &parent_meta)
+        // Only the `..` record (index 1) needs the parent, so its stat is
+        // taken only by the request whose page starts at or before it.
+        let parent_node = if offset <= 1 {
+            let parent_meta = Stat::lstat(&parent_path)?;
+            if plus {
+                self.node_for(parent_path.clone(), &parent_meta)
+            } else {
+                parent_meta.ino()
+            }
         } else {
-            parent_meta.ino()
+            0
         };
 
         // No reply can hold more than `limit / min_record_len` entries, so
@@ -2375,11 +2393,26 @@ impl VirtioFs {
         // fh 0 is never a real handle (they start at 1): the guest has
         // stopped sending OPENDIR, so the listing is read here.
         let batch: Vec<(usize, DirEntryInfo)> = if fh == 0 {
-            self.dir_entries(&dir)?
+            let reuse = offset != 0 && self.fh0_listings.contains_key(&node);
+            if !reuse {
+                let entries = self.dir_entries(&dir)?;
+                if self.fh0_listings.insert(node, entries).is_none() {
+                    self.fh0_order.push_back(node);
+                    if self.fh0_order.len() > FH0_LISTINGS_MAX {
+                        if let Some(oldest) = self.fh0_order.pop_front() {
+                            self.fh0_listings.remove(&oldest);
+                        }
+                    }
+                }
+            }
+            self.fh0_listings
+                .get(&node)
                 .into_iter()
+                .flatten()
                 .enumerate()
                 .skip(offset)
                 .take(max_entries)
+                .map(|(idx, entry)| (idx, entry.clone()))
                 .collect()
         } else {
             self.dir_handles
@@ -2869,10 +2902,13 @@ impl VirtioFs {
                     // A miss opens the entry. The cache is what keeps this off
                     // the hot path: one open per node the first time it is
                     // seen, in place of the getxattr this replaces.
-                    let stored = self
-                        .open_entry_at(node)
-                        .ok()
-                        .and_then(|fd| stored_guest_attr(fd.as_fd()));
+                    let stored = match path {
+                        Some(path) => stored_guest_attr_at(path),
+                        None => self
+                            .open_entry_at(node)
+                            .ok()
+                            .and_then(|fd| stored_guest_attr(fd.as_fd())),
+                    };
                     if let Some(n) = self.nodes.get_mut(&node) {
                         n.guest_attr = Some(stored);
                     }
@@ -3993,6 +4029,40 @@ fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
 #[cfg(target_os = "macos")]
 fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
     let value = fd_getxattr(fd, HVI_XATTR_LINUX_ATTR).ok()?;
+    decode_guest_attr(&value)
+}
+
+/// The stored guest attribute of a path, read without following a symlink.
+///
+/// The value is 12 bytes, so one call with a 12-byte buffer reads it. The
+/// size probe a general getxattr makes first, and the open that a
+/// descriptor read needs, are the cost this avoids on every READDIRPLUS
+/// entry.
+#[cfg(target_os = "macos")]
+fn stored_guest_attr_at(path: &Path) -> Option<GuestAttr> {
+    let path = path_cstring(path).ok()?;
+    let name = xattr_name(HVI_XATTR_LINUX_ATTR).ok()?;
+    let mut value = [0u8; 12];
+    // SAFETY: both strings are NUL-terminated and the buffer length is
+    // passed alongside the buffer.
+    let got = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if got != 12 {
+        return None;
+    }
+    decode_guest_attr(&value)
+}
+
+#[cfg(target_os = "macos")]
+fn decode_guest_attr(value: &[u8]) -> Option<GuestAttr> {
     if value.len() != 12 {
         return None;
     }
@@ -5296,7 +5366,7 @@ mod tests {
         // GETATTR, less the descriptor that the lookup leaves in the cache.
         const PER_FILE_BUDGET: u64 = 2;
         // True for this fixture only. See the note above on what moves it.
-        const LISTING_BUDGET: u64 = 36;
+        const LISTING_BUDGET: u64 = 29;
 
         let (dir, mut dev) = fixture_with_access(true);
         let tree = dir.join("tree");
@@ -5305,11 +5375,14 @@ mod tests {
             fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
         }
         let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+        // The component descriptor for the tree is opened by whichever
+        // request first needs it. Opening it here keeps that one-time cost
+        // out of both phases, so each phase's count is its own.
+        lookup_node(&mut dev, tree_node, b"file-0000");
 
-        // The first round pays the costs that occur once: the component
-        // descriptor for the tree, and the entries in the node table. The
-        // budget applies to the steady state, and the third round shows
-        // that the steady state is real.
+        // The first round pays the costs that occur once: the entries in
+        // the node table. The budget applies to the steady state, and the
+        // third round shows that the steady state is real.
         let warm = metadata_round_cost(&mut dev, tree_node, FILES);
         let steady = metadata_round_cost(&mut dev, tree_node, FILES);
         let repeat = metadata_round_cost(&mut dev, tree_node, FILES);
