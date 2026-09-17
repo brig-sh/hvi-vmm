@@ -224,6 +224,16 @@ const EDQUOT: i32 = 122;
 struct FileHandle {
     file: File,
     writable: bool,
+    /// The flags the guest opened with, kept so that a descriptor parked when
+    /// this handle is released is only reused for an open asking for the same.
+    open_flags: u32,
+    /// What the file read as when this handle was opened: `(dev, ino)`, mode,
+    /// uid and gid. Parking the descriptor needs them, and taking them from
+    /// the open that already had to look means the release path asks the host
+    /// nothing. They can go stale while the handle is open -- a guest chmod
+    /// through this device does that -- and a stale set only costs the next
+    /// open its reuse, because the parked descriptor then fails its check.
+    attrs: HandleAttrs,
     path: PathBuf,
     temporary_path: Option<PathBuf>,
     /// The FUSE node this handle was opened for. A node the guest unlinks
@@ -244,6 +254,48 @@ impl FileHandle {
             _ => Ok(()),
         }
     }
+}
+
+/// What an open was decided on, carried from the open to the park.
+#[derive(Clone, Copy)]
+struct HandleAttrs {
+    key: (u64, u64),
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl HandleAttrs {
+    fn of(meta: &Stat) -> Self {
+        Self {
+            key: (meta.dev(), meta.ino()),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }
+    }
+}
+
+/// A host descriptor kept after the guest closed the file, so that the next
+/// open of the same node does not pay for another host open.
+///
+/// A build opens the same files over and over: the macro workload's report has
+/// 726,175 OPENs over a tree of 87,101 files, and the host open is 8.4 us of
+/// the 10.6 us each one cost. What the guest closes is therefore parked here
+/// rather than closed, and handed back when the same node is opened again the
+/// same way.
+///
+/// The attributes are what the open would have been decided on. A host open
+/// consults the file's mode, owner and group; if all three still read the same
+/// and the name still leads to the same inode, the open the device is skipping
+/// would have succeeded and returned this descriptor.
+struct ParkedFd {
+    file: File,
+    /// The open flags this descriptor carries, masked to the ones that change
+    /// what reads and writes through it do. A descriptor is reused only for an
+    /// open that asks for exactly these.
+    flags: u32,
+    attrs: HandleAttrs,
 }
 
 /// What a handler produced. `Direct` means the handler already placed its
@@ -412,6 +464,26 @@ pub struct VirtioFs {
     /// number chosen without knowing what a real build needs is a number that
     /// breaks one.
     peak_handles: usize,
+    /// Descriptors the guest has closed, kept for its next open of the same
+    /// node. Bounded by `parked_limit` and evicted oldest-first.
+    parked: HashMap<u64, ParkedFd>,
+    /// Park order, oldest first, so eviction has something to pick.
+    ///
+    /// Entries are left behind when a descriptor is taken or dropped, because
+    /// removing one by value is a scan of the whole queue and this is the
+    /// path a build spends its requests on -- 698,000 of 726,000 opens on the
+    /// macro workload were served from here, and a scan of 8,000 parked
+    /// entries on each of them cost more than the host open it replaced.
+    /// Eviction skips the ids it no longer finds, and the queue is compacted
+    /// once the stale ones outnumber the live.
+    parked_order: VecDeque<u64>,
+    /// How many descriptors may sit parked at once. They are host descriptors
+    /// like any other, so this comes out of the same budget as the guest's own
+    /// handles (#34) rather than adding to it.
+    parked_limit: usize,
+    /// Opens served from `parked`, and opens that had to reach the host.
+    parked_hits: u64,
+    parked_misses: u64,
     next_tmpfile: u64,
     /// How many READs and WRITEs took the zero-copy `preadv`/`pwritev` path.
     ///
@@ -480,7 +552,7 @@ impl VirtioFs {
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
         // Opened before `root` is moved into the struct, and once: every walk
         // starts from this descriptor.
-        let dirs = DirCache::new(&root, DIR_CACHE_LIMIT, cache_policy != CachePolicy::None)?;
+        let dirs = DirCache::new(&root, dir_cache_limit(), cache_policy != CachePolicy::None)?;
         Ok(Self {
             root,
             writable,
@@ -501,6 +573,14 @@ impl VirtioFs {
             dir_handles: HashMap::new(),
             next_handle: 1,
             handle_limit: crate::fdlimit::guest_handle_budget(),
+            parked: HashMap::new(),
+            parked_order: VecDeque::new(),
+            // A quarter of the guest's own budget: enough for the working set
+            // of headers a compiler reopens, small enough that the guest can
+            // still hold the handles it is entitled to.
+            parked_limit: crate::fdlimit::guest_handle_budget() / 4,
+            parked_hits: 0,
+            parked_misses: 0,
             peak_handles: 0,
             next_tmpfile: 1,
             zero_copy_reads: AtomicU64::new(0),
@@ -1562,7 +1642,7 @@ impl VirtioFs {
         let meta = Stat::lstat(&path)?;
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         unlink_at(dirfd, &entry, directory)?;
-        self.invalidate_dirs(&path);
+        self.invalidate_dirs_by_type(&path, meta.is_dir());
         self.forget_node_path(&path, &meta);
         Ok(Vec::new())
     }
@@ -1591,8 +1671,10 @@ impl VirtioFs {
         host_rename(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name, flags)?;
         // Both ends now refer to something other than they did, and for a
         // directory that is true of everything beneath them too.
-        self.invalidate_dirs(&old_path);
-        self.invalidate_dirs(&new_path);
+        let moves_directories =
+            old_meta.is_dir() || replaced.map(|meta| meta.is_dir()).unwrap_or(false);
+        self.invalidate_dirs_by_type(&old_path, moves_directories);
+        self.invalidate_dirs_by_type(&new_path, moves_directories);
         if flags & RENAME_EXCHANGE != 0 {
             self.exchange_node_paths(&old_path, &new_path);
             return Ok(Vec::new());
@@ -1603,8 +1685,39 @@ impl VirtioFs {
             }
             self.forget_node_path(&new_path, &meta);
         }
-        self.rewrite_node_paths(&old_path, &new_path);
+        self.rewrite_renamed_paths(&old_path, &new_path, &old_meta);
         Ok(Vec::new())
+    }
+
+    /// Moves the recorded paths of whatever was renamed.
+    ///
+    /// Renaming a directory moves every path beneath it, and finding those
+    /// means looking at all of them. Renaming anything else moves exactly one
+    /// path of one node, and that node is the one the inode index already
+    /// names -- so the common case, a compiler renaming a temporary over its
+    /// object, does not walk the table. The walk cost 15 ms per rename on a
+    /// tree of 87,101 files, which was the most expensive request the macro
+    /// workload made.
+    fn rewrite_renamed_paths(&mut self, old: &Path, new: &Path, old_meta: &Stat) {
+        if old_meta.is_dir() {
+            self.rewrite_node_paths(old, new);
+            return;
+        }
+        let Some(node_id) = self
+            .inode_ids
+            .get(&(old_meta.dev(), old_meta.ino()))
+            .copied()
+        else {
+            return;
+        };
+        let Some(node) = self.nodes.get_mut(&node_id) else {
+            return;
+        };
+        for path in &mut node.paths {
+            if path == old {
+                *path = new.to_owned();
+            }
+        }
     }
 
     fn rewrite_node_paths(&mut self, old: &Path, new: &Path) {
@@ -1670,7 +1783,14 @@ impl VirtioFs {
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         let mut out = self.entry_out(node, &path, &meta);
-        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path, node);
+        let fh = self.insert_handle(
+            file,
+            flags & LINUX_O_ACCMODE != 0,
+            flags,
+            HandleAttrs::of(&meta),
+            path,
+            node,
+        );
         put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
@@ -1695,27 +1815,14 @@ impl VirtioFs {
             return Err(EROFS);
         }
         let path = self.node_path(node)?.to_owned();
-        let meta = Stat::lstat(&path)?;
-        if directory && !meta.is_dir() {
-            return Err(ENOTDIR);
-        }
-        if !directory && meta.is_dir() {
-            return Err(EISDIR);
-        }
-        // Only a regular file may be opened here. Opening a FIFO blocks until
-        // the other end is opened, and this request holds the device mutex --
-        // on the vCPU thread when the queue is shallow enough to be served
-        // inline -- so the guest would stop the VM rather than just itself.
-        // A guest kernel opens a FIFO, socket or device node on a FUSE mount
-        // itself and never sends OPEN for one, so refusing costs it nothing.
-        //
-        // `meta` comes from `symlink_metadata`, so this refuses a symlink too.
-        // That is deliberate rather than a side effect: `open_host_file`
-        // already passes `O_NOFOLLOW`, so such an open never succeeded, and
-        // the only change is that the guest now sees EPERM where it saw
-        // ELOOP.
-        if !directory && !meta.is_file() {
-            return Err(EPERM);
+        // OPENDIR asks the path what it is: it is rare next to OPEN, and
+        // `insert_dir_handle` walks the path anyway. OPEN does not, because
+        // the descriptor below answers the same question for less.
+        if directory {
+            let meta = Stat::lstat(&path)?;
+            if !meta.is_dir() {
+                return Err(ENOTDIR);
+            }
         }
         // Before anything is opened. Each handle pins a host descriptor until
         // the guest releases it, and the descriptor table is the process's,
@@ -1723,21 +1830,76 @@ impl VirtioFs {
         // block device, the ledger and the control socket, none of which can
         // tell the guest anything (#34). ENFILE is the errno for "the host is
         // out", as distinct from the EMFILE the host itself would raise.
-        if self.open_handle_count() >= self.handle_limit {
-            return Err(ENFILE);
+        //
+        // Both caches are this device's to give back, so they go first and the
+        // guest reaches the limit no sooner than it did before they existed.
+        if self.descriptors_held() >= self.handle_limit {
+            self.drain_parked();
+            if self.descriptors_held() >= self.handle_limit {
+                self.dirs.release_all();
+            }
+            if self.open_handle_count() >= self.handle_limit {
+                return Err(ENFILE);
+            }
         }
         let fh = if directory {
             self.insert_dir_handle(&path)?
         } else {
-            let file = {
-                let (dirfd, name) = self.entry_at(node)?;
-                open_host_file_at(dirfd, &name, flags, false, 0)?
+            // Only a regular file may be opened here, and what it is comes
+            // from the descriptor rather than from a `lstat` of the path
+            // ahead of it. The path form resolves every component again --
+            // 1.95 us of the 10.6 us this handler spent, on a tree eight
+            // directories deep -- and it answers about the name, while the
+            // descriptor answers about the file the guest is about to read.
+            //
+            // The open cannot wait: `host_open_flags` passes O_NONBLOCK, so a
+            // FIFO comes back at once and is refused here rather than
+            // stopping the VM. A guest kernel opens a FIFO, socket or device
+            // node on a FUSE mount itself and never sends OPEN for one, so
+            // refusing costs it nothing.
+            let reused = if self.may_reuse_descriptor(flags, open_flags) {
+                self.take_parked(node, flags)
+            } else {
+                None
+            };
+            let (file, attrs) = match reused {
+                Some(reused) => {
+                    // Parked descriptors are only ever taken from a successful
+                    // open of a regular file, and the file it refers to cannot
+                    // change under it, so the type checks below have already
+                    // been made about this descriptor.
+                    self.parked_hits += 1;
+                    reused
+                }
+                None => {
+                    self.parked_misses += 1;
+                    let file = {
+                        let (dirfd, name) = self.entry_at(node)?;
+                        match open_host_file_at(dirfd, &name, flags, false, 0) {
+                            Ok(file) => file,
+                            // O_NOFOLLOW turns a symlink into ELOOP, and a
+                            // special file fails its own way, so the errno the
+                            // guest saw when the type was checked ahead of the
+                            // open is restored here. Only a failed open pays
+                            // for it.
+                            Err(err) => return Err(open_failure_errno(&path, err)),
+                        }
+                    };
+                    let meta = Stat::of_file(&file)?;
+                    if meta.is_dir() {
+                        return Err(EISDIR);
+                    }
+                    if !meta.is_file() {
+                        return Err(EPERM);
+                    }
+                    (file, HandleAttrs::of(&meta))
+                }
             };
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
                 clear_suid_sgid(&path, &file)?;
                 self.invalidate_guest_attr(node);
             }
-            self.insert_handle(file, wants_write, path, node)
+            self.insert_handle(file, wants_write, flags, attrs, path, node)
         };
         let mut out = Vec::with_capacity(16);
         put_open_out(
@@ -1934,6 +2096,15 @@ impl VirtioFs {
         self.handles.len() + self.dir_handles.len()
     }
 
+    /// Every host descriptor this device is holding, the guest's and its own.
+    ///
+    /// The guest's entitlement is the whole budget, so the caches cannot be
+    /// spent on top of it: what they hold counts here, and they are emptied
+    /// before the guest is told the host is out.
+    fn descriptors_held(&self) -> usize {
+        self.open_handle_count() + self.parked.len() + self.dirs.held()
+    }
+
     /// Records the high-water mark, so the stop report can name it. The issue
     /// asks for the measurement before the limit is tightened, and this is
     /// where the number comes from.
@@ -1953,13 +2124,141 @@ impl VirtioFs {
         self.handle_limit
     }
 
-    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf, node: u64) -> u64 {
+    /// The open flags that decide what reads and writes through a descriptor
+    /// do. A parked descriptor is reused only for an open asking for exactly
+    /// these, so the guest never gets an append-only descriptor where it asked
+    /// for a plain one, or the other way round.
+    fn parked_flag_key(flags: u32) -> u32 {
+        flags & (LINUX_O_ACCMODE | LINUX_O_APPEND)
+    }
+
+    /// Whether an open may be served from a parked descriptor at all.
+    ///
+    /// O_TRUNC has to reach the host, because reuse would skip the truncation.
+    /// Killing suid needs the open's own path too. Under `cache=none` nothing
+    /// is parked: that policy's contract is that the host is consulted for
+    /// every request, and a descriptor opened a while ago is the opposite of
+    /// that.
+    fn may_reuse_descriptor(&self, flags: u32, open_flags: u32) -> bool {
+        self.cache_policy != CachePolicy::None
+            && flags & LINUX_O_TRUNC == 0
+            && open_flags & FUSE_OPEN_KILL_SUIDGID == 0
+    }
+
+    /// Hands back a descriptor the guest closed earlier, if the file it refers
+    /// to is still the file this open would have reached.
+    ///
+    /// The check costs one `fstatat` against the host open it replaces. The
+    /// name must still lead to the same inode, so a file replaced on the host
+    /// is not served from the descriptor of the file it replaced; and the
+    /// mode, owner and group must be unchanged, so an open the host would now
+    /// refuse is not answered from a descriptor it granted earlier.
+    fn take_parked(&mut self, node: u64, flags: u32) -> Option<(File, HandleAttrs)> {
+        let wanted = Self::parked_flag_key(flags);
+        if self.parked.get(&node).map(|p| p.flags) != Some(wanted) {
+            return None;
+        }
+        let meta = {
+            let (dirfd, name) = self.entry_at(node).ok()?;
+            Stat::at(dirfd, &name).ok()?
+        };
+        let parked = self.parked.get(&node)?;
+        let current = HandleAttrs::of(&meta);
+        if current.key != parked.attrs.key
+            || current.mode != parked.attrs.mode
+            || current.uid != parked.attrs.uid
+            || current.gid != parked.attrs.gid
+        {
+            self.drop_parked(node);
+            return None;
+        }
+        let parked = self.parked.remove(&node)?;
+        Some((parked.file, parked.attrs))
+    }
+
+    /// Keeps a descriptor the guest has finished with, for its next open.
+    ///
+    /// Only a descriptor that refers to exactly what its node names is worth
+    /// keeping: an unlinked file's would pin an inode the host has otherwise
+    /// finished with, and one whose node is gone could never be matched again.
+    fn park_descriptor(&mut self, node: u64, flags: u32, attrs: HandleAttrs, file: File) {
+        if !self.nodes.contains_key(&node) || self.is_orphan(node) {
+            return;
+        }
+        self.drop_parked(node);
+        if self.parked_limit == 0 {
+            return;
+        }
+        while self.parked.len() >= self.parked_limit {
+            let before = self.parked.len();
+            self.evict_one_parked();
+            if self.parked.len() == before {
+                return;
+            }
+        }
+        self.parked.insert(
+            node,
+            ParkedFd {
+                file,
+                flags: Self::parked_flag_key(flags),
+                attrs,
+            },
+        );
+        self.parked_order.push_back(node);
+    }
+
+    /// Closes any descriptor parked for `node`.
+    fn drop_parked(&mut self, node: u64) {
+        self.parked.remove(&node);
+    }
+
+    /// Drops the oldest parked descriptor, skipping ids that are no longer
+    /// parked, and compacts the queue when those have taken it over.
+    fn evict_one_parked(&mut self) {
+        while let Some(oldest) = self.parked_order.pop_front() {
+            if self.parked.remove(&oldest).is_some() {
+                break;
+            }
+        }
+        if self.parked_order.len() > 4 * self.parked.len().max(1) {
+            let live = std::mem::take(&mut self.parked_order);
+            self.parked_order = live
+                .into_iter()
+                .filter(|id| self.parked.contains_key(id))
+                .collect();
+        }
+    }
+
+    /// Closes every parked descriptor, for the paths that need the host
+    /// descriptor table back rather than the speed.
+    fn drain_parked(&mut self) {
+        self.parked.clear();
+        self.parked_order.clear();
+    }
+
+    /// Opens served from a parked descriptor, and opens that reached the host.
+    #[must_use]
+    pub fn descriptor_cache_stats(&self) -> (u64, u64, usize) {
+        (self.parked_hits, self.parked_misses, self.parked.len())
+    }
+
+    fn insert_handle(
+        &mut self,
+        file: File,
+        writable: bool,
+        open_flags: u32,
+        attrs: HandleAttrs,
+        path: PathBuf,
+        node: u64,
+    ) -> u64 {
         let fh = self.next_handle();
         self.handles.insert(
             fh,
             FileHandle {
                 file,
                 writable,
+                open_flags,
+                attrs,
                 path,
                 temporary_path: None,
                 node,
@@ -2043,7 +2342,17 @@ impl VirtioFs {
                 return Err(io_errno(io::Error::last_os_error()));
             }
         }
-        handle.remove_temporary().map_err(io_errno)?;
+        if handle.temporary_path.is_some() {
+            handle.remove_temporary().map_err(io_errno)?;
+            return Ok(Vec::new());
+        }
+        // The descriptor is kept for the guest's next open of the same file
+        // rather than closed here. A descriptor that carried a lock is not:
+        // the unlock above is this device's word that the lock is gone, and
+        // keeping the descriptor that held it open invites the argument.
+        if self.cache_policy != CachePolicy::None && flags & FUSE_RELEASE_FLOCK_UNLOCK == 0 {
+            self.park_descriptor(handle.node, handle.open_flags, handle.attrs, handle.file);
+        }
         Ok(Vec::new())
     }
 
@@ -2323,6 +2632,8 @@ impl VirtioFs {
             FileHandle {
                 file,
                 writable: true,
+                open_flags: flags,
+                attrs: HandleAttrs::of(&meta),
                 path: path.clone(),
                 temporary_path: Some(path),
                 node,
@@ -2640,6 +2951,31 @@ impl VirtioFs {
         }
     }
 
+    /// The same, for a mutation whose target is known not to be a directory.
+    ///
+    /// Only a directory can have cached descriptors beneath it, so only a
+    /// directory needs the subtree scan -- and that scan looks at every entry
+    /// in the cache, which is the size of a build's directory working set.
+    /// Anything else can only be cached under its own name, which a hash
+    /// lookup settles. Dropping that name rather than skipping the call keeps
+    /// an entry left over from when the path was a directory from outliving
+    /// the mutation.
+    fn invalidate_dir_entry(&mut self, path: &Path) {
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            let relative = relative.to_owned();
+            self.dirs.forget(&relative);
+        }
+    }
+
+    /// Drops what a mutation of `path` invalidates, by what it is.
+    fn invalidate_dirs_by_type(&mut self, path: &Path, is_dir: bool) {
+        if is_dir {
+            self.invalidate_dirs(path);
+        } else {
+            self.invalidate_dir_entry(path);
+        }
+    }
+
     /// Both ends of a two-path operation, resolved together.
     ///
     /// Returns each parent's descriptor owned rather than borrowed, because
@@ -2829,6 +3165,9 @@ impl VirtioFs {
         let Some(node_id) = self.inode_ids.get(&key).copied() else {
             return;
         };
+        // Whatever happens to the node below, the name this descriptor was
+        // parked under no longer leads to the file it refers to.
+        self.drop_parked(node_id);
         let mut empty = false;
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.paths.retain(|candidate| candidate != path);
@@ -3056,7 +3395,9 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
 // resolver and its tests before the call sites move onto it. The next stage
 // removes this attribute along with the first path-based caller.
 #[allow(dead_code)]
-const DIR_CACHE_LIMIT: usize = 128;
+fn dir_cache_limit() -> usize {
+    (crate::fdlimit::guest_handle_budget() / 16).clamp(128, 4096)
+}
 
 /// Most paths one node will remember at once (#34).
 ///
@@ -3105,7 +3446,9 @@ const MAX_NODE_ALIASES: usize = 16;
 struct DirCache {
     /// The export root. Pinned: never evicted, and the origin of every walk.
     root: OwnedFd,
-    open: HashMap<PathBuf, OwnedFd>,
+    /// The descriptor for each cached path, with the order stamp that says
+    /// which of its entries in `lru` is the live one.
+    open: HashMap<PathBuf, (OwnedFd, u64)>,
     /// Off under `CachePolicy::None`, whose contract is that every lookup
     /// reaches the host. Holding a descriptor would quietly break that: a
     /// directory replaced host-side keeps the same path and gets a new inode,
@@ -3116,8 +3459,19 @@ struct DirCache {
     /// Where a walk's result lives when it is not being cached, so a borrowed
     /// descriptor can still be handed out. Replaced on every miss.
     scratch: Option<OwnedFd>,
-    /// Least-recently-used first. Only paths present in `open` appear here.
-    lru: VecDeque<PathBuf>,
+    /// Least-recently-used first, stamped with the order the entry was last
+    /// used at.
+    ///
+    /// A path appears once per use and the stale appearances are left behind,
+    /// because removing one by value is a scan of the whole queue comparing
+    /// whole paths -- and this runs on every resolution the device makes, so
+    /// it was the most-walked loop in the device. Eviction drops the stamps
+    /// that no longer match, and the queue is compacted when they take it
+    /// over.
+    lru: VecDeque<(PathBuf, u64)>,
+    /// Counts uses, so an entry's newest appearance in `lru` can be told from
+    /// the ones it has left behind.
+    ticks: u64,
     limit: usize,
 }
 
@@ -3132,6 +3486,7 @@ impl DirCache {
             caching,
             scratch: None,
             lru: VecDeque::new(),
+            ticks: 0,
             limit: limit.max(1),
         })
     }
@@ -3162,7 +3517,7 @@ impl DirCache {
             let fd = self.walk(relative)?;
             self.admit(relative.to_path_buf(), fd);
         }
-        Ok(self.open.get(relative).expect("just inserted").as_fd())
+        Ok(self.open.get(relative).expect("just inserted").0.as_fd())
     }
 
     /// Opens each component in turn, resolving symlinks inside the export's
@@ -3268,23 +3623,55 @@ impl DirCache {
     }
 
     fn touch(&mut self, relative: &Path) {
-        if let Some(at) = self.lru.iter().position(|p| p == relative) {
-            self.lru.remove(at);
+        self.ticks += 1;
+        let tick = self.ticks;
+        if let Some(entry) = self.open.get_mut(relative) {
+            entry.1 = tick;
+            self.lru.push_back((relative.to_path_buf(), tick));
         }
-        self.lru.push_back(relative.to_path_buf());
+        self.compact_lru();
     }
 
     fn admit(&mut self, relative: PathBuf, fd: OwnedFd) {
         while self.open.len() >= self.limit {
-            match self.lru.pop_front() {
-                // Dropping the descriptor closes it, which is the whole point
-                // of the bound.
-                Some(evicted) => drop(self.open.remove(&evicted)),
-                None => break,
+            if !self.evict_one() {
+                break;
             }
         }
-        self.lru.push_back(relative.clone());
-        self.open.insert(relative, fd);
+        self.ticks += 1;
+        let tick = self.ticks;
+        self.lru.push_back((relative.clone(), tick));
+        self.open.insert(relative, (fd, tick));
+    }
+
+    /// Closes the least recently used descriptor. Returns whether one went.
+    fn evict_one(&mut self) -> bool {
+        while let Some((path, tick)) = self.lru.pop_front() {
+            // An appearance the entry has since been used past is not its
+            // place in the order, so it says nothing about what to evict.
+            if self.open.get(&path).map(|entry| entry.1) != Some(tick) {
+                continue;
+            }
+            // Dropping the descriptor closes it, which is the whole point of
+            // the bound.
+            drop(self.open.remove(&path));
+            return true;
+        }
+        false
+    }
+
+    /// Drops the appearances entries have been used past, once they outnumber
+    /// the live ones. Amortised: each compaction is paid for by the pushes
+    /// that made it necessary.
+    fn compact_lru(&mut self) {
+        if self.lru.len() <= 4 * self.open.len().max(1) {
+            return;
+        }
+        let used = std::mem::take(&mut self.lru);
+        self.lru = used
+            .into_iter()
+            .filter(|(path, tick)| self.open.get(path).map(|entry| entry.1) == Some(*tick))
+            .collect();
     }
 
     /// Drops the descriptor for `relative` and for everything beneath it.
@@ -3309,11 +3696,9 @@ impl DirCache {
     /// Drops a descriptor, for the mutations that invalidate a path (rename,
     /// unlink, rmdir) once those call sites move over.
     fn forget(&mut self, relative: &Path) {
-        if self.open.remove(relative).is_some() {
-            if let Some(at) = self.lru.iter().position(|p| p == relative) {
-                self.lru.remove(at);
-            }
-        }
+        // Whatever it has left in `lru` no longer matches an entry, so it is
+        // skipped at eviction and dropped at the next compaction.
+        self.open.remove(relative);
     }
 
     /// An owned descriptor for `relative`.
@@ -3347,6 +3732,18 @@ impl DirCache {
     #[cfg(test)]
     fn resident(&self) -> usize {
         self.open.len()
+    }
+
+    /// How many host descriptors this cache is holding.
+    fn held(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Closes all of them, for when the descriptors are worth more than the
+    /// resolutions they save.
+    fn release_all(&mut self) {
+        self.open.clear();
+        self.lru.clear();
     }
 }
 
@@ -3865,6 +4262,11 @@ fn host_open_flags(flags: u32, create: bool) -> io::Result<i32> {
     // The final component must be the inode the guest looked up, never a host
     // symlink followed behind the guest VFS's back.
     host_flags |= libc::O_NOFOLLOW;
+    // Opening a FIFO waits for the other end, and this call can run on the
+    // vCPU thread with the device mutex held, so a wait here stops the VM
+    // rather than the caller (#32). Only a regular file is ever handed back
+    // to the guest, and on a regular file this flag changes nothing.
+    host_flags |= libc::O_NONBLOCK;
     // A descriptor opened on the guest's behalf must not survive into any
     // process this one spawns. OpenOptions did this for us.
     host_flags |= libc::O_CLOEXEC;
@@ -3893,6 +4295,20 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
     }
     // SAFETY: fd is a fresh descriptor this call owns and has not shared.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// What the guest was told when a failed open was a type the device refuses.
+///
+/// The check used to run before the open, so a directory was EISDIR and a
+/// symlink, FIFO, socket or device node was EPERM. The open runs first now,
+/// and only when it fails does the path get asked what it was, so the guest
+/// sees the same errno for the same tree as it did before.
+fn open_failure_errno(path: &Path, err: i32) -> i32 {
+    match Stat::lstat(path) {
+        Ok(meta) if meta.is_dir() => EISDIR,
+        Ok(meta) if !meta.is_file() => EPERM,
+        _ => err,
+    }
 }
 
 /// The same, relative to a directory descriptor (#30).
@@ -5447,6 +5863,49 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Creates `path` on the host and returns the node for it, looking up
+    /// each component from the export root the way a guest does.
+    fn lookup_node_or_create(dev: &mut VirtioFs, root: &Path, path: &Path) -> u64 {
+        fs::create_dir_all(path).unwrap();
+        let relative = path.strip_prefix(root).expect("inside the export");
+        let mut node = FUSE_ROOT_ID;
+        for part in relative.components() {
+            node = lookup_node(dev, node, part.as_os_str().as_bytes());
+        }
+        node
+    }
+
+    /// Opens, reads and closes every file once, the way a compiler reads a
+    /// header it has read before. Returns the host operations it spent.
+    fn open_round_cost(dev: &mut VirtioFs, files: &[u64]) -> u64 {
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let start = spent();
+        for &node in files {
+            let mut input = vec![0u8; 8];
+            input[0..4].copy_from_slice(&0u32.to_le_bytes()); // O_RDONLY
+            let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "OPEN failed");
+            let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+            let mut read = vec![0u8; 40];
+            read[0..8].copy_from_slice(&fh.to_le_bytes());
+            read[16..20].copy_from_slice(&8u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(READ, node, &read), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "READ failed");
+
+            let mut flush = vec![0u8; 24];
+            flush[0..8].copy_from_slice(&fh.to_le_bytes());
+            let out = dev.handle_fuse(&request(FLUSH, node, &flush), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "FLUSH failed");
+
+            let mut release = vec![0u8; 24];
+            release[0..8].copy_from_slice(&fh.to_le_bytes());
+            let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "RELEASE failed");
+        }
+        spent() - start
+    }
+
     /// Runs one mutation phase of the build workload. For every
     /// `MUTATE_EVERY`-th file it writes an object the way a compiler does:
     /// create a temporary, fill it, close it, then rename it over the
@@ -5519,6 +5978,189 @@ mod tests {
     /// Read rounds come from the same helper as the budget test, so the
     /// test and both benchmarks always measure one workload.
     ///
+    /// Removing files, with the directory cache as full as a build makes it.
+    ///
+    /// Every removal invalidates cached directory descriptors, and finding
+    /// which ones used to mean looking at all of them -- so this benchmark is
+    /// only honest with a cache that holds what a real tree puts in it.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_unlink_workload
+    #[test]
+    #[ignore]
+    fn bench_unlink_workload() {
+        const DIRS: usize = 1500;
+        const FILES: usize = 300;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+
+        // Fill the directory cache the way a build does.
+        for d in 0..DIRS {
+            let name = format!("sub-{d:04}");
+            fs::create_dir_all(tree.join(&name)).unwrap();
+            let sub = lookup_node(&mut dev, tree_node, name.as_bytes());
+            fs::write(tree.join(&name).join("f"), b"x").unwrap();
+            lookup_node(&mut dev, sub, b"f");
+        }
+        for i in 0..FILES {
+            fs::write(tree.join(format!("gone-{i:04}")), b"x").unwrap();
+            lookup_node(&mut dev, tree_node, format!("gone-{i:04}").as_bytes());
+        }
+
+        let start = std::time::Instant::now();
+        for i in 0..FILES {
+            let mut input = format!("gone-{i:04}").into_bytes();
+            input.push(0);
+            let out = dev.handle_fuse(&request(UNLINK, tree_node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "UNLINK failed");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "BENCH unlink: {FILES} removals with {DIRS} directories cached => {:.2} us/unlink",
+            elapsed.as_secs_f64() * 1e6 / FILES as f64
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// What a compiler does at the end of every object it writes: rename a
+    /// temporary over the previous one.
+    ///
+    /// The macro workload's report has RENAME at 118 requests and 1,816 ms --
+    /// 15 ms each, the most expensive call in it by a wide margin. The cost is
+    /// not the host rename; it is what the device does to its own node table
+    /// afterwards, which is why this benchmark fills that table first.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_rename_workload
+    #[test]
+    #[ignore]
+    fn bench_rename_workload() {
+        const NODES: usize = 4000;
+        const RENAMES: usize = 200;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        for i in 0..NODES {
+            fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
+        }
+        let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+        // Look every file up, so the node table is the size a build reaches.
+        for i in 0..NODES {
+            lookup_node(&mut dev, tree_node, format!("file-{i:04}").as_bytes());
+        }
+
+        for i in 0..RENAMES {
+            fs::write(tree.join(format!("obj-{i:04}.tmp")), b"objbytes").unwrap();
+            lookup_node(&mut dev, tree_node, format!("obj-{i:04}.tmp").as_bytes());
+        }
+
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let before = spent();
+        let start = std::time::Instant::now();
+        for i in 0..RENAMES {
+            let mut input = Vec::new();
+            put_u64(&mut input, tree_node);
+            input.extend_from_slice(format!("obj-{i:04}.tmp\0").as_bytes());
+            input.extend_from_slice(format!("obj-{i:04}\0").as_bytes());
+            let out = dev.handle_fuse(&request(RENAME, tree_node, &input), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "BENCH rename: {} renames over {NODES} nodes in {:.3} ms => {:.2} us/rename",
+            RENAMES,
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / RENAMES as f64
+        );
+        println!(
+            "BENCH rename: {:.2} host ops per rename",
+            (spent() - before) as f64 / RENAMES as f64
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// What a build spends most of its requests on: opening the same files
+    /// again and again.
+    ///
+    /// The macro workload's exit report has OPEN at 726,175 requests and
+    /// 12.9 s of service time against 730,167 RELEASE requests costing 0.67 s,
+    /// on a tree of 87,101 files. Eight opens per file is a compiler
+    /// re-reading the same headers, and each one pays for a host open and a
+    /// host close. This drives that shape with no guest in the way.
+    ///
+    /// The tree is nested `DEPTH` directories deep, because the open path
+    /// resolves a full path and a deep one costs more than a shallow one.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored --nocapture bench_open_workload
+    #[test]
+    #[ignore]
+    fn bench_open_workload() {
+        // Enough files that the parked set is the size a real build reaches.
+        // At 200 this benchmark could not see an eviction order that was
+        // scanned on every hit; at 4,000 that cost 9.5 us of the 9.7 us an
+        // open took, and the macro workload agreed to within 4 percent.
+        const FILES: usize = 4000;
+        const ROUNDS: usize = 3;
+        const DEPTH: usize = 8;
+        /// More than `DIR_CACHE_LIMIT`, so resolving a path costs what it
+        /// costs in a real tree rather than always hitting a warm cache.
+        const DIRS: usize = 200;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut root = dir.join("tree");
+        for i in 0..DEPTH {
+            root = root.join(format!("d{i}"));
+        }
+        // Spread over more directories than the descriptor cache holds, the
+        // way a source tree is. One directory keeps that cache permanently
+        // warm and hides what resolving a path costs.
+        let mut tree_node = lookup_node_or_create(&mut dev, &dir, &root);
+        let mut files = Vec::with_capacity(FILES);
+        for d in 0..DIRS {
+            let sub = root.join(format!("sub-{d:04}"));
+            fs::create_dir_all(&sub).unwrap();
+            let sub_node = lookup_node(&mut dev, tree_node, format!("sub-{d:04}").as_bytes());
+            for i in 0..FILES / DIRS {
+                fs::write(sub.join(format!("file-{i:04}")), b"xxxxxxxx").unwrap();
+                files.push(lookup_node(
+                    &mut dev,
+                    sub_node,
+                    format!("file-{i:04}").as_bytes(),
+                ));
+            }
+        }
+        let _ = &mut tree_node;
+
+        // One open-read-close of every file, so the host's name cache and the
+        // device's directory descriptors are warm before the clock starts.
+        open_round_cost(&mut dev, &files);
+
+        let start = std::time::Instant::now();
+        let mut cost = 0u64;
+        for _ in 0..ROUNDS {
+            cost = open_round_cost(&mut dev, &files);
+        }
+        let elapsed = start.elapsed();
+        let opens = (FILES * ROUNDS) as u64;
+        println!(
+            "BENCH open: {} opens in {:.3} ms => {:.2} us/open",
+            opens,
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / opens as f64
+        );
+        println!(
+            "BENCH open: {} host ops per round ({:.2} per open x {FILES})",
+            cost,
+            cost as f64 / FILES as f64,
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// Run with:
     ///   cargo test --release -- --ignored --nocapture bench_build_workload
     #[test]
@@ -5782,6 +6424,85 @@ mod tests {
         assert_eq!(fs::read(dir.join("created")).unwrap(), b"\0\0\0hello");
         let mode = fs::metadata(dir.join("created")).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o640);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Moving a directory away drops the cached descriptors of the
+    /// directories under it, so a path rebuilt at the same name does not
+    /// resolve through the descriptor of the directory that used to be there.
+    #[test]
+    fn renaming_a_directory_retires_the_cached_descriptors_beneath_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/f"), b"x").unwrap();
+
+        // Resolving these is what puts "a" and "a/b" in the descriptor cache.
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let b = lookup_node(&mut dev, a, b"b");
+        lookup_node(&mut dev, b, b"f");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"a\0moved\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+
+        // A different tree at the same names. Its file is not in the one that
+        // was moved away, so a stale descriptor cannot find it.
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/g"), b"y").unwrap();
+
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let b = lookup_node(&mut dev, a, b"b");
+        let mut payload = b"g".to_vec();
+        payload.push(0);
+        let out = dev.handle_fuse(&request(LOOKUP, b, &payload), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "LOOKUP failed");
+        // Under a caching policy a name that is not there comes back as a
+        // successful reply with node zero, so the node is what says whether
+        // the name resolved.
+        assert_ne!(
+            get_u64(&out, OUT_HEADER_LEN),
+            Some(0),
+            "the rebuilt directory resolved through a fresh descriptor, \
+             not the one cached for the directory that was moved away"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Renaming a directory moves the recorded path of everything under it,
+    /// not just its own.
+    ///
+    /// A file rename takes a fast path that touches one node; a directory
+    /// rename cannot, and this is what says so.
+    #[test]
+    fn renaming_a_directory_moves_the_paths_of_the_nodes_beneath_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir_all(dir.join("a/deep")).unwrap();
+        fs::write(dir.join("a/deep/f"), b"x").unwrap();
+
+        let a = lookup_node(&mut dev, FUSE_ROOT_ID, b"a");
+        let deep = lookup_node(&mut dev, a, b"deep");
+        let f = lookup_node(&mut dev, deep, b"f");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"a\0b\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME failed");
+
+        let root = fs::canonicalize(&dir).unwrap();
+        assert_eq!(dev.node_path(a).unwrap(), root.join("b"));
+        assert_eq!(
+            dev.node_path(deep).unwrap(),
+            root.join("b/deep"),
+            "the directory beneath the renamed one moved with it"
+        );
+        assert_eq!(
+            dev.node_path(f).unwrap(),
+            root.join("b/deep/f"),
+            "so did the file two levels down"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6850,7 +7571,7 @@ mod tests {
         fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
         fs::create_dir_all(dir.join("etc")).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        let cache = DirCache::new(&dir, DIR_CACHE_LIMIT, true).unwrap();
+        let cache = DirCache::new(&dir, dir_cache_limit(), true).unwrap();
         (dir, cache)
     }
 
@@ -7832,6 +8553,221 @@ mod tests {
     /// A guest cannot spend the host's whole descriptor table on open
     /// handles. The cap is per export and derived from the process limit, so
     /// the test sets a small one rather than opening thousands of files.
+    /// Opens `node` read-only and returns the handle, or the errno.
+    fn try_open(dev: &mut VirtioFs, node: u64, flags: u32) -> Result<u64, i32> {
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&flags.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, node, &input), 4096);
+        match get_u32(&out, 4).map(|e| e as i32) {
+            Some(0) => Ok(get_u64(&out, OUT_HEADER_LEN).unwrap()),
+            Some(e) => Err(-e),
+            None => panic!("no status"),
+        }
+    }
+
+    fn release_handle(dev: &mut VirtioFs, node: u64, fh: u64) {
+        let mut input = vec![0u8; 24];
+        input[0..8].copy_from_slice(&fh.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RELEASE failed");
+    }
+
+    fn read_handle(dev: &mut VirtioFs, node: u64, fh: u64, len: u32) -> Vec<u8> {
+        let mut input = vec![0u8; 40];
+        input[0..8].copy_from_slice(&fh.to_le_bytes());
+        input[16..20].copy_from_slice(&len.to_le_bytes());
+        let out = dev.handle_fuse(&request(READ, node, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "READ failed");
+        out[OUT_HEADER_LEN..].to_vec()
+    }
+
+    /// The point of parking a descriptor: the second open of the same file
+    /// does not reach the host for one.
+    #[test]
+    fn a_reopened_file_is_served_from_the_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(
+            dev.descriptor_cache_stats().2,
+            1,
+            "the descriptor is parked"
+        );
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(hits_after, hits_before + 1, "the reopen was served from it");
+        assert_eq!(read_handle(&mut dev, node, fh, 5), b"first");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file replaced on the host between the close and the reopen is not
+    /// served from the descriptor of the file it replaced.
+    #[test]
+    fn a_file_replaced_on_the_host_is_not_served_from_the_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+
+        // What a host-side editor does: write a new file and rename it over.
+        fs::write(dir.join("new"), b"other").unwrap();
+        fs::rename(dir.join("new"), dir.join("f")).unwrap();
+
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        assert_eq!(
+            read_handle(&mut dev, node, fh, 5),
+            b"other",
+            "the reopen reached the file that is there now"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An open the host would now refuse is not answered from a descriptor it
+    /// granted before the mode changed.
+    #[test]
+    fn a_mode_change_on_the_host_retires_the_parked_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(dev.descriptor_cache_stats().2, 1);
+
+        fs::set_permissions(dir.join("f"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        let result = try_open(&mut dev, node, 0);
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(
+            hits_after, hits_before,
+            "the parked descriptor was not reused"
+        );
+        // Running as root defeats the mode, so the open may still succeed.
+        // What this pins is that the descriptor cache did not decide it.
+        if let Ok(fh) = result {
+            release_handle(&mut dev, node, fh);
+        }
+        let _ = fs::set_permissions(dir.join("f"), fs::Permissions::from_mode(0o644));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An unlinked file's descriptor is closed rather than parked, so the
+    /// host reclaims the inode when the guest is done with it.
+    #[test]
+    fn unlinking_a_file_closes_its_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(dev.descriptor_cache_stats().2, 1);
+
+        let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"f\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "UNLINK failed");
+        assert_eq!(
+            dev.descriptor_cache_stats().2,
+            0,
+            "the descriptor went with the name"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// O_TRUNC has to reach the host, or the file the guest asked to empty
+    /// keeps its contents.
+    #[test]
+    fn an_o_trunc_open_is_not_served_from_a_parked_descriptor() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, LINUX_O_RDWR).unwrap();
+        release_handle(&mut dev, node, fh);
+
+        let fh = try_open(&mut dev, node, LINUX_O_RDWR | LINUX_O_TRUNC).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(
+            fs::read(dir.join("f")).unwrap(),
+            Vec::<u8>::new(),
+            "the truncation happened"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A descriptor parked for reading does not answer an open for writing.
+    #[test]
+    fn a_parked_descriptor_does_not_widen_access() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+
+        let (hits_before, _, _) = dev.descriptor_cache_stats();
+        let fh = try_open(&mut dev, node, LINUX_O_RDWR).unwrap();
+        let (hits_after, _, _) = dev.descriptor_cache_stats();
+        assert_eq!(
+            hits_after, hits_before,
+            "a read-only descriptor did not serve a read-write open"
+        );
+        release_handle(&mut dev, node, fh);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `cache=none` promises the host is consulted for every request, and a
+    /// descriptor opened earlier is the opposite of that.
+    #[test]
+    fn nothing_is_parked_under_cache_none() {
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
+        fs::write(dir.join("f"), b"first").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(&mut dev, node, 0).unwrap();
+        release_handle(&mut dev, node, fh);
+        assert_eq!(
+            dev.descriptor_cache_stats().2,
+            0,
+            "no descriptor was kept behind the guest's back"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Parked descriptors are this device's to give back, so the guest reaches
+    /// the handle limit no sooner than it did before they existed.
+    #[test]
+    fn parked_descriptors_are_given_back_before_the_guest_is_refused() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..8 {
+            fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        dev.handle_limit = 4;
+        dev.parked_limit = 4;
+
+        // Fill the parked set: open and release four different files.
+        for i in 0..4 {
+            let node = lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            let fh = try_open(&mut dev, node, 0).unwrap();
+            release_handle(&mut dev, node, fh);
+        }
+        assert_eq!(dev.descriptor_cache_stats().2, 4, "four are parked");
+
+        // The guest is still entitled to its whole budget.
+        let mut opened = 0;
+        for i in 4..8 {
+            let node = lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            if try_open(&mut dev, node, 0).is_ok() {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 4, "the guest got its four handles");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn opens_stop_at_the_handle_limit() {
         let (dir, mut dev) = fixture_with_access(true);
