@@ -4029,7 +4029,9 @@ const MAX_NODE_ALIASES: usize = 16;
 struct DirCache {
     /// The export root. Pinned: never evicted, and the origin of every walk.
     root: OwnedFd,
-    open: HashMap<PathBuf, OwnedFd>,
+    /// The descriptor for each cached path, with the order stamp that says
+    /// which of its entries in `lru` is the live one.
+    open: HashMap<PathBuf, (OwnedFd, u64)>,
     /// Off under `CachePolicy::None`, whose contract is that every lookup
     /// reaches the host. Holding a descriptor would quietly break that: a
     /// directory replaced host-side keeps the same path and gets a new inode,
@@ -4040,8 +4042,19 @@ struct DirCache {
     /// Where a walk's result lives when it is not being cached, so a borrowed
     /// descriptor can still be handed out. Replaced on every miss.
     scratch: Option<OwnedFd>,
-    /// Least-recently-used first. Only paths present in `open` appear here.
-    lru: VecDeque<PathBuf>,
+    /// Least-recently-used first, stamped with the order the entry was last
+    /// used at.
+    ///
+    /// A path appears once per use and the stale appearances are left behind,
+    /// because removing one by value is a scan of the whole queue comparing
+    /// whole paths -- and this runs on every resolution the device makes, so
+    /// it was the most-walked loop in the device. Eviction drops the stamps
+    /// that no longer match, and the queue is compacted when they take it
+    /// over.
+    lru: VecDeque<(PathBuf, u64)>,
+    /// Counts uses, so an entry's newest appearance in `lru` can be told from
+    /// the ones it has left behind.
+    ticks: u64,
     limit: usize,
 }
 
@@ -4056,6 +4069,7 @@ impl DirCache {
             caching,
             scratch: None,
             lru: VecDeque::new(),
+            ticks: 0,
             limit: limit.max(1),
         })
     }
@@ -4086,7 +4100,7 @@ impl DirCache {
             let fd = self.walk(relative)?;
             self.admit(relative.to_path_buf(), fd);
         }
-        Ok(self.open.get(relative).expect("just inserted").as_fd())
+        Ok(self.open.get(relative).expect("just inserted").0.as_fd())
     }
 
     /// Opens each component in turn, resolving symlinks inside the export's
@@ -4192,23 +4206,55 @@ impl DirCache {
     }
 
     fn touch(&mut self, relative: &Path) {
-        if let Some(at) = self.lru.iter().position(|p| p == relative) {
-            self.lru.remove(at);
+        self.ticks += 1;
+        let tick = self.ticks;
+        if let Some(entry) = self.open.get_mut(relative) {
+            entry.1 = tick;
+            self.lru.push_back((relative.to_path_buf(), tick));
         }
-        self.lru.push_back(relative.to_path_buf());
+        self.compact_lru();
     }
 
     fn admit(&mut self, relative: PathBuf, fd: OwnedFd) {
         while self.open.len() >= self.limit {
-            match self.lru.pop_front() {
-                // Dropping the descriptor closes it, which is the whole point
-                // of the bound.
-                Some(evicted) => drop(self.open.remove(&evicted)),
-                None => break,
+            if !self.evict_one() {
+                break;
             }
         }
-        self.lru.push_back(relative.clone());
-        self.open.insert(relative, fd);
+        self.ticks += 1;
+        let tick = self.ticks;
+        self.lru.push_back((relative.clone(), tick));
+        self.open.insert(relative, (fd, tick));
+    }
+
+    /// Closes the least recently used descriptor. Returns whether one went.
+    fn evict_one(&mut self) -> bool {
+        while let Some((path, tick)) = self.lru.pop_front() {
+            // An appearance the entry has since been used past is not its
+            // place in the order, so it says nothing about what to evict.
+            if self.open.get(&path).map(|entry| entry.1) != Some(tick) {
+                continue;
+            }
+            // Dropping the descriptor closes it, which is the whole point of
+            // the bound.
+            drop(self.open.remove(&path));
+            return true;
+        }
+        false
+    }
+
+    /// Drops the appearances entries have been used past, once they outnumber
+    /// the live ones. Amortised: each compaction is paid for by the pushes
+    /// that made it necessary.
+    fn compact_lru(&mut self) {
+        if self.lru.len() <= 4 * self.open.len().max(1) {
+            return;
+        }
+        let used = std::mem::take(&mut self.lru);
+        self.lru = used
+            .into_iter()
+            .filter(|(path, tick)| self.open.get(path).map(|entry| entry.1) == Some(*tick))
+            .collect();
     }
 
     /// Drops the descriptor for `relative` and for everything beneath it.
@@ -4233,11 +4279,9 @@ impl DirCache {
     /// Drops a descriptor, for the mutations that invalidate a path (rename,
     /// unlink, rmdir) once those call sites move over.
     fn forget(&mut self, relative: &Path) {
-        if self.open.remove(relative).is_some() {
-            if let Some(at) = self.lru.iter().position(|p| p == relative) {
-                self.lru.remove(at);
-            }
-        }
+        // Whatever it has left in `lru` no longer matches an entry, so it is
+        // skipped at eviction and dropped at the next compaction.
+        self.open.remove(relative);
     }
 
     /// An owned descriptor for `relative`.
