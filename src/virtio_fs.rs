@@ -422,6 +422,9 @@ struct DirHandle {
     entries: Vec<DirEntryInfo>,
 }
 
+/// Listings paged through with fh 0 that the device keeps at once.
+const FH0_LISTINGS_MAX: usize = 64;
+
 /// A guest-created Unix socket, held in the device rather than on the host.
 /// See `VirtioFs::sockets`.
 #[derive(Clone, Copy)]
@@ -571,6 +574,15 @@ pub struct VirtioFs {
     next_socket_ino: u64,
     handles: HashMap<u64, FileHandle>,
     dir_handles: HashMap<u64, DirHandle>,
+    /// Listings guests page through with fh 0, by node. A guest that
+    /// stopped opening directories pages through a listing over several
+    /// requests, and a walk reads a subdirectory before it finishes its
+    /// parent, so several are open at once. Each is read once and kept
+    /// across the guest's own changes, as a handle's snapshot is, so the
+    /// offsets the guest holds stay valid. The oldest goes when there are
+    /// more than [`FH0_LISTINGS_MAX`].
+    fh0_listings: HashMap<u64, Vec<DirEntryInfo>>,
+    fh0_order: VecDeque<u64>,
     next_handle: u64,
     /// Most guest handles this export will hold open at once (#34).
     ///
@@ -722,6 +734,8 @@ impl VirtioFs {
             next_socket_ino: 1,
             handles: HashMap::new(),
             dir_handles: HashMap::new(),
+            fh0_listings: HashMap::new(),
+            fh0_order: VecDeque::new(),
             next_handle: 1,
             handle_limit: crate::fdlimit::guest_handle_budget(),
             parked: HashMap::new(),
@@ -3188,8 +3202,8 @@ impl VirtioFs {
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
         let limit = requested.min(capacity);
         let dir = self.node_path(node)?.to_owned();
-        if !self.stat_in_export(&dir)?.is_dir() {
-            return Err(ENOTDIR);
+        if fh != 0 && !self.dir_handles.contains_key(&fh) {
+            return Err(EBADF);
         }
         // Resolving the directory is what OPENDIR used to do, and everything
         // the guest does with the entries afterwards -- a lookup, an open, a
@@ -3208,11 +3222,19 @@ impl VirtioFs {
         } else {
             dir.parent().unwrap_or(&self.root).to_owned()
         };
-        let parent_meta = self.stat_in_export(&parent_path)?;
-        let parent_node = if plus {
-            self.node_for(parent_path.clone(), &parent_meta)
+        // Only the `..` record (index 1) needs the parent, so its stat is
+        // taken only by the request whose page starts at or before it. That
+        // is also the only index `stat_listed` reads it for, so the pages
+        // that skip the stat never ask for what they did not take.
+        let parent_meta = if offset <= 1 {
+            Some(self.stat_in_export(&parent_path)?)
         } else {
-            parent_meta.ino()
+            None
+        };
+        let parent_node = match &parent_meta {
+            Some(meta) if plus => self.node_for(parent_path.clone(), meta),
+            Some(meta) => meta.ino(),
+            None => 0,
         };
 
         // No reply can hold more than `limit / min_record_len` entries, so
@@ -3227,11 +3249,26 @@ impl VirtioFs {
         // fh 0 is never a real handle (they start at 1): the guest has
         // stopped sending OPENDIR, so the listing is read here.
         let batch: Vec<(usize, DirEntryInfo)> = if fh == 0 {
-            self.dir_entries(&dir)?
+            let reuse = offset != 0 && self.fh0_listings.contains_key(&node);
+            if !reuse {
+                let entries = self.dir_entries(&dir)?;
+                if self.fh0_listings.insert(node, entries).is_none() {
+                    self.fh0_order.push_back(node);
+                    if self.fh0_order.len() > FH0_LISTINGS_MAX {
+                        if let Some(oldest) = self.fh0_order.pop_front() {
+                            self.fh0_listings.remove(&oldest);
+                        }
+                    }
+                }
+            }
+            self.fh0_listings
+                .get(&node)
                 .into_iter()
+                .flatten()
                 .enumerate()
                 .skip(offset)
                 .take(max_entries)
+                .map(|(idx, entry)| (idx, entry.clone()))
                 .collect()
         } else {
             self.dir_handles
@@ -3247,16 +3284,22 @@ impl VirtioFs {
         };
 
         // Whatever is stat'd below is stat'd through this, so no name in the
-        // listing is resolved as a string. The handle opened the directory at
-        // OPENDIR and still holds it, so this is a dup of that rather than a
-        // second walk to the same place.
+        // listing is resolved as a string. A handle holds the descriptor it
+        // opened at OPENDIR, so that one is duplicated; with fh 0 there is no
+        // handle and the directory cache holds it instead. Either way this is
+        // a dup rather than a second walk to the same place.
         let listing = if plus
             || batch
                 .iter()
                 .any(|(idx, entry)| *idx <= 1 || entry.dtype == DT_UNKNOWN)
         {
-            let handle = self.dir_handles.get(&fh).ok_or(EBADF)?;
-            Some(OwnedFd::from(handle.file.try_clone().map_err(io_errno)?))
+            if fh == 0 {
+                let relative = self.relative_of_path(&dir)?;
+                Some(self.dirs.dir_fd_owned(&relative)?)
+            } else {
+                let handle = self.dir_handles.get(&fh).ok_or(EBADF)?;
+                Some(OwnedFd::from(handle.file.try_clone().map_err(io_errno)?))
+            }
         } else {
             None
         };
@@ -3293,10 +3336,11 @@ impl VirtioFs {
                 }
                 // READDIRPLUS always needs full attributes, so the d_type
                 // fast path below does not apply here.
-                let meta = match stat_listed(listing.as_ref(), idx, &entry.name, &parent_meta) {
-                    Ok(meta) => meta,
-                    Err(_) => continue,
-                };
+                let meta =
+                    match stat_listed(listing.as_ref(), idx, &entry.name, parent_meta.as_ref()) {
+                        Ok(meta) => meta,
+                        Err(_) => continue,
+                    };
                 let entry_node = if idx == 0 {
                     node
                 } else if idx == 1 {
@@ -3332,7 +3376,12 @@ impl VirtioFs {
                     _ => match self.sockets.get(&path) {
                         Some(socket) => (socket.ino, DT_SOCK),
                         None => {
-                            match stat_listed(listing.as_ref(), idx, &entry.name, &parent_meta) {
+                            match stat_listed(
+                                listing.as_ref(),
+                                idx,
+                                &entry.name,
+                                parent_meta.as_ref(),
+                            ) {
                                 Ok(meta) => (meta.ino(), dirent_type(&meta)),
                                 Err(_) => continue,
                             }
@@ -4942,11 +4991,13 @@ fn stat_listed(
     listing: Option<&OwnedFd>,
     idx: usize,
     name: &OsStr,
-    parent: &Stat,
+    parent: Option<&Stat>,
 ) -> Result<Stat, i32> {
     match idx {
         0 => Stat::of_fd(listing.ok_or(EINVAL)?.as_fd()),
-        1 => Ok(*parent),
+        // Only reached by a page that starts at or before `..`, which is the
+        // same condition the caller stats the parent under.
+        1 => parent.copied().ok_or(EINVAL),
         _ => {
             let name = CString::new(name.as_bytes()).map_err(|_| EINVAL)?;
             Stat::at(listing.ok_or(EINVAL)?.as_fd(), &name)
@@ -5258,7 +5309,31 @@ fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
 
 #[cfg(target_os = "macos")]
 fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
-    let value = fd_getxattr(fd, HVI_XATTR_LINUX_ATTR).ok()?;
+    let name = xattr_name(HVI_XATTR_LINUX_ATTR).ok()?;
+    // The value is twelve bytes, so a buffer that size reads it in one call.
+    // The general form asks the host for the length first and then reads,
+    // which is two calls per entry the node table has not seen.
+    let mut value = [0u8; 12];
+    // SAFETY: `fd` is open for the call, `name` is NUL-terminated, and the
+    // buffer's length is passed alongside it.
+    let got = unsafe {
+        libc::fgetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if got != 12 {
+        return None;
+    }
+    decode_guest_attr(&value)
+}
+
+#[cfg(target_os = "macos")]
+fn decode_guest_attr(value: &[u8]) -> Option<GuestAttr> {
     if value.len() != 12 {
         return None;
     }
@@ -6704,7 +6779,10 @@ mod tests {
         // GETATTR, less the descriptor that the lookup leaves in the cache.
         const PER_FILE_BUDGET: u64 = 2;
         // True for this fixture only. See the note above on what moves it.
-        const LISTING_BUDGET: u64 = 34;
+        // 34 before this branch. OPENDIR no longer opens or lists a
+        // directory, READDIR's stat of it goes with the gate, and the parent
+        // is stat'd only by the page that carries `..`.
+        const LISTING_BUDGET: u64 = 28;
 
         let (dir, mut dev) = fixture_with_access(true);
         let tree = dir.join("tree");
@@ -6713,11 +6791,14 @@ mod tests {
             fs::write(tree.join(format!("file-{i:04}")), b"x").unwrap();
         }
         let tree_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"tree");
+        // The component descriptor for the tree is opened by whichever
+        // request first needs it. Opening it here keeps that one-time cost
+        // out of both phases, so each phase's count is its own.
+        lookup_node(&mut dev, tree_node, b"file-0000");
 
-        // The first round pays the costs that occur once: the component
-        // descriptor for the tree, and the entries in the node table. The
-        // budget applies to the steady state, and the third round shows
-        // that the steady state is real.
+        // The first round pays the costs that occur once: the entries in
+        // the node table. The budget applies to the steady state, and the
+        // third round shows that the steady state is real.
         let warm = metadata_round_cost(&mut dev, tree_node, FILES);
         let steady = metadata_round_cost(&mut dev, tree_node, FILES);
         let repeat = metadata_round_cost(&mut dev, tree_node, FILES);
@@ -11381,6 +11462,22 @@ mod tests {
     // A plain READDIR reports the type the host already told us, for every
     // kind it has a byte for. A guest that lists /dev otherwise pays a stat
     // for each device node in it.
+    /// READDIR used to stat the node and answer ENOTDIR for a file. The gate
+    /// is the handle now, and with fh 0 there is none, so the refusal has to
+    /// come from the listing itself rather than from a stat this path no
+    /// longer makes.
+    #[test]
+    fn readdir_on_a_file_is_refused() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let mut readdir = vec![0u8; 40];
+        readdir[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIR, issue, &readdir), 8192);
+        assert_eq!(get_u32(&out, 4), Some((-ENOTDIR) as u32));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn readdir_reports_the_types_a_dirent_already_carries() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -11390,9 +11487,11 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        // A caching share answers OPENDIR with ENOSYS; the kernel then reads
+        // with fh 0 and never opens or releases directories again.
         let out = dev.handle_fuse(&request(OPENDIR, etc, &[0u8; 8]), 4096);
-        assert_eq!(get_u32(&out, 4), Some(0));
-        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        assert_eq!(get_u32(&out, 4), Some((-ENOSYS) as u32));
+        let fh = 0u64;
 
         let mut readdir = vec![0u8; 40];
         readdir[0..8].copy_from_slice(&fh.to_le_bytes());
