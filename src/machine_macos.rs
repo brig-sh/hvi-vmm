@@ -526,6 +526,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             dev.peak_handles(),
             dev.handle_limit()
         );
+        let (hits, waits, misses) = dev.readahead_stats();
+        eprintln!("[hvi] virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}");
     }
 
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
