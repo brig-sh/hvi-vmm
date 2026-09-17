@@ -1230,7 +1230,18 @@ impl VirtioFs {
             RENAME2 => self.rename(nodeid, payload, true),
             LINK => self.link(nodeid, payload),
             OPEN => self.open(nodeid, payload, false),
-            OPENDIR => self.open(nodeid, payload, true),
+            OPENDIR => {
+                if self.cache_policy == CachePolicy::None {
+                    self.open(nodeid, payload, true)
+                } else {
+                    // The kernel treats this as "no opendir needed": it stops
+                    // sending OPENDIR/RELEASEDIR and reads with fh 0, keeping
+                    // the directory cache on. Two round trips per directory
+                    // per walk go away. `cache=none` keeps real opens so its
+                    // every-request contract holds.
+                    Err(ENOSYS)
+                }
+            }
             READ => self.read(nodeid, payload, max_out.saturating_sub(OUT_HEADER_LEN)),
             WRITE => self.write(nodeid, payload),
             READDIR => self.readdir(
@@ -2658,11 +2669,17 @@ impl VirtioFs {
         fh
     }
 
-    fn insert_dir_handle(&mut self, path: &Path) -> Result<u64, i32> {
+    /// The listing a directory handle holds: host entries, this device's
+    /// sockets under it, sorted, with `.` and `..` in front. Also used for
+    /// a readdir with fh 0, which the guest sends once OPENDIR has answered
+    /// ENOSYS and it stopped opening directories.
+    ///
+    /// The walk resolves the directory, so the listing is taken through a
+    /// descriptor the cache holds rather than through the path. That is also
+    /// what leaves the descriptor cached for the lookups the guest makes
+    /// against the entries afterwards.
+    fn dir_entries(&mut self, path: &Path) -> Result<Vec<DirEntryInfo>, i32> {
         let relative = self.relative_of_path(path)?;
-        let file = File::from(self.dirs.dir_fd_owned(&relative)?);
-        // A second descriptor, because `fdopendir` takes the one it lists
-        // over and this handle keeps its own for FSYNCDIR.
         let mut entries = read_dir_at(self.dirs.dir_fd_owned(&relative)?)?;
         // Sockets this device holds are in no host directory, so they are
         // added here rather than found by `read_dir`. Doing it while the
@@ -2697,6 +2714,15 @@ impl VirtioFs {
                 dtype: 0,
             },
         );
+        Ok(entries)
+    }
+
+    fn insert_dir_handle(&mut self, path: &Path) -> Result<u64, i32> {
+        let relative = self.relative_of_path(path)?;
+        // A second descriptor, because `fdopendir` takes the one it lists
+        // over and this handle keeps its own for FSYNCDIR.
+        let file = File::from(self.dirs.dir_fd_owned(&relative)?);
+        let entries = self.dir_entries(path)?;
         let fh = self.next_handle();
         self.dir_handles.insert(fh, DirHandle { file, entries });
         self.note_handle_peak();
@@ -2773,6 +2799,9 @@ impl VirtioFs {
 
     fn release_dir(&mut self, input: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
+        if fh == 0 {
+            return Ok(Vec::new());
+        }
         self.dir_handles.remove(&fh).ok_or(EBADF)?;
         Ok(Vec::new())
     }
@@ -3162,6 +3191,18 @@ impl VirtioFs {
         if !self.stat_in_export(&dir)?.is_dir() {
             return Err(ENOTDIR);
         }
+        // Resolving the directory is what OPENDIR used to do, and everything
+        // the guest does with the entries afterwards -- a lookup, an open, a
+        // create -- goes through the descriptor it leaves cached. Nothing
+        // populates that cache once OPENDIR stops arriving, so the first of
+        // those requests paid to walk the path instead. Doing it here keeps
+        // the cost where a listing already is, and it is a hash lookup once
+        // the directory is resident.
+        if let Ok(relative) = dir.strip_prefix(&self.root) {
+            let relative = relative.to_owned();
+            let _ = self.dirs.dir_fd(&relative);
+        }
+
         let parent_path = if dir == self.root {
             self.root.clone()
         } else {
@@ -3183,17 +3224,27 @@ impl VirtioFs {
         // size.
         let min_record = align8((if plus { 128 } else { 0 }) + 24 + 1);
         let max_entries = limit / min_record + 1;
-        let batch: Vec<(usize, DirEntryInfo)> = self
-            .dir_handles
-            .get(&fh)
-            .ok_or(EBADF)?
-            .entries
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(max_entries)
-            .map(|(idx, entry)| (idx, entry.clone()))
-            .collect();
+        // fh 0 is never a real handle (they start at 1): the guest has
+        // stopped sending OPENDIR, so the listing is read here.
+        let batch: Vec<(usize, DirEntryInfo)> = if fh == 0 {
+            self.dir_entries(&dir)?
+                .into_iter()
+                .enumerate()
+                .skip(offset)
+                .take(max_entries)
+                .collect()
+        } else {
+            self.dir_handles
+                .get(&fh)
+                .ok_or(EBADF)?
+                .entries
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(max_entries)
+                .map(|(idx, entry)| (idx, entry.clone()))
+                .collect()
+        };
 
         // Whatever is stat'd below is stat'd through this, so no name in the
         // listing is resolved as a string. The handle opened the directory at
@@ -6565,8 +6616,10 @@ mod tests {
     fn metadata_round_cost(dev: &mut VirtioFs, tree_node: u64, files: usize) -> RoundCost {
         let spent = || HOST_META_OPS.with(std::cell::Cell::get);
         let start = spent();
-        let out = dev.handle_fuse(&request(OPENDIR, tree_node, &[0u8; 8]), 4096);
-        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        // A caching share sends no OPENDIR or RELEASEDIR in steady state:
+        // the kernel reads with fh 0 after the first ENOSYS. Each page then
+        // reads the directory itself, which is what `listing` counts.
+        let fh = 0u64;
         let mut offset = 0u64;
         loop {
             let mut input = vec![0u8; 40];
@@ -6590,9 +6643,6 @@ mod tests {
             }
             offset = last;
         }
-        let mut input = vec![0u8; 8];
-        input[0..8].copy_from_slice(&fh.to_le_bytes());
-        dev.handle_fuse(&request(RELEASEDIR, tree_node, &input), 4096);
         let listing = spent() - start;
 
         // Then stat every entry, which is what a build actually does.
@@ -8290,7 +8340,12 @@ mod tests {
     /// The share is writable because the unlink that makes the orphan is
     /// itself a mutation, which a read-only share answers with EROFS.
     fn orphan_fixture() -> (PathBuf, VirtioFs, u64, u64) {
-        let (dir, mut dev) = fixture_with_access(true);
+        orphan_fixture_with_cache(CachePolicy::Auto)
+    }
+
+    /// Builds the orphan fixture on a share with `policy`.
+    fn orphan_fixture_with_cache(policy: CachePolicy) -> (PathBuf, VirtioFs, u64, u64) {
+        let (dir, mut dev) = fixture_with_cache(true, policy);
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
         let issue = lookup_node(&mut dev, etc, b"issue");
         let fh = open_rw(&mut dev, issue);
@@ -8318,11 +8373,9 @@ mod tests {
         let sub = lookup_node(&mut dev, etc, b"sub");
         let etc_lookups = dev.nodes.get(&etc).unwrap().lookups;
 
-        let out = dev.handle_fuse(&request(OPENDIR, sub, &[0u8; 8]), 4096);
-        assert_eq!(get_u32(&out, 4), Some(0));
-        let dir_fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        // A caching share answers OPENDIR with ENOSYS, so the kernel reads
+        // with fh 0 and this reads the way it now does.
         let mut input = vec![0u8; 24];
-        input[0..8].copy_from_slice(&dir_fh.to_le_bytes());
         input[16..20].copy_from_slice(&4096u32.to_le_bytes());
         let out = dev.handle_fuse(&request(READDIRPLUS, sub, &input), 4096 + 16);
         assert_eq!(get_u32(&out, 4), Some(0));
@@ -8341,9 +8394,7 @@ mod tests {
         // The directory goes, then the one LOOKUP the guest really made is
         // given back: nothing is left behind. With `.` counted, the FORGET
         // below cancels that phantom reference instead and the node stays.
-        let mut release_dir = vec![0u8; 8];
-        release_dir[0..8].copy_from_slice(&dir_fh.to_le_bytes());
-        dev.handle_fuse(&request(RELEASEDIR, sub, &release_dir), 4096);
+        // No RELEASEDIR: the kernel stops sending it along with OPENDIR.
         let out = dev.handle_fuse(&request(RMDIR, etc, b"sub\0"), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         let mut forget = Vec::new();
@@ -8596,9 +8647,13 @@ mod tests {
     // unreleasable and the count would climb to the limit. A guest kernel
     // refuses O_DIRECTORY on a file before sending the request; this is the
     // guard against one that does not.
+    //
+    // Under `cache=none`, because that is the policy that still answers
+    // OPENDIR: a caching share answers ENOSYS and the kernel stops sending it,
+    // so there is no handle to hand out in the first place.
     #[test]
     fn opendir_on_an_orphan_hands_out_nothing() {
-        let (dir, mut dev, issue, _fh) = orphan_fixture();
+        let (dir, mut dev, issue, _fh) = orphan_fixture_with_cache(CachePolicy::None);
         let before = dev.open_handle_count();
         assert_eq!(
             i32::from_le_bytes(
@@ -9620,7 +9675,9 @@ mod tests {
 
     #[test]
     fn readdirplus_uses_a_real_directory_handle() {
-        let (dir, mut dev) = fixture_with_access(true);
+        // Real handles remain the contract under `cache=none`; a caching
+        // share answers OPENDIR with ENOSYS instead.
+        let (dir, mut dev) = fixture_with_cache(true, CachePolicy::None);
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
         let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
         let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
@@ -9680,8 +9737,11 @@ mod tests {
         fs::create_dir(dir.join("etc/sub")).unwrap();
         std::os::unix::fs::symlink("issue", dir.join("etc/issue-link")).unwrap();
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        // A caching share answers OPENDIR with ENOSYS; the kernel then reads
+        // with fh 0 and never opens or releases directories again.
         let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
-        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+        assert_eq!(get_u32(&opened, 4), Some((-ENOSYS) as u32));
+        let fh = 0u64;
         let mut read = vec![0u8; 40];
         read[0..8].copy_from_slice(&fh.to_le_bytes());
         read[16..20].copy_from_slice(&65536u32.to_le_bytes());
@@ -9703,8 +9763,11 @@ mod tests {
             fs::write(dir.join("etc").join(format!("f{i:02}")), b"x").unwrap();
         }
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        // A caching share answers OPENDIR with ENOSYS; the kernel then reads
+        // with fh 0 and never opens or releases directories again.
         let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
-        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+        assert_eq!(get_u32(&opened, 4), Some((-ENOSYS) as u32));
+        let fh = 0u64;
 
         let mut seen: Vec<String> = Vec::new();
         let mut offset = 0u64;
@@ -9738,8 +9801,11 @@ mod tests {
         fs::create_dir(dir.join("etc/sub")).unwrap();
         std::os::unix::fs::symlink("issue", dir.join("etc/issue-link")).unwrap();
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        // A caching share answers OPENDIR with ENOSYS; the kernel then reads
+        // with fh 0 and never opens or releases directories again.
         let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
-        let fh = get_u64(&opened, OUT_HEADER_LEN).unwrap();
+        assert_eq!(get_u32(&opened, 4), Some((-ENOSYS) as u32));
+        let fh = 0u64;
         let mut read = vec![0u8; 40];
         read[0..8].copy_from_slice(&fh.to_le_bytes());
         read[16..20].copy_from_slice(&65536u32.to_le_bytes());
