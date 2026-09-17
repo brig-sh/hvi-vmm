@@ -514,6 +514,7 @@ impl VirtioFs {
         )
     }
 
+
     fn note_zero_copy_read(&self) {
         self.zero_copy_reads.fetch_add(1, Ordering::Relaxed);
     }
@@ -2941,7 +2942,11 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
         out,
         if cache {
             if directory {
-                1 << 3
+                // FOPEN_CACHE_DIR lets the guest cache the listing, but the
+                // cache lives in the directory inode's page cache, which the
+                // kernel drops on every open unless FOPEN_KEEP_CACHE is set
+                // too. Without both, every opendir re-reads the directory.
+                (1 << 3) | (1 << 1)
             } else {
                 1 << 1
             }
