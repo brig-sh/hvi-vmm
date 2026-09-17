@@ -422,6 +422,9 @@ pub struct VirtioFs {
     /// to decide anything -- so relaxed is enough.
     zero_copy_reads: AtomicU64,
     zero_copy_writes: AtomicU64,
+    /// FUSE requests received, by opcode. Diagnostic only.
+    op_counts: [AtomicU64; 64],
+    op_nanos: [AtomicU64; 64],
     /// Directory descriptors for resolving without paths (#30). Read
     /// operations resolve through this; the rest of the device still joins
     /// path strings and moves over a stage at a time.
@@ -501,6 +504,8 @@ impl VirtioFs {
             next_tmpfile: 1,
             zero_copy_reads: AtomicU64::new(0),
             zero_copy_writes: AtomicU64::new(0),
+            op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            op_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             dirs,
         })
     }
@@ -512,6 +517,33 @@ impl VirtioFs {
             self.zero_copy_reads.load(Ordering::Relaxed),
             self.zero_copy_writes.load(Ordering::Relaxed),
         )
+    }
+
+    /// `(opcode, count)` for every opcode seen since boot.
+    pub fn op_counts(&self) -> Vec<(u32, u64)> {
+        self.op_counts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u32, c.load(Ordering::Relaxed)))
+            .filter(|(_, c)| *c > 0)
+            .collect()
+    }
+
+    /// `(opcode, count, total_nanos)` for every opcode seen since boot.
+    pub fn op_stats(&self) -> Vec<(u32, u64, u64)> {
+        self.op_counts
+            .iter()
+            .zip(self.op_nanos.iter())
+            .enumerate()
+            .map(|(i, (c, n))| {
+                (
+                    i as u32,
+                    c.load(Ordering::Relaxed),
+                    n.load(Ordering::Relaxed),
+                )
+            })
+            .filter(|(_, c, _)| *c > 0)
+            .collect()
     }
 
     fn note_zero_copy_read(&self) {
@@ -854,6 +886,7 @@ impl VirtioFs {
         let opcode = get_u32(&header, 4).unwrap_or(0);
         let unique = get_u64(&header, 8).unwrap_or(0);
 
+        let direct_start = std::time::Instant::now();
         let direct = match opcode {
             READ => self.read_direct(mem, unique, declared, input, output, max_out),
             WRITE => {
@@ -863,6 +896,16 @@ impl VirtioFs {
             _ => None,
         };
         if let Some(reply) = direct {
+            // `handle_fuse` counts every request it sees, and the direct
+            // path returns before reaching it, so the exit report used to
+            // be missing exactly the two opcodes that dominate a data
+            // workload. Count the request here instead, on the same
+            // opcode slot, so the report covers all of them.
+            if (opcode as usize) < self.op_counts.len() {
+                self.op_counts[opcode as usize].fetch_add(1, Ordering::Relaxed);
+                self.op_nanos[opcode as usize]
+                    .fetch_add(direct_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             return reply;
         }
 
@@ -879,6 +922,10 @@ impl VirtioFs {
         let opcode = get_u32(raw, 4).unwrap_or(0);
         let unique = get_u64(raw, 8).unwrap_or(0);
         let nodeid = get_u64(raw, 16).unwrap_or(0);
+        if (opcode as usize) < self.op_counts.len() {
+            self.op_counts[opcode as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        let op_start = std::time::Instant::now();
         let request_context = RequestContext {
             uid: get_u32(raw, 24).unwrap_or(0),
             gid: get_u32(raw, 28).unwrap_or(0),
@@ -952,6 +999,10 @@ impl VirtioFs {
             48 | 49 => Err(EOPNOTSUPP), // No DAX mapping window.
             _ => Err(ENOSYS),
         };
+        if (opcode as usize) < self.op_nanos.len() {
+            self.op_nanos[opcode as usize]
+                .fetch_add(op_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         match result {
             Ok(payload) => success_response(unique, &payload),
             Err(errno) => error_response(unique, errno),
