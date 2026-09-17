@@ -80,15 +80,23 @@ table carries the traffic.
 A trailing `cache=auto|always|none` on a share selects how long the guest may
 trust what it has.
 
-| Policy | Attribute and entry timeout | Page cache | Use when |
-| --- | --- | --- | --- |
-| `auto` (default) | 5 s on a writable share, 60 s on a read-only one | kept across opens | the normal case |
-| `none` | 0 s | not kept | the host mutates the tree while the guest runs |
-| `always` | same as `auto` | writeback cache added, writable shares only | many small writes to one file |
+| Policy | Attribute and entry timeout | Missing-name timeout | Page cache | Use when |
+| --- | --- | --- | --- | --- |
+| `auto` (default) | 5 s on a writable share, 60 s on a read-only one | 5 s | kept across opens | the normal case |
+| `none` | 0 s | 0 s, and a miss answers ENOENT | not kept | the host mutates the tree while the guest runs |
+| `always` | same as `auto` | 5 s | writeback cache added, writable shares only | many small writes to one file |
 
 The timeout depends on the **access mode**, not only on the policy. A
 read-only share cannot go stale from the guest's own writes, so it gets a
 minute under both `auto` and `always`.
+
+A name that does not exist is a separate case, and it is capped at 5 s on
+both share modes. A guest that has cached a *present* entry finds out it is
+wrong the moment it uses it, because the open reaches hvi and fails there. A
+guest that has cached an *absent* one does not: its own kernel answers the
+open, so a file created on the host afterwards stays invisible until the
+entry expires. On a read-only share the guest cannot create the name itself
+either, which is the other way such an entry would go away.
 
 `cache=always` on a read-only share is accepted and negotiates no writeback
 cache, so it behaves as `auto`.
