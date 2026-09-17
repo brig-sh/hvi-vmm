@@ -1695,27 +1695,14 @@ impl VirtioFs {
             return Err(EROFS);
         }
         let path = self.node_path(node)?.to_owned();
-        let meta = Stat::lstat(&path)?;
-        if directory && !meta.is_dir() {
-            return Err(ENOTDIR);
-        }
-        if !directory && meta.is_dir() {
-            return Err(EISDIR);
-        }
-        // Only a regular file may be opened here. Opening a FIFO blocks until
-        // the other end is opened, and this request holds the device mutex --
-        // on the vCPU thread when the queue is shallow enough to be served
-        // inline -- so the guest would stop the VM rather than just itself.
-        // A guest kernel opens a FIFO, socket or device node on a FUSE mount
-        // itself and never sends OPEN for one, so refusing costs it nothing.
-        //
-        // `meta` comes from `symlink_metadata`, so this refuses a symlink too.
-        // That is deliberate rather than a side effect: `open_host_file`
-        // already passes `O_NOFOLLOW`, so such an open never succeeded, and
-        // the only change is that the guest now sees EPERM where it saw
-        // ELOOP.
-        if !directory && !meta.is_file() {
-            return Err(EPERM);
+        // OPENDIR asks the path what it is: it is rare next to OPEN, and
+        // `insert_dir_handle` walks the path anyway. OPEN does not, because
+        // the descriptor below answers the same question for less.
+        if directory {
+            let meta = Stat::lstat(&path)?;
+            if !meta.is_dir() {
+                return Err(ENOTDIR);
+            }
         }
         // Before anything is opened. Each handle pins a host descriptor until
         // the guest releases it, and the descriptor table is the process's,
@@ -1729,10 +1716,36 @@ impl VirtioFs {
         let fh = if directory {
             self.insert_dir_handle(&path)?
         } else {
+            // Only a regular file may be opened here, and what it is comes
+            // from the descriptor rather than from a `lstat` of the path
+            // ahead of it. The path form resolves every component again --
+            // 1.95 us of the 10.6 us this handler spent, on a tree eight
+            // directories deep -- and it answers about the name, while the
+            // descriptor answers about the file the guest is about to read.
+            //
+            // The open cannot wait: `host_open_flags` passes O_NONBLOCK, so a
+            // FIFO comes back at once and is refused here rather than
+            // stopping the VM. A guest kernel opens a FIFO, socket or device
+            // node on a FUSE mount itself and never sends OPEN for one, so
+            // refusing costs it nothing.
             let file = {
                 let (dirfd, name) = self.entry_at(node)?;
-                open_host_file_at(dirfd, &name, flags, false, 0)?
+                match open_host_file_at(dirfd, &name, flags, false, 0) {
+                    Ok(file) => file,
+                    // O_NOFOLLOW turns a symlink into ELOOP, and a special
+                    // file fails its own way, so the errno the guest saw when
+                    // the type was checked ahead of the open is restored
+                    // here. Only a failed open pays for it.
+                    Err(err) => return Err(open_failure_errno(&path, err)),
+                }
             };
+            let meta = Stat::of_file(&file)?;
+            if meta.is_dir() {
+                return Err(EISDIR);
+            }
+            if !meta.is_file() {
+                return Err(EPERM);
+            }
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
                 clear_suid_sgid(&path, &file)?;
                 self.invalidate_guest_attr(node);
@@ -3865,6 +3878,11 @@ fn host_open_flags(flags: u32, create: bool) -> io::Result<i32> {
     // The final component must be the inode the guest looked up, never a host
     // symlink followed behind the guest VFS's back.
     host_flags |= libc::O_NOFOLLOW;
+    // Opening a FIFO waits for the other end, and this call can run on the
+    // vCPU thread with the device mutex held, so a wait here stops the VM
+    // rather than the caller (#32). Only a regular file is ever handed back
+    // to the guest, and on a regular file this flag changes nothing.
+    host_flags |= libc::O_NONBLOCK;
     // A descriptor opened on the guest's behalf must not survive into any
     // process this one spawns. OpenOptions did this for us.
     host_flags |= libc::O_CLOEXEC;
@@ -3893,6 +3911,20 @@ fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Resul
     }
     // SAFETY: fd is a fresh descriptor this call owns and has not shared.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// What the guest was told when a failed open was a type the device refuses.
+///
+/// The check used to run before the open, so a directory was EISDIR and a
+/// symlink, FIFO, socket or device node was EPERM. The open runs first now,
+/// and only when it fails does the path get asked what it was, so the guest
+/// sees the same errno for the same tree as it did before.
+fn open_failure_errno(path: &Path, err: i32) -> i32 {
+    match Stat::lstat(path) {
+        Ok(meta) if meta.is_dir() => EISDIR,
+        Ok(meta) if !meta.is_file() => EPERM,
+        _ => err,
+    }
 }
 
 /// The same, relative to a directory descriptor (#30).
