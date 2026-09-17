@@ -298,6 +298,10 @@ struct FileHandle {
     writable: bool,
     path: PathBuf,
     temporary_path: Option<PathBuf>,
+    /// The FUSE node this handle was opened for. A node the guest unlinks
+    /// while holding it open loses its paths but keeps its handles, and every
+    /// later request that names the node is answered through one of them.
+    node: u64,
 }
 
 impl FileHandle {
@@ -394,6 +398,11 @@ struct Node {
     key: (u64, u64),
     paths: Vec<PathBuf>,
     lookups: u64,
+    /// How many open file handles name this node. FORGET is the most frequent
+    /// request a build sends, and both it and every unlink ask whether the
+    /// node is still held; counting here answers that without walking the
+    /// handle table each time.
+    open_handles: u64,
     /// Cached `com.nofire.hvi.linux-attr`. `Some(None)` means "checked, not
     /// present" so a miss costs no syscall either. Invalidated whenever this
     /// module writes the xattr or changes ownership/mode. macOS only; on
@@ -559,6 +568,7 @@ impl VirtioFs {
                 key: (root_meta.dev(), root_meta.ino()),
                 paths: vec![root.clone()],
                 lookups: u64::MAX,
+                open_handles: 0,
                 guest_attr: None,
             },
         );
@@ -1256,10 +1266,36 @@ impl VirtioFs {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
             let meta = Stat::of_file(&handle.file)?;
             (handle.path.clone(), meta)
+        } else if self.is_orphan(node) {
+            let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
+            let meta = Stat::of_file(&handle.file)?;
+            (handle.path.clone(), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            let meta = self.stat_in_export(&path)?;
-            (path, meta)
+            match self.stat_in_export(&path) {
+                Ok(meta) => (path, meta),
+                // The file was unlinked on the host while the guest holds it
+                // open. FUSE names the inode, this server resolves it by
+                // path, and the path is gone -- so once the attribute
+                // validity expires, `fstat` on the open descriptor fails
+                // while `read` on the same descriptor keeps working. The
+                // kernel does not always set FUSE_GETATTR_FH, so the handle
+                // has to be found here.
+                //
+                // ENOENT only. Every other stat error is about the path
+                // rather than about the file's absence -- EACCES on a
+                // directory whose mode changed, ENOTDIR, ELOOP, EIO -- and
+                // answering those from a descriptor would report success for
+                // a path the guest genuinely cannot reach. A guest-side
+                // unlink never arrives here at all: it empties `paths`, and
+                // the `is_orphan` branch above takes it first.
+                Err(ENOENT) => {
+                    let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
+                    let meta = Stat::of_file(&handle.file)?;
+                    (path, meta)
+                }
+                Err(err) => return Err(err),
+            }
         };
         Ok(self.attr_out(node, &path, &meta))
     }
@@ -1302,6 +1338,14 @@ impl VirtioFs {
             return Ok(socket_attr_out(node, socket));
         }
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
+        // An unlinked-but-open node has no path to resolve, so a request that
+        // did not carry a handle is served through one of the node's handles.
+        let (valid, fh) = if valid & FATTR_FH == 0 && self.is_orphan(node) {
+            let (found, _) = self.handle_of_node(node).ok_or(ENOENT)?;
+            (valid | FATTR_FH, found)
+        } else {
+            (valid, fh)
+        };
         let size = get_u64(input, 16).ok_or(EINVAL)?;
         let atime = get_u64(input, 32).ok_or(EINVAL)?;
         let mtime = get_u64(input, 40).ok_or(EINVAL)?;
@@ -1617,6 +1661,7 @@ impl VirtioFs {
                 key,
                 paths: vec![path.to_owned()],
                 lookups: 0,
+                open_handles: 0,
                 guest_attr: None,
             },
         );
@@ -1814,7 +1859,7 @@ impl VirtioFs {
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         let mut out = self.entry_out(node, &path, &meta);
-        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path);
+        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path, node);
         put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
@@ -1837,6 +1882,16 @@ impl VirtioFs {
             || open_flags & FUSE_OPEN_KILL_SUIDGID != 0;
         if wants_write && !self.writable {
             return Err(EROFS);
+        }
+        // A node the guest unlinked while holding it open has no name left to
+        // open through, but `/proc/self/fd/N` in the guest is a path the
+        // kernel resolves into an OPEN on this node. The existing handle's
+        // descriptor is the only way to reach the file, so the new handle is
+        // a dup of it; that fixes the access mode to the one the first open
+        // took, and a request for more than it carries is refused rather than
+        // quietly granted.
+        if self.is_orphan(node) {
+            return self.open_orphan(node, flags, open_flags, directory);
         }
         let path = self.node_path(node)?.to_owned();
         let meta = self.stat_in_export(&path)?;
@@ -1879,7 +1934,13 @@ impl VirtioFs {
                 clear_suid_sgid(&path, &file)?;
                 self.invalidate_guest_attr(node);
             }
-            self.insert_handle(file, wants_write, path)
+            // The access mode, like CREATE above and the orphan path below.
+            // O_TRUNC and KILL_SUIDGID need write access to do their work but
+            // are not a request for it, and `handle_of_node` prefers a handle
+            // flagged writable -- so a read-only handle marked this way is
+            // chosen over a genuinely writable one and then fails at the host
+            // descriptor.
+            self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path, node)
         };
         let mut out = Vec::with_capacity(16);
         put_open_out(
@@ -1888,6 +1949,62 @@ impl VirtioFs {
             directory,
             self.cache_policy != CachePolicy::None,
         );
+        Ok(out)
+    }
+
+    /// Opens an unlinked-but-open node through a descriptor it already has.
+    ///
+    /// There is no name to open, so the new handle shares the open file
+    /// description of an existing one. `F_DUPFD_CLOEXEC` cannot widen the
+    /// access mode, so a request for write access is served only when the
+    /// node already has a writable handle to dup, and refused otherwise
+    /// rather than answered with a descriptor that would fail at the first
+    /// write.
+    fn open_orphan(
+        &mut self,
+        node: u64,
+        flags: u32,
+        open_flags: u32,
+        directory: bool,
+    ) -> Result<Vec<u8>, i32> {
+        // OPENDIR keeps its handles in a table of its own and RELEASEDIR only
+        // looks there, so a dup handed out here would sit in the file table
+        // with nothing able to release it, and the count would climb until the
+        // guest was refused an open it should have had. A guest kernel does
+        // not send O_DIRECTORY for a file, which is why this needs saying: the
+        // check is against a guest that does. ENOENT is what the path
+        // resolution answered before there was an orphan branch at all.
+        if directory {
+            return Err(ENOENT);
+        }
+        if self.open_handle_count() >= self.handle_limit {
+            return Err(ENFILE);
+        }
+        let writable = flags & LINUX_O_ACCMODE != 0;
+        let wants_write =
+            writable || flags & LINUX_O_TRUNC != 0 || open_flags & FUSE_OPEN_KILL_SUIDGID != 0;
+        let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
+        if wants_write && !handle.writable {
+            return Err(EACCES);
+        }
+        let path = handle.path.clone();
+        // SAFETY: a descriptor this call owns and hands over.
+        let file = File::from(dup_cloexec(handle.file.as_fd())?);
+        if flags & LINUX_O_TRUNC != 0 {
+            file.set_len(0).map_err(io_errno)?;
+        }
+        if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
+            clear_suid_sgid(&path, &file)?;
+            self.invalidate_guest_attr(node);
+        }
+        // The access mode the guest asked for, not what the open needed to do.
+        // A dup of a writable handle can be written through whatever this open
+        // requested, so the handle's own flag is the only thing standing
+        // between an O_RDONLY open and a later FUSE_WRITE. O_TRUNC and
+        // KILL_SUIDGID need write access to proceed without granting it.
+        let fh = self.insert_handle(file, writable, path, node);
+        let mut out = Vec::with_capacity(16);
+        put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
 
@@ -2109,7 +2226,7 @@ impl VirtioFs {
         self.handle_limit
     }
 
-    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf) -> u64 {
+    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf, node: u64) -> u64 {
         let fh = self.next_handle();
         self.handles.insert(
             fh,
@@ -2118,8 +2235,10 @@ impl VirtioFs {
                 writable,
                 path,
                 temporary_path: None,
+                node,
             },
         );
+        self.hold_node(node);
         self.note_handle_peak();
         fh
     }
@@ -2173,6 +2292,7 @@ impl VirtioFs {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let flags = get_u32(input, 12).unwrap_or(0);
         let handle = self.handles.remove(&fh).ok_or(EBADF)?;
+        self.release_node(handle.node);
         if flags & FUSE_RELEASE_FLOCK_UNLOCK != 0 {
             let result = unsafe { libc::flock(handle.file.as_raw_fd(), libc::LOCK_UN) };
             if result != 0 {
@@ -2528,8 +2648,10 @@ impl VirtioFs {
                 writable: true,
                 path: path.clone(),
                 temporary_path: Some(path),
+                node,
             },
         );
+        self.hold_node(node);
         put_open_out(&mut out, fh, false, false);
         Ok(out)
     }
@@ -2539,6 +2661,16 @@ impl VirtioFs {
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
         let (path, meta) = if flags & FUSE_GETATTR_FH != 0 {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
+            let meta = Stat::of_file(&handle.file)?;
+            (Some(handle.path.clone()), meta)
+        } else if self.is_orphan(node) {
+            // Same as GETATTR: init advertises minor 39, so the guest sends
+            // STATX rather than GETATTR whenever the requested mask reaches
+            // past the basic stats -- GNU `stat`, Rust's `File::metadata`,
+            // anything asking for STATX_BTIME. Without this an unlinked-but-
+            // open file answers `fstat` and fails `statx` on the same
+            // descriptor.
+            let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
             let meta = Stat::of_file(&handle.file)?;
             (Some(handle.path.clone()), meta)
         } else {
@@ -2657,7 +2789,17 @@ impl VirtioFs {
                 } else {
                     self.node_for(path.clone(), &meta)
                 };
-                self.remember_lookup(entry_node);
+                // Everything but `.` and `..`. The guest kernel returns from
+                // `fuse_direntplus_link` before `fuse_iget` for those two
+                // names, so it takes no reference and sends no FORGET for
+                // them; counting one here is a reference nothing ever gives
+                // back, and the node would sit in the table for the life of
+                // the device. libfuse's `fill_dir_plus` skips them for the
+                // same reason. An explicit LOOKUP of `.` or `..` does go
+                // through `fuse_iget` and is still counted, in `lookup`.
+                if idx > 1 {
+                    self.remember_lookup(entry_node);
+                }
                 out.extend_from_slice(&self.entry_out(entry_node, &path, &meta));
                 put_u64(&mut out, entry_node);
                 put_u64(&mut out, (idx + 1) as u64);
@@ -2883,17 +3025,22 @@ impl VirtioFs {
     ///
     /// The export root has no parent to be asked through, so it is opened
     /// from its own descriptor; everything else goes through its parent's.
+    ///
+    /// A node the guest unlinked while holding it open has no parent entry
+    /// left to open, and every caller here -- the xattr handlers and the
+    /// cached guest-attribute read -- would otherwise fail with ENOENT for a
+    /// file the guest can still reach through its descriptor. Such a node
+    /// resolves to a dup of one of its handles instead. Putting the fallback
+    /// in the resolver rather than in each handler is what keeps the next
+    /// descriptor-reachable request working without a fifth copy of it.
     #[cfg(target_os = "macos")]
     fn open_entry_at(&mut self, node: u64) -> Result<OwnedFd, i32> {
+        if self.is_orphan(node) {
+            let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
+            return dup_cloexec(handle.file.as_fd());
+        }
         if self.relative_of(node)?.as_os_str().is_empty() {
-            // SAFETY: the root descriptor is owned by the cache and open.
-            let dup =
-                unsafe { libc::fcntl(self.dirs.root_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-            if dup < 0 {
-                return Err(io_errno(io::Error::last_os_error()));
-            }
-            // SAFETY: a fresh descriptor this call owns.
-            return Ok(unsafe { OwnedFd::from_raw_fd(dup) });
+            return dup_cloexec(self.dirs.root_fd());
         }
         let (dirfd, name) = self.entry_at(node)?;
         open_entry_nofollow(dirfd, &name)
@@ -3024,6 +3171,7 @@ impl VirtioFs {
                 key,
                 paths: vec![path],
                 lookups: 0,
+                open_handles: 0,
                 guest_attr: None,
             },
         );
@@ -3067,9 +3215,49 @@ impl VirtioFs {
         if remembered.lookups != 0 {
             return;
         }
+        // A node the guest has forgotten but still holds a descriptor for
+        // stays: the handle answers requests that name the node, and the
+        // descriptor outlives the guest's dentry either way. Its inode key
+        // stays with it so a fresh lookup of the same file lands back on this
+        // node rather than minting a second one for the same inode. RELEASE
+        // of the last handle removes both.
+        if remembered.open_handles != 0 {
+            return;
+        }
         let key = remembered.key;
         self.nodes.remove(&node);
-        self.inode_ids.remove(&key);
+        if self.inode_ids.get(&key) == Some(&node) {
+            self.inode_ids.remove(&key);
+        }
+    }
+
+    /// Records that a new handle names `node`.
+    fn hold_node(&mut self, node: u64) {
+        if let Some(remembered) = self.nodes.get_mut(&node) {
+            remembered.open_handles = remembered.open_handles.saturating_add(1);
+        }
+    }
+
+    /// Records that a handle naming `node` has gone, and drops the node if
+    /// that was the last thing referring to it.
+    ///
+    /// This is the other half of the rule in `forget_count`: whichever of the
+    /// two arrives last does the removal. The kernel takes an `igrab` across
+    /// RELEASE, so a guest that behaves sends FORGET afterwards and the node
+    /// goes there; a guest that does not still leaves nothing behind.
+    fn release_node(&mut self, node: u64) {
+        let Some(remembered) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        remembered.open_handles = remembered.open_handles.saturating_sub(1);
+        if remembered.open_handles != 0 || remembered.lookups != 0 || node == FUSE_ROOT_ID {
+            return;
+        }
+        let key = remembered.key;
+        self.nodes.remove(&node);
+        if self.inode_ids.get(&key) == Some(&node) {
+            self.inode_ids.remove(&key);
+        }
     }
 
     fn forget_node_path(&mut self, path: &Path, meta: &Stat) {
@@ -3083,9 +3271,59 @@ impl VirtioFs {
             empty = node.paths.is_empty();
         }
         if empty && node_id != FUSE_ROOT_ID {
-            self.nodes.remove(&node_id);
+            // The host inode may be reused by a later file, which must get a
+            // node of its own, so the key goes now. The node itself stays
+            // while the guest still refers to it (an open handle, or lookups
+            // the kernel has not forgotten): FUSE names inodes by node id,
+            // and an unlinked-but-open file is still an inode to the guest.
+            // FORGET, or the release of the last handle once forgotten,
+            // removes it.
             self.inode_ids.remove(&key);
+            let held = self
+                .nodes
+                .get(&node_id)
+                .map(|node| node.lookups > 0 || node.open_handles > 0)
+                .unwrap_or(false);
+            if !held {
+                self.nodes.remove(&node_id);
+            }
         }
+    }
+
+    /// Returns whether `node` is one the guest unlinked while still holding it.
+    ///
+    /// Such a node is still in the table, but no path leads to it any more.
+    fn is_orphan(&self, node: u64) -> bool {
+        self.nodes
+            .get(&node)
+            .map(|remembered| remembered.paths.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Returns some open handle of `node`, for requests that name an orphan by
+    /// node.
+    ///
+    /// A writable handle is preferred over a read-only one. The choice
+    /// matters for exactly one caller: a size change arrives with FATTR_SIZE
+    /// and no FATTR_FH when the guest truncates through a path rather than a
+    /// descriptor (`truncate("/proc/self/fd/N")`), and the size branch
+    /// refuses a handle that was not opened for writing. Everything else a
+    /// handle answers here -- fstat, times, mode, ownership, xattrs -- is
+    /// inode-scoped and works on any of them. Hash-map order is otherwise
+    /// arbitrary, so without this the same request would succeed or fail
+    /// depending on which handle came out first.
+    fn handle_of_node(&self, node: u64) -> Option<(u64, &FileHandle)> {
+        let mut any = None;
+        for (fh, handle) in &self.handles {
+            if handle.node != node {
+                continue;
+            }
+            if handle.writable {
+                return Some((*fh, handle));
+            }
+            any.get_or_insert((*fh, handle));
+        }
+        any
     }
 
     fn cache_seconds(&self) -> u64 {
@@ -4068,6 +4306,22 @@ fn exists_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<(), i32> {
         return Err(io_errno(io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Duplicates a descriptor this device owns, close-on-exec.
+///
+/// The caller gets a descriptor of its own with the same open file
+/// description behind it, which is what lets an unlinked-but-open file be
+/// reached after its name is gone.
+#[cfg(target_os = "macos")]
+fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd, i32> {
+    // SAFETY: `fd` is borrowed for the call and open for its whole duration.
+    let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh descriptor this call owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
 }
 
 /// Returns the metadata of one entry in a directory listing.
@@ -7009,6 +7263,505 @@ mod tests {
             assert_ne!(opcode_name(opcode), "?", "opcode {opcode} prints as `?`");
         }
         assert_eq!(opcode_name(9999), "?");
+    }
+
+    // The guest unlinks a file it holds open and, past the attribute
+    // validity, asks for its attributes by node id without a handle: the
+    // server answers through the open handle, and the node goes away with
+    // the FORGET once the guest is done with it.
+    #[test]
+    fn getattr_after_unlink_answers_through_the_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let lookup = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"etc\0"), 4096);
+        let etc_node = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+        let lookup = dev.handle_fuse(&request(LOOKUP, etc_node, b"issue\0"), 4096);
+        let issue_node = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+
+        let mut open = vec![0u8; 8];
+        open[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, issue_node, &open), 4096);
+        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let out = dev.handle_fuse(&request(UNLINK, etc_node, b"issue\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(!dir.join("etc/issue").exists());
+        assert!(
+            dev.nodes.contains_key(&issue_node),
+            "the node outlives the unlink while open"
+        );
+
+        // GETATTR by node, no handle: getattr_in is flags, dummy, fh.
+        let getattr = vec![0u8; 16];
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &getattr), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "fstat after unlink answers");
+        assert_eq!(
+            get_u64(&out, OUT_HEADER_LEN + 16 + 8),
+            Some(6),
+            "size of hello\\n"
+        );
+
+        // SETATTR by node without FATTR_FH: served through the handle too.
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&FATTR_SIZE.to_le_bytes());
+        setattr[16..24].copy_from_slice(&2u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue_node, &setattr), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN + 16 + 8), Some(2));
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        dev.handle_fuse(&request(RELEASE, issue_node, &release), 4096);
+        // FORGET with the two lookups the guest holds on the node.
+        let lookups = dev
+            .nodes
+            .get(&issue_node)
+            .map(|node| node.lookups)
+            .unwrap_or(0);
+        let mut forget = Vec::new();
+        put_u64(&mut forget, lookups);
+        dev.handle_fuse(&request(FORGET, issue_node, &forget), 4096);
+        assert!(
+            !dev.nodes.contains_key(&issue_node),
+            "forgotten after release"
+        );
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &getattr), 4096);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -ENOENT);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Opens `node` read-only and returns the handle.
+    fn open_ro(dev: &mut VirtioFs, node: u64) -> u64 {
+        let out = dev.handle_fuse(&request(OPEN, node, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        get_u64(&out, OUT_HEADER_LEN).unwrap()
+    }
+
+    /// Looks `etc/issue` up, opens it read-write, and unlinks it: the orphan
+    /// every test below asks a different question of.
+    ///
+    /// The share is writable because the unlink that makes the orphan is
+    /// itself a mutation, which a read-only share answers with EROFS.
+    fn orphan_fixture() -> (PathBuf, VirtioFs, u64, u64) {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let fh = open_rw(&mut dev, issue);
+        let out = dev.handle_fuse(&request(UNLINK, etc, b"issue\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(
+            dev.is_orphan(issue),
+            "the unlink left the node without a path"
+        );
+        (dir, dev, issue, fh)
+    }
+
+    // READDIRPLUS reports `.` and `..` but takes no reference to them.
+    //
+    // The guest kernel returns from `fuse_direntplus_link` before
+    // `fuse_iget` for those two names, so no FORGET ever comes back for
+    // them. A count taken here is one the guest can never give back, and
+    // since an unlink now leaves a still-referenced node in place, the
+    // directory would stay in the table for the life of the device.
+    #[test]
+    fn readdirplus_does_not_count_dot_and_dotdot() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("etc/sub")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let sub = lookup_node(&mut dev, etc, b"sub");
+        let etc_lookups = dev.nodes.get(&etc).unwrap().lookups;
+
+        let out = dev.handle_fuse(&request(OPENDIR, sub, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let dir_fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let mut input = vec![0u8; 24];
+        input[0..8].copy_from_slice(&dir_fh.to_le_bytes());
+        input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, sub, &input), 4096 + 16);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        assert_eq!(
+            dev.nodes.get(&sub).unwrap().lookups,
+            1,
+            "`.` must not add a lookup the guest will never forget"
+        );
+        assert_eq!(
+            dev.nodes.get(&etc).unwrap().lookups,
+            etc_lookups,
+            "`..` must not add one either"
+        );
+
+        // The directory goes, then the one LOOKUP the guest really made is
+        // given back: nothing is left behind. With `.` counted, the FORGET
+        // below cancels that phantom reference instead and the node stays.
+        let mut release_dir = vec![0u8; 8];
+        release_dir[0..8].copy_from_slice(&dir_fh.to_le_bytes());
+        dev.handle_fuse(&request(RELEASEDIR, sub, &release_dir), 4096);
+        let out = dev.handle_fuse(&request(RMDIR, etc, b"sub\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let mut forget = Vec::new();
+        put_u64(&mut forget, 1);
+        dev.handle_fuse(&request(FORGET, sub, &forget), 4096);
+        assert!(
+            !dev.nodes.contains_key(&sub),
+            "a listed-then-removed directory must not outlive the guest's reference to it"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // STATX is what the guest sends whenever the requested mask reaches past
+    // the basic stats, so an orphan that answers GETATTR and not STATX fails
+    // for `stat(1)` and for Rust's `File::metadata` while `fstat` works.
+    #[test]
+    fn statx_on_an_orphan_answers_through_the_handle() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+        let out = dev.handle_fuse(&request(STATX, issue, &[0u8; 24]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "STATX after unlink");
+        assert_eq!(
+            get_u64(&out, OUT_HEADER_LEN + 72),
+            Some(6),
+            "size of hello\\n"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The xattr handlers resolve through `open_entry_at`, so the orphan
+    // fallback in the resolver is what makes all four of them work; one
+    // stands for the group.
+    #[test]
+    fn xattrs_on_an_orphan_answer_through_the_handle() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+
+        let mut set = vec![0u8; 16];
+        set[0..4].copy_from_slice(&5u32.to_le_bytes());
+        set.extend_from_slice(b"user.hvi\0");
+        set.extend_from_slice(b"value");
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(SETXATTR, issue, &set), 4096), 4),
+            Some(0),
+            "SETXATTR after unlink"
+        );
+
+        let mut get = vec![0u8; 8];
+        get[0..4].copy_from_slice(&64u32.to_le_bytes());
+        get.extend_from_slice(b"user.hvi\0");
+        let out = dev.handle_fuse(&request(GETXATTR, issue, &get), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "GETXATTR after unlink");
+        assert_eq!(&out[OUT_HEADER_LEN..OUT_HEADER_LEN + 5], b"value");
+
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&1024u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LISTXATTR, issue, &list), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "LISTXATTR after unlink");
+        let names = &out[OUT_HEADER_LEN..];
+        assert!(
+            names
+                .windows(b"user.hvi\0".len())
+                .any(|w| w == b"user.hvi\0"),
+            "the name set above is in the listing"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The same resolver carries the cached guest attribute, so a SETATTR on
+    // an orphan must not write a negative into the node and then serve the
+    // host's ownership from it for the rest of the node's life.
+    #[test]
+    fn setattr_on_an_orphan_keeps_the_guests_ownership() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+
+        let mut chown = vec![0u8; 88];
+        chown[0..4].copy_from_slice(&(FATTR_UID | FATTR_GID | FATTR_MODE).to_le_bytes());
+        chown[68..72].copy_from_slice(&0o600u32.to_le_bytes());
+        chown[72..76].copy_from_slice(&1000u32.to_le_bytes());
+        chown[76..80].copy_from_slice(&1000u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue, &chown), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "chown/chmod of an orphan");
+
+        // Truncating through the same node invalidates the cached attribute
+        // and rebuilds it. That rebuild used to resolve by path, fail, and
+        // store "no guest attribute" -- after which every reply reported the
+        // host's uid rather than the guest's.
+        let mut truncate = vec![0u8; 88];
+        truncate[0..4].copy_from_slice(&FATTR_SIZE.to_le_bytes());
+        truncate[16..24].copy_from_slice(&2u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue, &truncate), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 68),
+            Some(1000),
+            "the truncate reply still reports the guest's uid"
+        );
+
+        let out = dev.handle_fuse(&request(GETATTR, issue, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 16 + 68),
+            Some(1000),
+            "and so does every reply after it"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A stat that fails for a reason other than "the file is gone" is the
+    // guest's answer. Serving it from a descriptor would report success for
+    // a path the guest genuinely cannot reach.
+    #[test]
+    fn a_stat_error_that_is_not_enoent_is_not_masked_by_a_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let _fh = open_rw(&mut dev, issue);
+
+        // The parent becomes a regular file behind the device's back, so the
+        // node keeps its path and the walk to it now fails with ENOTDIR. The
+        // node is not an orphan: the unlink path never ran.
+        fs::remove_file(dir.join("etc/issue")).unwrap();
+        fs::remove_dir(dir.join("etc")).unwrap();
+        fs::write(dir.join("etc"), b"not a directory\n").unwrap();
+        // The device is holding a descriptor for the directory that was
+        // there, and a cached descriptor answers without walking. Dropping it
+        // is what an eviction would do, and the walk below is then the one
+        // the guest's request really makes.
+        dev.dirs.forget_subtree(Path::new("etc"));
+        assert!(!dev.is_orphan(issue));
+
+        assert_eq!(
+            i32::from_le_bytes(
+                dev.handle_fuse(&request(GETATTR, issue, &[0u8; 16]), 4096)[4..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            -ENOTDIR,
+            "an unreachable path answers its own error, not the handle's success"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A size change arrives with FATTR_SIZE and no FATTR_FH when the guest
+    // truncates through a path -- `truncate("/proc/self/fd/N")` -- and the
+    // size branch refuses a handle that was not opened for writing. Which
+    // handle answers must not depend on hash-map order.
+    #[test]
+    fn a_truncate_on_an_orphan_finds_the_writable_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        // Five read-only handles around one writable one: without a
+        // preference the writable one is found roughly one time in six.
+        for _ in 0..4 {
+            open_ro(&mut dev, issue);
+        }
+        let _writable = open_rw(&mut dev, issue);
+        open_ro(&mut dev, issue);
+        dev.handle_fuse(&request(UNLINK, etc, b"issue\0"), 4096);
+
+        let mut truncate = vec![0u8; 88];
+        truncate[0..4].copy_from_slice(&FATTR_SIZE.to_le_bytes());
+        truncate[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue, &truncate), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the path form of a truncate must reach the writable handle"
+        );
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN + 16 + 8), Some(1));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `/proc/self/fd/N` in the guest is a path the kernel resolves into an
+    // OPEN on a node whose name is gone. There is nothing to open by name,
+    // so the node's own descriptor is what serves it.
+    #[test]
+    fn opening_an_orphan_dups_the_handle_it_already_has() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+        let reopened = open_rw(&mut dev, issue);
+
+        let mut read = vec![0u8; 40];
+        read[0..8].copy_from_slice(&reopened.to_le_bytes());
+        read[16..20].copy_from_slice(&6u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READ, issue, &read), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(&out[OUT_HEADER_LEN..OUT_HEADER_LEN + 6], b"hello\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Write access cannot be conjured from a read-only descriptor, so an
+    // orphan with nothing writable to dup refuses rather than handing back a
+    // descriptor that would fail at the first write.
+    #[test]
+    fn opening_an_orphan_for_write_needs_a_writable_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let _ro = open_ro(&mut dev, issue);
+        dev.handle_fuse(&request(UNLINK, etc, b"issue\0"), 4096);
+
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        assert_eq!(
+            i32::from_le_bytes(
+                dev.handle_fuse(&request(OPEN, issue, &input), 4096)[4..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            -EACCES
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Whichever of FORGET and RELEASE arrives last removes the node. The
+    // kernel takes an `igrab` across RELEASE and so sends FORGET afterwards,
+    // but a node held by a descriptor must survive the other order too --
+    // and must not survive it for good.
+    #[test]
+    fn a_forget_before_the_last_release_leaves_nothing_behind() {
+        let (dir, mut dev, issue, fh) = orphan_fixture();
+        let lookups = dev.nodes.get(&issue).unwrap().lookups;
+        let mut forget = Vec::new();
+        put_u64(&mut forget, lookups);
+        dev.handle_fuse(&request(FORGET, issue, &forget), 4096);
+        assert!(
+            dev.nodes.contains_key(&issue),
+            "a node with an open descriptor outlives the FORGET"
+        );
+        assert_eq!(
+            get_u32(
+                &dev.handle_fuse(&request(GETATTR, issue, &[0u8; 16]), 4096),
+                4
+            ),
+            Some(0),
+            "and still answers through its handle"
+        );
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        dev.handle_fuse(&request(RELEASE, issue, &release), 4096);
+        assert!(
+            !dev.nodes.contains_key(&issue),
+            "the last release of a forgotten node removes it"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A handle from OPENDIR lives in `dir_handles` and RELEASEDIR only looks
+    // there, so a dup put in the file table by an OPENDIR would be
+    // unreleasable and the count would climb to the limit. A guest kernel
+    // refuses O_DIRECTORY on a file before sending the request; this is the
+    // guard against one that does not.
+    #[test]
+    fn opendir_on_an_orphan_hands_out_nothing() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+        let before = dev.open_handle_count();
+        assert_eq!(
+            i32::from_le_bytes(
+                dev.handle_fuse(&request(OPENDIR, issue, &[0u8; 8]), 4096)[4..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            -ENOENT
+        );
+        assert_eq!(
+            dev.open_handle_count(),
+            before,
+            "a refused OPENDIR must not leave a handle behind"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // O_TRUNC needs write access to do its work, but it is not a request for
+    // write access. The dup comes from a writable handle and can be written
+    // through whatever the open asked, so the handle's own flag is the only
+    // thing left holding an O_RDONLY open to reading.
+    #[test]
+    fn a_read_only_orphan_open_that_truncates_cannot_write() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&LINUX_O_TRUNC.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, issue, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "O_RDONLY|O_TRUNC is served");
+        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let mut write = vec![0u8; 41];
+        write[0..8].copy_from_slice(&fh.to_le_bytes());
+        write[16..20].copy_from_slice(&1u32.to_le_bytes());
+        write[40] = b'x';
+        assert_eq!(
+            i32::from_le_bytes(
+                dev.handle_fuse(&request(WRITE, issue, &write), 4096)[4..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            -EBADF,
+            "a read-only open must not write, whatever it truncated"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The ordinary open strips setuid and setgid when the guest asks for it.
+    // The orphan path answered success without doing either.
+    #[test]
+    fn an_orphan_open_that_kills_suid_clears_the_bits() {
+        let (dir, mut dev, issue, _fh) = orphan_fixture();
+        let mut chmod = vec![0u8; 88];
+        chmod[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+        chmod[68..72].copy_from_slice(&(0o4755u32).to_le_bytes());
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(SETATTR, issue, &chmod), 4096), 4),
+            Some(0)
+        );
+
+        let mut input = vec![0u8; 8];
+        input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        input[4..8].copy_from_slice(&FUSE_OPEN_KILL_SUIDGID.to_le_bytes());
+        assert_eq!(
+            get_u32(&dev.handle_fuse(&request(OPEN, issue, &input), 4096), 4),
+            Some(0)
+        );
+
+        let out = dev.handle_fuse(&request(GETATTR, issue, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let mode = get_u32(&out, OUT_HEADER_LEN + 16 + 60).unwrap();
+        assert_eq!(mode & 0o6000, 0, "setuid survived the open: {mode:o}");
+        assert_eq!(mode & 0o777, 0o755, "the permission bits are untouched");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // O_TRUNC and KILL_SUIDGID need write access to do their work, but an open
+    // carrying them is not a request for write access. Marking the handle
+    // writable used to be inert, because the host descriptor carried the real
+    // mode -- until `handle_of_node` began preferring a writable handle, which
+    // made the mismarked one the preferred answer and then failed on it.
+    #[test]
+    fn a_read_only_open_with_o_trunc_is_not_a_writable_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+
+        // Read-only but truncating, then a genuinely writable handle.
+        let mut truncating = vec![0u8; 8];
+        truncating[0..4].copy_from_slice(&LINUX_O_TRUNC.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, issue, &truncating), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let read_only = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        assert!(
+            !dev.handles[&read_only].writable,
+            "an O_RDONLY open is a read-only handle whatever it truncated"
+        );
+        let _writable = open_rw(&mut dev, issue);
+        dev.handle_fuse(&request(UNLINK, etc, b"issue\0"), 4096);
+
+        // The path form of a truncate has to land on the writable one.
+        let mut resize = vec![0u8; 88];
+        resize[0..4].copy_from_slice(&FATTR_SIZE.to_le_bytes());
+        resize[16..24].copy_from_slice(&3u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue, &resize), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the truncating read-only handle must not be preferred"
+        );
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN + 16 + 8), Some(3));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
