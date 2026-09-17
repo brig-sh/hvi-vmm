@@ -226,6 +226,10 @@ struct FileHandle {
     writable: bool,
     path: PathBuf,
     temporary_path: Option<PathBuf>,
+    /// The FUSE node this handle was opened for. A node the guest unlinks
+    /// while holding it open loses its paths but keeps its handles, and every
+    /// later request that names the node is answered through one of them.
+    node: u64,
 }
 
 impl FileHandle {
@@ -1069,10 +1073,36 @@ impl VirtioFs {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
             let meta = Stat::of_file(&handle.file)?;
             (handle.path.clone(), meta)
+        } else if self.is_orphan(node) {
+            let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
+            let meta = Stat::of_file(&handle.file)?;
+            (handle.path.clone(), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            let meta = self.stat_in_export(&path)?;
-            (path, meta)
+            match self.stat_in_export(&path) {
+                Ok(meta) => (path, meta),
+                // The guest unlinked a file it still holds open. FUSE names
+                // the inode, this server resolves it by path, and the path is
+                // gone -- so once the attribute validity expires, `fstat` on
+                // the open descriptor fails while `read` on the same
+                // descriptor keeps working. The kernel does not always set
+                // FUSE_GETATTR_FH, so the handle has to be found here.
+                //
+                // Only on failure, and only for a path that no longer
+                // resolves: if something else now lives at that path, the
+                // stat above succeeded and answered about that file, which is
+                // what a path-resolving server owes a caller that asked by
+                // path.
+                Err(err) => {
+                    let handle = self
+                        .handles
+                        .values()
+                        .find(|handle| handle.node == node)
+                        .ok_or(err)?;
+                    let meta = Stat::of_file(&handle.file)?;
+                    (path, meta)
+                }
+            }
         };
         Ok(self.attr_out(node, &path, &meta))
     }
@@ -1115,6 +1145,14 @@ impl VirtioFs {
             return Ok(socket_attr_out(node, socket));
         }
         let fh = get_u64(input, 8).ok_or(EINVAL)?;
+        // An unlinked-but-open node has no path to resolve, so a request that
+        // did not carry a handle is served through one of the node's handles.
+        let (valid, fh) = if valid & FATTR_FH == 0 && self.is_orphan(node) {
+            let (found, _) = self.handle_of_node(node).ok_or(ENOENT)?;
+            (valid | FATTR_FH, found)
+        } else {
+            (valid, fh)
+        };
         let size = get_u64(input, 16).ok_or(EINVAL)?;
         let atime = get_u64(input, 32).ok_or(EINVAL)?;
         let mtime = get_u64(input, 40).ok_or(EINVAL)?;
@@ -1632,7 +1670,7 @@ impl VirtioFs {
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         let mut out = self.entry_out(node, &path, &meta);
-        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path);
+        let fh = self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, path, node);
         put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
@@ -1699,7 +1737,7 @@ impl VirtioFs {
                 clear_suid_sgid(&path, &file)?;
                 self.invalidate_guest_attr(node);
             }
-            self.insert_handle(file, wants_write, path)
+            self.insert_handle(file, wants_write, path, node)
         };
         let mut out = Vec::with_capacity(16);
         put_open_out(
@@ -1915,7 +1953,7 @@ impl VirtioFs {
         self.handle_limit
     }
 
-    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf) -> u64 {
+    fn insert_handle(&mut self, file: File, writable: bool, path: PathBuf, node: u64) -> u64 {
         let fh = self.next_handle();
         self.handles.insert(
             fh,
@@ -1924,6 +1962,7 @@ impl VirtioFs {
                 writable,
                 path,
                 temporary_path: None,
+                node,
             },
         );
         self.note_handle_peak();
@@ -1988,6 +2027,16 @@ impl VirtioFs {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let flags = get_u32(input, 12).unwrap_or(0);
         let handle = self.handles.remove(&fh).ok_or(EBADF)?;
+        if self.is_orphan(handle.node)
+            && self
+                .nodes
+                .get(&handle.node)
+                .map(|node| node.lookups == 0)
+                .unwrap_or(false)
+            && self.handle_of_node(handle.node).is_none()
+        {
+            self.nodes.remove(&handle.node);
+        }
         if flags & FUSE_RELEASE_FLOCK_UNLOCK != 0 {
             let result = unsafe { libc::flock(handle.file.as_raw_fd(), libc::LOCK_UN) };
             if result != 0 {
@@ -2276,6 +2325,7 @@ impl VirtioFs {
                 writable: true,
                 path: path.clone(),
                 temporary_path: Some(path),
+                node,
             },
         );
         put_open_out(&mut out, fh, false, false);
@@ -2762,8 +2812,16 @@ impl VirtioFs {
             return;
         }
         let key = remembered.key;
+        let still_open = self.handles.values().any(|handle| handle.node == node);
         self.nodes.remove(&node);
-        self.inode_ids.remove(&key);
+        if self.inode_ids.get(&key) == Some(&node) {
+            self.inode_ids.remove(&key);
+        }
+        if still_open {
+            // The guest forgot the inode while a descriptor is still open
+            // (possible on an unlink-then-close ordering); the handle keeps
+            // its File and answers by fh until RELEASE.
+        }
     }
 
     fn forget_node_path(&mut self, path: &Path, meta: &Stat) {
@@ -2777,9 +2835,41 @@ impl VirtioFs {
             empty = node.paths.is_empty();
         }
         if empty && node_id != FUSE_ROOT_ID {
-            self.nodes.remove(&node_id);
+            // The host inode may be reused by a later file, which must get a
+            // node of its own, so the key goes now. The node itself stays
+            // while the guest still refers to it (an open handle, or lookups
+            // the kernel has not forgotten): FUSE names inodes by node id,
+            // and an unlinked-but-open file is still an inode to the guest.
+            // FORGET, or the release of the last handle once forgotten,
+            // removes it.
             self.inode_ids.remove(&key);
+            let held = self.handles.values().any(|handle| handle.node == node_id)
+                || self
+                    .nodes
+                    .get(&node_id)
+                    .map(|node| node.lookups > 0)
+                    .unwrap_or(false);
+            if !held {
+                self.nodes.remove(&node_id);
+            }
         }
+    }
+
+    /// Whether `node` is one the guest unlinked while still holding it: it
+    /// exists in the table but no path leads to it any more.
+    fn is_orphan(&self, node: u64) -> bool {
+        self.nodes
+            .get(&node)
+            .map(|remembered| remembered.paths.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Some open handle of `node`, for requests that name an orphan by node.
+    fn handle_of_node(&self, node: u64) -> Option<(u64, &FileHandle)> {
+        self.handles
+            .iter()
+            .find(|(_, handle)| handle.node == node)
+            .map(|(fh, handle)| (*fh, handle))
     }
 
     fn cache_seconds(&self) -> u64 {
@@ -6247,6 +6337,70 @@ mod tests {
         let mut release = vec![0u8; 24];
         release[0..8].copy_from_slice(&fh.to_le_bytes());
         dev.handle_fuse(&request(RELEASE, issue_node, &release), 4096);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The guest unlinks a file it holds open and, past the attribute
+    /// validity, asks for its attributes by node id without a handle: the
+    /// server answers through the open handle, and the node goes away with
+    /// the FORGET once the guest is done with it.
+    #[test]
+    fn getattr_after_unlink_answers_through_the_handle() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let lookup = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"etc\0"), 4096);
+        let etc_node = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+        let lookup = dev.handle_fuse(&request(LOOKUP, etc_node, b"issue\0"), 4096);
+        let issue_node = get_u64(&lookup, OUT_HEADER_LEN).unwrap();
+
+        let mut open = vec![0u8; 8];
+        open[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, issue_node, &open), 4096);
+        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let out = dev.handle_fuse(&request(UNLINK, etc_node, b"issue\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(!dir.join("etc/issue").exists());
+        assert!(
+            dev.nodes.contains_key(&issue_node),
+            "the node outlives the unlink while open"
+        );
+
+        // GETATTR by node, no handle: getattr_in is flags, dummy, fh.
+        let getattr = vec![0u8; 16];
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &getattr), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "fstat after unlink answers");
+        assert_eq!(
+            get_u64(&out, OUT_HEADER_LEN + 16 + 8),
+            Some(6),
+            "size of hello\\n"
+        );
+
+        // SETATTR by node without FATTR_FH: served through the handle too.
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&FATTR_SIZE.to_le_bytes());
+        setattr[16..24].copy_from_slice(&2u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, issue_node, &setattr), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(get_u64(&out, OUT_HEADER_LEN + 16 + 8), Some(2));
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        dev.handle_fuse(&request(RELEASE, issue_node, &release), 4096);
+        // FORGET with the two lookups the guest holds on the node.
+        let lookups = dev
+            .nodes
+            .get(&issue_node)
+            .map(|node| node.lookups)
+            .unwrap_or(0);
+        let mut forget = Vec::new();
+        put_u64(&mut forget, lookups);
+        dev.handle_fuse(&request(FORGET, issue_node, &forget), 4096);
+        assert!(
+            !dev.nodes.contains_key(&issue_node),
+            "forgotten after release"
+        );
+        let out = dev.handle_fuse(&request(GETATTR, issue_node, &getattr), 4096);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -ENOENT);
         let _ = fs::remove_dir_all(dir);
     }
 
