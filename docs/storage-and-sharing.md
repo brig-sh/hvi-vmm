@@ -82,7 +82,7 @@ trust what it has.
 
 | Policy | Attribute and entry timeout | Page cache | Use when |
 | --- | --- | --- | --- |
-| `auto` (default) | 1 s on a writable share, 60 s on a read-only one | kept across opens | the normal case |
+| `auto` (default) | 5 s on a writable share, 60 s on a read-only one | kept across opens | the normal case |
 | `none` | 0 s | not kept | the host mutates the tree while the guest runs |
 | `always` | same as `auto` | writeback cache added, writable shares only | many small writes to one file |
 

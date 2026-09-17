@@ -2786,10 +2786,9 @@ impl VirtioFs {
         if self.cache_policy == CachePolicy::None {
             0
         } else if !self.writable {
-            // Read-only shares cannot go stale from the guest's own writes.
-            60
+            READ_ONLY_CACHE_SECS
         } else {
-            1
+            WRITABLE_CACHE_SECS
         }
     }
 
@@ -2967,6 +2966,25 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
 // removes this attribute along with the first path-based caller.
 #[allow(dead_code)]
 const DIR_CACHE_LIMIT: usize = 128;
+
+/// Seconds a writable share's attribute and entry replies stay valid in the
+/// guest. The guest answers `stat` and `lookup` from its own cache for this
+/// long instead of sending a FUSE request per file, so a larger value cuts
+/// the request count on metadata-heavy walks. The cost is a wider window in
+/// which a change made on the host is invisible to the guest.
+///
+/// There is no single upstream number to match. libkrun's passthrough uses
+/// five seconds for every share. virtiofsd is one second under `--cache=auto`
+/// and a day under `--cache=always` and `--cache=metadata`. Five is the low
+/// end of that range and matches the other virtio-fs server that runs on
+/// macOS.
+const WRITABLE_CACHE_SECS: u64 = 5;
+
+/// The same for a read-only share, which the guest cannot make stale itself.
+/// Only the host can change the tree underneath it, so the window costs
+/// nothing a writable share does not already pay, and it is a minute rather
+/// than [`WRITABLE_CACHE_SECS`].
+const READ_ONLY_CACHE_SECS: u64 = 60;
 
 /// Most paths one node will remember at once (#34).
 ///
