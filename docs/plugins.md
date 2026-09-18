@@ -31,7 +31,7 @@ For constructing the `BootConfig` that carries a plugin, read
 All three methods on `Plugin` are defaulted, so an implementation takes only
 what it needs. All three backends call all three hooks.
 
-## The four rules that fail quietly
+## The five rules that fail quietly
 
 **1. `safepoint` is on the hot path.** It sits at the top of the vCPU run
 loop, so it runs once per guest entry. A tool with nothing to do this time
@@ -72,6 +72,11 @@ the one that reaches the hook.
 and do the writing in `safepoint`, where slow things are allowed. `IoTrace` is
 the worked example.
 
+**5. `request` must return promptly.** It runs on the VMM's console thread, and
+the stop waits for that thread. A `request` still running a second after the
+stop leaves its thread running, and `boot` returns an error naming it. Set a
+flag and return, as `MemoryDump` does; the backend kicks once `request` returns.
+
 ## Reading guest memory
 
 `CpuHandle::ram()` borrows the VMM's own mapping, which is writable. If your
@@ -87,10 +92,13 @@ that, because RAM stops at the MMIO hole and resumes at 4 GiB. Read
 `ram_regions()`. Do not assume a count. Each region's `gpa`, `size` and
 `file_offset` are multiples of 1 MiB.
 
-Guest RAM is allocated from a memfd on Linux and a POSIX shared-memory object
-on macOS, unlinked as soon as it is created, so `ram_fd()` is a descriptor
-another process can map and no other process can open by name.
-`hvi smoke --shm` proves that path on macOS.
+Guest RAM is allocated from a memfd on Linux and a POSIX shared-memory object on
+macOS, unlinked as soon as it is created, so `ram_fd()` is a descriptor another
+process can map and no other process can open by name. It is a `BorrowedFd`
+tied to the handle: open as long as the handle is, and not yours to close. To
+hold it past the borrow, on a thread of your own or for an `SCM_RIGHTS` send,
+keep the `OwnedFd` that `try_clone_to_owned()` returns. `hvi smoke --shm`
+proves that path on macOS.
 
 `RegsView::root` is the architectural translation-base register, TTBR1_EL1 on
 arm64 or CR3 on x86-64. The traits hand over access and deliberately no more.
@@ -110,6 +118,10 @@ if let Ok(mut led) = cpu.ledger().lock() {
 }
 ```
 
+Lines emitted after `boot` has returned are written on the 100 ms cadence and
+when the last handle drops. Call `flush()` on the ledger before you stop, or
+the last interval is lost.
+
 The envelope is this crate's and its wire shape is pinned by tests. The
 payload is yours, and the VMM never looks inside it. That is the whole of the
 coupling between a ledger reader and whatever produced a record.
@@ -128,8 +140,7 @@ Two things that hook does not cover, on any backend:
 
 - `attach` runs before any vCPU thread exists, so a panic there is not caught
   by it.
-- The Linux and x86 backends have no `catch_unwind` around the vCPU loop, and
-  their `stop_all` does not release the quiesce.
+- The Linux and x86 backends have no `catch_unwind` around the vCPU loop.
 
 ## Running several
 

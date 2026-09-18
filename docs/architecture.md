@@ -341,10 +341,10 @@ VM stops. Device and ledger mutexes go through `sync::lock_or_recover`, which
 takes a poisoned lock so the panic that poisoned it is reported once, where it
 happened.
 
-The Linux and x86 backends do neither. They have no `catch_unwind` around the
-vCPU loop, their `stop_all` does not release the quiesce, and they use
-`.lock().unwrap()` on device mutexes. Scope any guarantee about panic handling
-to the macOS backend.
+The Linux and x86 backends release the quiesce from their stop routine too, but
+they have no `catch_unwind` around the vCPU loop, and their vCPU-side device
+locks still use `.lock().unwrap()`, where the helper threads recover. Scope any
+guarantee about panic handling to the macOS backend.
 
 ## 6. The event ledger
 
@@ -383,7 +383,7 @@ how it works.
 | Devices | `virtio.rs`, `virtio_net.rs`, `tap.rs`, `virtio_vsock.rs`, `virtio_fs.rs` |
 | Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `quiesce.rs`, `sync.rs`, `used_ring_litmus.rs` |
+| Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `used_ring_litmus.rs` |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

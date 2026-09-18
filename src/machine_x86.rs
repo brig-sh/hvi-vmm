@@ -37,8 +37,10 @@
 //! path stalls). Set `HVI_X86_TRACE=1` for exit/register tracing. SMP AP
 //! bringup is asserted by the boot-x86 CI job, which boots with `--cpus 2`.
 
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
@@ -55,6 +57,8 @@ use crate::layout_x86::{
 use crate::mptable;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
+use crate::sync::lock_or_recover;
+use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
 use crate::uart16550::Uart16550;
 use crate::virtio::VirtioBlk;
 use crate::virtio_net::VirtioNet;
@@ -89,9 +93,9 @@ struct Shared {
     quiesce: Arc<crate::quiesce::Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
-    /// Guest RAM's shareable descriptor, for a plugin that hands the same
-    /// pages to another process.
-    ram_fd: std::os::fd::RawFd,
+    /// The object backing guest RAM, for a plugin that hands the same pages to
+    /// another process.
+    ram_file: Arc<std::fs::File>,
     sandbox_id: String,
     /// vCPU count, so a pause knows how many threads must park.
     num_cpus: u32,
@@ -135,6 +139,11 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
 }
 
 /// Boots `cfg` on KVM (x86-64) and runs until the guest powers off.
+///
+/// Every thread this call itself starts has exited when it returns, or the call
+/// returns an error naming the one that did not stop within
+/// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
+/// plugin kept, in a field or on a thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if !cfg.fs_shares.is_empty() {
         return Err(
@@ -319,7 +328,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         stop: Arc::new(Mutex::new(None)),
         quiesce: Arc::new(crate::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
-        ram_fd: shared_ram.fd(),
+        ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),
         num_cpus,
     };
@@ -335,9 +344,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // an error here rather than a SIGSYS inside a device thread later.
     // Nothing is filtered yet: each thread installs its own as it starts
     // (see `seccomp`).
-    if cfg.sandbox {
+    let allowed_counts = if cfg.sandbox {
         crate::seccomp::arm()?;
-    }
+        Some(crate::seccomp::allowed_counts()?)
+    } else {
+        None
+    };
 
     // Every listener is bound here, before any filter goes in: the seccomp
     // allowlists permit accept4 on a listener we already hold but not socket or
@@ -346,42 +358,69 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         Some(path) => Some(bind_unix(path)?),
         None => None,
     };
+    // The stop source's socket pair is created here for the same reason.
+    let stop_source = StopSource::new()?;
 
-    spawn_input_thread(shared.clone());
+    // Helper threads. Each polls its stop token beside its own descriptor and
+    // is joined after the vCPUs; `teardown` describes the stop.
+    let input = spawn_input_thread(shared.clone(), stop_source.token());
+    let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
     if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
-        spawn_vsock_bridge(
-            listener,
-            Arc::clone(dev),
-            Arc::clone(&shared.mem),
-            Arc::clone(&vm),
-        );
+        helpers.push((
+            "agent bridge",
+            spawn_vsock_bridge(
+                listener,
+                Arc::clone(dev),
+                Arc::clone(&shared.mem),
+                Arc::clone(&vm),
+                stop_source.token(),
+            ),
+        ));
     }
     if let (Some(reader), Some(dev)) = (net_reader, &shared.net) {
-        spawn_net_gateway_reader(
-            reader,
-            Arc::clone(dev),
-            Arc::clone(&shared.mem),
-            Arc::clone(&vm),
-        );
+        helpers.push((
+            "gateway relay",
+            spawn_net_gateway_reader(
+                reader,
+                Arc::clone(dev),
+                Arc::clone(&shared.mem),
+                Arc::clone(&vm),
+                stop_source.token(),
+            ),
+        ));
     }
     if let (Some(reader), Some(dev)) = (net_tap_reader, &shared.net) {
-        spawn_net_tap_reader(
-            reader,
-            Arc::clone(dev),
-            Arc::clone(&shared.mem),
-            Arc::clone(&vm),
-        );
+        helpers.push((
+            "tap relay",
+            spawn_net_tap_reader(
+                reader,
+                Arc::clone(dev),
+                Arc::clone(&shared.mem),
+                Arc::clone(&vm),
+                stop_source.token(),
+            ),
+        ));
     }
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if std::env::var_os("HVI_X86_TRACE").is_some() {
         let sh = shared.clone();
-        std::thread::spawn(move || {
-            crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-            for _ in 0..4 {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                kick_cpu0(&sh);
-            }
-        });
+        let watch = stop_source.token();
+        helpers.push((
+            "trace watchdog",
+            std::thread::spawn(move || {
+                crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
+                for _ in 0..4 {
+                    match watch.sleep(std::time::Duration::from_secs(2)) {
+                        Ok(true) => kick_cpu0(&sh),
+                        Ok(false) => break,
+                        Err(e) => {
+                            eprintln!("[hvi/x86] trace watchdog: {e}; trace watchdog stopped");
+                            break;
+                        }
+                    }
+                }
+            }),
+        ));
     }
     let _raw = RawTerm::enable();
 
@@ -394,27 +433,54 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // The main thread filters itself last, once everything it had to spawn
     // exists. Doing it in this order is what lets both allowlists refuse
     // `seccomp` itself: nothing is ever created underneath a filter except the
-    // per-connection vsock readers, which inherit one on purpose.
-    if cfg.sandbox {
-        crate::seccomp::install(crate::seccomp::Thread::Vmm)?;
-        let (vmm, vcpu) = crate::seccomp::allowed_counts()?;
-        if crate::seccomp::log_mode() {
-            eprintln!(
-                "[hvi] seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
-                crate::seccomp::LOG_ENV
-            );
-        } else {
-            eprintln!("[hvi] seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)");
-        }
+    // per-connection vsock readers, which are spawned under it and inherit it.
+    // The guest is already running by now, so a failure here stops it and is
+    // reported once every thread has been joined or given up on.
+    let confined = if cfg.sandbox {
+        crate::seccomp::install(crate::seccomp::Thread::Vmm)
     } else {
-        eprintln!(
+        Ok(())
+    };
+    match (&confined, allowed_counts) {
+        (Err(_), _) => stop_all(&shared),
+        (Ok(()), Some((vmm, vcpu))) => {
+            if crate::seccomp::log_mode() {
+                eprintln!(
+                    "[hvi] seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
+                    crate::seccomp::LOG_ENV
+                );
+            } else {
+                eprintln!("[hvi] seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)");
+            }
+        }
+        (Ok(()), None) => eprintln!(
             "[hvi] seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
-        );
+        ),
     }
 
     for j in joins {
         let _ = j.join();
     }
+
+    // The guest has stopped. End the helper threads (see `teardown`) and write
+    // out the ledger tail, which the flush cadence alone would leave in the
+    // buffer.
+    stop_source.request_stop();
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    kick_until_finished(&input, deadline);
+    let mut stuck = None;
+    for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
+        if let Err(e) = join_by(name, thread, deadline) {
+            eprintln!("[hvi/x86] {e}; left running");
+            stuck.get_or_insert(e);
+        }
+    }
+    lock_or_recover(&shared.emit).flush();
+    confined?;
+    if let Some(e) = stuck {
+        return Err(e.into());
+    }
+
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
     Ok(stop)
 }
@@ -496,6 +562,26 @@ fn write_boot_gdt(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A guard that clears a vCPU's entry in `Shared::threads` when dropped.
+///
+/// Held by `run_cpu` for its whole run, so the entry is cleared on every exit,
+/// a panic included, and a kick from a plugin thread that outlives `boot` never
+/// signals a thread that no longer exists.
+struct ThreadSlot<'a> {
+    threads: &'a Mutex<Vec<u64>>,
+    cpu: usize,
+}
+
+impl Drop for ThreadSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.threads.lock() {
+            if let Some(slot) = t.get_mut(self.cpu) {
+                *slot = 0;
+            }
+        }
+    }
+}
+
 /// A single vCPU thread: KVM_RUN loop with PIO (serial) + MMIO (virtio).
 fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
     // The tight filter, installed before this thread touches anything the guest
@@ -510,6 +596,10 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
             t[cpu_id as usize] = tid;
         }
     }
+    let _slot = ThreadSlot {
+        threads: &sh.threads,
+        cpu: cpu_id as usize,
+    };
     let is_boot = cpu_id == 0;
     let dbg = std::env::var_os("HVI_X86_TRACE").is_some();
     let mut n_exit = 0u64;
@@ -791,8 +881,8 @@ impl VmHandle for Shared {
         &self.mem
     }
 
-    fn ram_fd(&self) -> std::os::fd::RawFd {
-        self.ram_fd
+    fn ram_fd(&self) -> BorrowedFd<'_> {
+        self.ram_file.as_fd()
     }
 
     fn ram_regions(&self) -> Vec<MemRegion> {
@@ -886,6 +976,9 @@ impl CpuHandle for Cpu<'_> {
 
 fn stop_all(sh: &Shared) {
     sh.running.store(false, Ordering::SeqCst);
+    // A vCPU parked at a quiesce checkpoint waits on a condition variable the
+    // kick cannot end; releasing lets it see `running` and exit.
+    sh.quiesce.release();
     kick_all(sh);
 }
 fn kick_all(sh: &Shared) {
@@ -908,9 +1001,33 @@ fn kick_cpu0(sh: &Shared) {
     }
 }
 
+/// Sends the kick signal to `thread` until it has exited or `deadline` passes.
+///
+/// The console reader can be blocked in a read of stdin, a descriptor it shares
+/// with the rest of the process, where the stop token cannot reach it. The
+/// signal ends the read with `EINTR`; it is repeated because a signal that
+/// lands before the read blocks is lost. A wait the signal cannot end, such as
+/// a plugin blocking in `request`, ends the loop at the deadline instead.
+fn kick_until_finished(thread: &JoinHandle<()>, deadline: std::time::Instant) {
+    use std::os::unix::thread::JoinHandleExt;
+    while !thread.is_finished() && std::time::Instant::now() < deadline {
+        // SAFETY: the handle has not been joined, so its thread id is live;
+        // the handler is a no-op. The cast is for musl, where std and libc
+        // spell `pthread_t` differently.
+        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, KICK_SIGNAL) };
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Installs a no-op handler for the kick signal.
+///
+/// The handler is installed without `SA_RESTART`, so a blocking call the signal
+/// interrupts returns `EINTR` instead of resuming: `KVM_RUN` on a vCPU thread,
+/// or the console reader's read of stdin.
 fn install_kick_handler() {
     extern "C" fn noop(_: libc::c_int) {}
-    // SAFETY: installing a trivial handler at startup (no SA_RESTART -> EINTR).
+    // SAFETY: installing a trivial signal handler before the helper threads
+    // exist.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = noop as *const () as usize;
@@ -920,13 +1037,31 @@ fn install_kick_handler() {
     }
 }
 
-fn spawn_input_thread(sh: Shared) {
+/// Reads host stdin and feeds it to the guest UART, raising its interrupt.
+///
+/// With a plugin attached, [`REQUEST_KEY`] is intercepted and asks it for an
+/// observation instead of reaching the guest; with no plugin the key is an
+/// ordinary byte, so a run with no plugin passes stdin through untouched.
+fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
+        let stdin = std::io::stdin();
         let mut byte = [0u8; 1];
         loop {
+            match stop.wait(stdin.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!("[hvi/x86] console: {e}; console input stopped");
+                    break;
+                }
+            }
             // SAFETY: reading one byte from fd 0.
             let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                // The kick signal: the stop is seen at the top of the loop.
+                continue;
+            }
             if n <= 0 {
                 break;
             }
@@ -938,30 +1073,53 @@ fn spawn_input_thread(sh: Shared) {
                 }
             }
             let level = {
-                let mut u = sh.uart.lock().unwrap();
+                let mut u = lock_or_recover(&sh.uart);
                 u.push_rx(byte[0]);
                 u.irq_level()
             };
             let _ = sh.vm.set_irq_line(COM1_GSI, level);
         }
-    });
+    })
 }
 
+/// Bridges the host agent Unix socket to the guest vsock device.
+///
+/// The listener is non-blocking, so the accept loop can poll it beside the stop
+/// token. The per-connection readers poll the same token, and the listener
+/// thread joins the ones still running before it exits.
 fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
-) {
+    stop: StopToken,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
+        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        loop {
+            match stop.wait(listener.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!("[hvi/x86] vsock bridge: {e}; no longer accepting");
+                    break;
+                }
+            }
+            let Ok((stream, _)) = listener.accept() else {
+                continue;
+            };
+            // The device writes to this socket and must block, or a full send
+            // buffer would split a frame. On macOS an accepted socket inherits
+            // the listener's non-blocking flag, so blocking mode is set here.
+            if stream.set_nonblocking(false).is_err() {
+                continue;
+            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
             let port = {
-                let mut d = dev.lock().unwrap();
+                let mut d = lock_or_recover(&dev);
                 let port = d.add_conn(stream);
                 d.connect(&mem, port);
                 let level = d.irq_level();
@@ -972,98 +1130,102 @@ fn spawn_vsock_bridge(
             let dev2 = Arc::clone(&dev);
             let mem2 = Arc::clone(&mem);
             let vm2 = Arc::clone(&vm);
-            std::thread::spawn(move || {
+            let stop2 = stop.clone();
+            readers.retain(|handle| !handle.is_finished());
+            readers.push(std::thread::spawn(move || {
                 use std::io::Read;
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
                 loop {
+                    match stop2.wait(reader.as_fd()) {
+                        Ok(true) => {}
+                        // A stop ends the connection like a peer close, so the
+                        // device releases it.
+                        Ok(false) => break,
+                        Err(e) => {
+                            eprintln!("[hvi/x86] vsock bridge: {e}; connection closed");
+                            break;
+                        }
+                    }
                     let n = match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
                     let level = {
-                        let mut d = dev2.lock().unwrap();
+                        let mut d = lock_or_recover(&dev2);
                         d.host_data(&mem2, port, &buf[..n]);
                         d.irq_level()
                     };
                     let _ = vm2.set_irq_line(VIRTIO_VSOCK_GSI, level);
                 }
                 let level = {
-                    let mut d = dev2.lock().unwrap();
+                    let mut d = lock_or_recover(&dev2);
                     d.host_closed(&mem2, port);
                     d.irq_level()
                 };
                 let _ = vm2.set_irq_line(VIRTIO_VSOCK_GSI, level);
-            });
+            }));
         }
-    });
+        for reader in readers {
+            let _ = reader.join();
+        }
+    })
 }
 
-/// Pumps frames from the tap into the guest.
+/// Injects tap frames into the guest.
 ///
-/// Unlike the gateway stream there is no length prefix: one `read` returns
-/// exactly one frame, preceded by the `virtio_net_hdr` the tap was created
-/// with, which `tap::strip_vnet_hdr` drops before delivering.
+/// [`crate::virtio_net::TapRelay`] owns the wait and the drain. This thread
+/// supplies the delivery under the device lock and the interrupt.
 fn spawn_net_tap_reader(
-    mut reader: std::fs::File,
+    reader: std::fs::File,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
-) {
-    use std::io::Read;
+    stop: StopToken,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let mut buf = vec![0u8; 65_536];
-        loop {
-            let n = match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            let Some(frame) = crate::tap::strip_vnet_hdr(&buf, n) else {
-                continue;
-            };
+        let relayed = crate::virtio_net::TapRelay::new(reader).run(&stop, |frame| {
             let level = {
-                let mut d = dev.lock().unwrap();
+                let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);
                 d.irq_level()
             };
             let _ = vm.set_irq_line(VIRTIO_NET_GSI, level);
+        });
+        if let Err(e) = relayed {
+            eprintln!("[hvi/x86] virtio-net: {e}; tap relay stopped");
         }
-    });
+    })
 }
 
+/// Injects gateway frames into the guest, each prefixed by a 4-byte big-endian
+/// length.
+///
+/// [`crate::virtio_net::GatewayRelay`] owns the wait, the drain and the
+/// framing. This thread supplies the delivery under the device lock and the
+/// interrupt.
 fn spawn_net_gateway_reader(
-    mut reader: std::os::unix::net::UnixStream,
+    reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
-) {
-    use std::io::Read;
+    stop: StopToken,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let mut hdr = [0u8; 4];
-        loop {
-            if reader.read_exact(&mut hdr).is_err() {
-                break;
-            }
-            let len = u32::from_be_bytes(hdr) as usize;
-            if len == 0 || len > 65_536 {
-                continue;
-            }
-            let mut frame = vec![0u8; len];
-            if reader.read_exact(&mut frame).is_err() {
-                break;
-            }
+        let relayed = crate::virtio_net::GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
-                let mut d = dev.lock().unwrap();
-                d.deliver(&mem, &frame);
+                let mut d = lock_or_recover(&dev);
+                d.deliver(&mem, frame);
                 d.irq_level()
             };
             let _ = vm.set_irq_line(VIRTIO_NET_GSI, level);
+        });
+        if let Err(e) = relayed {
+            eprintln!("[hvi/x86] virtio-net: {e}; gateway relay stopped");
         }
-    });
+    })
 }
 
 /// Puts stdin into raw mode for the guest console, restoring it on drop.
@@ -1205,16 +1367,16 @@ mod pio_tests {
     }
 }
 
-/// Binds a Unix listener at `path`, clearing a stale socket from a previous run
-/// first (which would otherwise make `bind` fail with EADDRINUSE).
+/// Binds a non-blocking Unix listener at `path`, clearing a stale socket from a
+/// previous run first (which would otherwise make `bind` fail with EADDRINUSE).
 ///
-/// The caller used to do this inside the thread it spawned. It does it in
-/// `boot` instead because the seccomp filters allow `accept4` but not `socket`
-/// or `bind` -- a listener created after the filter is in would be killed --
-/// and because a failure is now a boot error the caller sees rather than a line
-/// in the log of a guest that is already running.
+/// The listener is non-blocking so the bridge can poll it beside the stop
+/// token and then accept without blocking.
 fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     let _ = std::fs::remove_file(path);
-    std::os::unix::net::UnixListener::bind(path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}")))
+    let listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
+    })?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }

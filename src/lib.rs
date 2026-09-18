@@ -107,6 +107,12 @@ pub mod sharedmem;
 pub mod sync;
 /// The tap side of virtio-net, and the portable vnet-header framing.
 pub mod tap;
+/// Ending the host-side helper threads when the guest stops.
+#[cfg(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+))]
+pub mod teardown;
 /// 16550A UART (x86 console).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod uart16550;

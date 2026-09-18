@@ -27,7 +27,8 @@ three things a reader should not have to guess between:
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |
 | An unreachable `--net-gateway` falls back to the built-in stack. | A guest comes up with no egress and exit status zero. The warning line is the only signal. | Design |
-| The gateway reader skips an over-long framed length without consuming its payload. | A frame above 64 KiB loses alignment on the stream. See [#93](https://github.com/brig-sh/hvi-vmm/issues/93). | Defect |
+| A full tap send buffer drops the guest's frame. | One line on stderr at the first drop, and none after. The ledger records the frame as egress before the write, so a dropped frame still appears in it. Only a tap whose creator lowered the send buffer ever fills it. | Design |
+| A gateway frame above 64 KiB ends the relay. | The relay writes one line to stderr and shuts the gateway socket down, so the guest receives nothing more from the gateway and its own frames are dropped for the rest of the run. No gateway sends one at its default MTU. | Design |
 | virtio-fs: one request queue per share, no DAX, no indirect descriptors. | Throughput ceiling per share. | Design |
 
 ## virtio-fs resource limits
@@ -57,7 +58,7 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| The ledger is not lossless. | It drains when a new event arrives more than 100 ms after the last drain. Events before a quiet period stay buffered. A killed VMM loses the tail. | Design |
+| The ledger is not lossless. | It drains when a new event arrives more than 100 ms after the last drain. Events before a quiet period stay buffered. A killed VMM loses the tail; a guest that stops on its own does not, because `boot` flushes before it returns. | Design |
 | The ledger is not tamper-proof. | An ordinary file written by the VMM. Nothing signs or chains it. | Design |
 | `net` records are per packet and egress only. | No flow aggregation. `direction` and `guest_initiated` are constants, not observations. Inbound frames produce no record. | Design |
 | `ts` is host wall-clock. | It is not monotonic and can move backwards. | Design |

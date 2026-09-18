@@ -443,6 +443,55 @@ fn probes() -> Vec<Probe> {
             },
         },
         Probe {
+            what: "poll an inherited descriptor (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            // Every helper thread waits in `poll` beside its stop token. If
+            // glibc lowers the call to a syscall the allowlist does not carry,
+            // every sandboxed run ends at the first wakeup.
+            run: || {
+                let mut fds = [libc::pollfd {
+                    fd: 1,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                }];
+                // SAFETY: one pollfd for fd 1, which we inherited, and a zero
+                // timeout, so the call returns at once.
+                unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            },
+        },
+        Probe {
+            what: "receive without blocking on an inherited descriptor (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            // The gateway relay drains its socket with `recv(MSG_DONTWAIT)`.
+            run: || {
+                // SAFETY: a zero-length receive on fd 1, which we inherited,
+                // so a stream socket loses nothing. The filter has passed the
+                // call before the kernel looks at the length.
+                unsafe { libc::recv(1, std::ptr::null_mut(), 0, libc::MSG_DONTWAIT) };
+            },
+        },
+        Probe {
+            what: "signal a thread of this process (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            // `boot` ends the console reader's blocking read with the kick
+            // signal, sent from the main thread under this filter.
+            run: || {
+                extern "C" fn noop(_: libc::c_int) {}
+                // SAFETY: a no-op handler for SIGUSR1 installed in this child,
+                // then the signal sent to the calling thread itself.
+                unsafe {
+                    let mut sa: libc::sigaction = std::mem::zeroed();
+                    sa.sa_sigaction = noop as *const () as usize;
+                    libc::sigemptyset(&mut sa.sa_mask);
+                    libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+                    libc::pthread_kill(libc::pthread_self(), libc::SIGUSR1);
+                }
+            },
+        },
+        Probe {
             what: "spawn a thread (vmm)",
             thread: Thread::Vmm,
             expect_ok: true,
