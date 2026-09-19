@@ -171,4 +171,7 @@ pub use run::spawn::{spawn, Run};
 
 /// This crate's version, so a binary built against it can report which VMM core
 /// it carries. Two binaries reporting the same core ran the same VMM.
-pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
+///
+/// Derived from git by the build script, so a build between two releases names
+/// the release it sits past and the commit it was built from.
+pub const CORE_VERSION: &str = env!("HVI_VERSION");

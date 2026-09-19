@@ -66,7 +66,7 @@ brought up yet waits inside the hypervisor. On macOS a secondary vCPU enters its
 run loop when the guest brings it up.
 
 ```json
-{"sandbox_id":"hvi","ts":1791672885321504305,"provenance":"vmm","source":"vmm.start","payload":{"arch":"x86_64","vcpus":2,"mem_bytes":268435456,"confined":true,"core_version":"0.1.0"}}
+{"sandbox_id":"hvi","ts":1791672885321504305,"provenance":"vmm","source":"vmm.start","payload":{"arch":"x86_64","vcpus":2,"mem_bytes":268435456,"confined":true,"core_version":"0.1.0+15.gabc1234"}}
 {"sandbox_id":"hvi","ts":1791672885321619047,"provenance":"vmm","source":"vmm.vcpu_started","payload":{"vcpu":0}}
 {"sandbox_id":"hvi","ts":1791672885321654412,"provenance":"vmm","source":"vmm.vcpu_started","payload":{"vcpu":1}}
 {"sandbox_id":"hvi","ts":1791672887494077791,"provenance":"vmm","source":"vmm.stop","payload":{"reason":"system_reset"}}

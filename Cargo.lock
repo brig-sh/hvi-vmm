@@ -42,6 +42,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "build-version"
+version = "0.0.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -91,11 +95,12 @@ dependencies = [
 
 [[package]]
 name = "hvi"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "acpi_tables",
  "applevisor",
  "applevisor-sys",
+ "build-version",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
