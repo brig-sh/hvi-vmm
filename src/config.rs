@@ -204,6 +204,7 @@ pub enum Stop {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{check_export_overlap, CachePolicy, FsShare, ShareMode};
     use std::path::{Path, PathBuf};

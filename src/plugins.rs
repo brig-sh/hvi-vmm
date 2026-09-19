@@ -34,6 +34,10 @@
 //! a flag then kick (see
 //! `MemoryDump::attach`, where the
 //! timer thread would otherwise never fire on an idle guest).
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. The paths here are this
+// VMM's own.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
 use std::io::{BufWriter, Write};

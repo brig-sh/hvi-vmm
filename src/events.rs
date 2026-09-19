@@ -26,6 +26,10 @@
 //! stream open to other sources: a plugin (see [`crate::plugin`]) names its
 //! own `source` and supplies its own payload, and its records interleave with
 //! the VMM's in one ledger. The envelope is this crate's; the payload is not.
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. The paths here are this
+// VMM's own.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
 use std::io::{BufWriter, Write};

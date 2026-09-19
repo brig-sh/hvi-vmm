@@ -30,6 +30,10 @@
 //! The GIC version is negotiated, not chosen: KVM's vGIC borrows the host's CPU
 //! interface, so a GICv3 host serves vGICv3 and a GIC-400 host serves vGICv2
 //! only. We ask for v3 and fall back to v2, laying out the DTB to match.
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. The paths here are this
+// VMM's own.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

@@ -31,6 +31,10 @@
 //! The object is unlinked from the namespace as soon as it is created. It
 //! stays alive through the open descriptor, so the RAM cannot outlive the VMM
 //! or be opened by name by a process that was not given the descriptor.
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. The paths here are this
+// VMM's own.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
 use std::io;
