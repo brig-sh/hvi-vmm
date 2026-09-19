@@ -426,6 +426,22 @@ pub struct VirtioFs {
     /// operations resolve through this; the rest of the device still joins
     /// path strings and moves over a stage at a time.
     dirs: DirCache,
+    /// Whether this export has accepted a mutation since the last SYNCFS.
+    ///
+    /// SYNCFS ends in a host-wide `sync(2)`, whose cost lands on every
+    /// filesystem the host has mounted. Charging that to a guest that has
+    /// written nothing buys nothing, and `while :; do sync; done` in a guest
+    /// would otherwise keep the host in writeback for as long as it runs.
+    /// Set where the device admits a mutation rather than where one
+    /// succeeds: a mutation that then fails costs one extra `sync`, and
+    /// missing one would cost durability.
+    dirty: bool,
+    /// How many host-wide `sync(2)` calls SYNCFS has made.
+    ///
+    /// The guards above are invisible in the reply -- a SYNCFS that syncs the
+    /// host and one that skips it both answer success -- so without a counter
+    /// a test cannot tell a working guard from one that never fires.
+    host_syncs: AtomicU64,
 }
 
 impl VirtioFs {
@@ -502,6 +518,8 @@ impl VirtioFs {
             zero_copy_reads: AtomicU64::new(0),
             zero_copy_writes: AtomicU64::new(0),
             dirs,
+            dirty: false,
+            host_syncs: AtomicU64::new(0),
         })
     }
 
@@ -512,6 +530,12 @@ impl VirtioFs {
             self.zero_copy_reads.load(Ordering::Relaxed),
             self.zero_copy_writes.load(Ordering::Relaxed),
         )
+    }
+
+    /// Host-wide syncs made on behalf of the guest since boot.
+    #[cfg(test)]
+    fn host_sync_count(&self) -> u64 {
+        self.host_syncs.load(Ordering::Relaxed)
     }
 
     fn note_zero_copy_read(&self) {
@@ -561,6 +585,12 @@ impl VirtioFs {
         self.nodes.retain(|&node, _| node == FUSE_ROOT_ID);
         self.inode_ids.retain(|_, &mut node| node == FUSE_ROOT_ID);
         self.next_node = FUSE_ROOT_ID + 1;
+        // `dirty` deliberately survives. The handles above are dropped
+        // without a flush, so anything written through them is still only in
+        // the host's page cache, and the next SYNCFS after the driver rebinds
+        // is what reaches it. Clearing the bit here would cost one sync less
+        // and lose those writes; leaving it set costs one sync more when the
+        // guest resets a device it never wrote to.
     }
 
     /// Services a virtio-mmio register access.
@@ -1317,8 +1347,12 @@ impl VirtioFs {
         Ok(self.attr_out(node, &final_path, &meta))
     }
 
-    fn require_writable(&self) -> Result<(), i32> {
+    /// Admits a mutation, and records that SYNCFS now has something to
+    /// flush. Every operation that changes the host filesystem passes
+    /// through here, so this is the one place the dirty bit has to be set.
+    fn require_writable(&mut self) -> Result<(), i32> {
         if self.writable {
+            self.dirty = true;
             Ok(())
         } else {
             Err(EROFS)
@@ -1835,6 +1869,9 @@ impl VirtioFs {
         if !self.writable {
             return None;
         }
+        // The buffered path reaches this through `require_writable`; this one
+        // never calls it, so it marks the export dirty itself.
+        self.dirty = true;
         let total_in: usize = input.iter().map(|(_, len)| *len as usize).sum();
         if declared < IN_HEADER_LEN || declared > total_in {
             return None;
@@ -2131,7 +2168,7 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn fallocate(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn fallocate(&mut self, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let offset = get_u64(input, 8).ok_or(EINVAL)?;
@@ -2168,7 +2205,7 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn copy_file_range(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn copy_file_range(&mut self, input: &[u8]) -> Result<Vec<u8>, i32> {
         self.require_writable()?;
         let source_fh = get_u64(input, 0).ok_or(EINVAL)?;
         let source_offset = get_u64(input, 8).ok_or(EINVAL)?;
@@ -2230,14 +2267,51 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn syncfs(&self) -> Result<Vec<u8>, i32> {
+    fn syncfs(&mut self) -> Result<Vec<u8>, i32> {
+        // The first failure is reported, and every handle is still flushed.
+        // Returning early would skip the host sync below in exactly the case
+        // where something already failed to reach the disk.
+        let mut failed = None;
         for handle in self.handles.values() {
-            handle.file.sync_all().map_err(io_errno)?;
+            if let Err(err) = handle.file.sync_all() {
+                failed.get_or_insert(io_errno(err));
+            }
         }
         for handle in self.dir_handles.values() {
-            handle.file.sync_all().map_err(io_errno)?;
+            if let Err(err) = handle.file.sync_all() {
+                failed.get_or_insert(io_errno(err));
+            }
         }
-        Ok(Vec::new())
+        // The loops above reach only the files the guest still holds open,
+        // and they flush the drive cache: `File::sync_all` is
+        // `fcntl(F_FULLFSYNC)` on macOS. A guest that writes a file, closes
+        // it and then calls `sync` expects those bytes on the host too, and
+        // this server has closed the descriptor they would have gone through.
+        //
+        // `sync(2)` is what reaches them, and it is both coarse and weak.
+        // Coarse because it schedules writeback for every filesystem the host
+        // has mounted, not just the one this export serves. Weak because XNU
+        // issues it with MNT_NOWAIT and ignores what each filesystem returns,
+        // and it does not flush the drive cache -- so a file the guest has
+        // closed ends up less durable than one it still holds open. What it
+        // does give is that the bytes leave this process's reach and become
+        // the host's to write out, so they outlive the VMM. They do not
+        // outlive the host losing power. Getting closed files to F_FULLFSYNC
+        // means tracking every path written since the last sync and reopening
+        // each one.
+        //
+        // Both of those costs are the host's, so they are only spent for a
+        // guest that can write, and only once per batch of writes.
+        if self.writable && self.dirty {
+            self.dirty = false;
+            self.host_syncs.fetch_add(1, Ordering::Relaxed);
+            // Safety: `sync` takes no arguments and returns nothing.
+            unsafe { libc::sync() };
+        }
+        match failed {
+            Some(errno) => Err(errno),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn tmpfile(
@@ -4990,6 +5064,93 @@ mod tests {
 
     fn fixture() -> (PathBuf, VirtioFs) {
         fixture_with_access(false)
+    }
+
+    /// Creates `name` under the root and writes `bytes` into it, leaving the
+    /// handle closed -- the case SYNCFS exists to cover.
+    fn write_and_close(dev: &mut VirtioFs, name: &str, bytes: &[u8]) {
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&LINUX_O_WRONLY.to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o640).to_le_bytes());
+        create.extend_from_slice(name.as_bytes());
+        create.push(0);
+        let out = dev.handle_fuse(&request(CREATE, FUSE_ROOT_ID, &create), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+
+        let mut write = vec![0u8; 40];
+        write[0..8].copy_from_slice(&fh.to_le_bytes());
+        write[16..20].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        write.extend_from_slice(bytes);
+        let out = dev.handle_fuse(&request(WRITE, node, &write), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+    }
+
+    /// `sync(2)` starts writeback on every filesystem the host has mounted,
+    /// including the ones this VM has nothing to do with. A guest holding
+    /// only read-only exports has written nothing to flush, and it reaches
+    /// SYNCFS on every `sync` it runs and once more when it powers off. It
+    /// must not be able to spend the host's disks that way.
+    #[test]
+    fn read_only_export_does_not_sync_the_host() {
+        let (_dir, mut dev) = fixture_with_access(false);
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.host_sync_count(), 0);
+    }
+
+    /// The same for a writable export the guest has not written to: the cost
+    /// is owed to writes, not to holding the share.
+    #[test]
+    fn writable_export_with_no_writes_does_not_sync_the_host() {
+        let (_dir, mut dev) = fixture_with_access(true);
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.host_sync_count(), 0);
+    }
+
+    /// And once a write has landed the sync does happen -- once. A guest
+    /// running `sync` in a loop pays for the first one and nothing after it,
+    /// until it writes again.
+    #[test]
+    fn syncfs_syncs_the_host_once_per_batch_of_writes() {
+        let (_dir, mut dev) = fixture_with_access(true);
+        write_and_close(&mut dev, "first", b"hello");
+
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.host_sync_count(), 1);
+
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.host_sync_count(), 1);
+
+        write_and_close(&mut dev, "second", b"world");
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.host_sync_count(), 2);
+    }
+
+    /// A reset drops every handle without flushing it, so writes made before
+    /// it are still only in the host's page cache. The bit that says so has
+    /// to outlive the reset, or the SYNCFS that follows the driver rebinding
+    /// skips them.
+    #[test]
+    fn reset_keeps_a_pending_host_sync() {
+        let (_dir, mut dev) = fixture_with_access(true);
+        write_and_close(&mut dev, "before-reset", b"hello");
+        dev.reset();
+        assert_eq!(dev.host_sync_count(), 0);
+
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(dev.host_sync_count(), 1);
     }
 
     /// A guest binding a Unix socket sends MKNOD with S_IFSOCK. It has to
