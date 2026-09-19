@@ -1,0 +1,74 @@
+# git-cliff configuration for hvi.
+#
+# A release's notes are generated from the Conventional-Commits history since
+# the tag before it, which is the whole changelog: the repository keeps no
+# CHANGELOG.md, so there is no second copy to go stale.
+#
+# hvi-vmm lands pull requests with a rebase-and-merge, so each commit reaches
+# main verbatim and an entry is one commit rather than one pull request. That
+# is why each entry links to its commit: the subject alone does not say which
+# change it was.
+#
+# Local use:  tools/changelog.sh                  # what is unreleased so far
+#             tools/changelog.sh --notes vX.Y.Z   # one release's notes
+# The release workflow runs the same script.
+
+[changelog]
+# Every caller strips the header, since what is rendered is one release's
+# notes rather than a file with a title on top.
+header = ""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | upper_first }} \
+([{{ commit.id | truncate(length=7, end="") }}]\
+(https://github.com/brig-sh/hvi-vmm/commit/{{ commit.id }}))\
+{% endfor %}
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+# Drop a commit that is not a Conventional Commit rather than collecting it in
+# a section of its own. validate-commits.yml holds every commit to the
+# convention, so what this drops is a merge the history carries from before it.
+filter_unconventional = true
+split_commits = false
+# Grouped by type, with the noise skipped, so the changelog reads as the
+# change a reader cares about rather than as the git log. A breaking commit is
+# matched first, since `feat!:` is a feat as well and the group it lands in is
+# whichever parser matches first.
+#
+# The number in each name orders the sections, because git-cliff groups in the
+# order the names sort and "Bug Fixes" sorts above "Features". The template
+# strips it back out.
+commit_parsers = [
+  { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking changes" },
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^refactor", group = "<!-- 4 -->Refactor" },
+  { message = "^docs", group = "<!-- 5 -->Documentation" },
+  { message = "^test", group = "<!-- 6 -->Tests" },
+  { message = "^build", group = "<!-- 7 -->Build" },
+  { message = "^chore\\(changelog\\)", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore", group = "<!-- 8 -->Miscellaneous" },
+  { message = "^ci", skip = true },
+  { message = "^style", skip = true },
+]
+protect_breaking_commits = true
+filter_commits = false
+# The same shape release.yml accepts, so a tag that reaches a release is a tag
+# the changelog sections on.
+tag_pattern = "v[0-9].*"
+topo_order = false
+sort_commits = "newest"

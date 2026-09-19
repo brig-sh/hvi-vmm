@@ -1,0 +1,175 @@
+name: Publish binaries
+
+# Publish the binaries to GHCR, tagged by the commit they were built from and,
+# for a release, by its version as well. A caller that already runs
+# `build-binaries.yml` in the same run points this at what that run built; a
+# dispatch builds them here instead.
+#
+# The push is a job here rather than one beside the build so that a pull request
+# cannot write to the registry: permissions are checked against what a workflow
+# declares, not against the jobs a run reaches.
+#
+# It runs on its own for a push to main rather than as a job of the main lane,
+# because that lane cancels a superseded run and a publish must not be
+# cancelled. A dispatch on a branch leaves a tag for a commit main will not
+# carry, since a rebase-and-merge gives it another one.
+
+on:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      publish-only:
+        description: >-
+          Whether to publish without building. A caller that runs
+          `build-binaries.yml` as a job of its own passes true, and this pushes
+          what that job left behind rather than building a second set.
+        type: boolean
+        required: false
+        default: false
+      version-tag:
+        description: >-
+          A second tag to publish each artifact under, which a release passes as
+          its version (for example `v0.2.0`). Empty publishes the commit tag
+          alone.
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+
+# One publish per commit: a group shared by every push to a branch would drop a
+# pending run, and that commit would never get its tags. Never cancelled, since
+# a run stopped between the push and the signature leaves a tag unsigned. The
+# tag is keyed on the commit, so re-running this run is what signs it: a later
+# push carries a commit of its own and never looks at this tag.
+concurrency:
+  group: publish-binaries-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The same build a release publishes, so what enters the registry is built the
+  # way a shipped binary is. Skipped when the caller built them already, since
+  # the artifacts a run holds are the ones this would remake.
+  build-binaries:
+    name: Build binaries
+    # A dispatch reads no `workflow_call` input, so the absent one leaves this
+    # on, which is what a dispatch needs.
+    if: ${{ !inputs.publish-only }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+
+  # Pushes bytes, so it runs anywhere rather than on a runner per target.
+  publish:
+    name: Publish ${{ matrix.target }}
+    needs: build-binaries
+    # Runs on a skipped build too, which is what a caller that built the
+    # binaries itself leaves behind. A failed one still stops it.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - aarch64-apple-darwin
+    steps:
+      # Only the scripts, since the binaries come from the run and nothing else
+      # here is read from the tree.
+      - name: Check out scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Set up oras
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Resolve the tags
+        id: resolve-tags
+        env:
+          TARGET: ${{ matrix.target }}
+          OWNER: ${{ github.repository_owner }}
+          VERSION_TAG: ${{ inputs.version-tag }}
+        run: |
+          # Tagged by commit rather than by a digest of the sources: this set
+          # is rebuilt on every push, so a digest would have nothing to skip,
+          # and the commit is what a caller already holds. A release adds a
+          # tag naming its version, which is the one a consumer pins to. The
+          # registry takes a lowercase path where the organization is not.
+          # Derived before the binaries are fetched, since the signing step
+          # below names the tags whether or not this run has the bytes that go
+          # under them.
+          # Lowercased where it is used: a local `owner` beside the `OWNER`
+          # this reads is what shellcheck reports as a probable misspelling.
+          repository="ghcr.io/${OWNER,,}/hvi-binaries"
+          refs="$repository:$TARGET-$GITHUB_SHA"
+          if [ -n "$VERSION_TAG" ]; then
+            refs="$refs $repository:$TARGET-$VERSION_TAG"
+          fi
+          echo "refs=$refs" >> "$GITHUB_OUTPUT"
+
+      # Not fatal when the artifact has expired: a re-run late enough finds no
+      # bytes to push, and the signing step below names the tags rather than
+      # the bytes, so it still has work to do.
+      - name: Download the binaries
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hvi-${{ matrix.target }}
+          path: ${{ runner.temp }}/artifact
+
+      - name: Push the binaries
+        if: steps.download.outcome == 'success'
+        env:
+          TARGET: ${{ matrix.target }}
+          REFS: ${{ steps.resolve-tags.outputs.refs }}
+        run: |
+          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/artifact/$TARGET.tar"
+          for ref in $REFS; do
+            if oras manifest fetch "$ref" >/dev/null 2>&1; then
+              echo "$ref is already published"
+              continue
+            fi
+            # Pushed as one directory rather than as loose files, because a
+            # file pushed on its own carries no mode and pulls back
+            # unexecutable.
+            (cd "$RUNNER_TEMP" && oras push "$ref" \
+              "binaries:application/vnd.brig-sh.hvi.binaries")
+            echo "- \`$ref\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # The version is pinned, since the script below reads the status cosign
+      # returns for an artifact that carries no signature.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      # Keyless, so a consumer can verify the binaries came from this workflow
+      # on this repository. Runs whether or not this run pushed, since signing
+      # takes the refs alone. A tag names the commit, so a re-run of this run is
+      # what signs one an earlier attempt pushed and left unsigned.
+      - name: Sign the unsigned artifacts
+        env:
+          COSIGN_YES: "true"
+          REFS: ${{ steps.resolve-tags.outputs.refs }}
+        run: |
+          # shellcheck disable=SC2086 # the refs are a space-separated list
+          .github/scripts/sign-artifacts.sh $REFS
