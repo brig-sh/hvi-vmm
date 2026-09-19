@@ -453,11 +453,13 @@ jobs:
           # which is the placement the device windows have to leave room for.
           # Nothing else in CI attaches a share, so nothing else checks it.
           mkdir -p share-probe
-          perl -e 'alarm shift; exec @ARGV' 120 \
-            ./target/release/hvi boot \
+          tools/boot-until.sh unikraft.log 120 \
+            "Powered by" \
+            "Set IPv4 address 10.0.2.15" \
+            "Listening on port 8123" \
+            -- ./target/release/hvi boot \
             --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 \
-            --net-stub --share-ro share-probe probe --cmdline httpreply \
-            </dev/null > unikraft.log 2>&1 || true
+            --net-stub --share-ro share-probe probe --cmdline httpreply
           tail -25 unikraft.log
           grep -aq "Powered by" unikraft.log \
             || { echo "::error::the Unikraft guest did not reach its banner"; exit 1; }
@@ -486,11 +488,13 @@ jobs:
           # for that address only, so any other resolver would leave a guest
           # that takes the right address and resolves nothing. console= mirrors
           # what urunc emits; arm64 has a PL011 and ignores it.
-          perl -e 'alarm shift; exec @ARGV' 120 \
-            ./target/release/hvi boot \
+          # The guest takes one address or the other, so 10.0.2.99 on the
+          # console is also the evidence for the DHCP assertion below.
+          tools/boot-until.sh unikraft-static.log 120 \
+            "Set IPv4 address 10.0.2.99" \
+            -- ./target/release/hvi boot \
             --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 --net-stub \
-            --cmdline "Unikraft console=ttyS0 netdev.ip=10.0.2.99/24:10.0.2.2:10.0.2.3 -- httpreply" \
-            </dev/null > unikraft-static.log 2>&1 || true
+            --cmdline "Unikraft console=ttyS0 netdev.ip=10.0.2.99/24:10.0.2.2:10.0.2.3 -- httpreply"
           tail -25 unikraft-static.log
           grep -aq "Set IPv4 address 10.0.2.99" unikraft-static.log \
             || { echo "::error::the guest ignored netdev.ip and did not take 10.0.2.99"; exit 1; }
@@ -512,12 +516,16 @@ jobs:
             || { echo "::error::the pinned initrd changed size; re-check the padding"; exit 1; }
           # --net-stub so the guest has a device to bring up; without it nginx has
           # nothing to bind and the console is silent past the banner.
-          perl -e 'alarm shift; exec @ARGV' 120 \
-            ./target/release/hvi boot \
+          # nginx prints nothing when it starts, so the banner is the only
+          # line to wait for. The two assertions below are that a message
+          # never appeared, and the settle gives those messages time to
+          # arrive.
+          tools/boot-until.sh unikraft-initrd.log 120 --settle 10 \
+            "Powered by" \
+            -- ./target/release/hvi boot \
             --kernel guest-nginx/unikraft/bin/kernel \
             --initramfs initrd-ragged --mem-mib 512 \
-            --net-stub --cmdline nginx \
-            </dev/null > unikraft-initrd.log 2>&1 || true
+            --net-stub --cmdline nginx
           tail -25 unikraft-initrd.log
           grep -aq "Powered by" unikraft-initrd.log \
             || { echo "::error::the Unikraft guest did not boot with an initrd"; exit 1; }
