@@ -171,11 +171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// what makes a comparison between them a comparison of plugins rather than of
 /// machines that merely resemble each other.
 fn print_version() {
-    println!(
-        "hvi {} (core {})",
-        env!("CARGO_PKG_VERSION"),
-        hvi::CORE_VERSION
-    );
+    println!("hvi {} (core {})", env!("HVI_VERSION"), hvi::CORE_VERSION);
 }
 
 /// Runs `dump-fdt`, which reads the kernel header, computes the guest layout,
