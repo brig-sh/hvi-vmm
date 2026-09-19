@@ -26,8 +26,13 @@ not apply returns a named error rather than "unknown subcommand".
 
 ```text
 $ hvi version
-hvi 0.1.0 (core 0.1.0)
+hvi 0.1.0+15.gabc1234 (core 0.1.0+15.gabc1234)
 ```
+
+The version comes from git: a release build names the release, a build past
+one names it, the commits since and the commit, and a build from changed
+sources adds `.dirty`. With no release tag in the history it is
+`0.0.0+g<commit>`, and `HVI_VERSION` set at build time overrides it.
 
 `smoke` dispatches on an exact match for `--shm`. Any other third argument,
 including a typo, silently runs the plain test.

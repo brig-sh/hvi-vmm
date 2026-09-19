@@ -13,14 +13,14 @@
 #     --target x86_64-unknown-linux-musl     validate-code / tidy-linux-musl
 #   tools/tidy.sh --check --lint-only \
 #     --target aarch64-unknown-linux-musl    validate-code / tidy-linux-musl-arm64
-#   cargo test                               build-and-test / test-portable
+#   cargo test --workspace                   build-and-test / test-portable
 #                                            (or build-and-test-macos)
 #   cargo deny check                         validate-code / check-deps
 #   actionlint -shellcheck=shellcheck        validate-code / lint-workflows
 #   typos --config .github/linters/typos.toml
 #                                            validate-commits / check-spelling
 #
-# tidy.sh and cargo test always run. The rest need something the pinned Rust
+# tidy.sh and the tests always run. The rest need something the pinned Rust
 # toolchain does not supply: the rustup target for each cross-lint (aarch64
 # glibc, x86-64 musl and aarch64 musl), and the binaries for cargo-deny,
 # actionlint plus shellcheck, and typos. The script skips a check when its tool
@@ -78,8 +78,9 @@ else
     skipped+=("aarch64-musl lint (rustup target add aarch64-unknown-linux-musl)")
 fi
 
-# The unit suite for this host's backend plus the portable core.
-cargo test
+# The unit suite for this host's backend plus the portable core, and the
+# build-version crate beside them.
+cargo test --workspace
 
 # The dependency audit, the command that check-deps runs. Without deny.toml,
 # cargo-deny uses its own defaults and answers a different question, so
