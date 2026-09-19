@@ -1711,7 +1711,7 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn read(&self, node: u64, input: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+    fn read(&mut self, node: u64, input: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let offset = get_u64(input, 8).ok_or(EINVAL)?;
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
@@ -1721,12 +1721,23 @@ impl VirtioFs {
         } else if fh == 0 {
             // A zero handle preserves compatibility with the earliest
             // stateless backend and is useful for pre-open protocol tests.
-            let path = self.node_path(node)?;
-            let meta = Stat::lstat(path)?;
+            //
+            // It opens through the export's descriptors, like every other
+            // opener here (#30). The kernel resolves a cached path string, so
+            // a guest that replaces a parent directory with a symlink steers
+            // that resolution wherever the symlink points. A descriptor walk
+            // chooses every hop itself.
+            // `entry_at` has no final component to give for the root, and a
+            // READ of it is a READ of a directory either way.
+            if node == FUSE_ROOT_ID {
+                return Err(EISDIR);
+            }
+            let (dirfd, name) = self.entry_at(node)?;
+            let meta = Stat::at(dirfd, &name)?;
             if !meta.is_file() {
                 return Err(if meta.is_dir() { EISDIR } else { EINVAL });
             }
-            let file = open_host_file(path, 0, false, 0).map_err(io_errno)?;
+            let file = open_host_file_at(dirfd, &name, 0, false, 0)?;
             file.read_at(&mut out, offset).map_err(io_errno)?
         } else {
             return Err(EBADF);
@@ -8278,6 +8289,276 @@ mod tests {
             "every published request must be serviced exactly once -- none \
              stranded, none double-serviced"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The sequence from CVE-2026-77179: open a file, delete it, replace its
+    // parent directory with a symlink out of the share, then write through
+    // the handle that is still open.
+    #[test]
+    fn a_write_after_the_parent_is_swapped_stays_on_the_pinned_fd() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-write");
+        fs::create_dir_all(&outside).unwrap();
+
+        // mkdir pv
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&(0o755u32).to_le_bytes());
+        mkdir.extend_from_slice(b"pv\0");
+        let out = dev.handle_fuse(&request(MKDIR, FUSE_ROOT_ID, &mkdir), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "MKDIR pv");
+        let pv = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        // : > pv/.canary && exec 9<> pv/.canary
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&(LINUX_O_RDWR | LINUX_O_EXCL).to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b".canary\0");
+        let out = dev.handle_fuse(&request(CREATE, pv, &create), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "CREATE pv/.canary");
+        let canary = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+
+        // rm pv/.canary; rmdir pv
+        let out = dev.handle_fuse(&request(UNLINK, pv, b".canary\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "UNLINK pv/.canary");
+        let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"pv\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RMDIR pv");
+
+        // ln -s /Users/Shared pv
+        let mut link = Vec::new();
+        link.extend_from_slice(b"pv\0");
+        link.extend_from_slice(outside.as_os_str().as_bytes());
+        link.push(0);
+        let out = dev.handle_fuse(&request(SYMLINK, FUSE_ROOT_ID, &link), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "SYMLINK pv -> outside");
+
+        // echo CONFIRMED > /proc/self/fd/9
+        let mut write = vec![0u8; 40];
+        write[0..8].copy_from_slice(&fh.to_le_bytes());
+        write[8..16].copy_from_slice(&0u64.to_le_bytes());
+        write[16..20].copy_from_slice(&9u32.to_le_bytes());
+        write.extend_from_slice(b"CONFIRMED");
+        let out = dev.handle_fuse(&request(WRITE, canary, &write), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the write failed, so it proves nothing about where it landed"
+        );
+
+        let leaked: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leaked.is_empty(), "the write escaped the share: {leaked:?}");
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The same swap on the read side, through the stateless `fh == 0` path.
+    #[test]
+    fn a_stateless_read_after_the_parent_is_swapped_reads_nothing_outside() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-read");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join(".canary"), b"HOST-SECRET").unwrap();
+
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&(0o755u32).to_le_bytes());
+        mkdir.extend_from_slice(b"pv\0");
+        let out = dev.handle_fuse(&request(MKDIR, FUSE_ROOT_ID, &mkdir), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let pv = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&(LINUX_O_RDWR | LINUX_O_EXCL).to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b".canary\0");
+        let out = dev.handle_fuse(&request(CREATE, pv, &create), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let canary = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let out = dev.handle_fuse(&request(UNLINK, pv, b".canary\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"pv\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let mut link = Vec::new();
+        link.extend_from_slice(b"pv\0");
+        link.extend_from_slice(outside.as_os_str().as_bytes());
+        link.push(0);
+        let out = dev.handle_fuse(&request(SYMLINK, FUSE_ROOT_ID, &link), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let mut read = vec![0u8; 24];
+        read[0..8].copy_from_slice(&0u64.to_le_bytes());
+        read[8..16].copy_from_slice(&0u64.to_le_bytes());
+        read[16..20].copy_from_slice(&64u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READ, canary, &read), 4096);
+        assert!(
+            !out.windows(11).any(|w| w == b"HOST-SECRET"),
+            "the stateless read reached a host file outside the export"
+        );
+        assert_eq!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            -ENOENT,
+            "the swapped parent should leave nothing to resolve"
+        );
+
+        // The root has no final component, so it answers for the directory it
+        // is rather than for the entry it has not got.
+        let out = dev.handle_fuse(&request(READ, FUSE_ROOT_ID, &read), 4096);
+        assert_eq!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            -EISDIR,
+            "a stateless read of the root"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // An absolute symlink target names the guest's root, so a mutation below
+    // one resolves inside the export.
+    #[test]
+    fn a_mutation_below_a_swapped_parent_is_clamped() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-create");
+        fs::create_dir_all(&outside).unwrap();
+
+        let mut link = Vec::new();
+        link.extend_from_slice(b"pv\0");
+        link.extend_from_slice(outside.as_os_str().as_bytes());
+        link.push(0);
+        let out = dev.handle_fuse(&request(SYMLINK, FUSE_ROOT_ID, &link), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let pv = lookup_node(&mut dev, FUSE_ROOT_ID, b"pv");
+
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b"planted\0");
+        let out = dev.handle_fuse(&request(CREATE, pv, &create), 4096);
+        assert_ne!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            0,
+            "CREATE below the swapped parent succeeded"
+        );
+        let leaked: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a mutation below the swapped parent reached the host: {leaked:?}"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The swap happens host-side here, so a forgotten node or a removed entry
+    // cannot mask the answer the way it can when the guest drives every step.
+    #[test]
+    fn a_cached_path_through_a_swapped_directory_reaches_nothing() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-primitive");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), b"HOST-SECRET").unwrap();
+
+        fs::create_dir(dir.join("d")).unwrap();
+        fs::write(dir.join("d/f"), b"inside").unwrap();
+        let d = lookup_node(&mut dev, FUSE_ROOT_ID, b"d");
+        let f = lookup_node(&mut dev, d, b"f");
+
+        // The swap, behind the device's back.
+        fs::remove_file(dir.join("d/f")).unwrap();
+        fs::remove_dir(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+        assert_eq!(
+            fs::read(dir.join("d/f")).unwrap(),
+            b"HOST-SECRET",
+            "the host path this test aims at does not resolve, so a refusal \
+             below would prove nothing"
+        );
+
+        // The one READ that used to resolve that string.
+        let mut read = vec![0u8; 24];
+        read[16..20].copy_from_slice(&64u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READ, f, &read), 4096);
+        assert!(
+            !out.windows(11).any(|w| w == b"HOST-SECRET"),
+            "the stateless read followed the swapped directory out of the export"
+        );
+
+        let _ = fs::remove_file(dir.join("d"));
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Every handler that takes a node id, asked whether it reaches outside
+    // the export once that node's cached path runs through a swapped
+    // directory.
+    #[test]
+    fn no_handler_reaches_outside_through_a_swapped_directory() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-surface");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), b"HOST-SECRET").unwrap();
+        fs::write(outside.join("witness"), b"x").unwrap();
+
+        fs::create_dir(dir.join("d")).unwrap();
+        fs::write(dir.join("d/f"), b"inside").unwrap();
+        let d = lookup_node(&mut dev, FUSE_ROOT_ID, b"d");
+        let f = lookup_node(&mut dev, d, b"f");
+
+        fs::remove_file(dir.join("d/f")).unwrap();
+        fs::remove_dir(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+
+        let status = |out: &[u8]| i32::from_le_bytes(out[4..8].try_into().unwrap());
+        let outside_mode =
+            |name: &str| fs::symlink_metadata(outside.join(name)).unwrap().mode() & 0o777;
+        let planted_mode = outside_mode("f");
+
+        // OPENDIR, which lists a directory, and READDIR through whatever it
+        // returns.
+        let out = dev.handle_fuse(&request(OPENDIR, d, &[0u8; 8]), 4096);
+        assert_ne!(status(&out), 0, "OPENDIR opened the swapped directory");
+
+        // SETATTR, which changes a mode. `mode` is at offset 68 of
+        // fuse_setattr_in.
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+        setattr[68..72].copy_from_slice(&0o777u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, f, &setattr), 4096);
+        assert_ne!(status(&out), 0, "SETATTR reached the stale node");
+        assert_eq!(
+            outside_mode("f"),
+            planted_mode,
+            "SETATTR changed a host file outside the export"
+        );
+
+        let out = dev.handle_fuse(&request(GETATTR, f, &[0u8; 16]), 4096);
+        assert_ne!(status(&out), 0, "GETATTR stat'd through the swapped parent");
+
+        let mut open = vec![0u8; 8];
+        open[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, f, &open), 4096);
+        assert_ne!(status(&out), 0, "OPEN opened through the swapped parent");
+
+        // The host-only entries are still the only ones there, and the guest
+        // never saw them.
+        let mut names: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["f", "witness"], "the export reached outside");
+
+        let _ = fs::remove_file(dir.join("d"));
+        let _ = fs::remove_dir_all(&outside);
         let _ = fs::remove_dir_all(dir);
     }
 }
