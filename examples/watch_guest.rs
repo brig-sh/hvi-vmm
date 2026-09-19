@@ -44,6 +44,10 @@
 //!    the networking mode, so do not assume one. Count in the sink; do the
 //!    writing at the safe point.
 
+// This example reads the kernel and initramfs it is given, which are the
+// caller's own paths rather than a guest's.
+#![allow(clippy::disallowed_methods)]
+
 #[cfg(any(
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
     all(target_arch = "x86_64", target_os = "linux")

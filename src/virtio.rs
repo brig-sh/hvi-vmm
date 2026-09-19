@@ -25,6 +25,10 @@
 //! Modern virtio-mmio (version 2) is implemented — enough for the Linux
 //! `virtio_mmio` + `virtio_blk` drivers to negotiate `VIRTIO_F_VERSION_1`,
 //! set up one queue, and do reads/writes.
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. The paths here are this
+// VMM's own.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;

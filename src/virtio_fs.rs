@@ -28,11 +28,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirEntryExt, FileExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -167,11 +167,20 @@ const LINUX_F_UNLCK: u32 = 2;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
 /// `DT_SOCK`, the readdir type byte for a socket.
+const DT_UNKNOWN: u32 = 0;
+const DT_FIFO: u32 = 1;
+const DT_CHR: u32 = 2;
+const DT_DIR: u32 = 4;
+const DT_BLK: u32 = 6;
+const DT_REG: u32 = 8;
+const DT_LNK: u32 = 10;
 const DT_SOCK: u32 = 12;
 
 // Linux errno values. Host errno numbers are not portable from macOS to the
@@ -229,16 +238,10 @@ struct FileHandle {
 }
 
 impl FileHandle {
-    /// Removes the host file behind a tmpfile the guest never linked, if this
-    /// handle holds one.
-    fn remove_temporary(self) -> io::Result<()> {
-        let Some(path) = self.temporary_path else {
-            return Ok(());
-        };
-        match fs::remove_file(path) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
-            _ => Ok(()),
-        }
+    /// Returns the host file behind a tmpfile the guest never linked, or
+    /// `None` when this handle holds none.
+    fn temporary(self) -> Option<PathBuf> {
+        self.temporary_path
     }
 }
 
@@ -263,7 +266,7 @@ struct GuestAttr {
     gid: u32,
 }
 
-/// One `fs::read_dir` entry captured at OPENDIR time.
+/// One directory entry captured at OPENDIR time.
 #[derive(Clone)]
 struct DirEntryInfo {
     name: OsString,
@@ -271,9 +274,9 @@ struct DirEntryInfo {
     /// stat, so plain (non-plus) READDIR never needs one for the inode number
     /// it reports.
     ino: u64,
-    /// From `d_type` at opendir time; `None` when the host returned DT_UNKNOWN
-    /// and a stat is genuinely required.
-    file_type: Option<std::fs::FileType>,
+    /// The readdir type byte from `d_type` at opendir time, and `0`
+    /// (DT_UNKNOWN) when the host had none and a stat is genuinely required.
+    dtype: u32,
 }
 
 struct DirHandle {
@@ -453,7 +456,12 @@ impl VirtioFs {
         writable: bool,
         cache_policy: CachePolicy,
     ) -> io::Result<Self> {
-        if !root.is_absolute() || !root.is_dir() {
+        // The export root, asked once before a guest exists and the only
+        // path this device resolves whole: there is nothing above it to ask
+        // through.
+        #[allow(clippy::disallowed_methods)]
+        let root_is_dir = root.is_dir();
+        if !root.is_absolute() || !root_is_dir {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "virtio-fs root must be an absolute directory",
@@ -577,8 +585,11 @@ impl VirtioFs {
         self.dev_feat_sel = 0;
         self.queue_sel = 0;
         self.notified.store(0, Ordering::Release);
-        for (_, handle) in self.handles.drain() {
-            let _ = handle.remove_temporary();
+        // Drained first: removing each tmpfile resolves through the
+        // descriptor cache, which is this device's to borrow.
+        let handles: Vec<FileHandle> = self.handles.drain().map(|(_, handle)| handle).collect();
+        for handle in handles {
+            let _ = self.remove_temporary(handle);
         }
         self.dir_handles.clear();
         self.sockets.clear();
@@ -1194,10 +1205,6 @@ impl VirtioFs {
         } else {
             None
         };
-        let metadata_path = handle
-            .map(|handle| handle.path.as_path())
-            .or(path.as_deref())
-            .ok_or(EINVAL)?;
         // The private attribute lives on the entry itself, so it needs a
         // descriptor for it rather than for its parent. A request carrying a
         // handle already has one open; otherwise the entry is opened through
@@ -1233,7 +1240,8 @@ impl VirtioFs {
                 let current_meta = if let Some(handle) = handle {
                     Stat::of_file(&handle.file)?
                 } else {
-                    Stat::lstat(metadata_path)?
+                    let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                    Stat::at(dirfd.as_fd(), name)?
                 };
                 let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta);
                 if valid & FATTR_UID != 0 {
@@ -1268,7 +1276,8 @@ impl VirtioFs {
             let current_meta = if let Some(handle) = handle {
                 Stat::of_file(&handle.file)?
             } else {
-                Stat::lstat(path.as_deref().ok_or(EINVAL)?)?
+                let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                Stat::at(dirfd.as_fd(), name)?
             };
             let mut new_mode = if valid & FATTR_MODE != 0 {
                 mode & 0o7777
@@ -1326,7 +1335,8 @@ impl VirtioFs {
             if let Some(handle) = handle {
                 host_futimens(&handle.file, &times)?;
             } else {
-                host_lutimens(path.as_deref().ok_or(EINVAL)?, &times)?;
+                let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                host_lutimens_at(dirfd.as_fd(), name, &times)?;
             }
         }
 
@@ -1337,7 +1347,8 @@ impl VirtioFs {
             (handle.path.clone(), Stat::of_file(&handle.file)?)
         } else {
             let final_path = path.as_deref().ok_or(EINVAL)?.to_owned();
-            let meta = Stat::lstat(&final_path)?;
+            let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+            let meta = Stat::at(dirfd.as_fd(), name)?;
             (final_path, meta)
         };
         // A setattr may have written HVI_XATTR_LINUX_ATTR above (uid/gid/mode
@@ -1359,34 +1370,21 @@ impl VirtioFs {
         }
     }
 
-    fn child_path(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
+    /// Returns the path of a name the guest asked for below `parent`.
+    ///
+    /// Naming a child is all this does. The walk each caller runs next is
+    /// what decides whether the parent is a directory inside the export, and
+    /// answering that here as well would be a second walk for the same
+    /// question. A directory symlink inside the export is expanded by that
+    /// walk, so a mutation below one still lands where the guest means.
+    fn child_path(&mut self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
         validate_mutation_name(name)?;
         let parent = self.node_path(parent)?;
-        // FUSE path resolution follows directory symlinks.  Keep using
-        // symlink_metadata for the node identity, but follow the parent here
-        // so mutations below a symlinked directory (common in distro include
-        // trees) are not rejected as ENOTDIR/ENOENT.
-        //
-        // There was a containment check here and in `lookup` that resolved
-        // this path and refused it unless it stayed under the export root. It
-        // is gone, and re-adding it in that shape is not the fix: resolving a
-        // path string host-side asks the wrong question, because an absolute
-        // symlink in a guest rootfs names the guest's filesystem and not
-        // ours. `/usr/lib/ssl/certs -> /etc/ssl/certs` means the guest's
-        // `/etc`; on the host it resolves to `/private/etc/ssl/certs`, which
-        // is outside any export. Containment stays with the Seatbelt profile
-        // until the path layer resolves relative to a descriptor instead
-        // (#30), which makes it structural rather than a
-        // check that can be asked the wrong question.
-        note_host_op();
-        if !fs::metadata(parent).map_err(io_errno)?.is_dir() {
-            return Err(ENOTDIR);
-        }
         Ok(parent.join(OsStr::from_bytes(name)))
     }
 
     fn new_entry(&mut self, path: PathBuf) -> Result<Vec<u8>, i32> {
-        let meta = Stat::lstat(&path)?;
+        let meta = self.stat_in_export(&path)?;
         let node = self.node_for(path.clone(), &meta);
         self.remember_lookup(node);
         Ok(self.entry_out(node, &path, &meta))
@@ -1435,7 +1433,11 @@ impl VirtioFs {
     ) -> Result<Vec<u8>, i32> {
         // A host entry at the same name wins: the guest asked to create
         // something that is already there, whatever its type.
-        if fs::symlink_metadata(&path).is_ok() || self.sockets.contains_key(&path) {
+        let taken = {
+            let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
+            exists_at(dirfd, &entry).is_ok()
+        };
+        if taken || self.sockets.contains_key(&path) {
             return Err(EEXIST);
         }
         let ino = self.next_socket_ino;
@@ -1555,8 +1557,8 @@ impl VirtioFs {
             }
             return Ok(Vec::new());
         }
-        let meta = Stat::lstat(&path)?;
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
+        let meta = Stat::at(dirfd, &entry)?;
         unlink_at(dirfd, &entry, directory)?;
         self.invalidate_dirs(&path);
         self.forget_node_path(&path, &meta);
@@ -1581,9 +1583,9 @@ impl VirtioFs {
         let new_name = nul_name(input, next)?;
         let old_path = self.child_path(old_parent, old_name)?;
         let new_path = self.child_path(new_parent, new_name)?;
-        let old_meta = Stat::lstat(&old_path)?;
-        let replaced = Stat::lstat(&new_path).ok();
         let (old_fd, old_name, new_fd, new_name) = self.two_entries_at(&old_path, &new_path)?;
+        let old_meta = Stat::at(old_fd.as_fd(), &old_name)?;
+        let replaced = Stat::at(new_fd.as_fd(), &new_name).ok();
         host_rename(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name, flags)?;
         // Both ends now refer to something other than they did, and for a
         // directory that is true of everything beneath them too.
@@ -1691,7 +1693,7 @@ impl VirtioFs {
             return Err(EROFS);
         }
         let path = self.node_path(node)?.to_owned();
-        let meta = Stat::lstat(&path)?;
+        let meta = self.stat_in_export(&path)?;
         if directory && !meta.is_dir() {
             return Err(ENOTDIR);
         }
@@ -1705,11 +1707,9 @@ impl VirtioFs {
         // A guest kernel opens a FIFO, socket or device node on a FUSE mount
         // itself and never sends OPEN for one, so refusing costs it nothing.
         //
-        // `meta` comes from `symlink_metadata`, so this refuses a symlink too.
-        // That is deliberate rather than a side effect: `open_host_file`
-        // already passes `O_NOFOLLOW`, so such an open never succeeded, and
-        // the only change is that the guest now sees EPERM where it saw
-        // ELOOP.
+        // `meta` follows nothing, so this refuses a symlink too. The opener
+        // passes `O_NOFOLLOW` as well, so such an open never succeeded; the
+        // guest sees EPERM where it would have seen ELOOP.
         if !directory && !meta.is_file() {
             return Err(EPERM);
         }
@@ -1745,7 +1745,7 @@ impl VirtioFs {
         Ok(out)
     }
 
-    fn read(&self, node: u64, input: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
+    fn read(&mut self, node: u64, input: &[u8], capacity: usize) -> Result<Vec<u8>, i32> {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let offset = get_u64(input, 8).ok_or(EINVAL)?;
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
@@ -1755,12 +1755,23 @@ impl VirtioFs {
         } else if fh == 0 {
             // A zero handle preserves compatibility with the earliest
             // stateless backend and is useful for pre-open protocol tests.
-            let path = self.node_path(node)?;
-            let meta = Stat::lstat(path)?;
+            //
+            // It opens through the export's descriptors, like every other
+            // opener here (#30). The kernel resolves a cached path string, so
+            // a guest that replaces a parent directory with a symlink steers
+            // that resolution wherever the symlink points. A descriptor walk
+            // chooses every hop itself.
+            // `entry_at` has no final component to give for the root, and a
+            // READ of it is a READ of a directory either way.
+            if node == FUSE_ROOT_ID {
+                return Err(EISDIR);
+            }
+            let (dirfd, name) = self.entry_at(node)?;
+            let meta = Stat::at(dirfd, &name)?;
             if !meta.is_file() {
                 return Err(if meta.is_dir() { EISDIR } else { EINVAL });
             }
-            let file = open_host_file(path, 0, false, 0).map_err(io_errno)?;
+            let file = open_host_file_at(dirfd, &name, 0, false, 0)?;
             file.read_at(&mut out, offset).map_err(io_errno)?
         } else {
             return Err(EBADF);
@@ -1968,20 +1979,11 @@ impl VirtioFs {
     }
 
     fn insert_dir_handle(&mut self, path: &Path) -> Result<u64, i32> {
-        let file = open_host_dir(path).map_err(io_errno)?;
-        // `file_type()`/`ino()` are read straight off the dirent (`d_type`,
-        // `d_ino`) on macOS and Linux, so capturing them here costs nothing
-        // beyond the readdir(3) calls this loop already makes.
-        note_host_op();
-        let mut entries: Vec<DirEntryInfo> = fs::read_dir(path)
-            .map_err(io_errno)?
-            .filter_map(Result::ok)
-            .map(|entry| DirEntryInfo {
-                name: entry.file_name(),
-                ino: entry.ino(),
-                file_type: entry.file_type().ok(),
-            })
-            .collect();
+        let relative = self.relative_of_path(path)?;
+        let file = File::from(self.dirs.dir_fd_owned(&relative)?);
+        // A second descriptor, because `fdopendir` takes the one it lists
+        // over and this handle keeps its own for FSYNCDIR.
+        let mut entries = read_dir_at(self.dirs.dir_fd_owned(&relative)?)?;
         // Sockets this device holds are in no host directory, so they are
         // added here rather than found by `read_dir`. Doing it while the
         // handle is built means the listing is a snapshot like every other
@@ -1994,7 +1996,7 @@ impl VirtioFs {
                 entries.push(DirEntryInfo {
                     name: name.to_owned(),
                     ino: socket.ino,
-                    file_type: None,
+                    dtype: 0,
                 });
             }
         }
@@ -2004,7 +2006,7 @@ impl VirtioFs {
             DirEntryInfo {
                 name: OsString::from_vec(b"..".to_vec()),
                 ino: 0,
-                file_type: None,
+                dtype: 0,
             },
         );
         entries.insert(
@@ -2012,7 +2014,7 @@ impl VirtioFs {
             DirEntryInfo {
                 name: OsString::from_vec(b".".to_vec()),
                 ino: 0,
-                file_type: None,
+                dtype: 0,
             },
         );
         let fh = self.next_handle();
@@ -2031,8 +2033,29 @@ impl VirtioFs {
                 return Err(io_errno(io::Error::last_os_error()));
             }
         }
-        handle.remove_temporary().map_err(io_errno)?;
+        self.remove_temporary(handle)?;
         Ok(Vec::new())
+    }
+
+    /// Removes the tmpfile a released handle owned, through the descriptor of
+    /// the directory it was created in.
+    fn remove_temporary(&mut self, handle: FileHandle) -> Result<(), i32> {
+        let Some(path) = handle.temporary() else {
+            return Ok(());
+        };
+        let relative = self.relative_of_path(&path)?;
+        // The name can have moved out from under the handle, which is the
+        // guest's own doing and not something it can act on: RELEASE answers
+        // for the descriptor, and the removal is this device's tidying.
+        let (dirfd, name) = match self.at_relative(&relative) {
+            Ok(entry) => entry,
+            Err(ENOENT) | Err(ENOTDIR) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        match unlink_at(dirfd, &name, false) {
+            Err(err) if err != ENOENT => Err(err),
+            _ => Ok(()),
+        }
     }
 
     fn release_dir(&mut self, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -2327,13 +2350,16 @@ impl VirtioFs {
         let id = self.next_tmpfile;
         self.next_tmpfile = self.next_tmpfile.saturating_add(1).max(1);
         let path = parent_path.join(format!(".hvi-tmp-{}-{id}", std::process::id()));
-        let file = open_host_file(
-            &path,
-            flags | LINUX_O_EXCL,
-            true,
-            host_creation_mode(mode, false),
-        )
-        .map_err(io_errno)?;
+        let file = {
+            let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
+            open_host_file_at(
+                dirfd,
+                &name,
+                flags | LINUX_O_EXCL,
+                true,
+                host_creation_mode(mode, false),
+            )?
+        };
         {
             let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
             initialize_guest_metadata(dirfd, &name, mode, context)?;
@@ -2365,7 +2391,7 @@ impl VirtioFs {
             (Some(handle.path.clone()), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            let meta = Stat::lstat(&path)?;
+            let meta = self.stat_in_export(&path)?;
             (Some(path), meta)
         };
         let cache_seconds = self.cache_seconds();
@@ -2385,17 +2411,15 @@ impl VirtioFs {
         let requested = get_u32(input, 16).ok_or(EINVAL)? as usize;
         let limit = requested.min(capacity);
         let dir = self.node_path(node)?.to_owned();
-        note_host_op();
-        if !fs::metadata(&dir).map_err(io_errno)?.is_dir() {
+        if !self.stat_in_export(&dir)?.is_dir() {
             return Err(ENOTDIR);
         }
-
         let parent_path = if dir == self.root {
             self.root.clone()
         } else {
             dir.parent().unwrap_or(&self.root).to_owned()
         };
-        let parent_meta = Stat::lstat(&parent_path)?;
+        let parent_meta = self.stat_in_export(&parent_path)?;
         let parent_node = if plus {
             self.node_for(parent_path.clone(), &parent_meta)
         } else {
@@ -2422,6 +2446,21 @@ impl VirtioFs {
             .take(max_entries)
             .map(|(idx, entry)| (idx, entry.clone()))
             .collect();
+
+        // Whatever is stat'd below is stat'd through this, so no name in the
+        // listing is resolved as a string. The handle opened the directory at
+        // OPENDIR and still holds it, so this is a dup of that rather than a
+        // second walk to the same place.
+        let listing = if plus
+            || batch
+                .iter()
+                .any(|(idx, entry)| *idx <= 1 || entry.dtype == DT_UNKNOWN)
+        {
+            let handle = self.dir_handles.get(&fh).ok_or(EBADF)?;
+            Some(OwnedFd::from(handle.file.try_clone().map_err(io_errno)?))
+        } else {
+            None
+        };
 
         let mut out = Vec::new();
         for (idx, entry) in batch {
@@ -2455,7 +2494,7 @@ impl VirtioFs {
                 }
                 // READDIRPLUS always needs full attributes, so the d_type
                 // fast path below does not apply here.
-                let meta = match Stat::lstat(&path) {
+                let meta = match stat_listed(listing.as_ref(), idx, &entry.name, &parent_meta) {
                     Ok(meta) => meta,
                     Err(_) => continue,
                 };
@@ -2473,20 +2512,22 @@ impl VirtioFs {
                 put_u32(&mut out, name.len() as u32);
                 put_u32(&mut out, dirent_type(&meta));
             } else {
-                // `.`/`..` are not from `fs::read_dir`, so they carry no
+                // `.`/`..` are this device's own records, so they carry no
                 // cached type; every other entry's d_type/ino came for free
                 // off the directory at OPENDIR time and needs no stat here.
-                let (entry_ino, dtype) = match entry.file_type {
-                    Some(ft) if idx > 1 => (entry.ino, dirent_type_ft(&ft)),
+                let (entry_ino, dtype) = match entry.dtype {
+                    cached if cached != 0 && idx > 1 => (entry.ino, cached),
                     // A socket carries no cached `d_type` -- it came from
                     // this device, not from a dirent -- and there is nothing
                     // to stat, so it is answered from the record.
                     _ => match self.sockets.get(&path) {
                         Some(socket) => (socket.ino, DT_SOCK),
-                        None => match Stat::lstat(&path) {
-                            Ok(meta) => (meta.ino(), dirent_type(&meta)),
-                            Err(_) => continue,
-                        },
+                        None => {
+                            match stat_listed(listing.as_ref(), idx, &entry.name, &parent_meta) {
+                                Ok(meta) => (meta.ino(), dirent_type(&meta)),
+                                Err(_) => continue,
+                            }
+                        }
                     },
                 };
                 let entry_node = if idx == 0 {
@@ -2723,6 +2764,24 @@ impl VirtioFs {
         Stat::at(dirfd, &name)
     }
 
+    /// Stats a path inside the export without the descriptor cache, for the
+    /// resolutions that happen behind `&self`.
+    fn stat_uncached(&self, path: &Path) -> Result<Stat, i32> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| EINVAL)?;
+        if relative.as_os_str().is_empty() {
+            return Stat::of_fd(self.dirs.root_fd());
+        }
+        let name =
+            CString::new(relative.file_name().ok_or(EINVAL)?.as_bytes()).map_err(|_| EINVAL)?;
+        match relative.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                let dirfd = self.dirs.walk(parent)?;
+                Stat::at(dirfd.as_fd(), &name)
+            }
+            _ => Stat::at(self.dirs.root_fd(), &name),
+        }
+    }
+
     fn node_path(&self, node: u64) -> Result<&Path, i32> {
         let remembered = self.nodes.get(&node).ok_or(ENOENT)?;
         // With one alias there is nothing to disambiguate: a stale path still
@@ -2737,7 +2796,7 @@ impl VirtioFs {
             .paths
             .iter()
             .find(|path| {
-                Stat::lstat(path)
+                self.stat_uncached(path)
                     .map(|meta| (meta.dev(), meta.ino()) == remembered.key)
                     .unwrap_or(false)
             })
@@ -2747,8 +2806,34 @@ impl VirtioFs {
 
     fn node_for(&mut self, path: PathBuf, meta: &Stat) -> u64 {
         let key = (meta.dev(), meta.ino());
-        if let Some(node) = self.inode_ids.get(&key) {
-            if let Some(remembered) = self.nodes.get_mut(node) {
+        if let Some(node) = self.inode_ids.get(&key).copied() {
+            let crowded = match self.nodes.get(&node) {
+                Some(remembered) => {
+                    !remembered.paths.contains(&path) && remembered.paths.len() >= MAX_NODE_ALIASES
+                }
+                None => false,
+            };
+            // Copied only here, where the list is about to be shortened: the
+            // scan below resolves through `&self`, which the borrow of the
+            // node entry would otherwise hold.
+            let stale = if crowded {
+                let candidates = self
+                    .nodes
+                    .get(&node)
+                    .map(|remembered| remembered.paths.clone())
+                    .unwrap_or_default();
+                candidates
+                    .iter()
+                    .position(|candidate| {
+                        self.stat_uncached(candidate)
+                            .map(|meta| (meta.dev(), meta.ino()) != key)
+                            .unwrap_or(true)
+                    })
+                    .or(Some(0))
+            } else {
+                None
+            };
+            if let Some(remembered) = self.nodes.get_mut(&node) {
                 if !remembered.paths.contains(&path) {
                     // A path we have not seen before resolving to an inode we
                     // already know is either a new alias or, after an unlink
@@ -2770,19 +2855,14 @@ impl VirtioFs {
                     // losing a live one takes away a name the guest may still
                     // be using. Only when every name is live does the oldest
                     // go.
-                    if remembered.paths.len() >= MAX_NODE_ALIASES {
-                        let stale = remembered.paths.iter().position(|candidate| {
-                            Stat::lstat(candidate)
-                                .map(|meta| (meta.dev(), meta.ino()) != key)
-                                .unwrap_or(true)
-                        });
-                        remembered.paths.remove(stale.unwrap_or(0));
+                    if let Some(stale) = stale {
+                        remembered.paths.remove(stale);
                     }
                     remembered.paths.push(path);
                     remembered.guest_attr = None;
                 }
             }
-            return *node;
+            return node;
         }
         let node = self.next_node;
         self.next_node = self.next_node.saturating_add(1);
@@ -2866,10 +2946,11 @@ impl VirtioFs {
         }
     }
 
-    /// Every caller already resolved `path` (typically for the
-    /// `symlink_metadata` that produced `meta`); taking it here instead of
-    /// re-resolving via `node_path` saves a redundant stat and is strictly
-    /// more correct, since it is the exact path `meta` was read from.
+    /// Returns the attribute reply for `node`.
+    ///
+    /// Every caller already resolved `path` for the stat that produced
+    /// `meta`, so taking it here instead of re-resolving through `node_path`
+    /// saves a stat and reports the path `meta` was read from.
     fn attr_out(&mut self, node: u64, path: &Path, meta: &Stat) -> Vec<u8> {
         let cache_seconds = self.cache_seconds();
         let guest = self.guest_attr(node, Some(path), meta);
@@ -3571,8 +3652,8 @@ fn mkfifo_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
 // more noise than a real regression does.
 //
 // Every site that reaches the host filesystem to find something must count:
-// the three `Stat` forms, the entry and directory opens, `fs::read_dir`, and
-// the `fs::metadata` probes on the readdir path. If a site does not count,
+// the `Stat` forms, including `Stat::of_fd` and the listing's `stat_listed`,
+// the entry and directory opens, and `read_dir_at`. If a site does not count,
 // extra work routed through it stays invisible to the test.
 //
 // Each site counts after the work that can fail without a syscall, so a
@@ -3616,8 +3697,8 @@ struct Stat {
 impl Stat {
     /// Stats a path without following it if it is a symlink.
     ///
-    /// The path form, still used by everything that has not moved onto a
-    /// descriptor yet.
+    /// The path form, which the export root is the only caller of: it has no
+    /// parent to be asked through.
     fn lstat(path: &Path) -> Result<Self, i32> {
         let path = path_cstring(path)?;
         note_host_op();
@@ -3790,6 +3871,96 @@ fn exists_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<(), i32> {
     Ok(())
 }
 
+/// Returns the metadata of one entry in a directory listing.
+///
+/// `.` is the directory the handle lists, `..` the parent it was opened
+/// through, and everything else a name inside it.
+fn stat_listed(
+    listing: Option<&OwnedFd>,
+    idx: usize,
+    name: &OsStr,
+    parent: &Stat,
+) -> Result<Stat, i32> {
+    match idx {
+        0 => Stat::of_fd(listing.ok_or(EINVAL)?.as_fd()),
+        1 => Ok(*parent),
+        _ => {
+            let name = CString::new(name.as_bytes()).map_err(|_| EINVAL)?;
+            Stat::at(listing.ok_or(EINVAL)?.as_fd(), &name)
+        }
+    }
+}
+
+/// Lists a directory through a descriptor, without naming it again.
+///
+/// `fdopendir` takes the descriptor over and `closedir` releases it, so the
+/// one passed in is handed across rather than closed here. `.` and `..` are
+/// dropped: the caller has its own records for them.
+///
+/// A `readdir` failure ends the listing, which is what the `read_dir` form
+/// this replaced did with an entry it could not read.
+fn read_dir_at(fd: OwnedFd) -> Result<Vec<DirEntryInfo>, i32> {
+    note_host_op();
+    // SAFETY: `fd` is an open directory descriptor this call owns.
+    let stream = unsafe { libc::fdopendir(fd.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    // The stream owns the descriptor now, so dropping `fd` would close it
+    // under `closedir`.
+    let _ = fd.into_raw_fd();
+    // The descriptor is a dup of the one the cache holds, so it shares that
+    // one's directory offset and a second listing would start where the first
+    // stopped. SAFETY: `stream` is open and owns the descriptor.
+    unsafe { libc::rewinddir(stream) };
+    let mut entries = Vec::new();
+    loop {
+        // SAFETY: `stream` is open for the whole loop, and this is the
+        // thread's own errno.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: `stream` is open for the whole loop. `readdir` returns a
+        // pointer into storage the stream owns, which is read here before the
+        // next call to it.
+        let record = unsafe { libc::readdir(stream) };
+        if record.is_null() {
+            // NULL is the end of the directory, or a failure part way through
+            // it. Reporting the partial listing as a whole one would hide
+            // entries from the guest, so errno decides which this was.
+            let failed = io::Error::last_os_error();
+            if failed.raw_os_error().unwrap_or(0) != 0 {
+                // SAFETY: `stream` is open and is not used after this.
+                unsafe { libc::closedir(stream) };
+                return Err(io_errno(failed));
+            }
+            break;
+        }
+        // SAFETY: the record is non-null and `d_name` is NUL-terminated.
+        let (name, ino, dtype) = unsafe {
+            let record = &*record;
+            (
+                CStr::from_ptr(record.d_name.as_ptr()).to_bytes().to_vec(),
+                record.d_ino as u64,
+                u32::from(record.d_type),
+            )
+        };
+        if name == b"." || name == b".." {
+            continue;
+        }
+        entries.push(DirEntryInfo {
+            name: OsString::from_vec(name),
+            ino,
+            // A whiteout, and anything a later host adds, is a stat's job.
+            dtype: match dtype {
+                DT_FIFO | DT_CHR | DT_DIR | DT_BLK | DT_REG | DT_LNK | DT_SOCK => dtype,
+                _ => DT_UNKNOWN,
+            },
+        });
+    }
+    // SAFETY: `stream` is open and is not used after this.
+    unsafe { libc::closedir(stream) };
+    Ok(entries)
+}
+
 /// Opens a directory without following a symlink in its final component.
 ///
 /// `parent` selects the form: `Some(fd)` resolves `name` relative to that
@@ -3834,10 +4005,9 @@ fn open_dir_nofollow_at(parent: Option<RawFd>, name: &[u8]) -> Result<OwnedFd, i
 /// than letting `open(2)` see a truncated one.
 /// Translates the guest's open flags into the host's.
 ///
-/// Shared by the path and descriptor forms so the two cannot drift. The
-/// `O_NOFOLLOW` that keeps the final component honest, and the `O_CLOEXEC`
-/// that keeps a guest's descriptor out of any process this one spawns, are
-/// decided once here rather than at each call site.
+/// The `O_NOFOLLOW` that keeps the final component honest, and the
+/// `O_CLOEXEC` that keeps a guest's descriptor out of any process this one
+/// spawns, are decided here rather than at each call site.
 fn host_open_flags(flags: u32, create: bool) -> io::Result<i32> {
     let mut host_flags = match flags & LINUX_O_ACCMODE {
         0 => libc::O_RDONLY,
@@ -3873,31 +4043,7 @@ fn host_open_flags(flags: u32, create: bool) -> io::Result<i32> {
     Ok(host_flags)
 }
 
-/// Opens a host file with the flags the guest asked for.
-///
-/// This translates by hand rather than going through `OpenOptions`, which
-/// rejects `O_CREAT` or `O_TRUNC` without write access before issuing any
-/// syscall, so the kernel never gets a say. `O_CREAT|O_RDONLY` is exactly how
-/// a lock file is opened, and refusing it surfaced in the guest as
-/// `flock: cannot open lock file: Invalid argument`.
-fn open_host_file(path: &Path, flags: u32, create: bool, mode: u32) -> io::Result<File> {
-    let host_flags = host_open_flags(flags, create)?;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    note_host_op();
-    // SAFETY: c_path is NUL-terminated and outlives the call. The mode
-    // argument is read by the kernel only when O_CREAT is set, and is passed
-    // as the promoted type a variadic open(2) expects. The descriptor is
-    // handed straight to File, which owns and closes it.
-    let fd = unsafe { libc::open(c_path.as_ptr(), host_flags, (mode & 0o7777) as libc::c_uint) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a fresh descriptor this call owns and has not shared.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-/// The same, relative to a directory descriptor (#30).
+/// Opens a file relative to a directory descriptor.
 ///
 /// `name` is the single component the guest asked for, so nothing here can
 /// resolve anywhere but inside the directory the descriptor already names.
@@ -3927,15 +4073,6 @@ fn open_host_file_at(
     }
     // SAFETY: a fresh descriptor this call owns and has not shared.
     Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn open_host_dir(path: &Path) -> io::Result<File> {
-    note_host_op();
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -4217,12 +4354,17 @@ fn host_futimens(file: &File, times: &[libc::timespec; 2]) -> Result<(), i32> {
     }
 }
 
-fn host_lutimens(path: &Path, times: &[libc::timespec; 2]) -> Result<(), i32> {
-    let path = path_cstring(path)?;
+fn host_lutimens_at(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    times: &[libc::timespec; 2],
+) -> Result<(), i32> {
+    // SAFETY: `dirfd` is open for the call, `name` is NUL-terminated, and
+    // `times` is a two-element array the kernel only reads.
     let result = unsafe {
         libc::utimensat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
             times.as_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
         )
@@ -4662,28 +4804,20 @@ fn dirent_type(meta: &Stat) -> u32 {
     dirent_type_ft_from_mode(meta.file_kind())
 }
 
-/// The readdir type byte for a mode's file-kind bits.
+/// Returns the readdir type byte for a mode's file-kind bits.
 ///
-/// Split out from the `FileType` form because a [`Stat`] carries the mode
-/// rather than a `FileType`, and readdir needs the same answer from both.
+/// A [`Stat`] carries the mode rather than a type byte, and a listing has to
+/// report the same answer whichever of the two it has.
 fn dirent_type_ft_from_mode(kind: u32) -> u32 {
     match kind {
-        S_IFDIR => 4,
-        S_IFREG => 8,
-        S_IFLNK => 10,
-        _ => 0,
-    }
-}
-
-fn dirent_type_ft(ty: &std::fs::FileType) -> u32 {
-    if ty.is_dir() {
-        4
-    } else if ty.is_file() {
-        8
-    } else if ty.is_symlink() {
-        10
-    } else {
-        0
+        S_IFIFO => DT_FIFO,
+        S_IFCHR => DT_CHR,
+        S_IFDIR => DT_DIR,
+        S_IFBLK => DT_BLK,
+        S_IFREG => DT_REG,
+        S_IFLNK => DT_LNK,
+        S_IFSOCK => DT_SOCK,
+        _ => DT_UNKNOWN,
     }
 }
 
@@ -5317,11 +5451,12 @@ mod tests {
     /// `per_file` is the cost of one LOOKUP and one GETATTR. Only the code
     /// that serves those two requests changes it.
     ///
-    /// `listing` also follows the shape of the directory. `readdir` spends
-    /// one parent stat and one `fs::read_dir` for each request, and the
-    /// number of requests is the number of entries divided by the number of
-    /// dirents that fit in one reply. The entry count, the length of the
-    /// names and the reply budget therefore all change this number.
+    /// `listing` also follows the shape of the directory. OPENDIR spends one
+    /// listing of it, each READDIRPLUS page spends a stat for every entry on
+    /// that page, and the number of pages is the number of entries divided by
+    /// the number of dirents that fit in one reply. The entry count, the
+    /// length of the names and the reply budget therefore all change this
+    /// number.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RoundCost {
         /// Host operations spent on OPENDIR, the READDIRPLUS pages and
@@ -5427,7 +5562,7 @@ mod tests {
         // GETATTR, less the descriptor that the lookup leaves in the cache.
         const PER_FILE_BUDGET: u64 = 2;
         // True for this fixture only. See the note above on what moves it.
-        const LISTING_BUDGET: u64 = 36;
+        const LISTING_BUDGET: u64 = 34;
 
         let (dir, mut dev) = fixture_with_access(true);
         let tree = dir.join("tree");
@@ -7587,8 +7722,9 @@ mod tests {
     /// descriptor opened on the guest's behalf must not survive into a child.
     #[test]
     fn guest_descriptors_are_close_on_exec() {
-        let (dir, _dev) = fixture_with_access(true);
-        let file = open_host_file(&dir.join("cloexec-probe"), 0, true, 0o600).unwrap();
+        let (dir, dev) = fixture_with_access(true);
+        let name = CString::new("cloexec-probe").unwrap();
+        let file = open_host_file_at(dev.dirs.root_fd(), &name, 0, true, 0o600).unwrap();
         // SAFETY: querying descriptor flags on a descriptor we own.
         let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
         assert!(descriptor_flags >= 0);
@@ -7603,29 +7739,12 @@ mod tests {
     /// O_NOFOLLOW was explicit before this change and stays explicit after it.
     #[test]
     fn the_final_component_is_never_a_followed_symlink() {
-        let (dir, _dev) = fixture_with_access(true);
+        let (dir, dev) = fixture_with_access(true);
         fs::write(dir.join("target"), b"host-side").unwrap();
         std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
-        let err = open_host_file(&dir.join("link"), 0, false, 0).unwrap_err();
-        assert_eq!(io_errno(err), ELOOP);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// `CString::new` is what refuses this now; before, `OpenOptions` did. An
-    /// interior NUL must not reach open(2), where it would silently name a
-    /// shorter path than the one asked for.
-    #[test]
-    fn a_path_with_an_interior_nul_is_refused() {
-        let (dir, _dev) = fixture_with_access(true);
-        let mut raw = dir.join("lock").into_os_string().into_vec();
-        raw.extend_from_slice(b"\0.ignored");
-        let path = PathBuf::from(OsString::from_vec(raw));
-        let err = open_host_file(&path, 0, true, 0o600).unwrap_err();
-        assert_eq!(io_errno(err), EINVAL);
-        assert!(
-            !dir.join("lock").exists(),
-            "the truncated path must not have been created"
-        );
+        let name = CString::new("link").unwrap();
+        let err = open_host_file_at(dev.dirs.root_fd(), &name, 0, false, 0).unwrap_err();
+        assert_eq!(err, ELOOP);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7633,10 +7752,43 @@ mod tests {
     /// hand translation and is refused by it.
     #[test]
     fn a_reserved_access_mode_is_refused() {
-        let (dir, _dev) = fixture_with_access(true);
-        let err = open_host_file(&dir.join("bad"), LINUX_O_ACCMODE, true, 0o600).unwrap_err();
-        assert_eq!(io_errno(err), EINVAL);
+        let (dir, dev) = fixture_with_access(true);
+        let name = CString::new("bad").unwrap();
+        let err =
+            open_host_file_at(dev.dirs.root_fd(), &name, LINUX_O_ACCMODE, true, 0o600).unwrap_err();
+        assert_eq!(err, EINVAL);
         assert!(!dir.join("bad").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // RELEASE answers for the handle, not for the name its tmpfile was
+    // created under. A RENAME of the parent leaves that name unresolvable,
+    // which is the guest's own doing and not an error it can act on.
+    #[test]
+    fn release_after_the_tmpfile_parent_is_renamed_still_succeeds() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("d")).unwrap();
+        let d = lookup_node(&mut dev, FUSE_ROOT_ID, b"d");
+
+        let mut input = vec![0u8; 16];
+        input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        input[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        let out = dev.handle_fuse(&request(TMPFILE, d, &input), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "TMPFILE");
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+
+        let mut rename = vec![0u8; 8];
+        rename[0..8].copy_from_slice(&FUSE_ROOT_ID.to_le_bytes());
+        rename.extend_from_slice(b"d\0e\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RENAME");
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&fh.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RELEASE after the parent moved");
+
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -8457,6 +8609,354 @@ mod tests {
             "every published request must be serviced exactly once -- none \
              stranded, none double-serviced"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A plain READDIR reports the type the host already told us, for every
+    // kind it has a byte for. A guest that lists /dev otherwise pays a stat
+    // for each device node in it.
+    #[test]
+    fn readdir_reports_the_types_a_dirent_already_carries() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let path = dir.join("etc/fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let out = dev.handle_fuse(&request(OPENDIR, etc, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        let mut readdir = vec![0u8; 40];
+        readdir[0..8].copy_from_slice(&fh.to_le_bytes());
+        readdir[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIR, etc, &readdir), 8192);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        // fuse_dirent: ino(8) off(8) namelen(4) type(4) name.
+        let mut pos = OUT_HEADER_LEN;
+        let mut fifo_type = None;
+        while pos + 24 <= out.len() {
+            let namelen = get_u32(&out, pos + 16).unwrap() as usize;
+            let dtype = get_u32(&out, pos + 20).unwrap();
+            let name = &out[pos + 24..pos + 24 + namelen];
+            if name == b"fifo" {
+                fifo_type = Some(dtype);
+            }
+            pos += align8(24 + namelen);
+        }
+        assert_eq!(fifo_type, Some(DT_FIFO), "the FIFO's type byte");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // STATX and GETATTR answer for the same node, so the root has to reach
+    // both. It has no final component, which is the form `entry_at` cannot
+    // give.
+    #[test]
+    fn statx_and_getattr_agree_about_the_root() {
+        let (dir, mut dev) = fixture_with_access(false);
+
+        let out = dev.handle_fuse(&request(GETATTR, FUSE_ROOT_ID, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "GETATTR of the root");
+        let attr_ino = get_u64(&out, OUT_HEADER_LEN + 16).unwrap();
+
+        // `fuse_statx` carries the inode 64 bytes in, where `fuse_attr` has
+        // it at 16.
+        let out = dev.handle_fuse(&request(STATX, FUSE_ROOT_ID, &[0u8; 16]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "STATX of the root");
+        let statx_ino = get_u64(&out, OUT_HEADER_LEN + 64).unwrap();
+
+        assert_eq!(attr_ino, statx_ino, "the two disagree about the root");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The sequence from CVE-2026-77179: open a file, delete it, replace its
+    // parent directory with a symlink out of the share, then write through
+    // the handle that is still open.
+    #[test]
+    fn a_write_after_the_parent_is_swapped_stays_on_the_pinned_fd() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-write");
+        fs::create_dir_all(&outside).unwrap();
+
+        // mkdir pv
+        let mut mkdir = vec![0u8; 8];
+        mkdir[0..4].copy_from_slice(&(0o755u32).to_le_bytes());
+        mkdir.extend_from_slice(b"pv\0");
+        let out = dev.handle_fuse(&request(MKDIR, FUSE_ROOT_ID, &mkdir), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "MKDIR pv");
+        let pv = get_u64(&out, OUT_HEADER_LEN).unwrap();
+
+        // : > pv/.canary && exec 9<> pv/.canary
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&(LINUX_O_RDWR | LINUX_O_EXCL).to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b".canary\0");
+        let out = dev.handle_fuse(&request(CREATE, pv, &create), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "CREATE pv/.canary");
+        let canary = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        let fh = get_u64(&out, OUT_HEADER_LEN + 128).unwrap();
+
+        // rm pv/.canary; rmdir pv
+        let out = dev.handle_fuse(&request(UNLINK, pv, b".canary\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "UNLINK pv/.canary");
+        let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"pv\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "RMDIR pv");
+
+        // ln -s /Users/Shared pv
+        let mut link = Vec::new();
+        link.extend_from_slice(b"pv\0");
+        link.extend_from_slice(outside.as_os_str().as_bytes());
+        link.push(0);
+        let out = dev.handle_fuse(&request(SYMLINK, FUSE_ROOT_ID, &link), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "SYMLINK pv -> outside");
+
+        // echo CONFIRMED > /proc/self/fd/9
+        let mut write = vec![0u8; 40];
+        write[0..8].copy_from_slice(&fh.to_le_bytes());
+        write[8..16].copy_from_slice(&0u64.to_le_bytes());
+        write[16..20].copy_from_slice(&9u32.to_le_bytes());
+        write.extend_from_slice(b"CONFIRMED");
+        let out = dev.handle_fuse(&request(WRITE, canary, &write), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some(0),
+            "the write failed, so it proves nothing about where it landed"
+        );
+
+        let leaked: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leaked.is_empty(), "the write escaped the share: {leaked:?}");
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // An absolute symlink target names the guest's root, so a mutation below
+    // one resolves inside the export.
+    #[test]
+    fn a_mutation_below_a_swapped_parent_is_clamped() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-create");
+        fs::create_dir_all(&outside).unwrap();
+
+        let mut link = Vec::new();
+        link.extend_from_slice(b"pv\0");
+        link.extend_from_slice(outside.as_os_str().as_bytes());
+        link.push(0);
+        let out = dev.handle_fuse(&request(SYMLINK, FUSE_ROOT_ID, &link), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let pv = lookup_node(&mut dev, FUSE_ROOT_ID, b"pv");
+
+        let mut create = vec![0u8; 16];
+        create[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        create[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        create.extend_from_slice(b"planted\0");
+        let out = dev.handle_fuse(&request(CREATE, pv, &create), 4096);
+        assert_ne!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            0,
+            "CREATE below the swapped parent succeeded"
+        );
+        let leaked: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a mutation below the swapped parent reached the host: {leaked:?}"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The swap happens host-side here, so a forgotten node or a removed entry
+    // cannot mask the answer the way it can when the guest drives every step.
+    #[test]
+    fn a_cached_path_through_a_swapped_directory_reaches_nothing() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-primitive");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), b"HOST-SECRET").unwrap();
+
+        fs::create_dir(dir.join("d")).unwrap();
+        fs::write(dir.join("d/f"), b"inside").unwrap();
+        let d = lookup_node(&mut dev, FUSE_ROOT_ID, b"d");
+        let f = lookup_node(&mut dev, d, b"f");
+
+        // The swap, behind the device's back.
+        fs::remove_file(dir.join("d/f")).unwrap();
+        fs::remove_dir(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+        assert_eq!(
+            fs::read(dir.join("d/f")).unwrap(),
+            b"HOST-SECRET",
+            "the host path this test aims at does not resolve, so a refusal \
+             below would prove nothing"
+        );
+
+        // The one READ that used to resolve that string.
+        let mut read = vec![0u8; 24];
+        read[16..20].copy_from_slice(&64u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READ, f, &read), 4096);
+        assert!(
+            !out.windows(11).any(|w| w == b"HOST-SECRET"),
+            "the stateless read followed the swapped directory out of the export"
+        );
+
+        // The root has no final component, so it answers for the directory it
+        // is rather than for the entry it has not got.
+        let out = dev.handle_fuse(&request(READ, FUSE_ROOT_ID, &read), 4096);
+        assert_eq!(
+            i32::from_le_bytes(out[4..8].try_into().unwrap()),
+            -EISDIR,
+            "a stateless read of the root"
+        );
+
+        let _ = fs::remove_file(dir.join("d"));
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opendir_below_a_swapped_directory_lists_nothing_outside() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("listing");
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        fs::write(outside.join("sub/witness"), b"x").unwrap();
+
+        fs::create_dir_all(dir.join("d/sub")).unwrap();
+        let d = lookup_node(&mut dev, FUSE_ROOT_ID, b"d");
+        let sub = lookup_node(&mut dev, d, b"sub");
+
+        fs::remove_dir_all(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+        assert!(
+            dir.join("d/sub/witness").exists(),
+            "the host path this test aims at does not resolve, so a refusal \
+             below would prove nothing"
+        );
+
+        let out = dev.handle_fuse(&request(OPENDIR, sub, &[0u8; 8]), 4096);
+        let status = i32::from_le_bytes(out[4..8].try_into().unwrap());
+        assert_ne!(status, 0, "OPENDIR opened a directory outside the export");
+        if status == 0 {
+            let fh = get_u64(&out, OUT_HEADER_LEN).unwrap();
+            let mut readdir = vec![0u8; 40];
+            readdir[0..8].copy_from_slice(&fh.to_le_bytes());
+            readdir[16..20].copy_from_slice(&4096u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(READDIR, sub, &readdir), 8192);
+            assert!(
+                !out.windows(7).any(|w| w == b"witness"),
+                "READDIR listed a host directory outside the export"
+            );
+        }
+
+        let _ = fs::remove_file(dir.join("d"));
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Every handler that takes a node id, asked whether it reaches outside
+    // the export once that node's cached path runs through a swapped
+    // directory.
+    #[test]
+    fn no_handler_reaches_outside_through_a_swapped_directory() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let outside = outside_path("sailor-surface");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), b"HOST-SECRET").unwrap();
+        fs::write(outside.join("witness"), b"x").unwrap();
+
+        fs::create_dir(dir.join("d")).unwrap();
+        fs::write(dir.join("d/f"), b"inside").unwrap();
+        let d = lookup_node(&mut dev, FUSE_ROOT_ID, b"d");
+        let f = lookup_node(&mut dev, d, b"f");
+
+        fs::remove_file(dir.join("d/f")).unwrap();
+        fs::remove_dir(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+
+        let status = |out: &[u8]| i32::from_le_bytes(out[4..8].try_into().unwrap());
+        let outside_mode =
+            |name: &str| fs::symlink_metadata(outside.join(name)).unwrap().mode() & 0o777;
+        let planted_mode = outside_mode("f");
+
+        // OPENDIR, which lists a directory, and READDIR through whatever it
+        // returns.
+        let out = dev.handle_fuse(&request(OPENDIR, d, &[0u8; 8]), 4096);
+        assert_ne!(status(&out), 0, "OPENDIR opened the swapped directory");
+
+        // SETATTR, which changes a mode. `mode` is at offset 68 of
+        // fuse_setattr_in.
+        let mut setattr = vec![0u8; 88];
+        setattr[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+        setattr[68..72].copy_from_slice(&0o777u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, f, &setattr), 4096);
+        assert_ne!(status(&out), 0, "SETATTR reached the stale node");
+        assert_eq!(
+            outside_mode("f"),
+            planted_mode,
+            "SETATTR changed a host file outside the export"
+        );
+
+        let out = dev.handle_fuse(&request(GETATTR, f, &[0u8; 16]), 4096);
+        assert_ne!(status(&out), 0, "GETATTR stat'd through the swapped parent");
+
+        let mut open = vec![0u8; 8];
+        open[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        let out = dev.handle_fuse(&request(OPEN, f, &open), 4096);
+        assert_ne!(status(&out), 0, "OPEN opened through the swapped parent");
+
+        // STATX, which answers from the same node.
+        let out = dev.handle_fuse(&request(STATX, f, &[0u8; 16]), 4096);
+        assert_ne!(
+            status(&out),
+            0,
+            "STATX reported a host file outside the export"
+        );
+
+        // SETATTR's times branch, which mutates.
+        let planted = fs::symlink_metadata(outside.join("f")).unwrap().mtime();
+        let mut times = vec![0u8; 88];
+        times[0..4].copy_from_slice(&FATTR_MTIME.to_le_bytes());
+        times[40..48].copy_from_slice(&1u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(SETATTR, f, &times), 4096);
+        assert_ne!(status(&out), 0, "SETATTR times reached the stale node");
+        assert_eq!(
+            fs::symlink_metadata(outside.join("f")).unwrap().mtime(),
+            planted,
+            "SETATTR times changed a host file outside the export"
+        );
+
+        // TMPFILE, which creates. The name is this device's own, so a refusal
+        // is not enough on its own: the directory has to stay as it was.
+        let mut tmpfile = vec![0u8; 16];
+        tmpfile[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+        tmpfile[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+        let out = dev.handle_fuse(&request(TMPFILE, d, &tmpfile), 4096);
+        assert_ne!(
+            status(&out),
+            0,
+            "TMPFILE created through the swapped parent"
+        );
+
+        // The host-only entries are still the only ones there, and the guest
+        // never saw them.
+        let mut names: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["f", "witness"], "the export reached outside");
+
+        let _ = fs::remove_file(dir.join("d"));
+        let _ = fs::remove_dir_all(&outside);
         let _ = fs::remove_dir_all(dir);
     }
 }

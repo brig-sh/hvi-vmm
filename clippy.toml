@@ -14,10 +14,56 @@
 # afterwards. Resolving a path string host-side reintroduces both the cost and
 # the TOCTOU race that design removed.
 #
-# Two places may still call it, and both say so with an explicit
-# `#[allow(clippy::disallowed_methods)]`: the export root, resolved once when
-# a share is constructed, and test setup.
+# The list names every std entry point that hands a path to the kernel, in
+# each of the three forms it comes in: the `std::fs` free function, the
+# `Path` method that mirrors it, and the constructor on `File`, `OpenOptions`
+# or `DirBuilder`. A ban that names one form reaches the next one that is
+# written, and `parent.join(name).is_dir()` compiles as cleanly as
+# `fs::metadata(parent)?.is_dir()`. The `libc` wrappers this module defines
+# itself are not listed, because clippy matches paths rather than argument
+# types; the module keeps them in `*_at` form instead, and `Stat::lstat` is
+# the one remaining path form.
+#
+# A file that resolves host paths of its own says so with a module-level
+# `#![allow(clippy::disallowed_methods)]` and a line on why: the VMM's own
+# state directories, the block device, the ledger, the plugins, shared
+# memory, the machine backends and the Seatbelt profile's export rules.
+# `config.rs` carries the one per-site waiver, for the export root.
 disallowed-methods = [
+    # std::fs, the free functions.
     { path = "std::fs::canonicalize", reason = "resolve relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::metadata", reason = "stat relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::symlink_metadata", reason = "stat relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::read_dir", reason = "list through a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::read_link", reason = "read the link relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::remove_file", reason = "unlink relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::remove_dir", reason = "unlink relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::remove_dir_all", reason = "unlink relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::rename", reason = "rename relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::hard_link", reason = "link relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::set_permissions", reason = "chmod relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::create_dir", reason = "create relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::create_dir_all", reason = "create relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::read", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::read_to_string", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::write", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::copy", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::os::unix::fs::symlink", reason = "symlink relative to a directory descriptor instead; see clippy.toml" },
+    # std::path::Path, the methods that mirror them.
     { path = "std::path::Path::canonicalize", reason = "resolve relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::metadata", reason = "stat relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::symlink_metadata", reason = "stat relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::read_dir", reason = "list through a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::read_link", reason = "read the link relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::exists", reason = "ask through a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::try_exists", reason = "ask through a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::is_dir", reason = "ask through a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::is_file", reason = "ask through a directory descriptor instead; see clippy.toml" },
+    { path = "std::path::Path::is_symlink", reason = "ask through a directory descriptor instead; see clippy.toml" },
+    # The constructors that go around the free functions.
+    { path = "std::fs::File::open", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::File::create", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::File::create_new", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::OpenOptions::open", reason = "open relative to a directory descriptor instead; see clippy.toml" },
+    { path = "std::fs::DirBuilder::create", reason = "create relative to a directory descriptor instead; see clippy.toml" },
 ]

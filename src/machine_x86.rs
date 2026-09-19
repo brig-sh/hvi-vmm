@@ -36,6 +36,10 @@
 //! triple-faults), and advertising RDRAND in that CPUID (else the KASLR entropy
 //! path stalls). Set `HVI_X86_TRACE=1` for exit/register tracing. SMP AP
 //! bringup is asserted by the boot-x86 CI job, which boots with `--cpus 2`.
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. The paths here are this
+// VMM's own.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
