@@ -35,10 +35,11 @@ impl ShareMode {
 /// re-checking the host.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CachePolicy {
-    /// Metadata cached for a second on a writable share, and for a minute on
-    /// a read-only one, which cannot go stale from the guest's own writes. The
-    /// page cache is retained across opens either way, with the guest
-    /// revalidating on a size or mtime change. Matches virtiofsd's default.
+    /// Metadata cached for five seconds on a writable share, and for a minute
+    /// on a read-only one, which cannot go stale from the guest's own writes.
+    /// The page cache is retained across opens either way, with the guest
+    /// revalidating on a size or mtime change. See `WRITABLE_CACHE_SECS` in
+    /// `virtio_fs` for where the five comes from.
     #[default]
     Auto,
     /// On a writable share, additionally lets the guest own the page cache for
