@@ -85,14 +85,15 @@ else
 fi
 
 # clippy and doc are report-only in both modes: neither writes to the tree, and
-# both are hard errors on any warning.
+# both are hard errors on any warning. --workspace, so the build-script helper
+# beside the VMM is held to the same lints.
 # shellcheck disable=SC2086 # TARGET_ARGS is a deliberate word split
-run cargo clippy --all-targets $TARGET_ARGS -- -D warnings
+run cargo clippy --workspace --all-targets $TARGET_ARGS -- -D warnings
 
 # Private items are documented too, because the doc comments on them are held to
 # the same standard as the public ones; --no-deps keeps the check to this repo.
-echo "+ RUSTDOCFLAGS=-D warnings cargo doc --no-deps --document-private-items $TARGET_ARGS"
+echo "+ RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --document-private-items $TARGET_ARGS"
 # shellcheck disable=SC2086
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items $TARGET_ARGS
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items $TARGET_ARGS
 
 echo "tidy: ok"

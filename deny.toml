@@ -38,7 +38,14 @@ allow = [
 # instead of failing on it. With 21 crates the report stays short, and a new
 # duplicate that arrives with an update is visible in the log.
 multiple-versions = "warn"
+# A dependency without a version requirement is refused, since one from a
+# registry would then float to whatever was published last.
 wildcards = "deny"
+# Except a path dependency on a crate of this workspace that is never
+# published: `build-version` carries no version to require, and the path says
+# exactly which code is built. Requiring one would put the same number in two
+# places for cargo to compare with itself.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
