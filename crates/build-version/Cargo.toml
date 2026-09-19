@@ -1,0 +1,13 @@
+[package]
+name = "build-version"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Build-script helper that derives a binary's version string from the git history."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# A build dependency, not something a binary links. It sits in a crate of its
+# own so the derivation can carry the unit tests below: cargo compiles and runs
+# a build script itself, and `cargo test` never sees it.
