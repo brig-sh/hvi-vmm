@@ -12,7 +12,8 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | The backend is chosen at compile time by target triple. | There is no runtime flag to pick one. Cross-compiling checks a backend, it does not produce a runnable one for this host. | Design |
-| virtio-fs is macOS only. | The Linux backends carry no directory sharing at all. Use a disk image. | Design |
+| virtio-fs is served in-process on macOS and by `virtiofsd` on Linux. | A Linux host needs the daemon installed, and a read-only export needs 1.11 or newer. | Design |
+| A Linux export produces no file-level events. | The daemon serves the guest in its own process, so the ledger sees none of it. The block and network boundaries are unaffected. | Design |
 | A non-backend host builds a stub. | The shared code and unit tests compile everywhere. That build cannot run a guest. | Design |
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
@@ -29,7 +30,8 @@ three things a reader should not have to guess between:
 | An unreachable `--net-gateway` falls back to the built-in stack. | A guest comes up with no egress and exit status zero. The warning line is the only signal. | Design |
 | A tap write that fails drops the guest's frame. | The write fails when the send buffer is full, the tap is detached, its interface is down, or the kernel cannot allocate or accept the frame. The first failure writes one line to stderr. The ledger records the frame as egress before the write, so a dropped frame still appears in it. The send buffer fills only when the tap's creator lowered it. | Design |
 | A gateway frame above 64 KiB ends the relay. | The relay writes one line to stderr and shuts the gateway socket down, so the guest receives nothing more from the gateway and its own frames are dropped for the rest of the run. Every gateway's default MTU is far below 64 KiB. | Design |
-| virtio-fs: one request queue per share, no DAX, no indirect descriptors. | Throughput ceiling per share. | Design |
+| virtio-fs: one request queue per share, and no DAX window on either host. The macOS device also takes no indirect descriptors. | Throughput ceiling per share. | Design |
+| An x86-64 guest has interrupt lines for four exports, an arm64 guest for sixteen. | The next export fails the boot rather than taking an interrupt the controller does not have. | Design |
 
 ## virtio-fs resource limits
 

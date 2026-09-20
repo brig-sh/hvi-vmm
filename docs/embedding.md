@@ -103,7 +103,8 @@ cargo build --release --example watch_guest
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
 | `disk` | `Option<String>` | One virtio-blk backing file. |
-| `fs_shares` | `Vec<FsShare>` | virtio-fs exports. macOS only: a non-empty vector **fails the boot** on either Linux backend. |
+| `fs_shares` | `Vec<FsShare>` | virtio-fs exports. Served in-process on macOS, by a `virtiofsd` per export on Linux. |
+| `virtiofsd` | `Option<PathBuf>` | The daemon the Linux backends start for an export with no socket of its own. `None` searches. |
 | `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |

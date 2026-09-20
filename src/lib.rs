@@ -119,6 +119,8 @@ pub mod uart16550;
 /// Concurrency litmus test for the used-ring publish in `virtio::Queue`.
 #[cfg(test)]
 mod used_ring_litmus;
+/// virtio-fs over MMIO, served by an out-of-process vhost-user daemon.
+pub mod vhost_user_fs;
 /// virtio-blk over MMIO.
 pub mod virtio;
 /// Virtio-fs over MMIO, serving an unpacked host directory.
@@ -128,6 +130,12 @@ pub mod virtio_fs;
 pub mod virtio_net;
 /// virtio-vsock over MMIO, bridged to a host Unix socket (guest agent).
 pub mod virtio_vsock;
+/// The `virtiofsd` daemons the Linux backends start for their exports.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod virtiofsd;
 
 // The active hypervisor backend, selected by target. All three expose the same
 // `boot(config::BootConfig) -> Result<config::Stop, _>` entry point.

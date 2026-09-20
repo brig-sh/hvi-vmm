@@ -23,6 +23,7 @@
             {"syscall": "sendto", "comment": "safety net: UnixStream::write lowers to this"},
             {"syscall": "eventfd2", "comment": "KVM irqfd/ioeventfd wiring"},
             {"syscall": "clone", "comment": "a reader thread per accepted vsock connection"},
+            {"syscall": "wait4", "comment": "reaping a virtiofsd whose connection the VMM has closed"},
             {"syscall": "clone3", "comment": "same, on a glibc new enough to use it"},
             {"syscall": "futex", "comment": "every Mutex, Condvar and thread join"},
             {"syscall": "mmap", "comment": "thread stacks and allocator growth"},
@@ -91,6 +92,8 @@
             {"syscall": "clock_gettime", "comment": "safety net: event timestamps"},
             {"syscall": "close", "comment": "safety net: a device dropping a descriptor"},
             {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end"},
+            {"syscall": "sendmsg", "comment": "vhost-user: the guest's DRIVER_OK write hands the virtio-fs rings to virtiofsd from this thread"},
+            {"syscall": "recvmsg", "comment": "vhost-user: what the daemon answers during that handover"},
             {"syscall": "exit", "comment": "thread exit"},
             {"syscall": "exit_group", "comment": "process exit on a guest power-off"}
         ]

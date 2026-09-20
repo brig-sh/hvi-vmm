@@ -46,8 +46,10 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
-| `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. macOS only. |
-| `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
+| `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. |
+| `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. |
+| `--share-sock <tag>=<socket>` | none | Serve that export from a vhost-user daemon already listening on `<socket>`. Names an export given earlier on the line, so it follows its own `--share-ro`/`--share-rw`. Linux only. |
+| `--virtiofsd <path>` | search | The daemon to start for an export that brings no socket. Linux only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
 | `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
@@ -86,8 +88,8 @@ hvi: boot needs --kernel <Image>
 ```
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
-`--fs-gid`, `--share-ro`, `--share-rw`, `--sandbox-id`, `--cpus`,
-`--dump-after`.
+`--fs-gid`, `--share-ro`, `--share-rw`, `--share-sock`, `--virtiofsd`,
+`--sandbox-id`, `--cpus`, `--dump-after`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -102,7 +104,9 @@ are three behaviours, not two.
 
 | Flag | macOS | Linux arm64 | Linux x86-64 |
 | --- | --- | --- | --- |
-| `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
+| `--share-ro`, `--share-rw` | acted on, served in-process | acted on, served by virtiofsd | acted on, served by virtiofsd |
+| `--share-sock` | **refused**, boot fails | acted on | acted on |
+| `--virtiofsd` | **ignored silently** | acted on | acted on |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored silently** | **ignored silently** |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
@@ -110,7 +114,7 @@ are three behaviours, not two.
 
 Two of those errors appear **after** `booting <kernel> with <N> MiB ...` has
 printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` on macOS, and the shares on either Linux backend.
+`--net-tap` on macOS, and `--share-sock` there as well.
 
 ```text
 booting Image with 512 MiB ...

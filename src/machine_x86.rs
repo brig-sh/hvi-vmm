@@ -54,9 +54,9 @@ use crate::config::{BootConfig, Stop};
 use crate::events::{CapturedEvent, Emitter};
 use crate::guestmem::GuestRam;
 use crate::layout_x86::{
-    BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR,
-    PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE,
-    VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    virtio_fs_base, virtio_fs_gsi, BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE,
+    MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI,
+    VIRTIO_NET_BASE, VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::mptable;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
@@ -64,6 +64,7 @@ use crate::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
 use crate::uart16550::Uart16550;
+use crate::vhost_user_fs::VhostUserFs;
 use crate::virtio::VirtioBlk;
 use crate::virtio_net::VirtioNet;
 use crate::virtio_vsock::VirtioVsock;
@@ -89,6 +90,8 @@ struct Shared {
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
+    /// One entry per virtio-fs export, in the order the exports were given.
+    fs: Arc<Vec<SharedFs>>,
     emit: Arc<Mutex<Emitter>>,
     running: Arc<AtomicBool>,
     threads: Arc<Mutex<Vec<u64>>>,
@@ -103,6 +106,22 @@ struct Shared {
     sandbox_id: String,
     /// vCPU count, so a pause knows how many threads must park.
     num_cpus: u32,
+}
+
+/// Request queues per virtio-fs device, beside the hiprio queue.
+///
+/// One is what the guest needs to make progress, and the daemon serves it on
+/// its own threads.
+const FS_REQUEST_QUEUES: usize = 1;
+
+/// One virtio-fs export: where its transport sits, and the device behind it.
+#[derive(Clone)]
+struct SharedFs {
+    base: u64,
+    gsi: u32,
+    dev: Arc<Mutex<VhostUserFs>>,
+    /// The descriptors a shutdown uses, so it never has to take `dev`.
+    stop: crate::vhost_user_fs::ShutdownFds,
 }
 
 /// Splices the parameters we own into a caller-supplied kernel command line.
@@ -149,11 +168,8 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
 /// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
 /// plugin kept, in a field or on a thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
-    if !cfg.fs_shares.is_empty() {
-        return Err(
-            "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
-        );
-    }
+    crate::config::check_export_overlap(&cfg.fs_shares)?;
+    crate::config::check_unique_tags(&cfg.fs_shares)?;
     install_kick_handler();
     let num_cpus = cfg.vcpus.max(1);
 
@@ -261,6 +277,56 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .as_ref()
         .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
 
+    // virtio-fs: one transport per export, each backed by its own daemon.
+    // The daemons are started here, before the seccomp filters go in, and
+    // they run until the VMM exits.
+    let mut fs_daemons = Vec::with_capacity(cfg.fs_shares.len());
+    let mut fs = Vec::with_capacity(cfg.fs_shares.len());
+    for (index, share) in cfg.fs_shares.iter().enumerate() {
+        let (Some(base), Some(gsi)) = (virtio_fs_base(index), virtio_fs_gsi(index)) else {
+            return Err(format!(
+                "virtio-fs export {index} has no interrupt line left on this machine"
+            )
+            .into());
+        };
+        let access = if share.mode.writable() {
+            "read-write"
+        } else {
+            "read-only"
+        };
+        let dev = match &share.socket {
+            Some(socket) => {
+                eprintln!(
+                    "[hvi/x86] virtio-fs[{index}]: {} as {:?} ({access}) on {}",
+                    share.path.display(),
+                    share.tag,
+                    socket.display()
+                );
+                crate::virtiofsd::warn_foreign_readonly(share);
+                VhostUserFs::connect(socket, &share.tag, FS_REQUEST_QUEUES, shared_ram.fd())?
+            }
+            None => {
+                let binary = crate::virtiofsd::find(cfg.virtiofsd.as_deref())?;
+                let (daemon, stream) = crate::virtiofsd::spawn(&binary, share, index)?;
+                eprintln!(
+                    "[hvi/x86] virtio-fs[{index}]: {} as {:?} ({access}) via {} pid {}",
+                    share.path.display(),
+                    share.tag,
+                    binary.display(),
+                    daemon.pid()
+                );
+                fs_daemons.push(daemon);
+                VhostUserFs::from_stream(stream, &share.tag, FS_REQUEST_QUEUES, shared_ram.fd())?
+            }
+        };
+        fs.push(SharedFs {
+            base,
+            gsi,
+            stop: dev.shutdown_fds(),
+            dev: Arc::new(Mutex::new(dev)),
+        });
+    }
+
     // Kernel command line: caller's args + ttyS0 console + virtio-mmio device
     // descriptors for whatever we attached. (KASLR works now that the guest
     // CPUID advertises RDRAND, so no nokaslr.)
@@ -273,6 +339,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
     if vsock.is_some() {
         ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_VSOCK_BASE:#x}:{VIRTIO_VSOCK_GSI}");
+    }
+    for slot in &fs {
+        ours += &format!(" virtio_mmio.device=0x200@{:#x}:{}", slot.base, slot.gsi);
     }
     let cmdline = splice_kernel_args(cfg.cmdline.trim(), &ours);
 
@@ -323,6 +392,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         virtio,
         net,
         vsock,
+        fs: Arc::new(fs),
         emit: Arc::new(Mutex::new(Emitter::new(
             cfg.events.as_deref(),
             &cfg.sandbox_id,
@@ -381,6 +451,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             ),
         ));
     }
+    spawn_fs_interrupts(&shared);
     if let (Some(reader), Some(dev)) = (net_reader, &shared.net) {
         helpers.push((
             "gateway relay",
@@ -779,6 +850,8 @@ fn mmio_read(sh: &Shared, addr: u64) -> u64 {
         net_read(sh, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
+    } else if let Some((base, gsi, dev)) = fs_slot(sh, addr) {
+        fs_mmio(sh, gsi, &dev, addr - base, false, 0)
     } else {
         0
     }
@@ -791,6 +864,50 @@ fn mmio_write(sh: &Shared, addr: u64, val: u64) {
         net_write(sh, addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
+    } else if let Some((base, gsi, dev)) = fs_slot(sh, addr) {
+        fs_mmio(sh, gsi, &dev, addr - base, true, val);
+    }
+}
+
+/// Returns the virtio-fs export whose window holds `addr`, or `None` when no
+/// export does.
+fn fs_slot(sh: &Shared, addr: u64) -> Option<(u64, u32, Arc<Mutex<VhostUserFs>>)> {
+    sh.fs
+        .iter()
+        .find(|slot| (slot.base..slot.base + VIRTIO_SIZE).contains(&addr))
+        .map(|slot| (slot.base, slot.gsi, Arc::clone(&slot.dev)))
+}
+
+/// Services one register access on a virtio-fs transport and drives its
+/// interrupt line.
+fn fs_mmio(
+    sh: &Shared,
+    gsi: u32,
+    dev: &Arc<Mutex<VhostUserFs>>,
+    off: u64,
+    is_write: bool,
+    val: u64,
+) -> u64 {
+    let (v, level) = {
+        let mut d = dev.lock().unwrap();
+        let v = d.mmio(&sh.mem, off, is_write, val);
+        (v, d.irq_level())
+    };
+    let _ = sh.vm.set_irq_line(gsi, level);
+    v
+}
+
+/// Starts the interrupt threads of every export.
+///
+/// The thread body is [`crate::vhost_user_fs::serve_interrupts`]; what this
+/// backend supplies is how a line is raised, which on x86 is an IOAPIC GSI.
+fn spawn_fs_interrupts(shared: &Shared) {
+    for slot in shared.fs.iter() {
+        let vm = Arc::clone(&shared.vm);
+        let gsi = slot.gsi;
+        crate::vhost_user_fs::serve_interrupts(&slot.dev, &shared.running, move |level| {
+            let _ = vm.set_irq_line(gsi, level);
+        });
     }
 }
 
@@ -983,6 +1100,14 @@ fn stop_all(sh: &Shared) {
     // A vCPU parked at a quiesce checkpoint waits on a condition variable the
     // kick cannot end; releasing lets it see `running` and exit.
     sh.quiesce.release();
+    // Ending each daemon's connection is what lets it exit, what frees a
+    // vhost-user read that is still waiting on it, and what wakes the
+    // interrupt threads, which are blocked in a read only the daemon
+    // completes. None of it takes the device lock, which a handover waiting
+    // on an unresponsive daemon would be holding.
+    for slot in sh.fs.iter() {
+        slot.stop.shutdown();
+    }
     kick_all(sh);
 }
 fn kick_all(sh: &Shared) {

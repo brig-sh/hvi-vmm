@@ -66,6 +66,32 @@ pub struct FsShare {
     pub tag: String,
     pub mode: ShareMode,
     pub cache: CachePolicy,
+    /// A vhost-user socket someone else is already serving this export on,
+    /// or `None` to start a daemon for it.
+    ///
+    /// Only the Linux backends read this. The macOS backend serves every
+    /// export itself, so a socket there is a configuration error, and the
+    /// machine says so before the guest runs.
+    pub socket: Option<PathBuf>,
+}
+
+/// Refuses two exports that share a mount tag.
+///
+/// The tag is the whole of what a guest has to name an export by, so a
+/// duplicate makes one of the two unreachable, and which one depends on the
+/// order the guest probes its devices in.
+///
+/// # Errors
+///
+/// Returns the tag when two exports carry it.
+pub fn check_unique_tags(shares: &[FsShare]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(shares.len());
+    for share in shares {
+        if !seen.insert(share.tag.as_str()) {
+            return Err(format!("duplicate virtio-fs tag {:?}", share.tag));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses two exports of the same host subtree that disagree on whether the
@@ -156,6 +182,12 @@ pub struct BootConfig {
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
     pub fs_shares: Vec<FsShare>,
+    /// The `virtiofsd` binary the Linux backends start for an export that
+    /// brings no socket of its own, or `None` to look for one.
+    ///
+    /// The search order is the `virtiofsd` module's, which is compiled only
+    /// on Linux, so this is not an intra-doc link.
+    pub virtiofsd: Option<PathBuf>,
     pub net: bool,
     /// When set, virtio-net relays frames to this gvisor-tap-vsock gateway QEMU
     /// stream socket (real egress) instead of the built-in user-space stack.
@@ -206,7 +238,7 @@ pub enum Stop {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, CachePolicy, FsShare, ShareMode};
+    use super::{check_export_overlap, check_unique_tags, CachePolicy, FsShare, ShareMode};
     use std::path::{Path, PathBuf};
 
     fn shares(pairs: &[(&str, ShareMode)]) -> Vec<FsShare> {
@@ -218,6 +250,7 @@ mod tests {
                 tag: format!("tag{i}"),
                 mode: *mode,
                 cache: CachePolicy::Auto,
+                socket: None,
             })
             .collect()
     }
@@ -280,12 +313,14 @@ mod tests {
                 tag: "real".into(),
                 mode: ShareMode::ReadWrite,
                 cache: CachePolicy::Auto,
+                socket: None,
             },
             FsShare {
                 path: dir.join("link"),
                 tag: "link".into(),
                 mode: ShareMode::ReadOnly,
                 cache: CachePolicy::Auto,
+                socket: None,
             },
         ])
         .unwrap_err();
@@ -333,5 +368,17 @@ mod tests {
         check_export_overlap(&shares(&[("/srv/root", ShareMode::ReadWrite)]))
             .expect("one export is fine");
         check_export_overlap(&[]).expect("no exports at all is fine");
+    }
+
+    #[test]
+    fn two_exports_may_not_share_a_tag() {
+        let mut shares = shares(&[
+            ("/srv/a", ShareMode::ReadOnly),
+            ("/srv/b", ShareMode::ReadOnly),
+        ]);
+        check_unique_tags(&shares).expect("distinct tags");
+        shares[1].tag = shares[0].tag.clone();
+        let err = check_unique_tags(&shares).expect_err("a duplicate tag");
+        assert!(err.contains(&shares[0].tag), "{err}");
     }
 }
