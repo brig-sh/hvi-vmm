@@ -24,13 +24,13 @@ test`, `cargo deny check`, the workflow lint and the spell check. `tidy.sh` and
 supply (the `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl` targets, `cargo-deny`, `actionlint` plus
 `shellcheck`, `typos`), so each is skipped when it is missing and every skip it
-probes for is named in the closing line. One skip is not counted
-there: `tidy.sh` drops the comment-reflow pass when the pinned nightly is
-missing, says so on stderr, and `gates.sh` still prints `ok`. Install that
-nightly, or CI finds what you missed. `--with-perf` adds the virtio-fs performance
-gate (`tools/perf-gate.sh`, macOS only), which builds the merge base as well
-as the branch and so costs more than every other check together. The live
-boots, the other host's backend and the commit-message lint stay CI's job.
+probes for is named in the closing line. One skip is not counted there:
+`tidy.sh` drops the comment-reflow pass when the pinned nightly is missing,
+says so on stderr, and `gates.sh` still prints `ok`. Install that nightly, or
+CI finds what you missed. `--with-perf` adds the virtio-fs performance gate
+(`tools/perf-gate.sh`, macOS only), which builds the merge base as well as the
+branch and so costs more than every other check together. The live boots, the
+other host's backend and the commit-message lint stay CI's job.
 
 Only the backend for your host target is compiled: the macOS/hvf one on Apple
 silicon, x86-64/KVM on an x86 Linux box. To lint a backend you have no host for,
@@ -54,6 +54,42 @@ MSRV floor, a compatibility claim rather than the build pin. No CI job builds
 at that floor, so nothing enforces it. Treat a change that raises it as
 something a reviewer has to notice.
 
+## Comments
+
+`tools/tidy.sh` reflows comments to 80 columns. That width is the only part
+of this a machine checks; the rest is convention.
+
+A doc comment on a function opens with a verb, in the third person: "Returns
+the name of the opcode", not "The name of the opcode". One that returns a
+bool reads "Returns whether ...". Types, fields, constants, variants and
+`//!` module headers take a noun phrase instead, because they name a thing
+rather than an action.
+
+Keep the summary to one sentence, and let it stand on its own. rustdoc prints
+the whole first paragraph in its item tables and nothing after it, so a second
+statement packed into that sentence reads as noise there. Put it below the
+blank `///` line.
+
+A `#[test]` function takes `//`, not `///`. rustdoc renders nothing under
+`#[cfg(test)]`, so a `///` above a `#[test]` is a code comment in a doc
+comment's syntax. Write that `//` only for a reason the test name cannot
+carry. Name a test for the behavior it checks, without an `a_` or `an_`
+prefix. Test helpers are ordinary private functions and keep `///`.
+
+Every struct field carries a `///`, private ones included. `tools/tidy.sh`
+builds the docs with `--document-private-items`, so private items render like
+public ones.
+
+Write a comment when it carries what the code cannot: where a constant's value
+came from, an ordering that has to hold, an approach that was tried and
+dropped. Measurements, before-and-after numbers and how a bug was found belong
+in the commit message. They are searchable there, and they do not go stale as
+the code moves. Issue and pull-request numbers belong there too, not in a
+comment.
+
+Touching a comment means conforming it. A doc comment you rewrite is yours,
+whoever wrote it first.
+
 ## Branches
 
 `main` is always releasable and protected; changes land through pull requests.
@@ -70,7 +106,9 @@ that means: keep a mechanical refactor in its own commit ahead of the change it
 enables, don't mix unrelated fixes in, and rebase away "fix typo from previous
 commit" before asking for review. Rewrite history freely while the branch is
 yours; once review has started, append fixup commits so reviewers can see what
-changed between rounds, and squash before merge.
+changed between rounds. When the reviewer is done, squash each one into the
+commit it fixes and push that before the final approval, so the approval covers
+the commits that land.
 
 Sign off every commit with `git commit -s`, which adds the `Signed-off-by`
 trailer and certifies the [DCO](https://developercertificate.org/). CI rejects
@@ -94,7 +132,9 @@ The rules CI enforces per pull request, from
 `.github/linters/commitlint.config.mjs`:
 
 - header within 72 columns, subject capitalized and without a trailing period
-- scope lowercase (arch, x86, virtio, boot, layout, fdt, ci, docs)
+- scope lowercase, and otherwise free: `scope-case` is the only rule on it,
+  so there is no fixed list. `arch`, `x86`, `kvm`, `virtio`, `virtio-fs`,
+  `vsock`, `net`, `sandbox` and `fdt` are among the ones in use
 - body prose wrapped at 72 columns, trailers and table rows exempt
 - a `Signed-off-by` trailer on every commit (DCO)
 
@@ -144,20 +184,26 @@ the same reusable ones.
   with shellcheck over the workflows, and `cargo deny check` over the lockfile.
 - **build-and-test**: the unit suite on x86 Linux, on `macos-15`, and against
   musl on x86-64 and arm64 Linux, the two confinement selftests, and then the
-  live boots on the self-hosted runners.
+  live boots on the self-hosted runners. The Seatbelt selftest is a step in
+  the macOS job. The seccomp one is its own job on x86 Linux
+  (`Seccomp filters (x86-64)`), and a step in both musl jobs and in the
+  arm64/KVM boot.
 
 `tools/gates.sh` runs everything in that list a developer machine can run.
 Three checks cannot run anywhere but CI: the other host's backend, the live
 boots, and the commit-message lint, which needs a pull request's commit range.
 
-The self-hosted lanes, which are the three live boots and the performance
-gate, are withheld from pull requests opened from a fork, because they run on
+The self-hosted lanes, which are the live boots and the performance gate,
+are withheld from pull requests opened from a fork, because they run on
 persistent machines the project owns rather than ephemeral VMs. A fork still
 gets every hosted job.
 
+The live boots are `Boot x86`, `Boot arm64/hvf`, `Boot Unikraft arm64/hvf`
+and `Boot arm64/kvm`, the last a matrix over vGICv2 and vGICv3.
+
 Every job carries a `timeout-minutes` cap. The boot jobs upload their logs as
-artifacts when they fail, and the two arm64 boots also upload the event
-ledger.
+artifacts when they fail, and the arm64/hvf and arm64/KVM boots also upload
+the event ledger.
 
 One known gap: the arm64/KVM backend is unit-tested on its stop path only.
 `src/arch/aarch64/kvm.rs` carries only tests of how a vCPU thread that ends
