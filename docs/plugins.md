@@ -80,11 +80,17 @@ flag and return, as `MemoryDump` does; the backend kicks once `request` returns.
 ## Reading guest memory
 
 `CpuHandle::ram()` borrows the VMM's own mapping, which is writable. If your
-tool only reads, prefer mapping your own read-only view from
-`VmHandle::ram_fd()` and `ram_regions()`, as `MemoryDump` does. It costs one
-`mmap` at attach and makes a class of bug structurally impossible: a tool
-holding `PROT_READ` pages cannot corrupt the guest it is inspecting, however
-wrong the rest of it is.
+tool only reads, build a `GuestRamView` over `VmHandle::ram_fd()` and
+`ram_regions()` instead, as `MemoryDump` does: duplicate the descriptor with
+`try_clone_to_owned()`, pair it with each region, and pass the pairs to
+`GuestRamView::map`. Build it in `attach`: the constructor duplicates the
+descriptor, checks the object's length and maps each region, and the seccomp
+filters that arm after `attach` do not allow the length check. The type has no
+write accessor and its pages are `PROT_READ`, so nothing your tool does through
+the view can write the guest. `GuestRam` dereferences to `GuestRamView`, so code
+written against the view runs unchanged on `ram()` inside the VMM. A tool
+outside the VMM process builds the same pairs from the hello on the control
+socket, which carries one descriptor to pair with every region in its list.
 
 Guest RAM is not always one span. `ram_regions()` returns one region on arm64.
 On x86-64 it returns one region up to 3328 MiB of guest RAM and two above
