@@ -194,9 +194,11 @@ jobs:
       - name: build
         if: steps.kvm.outputs.ok == 'yes'
         run: cargo build --release
+      # `linux-headers-virtual` is here for `scripts/extract-vmlinux`, which the
+      # step below runs against the image `linux-image-virtual` installs.
       - name: guest kernel
         if: steps.kvm.outputs.ok == 'yes'
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual zstd binutils
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual linux-headers-virtual zstd binutils
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
         if: steps.kvm.outputs.ok == 'yes'
         run: |
@@ -218,17 +220,24 @@ jobs:
           grep -qE "Total of 2 processors activated|smp: Brought up 1 node, 2 CPUs" boot.log \
             || { echo "::error::AP did not come online — SMP bringup failed"; exit 1; }
           echo "SMP: 2 processors online ✓"
-      # The distribution vmlinuz is a bzImage. scripts/extract-vmlinux from the
-      # kernel tree, fetched by tag and checked by hash, unpacks the ELF inside
-      # it, which is the other x86 format hvi boots.
+      # The distribution vmlinuz is a bzImage. `scripts/extract-vmlinux` unpacks
+      # the ELF inside it, which is the other x86 format hvi boots. It comes
+      # from the headers package apt installed a step ago, so it is the copy
+      # that ships with the kernel being unpacked, it arrives over the same
+      # signed archive as everything else here, and the job reaches no host of
+      # its own to get it.
       - name: boot the uncompressed vmlinux
         if: steps.kvm.outputs.ok == 'yes'
         run: |
           KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
-          curl -sSfL -o extract-vmlinux https://raw.githubusercontent.com/torvalds/linux/v6.18/scripts/extract-vmlinux
-          echo "aacb6bb09af227a6cf508f5283458f001722a39abd9c4cfb026bc97c31624910  extract-vmlinux" | sha256sum -c -
+          EXTRACT=$(find /usr/src -maxdepth 3 -type f -path '*/scripts/extract-vmlinux' \
+            | sort -V | tail -1)
+          # Named rather than assumed: the path carries a kernel version, and a
+          # missing file would otherwise surface as an empty vmlinux below.
+          test -n "$EXTRACT" || { echo "::error::no extract-vmlinux in the installed kernel headers"; exit 1; }
+          echo "extractor: $EXTRACT"
           sudo install -m 644 "$KIMG" vmlinuz
-          bash extract-vmlinux vmlinuz > vmlinux
+          bash "$EXTRACT" vmlinuz > vmlinux
           # The script exits 0 whether or not it found a kernel.
           if ! { test -s vmlinux && head -c4 vmlinux | grep -q $'\x7fELF'; }; then
             echo "::error::extract-vmlinux did not produce an ELF"; exit 1
