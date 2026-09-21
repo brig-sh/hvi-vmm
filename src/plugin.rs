@@ -100,12 +100,12 @@ pub trait VmHandle: Send + Sync {
     /// Descriptor of the object backing guest RAM, borrowed from this handle.
     ///
     /// Guest RAM is allocated from something nameable (see
-    /// [`crate::sharedmem`]), so a tool can map its own view of it rather than
-    /// borrowing the VMM's. [`crate::plugins::MemoryDump`] maps a read-only
-    /// one, which is what makes it structurally unable to corrupt the guest it
-    /// is dumping. The descriptor stays open as long as the handle does; a
-    /// plugin that needs it past the borrow, on a thread of its own or across a
-    /// `SCM_RIGHTS` send, keeps a duplicate from `try_clone_to_owned`.
+    /// [`crate::sharedmem`]), so a tool can build its own read-only
+    /// [`GuestRamView`](crate::guestmem::GuestRamView) over it rather than
+    /// borrow the VMM's mapping. The descriptor stays open as long as the
+    /// handle does; a plugin that needs it past the borrow, on a thread of its
+    /// own or across a `SCM_RIGHTS` send, keeps a duplicate from
+    /// `try_clone_to_owned`.
     fn ram_fd(&self) -> BorrowedFd<'_>;
 
     /// Where the guest's RAM sits, in guest-physical terms and in the backing

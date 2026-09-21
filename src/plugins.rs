@@ -44,6 +44,7 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::guestmem::GuestRamView;
 use crate::plugin::{CpuHandle, IoSink, MemRegion, Plugin, VmHandle};
 
 /// Runs several plugins as one, in order.
@@ -109,8 +110,8 @@ pub struct MemoryDump {
     pending: Arc<AtomicBool>,
     /// Seconds after attach to dump automatically, for unattended runs.
     after: Option<u64>,
-    /// A read-only mapping of guest RAM, and where each piece lives.
-    view: Mutex<Option<ReadOnlyRam>>,
+    /// A read-only mapping of guest RAM, made at attach.
+    view: Mutex<Option<GuestRamView>>,
 }
 
 impl MemoryDump {
@@ -137,7 +138,7 @@ impl MemoryDump {
     #[must_use]
     pub fn regions(&self) -> Vec<MemRegion> {
         match self.view.lock() {
-            Ok(v) => v.as_ref().map(|r| r.regions.clone()).unwrap_or_default(),
+            Ok(v) => v.as_ref().map(GuestRamView::regions).unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     }
@@ -153,19 +154,22 @@ impl MemoryDump {
                 "memory dump was never attached",
             ));
         };
-        let mut out = BufWriter::new(File::create(&self.path)?);
+        let mut out = File::create(&self.path)?;
         let mut written = 0u64;
-        for (i, region) in view.regions.iter().enumerate() {
-            // Written in 1 MiB slices rather than one call, so a partial write
-            // on a full disk fails on a boundary we can report.
-            let bytes = view.slice(i);
-            for chunk in bytes.chunks(1 << 20) {
-                out.write_all(chunk)?;
-                written += chunk.len() as u64;
+        // Written straight from the mapping in 1 MiB slices, one call per
+        // slice. macOS refuses a single write longer than `INT_MAX` bytes, so a
+        // region over 2 GiB cannot go in one call.
+        const SLICE: u64 = 1 << 20;
+        for region in view.regions() {
+            let mut offset = 0;
+            while offset < region.size {
+                let len = usize::try_from((region.size - offset).min(SLICE))
+                    .expect("a slice fits in usize");
+                view.write_to(region.gpa + offset, len, &mut out)?;
+                written += len as u64;
+                offset += len as u64;
             }
-            let _ = region;
         }
-        out.flush()?;
         Ok(written)
     }
 }
@@ -174,12 +178,17 @@ impl Plugin for MemoryDump {
     /// Maps its own read-only view of guest RAM and, if asked, starts the
     /// timer.
     ///
-    /// The view is read-only by construction, not by convention: this tool gets
-    /// `PROT_READ` pages of the same object the VMM runs the guest from, so a
-    /// bug here cannot corrupt the guest it is dumping. That is what
-    /// [`VmHandle::ram_fd`] is for.
+    /// The view maps `PROT_READ` pages of the object the VMM runs the guest
+    /// from, through a type with no write accessor, so nothing the dump does
+    /// through it can write the guest.
     fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
-        let view = ReadOnlyRam::map(vmm.ram_fd(), &vmm.ram_regions())?;
+        let file = Arc::new(File::from(vmm.ram_fd().try_clone_to_owned()?));
+        let regions: Vec<_> = vmm
+            .ram_regions()
+            .into_iter()
+            .map(|region| (Arc::clone(&file), region))
+            .collect();
+        let view = GuestRamView::map(&regions)?;
         *self
             .view
             .lock()
@@ -226,67 +235,6 @@ impl Plugin for MemoryDump {
 
     fn request(&self) {
         self.pending.store(true, Ordering::SeqCst);
-    }
-}
-
-/// A read-only mapping of the guest's RAM, made from the VMM's descriptor.
-struct ReadOnlyRam {
-    regions: Vec<MemRegion>,
-    maps: Vec<(*mut libc::c_void, usize)>,
-}
-
-// SAFETY: the mappings are `PROT_READ` and live until drop; nothing here hands
-// out a `&mut`, so sharing the handle across threads cannot produce a data race
-// that reading the guest's memory does not already have.
-unsafe impl Send for ReadOnlyRam {}
-unsafe impl Sync for ReadOnlyRam {}
-
-impl ReadOnlyRam {
-    fn map(fd: std::os::fd::BorrowedFd<'_>, regions: &[MemRegion]) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        let mut maps = Vec::with_capacity(regions.len());
-        for r in regions {
-            // SAFETY: mapping `size` bytes at `file_offset` of a descriptor
-            // that is open for the duration of the call; the mapping does not
-            // need it afterwards.
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    r.size as usize,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    fd.as_raw_fd(),
-                    r.file_offset as libc::off_t,
-                )
-            };
-            if p == libc::MAP_FAILED {
-                for (ptr, len) in &maps {
-                    // SAFETY: unmapping what this loop mapped.
-                    unsafe { libc::munmap(*ptr, *len) };
-                }
-                return Err(std::io::Error::last_os_error());
-            }
-            maps.push((p, r.size as usize));
-        }
-        Ok(ReadOnlyRam {
-            regions: regions.to_vec(),
-            maps,
-        })
-    }
-
-    fn slice(&self, i: usize) -> &[u8] {
-        let (ptr, len) = self.maps[i];
-        // SAFETY: `ptr` is a live `PROT_READ` mapping of `len` bytes.
-        unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }
-    }
-}
-
-impl Drop for ReadOnlyRam {
-    fn drop(&mut self) {
-        for (ptr, len) in &self.maps {
-            // SAFETY: unmapping this struct's own mappings, once.
-            unsafe { libc::munmap(*ptr, *len) };
-        }
     }
 }
 
@@ -421,23 +369,51 @@ mod tests {
         assert!(!path.exists(), "no file should be left behind");
     }
 
-    /// The read-only view maps what it was told to, and reads back the bytes
-    /// the writable side wrote -- the property the dumper depends on.
+    // The dump is the regions' bytes back to back in address order, written in
+    // slices; a region larger than one slice must come out whole.
     #[test]
-    fn a_read_only_view_sees_the_writable_side() {
-        let ram = crate::sharedmem::SharedRam::new(MemRegion::ALIGN as usize).expect("ram");
-        let regions = [MemRegion {
-            gpa: 0x4000_0000,
-            size: MemRegion::ALIGN,
-            file_offset: 0,
-        }];
-        crate::guestmem::GuestRam::new(&ram, &regions)
-            .expect("writable side")
-            .write_u8(0x4000_0000, 0xAB)
+    fn dump_writes_the_regions_in_address_order() {
+        const ALIGN: u64 = MemRegion::ALIGN;
+        let ram = crate::sharedmem::SharedRam::new(3 * ALIGN as usize).expect("ram");
+        let regions = [
+            MemRegion {
+                gpa: 0,
+                size: ALIGN,
+                file_offset: 0,
+            },
+            MemRegion {
+                gpa: 0x1_0000_0000,
+                size: 2 * ALIGN,
+                file_offset: ALIGN,
+            },
+        ];
+        let writable = crate::guestmem::GuestRam::new(&ram, &regions).expect("writable side");
+        writable.write(ALIGN - 4, b"LOW!").expect("write");
+        writable
+            .write(0x1_0000_0000 + 2 * ALIGN - 4, b"HIGH")
             .expect("write");
-        let view = ReadOnlyRam::map(ram.file().as_fd(), &regions).expect("map");
-        assert_eq!(view.slice(0)[0], 0xAB);
-        assert_eq!(view.slice(0).len(), MemRegion::ALIGN as usize);
+
+        let file = Arc::new(File::from(
+            ram.file().as_fd().try_clone_to_owned().expect("dup"),
+        ));
+        let view = GuestRamView::map(&[
+            (Arc::clone(&file), regions[0]),
+            (Arc::clone(&file), regions[1]),
+        ])
+        .expect("map");
+        let path = std::env::temp_dir().join(format!("hvi-dump-{}-order.raw", std::process::id()));
+        let dump = MemoryDump::new(path.to_str().unwrap());
+        *dump.view.lock().unwrap() = Some(view);
+        assert_eq!(dump.regions(), regions);
+
+        let written = dump.write_dump().expect("dump");
+        let image = std::fs::read(&path).expect("read the dump");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, 3 * ALIGN);
+        assert_eq!(image.len() as u64, 3 * ALIGN);
+        let low_end = ALIGN as usize;
+        assert_eq!(&image[low_end - 4..low_end], b"LOW!");
+        assert_eq!(&image[image.len() - 4..], b"HIGH");
     }
 
     /// A trace writes one line per event, in the order the device saw them.

@@ -65,7 +65,8 @@ pub mod fdlimit;
 /// `crate::layout` with it into every x86 build.
 #[cfg(target_arch = "aarch64")]
 pub mod fdt;
-/// `Send + Sync` accessor over the host's guest-RAM mapping.
+/// Guest RAM as a region collection, the VMM's writable mapping and a
+/// read-only view over its descriptor.
 pub mod guestmem;
 /// Guest-physical memory layout (arm64).
 #[cfg(target_arch = "aarch64")]
