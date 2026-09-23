@@ -32,7 +32,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
 use crate::guestmem::GuestRam;
-use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
+use crate::virtio::{reg, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
@@ -62,8 +62,15 @@ const OP_CREDIT_REQUEST: u16 = 7;
 /// Device to guest: the credit we advertise, so how much unread data the guest
 /// may leave outstanding with us.
 const OUR_BUF_ALLOC: u32 = 256 * 1024;
-/// Device to guest: how much payload we put in one RW packet we send.
-const MAX_RW: usize = 16 * 1024;
+/// Device to guest: the most payload we frame into one RW packet before
+/// handing it to `fill_rx`.
+///
+/// This is `VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE`, the payload a Linux guest's
+/// receive buffer holds, so a packet framed here lands in one of them whole.
+/// `fill_rx` still splits, because a guest is free to post something smaller
+/// and pre-6.4 guests split the header off into its own descriptor, but it is
+/// the fallback rather than the rule.
+const MAX_RW: usize = 4096;
 /// Guest to device: ceiling on the packet a transmit chain may assemble.
 ///
 /// Descriptor lengths are guest-controlled, so without a ceiling the guest
@@ -394,7 +401,7 @@ impl VirtioVsock {
                 mem.read_u16(da + 12).ok()?,
                 mem.read_u16(da + 14).ok()?,
             );
-            if flags & 2 == 0 {
+            if flags & VIRTQ_DESC_F_WRITE == 0 {
                 // The length comes from the guest, so it is checked against
                 // the ceiling before it is allowed to size an allocation, and
                 // the bytes are read straight into the packet rather than
@@ -407,7 +414,7 @@ impl VirtioVsock {
                 buf.resize(start + len, 0);
                 mem.read(addr, &mut buf[start..]).ok()?;
             }
-            if flags & 1 == 0 {
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             d = next;
@@ -533,6 +540,67 @@ impl VirtioVsock {
         self.pending.push_back(hdr.to_bytes().to_vec());
     }
 
+    /// Returns the writable segments of RX descriptor chain `head`, in order,
+    /// or `None` when the chain does not end within the queue's size.
+    ///
+    /// Linux posts one buffer per packet today, but the chained form is just as
+    /// legal: older guests split the header off into its own descriptor, and a
+    /// device that reads only the head silently drops the body.
+    fn rx_chain(&self, mem: &GuestRam, head: u16) -> Option<Vec<(u64, u32)>> {
+        let q = &self.queues[RX_QUEUE as usize];
+        let mut segs = Vec::new();
+        let mut d = head;
+        for _ in 0..q.size() {
+            let da = q.desc_addr(d)?;
+            let (addr, len, flags, next) = (
+                mem.read_u64(da).ok()?,
+                mem.read_u32(da + 8).ok()?,
+                mem.read_u16(da + 12).ok()?,
+                mem.read_u16(da + 14).ok()?,
+            );
+            if flags & VIRTQ_DESC_F_WRITE != 0 {
+                segs.push((addr, len));
+            }
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
+                return Some(segs);
+            }
+            d = next;
+        }
+        // A chain that never clears NEXT within the queue's own size is a
+        // cycle. Walking it to the budget would return the same descriptor
+        // many times over, and the caller would size a packet from capacity
+        // that does not exist and then write every copy onto one buffer.
+        None
+    }
+
+    /// Trims `pkt` to the `cap` bytes the guest's buffer holds and re-queues
+    /// the rest as the next RW packet.
+    ///
+    /// A stream connection carries bytes, not messages, so cutting one RW
+    /// packet into two is invisible to the guest. What it must never see is a
+    /// header promising more payload than the buffer received. Only RW packets
+    /// carry a payload, so nothing else can outgrow a buffer that holds a
+    /// header at all.
+    fn split_pending(&mut self, pkt: Vec<u8>, cap: usize) -> Vec<u8> {
+        let keep = cap - HDR_LEN;
+        // Every producer of `pending` frames its packet with `Hdr::to_bytes`,
+        // and `fill_rx` reaches this only for a packet longer than a buffer
+        // that already holds a header, so the parse cannot fail. Saying so
+        // here keeps a silent short write from ever standing in for it.
+        let mut h = Hdr::parse(&pkt).expect("a pending packet always carries a header");
+        let mut tail_hdr = h;
+        tail_hdr.len = (pkt.len() - HDR_LEN - keep) as u32;
+        let mut tail = tail_hdr.to_bytes().to_vec();
+        tail.extend_from_slice(&pkt[HDR_LEN + keep..]);
+        self.pending.push_front(tail);
+
+        h.len = keep as u32;
+        let mut head = pkt;
+        head.truncate(HDR_LEN + keep);
+        head[..HDR_LEN].copy_from_slice(&h.to_bytes());
+        head
+    }
+
     /// Delivers pending host -> guest packets into the guest's RX buffers.
     fn fill_rx(&mut self, mem: &GuestRam) {
         if !self.queues[RX_QUEUE as usize].is_ready() {
@@ -551,18 +619,45 @@ impl VirtioVsock {
             let Ok(head) = mem.read_u16(slot) else {
                 return;
             };
-            let Some(da) = rx.desc_addr(head) else {
+            // A chain this walk refuses is malformed, so the guest cannot
+            // repost its way out of it: this head stays at the front of the
+            // ring and the RX queue stops for that guest. Completing it with a
+            // used length of zero would keep the queue moving; only a guest
+            // that posted a cycle reaches it.
+            let Some(segs) = self.rx_chain(mem, head) else {
                 return;
             };
-            let (Ok(addr), Ok(len)) = (mem.read_u64(da), mem.read_u32(da + 8)) else {
-                return;
-            };
-            let pkt = self.pending.pop_front().unwrap();
-            let n = pkt.len().min(len as usize);
-            if mem.write(addr, &pkt[..n]).is_err() {
+            let cap: usize = segs.iter().map(|&(_, l)| l as usize).sum();
+            let waiting = self.pending.front().map_or(0, Vec::len);
+            // A buffer too small for a header cannot carry any packet, and one
+            // that holds exactly a header cannot carry a payload: splitting
+            // there would hand the guest a zero-payload RW packet and push the
+            // whole of the original back, consuming every buffer it posts
+            // without moving a byte. As in `virtio_net::inject_rx`, a head
+            // that can never hold what is waiting blocks the packets behind it
+            // until the guest reposts one that can; leave the queue alone
+            // rather than complete it with a partial packet.
+            if cap < HDR_LEN || (waiting > cap && cap == HDR_LEN) {
                 return;
             }
-            self.queues[RX_QUEUE as usize].push_used(mem, head, n as u32);
+            let pkt = self.pending.pop_front().unwrap();
+            let pkt = if pkt.len() > cap {
+                self.split_pending(pkt, cap)
+            } else {
+                pkt
+            };
+            let mut off = 0usize;
+            for (addr, len) in segs {
+                if off == pkt.len() {
+                    break;
+                }
+                let n = (pkt.len() - off).min(len as usize);
+                if mem.write(addr, &pkt[off..off + n]).is_err() {
+                    return;
+                }
+                off += n;
+            }
+            self.queues[RX_QUEUE as usize].push_used(mem, head, off as u32);
             self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
             self.interrupt_status |= 1;
         }
@@ -619,7 +714,7 @@ mod session_tests {
     use std::io::Read;
     use std::time::Duration;
 
-    use crate::virtio::VIRTQ_DESC_F_WRITE;
+    use crate::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     fn mem_of(len: usize) -> GuestRam {
         GuestRam::from_ranges(&[(0x4000_0000, len)])
@@ -1017,5 +1112,206 @@ mod session_tests {
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"hello"));
         assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"hello"[..]));
         assert_eq!(dev.conns[&port].rx_cnt, 5, "credit accounted");
+    }
+
+    /// Programs the RX queue with `n` buffers of `size` bytes each, the way a
+    /// guest driver publishes receive buffers.
+    fn program_rx_buffers(
+        dev: &mut VirtioVsock,
+        mem: &GuestRam,
+        rings: (u64, u64, u64, u64),
+        n: u16,
+        size: u32,
+    ) {
+        let (desc, avail, used, data) = rings;
+        for i in 0..u64::from(n) {
+            let d = desc + i * 16;
+            mem.write_u64(d, data + i * u64::from(size)).unwrap();
+            mem.write_u32(d + 8, size).unwrap();
+            mem.write_u16(d + 12, VIRTQ_DESC_F_WRITE).unwrap();
+            mem.write_u16(d + 14, 0).unwrap();
+            mem.write_u16(avail + 4 + i * 2, i as u16).unwrap();
+        }
+        mem.write_u16(avail + 2, n).unwrap(); // avail.idx
+        program_queue(dev, mem, RX_QUEUE, desc, avail, used);
+    }
+
+    /// Reads back the packet the device wrote into RX buffer `i`, using the
+    /// length it reported in used slot `u`.
+    fn delivered(mem: &GuestRam, used: u64, u: u64, data: u64, size: u32) -> (Hdr, Vec<u8>) {
+        let entry = used + 4 + u * 8;
+        let id = u64::from(mem.read_u32(entry).unwrap());
+        let written = mem.read_u32(entry + 4).unwrap() as usize;
+        let mut buf = vec![0u8; written];
+        mem.read(data + id * u64::from(size), &mut buf).unwrap();
+        let h = Hdr::parse(&buf).unwrap();
+        (h, buf[HDR_LEN..].to_vec())
+    }
+
+    // A host write larger than the guest's receive buffer is split across
+    // buffers instead of being cut to the first one. The tail used to be
+    // dropped with no error anywhere, taking the frame that closes stdin with
+    // it, so a guest command waited on a stdin that never ended.
+    //
+    // The buffers are deliberately smaller than a framed packet. At the
+    // guest's usual 44 + 4096 they are exactly as large as one, so nothing
+    // would be longer than a buffer and `split_pending` would never run: the
+    // test would pass against a device that truncates.
+    #[test]
+    fn host_data_larger_than_one_rx_buffer_is_split_not_truncated() {
+        const BASE: u64 = 0x4000_0000;
+        // Under `MAX_RW` + `HDR_LEN`, so every framed packet has to be split.
+        const RXBUF: u32 = 2048;
+        const PAYLOAD: usize = 5000;
+        const BUFFERS: u16 = 8;
+
+        let mem = mem_of(0x8000);
+        let mut dev = VirtioVsock::new();
+        let (desc, avail, used, data) = (BASE, BASE + 0x200, BASE + 0x400, BASE + 0x1000);
+        program_rx_buffers(&mut dev, &mem, (desc, avail, used, data), BUFFERS, RXBUF);
+
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side);
+        dev.connect(&mem, port); // REQUEST takes used slot 0
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+
+        dev.host_data(&mem, port, &vec![b'x'; PAYLOAD]);
+
+        let completed = mem.read_u16(used + 2).unwrap();
+        assert!(
+            completed > 3,
+            "{PAYLOAD} bytes over {RXBUF}-byte buffers took {completed} \
+             completions, so nothing was split"
+        );
+        let mut carried = Vec::new();
+        for slot in 1..u64::from(completed) {
+            let (hdr, body) = delivered(&mem, used, slot, data, RXBUF);
+            assert_eq!(hdr.op, OP_RW);
+            assert_eq!(
+                hdr.len as usize,
+                body.len(),
+                "the header of packet {slot} describes {} bytes but {} landed",
+                hdr.len,
+                body.len()
+            );
+            assert!(body.len() <= RXBUF as usize - HDR_LEN);
+            carried.extend_from_slice(&body);
+        }
+        assert_eq!(
+            carried.len(),
+            PAYLOAD,
+            "every byte the host wrote reached the guest"
+        );
+        assert!(carried.iter().all(|&b| b == b'x'));
+    }
+
+    // An RX chain that never clears NEXT is refused rather than walked to the
+    // queue's size. The walk used to end on the budget and hand back the
+    // segments it had collected, so one self-referencing descriptor became
+    // `q.size()` copies of the same buffer: a capacity far larger than the
+    // guest posted, no split for a packet that needed one, and every copy
+    // written over the same bytes with a used length the buffer could not hold.
+    #[test]
+    fn rx_descriptor_cycle_is_refused() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = mem_of(0x8000);
+        let mut dev = VirtioVsock::new();
+        program_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+
+        // desc[0] -> desc[0], writable and carrying NEXT.
+        mem.write_u64(BASE, BASE + 0x4000).unwrap();
+        mem.write_u32(BASE + 8, 4140).unwrap();
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+            .unwrap();
+        mem.write_u16(BASE + 14, 0).unwrap();
+        assert_eq!(dev.rx_chain(&mem, 0), None, "a cycle yields no segments");
+
+        // The same descriptor with NEXT clear is an ordinary one-buffer chain.
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE).unwrap();
+        assert_eq!(dev.rx_chain(&mem, 0), Some(vec![(BASE + 0x4000, 4140)]));
+    }
+
+    // A buffer with room for a header and nothing else is left for the guest to
+    // repost, rather than split into a packet that carries no payload.
+    // `split_pending` would take `keep = 0`, deliver an RW header describing an
+    // empty payload and push the whole of the original back to the front of the
+    // queue, so every buffer the guest posted would be consumed and not one
+    // payload byte would move.
+    #[test]
+    fn buffer_that_holds_only_a_header_carries_no_payload() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = mem_of(0x8000);
+        let mut dev = VirtioVsock::new();
+        let (desc, avail, used, data) = (BASE, BASE + 0x200, BASE + 0x400, BASE + 0x1000);
+        program_rx_buffers(&mut dev, &mem, (desc, avail, used, data), 4, HDR_LEN as u32);
+
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side);
+        dev.connect(&mem, port); // REQUEST is header-only and fits exactly
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "the REQUEST landed");
+
+        dev.host_data(&mem, port, b"payload");
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            1,
+            "no buffer is completed for a packet none of them can carry"
+        );
+        assert_eq!(
+            dev.pending.len(),
+            1,
+            "the packet waits for a buffer with room for a payload"
+        );
+    }
+
+    // A guest that splits the header off into its own descriptor still gets the
+    // whole packet: the RX walker follows the chain the way the transmit walker
+    // always has.
+    #[test]
+    fn chained_rx_buffer_receives_the_whole_packet() {
+        const BASE: u64 = 0x4000_0000;
+        const BODY: usize = 900;
+
+        let mem = mem_of(0x8000);
+        let mut dev = VirtioVsock::new();
+        let (desc, avail, used, data) = (BASE, BASE + 0x200, BASE + 0x400, BASE + 0x1000);
+
+        // Two chains of two descriptors each: a 44-byte header buffer and a
+        // 4096-byte body buffer, as pre-6.4 Linux posts them.
+        for i in 0..2u64 {
+            let (hd, bd) = (desc + i * 32, desc + i * 32 + 16);
+            let base = data + i * 0x2000;
+            mem.write_u64(hd, base).unwrap();
+            mem.write_u32(hd + 8, HDR_LEN as u32).unwrap();
+            mem.write_u16(hd + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+                .unwrap();
+            mem.write_u16(hd + 14, (i * 2 + 1) as u16).unwrap();
+            mem.write_u64(bd, base + HDR_LEN as u64).unwrap();
+            mem.write_u32(bd + 8, 4096).unwrap();
+            mem.write_u16(bd + 12, 2).unwrap();
+            mem.write_u16(bd + 14, 0).unwrap();
+            mem.write_u16(avail + 4 + i * 2, (i * 2) as u16).unwrap();
+        }
+        mem.write_u16(avail + 2, 2).unwrap();
+        program_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
+
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side);
+        dev.connect(&mem, port); // REQUEST takes the first chain
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        dev.host_data(&mem, port, &vec![b'y'; BODY]);
+
+        let entry = used + 4 + 8;
+        assert_eq!(mem.read_u32(entry).unwrap(), 2, "the second chain was used");
+        assert_eq!(
+            mem.read_u32(entry + 4).unwrap() as usize,
+            HDR_LEN + BODY,
+            "header and body both landed"
+        );
+        let mut buf = vec![0u8; HDR_LEN + BODY];
+        mem.read(data + 0x2000, &mut buf).unwrap();
+        let h = Hdr::parse(&buf).unwrap();
+        assert_eq!((h.op, h.len as usize), (OP_RW, BODY));
+        assert!(buf[HDR_LEN..].iter().all(|&b| b == b'y'));
     }
 }
