@@ -19,8 +19,9 @@ You need:
   the `hv_gic_*` calls, which arrived in macOS 15, so an older host has no
   such symbols. hvi does not check the version itself and fails when it first
   reaches the framework rather than with a clear message.
-- On Linux: read and write access to `/dev/kvm`. Add yourself to the `kvm`
-  group. A group you join does not reach a running shell, so start a new one.
+- On Linux: kernel 4.11 or newer, and read and write access to `/dev/kvm`. Add
+  yourself to the `kvm` group. A group you join does not reach a running shell,
+  so start a new one.
 - `python3`, for the initramfs builder.
 - `oras`, to pull the kernel below. Optional: step 3 has a `curl` fallback
   that needs only `curl` and `python3`.

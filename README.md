@@ -56,7 +56,8 @@ Developer ID and no terminal session. Each build writes a new unsigned binary,
 which is why you sign after every build. Copying a signed binary keeps its
 signature.
 
-On Linux you need read and write access to `/dev/kvm`. No signing applies.
+On Linux you need kernel 4.11 or newer and read and write access to `/dev/kvm`.
+No signing applies.
 
 ## First boot
 
@@ -140,8 +141,8 @@ hvi is young. Read these before you build on it.
   flow, and it is not a tamper-proof record.
 - **The arm64/KVM backend is unit-tested on its stop path only.**
   `src/machine_linux.rs` carries only tests of how a vCPU thread that ends stops
-  the VM, and they need `/dev/kvm`. The rest of that backend is cross-linted and
-  booted.
+  the VM and how a kick ends a run, and they need `/dev/kvm`. The rest of that
+  backend is cross-linted and booted.
 
 [docs/limitations.md](docs/limitations.md) has the full list with the
 consequences.
