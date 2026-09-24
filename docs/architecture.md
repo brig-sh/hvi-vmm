@@ -88,16 +88,18 @@ environment variables. See
 ## 2. Guest memory
 
 `GuestRam` (`guestmem.rs`) is what makes the device models host-neutral: a
-wrapper over a `vm-memory` `GuestMemoryMmap` whose regions are the guest's
-RAM. Every device reads and writes guest memory only through it, and
-`memory()` returns the collection for the rust-vmm crates that take guest
-memory.
+wrapper over a `vm-memory` `GuestMemoryMmap` whose regions are the guest's RAM.
+Every device reads and writes guest memory only through it, and `memory()`
+returns the collection for the rust-vmm crates that take guest memory. Its read
+accessors live on `GuestRamView`, which it dereferences to; a tool that only
+reads builds a `GuestRamView` of its own over the RAM descriptor, with
+`PROT_READ` pages and no write accessor.
 
-Every accessor that takes a guest address resolves it through the wrapper's
-table of the collection's regions and fails with an `io::Error` on a range the
-guest does not own. A range that would cross from one region into the next is
-refused. `scan()` takes no guest address: it walks each region's host mapping
-and maps its hits back to guest addresses.
+Every accessor that takes a guest address resolves it through the view's table
+of the collection's regions and fails with an `io::Error` on a range the guest
+does not own. A range that would cross from one region into the next is refused.
+`scan()` takes no guest address: it walks each region's host mapping and maps
+its hits back to guest addresses.
 
 `host_ptr` is a bounds-checked raw pointer into one region for the iovec
 paths. It is a raw pointer rather than a `&mut [u8]` because a guest can point
@@ -105,8 +107,8 @@ two descriptors at one address, which would alias the borrow.
 
 The backing object comes from `sharedmem.rs`: a memfd on Linux or a POSIX
 shared-memory object on macOS, unlinked from the namespace as soon as it is
-created. An out-of-process tool given the descriptor can map the same pages
-read-only; no other process can open them by name. Each region is a
+created. A tool given the descriptor builds a `GuestRamView` over the same
+pages, read-only; no other process can open them by name. Each region is a
 `MAP_SHARED` mapping of that object at its file offset, and the hypervisor gets
 it as a KVM memory slot or through `hv_vm_map`. A region's address, size and
 file offset are multiples of 1 MiB, so they are page-aligned on any host.
