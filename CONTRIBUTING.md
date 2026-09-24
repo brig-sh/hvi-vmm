@@ -125,7 +125,10 @@ performance gate. What matters when you open a pull request:
 
 A pull request runs `.github/workflows/pr-build-and-verify.yml` and a push to
 `main` runs `main-build-and-verify.yml`. Both are thin entry workflows calling
-the same reusable ones.
+the same reusable ones. A push to `main` also runs `publish-binaries.yml`,
+which is where the development builds come from (see Releasing below); it is a
+workflow of its own because the main lane cancels a superseded run and a
+publish must not be cancelled.
 
 - **validate-commits** (pull requests only, since a rebase-and-merge lands the
   commits on `main` verbatim): the commit conventions above, per commit and
@@ -166,6 +169,62 @@ reflow nightly still agrees with the latest one.
 External actions are pinned to commit SHAs, with the version in a comment.
 Renovate keeps those pins, the Cargo dependencies and the commitlint tooling
 updated (`.github/renovate.json`).
+
+## Releasing
+
+A release is a tag, and nothing else. No file in the tree names a version, so
+there is no pull request to open first:
+
+```sh
+tools/changelog.sh                        # what the release would say
+git tag -a v0.2.0 -m "hvi 0.2.0"
+git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` takes it from there. It builds the three
+targets, signs the macOS binary with the organization's Developer ID and
+notarizes it, publishes the binaries to GHCR under the version, and creates
+the GitHub release with an archive per target, a `SHA256SUMS` file and a
+Sigstore signature over it. A version carrying a prerelease field, such as
+`v0.2.0-rc.1`, is marked as a prerelease.
+
+The preview is worth reading before you tag. The notes are the commit
+subjects, so a subject that reads badly is a subject to fix, and after the tag
+it is published.
+
+Nothing enforces that a version follows the one before it. The tag is the
+only place a version is written, so there is nothing for it to disagree with.
+What is checked is the other direction: each binary reports the version it was
+built at, and the release stops when that is not the version being released.
+
+### The changelog
+
+There is no `CHANGELOG.md`. A release's notes are generated from the
+Conventional-Commits history since the tag before it, so the releases page is
+the changelog and no copy of it can go stale. git-cliff does the generating,
+configured in [`cliff.toml`](cliff.toml) and driven by `tools/changelog.sh`.
+
+Entries are grouped by commit type, and `ci` and `style` commits are left out
+as things a reader of a changelog does not need. Since a pull request lands
+here with a rebase-and-merge, each commit reaches `main` verbatim and becomes
+one entry, linked to its commit. That is the other reason the commit
+conventions above matter: a commit subject is published.
+
+git-cliff is pinned in [`pins.env`](pins.env); an installed binary is used
+when there is one and the pinned version runs in a container otherwise.
+
+A tag that fails partway through is re-run with the workflow's `Existing tag
+to release` dispatch. Each step skips what is already published, so a second
+run repairs the release rather than duplicating it.
+
+Signing needs the organization's certificate and a route to Apple's notary
+service, so the macOS build runs on a self-hosted runner labelled `notary`.
+Nothing else in the release needs a runner the project owns.
+
+Between releases, every push to `main` publishes the same binaries to GHCR
+tagged by commit (`publish-binaries.yml`), with the macOS one signed ad-hoc.
+Those are development builds: the ad-hoc signature carries the entitlement
+only on a machine with the checks relaxed.
 
 ## AI policy
 

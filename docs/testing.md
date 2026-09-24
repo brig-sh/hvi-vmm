@@ -159,9 +159,30 @@ next green run closes it.
 
 ## Distribution
 
-There is none. No git tag exists, no workflow publishes a crate, and no
-workflow produces a release artifact. The only uploads anywhere are failure
-logs. Anything that tells a reader to install hvi is wrong.
+No crate is published. Binaries are, through two lanes that share one build
+(`build-binaries.yml`): a static musl build for each Linux target, and a
+signed build for macOS on Apple silicon.
+
+- `publish-binaries.yml` runs on every push to `main` and pushes the three
+  binaries to `ghcr.io/brig-sh/hvi-binaries`, tagged by commit and signed with
+  a keyless cosign signature. The macOS binary is signed ad-hoc, so it carries
+  the hypervisor entitlement only where the checks are relaxed. These are
+  development builds.
+- `release.yml` runs on a `vX.Y.Z` tag, which is the only place a version is
+  written. It signs the macOS binary with the organization's Developer ID and
+  notarizes it on a runner labelled `notary`, publishes the three binaries to
+  GHCR under the version, and creates the GitHub release: an archive per
+  target, a `SHA256SUMS` file, and a Sigstore signature over it. The notes
+  come from `tools/changelog.sh`, generated from the commits since the
+  previous tag.
+
+  The version is not passed into the build. Each binary derives it from the
+  history it was built in, and the release stops unless every one of them
+  reports the version being released, which is what says the binaries came
+  from the tagged commit.
+
+[../CONTRIBUTING.md](../CONTRIBUTING.md) covers how to cut one. The README
+covers how to verify a download.
 
 ## See also
 

@@ -40,7 +40,7 @@ jobs:
       # once under llvm-cov instead, which produces the same pass or fail plus
       # the profile the coverage badge reads. Only main publishes that number,
       # so a pull request does not pay for the instrumentation.
-      - run: cargo test
+      - run: cargo test --workspace
         if: github.event_name != 'push' || github.ref != 'refs/heads/main'
       - name: Install cargo-llvm-cov
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

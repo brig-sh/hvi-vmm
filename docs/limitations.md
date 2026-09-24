@@ -15,7 +15,7 @@ three things a reader should not have to guess between:
 | virtio-fs is macOS only. | The Linux backends carry no directory sharing at all. Use a disk image. | Design |
 | A non-backend host builds a stub. | The shared code and unit tests compile everywhere. That build cannot run a guest. | Design |
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
-| No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
+| No published crate, and no release cut yet. | A `vX.Y.Z` tag builds one (see CONTRIBUTING.md). Until then, build from source and pin a commit when you depend on it. | Design |
 | The arm64/KVM backend has no unit tests. | `src/machine_linux.rs` carries no `#[cfg(test)]` module. The full suite runs on both self-hosted arm64/KVM runners, so a test added there would be executed; that backend is cross-linted and booted, not unit-tested. | Defect |
 
 ## Devices

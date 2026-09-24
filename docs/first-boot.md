@@ -25,8 +25,8 @@ You need:
 - `oras`, to pull the kernel below. Optional: step 3 has a `curl` fallback
   that needs only `curl` and `python3`.
 
-There is no published crate and no downloadable release, so you build from
-source.
+There is no published crate. Build from source, or take a binary from a
+release (see the README) once one is cut.
 
 ## 1. Build
 
