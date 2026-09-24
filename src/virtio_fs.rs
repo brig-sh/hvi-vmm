@@ -11451,13 +11451,8 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // A plain READDIR reports the type the host already told us, for every
-    // kind it has a byte for. A guest that lists /dev otherwise pays a stat
-    // for each device node in it.
-    /// READDIR used to stat the node and answer ENOTDIR for a file. The gate
-    /// is the handle now, and with fh 0 there is none, so the refusal has to
-    /// come from the listing itself rather than from a stat this path no
-    /// longer makes.
+    // With fh 0 there is no handle to gate on and READDIR takes no stat of
+    // the node, so the ENOTDIR for a file comes from opening the listing.
     #[test]
     fn readdir_on_a_file_is_refused() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -11680,6 +11675,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // A plain READDIR reports the type the host already told us, for every
+    // kind it has a byte for. A guest that lists /dev otherwise pays a stat
+    // for each device node in it.
     #[test]
     fn opendir_below_a_swapped_directory_lists_nothing_outside() {
         let (dir, mut dev) = fixture_with_access(true);
