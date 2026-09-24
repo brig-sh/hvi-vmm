@@ -346,19 +346,17 @@ guest. `CpuHandle::pause()` requests the quiesce, kicks the vCPUs, and waits
 up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU never parks
 itself.
 
-On every backend, every path that ends a vCPU's run loop ends the VM through
-one stop routine, which clears the running flag, releases the quiesce so no
-vCPU stays parked, and kicks the other vCPUs out of the hypervisor. On the
-macOS backend the loop runs under `catch_unwind`, and a panic in a plugin hook
-or a device is reported with the vCPU, its last exit reason and its program
-counter before the stop. On the Linux and x86 backends a guard held by the
-vCPU thread calls the stop routine when the thread exits, whatever ended the
-loop: a guest-requested stop, a failed entry, an unhandled exit, a `KVM_RUN`
-error, or a panic unwinding through it. The panic report there is the standard
-one, and the vCPU threads are named `cpu0`, `cpu1` and so on, so it says which
-vCPU panicked. Under the seccomp sandbox the report has to stay unsymbolized:
-with `RUST_BACKTRACE` set it opens the binary, which the vCPU allowlist
-refuses, and the process dies of `SIGSYS` after the message.
+On every backend, every path that ends a vCPU's run loop ends the VM through one
+stop routine, which clears the running flag, releases the quiesce so no vCPU
+stays parked, and kicks the vCPUs out of the hypervisor. A guard held by the
+vCPU thread calls it when the thread exits, whatever ended the loop: a
+guest-requested stop, a failed entry, an unhandled exit, a failed run, or a
+panic. The vCPU threads are named `cpu0`, `cpu1` and so on, so the panic hook's
+report says which vCPU panicked. The macOS backend catches the panic at the loop
+and adds a line with the vCPU's last exit reason and its program counter. Under
+the seccomp sandbox the report has to stay unsymbolized: with `RUST_BACKTRACE`
+set it opens the binary, which the vCPU allowlist refuses, and the process dies
+of `SIGSYS` after the message.
 
 Device and ledger mutexes on the macOS backend and in the helper threads go
 through `sync::lock_or_recover`, which takes a poisoned lock so the panic that

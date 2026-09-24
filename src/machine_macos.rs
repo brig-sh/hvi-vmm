@@ -559,12 +559,26 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         readahead_stops.push(stop);
     }
 
-    // One thread per vCPU; join them all (cpu0 ends on PSCI SYSTEM_OFF and
-    // stops the rest).
+    // One thread per vCPU. From here on a failure stops the guest and is
+    // reported once every thread has been joined or left running, and the first
+    // failure is the one reported.
+    let mut failure: Option<Box<dyn std::error::Error>> = None;
     let mut joins = Vec::new();
     for cpu in 0..num_cpus {
         let sh = shared.clone();
-        joins.push(std::thread::spawn(move || run_cpu(cpu, sh)));
+        // The thread is named after its vCPU, so the panic hook's report says
+        // which one panicked.
+        let spawned = std::thread::Builder::new()
+            .name(format!("cpu{cpu}"))
+            .spawn(move || run_cpu(cpu, sh));
+        match spawned {
+            Ok(join) => joins.push(join),
+            Err(e) => {
+                failure = Some(format!("spawning the cpu{cpu} thread: {e}").into());
+                stop_all(&shared);
+                break;
+            }
+        }
     }
     for j in joins {
         let _ = j.join();
@@ -582,11 +596,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     kick_until_finished(&input, deadline);
-    let mut stuck = None;
     for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
         if let Err(e) = join_by(name, thread, deadline) {
             eprintln!("[hvi] {e}; left running");
-            stuck.get_or_insert(e);
+            failure.get_or_insert(e.into());
         }
     }
     lock_or_recover(&shared.emit).flush();
@@ -623,11 +636,24 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         eprintln!("[hvi] virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}");
     }
 
-    if let Some(e) = stuck {
-        return Err(e.into());
+    if let Some(e) = failure {
+        return Err(e);
     }
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
     Ok(stop)
+}
+
+/// A guard that ends the VM when dropped.
+///
+/// The drop calls [`stop_all`], on a panic as on a return.
+struct StopOnDrop<'a> {
+    sh: &'a Shared,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        stop_all(self.sh);
+    }
 }
 
 thread_local! {
@@ -651,15 +677,19 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let vcpu = match sh.vm.vcpu_create() {
         Ok(v) => v,
         Err(e) => {
-            // Returning alone left every other thread waiting on a vCPU that
-            // will never exist: the secondaries block for a CPU_ON that
-            // cannot arrive and the join in `boot` never returns. A vCPU that
-            // cannot be created ends the VM (#35).
+            // The secondaries would otherwise wait for a CPU_ON that cannot
+            // arrive, and the join in `boot` with them.
             eprintln!("[hvi] cpu{cpu_id}: vcpu_create failed: {e:?}");
             stop_all(&sh);
             return;
         }
     };
+    // Held for the rest of the run, so every way out ends the VM. A secondary
+    // that ended alone would otherwise leave the VM running with one vCPU fewer
+    // and the join in `boot` blocked. Declared after the vCPU so it drops
+    // first: the VM is stopped while this vCPU still exists, and its
+    // destruction is outside the stop.
+    let _stop = StopOnDrop { sh: &sh };
     let _ = vcpu.set_trap_debug_exceptions(false);
     let _ = vcpu.set_trap_debug_reg_accesses(false);
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
@@ -693,11 +723,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     }
 
     let is_boot = cpu_id == 0;
-    // The loop runs inside `catch_unwind` so a panic ends the VM with a
-    // report rather than leaving it alive with one thread missing. A panic
-    // in a plugin hook is the case that matters: those run between guest
-    // entries with the other vCPUs parked in `checkpoint`, and nothing was
-    // releasing them (#35).
+    // The loop runs inside `catch_unwind` only for the report. A panic is
+    // reported with where the guest was and what it last did, and the guard
+    // ends the VM on the way out.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         while sh.running.load(Ordering::SeqCst) {
             // Safe point for every vCPU: park here while cpu0 lets a plugin
@@ -716,10 +744,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             }
 
             if let Err(e) = vcpu.run() {
-                // Same shape as the four paths in #35, and not listed there:
-                // breaking alone left `running` true and the VM hung.
                 eprintln!("[hvi] cpu{cpu_id}: vcpu run failed: {e:?}");
-                stop_all(&sh);
                 break;
             }
             let exit = vcpu.get_exit_info();
@@ -778,11 +803,6 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                     "[hvi] cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
                                     vcpu.get_reg(Reg::PC).unwrap_or(0)
                                 );
-                                // Any vCPU, not only the boot one: a secondary
-                                // that gave up left the VM running with one
-                                // fewer
-                                // vCPU and nothing said so (#35).
-                                stop_all(&sh);
                                 break;
                             }
                         }
@@ -800,7 +820,6 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                 "[hvi] cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
                                 vcpu.get_reg(Reg::PC).unwrap_or(0)
                             );
-                            stop_all(&sh);
                             break;
                         }
                     }
@@ -811,13 +830,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 ExitReason::CANCELED => {} // kicked for a snapshot or a stop
                 ExitReason::UNKNOWN => {
                     // hvf could not say why it exited, so there is nothing to
-                    // resume into. Breaking alone left `running` true, so the
-                    // secondaries kept waiting and `boot` never joined (#35).
+                    // resume into.
                     eprintln!(
                         "[hvi] cpu{cpu_id}: unknown exit reason (pc {:#x})",
                         vcpu.get_reg(Reg::PC).unwrap_or(0)
                     );
-                    stop_all(&sh);
                     break;
                 }
             }
@@ -825,9 +842,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     }));
 
     if let Err(payload) = outcome {
-        // Name the thread, where the guest was, and what it last did, so the
-        // report is usable without a debugger. `payload` carries the panic
-        // message for the two types a `panic!` produces.
+        // The report names where the guest was and what it last did, so it is
+        // usable without a debugger. `payload` carries the panic message for
+        // the two types a `panic!` produces.
         let what = payload
             .downcast_ref::<&str>()
             .map(|s| (*s).to_string())
@@ -838,7 +855,6 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             last_exit(),
             vcpu.get_reg(Reg::PC).unwrap_or(0)
         );
-        stop_all(&sh);
     }
 }
 
@@ -963,12 +979,10 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
         }
         psci::SYSTEM_OFF => {
             *sh.stop.lock().unwrap() = Some(Stop::SystemOff);
-            stop_all(sh);
             true
         }
         psci::SYSTEM_RESET => {
             *sh.stop.lock().unwrap() = Some(Stop::SystemReset);
-            stop_all(sh);
             true
         }
         psci::FEATURES => {
@@ -1018,17 +1032,32 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
     }
 }
 
-/// Signals all vCPUs to stop and kicks them out of `run()`.
+/// Ends the VM.
+///
+/// Clears `running`, releases the quiesce so no vCPU stays parked at a
+/// checkpoint, kicks every vCPU out of `run()` and wakes the secondaries still
+/// waiting for `CPU_ON`. Only the first call kicks; a later one just releases
+/// the quiesce again.
 fn stop_all(sh: &Shared) {
-    sh.running.store(false, Ordering::SeqCst);
-    // Nobody may still be parked at a checkpoint once the VM is stopping. A
-    // plugin that panicked between `request` and `release` left every other
-    // vCPU waiting there with no one left to release them (#35).
+    let was_running = sh.running.swap(false, Ordering::SeqCst);
+    // A vCPU parked at a quiesce checkpoint waits on a condition variable the
+    // kick cannot end. Releasing sends it on to its run, which the kick ends,
+    // and it sees `running` at the top of its loop. Released on every call,
+    // since a request can follow the first release.
     sh.quiesce.release();
+    // One round of kicks is enough. A vCPU that has not entered its run yet
+    // keeps the cancel pending and leaves that run at once, and a secondary
+    // reads `running` under the mailbox lock the first round notified under.
+    if !was_running {
+        return;
+    }
     if let Ok(handles) = sh.handles.lock() {
         let _ = sh.vm.vcpus_exit(handles.as_slice());
     }
     for sec in sh.secondaries.iter() {
+        // The lock is taken so a secondary cannot be between its check of
+        // `running` and its wait when the notify lands.
+        let _mbox = lock_or_recover(&sec.mbox);
         sec.cv.notify_all();
     }
 }
