@@ -223,6 +223,10 @@ const LINUX_XATTR_REPLACE: u32 = 2;
 // private, no-follow xattrs while retaining host-owner access.
 const HVI_XATTR_PREFIX: &[u8] = b"com.nofire.hvi.";
 const HVI_XATTR_LINUX_ATTR: &[u8] = b"com.nofire.hvi.linux-attr";
+/// Length of the `HVI_XATTR_LINUX_ATTR` value: mode, uid and gid, each a
+/// little-endian `u32`.
+#[cfg(target_os = "macos")]
+const GUEST_ATTR_LEN: usize = 12;
 
 const LINUX_F_RDLCK: u32 = 0;
 const LINUX_F_WRLCK: u32 = 1;
@@ -5286,7 +5290,7 @@ fn filter_private_xattrs(value: Vec<u8>) -> Vec<u8> {
 
 #[cfg(target_os = "macos")]
 fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
-    let mut value = [0u8; 12];
+    let mut value = [0u8; GUEST_ATTR_LEN];
     value[0..4].copy_from_slice(&(guest.mode & 0o177777).to_le_bytes());
     value[4..8].copy_from_slice(&guest.uid.to_le_bytes());
     value[8..12].copy_from_slice(&guest.gid.to_le_bytes());
@@ -5296,10 +5300,10 @@ fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
 #[cfg(target_os = "macos")]
 fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
     let name = xattr_name(HVI_XATTR_LINUX_ATTR).ok()?;
-    // The value is twelve bytes, so a buffer that size reads it in one call.
-    // The general form asks the host for the length first and then reads,
-    // which is two calls per entry the node table has not seen.
-    let mut value = [0u8; 12];
+    // A buffer of the value's length reads it in one call. The general form
+    // asks the host for the length first and then reads, which is two calls
+    // per entry the node table has not seen.
+    let mut value = [0u8; GUEST_ATTR_LEN];
     // SAFETY: `fd` is open for the call, `name` is NUL-terminated, and the
     // buffer's length is passed alongside it.
     let got = unsafe {
@@ -5312,7 +5316,9 @@ fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
             0,
         )
     };
-    if got != 12 {
+    // A longer value fails with ERANGE and a shorter one comes back short.
+    // Neither is a record this device wrote, so both read as absent.
+    if got != GUEST_ATTR_LEN as isize {
         return None;
     }
     decode_guest_attr(&value)
@@ -5320,7 +5326,7 @@ fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
 
 #[cfg(target_os = "macos")]
 fn decode_guest_attr(value: &[u8]) -> Option<GuestAttr> {
-    if value.len() != 12 {
+    if value.len() != GUEST_ATTR_LEN {
         return None;
     }
     Some(GuestAttr {
