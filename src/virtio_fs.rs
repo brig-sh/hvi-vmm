@@ -6768,37 +6768,6 @@ mod tests {
         spent() - start
     }
 
-    // Measures what a directory that keeps changing costs the read path.
-    //
-    // The metadata benchmark above never mutates. A cache that is keyed on
-    // the shape of the directory therefore measures at its best case
-    // there: every probe hits, and the cache never pays to rebuild. A
-    // build does not behave that way. It stats sources continuously and,
-    // for each file it compiles, creates an object, writes it, then
-    // renames a temporary into place.
-    //
-    // This benchmark runs the same read rounds twice. The first pass reads
-    // a directory that nothing changes. The second pass reads the same
-    // directory with mutations between the rounds. It reports the second
-    // cost as a ratio of the first.
-    //
-    // A ratio is necessary because one blended number hides the answer.
-    // Write I/O is much more expensive than a read, so a blend mostly
-    // reports the write cost. The blend then follows `MUTATE_EVERY`
-    // instead of the code under test.
-    //
-    // Read the two outputs differently:
-    //
-    // - The host operations are exact. If a cache rebuilds its state on every
-    //   rename, a read round under mutation spends more operations than a quiet
-    //   one. The two counts are equal today.
-    // - The ratio carries the noise of any measurement of time. It moves by
-    //   tens of percent between runs on an idle host, and it can fall below 1.
-    //   Take it as an order of magnitude, never as a measurement.
-    //
-    // Read rounds come from the same helper as the budget test, so the
-    // test and both benchmarks always measure one workload.
-    //
     // Removing files, with the directory cache as full as a build makes it.
     //
     // Every removal invalidates cached directory descriptors, and finding
@@ -6981,8 +6950,38 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Run with:
-    ///   cargo test --release -- --ignored --nocapture bench_build_workload
+    // Measures what a directory that keeps changing costs the read path.
+    //
+    // The metadata benchmark never mutates. A cache that is keyed on the shape
+    // of the directory therefore measures at its best case there: every probe
+    // hits, and the cache never pays to rebuild. A build does not behave that
+    // way. It stats sources continuously and, for each file it compiles,
+    // creates an object, writes it, then renames a temporary into place.
+    //
+    // This benchmark runs the same read rounds twice. The first pass reads a
+    // directory that nothing changes. The second pass reads the same directory
+    // with mutations between the rounds. It reports the second cost as a ratio
+    // of the first.
+    //
+    // A ratio is necessary because one blended number hides the answer. Write
+    // I/O is much more expensive than a read, so a blend mostly reports the
+    // write cost. The blend then follows `MUTATE_EVERY` instead of the code
+    // under test.
+    //
+    // Read the two outputs differently:
+    //
+    // - The host operations are exact. If a cache rebuilds its state on every
+    //   rename, a read round under mutation spends more operations than a quiet
+    //   one. The two counts are equal today.
+    // - The ratio carries the noise of any measurement of time. It moves by
+    //   tens of percent between runs on an idle host, and it can fall below 1.
+    //   Take it as an order of magnitude, never as a measurement.
+    //
+    // Read rounds come from the same helper as the budget test, so the test and
+    // both benchmarks always measure one workload.
+    //
+    // Run with:
+    //   cargo test --release -- --ignored --nocapture bench_build_workload
     #[test]
     #[ignore]
     fn bench_build_workload() {
@@ -10113,9 +10112,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A guest cannot spend the host's whole descriptor table on open
-    /// handles. The cap is per export and derived from the process limit, so
-    /// the test sets a small one rather than opening thousands of files.
     /// Opens `node` read-only and returns the handle, or the errno.
     fn try_open(dev: &mut VirtioFs, node: u64, flags: u32) -> Result<u64, i32> {
         let mut input = vec![0u8; 8];
@@ -10631,6 +10627,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // A guest cannot spend the host's whole descriptor table on open handles.
+    // The cap is per export and derived from the process limit, so this sets a
+    // small one rather than opening thousands of files.
     #[test]
     fn opens_stop_at_the_handle_limit() {
         let (dir, mut dev) = fixture_with_access(true);
