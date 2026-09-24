@@ -1282,7 +1282,7 @@ impl VirtioFs {
             RELEASEDIR => self.release_dir(payload),
             FLUSH => self.flush(payload),
             FSYNC => self.fsync(payload),
-            FSYNCDIR => self.fsync_dir(payload),
+            FSYNCDIR => self.fsync_dir(nodeid, payload),
             GETLK => self.lock(payload, GETLK),
             SETLK => self.lock(payload, SETLK),
             SETLKW => self.lock(payload, SETLKW),
@@ -2836,23 +2836,24 @@ impl VirtioFs {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let flags = get_u32(input, 8).ok_or(EINVAL)?;
         let handle = self.handles.get(&fh).ok_or(EBADF)?;
-        if flags & FUSE_FSYNC_FDATASYNC != 0 {
-            handle.file.sync_data().map_err(io_errno)?;
-        } else {
-            handle.file.sync_all().map_err(io_errno)?;
-        }
+        sync_file(&handle.file, flags)?;
         Ok(Vec::new())
     }
 
-    fn fsync_dir(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
+    fn fsync_dir(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let flags = get_u32(input, 8).ok_or(EINVAL)?;
-        let handle = self.dir_handles.get(&fh).ok_or(EBADF)?;
-        if flags & FUSE_FSYNC_FDATASYNC != 0 {
-            handle.file.sync_data().map_err(io_errno)?;
-        } else {
-            handle.file.sync_all().map_err(io_errno)?;
+        if fh != 0 {
+            let handle = self.dir_handles.get(&fh).ok_or(EBADF)?;
+            sync_file(&handle.file, flags)?;
+            return Ok(Vec::new());
         }
+        // A guest that stopped sending OPENDIR holds no handle, so the
+        // directory's cached descriptor is what gets synced.
+        let dir = self.node_path(node)?.to_owned();
+        let relative = self.relative_of_path(&dir)?;
+        let file = File::from(self.dirs.dir_fd_owned(&relative)?);
+        sync_file(&file, flags)?;
         Ok(Vec::new())
     }
 
@@ -3072,6 +3073,27 @@ impl VirtioFs {
         for handle in self.dir_handles.values() {
             if let Err(err) = handle.file.sync_all() {
                 failed.get_or_insert(io_errno(err));
+            }
+        }
+        // A caching share has no directory handles. The directories the guest
+        // is paging through with fh 0 stand in for them, and only when this
+        // export has changed something since the last SYNCFS. One the guest
+        // has since removed no longer resolves, and there is nothing of it
+        // left to sync.
+        if self.writable && self.dirty {
+            let listed: Vec<PathBuf> = self
+                .fh0_order
+                .iter()
+                .filter_map(|&node| self.node_path(node).ok())
+                .filter_map(|dir| self.relative_of_path(dir).ok())
+                .collect();
+            for relative in listed {
+                let Ok(fd) = self.dirs.dir_fd_owned(&relative) else {
+                    continue;
+                };
+                if let Err(err) = File::from(fd).sync_all() {
+                    failed.get_or_insert(io_errno(err));
+                }
             }
         }
         // The loops above reach only the files the guest still holds open,
@@ -4124,6 +4146,16 @@ fn put_open_out(out: &mut Vec<u8>, fh: u64, cache: bool) {
     // still rediscovered.
     put_u32(out, if cache { 1 << 1 } else { 0 }); // FOPEN_KEEP_CACHE
     put_u32(out, 0); // backing_id (signed on the wire, zero means none)
+}
+
+/// Syncs `file` to the host's disk, its data alone when the guest's FSYNC
+/// `flags` ask for FUSE_FSYNC_FDATASYNC.
+fn sync_file(file: &File, flags: u32) -> Result<(), i32> {
+    if flags & FUSE_FSYNC_FDATASYNC != 0 {
+        file.sync_data().map_err(io_errno)
+    } else {
+        file.sync_all().map_err(io_errno)
+    }
 }
 
 /// Returns how many directory descriptors [`DirCache`] keeps open.
@@ -9877,38 +9909,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn readdirplus_reports_correct_attributes_for_each_type() {
-        let (dir, mut dev) = fixture_with_access(true);
-        fs::create_dir(dir.join("etc/sub")).unwrap();
-        std::os::unix::fs::symlink("issue", dir.join("etc/issue-link")).unwrap();
-        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
-        // A caching share answers OPENDIR with ENOSYS; the kernel then reads
-        // with fh 0 and never opens or releases directories again.
-        let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
-        assert_eq!(get_u32(&opened, 4), Some((-ENOSYS) as u32));
-        let fh = 0u64;
-        let mut read = vec![0u8; 40];
-        read[0..8].copy_from_slice(&fh.to_le_bytes());
-        read[16..20].copy_from_slice(&65536u32.to_le_bytes());
-        let out = dev.handle_fuse(&request(READDIRPLUS, etc, &read), 65536 + OUT_HEADER_LEN);
-        let entries = parse_readdir_entries(&out[OUT_HEADER_LEN..], true);
-        let find = |n: &str| entries.iter().find(|e| e.3 == n).unwrap().clone();
-
-        let (_, _, dtype, _, mode) = find("sub");
-        assert_eq!(dtype, 4);
-        assert_eq!(mode & S_IFMT, libc::S_IFDIR as u32);
-
-        let (_, _, dtype, _, mode) = find("issue");
-        assert_eq!(dtype, 8);
-        assert_eq!(mode & S_IFMT, S_IFREG);
-
-        let (_, _, dtype, _, mode) = find("issue-link");
-        assert_eq!(dtype, 10);
-        assert_eq!(mode & S_IFMT, libc::S_IFLNK as u32);
-        let _ = fs::remove_dir_all(dir);
-    }
-
     /// Sends a READDIR with fh 0 for one small page of `node` from `offset`.
     fn read_fh0_page(dev: &mut VirtioFs, node: u64, offset: u64) {
         let mut read = vec![0u8; 40];
@@ -9947,6 +9947,45 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn fsyncdir_with_fh0_syncs_the_directory() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        for flags in [0, FUSE_FSYNC_FDATASYNC] {
+            let mut fsync = vec![0u8; 16];
+            fsync[8..12].copy_from_slice(&flags.to_le_bytes());
+            let out = dev.handle_fuse(&request(FSYNCDIR, etc, &fsync), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "flags {flags:#x}");
+        }
+        let mut fsync = vec![0u8; 16];
+        fsync[0..8].copy_from_slice(&7u64.to_le_bytes());
+        let out = dev.handle_fuse(&request(FSYNCDIR, etc, &fsync), 4096);
+        assert_eq!(
+            get_u32(&out, 4),
+            Some((-EBADF) as u32),
+            "a handle never opened"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // SYNCFS syncs the directories listed with fh 0, and one removed since
+    // it was listed has nothing left to sync.
+    #[test]
+    fn syncfs_skips_a_listed_directory_that_is_gone() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("gone")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let gone = lookup_node(&mut dev, FUSE_ROOT_ID, b"gone");
+        read_fh0_page(&mut dev, etc, 0);
+        read_fh0_page(&mut dev, gone, 0);
+        fs::remove_dir(dir.join("gone")).unwrap();
+        write_and_close(&mut dev, "f", b"x");
+
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // The listings are keyed by node, and a reset restarts node ids.
     #[test]
     fn status_reset_drops_the_fh0_listings() {
@@ -9959,6 +9998,38 @@ mod tests {
         dev.mmio(&mem, reg::STATUS, true, 0);
         assert!(dev.fh0_listings.is_empty());
         assert!(dev.fh0_order.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readdirplus_reports_correct_attributes_for_each_type() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("etc/sub")).unwrap();
+        std::os::unix::fs::symlink("issue", dir.join("etc/issue-link")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        // A caching share answers OPENDIR with ENOSYS; the kernel then reads
+        // with fh 0 and never opens or releases directories again.
+        let opened = dev.handle_fuse(&request(OPENDIR, etc, &[0; 8]), 4096);
+        assert_eq!(get_u32(&opened, 4), Some((-ENOSYS) as u32));
+        let fh = 0u64;
+        let mut read = vec![0u8; 40];
+        read[0..8].copy_from_slice(&fh.to_le_bytes());
+        read[16..20].copy_from_slice(&65536u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, etc, &read), 65536 + OUT_HEADER_LEN);
+        let entries = parse_readdir_entries(&out[OUT_HEADER_LEN..], true);
+        let find = |n: &str| entries.iter().find(|e| e.3 == n).unwrap().clone();
+
+        let (_, _, dtype, _, mode) = find("sub");
+        assert_eq!(dtype, 4);
+        assert_eq!(mode & S_IFMT, libc::S_IFDIR as u32);
+
+        let (_, _, dtype, _, mode) = find("issue");
+        assert_eq!(dtype, 8);
+        assert_eq!(mode & S_IFMT, S_IFREG);
+
+        let (_, _, dtype, _, mode) = find("issue-link");
+        assert_eq!(dtype, 10);
+        assert_eq!(mode & S_IFMT, libc::S_IFLNK as u32);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11527,6 +11598,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // A plain READDIR reports the type the host already told us, for every
+    // kind it has a byte for. A guest that lists /dev otherwise pays a stat
+    // for each device node in it.
     #[test]
     fn readdir_reports_the_types_a_dirent_already_carries() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -11737,9 +11811,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // A plain READDIR reports the type the host already told us, for every
-    // kind it has a byte for. A guest that lists /dev otherwise pays a stat
-    // for each device node in it.
     #[test]
     fn opendir_below_a_swapped_directory_lists_nothing_outside() {
         let (dir, mut dev) = fixture_with_access(true);
