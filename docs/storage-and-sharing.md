@@ -1,7 +1,8 @@
 # Disks and directory shares
 
 A guest gets storage two ways: one virtio-blk disk, and any number of
-virtio-fs directory shares on macOS.
+virtio-fs directory shares. A guest can have both at once, and either on its
+own.
 
 ## virtio-blk: `--disk <file>`
 
@@ -25,13 +26,20 @@ Every request emits a `block` record into the ledger when `--events` is set:
 `HVI_BLK_TRACE=1` also logs each request to stderr. It is off by default
 because it costs a synchronous write per request.
 
-## virtio-fs shares, macOS only
+## virtio-fs shares
 
 `--share-ro` and `--share-rw` export a host directory to the guest over
-virtio-fs. hvi answers the guest's FUSE requests itself. There is no macFUSE
+virtio-fs. The flags mean the same thing on both hosts; what serves them
+differs.
+
+On **macOS** hvi answers the guest's FUSE requests itself. There is no macFUSE
 mount, no block image, no DAX window and no indirect descriptors.
 
-The Linux backends do not carry the device at all.
+On **Linux** the export is served by `virtiofsd`, which hvi starts, one daemon
+per export. hvi is the virtio-mmio transport in front of it: the daemon maps
+guest RAM through the memfd that backs it and walks the virtqueues in its own
+process. See [Serving a Linux export](#serving-a-linux-export) for the daemon
+and its options.
 
 ```sh
 hvi boot --kernel <Image> \
@@ -110,7 +118,66 @@ to a writable share: at `dd bs=4k` it batched 65536 requests down to a few
 hundred and ran 2.4 times faster, and at `bs=1M` it ran 3.7 times slower,
 because the guest's writeback path then costs more than the requests it saves.
 
-### Ownership: `--fs-uid` and `--fs-gid`
+### Serving a Linux export
+
+On Linux the export is served by `virtiofsd`, the daemon from the virtio-fs
+project. hvi starts one per export before the guest runs, and the pair speaks
+vhost-user: hvi sends the rings and the memfd that backs guest RAM, the daemon
+maps that memory and answers the guest's FUSE requests in its own process.
+
+hvi looks for the binary in `--virtiofsd <path>`, then `HVI_VIRTIOFSD`, then
+`PATH`, then `/usr/libexec/virtiofsd` and the other usual locations. It fails
+the boot when it finds none, naming where it looked.
+
+```sh
+hvi boot --kernel <bzImage> \
+  --virtiofsd /usr/libexec/virtiofsd \
+  --share-rw /path/to/scratch work
+```
+
+The connection never touches the filesystem. hvi binds a socket in the
+abstract namespace, connects to it, and hands the listening descriptor to the
+daemon, which accepts the connection already queued on it. There is no socket
+file and nothing to clean up.
+
+A caller that runs its own daemons names them instead:
+
+```sh
+hvi boot --kernel <bzImage> \
+  --share-rw /cntrRootfs fs0 --share-sock fs0=/tmp/vhostqemu
+```
+
+`--share-sock <tag>=<socket>` attaches the export to a daemon already
+listening there, and hvi starts none of its own. This is the shape urunc uses:
+it starts a virtiofsd per container before the monitor and passes the socket
+down.
+
+The guest can mount an export as its root, which is what a container boot
+does: `root=fs0 rw rootfstype=virtiofs` on the kernel command line, with no
+block device in the machine at all.
+
+Three things about this backend are worth knowing:
+
+- **A read-only export needs virtiofsd 1.11 or newer**, which is where
+  `--readonly` arrived. hvi refuses the boot on an older daemon rather than
+  serving the export writable. A writable export works on any version it has
+  been run against, 1.10 included. This is a check on the daemon hvi starts.
+  An export attached with `--share-sock` is served by a daemon someone else
+  started, and vhost-user has no message that asks a backend what it refuses,
+  so there the mode is the caller's to enforce; hvi says so at boot and
+  carries on.
+- **The daemon's sandbox is `namespace` when hvi runs as root, and `none`
+  otherwise**, because unsharing a mount namespace needs privileges an
+  unprivileged VMM does not have.
+- **No file-level events.** A request the daemon serves never crosses the VMM,
+  so the ledger records nothing for it. `--events` still carries the block and
+  network boundaries.
+
+`HVI_VIRTIOFSD_LOG` sets the daemon's log level, which is `warn` by default so
+the daemon stays off the guest's console. A mount that does not come up is the
+case where `HVI_VIRTIOFSD_LOG=debug` is worth having.
+
+### Ownership: `--fs-uid` and `--fs-gid` (macOS)
 
 Both default to 0, so a workload running as root sees the host's files as
 root. A guest running as an unprivileged user needs its own uid here, or the
@@ -127,7 +194,7 @@ These two flags are process-global, not per share. They are set once before
 any share is served, and they are not part of `BootConfig`. See
 [embedding.md](embedding.md#configuration-outside-bootconfig).
 
-### Containment
+### Containment (macOS)
 
 Resolution goes through the parent directory's descriptor with `O_NOFOLLOW` on
 each component, so containment follows from how the descriptor was obtained
@@ -160,6 +227,9 @@ tested, not as proven.
 - The open file limit is raised when the **first share** is set up, not at
   startup, and only on macOS. A boot with no share never raises it and never
   logs the line.
+- The node table, the descriptor budget and the lock behaviour above are the
+  macOS device's. On Linux those belong to `virtiofsd`, and its own
+  documentation covers them.
 
 Each export reports its peak handle count on a clean stop:
 
@@ -174,6 +244,13 @@ directory tree, bounded by the export root and by the process's own
 permissions. Give `--share-rw` a directory you can afford to lose. For a
 development workload, an instance-owned APFS clone is the right shape. For a
 shared cache that several guests read, use `--share-ro`.
+
+On Linux, a read-only export is enforced by the daemon, which answers `EROFS`
+to every mutation. What bounds a writable one depends on how hvi runs. As
+root the daemon gets its own mount and pid namespace, as above. Unprivileged
+it runs with `--sandbox none`, and the bound is then the daemon's own path
+resolution within the shared directory: it runs as the same user as the VMM,
+outside the VMM's seccomp filter, and reaches whatever that user reaches.
 
 The macOS Seatbelt profile grants exactly one rule per export, by resolved
 root path: `file-read*` for a read-only share and `file-read* file-write*` for

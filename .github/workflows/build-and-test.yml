@@ -295,6 +295,77 @@ jobs:
           sudo losetup -d "$LOOP"
           grep -q "test result: ok. 1 passed" blk.log \
             || { echo "::error::the block-device size test did not pass"; exit 1; }
+      # The vhost-user handover runs on the vCPU thread that services the
+      # guest's DRIVER_OK write, so it is the seccomp filter for that thread
+      # that has to allow it. A missing entry there does not fail a unit test:
+      # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
+      - name: virtio-fs export served by virtiofsd
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
+          VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
+          echo "daemon: $VFSD"; "$VFSD" --version
+          KREL=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)
+          # The distribution kernel builds virtiofs as a module, so the guest
+          # loads it before it can mount anything.
+          W=$(mktemp -d); mkdir -p "$W/bin"
+          cp /bin/busybox "$W/bin/busybox"
+          for a in sh mount ls cat echo sleep insmod poweroff sync; do ln -sf busybox "$W/bin/$a"; done
+          unzstd -f -o "$W/virtiofs.ko" "/lib/modules/$KREL/kernel/fs/fuse/virtiofs.ko.zst"
+          {
+            echo '#!/bin/sh'
+            echo 'export PATH=/bin'
+            echo '/bin/busybox mount -t proc proc /proc'
+            echo '/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null'
+            echo 'insmod /virtiofs.ko'
+            echo 'mkdir -p /mnt/s'
+            echo 'mount -t virtiofs hvishare /mnt/s && echo FS-MOUNT-OK'
+            echo 'cat /mnt/s/hello.txt && echo FS-READ-OK'
+            echo 'echo from-guest > /mnt/s/from-guest.txt && sync && echo FS-WRITE-OK'
+            echo 'echo FS-DONE'
+            echo '/bin/busybox sleep 2'
+            echo 'poweroff -f'
+          } > "$W/init"
+          chmod +x "$W/init"
+          ( cd "$W" && find . | cpio -o -H newc --quiet | gzip -1 ) > fs-initramfs.cpio.gz
+          rm -rf share && mkdir share && echo "hello from the host" > share/hello.txt
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          # The guest does its work in a couple of seconds and then halts,
+          # which on x86 is a halt rather than a power-off, so the step always
+          # spends this whole budget. Keep it tight.
+          sudo timeout 30 ./target/release/hvi boot --kernel "$KIMG" \
+            --initramfs fs-initramfs.cpio.gz --mem-mib 1024 --cpus 2 \
+            --virtiofsd "$VFSD" --share-rw "$PWD/share" hvishare \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-fs.log || true
+          grep -qa "seccomp: on" boot-fs.log \
+            || { echo "::error::the share boot ran without seccomp enforcement"; exit 1; }
+          for marker in FS-MOUNT-OK FS-READ-OK FS-WRITE-OK; do
+            grep -qa "$marker" boot-fs.log || { echo "::error::$marker missing"; exit 1; }
+          done
+          # The write has to have reached the host, not just the guest's cache.
+          grep -q from-guest share/from-guest.txt \
+            || { echo "::error::the guest's write never reached the host"; exit 1; }
+          echo "virtio-fs export served end to end ✓"
+      # A read-only export cannot be honoured by a daemon without --readonly,
+      # which arrived in 1.11. The distribution ships 1.10, so this asserts the
+      # version gate refuses rather than serving the export writable.
+      - name: a read-only export is refused on a daemon that cannot enforce it
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
+          VER=$("$VFSD" --version | awk '{print $2}')
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          mkdir -p share-ro
+          sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 512 \
+            --virtiofsd "$VFSD" --share-ro "$PWD/share-ro" ro \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-ro.log || true
+          case "$VER" in
+            1.[0-9].*|1.10.*)
+              grep -q "has no --readonly" boot-ro.log \
+                || { echo "::error::virtiofsd $VER served a read-only export it cannot enforce"; cat boot-ro.log; exit 1; }
+              echo "read-only export refused on virtiofsd $VER ✓" ;;
+            *) echo "virtiofsd $VER enforces --readonly; nothing to assert here" ;;
+          esac
       # The searches above keep only the lines they match. When the job
       # fails, the full log answers what those lines cannot.
       - name: keep the boot evidence
@@ -307,6 +378,8 @@ jobs:
             boot-vmlinux.log
             boot-4g.log
             blk.log
+            boot-fs.log
+            boot-ro.log
           retention-days: 7
           if-no-files-found: ignore
 

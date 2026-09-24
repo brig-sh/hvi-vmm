@@ -56,16 +56,34 @@ use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
-    GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
+    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::vhost_user_fs::VhostUserFs;
 use crate::virtio::VirtioBlk;
 use crate::virtio_net::VirtioNet;
 use crate::virtio_vsock::VirtioVsock;
+
+/// Request queues per virtio-fs device, beside the hiprio queue.
+///
+/// One is what the guest needs to make progress, and the daemon serves it on
+/// its own threads.
+const FS_REQUEST_QUEUES: usize = 1;
+
+/// One virtio-fs export: where its transport sits, and the device behind it.
+#[derive(Clone)]
+struct SharedFs {
+    base: u64,
+    spi: u32,
+    dev: Arc<Mutex<VhostUserFs>>,
+    /// The descriptors a shutdown uses, so it never has to take `dev`.
+    stop: crate::vhost_user_fs::ShutdownFds,
+}
 
 // --- ONE_REG ids (architectural KVM ABI, aarch64). ---------------
 // Core regs: KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
@@ -117,6 +135,8 @@ struct Shared {
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
+    /// One entry per virtio-fs export, in the order the exports were given.
+    fs: Arc<Vec<SharedFs>>,
     emit: Arc<Mutex<Emitter>>,
     running: Arc<AtomicBool>,
     /// Per-vCPU pthread handles, for signal-kicks (index = cpu id).
@@ -141,11 +161,8 @@ struct Shared {
 /// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
 /// plugin kept, in a field or on a thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
-    if !cfg.fs_shares.is_empty() {
-        return Err(
-            "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
-        );
-    }
+    crate::config::check_export_overlap(&cfg.fs_shares)?;
+    crate::config::check_unique_tags(&cfg.fs_shares)?;
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
@@ -270,6 +287,63 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .agent_sock
         .as_ref()
         .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
+    // virtio-fs: one transport per export, each backed by its own daemon.
+    // The daemons are started here, before the seccomp filters go in, and
+    // they run until the VMM exits.
+    let gic_end = gic.gicr_base + gic.gicr_size * u64::from(num_cpus);
+    let mut fs_daemons = Vec::with_capacity(cfg.fs_shares.len());
+    let mut fs = Vec::with_capacity(cfg.fs_shares.len());
+    for (index, share) in cfg.fs_shares.iter().enumerate() {
+        let base = virtio_fs_base(index).ok_or("too many virtio-fs devices")?;
+        let spi = virtio_fs_spi(index).ok_or("too many virtio-fs devices")?;
+        let end = base
+            .checked_add(VIRTIO_SIZE)
+            .ok_or("virtio-fs MMIO address overflow")?;
+        if base < gic_end || end > DEVICE_WINDOW_END {
+            return Err(format!(
+                "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
+                 between the GIC (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
+            )
+            .into());
+        }
+        let access = if share.mode.writable() {
+            "read-write"
+        } else {
+            "read-only"
+        };
+        let dev = match &share.socket {
+            Some(socket) => {
+                eprintln!(
+                    "[hvi/kvm] virtio-fs[{index}]: {} as {:?} ({access}) on {}",
+                    share.path.display(),
+                    share.tag,
+                    socket.display()
+                );
+                crate::virtiofsd::warn_foreign_readonly(share);
+                VhostUserFs::connect(socket, &share.tag, FS_REQUEST_QUEUES, shared_ram.fd())?
+            }
+            None => {
+                let binary = crate::virtiofsd::find(cfg.virtiofsd.as_deref())?;
+                let (daemon, stream) = crate::virtiofsd::spawn(&binary, share, index)?;
+                eprintln!(
+                    "[hvi/kvm] virtio-fs[{index}]: {} as {:?} ({access}) via {} pid {}",
+                    share.path.display(),
+                    share.tag,
+                    binary.display(),
+                    daemon.pid()
+                );
+                fs_daemons.push(daemon);
+                VhostUserFs::from_stream(stream, &share.tag, FS_REQUEST_QUEUES, shared_ram.fd())?
+            }
+        };
+        fs.push(SharedFs {
+            base,
+            spi,
+            stop: dev.shutdown_fds(),
+            dev: Arc::new(Mutex::new(dev)),
+        });
+    }
+
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
@@ -277,7 +351,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         blk: has_blk,
         net: has_net,
         vsock: has_vsock,
-        fs_count: 0,
+        fs_count: fs.len(),
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -319,8 +393,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vcpus.push(vcpu);
     }
 
-    // Number of SPIs (multiple of 32), then finalize the GIC.
-    let nr_irqs: u32 = 256;
+    // Number of SPIs (multiple of 32), then finalize the GIC. The layout
+    // checks its own interrupt placements against the same constant.
+    let nr_irqs: u32 = crate::layout::GIC_NUM_IRQS;
     set_gic_attr_u32(&gicfd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &nr_irqs)?;
     let init_attr = kvm_device_attr {
         flags: 0,
@@ -336,6 +411,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     set_u64(&vcpus[0], REG_PSTATE, PSTATE_EL1H_DAIF);
 
     let vm = Arc::new(vm);
+    let fs = Arc::new(fs);
     let shared = Shared {
         vm: Arc::clone(&vm),
         mem: ram,
@@ -343,6 +419,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         virtio,
         net,
         vsock,
+        fs: Arc::clone(&fs),
         emit: Arc::new(Mutex::new(emitter)),
         running: Arc::new(AtomicBool::new(true)),
         threads: Arc::new(Mutex::new(vec![0u64; num_cpus as usize])),
@@ -386,6 +463,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // is joined after the vCPUs; `teardown` describes the stop.
     let input = spawn_input_thread(shared.clone(), stop_source.token());
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
+    // The vhost-user interrupt threads are not joined here: each blocks in a
+    // read only its daemon completes, and the stop below ends the connection
+    // that frees them.
+    spawn_fs_interrupts(&shared);
     if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
         helpers.push((
             "agent bridge",
@@ -612,6 +693,8 @@ fn read_device(sh: &Shared, addr: u64) -> u64 {
         dev_read(sh, sh.net.as_ref(), VIRTIO_NET_SPI, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
+    } else if let Some((base, spi, dev)) = fs_slot(sh, addr) {
+        dev_read(sh, Some(&dev), spi, addr - base)
     } else {
         0
     }
@@ -641,7 +724,18 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
         );
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
+    } else if let Some((base, spi, dev)) = fs_slot(sh, addr) {
+        dev_write(sh, Some(&dev), spi, addr - base, val);
     }
+}
+
+/// Returns the virtio-fs export whose window holds `addr`, or `None` when no
+/// export does.
+fn fs_slot(sh: &Shared, addr: u64) -> Option<(u64, u32, Arc<Mutex<VhostUserFs>>)> {
+    sh.fs
+        .iter()
+        .find(|slot| (slot.base..slot.base + VIRTIO_SIZE).contains(&addr))
+        .map(|slot| (slot.base, slot.spi, Arc::clone(&slot.dev)))
 }
 
 /// Generic virtio-blk/net read: `mmio`, drain events to the ledger, set IRQ.
@@ -722,6 +816,17 @@ impl VirtioMmio for VirtioBlk {
     }
     fn take_events(&mut self) -> Vec<crate::events::CapturedEvent> {
         VirtioBlk::take_events(self)
+    }
+}
+impl VirtioMmio for VhostUserFs {
+    fn mmio(&mut self, m: &GuestRam, o: u64, w: bool, v: u64) -> u64 {
+        VhostUserFs::mmio(self, m, o, w, v)
+    }
+    fn irq_level(&self) -> bool {
+        VhostUserFs::irq_level(self)
+    }
+    fn take_events(&mut self) -> Vec<crate::events::CapturedEvent> {
+        VhostUserFs::take_events(self)
     }
 }
 impl VirtioMmio for VirtioNet {
@@ -854,6 +959,14 @@ fn stop_all(sh: &Shared) {
     // A vCPU parked at a quiesce checkpoint waits on a condition variable the
     // kick cannot end; releasing lets it see `running` and exit.
     sh.quiesce.release();
+    // Ending each daemon's connection is what lets it exit, what frees a
+    // vhost-user read that is still waiting on it, and what wakes the
+    // interrupt threads, which are blocked in a read only the daemon
+    // completes. None of it takes the device lock, which a handover waiting
+    // on an unresponsive daemon would be holding.
+    for slot in sh.fs.iter() {
+        slot.stop.shutdown();
+    }
     kick_all(sh);
 }
 
@@ -989,6 +1102,20 @@ fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
             let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
         }
     })
+}
+
+/// Starts the interrupt threads of every export.
+///
+/// The thread body is [`crate::vhost_user_fs::serve_interrupts`]; what this
+/// backend supplies is how a line is raised, which on arm64 is a GIC SPI.
+fn spawn_fs_interrupts(shared: &Shared) {
+    for slot in shared.fs.iter() {
+        let vm = Arc::clone(&shared.vm);
+        let spi = slot.spi;
+        crate::vhost_user_fs::serve_interrupts(&slot.dev, &shared.running, move |level| {
+            let _ = vm.set_irq_line(spi_gsi(spi), level);
+        });
+    }
 }
 
 /// Bridges the host agent Unix socket to the guest vsock device (exec).

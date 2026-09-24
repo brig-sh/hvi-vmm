@@ -296,8 +296,11 @@ Interrupt injection is the one device-facing thing that differs by backend:
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
 - **virtio-vsock** (`virtio_vsock.rs`, id 19) is the exec channel. Host CID 2,
   guest CID 3, port 1024.
-- **virtio-fs** (`virtio_fs.rs`, id 26, macOS only) serves the guest's FUSE
-  messages itself over a hiprio and a request queue. See
+- **virtio-fs** (id 26) has one device per export, each with a hiprio and a
+  request queue. On macOS (`virtio_fs.rs`) the VMM answers the guest's FUSE
+  messages itself. On Linux (`vhost_user_fs.rs`) the device is a transport in
+  front of `virtiofsd`, which is handed the rings and the memfd behind guest
+  RAM over vhost-user and serves the requests in its own process. See
   [storage-and-sharing.md](storage-and-sharing.md).
 
 A write of 0 to a device's STATUS register resets it: every queue returns to

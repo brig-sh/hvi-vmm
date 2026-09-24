@@ -66,6 +66,16 @@ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 # See the aarch64 section above.
 seccompiler = { version = "0.5", features = ["json"] }
 
+# virtio-fs on Linux is served out of process by virtiofsd, so what the VMM
+# needs is the frontend half of vhost-user: the handshake, the memory table and
+# the vring messages. The rust-vmm crate owns that protocol, which is the same
+# one cloud-hypervisor and QEMU speak, so the device in `vhost_user_fs` is a
+# virtio-mmio transport and nothing else.
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { version = "0.17.0", features = ["vhost-user-frontend"] }
+# EventFd, the type `vhost` takes for the kick and call descriptors.
+vmm-sys-util = "0.15"
+
 # The VMM as a library, so it can be linked as well as run.
 [lib]
 name = "hvi"
