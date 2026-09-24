@@ -428,10 +428,26 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     }
     let _raw = RawTerm::enable();
 
+    // One thread per vCPU. From here on a failure stops the guest and is
+    // reported once every thread has been joined or left running, and the first
+    // failure is the one reported.
+    let mut failure: Option<Box<dyn std::error::Error>> = None;
     let mut joins = Vec::new();
     for (id, vcpu) in vcpus.into_iter().enumerate() {
         let sh = shared.clone();
-        joins.push(std::thread::spawn(move || run_cpu(id as u32, vcpu, sh)));
+        // The thread is named after its vCPU, so the panic hook's report says
+        // which one panicked.
+        let spawned = std::thread::Builder::new()
+            .name(format!("cpu{id}"))
+            .spawn(move || run_cpu(id as u32, vcpu, sh));
+        match spawned {
+            Ok(join) => joins.push(join),
+            Err(e) => {
+                failure = Some(format!("spawning the cpu{id} thread: {e}").into());
+                stop_all(&shared);
+                break;
+            }
+        }
     }
 
     // The main thread filters itself last, once everything it had to spawn
@@ -445,8 +461,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     } else {
         Ok(())
     };
-    match (&confined, allowed_counts) {
-        (Err(_), _) => stop_all(&shared),
+    match (confined, allowed_counts) {
+        (Err(e), _) => {
+            // Printed here, since a spawn failure ahead of it is the one
+            // reported.
+            eprintln!("[hvi/x86] {e}");
+            failure.get_or_insert(e.into());
+            stop_all(&shared);
+        }
         (Ok(()), Some((vmm, vcpu))) => {
             if crate::seccomp::log_mode() {
                 eprintln!(
@@ -472,17 +494,15 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     stop_source.request_stop();
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     kick_until_finished(&input, deadline);
-    let mut stuck = None;
     for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
         if let Err(e) = join_by(name, thread, deadline) {
             eprintln!("[hvi/x86] {e}; left running");
-            stuck.get_or_insert(e);
+            failure.get_or_insert(e.into());
         }
     }
     lock_or_recover(&shared.emit).flush();
-    confined?;
-    if let Some(e) = stuck {
-        return Err(e.into());
+    if let Some(e) = failure {
+        return Err(e);
     }
 
     let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
@@ -586,7 +606,20 @@ impl Drop for ThreadSlot<'_> {
     }
 }
 
-/// A single vCPU thread: KVM_RUN loop with PIO (serial) + MMIO (virtio).
+/// A guard that ends the VM when dropped.
+///
+/// The drop calls [`stop_all`], on a panic as on a return.
+struct StopOnDrop<'a> {
+    sh: &'a Shared,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        stop_all(self.sh);
+    }
+}
+
+/// Runs one vCPU until the VM stops, servicing its port I/O and MMIO exits.
 fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
     // The tight filter, installed before this thread touches anything the guest
     // controls: MMIO exits are serviced inline here, so the virtio device
@@ -600,6 +633,12 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
             t[cpu_id as usize] = tid;
         }
     }
+    // Held for the whole run, so every way out ends the VM. A secondary that
+    // ended alone would otherwise leave the VM running with one vCPU fewer and
+    // the join in `boot` blocked. Declared before the slot so the slot drops
+    // first: the entry is cleared before the stop kicks, so a thread never
+    // kicks itself.
+    let _stop = StopOnDrop { sh: &sh };
     let _slot = ThreadSlot {
         threads: &sh.threads,
         cpu: cpu_id as usize,
@@ -676,7 +715,6 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
                     dump_regs(&vcpu, &sh.mem, cpu_id, "SHUTDOWN");
                 }
                 *sh.stop.lock().unwrap() = Some(Stop::SystemReset);
-                stop_all(&sh);
                 break;
             }
             Ok(VcpuExit::Intr) => {
@@ -686,9 +724,6 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
             }
             Ok(other) => {
                 eprintln!("[hvi/x86] cpu{cpu_id}: unhandled exit {other:?}");
-                if is_boot {
-                    stop_all(&sh);
-                }
                 break;
             }
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
@@ -978,6 +1013,10 @@ impl CpuHandle for Cpu<'_> {
     }
 }
 
+/// Ends the VM.
+///
+/// Clears `running`, releases the quiesce so no vCPU stays parked at a
+/// checkpoint, and kicks every vCPU out of `KVM_RUN`.
 fn stop_all(sh: &Shared) {
     sh.running.store(false, Ordering::SeqCst);
     // A vCPU parked at a quiesce checkpoint waits on a condition variable the
@@ -1383,4 +1422,165 @@ fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     })?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// A plugin whose `safepoint` panics on its first call, after recording
+    /// that it was reached.
+    struct PanicAtSafepoint {
+        reached: AtomicBool,
+    }
+
+    impl Plugin for PanicAtSafepoint {
+        fn safepoint(&self, _cpu: &dyn CpuHandle) {
+            self.reached.store(true, Ordering::SeqCst);
+            panic!("plugin failure under test");
+        }
+    }
+
+    /// Returns the configuration of a two-vCPU boot of `kernel`.
+    ///
+    /// The seccomp filters are on in a release build, so a vCPU thread exits
+    /// under the vCPU allowlist as it would in production. A debug build's std
+    /// checks every descriptor it closes with `fcntl`, which that allowlist
+    /// refuses, so there the filters stay off.
+    fn config(kernel: Vec<u8>, plugin: Option<Arc<dyn Plugin>>) -> BootConfig {
+        BootConfig {
+            kernel,
+            initramfs: None,
+            mem_bytes: 128 << 20,
+            cmdline: String::new(),
+            disk: None,
+            fs_shares: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: "stop-test".to_string(),
+            vcpus: 2,
+            agent_sock: None,
+            plugin,
+            sandbox: !cfg!(debug_assertions),
+        }
+    }
+
+    /// Returns the kernel's id for the thread named `name`, or `None` if no
+    /// thread of this process has that name.
+    fn thread_id(name: &str) -> Option<libc::pid_t> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|task| {
+                std::fs::read_to_string(task.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim_end() == name)
+            })
+            .and_then(|task| task.file_name().to_str()?.parse().ok())
+    }
+
+    /// Returns every descriptor of this process that refers to vCPU `cpu`.
+    fn vcpu_descriptors(cpu: u32) -> Vec<RawFd> {
+        let vcpu = format!("anon_inode:kvm-vcpu:{cpu}");
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == &*vcpu))
+            .filter_map(|fd| fd.file_name().to_str()?.parse().ok())
+            .collect()
+    }
+
+    // The boot vCPU's plugin panics before the first guest entry, while the
+    // secondary is in `KVM_RUN` or on its way there. `boot` returns only if the
+    // panicking thread ends the VM on its way out; a secondary left running
+    // keeps the join in `boot` blocked, so the bound is the assertion. Ignored
+    // by default: it needs a usable `/dev/kvm`, and `boot` takes the terminal
+    // into raw mode and reads stdin for the guest, so it runs on its own, by
+    // name, with `--ignored`.
+    #[test]
+    #[ignore]
+    fn plugin_panic_on_the_boot_vcpu_ends_the_vm() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let plugin = Arc::new(PanicAtSafepoint {
+            reached: AtomicBool::new(false),
+        });
+        let (sender, receiver) = mpsc::channel();
+        let booted = Arc::clone(&plugin);
+        std::thread::spawn(move || {
+            let outcome = boot(config(
+                crate::boot_x86::tests::synthetic_bzimage(),
+                Some(booted),
+            ))
+            .map_err(|e| e.to_string());
+            let _ = sender.send(outcome);
+        });
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the boot vCPU's plugin panicked");
+        assert!(
+            plugin.reached.load(Ordering::SeqCst),
+            "the boot vCPU never reached the plugin"
+        );
+        // `boot` has to have run to the end and returned a stop, whichever stop
+        // it reports.
+        assert!(outcome.is_ok(), "boot failed before the stop: {outcome:?}");
+    }
+
+    // A secondary's `KVM_RUN` fails while the boot vCPU is in a guest that
+    // never exits, so `boot` returns only if the secondary's exit ends the VM.
+    // The test causes the failure from outside the VMM: it replaces the
+    // secondary's vCPU descriptor with `/dev/null`, which refuses the next
+    // `KVM_RUN`. Ignored by default, as the test above is.
+    #[test]
+    #[ignore]
+    fn failed_run_on_a_secondary_ends_the_vm() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = boot(config(crate::boot_x86::tests::spinning_bzimage(), None))
+                .map_err(|e| e.to_string());
+            let _ = sender.send(outcome);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let secondary = loop {
+            if let Some(id) = thread_id("cpu1") {
+                break id;
+            }
+            assert!(Instant::now() < deadline, "the secondary never started");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        let null = File::open("/dev/null").unwrap();
+        let descriptors = vcpu_descriptors(1);
+        assert!(!descriptors.is_empty(), "the secondary has no descriptor");
+        for descriptor in descriptors {
+            // SAFETY: both descriptors are open. The vCPU handle still owns
+            // `descriptor` and closes what it now refers to.
+            let replaced = unsafe { libc::dup2(null.as_raw_fd(), descriptor) };
+            assert_eq!(replaced, descriptor);
+        }
+
+        // The signal ends a run in progress. It is repeated, since one that
+        // lands before the run starts is lost.
+        let outcome = loop {
+            // SAFETY: a signal to a thread of this process, for which `boot`
+            // installed a handler that does nothing.
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), secondary, KICK_SIGNAL) };
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(outcome) => break outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => assert!(
+                    Instant::now() < deadline,
+                    "boot did not return after the secondary's run failed"
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("boot panicked"),
+            }
+        };
+        assert!(outcome.is_ok(), "boot failed before the stop: {outcome:?}");
+    }
 }

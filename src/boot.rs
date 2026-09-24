@@ -267,7 +267,7 @@ fn write_dtb<M: GuestMemoryBackend>(mem: &M, addr: u64, dtb: &[u8]) -> Result<()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::guestmem::GuestRam;
 
@@ -275,7 +275,7 @@ mod tests {
 
     /// Builds an `Image` with the header fields the loader reads and a body of
     /// `body_len` bytes with a recognisable pattern.
-    fn synthetic_image(text_offset: u64, image_size: u64, body_len: usize) -> Vec<u8> {
+    pub(crate) fn synthetic_image(text_offset: u64, image_size: u64, body_len: usize) -> Vec<u8> {
         let header = arm64_image_header {
             text_offset: text_offset.to_le(),
             image_size: image_size.to_le(),
@@ -284,6 +284,16 @@ mod tests {
         };
         let mut image = header.as_slice().to_vec();
         image.extend((0..body_len).map(|i| (i % 251) as u8));
+        image
+    }
+
+    /// Builds an `Image` whose first instruction branches to itself, so a vCPU
+    /// that enters it never exits on its own.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spinning_image() -> Vec<u8> {
+        let mut image = synthetic_image(0x8_0000, 0x40_0000, 0x1000);
+        // The entry point is the header's first word, `code0`.
+        image[..4].copy_from_slice(&0x1400_0000_u32.to_le_bytes()); // b .
         image
     }
 
