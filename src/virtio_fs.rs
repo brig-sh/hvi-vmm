@@ -2068,7 +2068,7 @@ impl VirtioFs {
             path,
             node,
         );
-        put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
+        put_open_out(&mut out, fh, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
     /// Reads a symlink through the export's descriptors (#30).
@@ -2220,12 +2220,7 @@ impl VirtioFs {
             self.insert_handle(file, flags & LINUX_O_ACCMODE != 0, flags, attrs, path, node)
         };
         let mut out = Vec::with_capacity(16);
-        put_open_out(
-            &mut out,
-            fh,
-            directory,
-            self.cache_policy != CachePolicy::None,
-        );
+        put_open_out(&mut out, fh, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
 
@@ -2285,7 +2280,7 @@ impl VirtioFs {
         // KILL_SUIDGID need write access to proceed without granting it.
         let fh = self.insert_handle(file, writable, flags, attrs, path, node);
         let mut out = Vec::with_capacity(16);
-        put_open_out(&mut out, fh, false, self.cache_policy != CachePolicy::None);
+        put_open_out(&mut out, fh, self.cache_policy != CachePolicy::None);
         Ok(out)
     }
 
@@ -3159,7 +3154,7 @@ impl VirtioFs {
             },
         );
         self.hold_node(node);
-        put_open_out(&mut out, fh, false, false);
+        put_open_out(&mut out, fh, false);
         Ok(out)
     }
 
@@ -4104,26 +4099,17 @@ fn entry_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Ve
     out
 }
 
-fn put_open_out(out: &mut Vec<u8>, fh: u64, directory: bool, cache: bool) {
+/// Appends a `fuse_open_out` for `fh`, keeping the file's pages cached when
+/// `cache` is set.
+///
+/// A directory reaches this only under `cache=none`, which caches nothing. A
+/// caching share answers OPENDIR with ENOSYS, and the kernel then sets
+/// FOPEN_CACHE_DIR and FOPEN_KEEP_CACHE on the directory itself.
+fn put_open_out(out: &mut Vec<u8>, fh: u64, cache: bool) {
     put_u64(out, fh);
-    // Cache directory contents and regular-file pages. Attribute/entry
-    // timeouts remain short, so host-side changes are still rediscovered.
-    put_u32(
-        out,
-        if cache {
-            if directory {
-                // FOPEN_CACHE_DIR lets the guest cache the listing, but the
-                // cache lives in the directory inode's page cache, which the
-                // kernel drops on every open unless FOPEN_KEEP_CACHE is set
-                // too. Without both, every opendir re-reads the directory.
-                (1 << 3) | (1 << 1)
-            } else {
-                1 << 1
-            }
-        } else {
-            0
-        },
-    );
+    // Attribute and entry timeouts stay short, so host-side changes are
+    // still rediscovered.
+    put_u32(out, if cache { 1 << 1 } else { 0 }); // FOPEN_KEEP_CACHE
     put_u32(out, 0); // backing_id (signed on the wire, zero means none)
 }
 
