@@ -104,10 +104,10 @@ console log:
 
 | Job | Runner | Asserts |
 | --- | --- | --- |
-| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. Also runs the virtio-blk sizing test against a real loop device, and the two vCPU stop tests. |
+| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. Also runs the virtio-blk sizing test against a real loop device, and the vCPU stop tests. |
 | `boot-arm64-hvf` | self-hosted Apple silicon | `hvi smoke`, `hvi smoke --shm`, then a boot reaching `Linux version` and `HVI-INITRAMFS-UP`. |
 | `boot-unikraft-hvf` | self-hosted Apple silicon | Two public Unikraft images, over four boots. A DHCP boot asserts the banner, `Set IPv4 address 10.0.2.15` and `Listening on port 8123`, with a share attached so the VMM has to place a virtio-fs device -- no other job does. A second boot passes `netdev.ip=` and asserts the guest took `10.0.2.99` and did *not* fall through to `10.0.2.15`, which is what fails if an image loses `CONFIG_LIBUKNETDEV_EINFO_LIBPARAM`. A third boots a padded cpio -- the pinned one is two whole pages, so the job adds 512 bytes to make the length ragged -- and asserts the banner, no memory-region assertion failure, and no `nginx:` error line. |
-| `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the two vCPU stop tests, the aarch64 seccomp selftest, a boot, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
+| `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the vCPU stop tests, the aarch64 seccomp selftest, a boot, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
 
 `boot-x86` skips itself with a warning when the runner has no `/dev/kvm`. A
 skip is not a pass.

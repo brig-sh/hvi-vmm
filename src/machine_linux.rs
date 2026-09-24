@@ -19,9 +19,10 @@
 //! the hvf one: secondaries are created `POWER_OFF` and brought up by the
 //! guest's own PSCI `CPU_ON` (handled entirely in-kernel — no mailbox), and
 //! interrupts are a single `set_irq_line`, which also wakes a WFI'd vCPU (no
-//! explicit kick for delivery). We only signal-kick a vCPU to (a) get cpu0 to
-//! its next safe point, where a plugin runs, and (b) break secondaries out
-//! of `KVM_RUN` at shutdown.
+//! explicit kick for delivery). A kick sets the vCPU's `immediate_exit` byte
+//! and signals its thread. It gets cpu0 to its next safe point, where a plugin
+//! runs, gets the other vCPUs to theirs for a pause, and breaks every vCPU out
+//! of `KVM_RUN` when the VM stops.
 //!
 //! Everything else — image/layout/DTB, virtio devices, PL011, the RawEvent
 //! ledger, and the plugin seam — is the same hypervisor-agnostic code the
@@ -35,8 +36,8 @@
 // VMM's own.
 #![allow(clippy::disallowed_methods)]
 
-use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -44,11 +45,11 @@ use kvm_bindings::{
     kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
     kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF,
     KVM_ARM_VCPU_PSCI_0_2, KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR,
-    KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_SYSTEM_EVENT_RESET,
+    KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET,
     KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST,
     KVM_VGIC_V3_ADDR_TYPE_REDIST,
 };
-use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::boot;
 use crate::config::{BootConfig, Stop};
@@ -119,8 +120,9 @@ struct Shared {
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
     emit: Arc<Mutex<Emitter>>,
     running: Arc<AtomicBool>,
-    /// Per-vCPU pthread handles, for signal-kicks (index = cpu id).
-    threads: Arc<Mutex<Vec<u64>>>,
+    /// The vCPU threads (index = cpu id), `None` until a thread has registered
+    /// itself and again once it has exited.
+    threads: Arc<Mutex<Vec<Option<VcpuThread>>>>,
     stop: Arc<Mutex<Option<Stop>>>,
     /// Parks every vCPU at a safe point so an observation sees a still guest.
     quiesce: Arc<crate::quiesce::Quiesce>,
@@ -154,6 +156,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let num_cpus = cfg.vcpus.max(1);
 
     let kvm = Kvm::new()?;
+    // A kick relies on `kvm_run.immediate_exit`. Without it, one that lands
+    // just before `KVM_RUN` is lost, and a stop with it.
+    if !kvm.check_extension(Cap::ImmediateExit) {
+        return Err("hvi needs KVM_CAP_IMMEDIATE_EXIT, which Linux 4.11 added".into());
+    }
     let vm = kvm.create_vm()?;
 
     // The guest GIC has to be created before the DTB is built, because which
@@ -309,6 +316,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     vm.get_preferred_target(&mut kvi)?;
     kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
+    let mut kickers = Vec::with_capacity(num_cpus as usize);
     for id in 0..num_cpus {
         let vcpu = vm.create_vcpu(u64::from(id))?;
         let mut kvi_cpu = kvi;
@@ -316,6 +324,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             kvi_cpu.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
         }
         vcpu.vcpu_init(&kvi_cpu)?;
+        kickers.push(kick_handle(&vm, &vcpu)?);
         vcpus.push(vcpu);
     }
 
@@ -345,7 +354,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vsock,
         emit: Arc::new(Mutex::new(emitter)),
         running: Arc::new(AtomicBool::new(true)),
-        threads: Arc::new(Mutex::new(vec![0u64; num_cpus as usize])),
+        threads: Arc::new(Mutex::new((0..num_cpus).map(|_| None).collect())),
         stop: Arc::new(Mutex::new(None)),
         quiesce: Arc::new(crate::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
@@ -429,13 +438,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // failure is the one reported.
     let mut failure: Option<Box<dyn std::error::Error>> = None;
     let mut joins = Vec::new();
-    for (id, vcpu) in vcpus.into_iter().enumerate() {
+    for (id, (vcpu, kicker)) in vcpus.into_iter().zip(kickers).enumerate() {
         let sh = shared.clone();
         // The thread is named after its vCPU, so the panic hook's report says
         // which one panicked.
         let spawned = std::thread::Builder::new()
             .name(format!("cpu{id}"))
-            .spawn(move || run_cpu(id as u32, vcpu, sh));
+            .spawn(move || run_cpu(id as u32, vcpu, kicker, sh));
         match spawned {
             Ok(join) => joins.push(join),
             Err(e) => {
@@ -505,22 +514,96 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     Ok(stop)
 }
 
-/// A guard that clears a vCPU's entry in `Shared::threads` when dropped.
+/// A vCPU thread as the other threads reach it, the target of a kick.
 ///
-/// Held by `run_cpu` for its whole run, so the entry is cleared on every exit,
-/// a panic included, and a kick from a plugin thread that outlives `boot` never
-/// signals a thread that no longer exists.
-struct ThreadSlot<'a> {
-    threads: &'a Mutex<Vec<u64>>,
+/// The kick signal alone is not enough: one that lands while the thread is in
+/// user space, between its check of `running` and its `KVM_RUN`, is consumed by
+/// the handler and the run goes ahead. So a kick first sets the vCPU's
+/// `kvm_run.immediate_exit` byte, which makes the next `KVM_RUN` return `EINTR`
+/// at once, and then sends the signal for a run already in progress.
+struct VcpuThread {
+    /// The pthread handle the signal goes to, as an integer.
+    tid: u64,
+    /// A handle to the vCPU that the kick owns, from [`kick_handle`].
+    vcpu: VcpuFd,
+}
+
+impl VcpuThread {
+    /// Registers the calling thread as `cpu` in `threads`, to be kicked through
+    /// `vcpu`.
+    ///
+    /// The returned guard removes the entry when dropped. The thread must clear
+    /// its own `immediate_exit` byte before each read of `running`, so a kick
+    /// that lands after the clear ends the run that follows.
+    fn register(
+        threads: &Mutex<Vec<Option<VcpuThread>>>,
+        cpu: usize,
+        vcpu: VcpuFd,
+    ) -> Registration<'_> {
+        let thread = VcpuThread {
+            // SAFETY: pthread_self is always valid on the current thread.
+            tid: unsafe { libc::pthread_self() } as u64,
+            vcpu,
+        };
+        if let Some(slot) = lock_or_recover(threads).get_mut(cpu) {
+            *slot = Some(thread);
+        }
+        Registration { threads, cpu }
+    }
+
+    /// Ends the thread's current or next `KVM_RUN`, unless the caller is the
+    /// thread itself.
+    fn kick(&mut self) {
+        // A kick from the thread itself, from a plugin's `safepoint` or a sink
+        // on the exit path, would end its next run before the guest ran and
+        // call the hook again at once.
+        // SAFETY: pthread_self is always valid on the current thread.
+        if self.tid == unsafe { libc::pthread_self() } as u64 {
+            return;
+        }
+        immediate_exit(&mut self.vcpu).store(1, Ordering::SeqCst);
+        // SAFETY: pthread_kill to a live thread handle; no-op handler.
+        unsafe { libc::pthread_kill(self.tid as libc::pthread_t, KICK_SIGNAL) };
+    }
+}
+
+/// Returns the `kvm_run.immediate_exit` byte of `vcpu`.
+///
+/// The vCPU thread, a thread that kicks it and the kernel each reach the byte
+/// through a mapping of their own, so it is read and written as an atomic.
+fn immediate_exit(vcpu: &mut VcpuFd) -> &AtomicU8 {
+    let byte: *mut u8 = &mut vcpu.get_kvm_run().immediate_exit;
+    // SAFETY: `byte` points into the mapping `vcpu` owns, which outlives the
+    // borrow, and an `AtomicU8` has the layout of the `u8` it points to.
+    unsafe { AtomicU8::from_ptr(byte) }
+}
+
+/// Returns a second handle to `vcpu`, with its own mapping of the run struct.
+///
+/// # Errors
+///
+/// Errors if the descriptor cannot be duplicated or the run struct cannot be
+/// mapped.
+fn kick_handle(vm: &VmFd, vcpu: &VcpuFd) -> std::io::Result<VcpuFd> {
+    // SAFETY: `vcpu` owns the descriptor and outlives the borrow.
+    let descriptor = unsafe { BorrowedFd::borrow_raw(vcpu.as_raw_fd()) }.try_clone_to_owned()?;
+    // SAFETY: `descriptor` is a vCPU of `vm`, and the handle takes it over.
+    unsafe { vm.create_vcpu_from_rawfd(descriptor.into_raw_fd()) }.map_err(std::io::Error::from)
+}
+
+/// A vCPU thread's entry in `Shared::threads`, removed when dropped.
+///
+/// The removal runs on a panic as on a return, so a kick from a plugin thread
+/// that outlives `boot` never signals a thread that no longer exists.
+struct Registration<'a> {
+    threads: &'a Mutex<Vec<Option<VcpuThread>>>,
     cpu: usize,
 }
 
-impl Drop for ThreadSlot<'_> {
+impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        if let Ok(mut t) = self.threads.lock() {
-            if let Some(slot) = t.get_mut(self.cpu) {
-                *slot = 0;
-            }
+        if let Some(slot) = lock_or_recover(self.threads).get_mut(self.cpu) {
+            *slot = None;
         }
     }
 }
@@ -539,32 +622,27 @@ impl Drop for StopOnDrop<'_> {
 }
 
 /// Runs one vCPU until the VM stops, servicing its MMIO and PSCI exits.
-fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
+fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
     // The tight filter, installed before this thread touches anything the guest
     // controls: MMIO exits are serviced inline here, so the virtio device
     // models -- the code that parses guest descriptors -- run on this
     // thread.
     crate::seccomp::install_thread(crate::seccomp::Thread::Vcpu);
-    // SAFETY: pthread_self is always valid on the current thread.
-    let tid = unsafe { libc::pthread_self() } as u64;
-    if let Ok(mut t) = sh.threads.lock() {
-        if (cpu_id as usize) < t.len() {
-            t[cpu_id as usize] = tid;
-        }
-    }
     // Held for the whole run, so every way out ends the VM. A secondary that
     // ended alone would otherwise leave the VM running with one vCPU fewer and
-    // the join in `boot` blocked. Declared before the slot so the slot drops
-    // first: the entry is cleared before the stop kicks, so a thread never
-    // kicks itself.
+    // the join in `boot` blocked. Declared before the registration so the
+    // registration drops first: the entry is removed before the stop kicks.
     let _stop = StopOnDrop { sh: &sh };
-    let _slot = ThreadSlot {
-        threads: &sh.threads,
-        cpu: cpu_id as usize,
-    };
+    let _registration = VcpuThread::register(&sh.threads, cpu_id as usize, kicker);
     let is_boot = cpu_id == 0;
 
-    while sh.running.load(Ordering::SeqCst) {
+    loop {
+        // Cleared before `running` is read, so a kick that lands from here on
+        // ends the run below at once.
+        immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
+        if !sh.running.load(Ordering::SeqCst) {
+            break;
+        }
         // Safe point for every vCPU: park here while cpu0 lets a plugin
         // look at the guest.
         sh.quiesce.checkpoint();
@@ -609,7 +687,14 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, sh: Shared) {
                 eprintln!("[hvi/kvm] cpu{cpu_id}: unhandled exit {other:?}");
                 break;
             }
-            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {} // kicked / retry
+            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                // A run that a kick cut short has completed the MMIO exit
+                // before it and left `exit_reason` as it was. Linux 5.0 to 5.2,
+                // and the stable series that took that change back to 4.14,
+                // complete the exit again on the next run, which skips one more
+                // guest instruction, so the reason is cleared here.
+                vcpu.get_kvm_run().exit_reason = KVM_EXIT_INTR;
+            }
             Err(e) => {
                 eprintln!("[hvi/kvm] cpu{cpu_id}: KVM_RUN error: {e}");
                 break;
@@ -881,33 +966,34 @@ impl CpuHandle for Cpu<'_> {
 /// Ends the VM.
 ///
 /// Clears `running`, releases the quiesce so no vCPU stays parked at a
-/// checkpoint, and kicks every vCPU out of `KVM_RUN`.
+/// checkpoint, and kicks every vCPU out of `KVM_RUN`. Only the first call
+/// kicks; a later one just releases the quiesce again.
 fn stop_all(sh: &Shared) {
-    sh.running.store(false, Ordering::SeqCst);
+    let was_running = sh.running.swap(false, Ordering::SeqCst);
     // A vCPU parked at a quiesce checkpoint waits on a condition variable the
-    // kick cannot end; releasing lets it see `running` and exit.
+    // kick cannot end. Releasing sends it on to its run, which the kick ends,
+    // and it sees `running` at the top of its loop. Released on every call,
+    // since a request can follow the first release.
     sh.quiesce.release();
-    kick_all(sh);
-}
-
-fn kick_all(sh: &Shared) {
-    if let Ok(t) = sh.threads.lock() {
-        for &tid in t.iter() {
-            if tid != 0 {
-                // SAFETY: pthread_kill to a live thread handle; no-op handler.
-                unsafe { libc::pthread_kill(tid as libc::pthread_t, KICK_SIGNAL) };
-            }
-        }
+    // One round of kicks is enough. A thread that registered before the round
+    // has its `immediate_exit` byte set, and one that registers after it reads
+    // `running` as false at the top of its loop.
+    if was_running {
+        kick_all(sh);
     }
 }
 
+/// Kicks every vCPU.
+fn kick_all(sh: &Shared) {
+    for thread in lock_or_recover(&sh.threads).iter_mut().flatten() {
+        thread.kick();
+    }
+}
+
+/// Kicks the boot vCPU, the one that runs the plugin.
 fn kick_cpu0(sh: &Shared) {
-    if let Ok(t) = sh.threads.lock() {
-        if let Some(&tid) = t.first() {
-            if tid != 0 {
-                unsafe { libc::pthread_kill(tid as libc::pthread_t, KICK_SIGNAL) };
-            }
-        }
+    if let Some(Some(thread)) = lock_or_recover(&sh.threads).first_mut() {
+        thread.kick();
     }
 }
 
@@ -1222,7 +1308,7 @@ fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
 mod stop_tests {
     use super::*;
     use std::fs::File;
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::RawFd;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1376,5 +1462,36 @@ mod stop_tests {
             }
         };
         assert!(outcome.is_ok(), "boot failed before the stop: {outcome:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn kick_before_the_run_ends_it_at_once() {
+        let kvm = Kvm::new().expect("/dev/kvm is not usable");
+        let vm = kvm.create_vm().unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        install_kick_handler();
+        let kicker = VcpuThread {
+            // SAFETY: pthread_self is always valid on the current thread.
+            tid: unsafe { libc::pthread_self() } as u64,
+            vcpu: kick_handle(&vm, &vcpu).unwrap(),
+        };
+        // Kicked from another thread, as a kick to itself is dropped. The
+        // signal lands here before the run starts, the case a signal alone
+        // loses.
+        let mut kicker = std::thread::spawn(move || {
+            let mut kicker = kicker;
+            kicker.kick();
+            kicker
+        })
+        .join()
+        .unwrap();
+        let error = vcpu.run().expect_err("the run went ahead after the kick");
+        assert_eq!(error.errno(), libc::EINTR);
+        immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
+        assert_eq!(immediate_exit(&mut kicker.vcpu).load(Ordering::SeqCst), 0);
     }
 }

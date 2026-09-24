@@ -67,6 +67,9 @@ which is to say not on your desk.
 out of the hypervisor. The two KVM backends kick the boot vCPU only, which is
 the one that reaches the hook.
 
+A `kick()` from the vCPU's own thread, inside `safepoint` or an `IoSink` on its
+exit path, is dropped. Call it from a thread of your own.
+
 **4. An `IoSink` must not block.** It is called with the device lock held. No
 `write(2)`, no allocation you can avoid. Count in the sink, set a dirty flag,
 and do the writing in `safepoint`, where slow things are allowed. `IoTrace` is

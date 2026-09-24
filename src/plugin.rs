@@ -140,6 +140,10 @@ pub trait VmHandle: Send + Sync {
     /// [`Plugin::safepoint`] is only reached between guest entries. Without
     /// the kick a request against an idle guest waits for the next timer tick,
     /// or never lands at all.
+    ///
+    /// A kick from the vCPU's own thread, from inside [`Plugin::safepoint`] or
+    /// an [`IoSink`] on its exit path, is dropped. Call it from a thread of the
+    /// plugin's own.
     fn kick(&self);
 }
 

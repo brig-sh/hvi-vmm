@@ -342,9 +342,9 @@ register clears `ready`.
 ## 5. Concurrency and failure
 
 `quiesce.rs` parks every vCPU at a safe point so an observation sees a still
-guest. `CpuHandle::pause()` requests the quiesce, kicks the vCPUs, and waits
-up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU never parks
-itself.
+guest. `CpuHandle::pause()` requests the quiesce, kicks the other vCPUs, and
+waits up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU never
+parks itself.
 
 On every backend, every path that ends a vCPU's run loop ends the VM through one
 stop routine, which clears the running flag, releases the quiesce so no vCPU
