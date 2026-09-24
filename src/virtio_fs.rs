@@ -583,8 +583,8 @@ pub struct VirtioFs {
     /// requests, and a walk reads a subdirectory before it finishes its
     /// parent, so several are open at once. Each is read once and kept
     /// across the guest's own changes, as a handle's snapshot is, so the
-    /// offsets the guest holds stay valid. The oldest goes when there are
-    /// more than [`FH0_LISTINGS_MAX`].
+    /// offsets the guest holds stay valid. The least recently read goes when
+    /// there are more than [`FH0_LISTINGS_MAX`].
     fh0_listings: HashMap<u64, Vec<DirEntryInfo>>,
     fh0_order: VecDeque<u64>,
     next_handle: u64,
@@ -860,6 +860,9 @@ impl VirtioFs {
             let _ = self.remove_temporary(handle);
         }
         self.dir_handles.clear();
+        // Keyed by node id, and node ids restart below.
+        self.fh0_listings.clear();
+        self.fh0_order.clear();
         self.sockets.clear();
         self.nodes.retain(|&node, _| node == FUSE_ROOT_ID);
         self.inode_ids.retain(|_, &mut node| node == FUSE_ROOT_ID);
@@ -3251,13 +3254,19 @@ impl VirtioFs {
             let reuse = offset != 0 && self.fh0_listings.contains_key(&node);
             if !reuse {
                 let entries = self.dir_entries(&dir)?;
-                if self.fh0_listings.insert(node, entries).is_none() {
-                    self.fh0_order.push_back(node);
-                    if self.fh0_order.len() > FH0_LISTINGS_MAX {
-                        if let Some(oldest) = self.fh0_order.pop_front() {
-                            self.fh0_listings.remove(&oldest);
-                        }
-                    }
+                self.fh0_listings.insert(node, entries);
+            }
+            // Every page moves its listing to the back. A reader descends into
+            // the children before it asks for the parent's next page, and
+            // evicting the parent then would re-read it under offsets that
+            // index the old listing.
+            if let Some(pos) = self.fh0_order.iter().position(|&n| n == node) {
+                self.fh0_order.remove(pos);
+            }
+            self.fh0_order.push_back(node);
+            if self.fh0_order.len() > FH0_LISTINGS_MAX {
+                if let Some(oldest) = self.fh0_order.pop_front() {
+                    self.fh0_listings.remove(&oldest);
                 }
             }
             self.fh0_listings
@@ -9897,6 +9906,59 @@ mod tests {
         let (_, _, dtype, _, mode) = find("issue-link");
         assert_eq!(dtype, 10);
         assert_eq!(mode & S_IFMT, libc::S_IFLNK as u32);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Sends a READDIR with fh 0 for one small page of `node` from `offset`.
+    fn read_fh0_page(dev: &mut VirtioFs, node: u64, offset: u64) {
+        let mut read = vec![0u8; 40];
+        read[8..16].copy_from_slice(&offset.to_le_bytes());
+        read[16..20].copy_from_slice(&256u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIR, node, &read), 256 + OUT_HEADER_LEN);
+        assert_eq!(get_u32(&out, 4), Some(0));
+    }
+
+    // `rm -rf` reads a page of the parent, empties each child it named, then
+    // asks for the next page. Evicting the parent in between re-reads it, and
+    // the guest's offset then skips entries it never saw.
+    #[test]
+    fn reader_keeps_its_fh0_listing_while_it_walks_the_children() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let parent = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let mut children = Vec::new();
+        for i in 0..FH0_LISTINGS_MAX {
+            let name = format!("d{i:02}");
+            fs::create_dir(dir.join(&name)).unwrap();
+            children.push(lookup_node(&mut dev, FUSE_ROOT_ID, name.as_bytes()));
+        }
+
+        read_fh0_page(&mut dev, parent, 0);
+        for &child in &children[..FH0_LISTINGS_MAX - 1] {
+            read_fh0_page(&mut dev, child, 0);
+        }
+        read_fh0_page(&mut dev, parent, 1);
+        read_fh0_page(&mut dev, children[FH0_LISTINGS_MAX - 1], 0);
+
+        assert!(
+            dev.fh0_listings.contains_key(&parent),
+            "the listing being paged through was evicted"
+        );
+        assert!(!dev.fh0_listings.contains_key(&children[0]));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The listings are keyed by node, and a reset restarts node ids.
+    #[test]
+    fn status_reset_drops_the_fh0_listings() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        read_fh0_page(&mut dev, etc, 0);
+        assert!(dev.fh0_listings.contains_key(&etc));
+
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        dev.mmio(&mem, reg::STATUS, true, 0);
+        assert!(dev.fh0_listings.is_empty());
+        assert!(dev.fh0_order.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
