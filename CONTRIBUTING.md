@@ -159,10 +159,10 @@ Every job carries a `timeout-minutes` cap. The boot jobs upload their logs as
 artifacts when they fail, and the two arm64 boots also upload the event
 ledger.
 
-One known gap: the arm64/KVM backend has no unit tests. `src/machine_linux.rs`
-carries no test module. The suite already runs on arm64 Linux, on the
-self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner, so closing
-the gap needs only the tests.
+One known gap: the arm64/KVM backend is unit-tested on its stop path only.
+`src/machine_linux.rs` carries only tests of how a vCPU thread that ends stops
+the VM. The suite runs on arm64 Linux, on the self-hosted boot runners and on a
+hosted `ubuntu-24.04-arm` runner; the boot runners also run the stop tests.
 
 Three scheduled workflows run outside the two entry points, each reporting
 through a tracking issue so `main` stays green: the weekly dependency audit,

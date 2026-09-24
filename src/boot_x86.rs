@@ -262,7 +262,7 @@ fn add_e820(params: &mut boot_params, addr: u64, size: u64) -> Result<(), String
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::guestmem::GuestRam;
     use crate::layout_x86::{HIGH_RAM_BASE, MMIO_GAP_START};
@@ -286,7 +286,7 @@ mod tests {
     /// loader checks (boot flag, `HdrS`, protocol 2.15, `LOADED_HIGH`, the
     /// 1 MiB `code32_start`) and a protected-mode body with a recognisable
     /// pattern.
-    fn synthetic_bzimage() -> Vec<u8> {
+    pub(crate) fn synthetic_bzimage() -> Vec<u8> {
         let hdr = setup_header {
             setup_sects: 1, // setup area = (1 + 1) * 512 bytes
             boot_flag: BOOT_FLAG,
@@ -302,6 +302,17 @@ mod tests {
         for (i, b) in k[0x400..].iter_mut().enumerate() {
             *b = (i % 251) as u8;
         }
+        k
+    }
+
+    /// Builds a bzImage whose 64-bit entry point jumps to itself, so a vCPU
+    /// that enters it never exits on its own.
+    pub(crate) fn spinning_bzimage() -> Vec<u8> {
+        let mut k = synthetic_bzimage();
+        // The protected-mode body follows the two setup sectors, and the 64-bit
+        // entry point is `KERNEL_ENTRY_OFF` into it.
+        let entry = 2 * 512 + KERNEL_ENTRY_OFF as usize;
+        k[entry..entry + 2].copy_from_slice(&[0xeb, 0xfe]); // jmp .
         k
     }
 

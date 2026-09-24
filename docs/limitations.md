@@ -16,7 +16,7 @@ three things a reader should not have to guess between:
 | A non-backend host builds a stub. | The shared code and unit tests compile everywhere. That build cannot run a guest. | Design |
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
-| The arm64/KVM backend has no unit tests. | `src/machine_linux.rs` carries no `#[cfg(test)]` module. The full suite runs on both self-hosted arm64/KVM runners, so a test added there would be executed; that backend is cross-linted and booted, not unit-tested. | Defect |
+| The arm64/KVM backend is unit-tested on its stop path only. | `src/machine_linux.rs` carries only tests of how a vCPU thread that ends stops the VM, and they need `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
 
 ## Devices
 

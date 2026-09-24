@@ -346,18 +346,24 @@ guest. `CpuHandle::pause()` requests the quiesce, kicks the vCPUs, and waits
 up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU never parks
 itself.
 
-On the macOS backend every path that ends the run loop goes through one stop
-routine, which also releases the quiesce so no vCPU stays parked. The vCPU
-loop runs under `catch_unwind`: a panic in a plugin hook or a device is
-reported with the vCPU, its last exit reason and its program counter, and the
-VM stops. Device and ledger mutexes go through `sync::lock_or_recover`, which
-takes a poisoned lock so the panic that poisoned it is reported once, where it
-happened.
+On every backend, every path that ends a vCPU's run loop ends the VM through
+one stop routine, which clears the running flag, releases the quiesce so no
+vCPU stays parked, and kicks the other vCPUs out of the hypervisor. On the
+macOS backend the loop runs under `catch_unwind`, and a panic in a plugin hook
+or a device is reported with the vCPU, its last exit reason and its program
+counter before the stop. On the Linux and x86 backends a guard held by the
+vCPU thread calls the stop routine when the thread exits, whatever ended the
+loop: a guest-requested stop, a failed entry, an unhandled exit, a `KVM_RUN`
+error, or a panic unwinding through it. The panic report there is the standard
+one, and the vCPU threads are named `cpu0`, `cpu1` and so on, so it says which
+vCPU panicked. Under the seccomp sandbox the report has to stay unsymbolized:
+with `RUST_BACKTRACE` set it opens the binary, which the vCPU allowlist
+refuses, and the process dies of `SIGSYS` after the message.
 
-The Linux and x86 backends release the quiesce from their stop routine too, but
-they have no `catch_unwind` around the vCPU loop, and their vCPU-side device
-locks still use `.lock().unwrap()`, where the helper threads recover. Scope any
-guarantee about panic handling to the macOS backend.
+Device and ledger mutexes on the macOS backend and in the helper threads go
+through `sync::lock_or_recover`, which takes a poisoned lock so the panic that
+poisoned it is reported once, where it happened. The vCPU-side device locks on
+the Linux and x86 backends use `.lock().unwrap()`.
 
 ## 6. The event ledger
 

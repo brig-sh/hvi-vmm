@@ -293,6 +293,7 @@ jobs:
       # skip cannot pass for coverage. Loop devices need root, not KVM, but the
       # build above is gated on KVM, so gate the same way.
       - name: virtio-blk sizing against a real block device
+        id: blk
         if: steps.kvm.outputs.ok == 'yes'
         run: |
           truncate -s 64M blk.img
@@ -310,12 +311,31 @@ jobs:
                             and .target.name=="hvi" and (.target.kind|contains(["lib"])))
                      | .executable')
           echo "test binary: $BIN"
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
           sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
             virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture \
             | tee blk.log || true
           sudo losetup -d "$LOOP"
           grep -q "test result: ok. 1 passed" blk.log \
             || { echo "::error::the block-device size test did not pass"; exit 1; }
+      # The proving tests for a vCPU thread that ends: the boot vCPU's plugin
+      # panics in one, a secondary's `KVM_RUN` fails in the other, and `boot`
+      # has to return. They are ignored in the plain suite, since they need KVM
+      # (root's here) and boot a guest on the terminal. They run in release,
+      # where they keep the seccomp filters on; a debug build turns the filters
+      # off, since std checks each descriptor it closes with `fcntl`, which the
+      # vCPU allowlist refuses. One at a time, since the second finds the
+      # secondary's thread by name. 2>&1: the panic report is on stderr.
+      - name: run the vCPU stop tests (2 vCPUs)
+        if: steps.kvm.outputs.ok == 'yes'
+        env:
+          BIN: ${{ steps.blk.outputs.bin }}
+        run: |
+          echo "test binary: $BIN"
+          sudo "$BIN" machine::stop_tests:: --ignored --nocapture --test-threads=1 \
+            </dev/null 2>&1 | tee stop.log || true
+          grep -q "test result: ok. 2 passed" stop.log \
+            || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
       # The searches above keep only the lines they match. When the job
       # fails, the full log answers what those lines cannot.
       - name: keep the boot evidence
@@ -328,6 +348,7 @@ jobs:
             boot-vmlinux.log
             boot-4g.log
             blk.log
+            stop.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -672,6 +693,14 @@ jobs:
       # build above.
       - name: unit suite
         run: cargo test --release
+      # The vCPU stop tests, as on the x86 job. The runner user owns /dev/kvm
+      # here, so no sudo.
+      - name: run the vCPU stop tests (2 vCPUs)
+        run: |
+          cargo test --release --lib machine::stop_tests:: \
+            -- --ignored --nocapture --test-threads=1 </dev/null 2>&1 | tee stop.log || true
+          grep -q "test result: ok. 2 passed" stop.log \
+            || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
       # The aarch64 allowlist is a different file from the x86 one. The hosted
       # arm64 musl job runs it on the static musl binary. This is the only place
       # it runs on the glibc build, and where another page size appears.
@@ -811,6 +840,7 @@ jobs:
         with:
           name: boot-arm64-kvm-${{ matrix.vgic }}-logs
           path: |
+            stop.log
             run.log
             ev.ndjson
             tap.log
