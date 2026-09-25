@@ -1270,6 +1270,20 @@ impl VirtioFs {
         self.readahead.stats()
     }
 
+    /// Drops every prepared listing and the prepared stats of every fh-0
+    /// listing, for a request that may change what they describe.
+    ///
+    /// A listing being paged through keeps its entries, so the offsets the
+    /// guest holds stay valid, as they do for a handle's snapshot. Only its
+    /// remaining pages are stat'd afresh.
+    fn drop_prepared(&mut self) {
+        self.readahead.invalidate();
+        for listing in self.fh0_listings.values_mut() {
+            listing.prepared.clear();
+            listing.prepared_at = None;
+        }
+    }
+
     fn note_zero_copy_read(&self) {
         self.zero_copy_reads.fetch_add(1, Ordering::Relaxed);
     }
@@ -1665,14 +1679,7 @@ impl VirtioFs {
         self.count_op(opcode);
         let op_start = std::time::Instant::now();
         if !opcode_is_read_only(opcode) {
-            self.readahead.invalidate();
-            // A listing being paged through keeps its entries, so the
-            // offsets the guest holds stay valid, as they do for a handle's
-            // snapshot. Its prepared attributes may describe what the
-            // request changes, so the pages left are stated afresh.
-            for listing in self.fh0_listings.values_mut() {
-                listing.prepared.clear();
-            }
+            self.drop_prepared();
         }
         let request_context = RequestContext {
             uid: get_u32(raw, 24).unwrap_or(0),
@@ -2893,9 +2900,11 @@ impl VirtioFs {
         if !self.writable {
             return None;
         }
-        // The buffered path reaches this through `require_writable`; this one
-        // never calls it, so it marks the export dirty itself.
+        // The buffered path reaches this through `require_writable` and the
+        // non-read-only check in `handle_fuse`. This one reaches neither, so
+        // it marks the export dirty and drops what was prepared itself.
         self.dirty = true;
+        self.drop_prepared();
         let total_in: usize = input.iter().map(|(_, len)| *len as usize).sum();
         if declared < IN_HEADER_LEN || declared > total_in {
             return None;
@@ -7521,6 +7530,44 @@ mod tests {
             .read_at = aged;
         assert_eq!(readdirplus_size(&mut dev, sub_node, b"a"), Some(5));
         assert_eq!(dev.readahead.stats(), (1, 0, 0), "it was taken, then refused");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A WRITE on the direct path never reaches `handle_fuse`, so it has to
+    // drop what was prepared itself, or the next listing reports the size
+    // the file had before the write.
+    #[test]
+    fn direct_write_drops_the_prepared_listing() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("g"), b"").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+        let g = lookup_node(&mut dev, sub_node, b"g");
+        let fh = open_rw(&mut dev, g);
+        dev.readahead.prepare_now(&sub);
+
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
+        let (in_buf, out_buf) = (base, base + 0x8000);
+        let data = [7u8; 512];
+        let mut req = fuse_in_header((IN_HEADER_LEN + 40 + data.len()) as u32, WRITE, 1, g);
+        let mut write = [0u8; 40];
+        write[0..8].copy_from_slice(&fh.to_le_bytes());
+        write[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        req.extend_from_slice(&write);
+        req.extend_from_slice(&data);
+        mem.write(in_buf, &req).unwrap();
+        let reply = dev.handle_fuse_desc(
+            &mem,
+            &[(in_buf, req.len() as u32)],
+            &[(out_buf, 24)],
+            24,
+        );
+        assert!(matches!(reply, Reply::Buffered(_)));
+        assert_eq!(dev.zero_copy_writes.load(Ordering::Relaxed), 1, "direct path");
+
+        assert_eq!(readdirplus_size(&mut dev, sub_node, b"g"), Some(512));
         let _ = fs::remove_dir_all(dir);
     }
 
