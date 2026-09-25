@@ -528,8 +528,9 @@ struct ReadaheadState {
     /// Prepared directories in insertion order, for eviction.
     order: VecDeque<PathBuf>,
     in_flight: std::collections::HashSet<PathBuf>,
-    /// Queued directories already served, read by the serving thread or
-    /// taken prepared. A worker drops them when it reaches them.
+    /// Queued or in-flight directories already served, read by the serving
+    /// thread or taken prepared. A worker drops them when it reaches them
+    /// or finishes reading them.
     skip: std::collections::HashSet<PathBuf>,
     cache: HashMap<PathBuf, PreparedDir>,
     generation: u64,
@@ -544,6 +545,28 @@ impl ReadaheadState {
             self.queue.pop_front();
         }
         self.queue.push_back(dir);
+    }
+
+    /// Removes and returns the prepared listing of `path`, if any, and marks
+    /// it served.
+    fn take_prepared(&mut self, path: &Path) -> Option<PreparedDir> {
+        let prepared = self.cache.remove(path)?;
+        if let Some(pos) = self.order.iter().position(|queued| queued == path) {
+            self.order.remove(pos);
+        }
+        self.mark_served(path);
+        Some(prepared)
+    }
+
+    /// Records that the serving thread has served `path`, so a worker drops
+    /// a queued request for it or a result it is still reading.
+    ///
+    /// Only a path a worker would reach is recorded, so `skip` holds no more
+    /// than the queue and the directories in flight.
+    fn mark_served(&mut self, path: &Path) {
+        if self.in_flight.contains(path) || self.queue.iter().any(|queued| queued.path == path) {
+            self.skip.insert(path.to_owned());
+        }
     }
 }
 
@@ -657,7 +680,7 @@ impl Readahead {
                 || guard.cache.contains_key(&path)
                 || guard.in_flight.contains(&path)
             {
-                if guard.queue.is_empty() {
+                if guard.queue.is_empty() && guard.in_flight.is_empty() {
                     guard.skip.clear();
                 }
                 continue;
@@ -672,7 +695,13 @@ impl Readahead {
             let prepared = dir_fd.as_ref().and_then(|fd| prepare_dir(fd.as_fd()));
             guard = lock.lock().unwrap();
             guard.in_flight.remove(&path);
-            if let (Some(prepared), Some(dir_fd)) = (prepared, dir_fd) {
+            // The serving thread stopped waiting for this one and read the
+            // directory itself.
+            let abandoned = guard.skip.remove(&path);
+            if guard.queue.is_empty() && guard.in_flight.is_empty() {
+                guard.skip.clear();
+            }
+            if let (Some(prepared), Some(dir_fd), false) = (prepared, dir_fd, abandoned) {
                 if guard.generation == generation {
                     // The subdirectories found go on the stack in reverse,
                     // so the first one is prepared next, as a walk asks.
@@ -746,17 +775,13 @@ impl Readahead {
     fn take(&self, path: &Path) -> Option<PreparedDir> {
         let ReadaheadShared {
             lock,
-            work,
             done,
-            posted,
             completed,
+            ..
         } = &*self.state;
         let mut guard = lock.lock().unwrap();
-        if let Some(prepared) = guard.cache.remove(path) {
+        if let Some(prepared) = guard.take_prepared(path) {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            guard.skip.insert(path.to_owned());
-            posted.fetch_add(1, Ordering::Release);
-            work.notify_one();
             return Some(prepared);
         }
         if guard.in_flight.contains(path) {
@@ -781,16 +806,14 @@ impl Readahead {
                     guard = done.wait_timeout(guard, deadline - now).unwrap().0;
                 }
             }
-            if let Some(prepared) = guard.cache.remove(path) {
-                guard.skip.insert(path.to_owned());
-                posted.fetch_add(1, Ordering::Release);
-                work.notify_one();
+            if let Some(prepared) = guard.take_prepared(path) {
                 return Some(prepared);
             }
         }
-        // Not prepared and not being prepared: the serving thread reads it,
-        // so a worker that reaches a queued request for it drops it.
-        guard.skip.insert(path.to_owned());
+        // Not prepared, or not in time: the serving thread reads it, so a
+        // worker drops a queued request for it and a result that arrives
+        // late.
+        guard.mark_served(path);
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
@@ -3320,7 +3343,10 @@ impl VirtioFs {
             .any(|socket_path| socket_path.parent() == Some(dir));
         if plus && self.readahead_enabled() && !has_socket {
             if let Some(prepared) = self.readahead.take(dir) {
-                let dir_meta = self.stat_uncached(dir)?;
+                // `readdir` left the directory's descriptor cached, so this is
+                // an fstat and no walk from the root.
+                let relative = self.relative_of_path(dir)?;
+                let dir_meta = Stat::of_fd(self.dirs.dir_fd(&relative)?)?;
                 if (dir_meta.ctime(), dir_meta.ctime_nsec()) == prepared.ctime {
                     let mut entries = Vec::with_capacity(prepared.entries.len() + 2);
                     let mut attrs = Vec::with_capacity(prepared.entries.len());
@@ -7721,6 +7747,43 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A taken listing left in `order` grew it by one path per directory
+    // walked, and a later eviction by that stale entry dropped a newer
+    // listing of the same directory out of turn.
+    #[test]
+    fn taking_a_prepared_listing_leaves_nothing_behind() {
+        let (dir, dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        dev.readahead.prepare_now(&sub);
+        assert!(dev.readahead.take(&sub).is_some());
+        assert!(dev.readahead.take(&sub).is_none());
+        let guard = dev.readahead.state.lock.lock().unwrap();
+        assert!(guard.order.is_empty());
+        assert!(guard.skip.is_empty(), "nothing queued or in flight to skip");
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The serving thread reads the directory itself once it stops waiting,
+    // so the worker's late result must not stay cached.
+    #[test]
+    fn wait_that_times_out_marks_the_late_result_for_dropping() {
+        let (dir, dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        dev.readahead
+            .state
+            .lock
+            .lock()
+            .unwrap()
+            .in_flight
+            .insert(sub.clone());
+        assert!(dev.readahead.take(&sub).is_none());
+        assert_eq!(dev.readahead.stats(), (0, 1, 1));
+        assert!(dev.readahead.state.lock.lock().unwrap().skip.contains(&sub));
         let _ = fs::remove_dir_all(dir);
     }
 
