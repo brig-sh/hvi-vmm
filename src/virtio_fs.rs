@@ -2691,15 +2691,16 @@ impl VirtioFs {
         fh
     }
 
-    /// The listing a directory handle holds: host entries, this device's
-    /// sockets under it, sorted, with `.` and `..` in front. Also used for
-    /// a readdir with fh 0, which the guest sends once OPENDIR has answered
-    /// ENOSYS and it stopped opening directories.
+    /// Returns the listing a directory handle holds, the host entries and
+    /// this device's sockets under `path`, sorted, with `.` and `..` in front.
+    ///
+    /// A readdir with fh 0 uses it too. The guest sends one once OPENDIR has
+    /// answered ENOSYS and it has stopped opening directories.
     ///
     /// The walk resolves the directory, so the listing is taken through a
-    /// descriptor the cache holds rather than through the path. That is also
-    /// what leaves the descriptor cached for the lookups the guest makes
-    /// against the entries afterwards.
+    /// descriptor the cache holds and not through the path. That also leaves
+    /// the descriptor cached for the lookups the guest makes against the
+    /// entries afterwards.
     fn dir_entries(&mut self, path: &Path) -> Result<Vec<DirEntryInfo>, i32> {
         let relative = self.relative_of_path(path)?;
         let mut entries = read_dir_at(self.dirs.dir_fd_owned(&relative)?)?;
