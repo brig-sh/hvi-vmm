@@ -466,6 +466,15 @@ const FH0_LISTINGS_MAX: usize = 64;
 /// goes.
 const READAHEAD_MAX_DIRS: usize = 256;
 
+/// Directories queued for the workers at once. Past this, the one queued
+/// earliest goes, which is the one a walk reaches last.
+///
+/// A queued directory holds its parent's descriptor, shared with its
+/// siblings, so this also bounds the descriptors the queue holds. They are
+/// not in the guest's handle budget and come out of the VMM's reserve in
+/// [`crate::fdlimit`], which is larger.
+const READAHEAD_MAX_QUEUED: usize = 64;
+
 /// How many levels below a served listing the workers walk on their own.
 /// The serving thread's requests are level 0; the subdirectories a worker
 /// finds while preparing a level-n directory are level n + 1.
@@ -496,17 +505,26 @@ struct ReadaheadShared {
     completed: AtomicU64,
 }
 
+/// A directory queued for a worker.
+///
+/// The worker opens `name` under `parent`, the descriptor the directory was
+/// listed through, so no thread here turns a path into a file. It does so
+/// when it takes the entry, outside the lock.
+struct QueuedDir {
+    path: PathBuf,
+    parent: Arc<OwnedFd>,
+    name: CString,
+    /// The level below a served listing, 0 for the serving thread's own
+    /// requests.
+    depth: u8,
+}
+
 struct ReadaheadState {
-    /// Directories to prepare with the descriptor each is read through and
-    /// its level, most recent last. Workers take from the end: a walk
-    /// descends into the directory it listed last, so the most recent
-    /// request is the one the guest asks for next.
-    ///
-    /// The descriptor is what keeps a worker off the resolution path. It is
-    /// opened by whoever queues the directory -- the serving thread from the
-    /// listing it is answering, a worker from the directory it just read --
-    /// so no thread here turns a name into a file.
-    queue: Vec<(PathBuf, OwnedFd, u8)>,
+    /// Directories to prepare, most recent last, at most
+    /// [`READAHEAD_MAX_QUEUED`]. Workers take from the end: a walk descends
+    /// into the directory it listed last, so the most recent request is the
+    /// one the guest asks for next.
+    queue: VecDeque<QueuedDir>,
     /// Prepared directories in insertion order, for eviction.
     order: VecDeque<PathBuf>,
     in_flight: std::collections::HashSet<PathBuf>,
@@ -518,6 +536,17 @@ struct ReadaheadState {
     stopped: bool,
 }
 
+impl ReadaheadState {
+    /// Queues `dir` as the next to prepare, dropping the earliest queued when
+    /// the queue is full.
+    fn push(&mut self, dir: QueuedDir) {
+        if self.queue.len() >= READAHEAD_MAX_QUEUED {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(dir);
+    }
+}
+
 /// Prepares directory listings on worker threads ahead of the READDIRPLUS
 /// that asks for them.
 ///
@@ -525,9 +554,10 @@ struct ReadaheadState {
 /// serving thread sends those subdirectories here while it answers for the
 /// parent. A worker stats every entry of a directory and reads its stored
 /// guest attribute, then requests the subdirectories it found, so the
-/// workers walk ahead of the guest until [`READAHEAD_MAX_DIRS`] listings
-/// wait unconsumed. A prepared listing is used once, and only when the
-/// directory's change time still matches, so a host-side create, unlink
+/// workers walk ahead of the guest. At most [`READAHEAD_MAX_QUEUED`]
+/// directories wait to be prepared and [`READAHEAD_MAX_DIRS`] prepared
+/// listings wait to be taken. A prepared listing is used once, and only when
+/// the directory's change time still matches, so a host-side create, unlink
 /// or rename in between discards it. Every request that changes the share
 /// clears the cache and bumps the generation, and a worker drops a
 /// listing it began under an older generation.
@@ -542,7 +572,7 @@ impl Readahead {
     fn new() -> Self {
         let state = Arc::new(ReadaheadShared {
             lock: Mutex::new(ReadaheadState {
-                queue: Vec::new(),
+                queue: VecDeque::new(),
                 order: VecDeque::new(),
                 in_flight: std::collections::HashSet::new(),
                 skip: std::collections::HashSet::new(),
@@ -599,7 +629,13 @@ impl Readahead {
             if guard.stopped {
                 return;
             }
-            let Some((path, dir_fd, depth)) = guard.queue.pop() else {
+            let Some(QueuedDir {
+                path,
+                parent,
+                name,
+                depth,
+            }) = guard.queue.pop_back()
+            else {
                 // Spin before parking: the next request usually follows
                 // within the time a parked wakeup takes. The spin reads
                 // the counter only, so it does not contend for the lock.
@@ -629,10 +665,14 @@ impl Readahead {
             let generation = guard.generation;
             guard.in_flight.insert(path.clone());
             drop(guard);
-            let prepared = prepare_dir(dir_fd.as_fd());
+            let dir_fd = open_entry_nofollow(parent.as_fd(), &name)
+                .ok()
+                .map(Arc::new);
+            drop(parent);
+            let prepared = dir_fd.as_ref().and_then(|fd| prepare_dir(fd.as_fd()));
             guard = lock.lock().unwrap();
             guard.in_flight.remove(&path);
-            if let Some(prepared) = prepared {
+            if let (Some(prepared), Some(dir_fd)) = (prepared, dir_fd) {
                 if guard.generation == generation {
                     // The subdirectories found go on the stack in reverse,
                     // so the first one is prepared next, as a walk asks.
@@ -649,12 +689,15 @@ impl Readahead {
                             let Ok(name) = CString::new(entry.info.name.as_bytes()) else {
                                 continue;
                             };
-                            // From the descriptor this directory was read
+                            // Under the descriptor this directory was read
                             // through, so the child is the one that was
-                            // listed and not whatever the name leads to now.
-                            if let Ok(child_fd) = open_entry_nofollow(dir_fd.as_fd(), &name) {
-                                guard.queue.push((child, child_fd, depth + 1));
-                            }
+                            // listed and not whatever the path leads to now.
+                            guard.push(QueuedDir {
+                                path: child,
+                                parent: Arc::clone(&dir_fd),
+                                name,
+                                depth: depth + 1,
+                            });
                         }
                     }
                     while guard.cache.len() >= READAHEAD_MAX_DIRS {
@@ -676,11 +719,11 @@ impl Readahead {
         }
     }
 
-    /// Asks a worker to prepare the directory `dir_fd` is open on.
+    /// Asks a worker to prepare the directory `name` names under `parent`.
     ///
-    /// `path` names it for the cache; `dir_fd` is how it is read. The caller
-    /// opened `dir_fd`, so the worker never resolves the name itself.
-    fn request(&self, path: PathBuf, dir_fd: OwnedFd) {
+    /// `path` names it for the cache. The worker opens it under `parent`,
+    /// so it never resolves the path itself.
+    fn request(&self, path: PathBuf, parent: Arc<OwnedFd>, name: CString) {
         let mut guard = self.state.lock.lock().unwrap();
         if guard.cache.contains_key(&path) || guard.in_flight.contains(&path) {
             return;
@@ -688,7 +731,12 @@ impl Readahead {
         // A request from the serving thread is for a directory the guest
         // is about to ask for, whether or not it was served before.
         guard.skip.remove(&path);
-        guard.queue.push((path, dir_fd, 0));
+        guard.push(QueuedDir {
+            path,
+            parent,
+            name,
+            depth: 0,
+        });
         self.state.posted.fetch_add(1, Ordering::Release);
         self.state.work.notify_one();
     }
@@ -3902,12 +3950,16 @@ impl VirtioFs {
         // listing requested them too; requesting them again from here puts
         // the guest's position back on top of the workers' stack.
         //
-        // Each one is handed the descriptor it is to be read through, opened
-        // here from the descriptor this listing came from. A worker never
-        // resolves a name, so a rename under it cannot send it anywhere but
-        // to the directory that was listed.
+        // Each one is queued with the descriptor this listing came from, and
+        // the worker opens it there. A worker never resolves a path, so a
+        // rename under it cannot send it anywhere but to the directory that
+        // was listed.
         if plus && self.readahead_enabled() {
-            if let Some(listing) = listing.as_ref() {
+            let parent = listing
+                .as_ref()
+                .and_then(|listing| dup_cloexec(listing.as_fd()).ok())
+                .map(Arc::new);
+            if let Some(parent) = parent {
                 for (idx, entry) in batch.iter().rev() {
                     if *idx <= 1 || entry.dtype != DT_DIR {
                         continue;
@@ -3915,9 +3967,8 @@ impl VirtioFs {
                     let Ok(name) = CString::new(entry.name.as_bytes()) else {
                         continue;
                     };
-                    if let Ok(fd) = open_entry_nofollow(listing.as_fd(), &name) {
-                        self.readahead.request(dir.join(&entry.name), fd);
-                    }
+                    self.readahead
+                        .request(dir.join(&entry.name), Arc::clone(&parent), name);
                 }
             }
         }
@@ -7550,7 +7601,11 @@ mod tests {
             .unwrap()
             .read_at = aged;
         assert_eq!(readdirplus_size(&mut dev, sub_node, b"a"), Some(5));
-        assert_eq!(dev.readahead.stats(), (1, 0, 0), "it was taken, then refused");
+        assert_eq!(
+            dev.readahead.stats(),
+            (1, 0, 0),
+            "it was taken, then refused"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7579,14 +7634,13 @@ mod tests {
         req.extend_from_slice(&write);
         req.extend_from_slice(&data);
         mem.write(in_buf, &req).unwrap();
-        let reply = dev.handle_fuse_desc(
-            &mem,
-            &[(in_buf, req.len() as u32)],
-            &[(out_buf, 24)],
-            24,
-        );
+        let reply = dev.handle_fuse_desc(&mem, &[(in_buf, req.len() as u32)], &[(out_buf, 24)], 24);
         assert!(matches!(reply, Reply::Buffered(_)));
-        assert_eq!(dev.zero_copy_writes.load(Ordering::Relaxed), 1, "direct path");
+        assert_eq!(
+            dev.zero_copy_writes.load(Ordering::Relaxed),
+            1,
+            "direct path"
+        );
 
         assert_eq!(readdirplus_size(&mut dev, sub_node, b"g"), Some(512));
         let _ = fs::remove_dir_all(dir);
@@ -7612,6 +7666,61 @@ mod tests {
         dev.readahead.prepare_now(&sub);
         open_rw(&mut dev, f);
         assert!(dev.readahead.take(&sub).is_none(), "O_RDWR dropped it");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A directory of 2,000 packages queues 2,000 subdirectories. The queue
+    // keeps the ones a walk reaches first, and they share one descriptor.
+    #[test]
+    fn readahead_queue_is_capped_and_keeps_the_latest_requests() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap());
+        for i in 0..READAHEAD_MAX_QUEUED * 4 {
+            let name = format!("d{i:04}");
+            dev.readahead.request(
+                dir.join(&name),
+                Arc::clone(&root),
+                CString::new(name).unwrap(),
+            );
+        }
+        let guard = dev.readahead.state.lock.lock().unwrap();
+        assert_eq!(guard.queue.len(), READAHEAD_MAX_QUEUED);
+        let last = format!("d{:04}", READAHEAD_MAX_QUEUED * 4 - 1);
+        assert_eq!(guard.queue.back().unwrap().path, dir.join(last));
+        drop(guard);
+        assert_eq!(Arc::strong_count(&root), READAHEAD_MAX_QUEUED + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_opens_and_prepares_a_queued_directory() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("sub/inner")).unwrap();
+        let workers = dev.start_readahead();
+        dev.readahead.request(
+            root.join("sub"),
+            Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap()),
+            CString::new("sub").unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let prepared = |path: &Path| {
+            dev.readahead
+                .state
+                .lock
+                .lock()
+                .unwrap()
+                .cache
+                .contains_key(path)
+        };
+        while !(prepared(&root.join("sub")) && prepared(&root.join("sub/inner"))) {
+            assert!(std::time::Instant::now() < deadline, "nothing was prepared");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        dev.stop_readahead();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
