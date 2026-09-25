@@ -7337,28 +7337,8 @@ mod tests {
         }
     }
 
-    /// Holds the metadata path to a fixed budget of host operations.
-    ///
-    /// This is the gate against a change that makes the device do more host
-    /// work per request. It counts operations instead of taking the time,
-    /// because the count is exact. A count cannot fail on a busy runner, and
-    /// it cannot pass a change that is slower but does the same work.
-    ///
-    /// The budget has two parts, and a failure means something different in
-    /// each:
-    ///
-    /// - `per_file` is the cost of one LOOKUP and one GETATTR. Nothing but the
-    ///   code that serves those requests changes it, so a new value is a
-    ///   regression until someone shows why the path is cheaper.
-    /// - `listing` also follows the shape of the fixture. The entry count, the
-    ///   length of the names and the reply budget all change it. Check those
-    ///   three first, before you look for a regression.
-    ///
-    /// If a change lowers either number, measure again, set the new value
-    /// here, and say in the commit why the path is cheaper.
-    ///
-    /// `virtio_fs` builds on macOS only, so CI runs this test in the
-    /// `build-and-test-macos` job. It needs no quiet or dedicated runner.
+    /// Returns the names in the first READDIRPLUS page of `node`, read with
+    /// fh 0.
     fn readdirplus_names(dev: &mut VirtioFs, node: u64) -> Vec<Vec<u8>> {
         let mut input = vec![0u8; 40];
         input[16..20].copy_from_slice(&4096u32.to_le_bytes());
@@ -7374,7 +7354,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_listing_serves_readdirplus_until_the_directory_changes() {
+    fn prepared_listing_serves_readdirplus_until_the_directory_changes() {
         let (dir, mut dev) = fixture_with_access(true);
         // The device keys its listings by canonical path.
         let sub = fs::canonicalize(&dir).unwrap().join("sub");
@@ -7426,6 +7406,28 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // Holds the metadata path to a fixed budget of host operations.
+    //
+    // This is the gate against a change that makes the device do more host
+    // work per request. It counts operations instead of taking the time,
+    // because the count is exact. A count cannot fail on a busy runner, and
+    // it cannot pass a change that is slower but does the same work.
+    //
+    // The budget has two parts, and a failure means something different in
+    // each:
+    //
+    // - `per_file` is the cost of one LOOKUP and one GETATTR. Nothing but the
+    //   code that serves those requests changes it, so a new value is a
+    //   regression until someone shows why the path is cheaper.
+    // - `listing` also follows the shape of the fixture. The entry count, the
+    //   length of the names and the reply budget all change it. Check those
+    //   three first, before you look for a regression.
+    //
+    // If a change lowers either number, measure again, set the new value
+    // here, and say in the commit why the path is cheaper.
+    //
+    // `virtio_fs` builds on macOS only, so CI runs this test in the
+    // `build-and-test-macos` job. It needs no quiet or dedicated runner.
     #[test]
     fn the_metadata_workload_spends_a_pinned_host_budget() {
         const FILES: usize = 25;
