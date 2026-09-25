@@ -10260,13 +10260,47 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Each two-path operation duplicates two descriptors. Duplicates that are
-    /// not released are how this device reaches EMFILE and reports nonsense on
-    /// unrelated files (#34), so the count must come back to where it started.
+    /// Returns the path descriptor `fd` refers to, or `None` when it is
+    /// closed or the host cannot say.
+    fn descriptor_path(fd: RawFd) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut buf = vec![0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which
+            // is that long.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let len = buf.iter().position(|&byte| byte == 0)?;
+            buf.truncate(len);
+            Some(PathBuf::from(OsString::from_vec(buf)))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+        }
+    }
+
+    /// Returns how many of the process's descriptors refer to `root` or
+    /// something under it.
+    fn descriptors_under(root: &Path) -> usize {
+        let root = fs::canonicalize(root).unwrap();
+        let fds: Vec<RawFd> = fs::read_dir("/dev/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        fds.into_iter()
+            .filter(|&fd| descriptor_path(fd).is_some_and(|path| path.starts_with(&root)))
+            .count()
+    }
+
+    // Each two-path operation duplicates two descriptors. Duplicates that are
+    // not released are how this device reaches EMFILE and reports nonsense on
+    // unrelated files (#34), so the count must come back to where it started.
     #[test]
     fn two_path_operations_do_not_leak_descriptors() {
         let (dir, mut dev) = fixture_with_access(true);
-        let open_now = || fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+        let open_now = || descriptors_under(&dir);
 
         // Warm the cache and the fixture so the baseline is steady.
         for round in 0..4u32 {
@@ -10289,11 +10323,10 @@ mod tests {
             assert_eq!(get_u32(&out, 4), Some(0), "rename {round} failed");
         }
         let after = open_now();
-        // The count is process-wide and the suite runs in parallel, so other
-        // tests opening files move it under this one. The tolerance is set by
-        // what a leak actually looks like rather than by hope: one duplicate
-        // per operation is sixty, and each rename takes two, so a real leak
-        // clears any plausible noise from a handful of concurrent tests.
+        // Only descriptors into this fixture count, so the tests running
+        // beside it cannot move the number. A leak is one duplicate per
+        // operation or more, sixty at least, which the bound leaves far below
+        // it.
         let growth = after.saturating_sub(before);
         assert!(
             growth < 20,
