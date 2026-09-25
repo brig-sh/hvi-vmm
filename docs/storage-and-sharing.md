@@ -178,7 +178,17 @@ shared cache that several guests read, use `--share-ro`.
 The macOS Seatbelt profile grants exactly one rule per export, by resolved
 root path: `file-read*` for a read-only share and `file-read* file-write*` for
 a writable one, on top of a deny-default profile. Nothing else on the host
-filesystem is writable. See [security.md](security.md).
+filesystem is writable. A writable export also brings the one fsctl SYNCFS
+needs, `FSIOC_SYNC_VOLUME`, and no other. See [security.md](security.md).
+
+SYNCFS on a writable export flushes every file the guest holds open, then
+syncs the export's volume, drive cache included, before it answers. That
+covers the volume the export root is on. A second volume mounted inside the
+export is not synced by it.
+
+SMB cannot sync a volume this way. On an export there, the first SYNCFS fails
+with `ENOSYS`, and the guest's FUSE client stops sending SYNCFS for that
+mount.
 
 ## See also
 
