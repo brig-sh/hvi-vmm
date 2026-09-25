@@ -434,6 +434,9 @@ struct Fh0Listing {
     /// Stat and stored guest attribute of `entries[i + 2]`, when the
     /// listing came from [`Readahead`]. Empty otherwise.
     prepared: Vec<(Stat, Option<GuestAttr>)>,
+    /// When a worker read `prepared`. Past the share's attribute timeout
+    /// the entries are stat'd afresh.
+    prepared_at: Option<std::time::Instant>,
 }
 
 /// One host entry a readahead worker prepared.
@@ -447,6 +450,10 @@ struct PreparedEntry {
 /// the directory had when it was read.
 struct PreparedDir {
     ctime: (i64, i64),
+    /// When the worker read the listing. The directory's change time does
+    /// not move when a child's contents change, so the age is what bounds
+    /// how stale a prepared stat can be.
+    read_at: std::time::Instant,
     entries: Vec<PreparedEntry>,
 }
 
@@ -809,6 +816,7 @@ fn prepare_dir(dir_fd: BorrowedFd<'_>) -> Option<PreparedDir> {
     entries.sort_by(|left, right| left.info.name.as_bytes().cmp(right.info.name.as_bytes()));
     Some(PreparedDir {
         ctime: (dir_meta.ctime(), dir_meta.ctime_nsec()),
+        read_at: std::time::Instant::now(),
         entries,
     })
 }
@@ -3208,6 +3216,18 @@ impl VirtioFs {
         self.cache_policy != CachePolicy::None
     }
 
+    /// Returns whether an attribute read at `at` is still one this share
+    /// may reply with.
+    ///
+    /// The reply lets the guest cache it for the share's attribute timeout,
+    /// which is as long as a fresh stat would be trusted. A prepared stat
+    /// older than that would keep the guest on a size the host moved past,
+    /// and the guest takes the attributes of a READDIRPLUS over the ones it
+    /// already holds.
+    fn prepared_is_fresh(&self, at: std::time::Instant) -> bool {
+        at.elapsed() < std::time::Duration::from_secs(self.cache_seconds())
+    }
+
     /// Returns the listing for a readdir with fh 0 that starts a directory.
     ///
     /// A prepared listing is used when the directory has not changed since it
@@ -3240,6 +3260,7 @@ impl VirtioFs {
                     return Ok(Fh0Listing {
                         entries,
                         prepared: attrs,
+                        prepared_at: Some(prepared.read_at),
                     });
                 }
             }
@@ -3247,6 +3268,7 @@ impl VirtioFs {
         Ok(Fh0Listing {
             entries: self.dir_entries(dir)?,
             prepared: Vec::new(),
+            prepared_at: None,
         })
     }
 
@@ -3785,6 +3807,20 @@ impl VirtioFs {
                 .fh0_listings
                 .get(&node)
                 .map(|listing| listing.entries.len());
+            // A prepared stat is served only while it is fresh, whether the
+            // page starts the listing or the guest has paged through it for
+            // longer than the attribute timeout.
+            let stale = self
+                .fh0_listings
+                .get(&node)
+                .and_then(|listing| listing.prepared_at)
+                .is_some_and(|at| !self.prepared_is_fresh(at));
+            if stale {
+                if let Some(listing) = self.fh0_listings.get_mut(&node) {
+                    listing.prepared.clear();
+                    listing.prepared_at = None;
+                }
+            }
             self.fh0_listings
                 .get(&node)
                 .map(|listing| &listing.entries)
@@ -7437,6 +7473,54 @@ mod tests {
         dev.handle_fuse(&request(UNLINK, sub_node, &unlink), 4096);
         assert!(dev.readahead.take(&sub).is_none());
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Returns the size READDIRPLUS reports for `name` in the first page of
+    /// `node`, read with fh 0.
+    fn readdirplus_size(dev: &mut VirtioFs, node: u64, name: &[u8]) -> Option<u64> {
+        let mut input = vec![0u8; 40];
+        input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, node, &input), 4096 + 16);
+        let mut pos = OUT_HEADER_LEN;
+        while pos + 152 <= out.len() {
+            let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
+            if &out[pos + 152..pos + 152 + namelen] == name {
+                // fuse_entry_out: 40 bytes, then fuse_attr's ino and size.
+                return get_u64(&out, pos + 48);
+            }
+            pos += align8(128 + 24 + namelen);
+        }
+        None
+    }
+
+    // A child's contents change without moving the directory's ctime, so the
+    // age of a prepared stat is what keeps it from outliving the timeout the
+    // guest would have trusted a fresh one for.
+    #[test]
+    fn prepared_listing_older_than_the_attribute_timeout_is_not_served() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a"), b"a").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+
+        dev.readahead.prepare_now(&sub);
+        fs::write(sub.join("a"), b"grown").unwrap();
+        let aged = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(WRITABLE_CACHE_SECS + 1))
+            .unwrap();
+        dev.readahead
+            .state
+            .lock
+            .lock()
+            .unwrap()
+            .cache
+            .get_mut(&sub)
+            .unwrap()
+            .read_at = aged;
+        assert_eq!(readdirplus_size(&mut dev, sub_node, b"a"), Some(5));
+        assert_eq!(dev.readahead.stats(), (1, 0, 0), "it was taken, then refused");
         let _ = fs::remove_dir_all(dir);
     }
 
