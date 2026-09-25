@@ -3075,27 +3075,6 @@ impl VirtioFs {
                 failed.get_or_insert(io_errno(err));
             }
         }
-        // A caching share has no directory handles. The directories the guest
-        // is paging through with fh 0 stand in for them, and only when this
-        // export has changed something since the last SYNCFS. One the guest
-        // has since removed no longer resolves, and there is nothing of it
-        // left to sync.
-        if self.writable && self.dirty {
-            let listed: Vec<PathBuf> = self
-                .fh0_order
-                .iter()
-                .filter_map(|&node| self.node_path(node).ok())
-                .filter_map(|dir| self.relative_of_path(dir).ok())
-                .collect();
-            for relative in listed {
-                let Ok(fd) = self.dirs.dir_fd_owned(&relative) else {
-                    continue;
-                };
-                if let Err(err) = File::from(fd).sync_all() {
-                    failed.get_or_insert(io_errno(err));
-                }
-            }
-        }
         // The loops above reach only the files the guest still holds open,
         // and they flush the drive cache: `File::sync_all` is
         // `fcntl(F_FULLFSYNC)` on macOS. A guest that writes a file, closes
@@ -9965,24 +9944,6 @@ mod tests {
             Some((-EBADF) as u32),
             "a handle never opened"
         );
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    // SYNCFS syncs the directories listed with fh 0, and one removed since
-    // it was listed has nothing left to sync.
-    #[test]
-    fn syncfs_skips_a_listed_directory_that_is_gone() {
-        let (dir, mut dev) = fixture_with_access(true);
-        fs::create_dir(dir.join("gone")).unwrap();
-        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
-        let gone = lookup_node(&mut dev, FUSE_ROOT_ID, b"gone");
-        read_fh0_page(&mut dev, etc, 0);
-        read_fh0_page(&mut dev, gone, 0);
-        fs::remove_dir(dir.join("gone")).unwrap();
-        write_and_close(&mut dev, "f", b"x");
-
-        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
-        assert_eq!(get_u32(&out, 4), Some(0));
         let _ = fs::remove_dir_all(dir);
     }
 
