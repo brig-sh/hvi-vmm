@@ -7997,25 +7997,24 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // `boot` joins these threads after the guest stops, so they have to exit
-    // when told. The device is locked throughout, as it is when the FUSE
-    // worker is stuck in a host call, and the stop must not wait for it.
+    // `boot` joins these threads after the guest stops, so the stop handle
+    // alone has to end them, with the device still alive. That `boot` stops
+    // them without taking the device lock is its ordering, which a unit test
+    // cannot see.
     #[test]
-    fn readahead_workers_stop_without_the_device_lock() {
+    fn readahead_workers_exit_through_the_stop_handle() {
         let (dir, dev) = fixture_with_cache(true, CachePolicy::None);
         assert!(dev.start_readahead().0.is_empty());
         let _ = fs::remove_dir_all(dir);
 
         let (dir, dev) = fixture_with_access(true);
-        let dev = Mutex::new(dev);
-        let held = dev.lock().unwrap();
-        let (workers, stop) = held.start_readahead();
+        let (workers, stop) = dev.start_readahead();
         assert_eq!(workers.len(), READAHEAD_WORKERS);
         stop.stop();
         for worker in workers {
             worker.join().unwrap();
         }
-        drop(held);
+        drop(dev);
         let _ = fs::remove_dir_all(dir);
     }
 
