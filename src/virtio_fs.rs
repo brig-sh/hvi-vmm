@@ -481,6 +481,38 @@ struct Node {
     guest_attr: Option<Option<GuestAttr>>,
 }
 
+/// `fsctl` command behind `sync_volume_np(3)`: `_IOW('A', 1, uint32_t)` in
+/// XNU's `sys/fsctl.h`, which the SDK does not ship. The sandbox grants this
+/// one command and no other; see `crate::sandbox`.
+pub(crate) const FSIOC_SYNC_VOLUME: u32 = 0x8004_4101;
+
+const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
+const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
+
+extern "C" {
+    fn sync_volume_np(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int;
+}
+
+/// Writes out the volume `path` is on, drive cache included, and waits for it.
+///
+/// This is what SYNCFS uses to reach the files the guest has closed. It costs
+/// one volume, where `sync(2)` walks every filesystem the host has mounted --
+/// network shares and every attached disk image included -- and on a busy host
+/// that walk took minutes. It is also the stronger of the two: `sync(2)` on XNU
+/// only schedules writeback and never flushes the drive cache.
+pub(crate) fn sync_volume(path: &Path) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // Safety: `path` is a NUL-terminated string that outlives the call.
+    let rc = unsafe { sync_volume_np(path.as_ptr(), SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT) };
+    // It returns the error and leaves `errno` as it found it.
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
 /// A virtio-fs device exporting exactly one canonical host directory.
 pub struct VirtioFs {
     root: PathBuf,
@@ -601,15 +633,15 @@ pub struct VirtioFs {
     dirs: DirCache,
     /// Whether this export has accepted a mutation since the last SYNCFS.
     ///
-    /// SYNCFS ends in a host-wide `sync(2)`, whose cost lands on every
-    /// filesystem the host has mounted. Charging that to a guest that has
+    /// SYNCFS ends in a full sync of the export's volume, whose cost lands on
+    /// everything else on that volume. Charging that to a guest that has
     /// written nothing buys nothing, and `while :; do sync; done` in a guest
-    /// would otherwise keep the host in writeback for as long as it runs.
+    /// would otherwise keep the volume flushing for as long as it runs.
     /// Set where the device admits a mutation rather than where one
     /// succeeds: a mutation that then fails costs one extra `sync`, and
     /// missing one would cost durability.
     dirty: bool,
-    /// How many host-wide `sync(2)` calls SYNCFS has made.
+    /// How many volume syncs SYNCFS has made.
     ///
     /// The guards above are invisible in the reply -- a SYNCFS that syncs the
     /// host and one that skips it both answer success -- so without a counter
@@ -3002,25 +3034,26 @@ impl VirtioFs {
         // it and then calls `sync` expects those bytes on the host too, and
         // this server has closed the descriptor they would have gone through.
         //
-        // `sync(2)` is what reaches them, and it is both coarse and weak.
-        // Coarse because it schedules writeback for every filesystem the host
-        // has mounted, not just the one this export serves. Weak because XNU
-        // issues it with MNT_NOWAIT and ignores what each filesystem returns,
-        // and it does not flush the drive cache -- so a file the guest has
-        // closed ends up less durable than one it still holds open. What it
-        // does give is that the bytes leave this process's reach and become
-        // the host's to write out, so they outlive the VMM. They do not
-        // outlive the host losing power. Getting closed files to F_FULLFSYNC
-        // means tracking every path written since the last sync and reopening
-        // each one.
+        // A sync of the export's volume is what reaches them: every dirty
+        // block on it goes to the disk and through the drive cache, and the
+        // call waits for that, so a closed file ends up as durable as an open
+        // one. It used to be `sync(2)`, which walks every filesystem the host
+        // has mounted and only schedules their writeback. The guest waits for
+        // this reply -- one shutting down cannot power off until it has it --
+        // and on a busy host, with network shares and disk images mounted,
+        // that walk held a guest in shutdown for minutes.
         //
-        // Both of those costs are the host's, so they are only spent for a
-        // guest that can write, and only once per batch of writes.
+        // The cost is still the volume's, so it is only spent for a guest
+        // that can write, and only once per batch of writes. A sync that
+        // fails leaves the batch pending, so the next SYNCFS tries again.
         if self.writable && self.dirty {
-            self.dirty = false;
             self.host_syncs.fetch_add(1, Ordering::Relaxed);
-            // Safety: `sync` takes no arguments and returns nothing.
-            unsafe { libc::sync() };
+            match sync_volume(&self.root) {
+                Ok(()) => self.dirty = false,
+                Err(err) => {
+                    failed.get_or_insert(io_errno(err));
+                }
+            }
         }
         match failed {
             Some(errno) => Err(errno),
@@ -6297,6 +6330,38 @@ mod tests {
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 2);
+    }
+
+    /// A volume sync that fails is reported to the guest, and the writes it
+    /// was for stay pending: the next SYNCFS syncs again rather than treating
+    /// the batch as done.
+    #[test]
+    fn a_failed_volume_sync_is_reported_and_retried() {
+        let (root, mut dev) = fixture_with_access(true);
+        write_and_close(&mut dev, "file", b"hello");
+
+        // Move the export away, so the volume sync has no path to resolve.
+        let root = fs::canonicalize(root).unwrap();
+        let mut moved = root.clone().into_os_string();
+        moved.push("-moved-away");
+        let moved = PathBuf::from(moved);
+        fs::rename(&root, &moved).unwrap();
+        // A stale ENOSYS passed through would turn SYNCFS off in the guest
+        // for the rest of the mount.
+        // Safety: `__error` returns this thread's errno slot.
+        unsafe { *libc::__error() = libc::ENOSYS };
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| e as i32), Some(-ENOENT));
+        assert_eq!(dev.host_sync_count(), 1);
+
+        fs::rename(&moved, &root).unwrap();
+        let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(
+            dev.host_sync_count(),
+            2,
+            "the pending batch was not retried"
+        );
     }
 
     /// A reset drops every handle without flushing it, so writes made before
