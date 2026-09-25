@@ -34,10 +34,12 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
 use crate::guestmem::GuestRam;
+use crate::sync::lock_or_recover;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
 const MAGIC_VALUE: u64 = 0x7472_6976;
@@ -100,6 +102,7 @@ const SETLK: u32 = 32;
 const SETLKW: u32 = 33;
 const ACCESS: u32 = 34;
 const CREATE: u32 = 35;
+const INTERRUPT: u32 = 36;
 const DESTROY: u32 = 38;
 const POLL: u32 = 40;
 const BATCH_FORGET: u32 = 42;
@@ -157,6 +160,7 @@ pub fn opcode_name(opcode: u32) -> &'static str {
         SETLKW => "SETLKW",
         ACCESS => "ACCESS",
         CREATE => "CREATE",
+        INTERRUPT => "INTERRUPT",
         DESTROY => "DESTROY",
         POLL => "POLL",
         BATCH_FORGET => "BATCH_FORGET",
@@ -426,8 +430,628 @@ struct DirHandle {
     entries: Vec<DirEntryInfo>,
 }
 
+/// The listing a readdir with fh 0 pages through, with whatever a readahead
+/// worker prepared for its entries.
+struct Fh0Listing {
+    entries: Vec<DirEntryInfo>,
+    /// Stat and stored guest attribute of `entries[i + 2]`, when the
+    /// listing came from [`Readahead`]. Empty otherwise.
+    prepared: Vec<(Stat, Option<GuestAttr>)>,
+    /// When a worker read `prepared`, on [`clock_with_sleep`]. Past the
+    /// share's attribute timeout the entries are stat'd afresh.
+    prepared_at: Option<std::time::Duration>,
+}
+
+/// One host entry a readahead worker prepared.
+struct PreparedEntry {
+    info: DirEntryInfo,
+    meta: Stat,
+    guest: Option<GuestAttr>,
+}
+
+/// A directory listing a readahead worker prepared, with the change time
+/// the directory had when it was read.
+struct PreparedDir {
+    ctime: (i64, i64),
+    /// When the worker read the listing, on [`clock_with_sleep`]. The
+    /// directory's change time does not move when a child's contents change,
+    /// so the age is what bounds how stale a prepared stat can be.
+    read_at: std::time::Duration,
+    entries: Vec<PreparedEntry>,
+}
+
+/// Returns the time since an arbitrary point, counting the time the host
+/// spent asleep.
+///
+/// A prepared stat is aged on this clock. `Instant` on macOS stops while the
+/// host sleeps, so a listing prepared before a lid close would come back
+/// from it no older than it went in.
+fn clock_with_sleep() -> std::time::Duration {
+    #[cfg(target_os = "macos")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    #[cfg(not(target_os = "macos"))]
+    const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid `timespec` for the call to fill, and `CLOCK`
+    // is a clock this platform has, so the call cannot fail.
+    unsafe { libc::clock_gettime(CLOCK, &mut now) };
+    std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
 /// Listings paged through with fh 0 that the device keeps at once.
 const FH0_LISTINGS_MAX: usize = 64;
+
+/// Prepared listings a readahead holds unconsumed. Past this, the oldest
+/// goes.
+const READAHEAD_MAX_DIRS: usize = 256;
+
+/// Directories queued for the workers at once. Past this, the one queued
+/// earliest goes, which is the one a walk reaches last.
+///
+/// A queued directory holds its parent's descriptor, shared with its
+/// siblings, so this also bounds the descriptors the queue holds. They are
+/// not in the guest's handle budget and come out of the VMM's reserve in
+/// [`crate::fdlimit`], which is larger.
+const READAHEAD_MAX_QUEUED: usize = 64;
+
+/// Subdirectories a worker queues from one directory it prepared, the first
+/// in listing order. The serving thread queues the rest as the guest pages
+/// through the directory. Half the queue, so a wide directory leaves room
+/// for the siblings queued before it.
+const READAHEAD_SUBDIRS_PER_DIR: usize = READAHEAD_MAX_QUEUED / 2;
+
+/// How many levels below a served listing the workers walk on their own.
+/// The serving thread's requests are level 0; the subdirectories a worker
+/// finds while preparing a level-n directory are level n + 1.
+const READAHEAD_DEPTH: u8 = 3;
+
+/// Worker threads a readahead runs. Two measured better than one or
+/// three: one falls behind a walk, three take CPU from the vCPUs.
+const READAHEAD_WORKERS: usize = 2;
+
+/// How long a thread spins before it parks. A parked thread on macOS wakes
+/// tens of microseconds after it is signaled, which is longer than a small
+/// directory takes to prepare.
+const READAHEAD_SPIN: std::time::Duration = std::time::Duration::from_micros(150);
+
+/// The longest the serving thread waits for a listing a worker is
+/// preparing before it reads the directory itself.
+const READAHEAD_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// What the readahead threads share. The two counters let a thread spin
+/// on a change without taking the lock: `posted` moves when a request is
+/// queued or a cache slot frees, `completed` when a worker finishes a
+/// directory.
+struct ReadaheadShared {
+    lock: Mutex<ReadaheadState>,
+    work: std::sync::Condvar,
+    done: std::sync::Condvar,
+    posted: AtomicU64,
+    completed: AtomicU64,
+    /// Set with `ReadaheadState::stopped`, for a worker in the middle of a
+    /// directory to read without the lock.
+    stopping: AtomicBool,
+}
+
+impl ReadaheadShared {
+    /// Tells the workers to exit. A worker reading a directory leaves it at
+    /// the next entry.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        lock_or_recover(&self.lock).stopped = true;
+        self.posted.fetch_add(1, Ordering::Release);
+        self.work.notify_all();
+    }
+}
+
+/// Stops a device's readahead workers without taking the device's lock.
+///
+/// `boot` stops the workers after the guest has powered off, and the FUSE
+/// worker may still hold the device then, stuck in a host call. Stopping
+/// through the device would wait for it and never reach the deadline that
+/// reports it.
+pub struct ReadaheadStop(Arc<ReadaheadShared>);
+
+impl ReadaheadStop {
+    /// Tells the workers to exit. It returns at once; `boot` joins them.
+    pub fn stop(&self) {
+        self.0.stop();
+    }
+}
+
+/// A directory queued for a worker.
+///
+/// The worker opens `name` under `parent`, the descriptor the directory was
+/// listed through, so no thread here turns a path into a file. It does so
+/// when it takes the entry, outside the lock.
+struct QueuedDir {
+    path: PathBuf,
+    parent: Arc<OwnedFd>,
+    name: CString,
+    /// The level below a served listing, 0 for the serving thread's own
+    /// requests.
+    depth: u8,
+}
+
+struct ReadaheadState {
+    /// Directories to prepare, most recent last, at most
+    /// [`READAHEAD_MAX_QUEUED`]. Workers take from the end: a walk descends
+    /// into the directory it listed last, so the most recent request is the
+    /// one the guest asks for next.
+    queue: VecDeque<QueuedDir>,
+    /// Prepared directories in insertion order, for eviction.
+    order: VecDeque<PathBuf>,
+    in_flight: std::collections::HashSet<PathBuf>,
+    /// Queued or in-flight directories already served, read by the serving
+    /// thread or taken prepared. A worker drops them when it reaches them
+    /// or finishes reading them.
+    skip: std::collections::HashSet<PathBuf>,
+    cache: HashMap<PathBuf, PreparedDir>,
+    generation: u64,
+    stopped: bool,
+}
+
+impl ReadaheadState {
+    /// Queues `dir` as the next to prepare.
+    ///
+    /// A directory already queued moves to the top and keeps the shallower
+    /// of its two depths, so it is not prepared twice. A full queue drops the
+    /// entry queued earliest, which is the one a walk reaches last.
+    fn push(&mut self, mut dir: QueuedDir) {
+        if let Some(pos) = self.queue.iter().position(|queued| queued.path == dir.path) {
+            if let Some(queued) = self.queue.remove(pos) {
+                dir.depth = dir.depth.min(queued.depth);
+            }
+        }
+        // Dropping the deepest entry first measured worse: on a deep tree the
+        // workers' deepest pushes are the directories the guest lists next.
+        // `READAHEAD_SUBDIRS_PER_DIR` is what keeps a wide directory from
+        // flushing its siblings.
+        if self.queue.len() >= READAHEAD_MAX_QUEUED {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(dir);
+    }
+
+    /// Queues the subdirectories among `entries`, the listing of `path` read
+    /// through `dir_fd`, at `depth`.
+    ///
+    /// Only the first [`READAHEAD_SUBDIRS_PER_DIR`] are queued. They go on in
+    /// reverse, so the first one is prepared next, as a walk asks.
+    fn queue_subdirs(
+        &mut self,
+        path: &Path,
+        entries: &[PreparedEntry],
+        dir_fd: &Arc<OwnedFd>,
+        depth: u8,
+    ) {
+        let subdirs: Vec<&PreparedEntry> = entries
+            .iter()
+            .filter(|entry| entry.meta.is_dir())
+            .take(READAHEAD_SUBDIRS_PER_DIR)
+            .collect();
+        for entry in subdirs.into_iter().rev() {
+            let child = path.join(&entry.info.name);
+            if self.cache.contains_key(&child) || self.in_flight.contains(&child) {
+                continue;
+            }
+            let Ok(name) = CString::new(entry.info.name.as_bytes()) else {
+                continue;
+            };
+            // Queued with the descriptor this directory was read through. The
+            // worker opens the one name there, so it never walks the path from
+            // the root.
+            self.push(QueuedDir {
+                path: child,
+                parent: Arc::clone(dir_fd),
+                name,
+                depth,
+            });
+        }
+    }
+
+    /// Removes and returns the prepared listing of `path`, if any, and marks
+    /// it served.
+    fn take_prepared(&mut self, path: &Path) -> Option<PreparedDir> {
+        let prepared = self.cache.remove(path)?;
+        if let Some(pos) = self.order.iter().position(|queued| queued == path) {
+            self.order.remove(pos);
+        }
+        self.mark_served(path);
+        Some(prepared)
+    }
+
+    /// Records that the serving thread has served `path`, so a worker drops
+    /// a queued request for it or a result it is still reading.
+    ///
+    /// Only a path a worker would reach is recorded, so `skip` holds no more
+    /// than the queue and the directories in flight.
+    fn mark_served(&mut self, path: &Path) {
+        if self.in_flight.contains(path) || self.queue.iter().any(|queued| queued.path == path) {
+            self.skip.insert(path.to_owned());
+        }
+    }
+}
+
+/// Prepares directory listings on worker threads ahead of the READDIRPLUS
+/// that asks for them.
+///
+/// A tree walk lists a directory, then each subdirectory it found. The
+/// serving thread sends those subdirectories here while it answers for the
+/// parent. A worker stats every entry of a directory and reads its stored
+/// guest attribute, then requests the subdirectories it found, so the
+/// workers walk ahead of the guest. At most [`READAHEAD_MAX_QUEUED`]
+/// directories wait to be prepared and [`READAHEAD_MAX_DIRS`] prepared
+/// listings wait to be taken. A prepared listing is used once, and only when
+/// the directory's change time still matches, so a host-side create, unlink
+/// or rename in between discards it. Its stats are served only while they
+/// are younger than the share's attribute timeout; see
+/// [`VirtioFs::prepared_is_fresh`]. Every request that changes the share
+/// clears the cache and bumps the generation, and a worker drops a
+/// listing it began under an older generation.
+struct Readahead {
+    state: Arc<ReadaheadShared>,
+    hits: AtomicU64,
+    waits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl Readahead {
+    fn new() -> Self {
+        let state = Arc::new(ReadaheadShared {
+            lock: Mutex::new(ReadaheadState {
+                queue: VecDeque::new(),
+                order: VecDeque::new(),
+                in_flight: std::collections::HashSet::new(),
+                skip: std::collections::HashSet::new(),
+                cache: HashMap::new(),
+                generation: 0,
+                stopped: false,
+            }),
+            work: std::sync::Condvar::new(),
+            done: std::sync::Condvar::new(),
+            posted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
+        });
+        Self {
+            state,
+            hits: AtomicU64::new(0),
+            waits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Starts the worker threads and returns their handles.
+    ///
+    /// A thread that fails to start is left out, and the rest serve alone.
+    fn start(&self) -> Vec<std::thread::JoinHandle<()>> {
+        (0..READAHEAD_WORKERS)
+            .filter_map(|_| {
+                let state = Arc::clone(&self.state);
+                std::thread::Builder::new()
+                    .name("virtio-fs-readahead".into())
+                    .spawn(move || Self::worker(&state))
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// Returns a handle that stops the workers.
+    fn stopper(&self) -> ReadaheadStop {
+        ReadaheadStop(Arc::clone(&self.state))
+    }
+
+    fn worker(state: &ReadaheadShared) {
+        let ReadaheadShared {
+            lock,
+            work,
+            done,
+            posted,
+            completed,
+            stopping,
+        } = state;
+        let mut guard = lock_or_recover(lock);
+        loop {
+            if guard.stopped {
+                return;
+            }
+            let Some(QueuedDir {
+                path,
+                parent,
+                name,
+                depth,
+            }) = guard.queue.pop_back()
+            else {
+                // Spin before parking: the next request usually follows
+                // within the time a parked wakeup takes. The spin reads
+                // the counter only, so it does not contend for the lock.
+                let seen = posted.load(Ordering::Acquire);
+                drop(guard);
+                let spin_until = std::time::Instant::now() + READAHEAD_SPIN;
+                while posted.load(Ordering::Acquire) == seen
+                    && std::time::Instant::now() < spin_until
+                {
+                    std::hint::spin_loop();
+                }
+                guard = lock_or_recover(lock);
+                if posted.load(Ordering::Acquire) == seen && !guard.stopped {
+                    guard = work.wait(guard).unwrap_or_else(PoisonError::into_inner);
+                }
+                continue;
+            };
+            if guard.skip.remove(&path)
+                || guard.cache.contains_key(&path)
+                || guard.in_flight.contains(&path)
+            {
+                if guard.queue.is_empty() && guard.in_flight.is_empty() {
+                    guard.skip.clear();
+                }
+                continue;
+            }
+            let generation = guard.generation;
+            guard.in_flight.insert(path.clone());
+            drop(guard);
+            let dir_fd = open_entry_nofollow(parent.as_fd(), &name)
+                .ok()
+                .map(Arc::new);
+            drop(parent);
+            let prepared = dir_fd
+                .as_ref()
+                .and_then(|fd| prepare_dir(fd.as_fd(), stopping));
+            guard = lock_or_recover(lock);
+            guard.in_flight.remove(&path);
+            // The serving thread stopped waiting for this one and read the
+            // directory itself.
+            let abandoned = guard.skip.remove(&path);
+            if guard.queue.is_empty() && guard.in_flight.is_empty() {
+                guard.skip.clear();
+            }
+            if let (Some(prepared), Some(dir_fd), false) = (prepared, dir_fd, abandoned) {
+                if guard.generation == generation {
+                    if depth < READAHEAD_DEPTH {
+                        guard.queue_subdirs(&path, &prepared.entries, &dir_fd, depth + 1);
+                    }
+                    while guard.cache.len() >= READAHEAD_MAX_DIRS {
+                        match guard.order.pop_front() {
+                            Some(oldest) => {
+                                guard.cache.remove(&oldest);
+                            }
+                            None => break,
+                        }
+                    }
+                    guard.order.push_back(path.clone());
+                    guard.cache.insert(path, prepared);
+                    posted.fetch_add(1, Ordering::Release);
+                    work.notify_all();
+                }
+            }
+            completed.fetch_add(1, Ordering::Release);
+            done.notify_all();
+        }
+    }
+
+    /// Asks a worker to prepare the directory `name` names under `parent`.
+    ///
+    /// `path` names it for the cache. The worker opens it under `parent`,
+    /// so it never resolves the path itself.
+    fn request(&self, path: PathBuf, parent: Arc<OwnedFd>, name: CString) {
+        let mut guard = lock_or_recover(&self.state.lock);
+        if guard.cache.contains_key(&path) || guard.in_flight.contains(&path) {
+            return;
+        }
+        // A request from the serving thread is for a directory the guest
+        // is about to ask for, whether or not it was served before.
+        guard.skip.remove(&path);
+        guard.push(QueuedDir {
+            path,
+            parent,
+            name,
+            depth: 0,
+        });
+        self.state.posted.fetch_add(1, Ordering::Release);
+        self.state.work.notify_one();
+    }
+
+    /// Removes and returns the prepared listing of `path`, if any. When a
+    /// worker is preparing it, waits up to [`READAHEAD_WAIT`] for it.
+    fn take(&self, path: &Path) -> Option<PreparedDir> {
+        let ReadaheadShared {
+            lock,
+            done,
+            completed,
+            ..
+        } = &*self.state;
+        let mut guard = lock_or_recover(lock);
+        if let Some(prepared) = guard.take_prepared(path) {
+            return Some(prepared);
+        }
+        if guard.in_flight.contains(path) {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let deadline = started + READAHEAD_WAIT;
+            while guard.in_flight.contains(path) {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                if now < started + READAHEAD_SPIN {
+                    let seen = completed.load(Ordering::Acquire);
+                    drop(guard);
+                    while completed.load(Ordering::Acquire) == seen
+                        && std::time::Instant::now() < started + READAHEAD_SPIN
+                    {
+                        std::hint::spin_loop();
+                    }
+                    guard = lock_or_recover(lock);
+                } else {
+                    guard = done
+                        .wait_timeout(guard, deadline - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+            if let Some(prepared) = guard.take_prepared(path) {
+                return Some(prepared);
+            }
+        }
+        // Not prepared, or not in time: the serving thread reads it, so a
+        // worker drops a queued request for it and a result that arrives
+        // late.
+        guard.mark_served(path);
+        None
+    }
+
+    /// Counts a listing the serving thread started, as a hit when it served
+    /// the prepared stats and as a miss when it stat'd the entries itself, a
+    /// listing whose prepared stats were stale included.
+    fn count(&self, hit: bool) {
+        let counter = if hit { &self.hits } else { &self.misses };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drops every prepared listing and every request in flight.
+    fn invalidate(&self) {
+        let mut guard = lock_or_recover(&self.state.lock);
+        guard.generation += 1;
+        guard.queue.clear();
+        guard.skip.clear();
+        guard.cache.clear();
+        guard.order.clear();
+    }
+
+    /// Returns `(hits, waits, misses)` since boot: listings served prepared,
+    /// waits in [`Self::take`] for one in flight, and listings read from the
+    /// host. See [`Self::count`].
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.waits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Prepares `path` on the calling thread, for tests that need the
+    /// listing in place before the next request.
+    #[cfg(test)]
+    fn prepare_now(&self, path: &Path) {
+        // The test names a directory it created itself, so there is no
+        // guest-supplied name here to resolve through a descriptor.
+        #[allow(clippy::disallowed_methods)]
+        let Ok(dir) = File::open(path) else {
+            return;
+        };
+        if let Some(prepared) = prepare_dir(dir.as_fd(), &AtomicBool::new(false)) {
+            let mut guard = lock_or_recover(&self.state.lock);
+            guard.order.push_back(path.to_owned());
+            guard.cache.insert(path.to_owned(), prepared);
+        }
+    }
+}
+
+impl Drop for Readahead {
+    fn drop(&mut self) {
+        self.state.stop();
+    }
+}
+
+/// Reads and stats a directory through `dir_fd`, for a worker to hold until
+/// the guest asks for it, or `None` when it cannot be read or `stopping` is
+/// set.
+///
+/// Every host call here is against `dir_fd` or a descriptor opened from it,
+/// so a worker running beside the guest resolves no names of its own.
+fn prepare_dir(dir_fd: BorrowedFd<'_>, stopping: &AtomicBool) -> Option<PreparedDir> {
+    let dir_meta = Stat::of_fd(dir_fd).ok()?;
+    // `read_dir_at` takes its descriptor over, so it gets a dup and the
+    // caller's stays open for the stats below and for the descent.
+    let listing = read_dir_at(dup_cloexec(dir_fd).ok()?).ok()?;
+    let mut entries = Vec::with_capacity(listing.len());
+    for info in listing {
+        // Checked per entry, so a worker in a large directory when the guest
+        // powers off exits within `boot`'s deadline.
+        if stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        let Ok(name) = CString::new(info.name.as_bytes()) else {
+            continue;
+        };
+        let Ok(meta) = Stat::at(dir_fd, &name) else {
+            continue;
+        };
+        #[cfg(target_os = "macos")]
+        let guest = open_entry_nofollow(dir_fd, &name)
+            .ok()
+            .and_then(|fd| stored_guest_attr(fd.as_fd()));
+        #[cfg(not(target_os = "macos"))]
+        let guest = None;
+        entries.push(PreparedEntry { info, meta, guest });
+    }
+    // Listing order, which is the order a walk descends in.
+    entries.sort_by(|left, right| left.info.name.as_bytes().cmp(right.info.name.as_bytes()));
+    Some(PreparedDir {
+        ctime: (dir_meta.ctime(), dir_meta.ctime_nsec()),
+        read_at: clock_with_sleep(),
+        entries,
+    })
+}
+
+/// Returns whether an OPEN with these `fuse_open_in` flags may change the
+/// file, by writing to it, truncating it or clearing its set-id bits.
+fn open_wants_write(flags: u32, open_flags: u32) -> bool {
+    flags & LINUX_O_ACCMODE != 0
+        || flags & LINUX_O_TRUNC != 0
+        || open_flags & FUSE_OPEN_KILL_SUIDGID != 0
+}
+
+/// Returns whether a request of `opcode` with `payload` leaves the share
+/// unchanged, so a prepared listing stays valid across it.
+///
+/// An OPEN is read-only when it asks for no write. A payload too short to
+/// say is taken as a write.
+fn request_is_read_only(opcode: u32, payload: &[u8]) -> bool {
+    if opcode == OPEN {
+        return match (get_u32(payload, 0), get_u32(payload, 4)) {
+            (Some(flags), Some(open_flags)) => !open_wants_write(flags, open_flags),
+            _ => false,
+        };
+    }
+    matches!(
+        opcode,
+        LOOKUP
+            | FORGET
+            | GETATTR
+            | READLINK
+            | READ
+            | STATFS
+            | RELEASE
+            | FSYNC
+            | GETXATTR
+            | LISTXATTR
+            | FLUSH
+            | INIT
+            | OPENDIR
+            | READDIR
+            | RELEASEDIR
+            | FSYNCDIR
+            | GETLK
+            | SETLK
+            | SETLKW
+            | IOCTL
+            | INTERRUPT
+            | ACCESS
+            | DESTROY
+            | POLL
+            | BATCH_FORGET
+            | READDIRPLUS
+            | LSEEK
+            | SYNCFS
+            | STATX
+    )
+}
 
 /// A guest-created Unix socket, held in the device rather than on the host.
 /// See `VirtioFs::sockets`.
@@ -586,11 +1210,12 @@ pub struct VirtioFs {
     /// offsets the guest holds stay valid. There are at most
     /// [`FH0_LISTINGS_MAX`]; see [`Self::make_room_for_fh0_listing`] for which
     /// one goes.
-    fh0_listings: HashMap<u64, Vec<DirEntryInfo>>,
+    fh0_listings: HashMap<u64, Fh0Listing>,
     /// The nodes in `fh0_listings`, least recently read first.
     fh0_order: VecDeque<u64>,
     /// The nodes in `fh0_listings` whose listing a page has read to the end.
     fh0_finished: HashSet<u64>,
+    readahead: Readahead,
     next_handle: u64,
     /// Most guest handles this export will hold open at once (#34).
     ///
@@ -745,6 +1370,7 @@ impl VirtioFs {
             fh0_listings: HashMap::new(),
             fh0_order: VecDeque::new(),
             fh0_finished: HashSet::new(),
+            readahead: Readahead::new(),
             next_handle: 1,
             handle_limit: crate::fdlimit::guest_handle_budget(),
             parked: HashMap::new(),
@@ -819,6 +1445,41 @@ impl VirtioFs {
         }
     }
 
+    /// Starts the readahead workers and returns their handles, none under
+    /// `cache=none`, which never serves a prepared listing, and the handle
+    /// that stops them.
+    ///
+    /// The workers read the shared tree, so the machine starts them after it
+    /// confines the process and joins them with its other helper threads.
+    /// Until then a READDIRPLUS finds nothing prepared and reads the host.
+    pub fn start_readahead(&self) -> (Vec<std::thread::JoinHandle<()>>, ReadaheadStop) {
+        let workers = if self.readahead_enabled() {
+            self.readahead.start()
+        } else {
+            Vec::new()
+        };
+        (workers, self.readahead.stopper())
+    }
+
+    /// Returns `(hits, waits, misses)` of the READDIRPLUS readahead since boot.
+    pub fn readahead_stats(&self) -> (u64, u64, u64) {
+        self.readahead.stats()
+    }
+
+    /// Drops every prepared listing and the prepared stats of every fh-0
+    /// listing, for a request that may change what they describe.
+    ///
+    /// A listing being paged through keeps its entries, so the offsets the
+    /// guest holds stay valid, as they do for a handle's snapshot. Only its
+    /// remaining pages are stat'd afresh.
+    fn drop_prepared(&mut self) {
+        self.readahead.invalidate();
+        for listing in self.fh0_listings.values_mut() {
+            listing.prepared.clear();
+            listing.prepared_at = None;
+        }
+    }
+
     fn note_zero_copy_read(&self) {
         self.zero_copy_reads.fetch_add(1, Ordering::Relaxed);
     }
@@ -869,6 +1530,9 @@ impl VirtioFs {
         self.fh0_listings.clear();
         self.fh0_order.clear();
         self.fh0_finished.clear();
+        // The queue and the prepared listings belong to the session that
+        // walked into them.
+        self.readahead.invalidate();
         self.sockets.clear();
         self.nodes.retain(|&node, _| node == FUSE_ROOT_ID);
         self.inode_ids.retain(|_, &mut node| node == FUSE_ROOT_ID);
@@ -1213,6 +1877,9 @@ impl VirtioFs {
         let nodeid = get_u64(raw, 16).unwrap_or(0);
         self.count_op(opcode);
         let op_start = std::time::Instant::now();
+        if !request_is_read_only(opcode, raw.get(IN_HEADER_LEN..).unwrap_or_default()) {
+            self.drop_prepared();
+        }
         let request_context = RequestContext {
             uid: get_u32(raw, 24).unwrap_or(0),
             gid: get_u32(raw, 28).unwrap_or(0),
@@ -2098,9 +2765,7 @@ impl VirtioFs {
     fn open(&mut self, node: u64, input: &[u8], directory: bool) -> Result<Vec<u8>, i32> {
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let open_flags = get_u32(input, 4).ok_or(EINVAL)?;
-        let wants_write = flags & LINUX_O_ACCMODE != 0
-            || flags & LINUX_O_TRUNC != 0
-            || open_flags & FUSE_OPEN_KILL_SUIDGID != 0;
+        let wants_write = open_wants_write(flags, open_flags);
         if wants_write && !self.writable {
             return Err(EROFS);
         }
@@ -2432,9 +3097,11 @@ impl VirtioFs {
         if !self.writable {
             return None;
         }
-        // The buffered path reaches this through `require_writable`; this one
-        // never calls it, so it marks the export dirty itself.
+        // The buffered path reaches this through `require_writable` and the
+        // non-read-only check in `handle_fuse`. This one reaches neither, so
+        // it marks the export dirty and drops what was prepared itself.
         self.dirty = true;
+        self.drop_prepared();
         let total_in: usize = input.iter().map(|(_, len)| *len as usize).sum();
         if declared < IN_HEADER_LEN || declared > total_in {
             return None;
@@ -2703,7 +3370,16 @@ impl VirtioFs {
     /// entries afterwards.
     fn dir_entries(&mut self, path: &Path) -> Result<Vec<DirEntryInfo>, i32> {
         let relative = self.relative_of_path(path)?;
-        let mut entries = read_dir_at(self.dirs.dir_fd_owned(&relative)?)?;
+        let entries = read_dir_at(self.dirs.dir_fd_owned(&relative)?)?;
+        Ok(self.assemble_entries(path, entries))
+    }
+
+    /// Completes a directory's host entries into the listing a handle
+    /// holds: this device's sockets under it, sorted, `.` and `..` in front.
+    ///
+    /// Separate from the read so that a readahead worker, which reads the
+    /// directory on its own thread, produces the same listing this does.
+    fn assemble_entries(&self, path: &Path, mut entries: Vec<DirEntryInfo>) -> Vec<DirEntryInfo> {
         // Sockets this device holds are in no host directory, so they are
         // added here rather than found by `read_dir`. Doing it while the
         // handle is built means the listing is a snapshot like every other
@@ -2737,7 +3413,85 @@ impl VirtioFs {
                 dtype: 0,
             },
         );
-        Ok(entries)
+        entries
+    }
+
+    /// Returns whether READDIRPLUS may serve a prepared listing. A share
+    /// with no caching answers every request from the host as it is.
+    fn readahead_enabled(&self) -> bool {
+        self.cache_policy != CachePolicy::None
+    }
+
+    /// Returns whether a stat read at `at`, on [`clock_with_sleep`], is
+    /// still one this share may reply with.
+    ///
+    /// The reply lets the guest cache it for the share's attribute timeout,
+    /// which is as long as a fresh stat would be trusted. A prepared stat
+    /// older than that would keep the guest on a size the host moved past,
+    /// and the guest takes the attributes of a READDIRPLUS over the ones it
+    /// already holds.
+    ///
+    /// A stat sent just inside the timeout is then cached for another one,
+    /// so the guest can hold a prepared stat up to about twice the timeout
+    /// old: 10 s on a writable share and 120 s on a read-only one.
+    fn prepared_is_fresh(&self, at: std::time::Duration) -> bool {
+        clock_with_sleep().saturating_sub(at) < std::time::Duration::from_secs(self.cache_seconds())
+    }
+
+    /// Returns the listing for a readdir with fh 0 that starts a directory.
+    ///
+    /// A prepared listing is used when the directory has not changed since it
+    /// was read. Its stats go with it only while they are fresh; see
+    /// [`Self::prepared_is_fresh`].
+    fn fh0_listing_for(&mut self, dir: &Path, plus: bool) -> Result<Fh0Listing, i32> {
+        // A directory this device holds a socket under is listed the plain
+        // way: the prepared entries are host entries in name order, and
+        // the socket would have to be merged in.
+        let has_socket = self
+            .sockets
+            .keys()
+            .any(|socket_path| socket_path.parent() == Some(dir));
+        if plus && self.readahead_enabled() && !has_socket {
+            if let Some(prepared) = self.readahead.take(dir) {
+                // `readdir` left the directory's descriptor cached, so this is
+                // an fstat and no walk from the root.
+                let relative = self.relative_of_path(dir)?;
+                let dir_meta = Stat::of_fd(self.dirs.dir_fd(&relative)?)?;
+                if (dir_meta.ctime(), dir_meta.ctime_nsec()) == prepared.ctime {
+                    // The names hold for as long as the change time does. A
+                    // stale listing keeps them, which saves reading the
+                    // directory again, and its pages stat the entries afresh.
+                    let fresh = self.prepared_is_fresh(prepared.read_at);
+                    self.readahead.count(fresh);
+                    let mut entries = Vec::with_capacity(prepared.entries.len() + 2);
+                    let mut attrs = Vec::with_capacity(prepared.entries.len());
+                    for name in [b".".as_slice(), b"..".as_slice()] {
+                        entries.push(DirEntryInfo {
+                            name: OsString::from_vec(name.to_vec()),
+                            ino: 0,
+                            dtype: 0,
+                        });
+                    }
+                    for entry in prepared.entries {
+                        entries.push(entry.info);
+                        if fresh {
+                            attrs.push((entry.meta, entry.guest));
+                        }
+                    }
+                    return Ok(Fh0Listing {
+                        entries,
+                        prepared: attrs,
+                        prepared_at: fresh.then_some(prepared.read_at),
+                    });
+                }
+            }
+            self.readahead.count(false);
+        }
+        Ok(Fh0Listing {
+            entries: self.dir_entries(dir)?,
+            prepared: Vec::new(),
+            prepared_at: None,
+        })
     }
 
     fn insert_dir_handle(&mut self, path: &Path) -> Result<u64, i32> {
@@ -3262,8 +4016,8 @@ impl VirtioFs {
         let batch: Vec<(usize, DirEntryInfo)> = if fh == 0 {
             let reuse = offset != 0 && self.fh0_listings.contains_key(&node);
             if !reuse {
-                let entries = self.dir_entries(&dir)?;
-                self.fh0_listings.insert(node, entries);
+                let listing = self.fh0_listing_for(&dir, plus)?;
+                self.fh0_listings.insert(node, listing);
                 self.fh0_finished.remove(&node);
             }
             if let Some(pos) = self.fh0_order.iter().position(|&n| n == node) {
@@ -3271,9 +4025,27 @@ impl VirtioFs {
             }
             self.make_room_for_fh0_listing();
             self.fh0_order.push_back(node);
-            fh0_len = self.fh0_listings.get(&node).map(Vec::len);
+            fh0_len = self
+                .fh0_listings
+                .get(&node)
+                .map(|listing| listing.entries.len());
+            // A prepared stat is served only while it is fresh, whether the
+            // page starts the listing or the guest has paged through it for
+            // longer than the attribute timeout.
+            let stale = self
+                .fh0_listings
+                .get(&node)
+                .and_then(|listing| listing.prepared_at)
+                .is_some_and(|at| !self.prepared_is_fresh(at));
+            if stale {
+                if let Some(listing) = self.fh0_listings.get_mut(&node) {
+                    listing.prepared.clear();
+                    listing.prepared_at = None;
+                }
+            }
             self.fh0_listings
                 .get(&node)
+                .map(|listing| &listing.entries)
                 .into_iter()
                 .flatten()
                 .enumerate()
@@ -3315,6 +4087,38 @@ impl VirtioFs {
             None
         };
 
+        // A walk lists each subdirectory it finds next, in listing order, so
+        // their listings are prepared while the guest reads this reply.
+        // Workers take the most recent request first, so the first
+        // subdirectory is requested last. The worker that prepared this
+        // listing requested them too; requesting them again from here puts
+        // the guest's position back on top of the workers' stack.
+        //
+        // Each one is queued with the descriptor this listing came from, and
+        // the worker opens the one name there. A worker never resolves a path,
+        // so a rename of a directory above cannot send it elsewhere.
+        let names_a_subdirectory = batch
+            .iter()
+            .any(|(idx, entry)| *idx > 1 && entry.dtype == DT_DIR);
+        if plus && names_a_subdirectory && self.readahead_enabled() {
+            let parent = listing
+                .as_ref()
+                .and_then(|listing| dup_cloexec(listing.as_fd()).ok())
+                .map(Arc::new);
+            if let Some(parent) = parent {
+                for (idx, entry) in batch.iter().rev() {
+                    if *idx <= 1 || entry.dtype != DT_DIR {
+                        continue;
+                    }
+                    let Ok(name) = CString::new(entry.name.as_bytes()) else {
+                        continue;
+                    };
+                    self.readahead
+                        .request(dir.join(&entry.name), Arc::clone(&parent), name);
+                }
+            }
+        }
+
         let batch_end = batch.last().map_or(offset, |(idx, _)| idx + 1);
         let mut full = false;
         let mut out = Vec::new();
@@ -3336,7 +4140,12 @@ impl VirtioFs {
             if plus {
                 // A socket has no host entry behind it, so its attributes
                 // come from this device rather than from a stat.
-                if let Some(socket) = self.sockets.get(&path).copied() {
+                let socket = if self.sockets.is_empty() {
+                    None
+                } else {
+                    self.sockets.get(&path).copied()
+                };
+                if let Some(socket) = socket {
                     let entry_node = self.socket_node_id(&path, socket.ino);
                     self.remember_lookup(entry_node);
                     out.extend_from_slice(&socket_entry_out(entry_node, socket));
@@ -3350,11 +4159,23 @@ impl VirtioFs {
                 }
                 // READDIRPLUS always needs full attributes, so the d_type
                 // fast path below does not apply here.
-                let meta =
-                    match stat_listed(listing.as_ref(), idx, &entry.name, parent_meta.as_ref()) {
-                        Ok(meta) => meta,
-                        Err(_) => continue,
-                    };
+                let prepared = if fh == 0 && idx > 1 {
+                    self.fh0_listings
+                        .get(&node)
+                        .and_then(|listing| listing.prepared.get(idx - 2).copied())
+                } else {
+                    None
+                };
+                let meta = match prepared {
+                    Some((meta, _)) => meta,
+                    None => {
+                        match stat_listed(listing.as_ref(), idx, &entry.name, parent_meta.as_ref())
+                        {
+                            Ok(meta) => meta,
+                            Err(_) => continue,
+                        }
+                    }
+                };
                 let entry_node = if idx == 0 {
                     node
                 } else if idx == 1 {
@@ -3362,6 +4183,15 @@ impl VirtioFs {
                 } else {
                     self.node_for(path.clone(), &meta)
                 };
+                if let Some((_, guest)) = prepared {
+                    // A value this device wrote since is already cached on
+                    // the node and stays.
+                    if let Some(n) = self.nodes.get_mut(&entry_node) {
+                        if n.guest_attr.is_none() {
+                            n.guest_attr = Some(guest);
+                        }
+                    }
+                }
                 // Everything but `.` and `..`. The guest kernel returns from
                 // `fuse_direntplus_link` before `fuse_iget` for those two
                 // names, so it takes no reference and sends no FORGET for
@@ -4661,6 +5491,20 @@ fn open_entry_nofollow(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, i3
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Duplicates a descriptor this device owns, close-on-exec.
+///
+/// `read_dir_at` takes its descriptor over, so a caller that still needs its
+/// own hands that one a dup.
+fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd, i32> {
+    // SAFETY: `fd` is borrowed for the call and open for its whole duration.
+    let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(io_errno(io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh descriptor this call owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
 /// Reads an extended attribute from an open descriptor.
 #[cfg(target_os = "macos")]
 fn fd_getxattr(fd: BorrowedFd<'_>, name: &[u8]) -> Result<Vec<u8>, i32> {
@@ -5019,22 +5863,6 @@ fn exists_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<(), i32> {
         return Err(io_errno(io::Error::last_os_error()));
     }
     Ok(())
-}
-
-/// Duplicates a descriptor this device owns, close-on-exec.
-///
-/// The caller gets a descriptor of its own with the same open file
-/// description behind it, which is what lets an unlinked-but-open file be
-/// reached after its name is gone.
-#[cfg(target_os = "macos")]
-fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd, i32> {
-    // SAFETY: `fd` is borrowed for the call and open for its whole duration.
-    let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if dup < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    // SAFETY: a fresh descriptor this call owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
 }
 
 /// Returns the metadata of one entry in a directory listing.
@@ -6806,28 +7634,425 @@ mod tests {
         }
     }
 
-    /// Holds the metadata path to a fixed budget of host operations.
-    ///
-    /// This is the gate against a change that makes the device do more host
-    /// work per request. It counts operations instead of taking the time,
-    /// because the count is exact. A count cannot fail on a busy runner, and
-    /// it cannot pass a change that is slower but does the same work.
-    ///
-    /// The budget has two parts, and a failure means something different in
-    /// each:
-    ///
-    /// - `per_file` is the cost of one LOOKUP and one GETATTR. Nothing but the
-    ///   code that serves those requests changes it, so a new value is a
-    ///   regression until someone shows why the path is cheaper.
-    /// - `listing` also follows the shape of the fixture. The entry count, the
-    ///   length of the names and the reply budget all change it. Check those
-    ///   three first, before you look for a regression.
-    ///
-    /// If a change lowers either number, measure again, set the new value
-    /// here, and say in the commit why the path is cheaper.
-    ///
-    /// `virtio_fs` builds on macOS only, so CI runs this test in the
-    /// `build-and-test-macos` job. It needs no quiet or dedicated runner.
+    /// Returns the names in the first READDIRPLUS page of `node`, read with
+    /// fh 0.
+    fn readdirplus_names(dev: &mut VirtioFs, node: u64) -> Vec<Vec<u8>> {
+        let mut input = vec![0u8; 40];
+        input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, node, &input), 4096 + 16);
+        let mut names = Vec::new();
+        let mut pos = OUT_HEADER_LEN;
+        while pos + 152 <= out.len() {
+            let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
+            names.push(out[pos + 152..pos + 152 + namelen].to_vec());
+            pos += align8(128 + 24 + namelen);
+        }
+        names
+    }
+
+    #[test]
+    fn prepared_listing_serves_readdirplus_until_the_directory_changes() {
+        let (dir, mut dev) = fixture_with_access(true);
+        // The device keys its listings by canonical path.
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a"), b"a").unwrap();
+        fs::write(sub.join("b"), b"b").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+
+        // Served from the prepared listing: the change-time check, the
+        // parent stat, `..` and the walk that puts this directory's
+        // descriptor in the cache are the only host operations. `.` is an
+        // fstat on the descriptor the listing is read through, which costs
+        // no resolution, and neither `a` nor `b` is stat'd at all.
+        dev.readahead.prepare_now(&sub);
+        let spent = || HOST_META_OPS.with(std::cell::Cell::get);
+        let before = spent();
+        let names = readdirplus_names(&mut dev, sub_node);
+        assert_eq!(
+            names,
+            [b".".to_vec(), b"..".to_vec(), b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(
+            spent() - before,
+            5,
+            "a prepared listing must not stat its entries again"
+        );
+        assert_eq!(
+            dev.readahead.stats(),
+            (1, 0, 0),
+            "the page came from the prepared listing"
+        );
+
+        // A host-side create after the preparation changes the directory,
+        // so the prepared listing is dropped and the new entry is listed.
+        dev.readahead.prepare_now(&sub);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(sub.join("c"), b"c").unwrap();
+        let names = readdirplus_names(&mut dev, sub_node);
+        assert_eq!(names.len(), 5);
+        assert_eq!(names[4], b"c".to_vec());
+
+        // A request that changes the share drops what was prepared.
+        dev.readahead.prepare_now(&sub);
+        let mut unlink = b"c".to_vec();
+        unlink.push(0);
+        dev.handle_fuse(&request(UNLINK, sub_node, &unlink), 4096);
+        assert!(dev.readahead.take(&sub).is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Returns the size READDIRPLUS reports for `name` in the page of `node`
+    /// that starts at `offset`, read with fh 0.
+    fn readdirplus_size(dev: &mut VirtioFs, node: u64, offset: u64, name: &[u8]) -> Option<u64> {
+        let mut input = vec![0u8; 40];
+        input[8..16].copy_from_slice(&offset.to_le_bytes());
+        input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, node, &input), 4096 + 16);
+        let mut pos = OUT_HEADER_LEN;
+        while pos + 152 <= out.len() {
+            let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
+            if &out[pos + 152..pos + 152 + namelen] == name {
+                // fuse_entry_out: 40 bytes, then fuse_attr's ino and size.
+                return get_u64(&out, pos + 48);
+            }
+            pos += align8(128 + 24 + namelen);
+        }
+        None
+    }
+
+    // A child's contents change without moving the directory's ctime, so the
+    // age of a prepared stat is what keeps it from outliving the timeout the
+    // guest would have trusted a fresh one for. It is checked when a walk
+    // starts the listing and again on every page after that.
+    #[test]
+    fn prepared_listing_older_than_the_attribute_timeout_is_not_served() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a"), b"a").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+        let aged = clock_with_sleep()
+            .saturating_sub(std::time::Duration::from_secs(WRITABLE_CACHE_SECS + 1));
+
+        dev.readahead.prepare_now(&sub);
+        fs::write(sub.join("a"), b"grown").unwrap();
+        dev.readahead
+            .state
+            .lock
+            .lock()
+            .unwrap()
+            .cache
+            .get_mut(&sub)
+            .unwrap()
+            .read_at = aged;
+        assert_eq!(readdirplus_size(&mut dev, sub_node, 0, b"a"), Some(5));
+        assert_eq!(dev.readahead.stats(), (0, 0, 1), "refused, so a miss");
+
+        dev.readahead.prepare_now(&sub);
+        assert_eq!(readdirplus_size(&mut dev, sub_node, 0, b"a"), Some(5));
+        assert_eq!(dev.readahead.stats(), (1, 0, 1));
+        fs::write(sub.join("a"), b"grown again").unwrap();
+        dev.fh0_listings.get_mut(&sub_node).unwrap().prepared_at = Some(aged);
+        assert_eq!(readdirplus_size(&mut dev, sub_node, 2, b"a"), Some(11));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A WRITE on the direct path never reaches `handle_fuse`, so it has to
+    // drop what was prepared itself, or the next listing reports the size
+    // the file had before the write.
+    #[test]
+    fn direct_write_drops_the_prepared_listing() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("g"), b"").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+        let g = lookup_node(&mut dev, sub_node, b"g");
+        let fh = open_rw(&mut dev, g);
+        dev.readahead.prepare_now(&sub);
+
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
+        let (in_buf, out_buf) = (base, base + 0x8000);
+        let data = [7u8; 512];
+        let mut req = fuse_in_header((IN_HEADER_LEN + 40 + data.len()) as u32, WRITE, 1, g);
+        let mut write = [0u8; 40];
+        write[0..8].copy_from_slice(&fh.to_le_bytes());
+        write[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        req.extend_from_slice(&write);
+        req.extend_from_slice(&data);
+        mem.write(in_buf, &req).unwrap();
+        let reply = dev.handle_fuse_desc(&mem, &[(in_buf, req.len() as u32)], &[(out_buf, 24)], 24);
+        assert!(matches!(reply, Reply::Buffered(_)));
+        assert_eq!(
+            dev.zero_copy_writes.load(Ordering::Relaxed),
+            1,
+            "direct path"
+        );
+
+        assert_eq!(readdirplus_size(&mut dev, sub_node, 0, b"g"), Some(512));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `grep -r` opens every file it reaches, so an OPEN that asks for no
+    // write has to leave the prepared listings in place. One that may write
+    // still drops them.
+    #[test]
+    fn only_an_open_for_writing_drops_the_prepared_listings() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f"), b"f").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+        let f = lookup_node(&mut dev, sub_node, b"f");
+
+        dev.readahead.prepare_now(&sub);
+        let out = dev.handle_fuse(&request(OPEN, f, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(dev.readahead.take(&sub).is_some(), "O_RDONLY kept it");
+
+        dev.readahead.prepare_now(&sub);
+        open_rw(&mut dev, f);
+        assert!(dev.readahead.take(&sub).is_none(), "O_RDWR dropped it");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A directory of 2,000 packages queues 2,000 subdirectories. The queue
+    // keeps the ones a walk reaches first, and they share one descriptor.
+    #[test]
+    fn readahead_queue_is_capped_and_keeps_the_latest_requests() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap());
+        for i in 0..READAHEAD_MAX_QUEUED * 4 {
+            let name = format!("d{i:04}");
+            dev.readahead.request(
+                dir.join(&name),
+                Arc::clone(&root),
+                CString::new(name).unwrap(),
+            );
+        }
+        let guard = dev.readahead.state.lock.lock().unwrap();
+        assert_eq!(guard.queue.len(), READAHEAD_MAX_QUEUED);
+        let last = format!("d{:04}", READAHEAD_MAX_QUEUED * 4 - 1);
+        assert_eq!(guard.queue.back().unwrap().path, dir.join(last));
+        drop(guard);
+        assert_eq!(Arc::strong_count(&root), READAHEAD_MAX_QUEUED + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A wide directory a worker prepares shares the queue with the siblings
+    // the guest lists after it. Its subdirectories take half the queue at
+    // most, so the siblings queued before it stay.
+    #[test]
+    fn wide_directory_leaves_its_siblings_queued() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        let wide = root.join("s00");
+        for i in 0..200 {
+            fs::create_dir_all(wide.join(format!("k{i:03}"))).unwrap();
+        }
+        let parent = Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap());
+        // The fixture's own directory, so no guest-supplied name is resolved.
+        #[allow(clippy::disallowed_methods)]
+        let fd = Arc::new(OwnedFd::from(File::open(&wide).unwrap()));
+        let prepared = prepare_dir(fd.as_fd(), &AtomicBool::new(false)).unwrap();
+
+        let siblings: Vec<String> = (1..10).map(|i| format!("s{i:02}")).collect();
+        let mut guard = dev.readahead.state.lock.lock().unwrap();
+        for name in siblings.iter().rev() {
+            guard.push(QueuedDir {
+                path: root.join(name),
+                parent: Arc::clone(&parent),
+                name: CString::new(name.as_str()).unwrap(),
+                depth: 0,
+            });
+        }
+        guard.queue_subdirs(&wide, &prepared.entries, &fd, 1);
+        for name in &siblings {
+            assert!(
+                guard
+                    .queue
+                    .iter()
+                    .any(|entry| entry.path == root.join(name)),
+                "{name} was pushed off the queue"
+            );
+        }
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A wide directory a worker prepares queues only its first
+    // subdirectories, so it cannot push the guest's next pages off the queue.
+    #[test]
+    fn worker_queues_the_first_subdirectories_of_a_wide_directory() {
+        let (dir, dev) = fixture_with_access(true);
+        let wide = fs::canonicalize(&dir).unwrap().join("wide");
+        for i in 0..40 {
+            fs::create_dir_all(wide.join(format!("d{i:02}"))).unwrap();
+        }
+        // The fixture's own directory, so no guest-supplied name is resolved.
+        #[allow(clippy::disallowed_methods)]
+        let fd = Arc::new(OwnedFd::from(File::open(&wide).unwrap()));
+        let prepared = prepare_dir(fd.as_fd(), &AtomicBool::new(false)).unwrap();
+
+        let mut guard = dev.readahead.state.lock.lock().unwrap();
+        guard.queue_subdirs(&wide, &prepared.entries, &fd, 1);
+        assert_eq!(guard.queue.len(), READAHEAD_SUBDIRS_PER_DIR);
+        assert_eq!(guard.queue.back().unwrap().path, wide.join("d00"));
+        let last = format!("d{:02}", READAHEAD_SUBDIRS_PER_DIR - 1);
+        assert_eq!(guard.queue.front().unwrap().path, wide.join(last));
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readahead_queues_a_directory_once() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap());
+        let queued = |name: &str, depth: u8| QueuedDir {
+            path: dir.join(name),
+            parent: Arc::clone(&root),
+            name: CString::new(name).unwrap(),
+            depth,
+        };
+        let mut guard = dev.readahead.state.lock.lock().unwrap();
+        guard.push(queued("sub", 0));
+        guard.push(queued("other", 1));
+        guard.push(queued("sub", 2));
+        assert_eq!(guard.queue.len(), 2);
+        let top = guard.queue.back().unwrap();
+        assert_eq!((top.path.clone(), top.depth), (dir.join("sub"), 0));
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_opens_and_prepares_a_queued_directory() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("sub/inner")).unwrap();
+        let (workers, stop) = dev.start_readahead();
+        dev.readahead.request(
+            root.join("sub"),
+            Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap()),
+            CString::new("sub").unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let prepared = |path: &Path| {
+            dev.readahead
+                .state
+                .lock
+                .lock()
+                .unwrap()
+                .cache
+                .contains_key(path)
+        };
+        while !(prepared(&root.join("sub")) && prepared(&root.join("sub/inner"))) {
+            assert!(std::time::Instant::now() < deadline, "nothing was prepared");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        stop.stop();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A taken listing left in `order` grew it by one path per directory
+    // walked, and a later eviction by that stale entry dropped a newer
+    // listing of the same directory out of turn.
+    #[test]
+    fn taking_a_prepared_listing_leaves_nothing_behind() {
+        let (dir, dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        dev.readahead.prepare_now(&sub);
+        assert!(dev.readahead.take(&sub).is_some());
+        assert!(dev.readahead.take(&sub).is_none());
+        let guard = dev.readahead.state.lock.lock().unwrap();
+        assert!(guard.order.is_empty());
+        assert!(guard.skip.is_empty(), "nothing queued or in flight to skip");
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The serving thread reads the directory itself once it stops waiting,
+    // so the worker's late result must not stay cached.
+    #[test]
+    fn wait_that_times_out_marks_the_late_result_for_dropping() {
+        let (dir, dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        dev.readahead
+            .state
+            .lock
+            .lock()
+            .unwrap()
+            .in_flight
+            .insert(sub.clone());
+        assert!(dev.readahead.take(&sub).is_none());
+        assert_eq!(dev.readahead.stats(), (0, 1, 0));
+        assert!(dev.readahead.state.lock.lock().unwrap().skip.contains(&sub));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `boot` joins these threads after the guest stops, so the stop handle
+    // alone has to end them, with the device still alive. That `boot` stops
+    // them without taking the device lock is its ordering, which a unit test
+    // cannot see.
+    #[test]
+    fn readahead_workers_exit_through_the_stop_handle() {
+        let (dir, dev) = fixture_with_cache(true, CachePolicy::None);
+        assert!(dev.start_readahead().0.is_empty());
+        let _ = fs::remove_dir_all(dir);
+
+        let (dir, dev) = fixture_with_access(true);
+        let (workers, stop) = dev.start_readahead();
+        assert_eq!(workers.len(), READAHEAD_WORKERS);
+        stop.stop();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        drop(dev);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `boot` gives the workers a deadline after the guest powers off, so one
+    // in the middle of a large directory has to leave it at the next entry.
+    #[test]
+    fn prepare_dir_leaves_a_directory_when_told_to_stop() {
+        let (dir, _dev) = fixture_with_access(true);
+        // The fixture's own directory, so no guest-supplied name is resolved.
+        #[allow(clippy::disallowed_methods)]
+        let etc = File::open(dir.join("etc")).unwrap();
+        assert!(prepare_dir(etc.as_fd(), &AtomicBool::new(false)).is_some());
+        assert!(prepare_dir(etc.as_fd(), &AtomicBool::new(true)).is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Holds the metadata path to a fixed budget of host operations.
+    //
+    // This is the gate against a change that makes the device do more host
+    // work per request. It counts operations instead of taking the time,
+    // because the count is exact. A count cannot fail on a busy runner, and
+    // it cannot pass a change that is slower but does the same work.
+    //
+    // The budget has two parts, and a failure means something different in
+    // each:
+    //
+    // - `per_file` is the cost of one LOOKUP and one GETATTR. Nothing but the
+    //   code that serves those requests changes it, so a new value is a
+    //   regression until someone shows why the path is cheaper.
+    // - `listing` also follows the shape of the fixture. The entry count, the
+    //   length of the names and the reply budget all change it. Check those
+    //   three first, before you look for a regression.
+    //
+    // If a change lowers either number, measure again, set the new value
+    // here, and say in the commit why the path is cheaper.
+    //
+    // `virtio_fs` builds on macOS only, so CI runs this test in the
+    // `build-and-test-macos` job. It needs no quiet or dedicated runner.
     #[test]
     fn the_metadata_workload_spends_a_pinned_host_budget() {
         const FILES: usize = 25;
@@ -9035,13 +10260,47 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Each two-path operation duplicates two descriptors. Duplicates that are
-    /// not released are how this device reaches EMFILE and reports nonsense on
-    /// unrelated files (#34), so the count must come back to where it started.
+    /// Returns the path descriptor `fd` refers to, or `None` when it is
+    /// closed or the host cannot say.
+    fn descriptor_path(fd: RawFd) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut buf = vec![0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which
+            // is that long.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let len = buf.iter().position(|&byte| byte == 0)?;
+            buf.truncate(len);
+            Some(PathBuf::from(OsString::from_vec(buf)))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+        }
+    }
+
+    /// Returns how many of the process's descriptors refer to `root` or
+    /// something under it.
+    fn descriptors_under(root: &Path) -> usize {
+        let root = fs::canonicalize(root).unwrap();
+        let fds: Vec<RawFd> = fs::read_dir("/dev/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        fds.into_iter()
+            .filter(|&fd| descriptor_path(fd).is_some_and(|path| path.starts_with(&root)))
+            .count()
+    }
+
+    // Each two-path operation duplicates two descriptors. Duplicates that are
+    // not released are how this device reaches EMFILE and reports nonsense on
+    // unrelated files (#34), so the count must come back to where it started.
     #[test]
     fn two_path_operations_do_not_leak_descriptors() {
         let (dir, mut dev) = fixture_with_access(true);
-        let open_now = || fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+        let open_now = || descriptors_under(&dir);
 
         // Warm the cache and the fixture so the baseline is steady.
         for round in 0..4u32 {
@@ -9064,11 +10323,10 @@ mod tests {
             assert_eq!(get_u32(&out, 4), Some(0), "rename {round} failed");
         }
         let after = open_now();
-        // The count is process-wide and the suite runs in parallel, so other
-        // tests opening files move it under this one. The tolerance is set by
-        // what a leak actually looks like rather than by hope: one duplicate
-        // per operation is sixty, and each rename takes two, so a real leak
-        // clears any plausible noise from a handful of concurrent tests.
+        // Only descriptors into this fixture count, so the tests running
+        // beside it cannot move the number. A leak is one duplicate per
+        // operation or more, sixty at least, which the bound leaves far below
+        // it.
         let growth = after.saturating_sub(before);
         assert!(
             growth < 20,
@@ -10100,18 +11358,22 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // The listings are keyed by node, and a reset restarts node ids.
+    // The listings are keyed by node, and a reset restarts node ids. What the
+    // readahead queued and prepared was for the session that walked into it.
     #[test]
     fn status_reset_drops_the_fh0_listings() {
         let (dir, mut dev) = fixture_with_access(true);
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
         read_fh0_page(&mut dev, etc, 0);
         assert!(dev.fh0_listings.contains_key(&etc));
+        let etc_path = fs::canonicalize(&dir).unwrap().join("etc");
+        dev.readahead.prepare_now(&etc_path);
 
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
         dev.mmio(&mem, reg::STATUS, true, 0);
         assert!(dev.fh0_listings.is_empty());
         assert!(dev.fh0_order.is_empty());
+        assert!(dev.readahead.take(&etc_path).is_none(), "prepared survived");
         let _ = fs::remove_dir_all(dir);
     }
 
