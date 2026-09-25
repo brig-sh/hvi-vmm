@@ -472,8 +472,10 @@ fn probes() -> Vec<Probe> {
             // The volume-sync grant is one fsctl command, not fsctl. Only
             // EPERM counts as the sandbox refusing: any other error means the
             // call got past it to the filesystem, which is the grant being
-            // wider than it says, so that reads as a mismatch too -- and says
-            // what did refuse it, so the report does not claim a success.
+            // wider than it says, so that returns Ok and reads as a mismatch.
+            // The report line then says "succeeded", so a note on the line
+            // before it says what the filesystem answered. Returning an Err
+            // instead would count as the denial this probe wants, and pass.
             what: "another fsctl on the writable export",
             expect_ok: false,
             run: |f| {
@@ -505,7 +507,7 @@ fn probes() -> Vec<Probe> {
                     return Err(err);
                 }
                 if rc != 0 {
-                    eprintln!(
+                    println!(
                         "  note: the sandbox let that fsctl through; the filesystem refused it ({err})"
                     );
                 }
@@ -841,6 +843,35 @@ mod tests {
         let rw = policy_for([(Path::new("/tmp/ro"), false), (Path::new("/tmp/rw"), true)]).unwrap();
         assert_eq!(rw.matches("system-fsctl").count(), 1);
         assert!(rw.contains(&grant), "{rw}");
+    }
+
+    /// The composed policy's allow set, pinned exactly the way
+    /// `profile_grants_only_the_tty_ioctl` pins the static profile's: an
+    /// `(allow)` added in `policy_for` has to be an edit here too.
+    #[test]
+    fn composed_policy_grants_only_the_exports_and_the_volume_sync() {
+        let policy =
+            policy_for([(Path::new("/tmp/rw"), true), (Path::new("/tmp/ro"), false)]).unwrap();
+        let allows: Vec<&str> = policy
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with(';'))
+            .filter(|l| l.contains("(allow"))
+            .collect();
+        let fsctl = format!(
+            "(allow system-fsctl (fsctl-command {}))",
+            crate::virtio_fs::FSIOC_SYNC_VOLUME
+        );
+        assert_eq!(
+            allows,
+            vec![
+                r##"(allow file-ioctl (regex #"^/dev/tty"))"##,
+                r#"(allow file-read* file-write* (subpath "/tmp/rw"))"#,
+                r#"(allow file-read* (subpath "/tmp/ro"))"#,
+                fsctl.as_str(),
+            ],
+            "the composed policy's allow set changed; see policy_for in src/sandbox.rs"
+        );
     }
 
     /// The tty rule is only defensible because the process cannot open a tty in
