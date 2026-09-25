@@ -476,6 +476,12 @@ const READAHEAD_MAX_DIRS: usize = 256;
 /// [`crate::fdlimit`], which is larger.
 const READAHEAD_MAX_QUEUED: usize = 64;
 
+/// Subdirectories a worker queues from one directory it prepared, the first
+/// in listing order. The serving thread queues the rest as the guest pages
+/// through the directory. Half the queue, so a wide directory leaves room
+/// for the siblings queued before it.
+const READAHEAD_SUBDIRS_PER_DIR: usize = READAHEAD_MAX_QUEUED / 2;
+
 /// How many levels below a served listing the workers walk on their own.
 /// The serving thread's requests are level 0; the subdirectories a worker
 /// finds while preparing a level-n directory are level n + 1.
@@ -568,13 +574,62 @@ struct ReadaheadState {
 }
 
 impl ReadaheadState {
-    /// Queues `dir` as the next to prepare, dropping the earliest queued when
-    /// the queue is full.
-    fn push(&mut self, dir: QueuedDir) {
+    /// Queues `dir` as the next to prepare.
+    ///
+    /// A directory already queued moves to the top and keeps the shallower
+    /// of its two depths, so it is not prepared twice. A full queue drops the
+    /// entry queued earliest, which is the one a walk reaches last.
+    fn push(&mut self, mut dir: QueuedDir) {
+        if let Some(pos) = self.queue.iter().position(|queued| queued.path == dir.path) {
+            if let Some(queued) = self.queue.remove(pos) {
+                dir.depth = dir.depth.min(queued.depth);
+            }
+        }
+        // Dropping the deepest entry first measured worse: on a deep tree the
+        // workers' deepest pushes are the directories the guest lists next.
+        // `READAHEAD_SUBDIRS_PER_DIR` is what keeps a wide directory from
+        // flushing its siblings.
         if self.queue.len() >= READAHEAD_MAX_QUEUED {
             self.queue.pop_front();
         }
         self.queue.push_back(dir);
+    }
+
+    /// Queues the subdirectories among `entries`, the listing of `path` read
+    /// through `dir_fd`, at `depth`.
+    ///
+    /// Only the first [`READAHEAD_SUBDIRS_PER_DIR`] are queued. They go on in
+    /// reverse, so the first one is prepared next, as a walk asks.
+    fn queue_subdirs(
+        &mut self,
+        path: &Path,
+        entries: &[PreparedEntry],
+        dir_fd: &Arc<OwnedFd>,
+        depth: u8,
+    ) {
+        let subdirs: Vec<&PreparedEntry> = entries
+            .iter()
+            .filter(|entry| entry.meta.is_dir())
+            .take(READAHEAD_SUBDIRS_PER_DIR)
+            .collect();
+        for entry in subdirs.into_iter().rev() {
+            let child = path.join(&entry.info.name);
+            if self.cache.contains_key(&child) || self.in_flight.contains(&child) {
+                continue;
+            }
+            let Ok(name) = CString::new(entry.info.name.as_bytes()) else {
+                continue;
+            };
+            // Queued with the descriptor this directory was read through. The
+            // worker opens the one name there, so it never walks the path from
+            // the root.
+            self.push(QueuedDir {
+                path: child,
+                parent: Arc::clone(dir_fd),
+                name,
+                depth,
+            });
+        }
     }
 
     /// Removes and returns the prepared listing of `path`, if any, and marks
@@ -734,31 +789,8 @@ impl Readahead {
             }
             if let (Some(prepared), Some(dir_fd), false) = (prepared, dir_fd, abandoned) {
                 if guard.generation == generation {
-                    // The subdirectories found go on the stack in reverse,
-                    // so the first one is prepared next, as a walk asks.
                     if depth < READAHEAD_DEPTH {
-                        for entry in prepared.entries.iter().rev() {
-                            if !entry.meta.is_dir() {
-                                continue;
-                            }
-                            let child = path.join(&entry.info.name);
-                            if guard.cache.contains_key(&child) || guard.in_flight.contains(&child)
-                            {
-                                continue;
-                            }
-                            let Ok(name) = CString::new(entry.info.name.as_bytes()) else {
-                                continue;
-                            };
-                            // Under the descriptor this directory was read
-                            // through, so the child is the one that was
-                            // listed and not whatever the path leads to now.
-                            guard.push(QueuedDir {
-                                path: child,
-                                parent: Arc::clone(&dir_fd),
-                                name,
-                                depth: depth + 1,
-                            });
-                        }
+                        guard.queue_subdirs(&path, &prepared.entries, &dir_fd, depth + 1);
                     }
                     while guard.cache.len() >= READAHEAD_MAX_DIRS {
                         match guard.order.pop_front() {
@@ -4016,9 +4048,8 @@ impl VirtioFs {
         // the guest's position back on top of the workers' stack.
         //
         // Each one is queued with the descriptor this listing came from, and
-        // the worker opens it there. A worker never resolves a path, so a
-        // rename under it cannot send it anywhere but to the directory that
-        // was listed.
+        // the worker opens the one name there. A worker never resolves a path,
+        // so a rename of a directory above cannot send it elsewhere.
         if plus && self.readahead_enabled() {
             let parent = listing
                 .as_ref()
@@ -7754,6 +7785,92 @@ mod tests {
         assert_eq!(guard.queue.back().unwrap().path, dir.join(last));
         drop(guard);
         assert_eq!(Arc::strong_count(&root), READAHEAD_MAX_QUEUED + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A wide directory a worker prepares shares the queue with the siblings
+    // the guest lists after it. Its subdirectories take half the queue at
+    // most, so the siblings queued before it stay.
+    #[test]
+    fn wide_directory_leaves_its_siblings_queued() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        let wide = root.join("s00");
+        for i in 0..200 {
+            fs::create_dir_all(wide.join(format!("k{i:03}"))).unwrap();
+        }
+        let parent = Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap());
+        // The fixture's own directory, so no guest-supplied name is resolved.
+        #[allow(clippy::disallowed_methods)]
+        let fd = Arc::new(OwnedFd::from(File::open(&wide).unwrap()));
+        let prepared = prepare_dir(fd.as_fd(), &AtomicBool::new(false)).unwrap();
+
+        let siblings: Vec<String> = (1..10).map(|i| format!("s{i:02}")).collect();
+        let mut guard = dev.readahead.state.lock.lock().unwrap();
+        for name in siblings.iter().rev() {
+            guard.push(QueuedDir {
+                path: root.join(name),
+                parent: Arc::clone(&parent),
+                name: CString::new(name.as_str()).unwrap(),
+                depth: 0,
+            });
+        }
+        guard.queue_subdirs(&wide, &prepared.entries, &fd, 1);
+        for name in &siblings {
+            assert!(
+                guard
+                    .queue
+                    .iter()
+                    .any(|entry| entry.path == root.join(name)),
+                "{name} was pushed off the queue"
+            );
+        }
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A wide directory a worker prepares queues only its first
+    // subdirectories, so it cannot push the guest's next pages off the queue.
+    #[test]
+    fn worker_queues_the_first_subdirectories_of_a_wide_directory() {
+        let (dir, dev) = fixture_with_access(true);
+        let wide = fs::canonicalize(&dir).unwrap().join("wide");
+        for i in 0..40 {
+            fs::create_dir_all(wide.join(format!("d{i:02}"))).unwrap();
+        }
+        // The fixture's own directory, so no guest-supplied name is resolved.
+        #[allow(clippy::disallowed_methods)]
+        let fd = Arc::new(OwnedFd::from(File::open(&wide).unwrap()));
+        let prepared = prepare_dir(fd.as_fd(), &AtomicBool::new(false)).unwrap();
+
+        let mut guard = dev.readahead.state.lock.lock().unwrap();
+        guard.queue_subdirs(&wide, &prepared.entries, &fd, 1);
+        assert_eq!(guard.queue.len(), READAHEAD_SUBDIRS_PER_DIR);
+        assert_eq!(guard.queue.back().unwrap().path, wide.join("d00"));
+        let last = format!("d{:02}", READAHEAD_SUBDIRS_PER_DIR - 1);
+        assert_eq!(guard.queue.front().unwrap().path, wide.join(last));
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readahead_queues_a_directory_once() {
+        let (dir, dev) = fixture_with_access(true);
+        let root = Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap());
+        let queued = |name: &str, depth: u8| QueuedDir {
+            path: dir.join(name),
+            parent: Arc::clone(&root),
+            name: CString::new(name).unwrap(),
+            depth,
+        };
+        let mut guard = dev.readahead.state.lock.lock().unwrap();
+        guard.push(queued("sub", 0));
+        guard.push(queued("other", 1));
+        guard.push(queued("sub", 2));
+        assert_eq!(guard.queue.len(), 2);
+        let top = guard.queue.back().unwrap();
+        assert_eq!((top.path.clone(), top.depth), (dir.join("sub"), 0));
+        drop(guard);
         let _ = fs::remove_dir_all(dir);
     }
 
