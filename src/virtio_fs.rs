@@ -34,7 +34,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
@@ -504,6 +504,35 @@ struct ReadaheadShared {
     done: std::sync::Condvar,
     posted: AtomicU64,
     completed: AtomicU64,
+    /// Set with `ReadaheadState::stopped`, for a worker in the middle of a
+    /// directory to read without the lock.
+    stopping: AtomicBool,
+}
+
+impl ReadaheadShared {
+    /// Tells the workers to exit. A worker reading a directory leaves it at
+    /// the next entry.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        lock_or_recover(&self.lock).stopped = true;
+        self.posted.fetch_add(1, Ordering::Release);
+        self.work.notify_all();
+    }
+}
+
+/// Stops a device's readahead workers without taking the device's lock.
+///
+/// `boot` stops the workers after the guest has powered off, and the FUSE
+/// worker may still hold the device then, stuck in a host call. Stopping
+/// through the device would wait for it and never reach the deadline that
+/// reports it.
+pub struct ReadaheadStop(Arc<ReadaheadShared>);
+
+impl ReadaheadStop {
+    /// Tells the workers to exit. It returns at once; `boot` joins them.
+    pub fn stop(&self) {
+        self.0.stop();
+    }
 }
 
 /// A directory queued for a worker.
@@ -608,6 +637,7 @@ impl Readahead {
             done: std::sync::Condvar::new(),
             posted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
         });
         Self {
             state,
@@ -632,12 +662,9 @@ impl Readahead {
             .collect()
     }
 
-    /// Tells the workers to exit. Each finishes the directory it is reading
-    /// first.
-    fn stop(&self) {
-        lock_or_recover(&self.state.lock).stopped = true;
-        self.state.posted.fetch_add(1, Ordering::Release);
-        self.state.work.notify_all();
+    /// Returns a handle that stops the workers.
+    fn stopper(&self) -> ReadaheadStop {
+        ReadaheadStop(Arc::clone(&self.state))
     }
 
     fn worker(state: &ReadaheadShared) {
@@ -647,6 +674,7 @@ impl Readahead {
             done,
             posted,
             completed,
+            stopping,
         } = state;
         let mut guard = lock_or_recover(lock);
         loop {
@@ -693,7 +721,9 @@ impl Readahead {
                 .ok()
                 .map(Arc::new);
             drop(parent);
-            let prepared = dir_fd.as_ref().and_then(|fd| prepare_dir(fd.as_fd()));
+            let prepared = dir_fd
+                .as_ref()
+                .and_then(|fd| prepare_dir(fd.as_fd(), stopping));
             guard = lock_or_recover(lock);
             guard.in_flight.remove(&path);
             // The serving thread stopped waiting for this one and read the
@@ -851,7 +881,7 @@ impl Readahead {
         let Ok(dir) = File::open(path) else {
             return;
         };
-        if let Some(prepared) = prepare_dir(dir.as_fd()) {
+        if let Some(prepared) = prepare_dir(dir.as_fd(), &AtomicBool::new(false)) {
             let mut guard = lock_or_recover(&self.state.lock);
             guard.order.push_back(path.to_owned());
             guard.cache.insert(path.to_owned(), prepared);
@@ -861,34 +891,42 @@ impl Readahead {
 
 impl Drop for Readahead {
     fn drop(&mut self) {
-        self.stop();
+        self.state.stop();
     }
 }
 
 /// Reads and stats a directory through `dir_fd`, for a worker to hold until
-/// the guest asks for it, or `None` when it cannot be read.
+/// the guest asks for it, or `None` when it cannot be read or `stopping` is
+/// set.
 ///
 /// Every host call here is against `dir_fd` or a descriptor opened from it,
 /// so a worker running beside the guest resolves no names of its own.
-fn prepare_dir(dir_fd: BorrowedFd<'_>) -> Option<PreparedDir> {
+fn prepare_dir(dir_fd: BorrowedFd<'_>, stopping: &AtomicBool) -> Option<PreparedDir> {
     let dir_meta = Stat::of_fd(dir_fd).ok()?;
     // `read_dir_at` takes its descriptor over, so it gets a dup and the
     // caller's stays open for the stats below and for the descent.
     let listing = read_dir_at(dup_cloexec(dir_fd).ok()?).ok()?;
-    let mut entries: Vec<PreparedEntry> = listing
-        .into_iter()
-        .filter_map(|info| {
-            let name = CString::new(info.name.as_bytes()).ok()?;
-            let meta = Stat::at(dir_fd, &name).ok()?;
-            #[cfg(target_os = "macos")]
-            let guest = open_entry_nofollow(dir_fd, &name)
-                .ok()
-                .and_then(|fd| stored_guest_attr(fd.as_fd()));
-            #[cfg(not(target_os = "macos"))]
-            let guest = None;
-            Some(PreparedEntry { info, meta, guest })
-        })
-        .collect();
+    let mut entries = Vec::with_capacity(listing.len());
+    for info in listing {
+        // Checked per entry, so a worker in a large directory when the guest
+        // powers off exits within `boot`'s deadline.
+        if stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        let Ok(name) = CString::new(info.name.as_bytes()) else {
+            continue;
+        };
+        let Ok(meta) = Stat::at(dir_fd, &name) else {
+            continue;
+        };
+        #[cfg(target_os = "macos")]
+        let guest = open_entry_nofollow(dir_fd, &name)
+            .ok()
+            .and_then(|fd| stored_guest_attr(fd.as_fd()));
+        #[cfg(not(target_os = "macos"))]
+        let guest = None;
+        entries.push(PreparedEntry { info, meta, guest });
+    }
     // Listing order, which is the order a walk descends in.
     entries.sort_by(|left, right| left.info.name.as_bytes().cmp(right.info.name.as_bytes()));
     Some(PreparedDir {
@@ -1344,23 +1382,20 @@ impl VirtioFs {
         }
     }
 
-    /// Starts the readahead workers and returns their handles, or none under
-    /// `cache=none`, which never serves a prepared listing.
+    /// Starts the readahead workers and returns their handles, none under
+    /// `cache=none`, which never serves a prepared listing, and the handle
+    /// that stops them.
     ///
     /// The workers read the shared tree, so the machine starts them after it
     /// confines the process and joins them with its other helper threads.
     /// Until then a READDIRPLUS finds nothing prepared and reads the host.
-    pub fn start_readahead(&self) -> Vec<std::thread::JoinHandle<()>> {
-        if self.readahead_enabled() {
+    pub fn start_readahead(&self) -> (Vec<std::thread::JoinHandle<()>>, ReadaheadStop) {
+        let workers = if self.readahead_enabled() {
             self.readahead.start()
         } else {
             Vec::new()
-        }
-    }
-
-    /// Tells the readahead workers to exit, for the machine to join them.
-    pub fn stop_readahead(&self) {
-        self.readahead.stop();
+        };
+        (workers, self.readahead.stopper())
     }
 
     /// Returns `(hits, waits, misses)` of the READDIRPLUS readahead since boot.
@@ -7727,7 +7762,7 @@ mod tests {
         let (dir, dev) = fixture_with_access(true);
         let root = fs::canonicalize(&dir).unwrap();
         fs::create_dir_all(root.join("sub/inner")).unwrap();
-        let workers = dev.start_readahead();
+        let (workers, stop) = dev.start_readahead();
         dev.readahead.request(
             root.join("sub"),
             Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap()),
@@ -7747,7 +7782,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "nothing was prepared");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        dev.stop_readahead();
+        stop.stop();
         for worker in workers {
             worker.join().unwrap();
         }
@@ -7792,20 +7827,37 @@ mod tests {
     }
 
     // `boot` joins these threads after the guest stops, so they have to exit
-    // when told.
+    // when told. The device is locked throughout, as it is when the FUSE
+    // worker is stuck in a host call, and the stop must not wait for it.
     #[test]
-    fn readahead_workers_start_on_request_and_exit_on_stop() {
+    fn readahead_workers_stop_without_the_device_lock() {
         let (dir, dev) = fixture_with_cache(true, CachePolicy::None);
-        assert!(dev.start_readahead().is_empty());
+        assert!(dev.start_readahead().0.is_empty());
         let _ = fs::remove_dir_all(dir);
 
         let (dir, dev) = fixture_with_access(true);
-        let workers = dev.start_readahead();
+        let dev = Mutex::new(dev);
+        let held = dev.lock().unwrap();
+        let (workers, stop) = held.start_readahead();
         assert_eq!(workers.len(), READAHEAD_WORKERS);
-        dev.stop_readahead();
+        stop.stop();
         for worker in workers {
             worker.join().unwrap();
         }
+        drop(held);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `boot` gives the workers a deadline after the guest powers off, so one
+    // in the middle of a large directory has to leave it at the next entry.
+    #[test]
+    fn prepare_dir_leaves_a_directory_when_told_to_stop() {
+        let (dir, _dev) = fixture_with_access(true);
+        // The fixture's own directory, so no guest-supplied name is resolved.
+        #[allow(clippy::disallowed_methods)]
+        let etc = File::open(dir.join("etc")).unwrap();
+        assert!(prepare_dir(etc.as_fd(), &AtomicBool::new(false)).is_some());
+        assert!(prepare_dir(etc.as_fd(), &AtomicBool::new(true)).is_none());
         let _ = fs::remove_dir_all(dir);
     }
 

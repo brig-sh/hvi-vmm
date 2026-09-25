@@ -508,6 +508,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         stop_source.token(),
     );
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
+    let mut readahead_stops = Vec::new();
     if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
         helpers.push((
             "agent bridge",
@@ -549,9 +550,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Arc::clone(&fs.wake),
             ),
         ));
-        for worker in lock_or_recover(&fs.dev).start_readahead() {
-            helpers.push(("virtio-fs readahead", worker));
-        }
+        let (workers, stop) = lock_or_recover(&fs.dev).start_readahead();
+        helpers.extend(
+            workers
+                .into_iter()
+                .map(|worker| ("virtio-fs readahead", worker)),
+        );
+        readahead_stops.push(stop);
     }
 
     // One thread per vCPU; join them all (cpu0 ends on PSCI SYSTEM_OFF and
@@ -571,7 +576,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     stop_source.request_stop();
     for fs in &shared.fs {
         fs.wake.stop();
-        lock_or_recover(&fs.dev).stop_readahead();
+    }
+    for stop in &readahead_stops {
+        stop.stop();
     }
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     kick_until_finished(&input, deadline);
