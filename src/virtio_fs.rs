@@ -35,10 +35,11 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
 use crate::guestmem::GuestRam;
+use crate::sync::lock_or_recover;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
 const MAGIC_VALUE: u64 = 0x7472_6976;
@@ -634,7 +635,7 @@ impl Readahead {
     /// Tells the workers to exit. Each finishes the directory it is reading
     /// first.
     fn stop(&self) {
-        self.state.lock.lock().unwrap().stopped = true;
+        lock_or_recover(&self.state.lock).stopped = true;
         self.state.posted.fetch_add(1, Ordering::Release);
         self.state.work.notify_all();
     }
@@ -647,7 +648,7 @@ impl Readahead {
             posted,
             completed,
         } = state;
-        let mut guard = lock.lock().unwrap();
+        let mut guard = lock_or_recover(lock);
         loop {
             if guard.stopped {
                 return;
@@ -670,9 +671,9 @@ impl Readahead {
                 {
                     std::hint::spin_loop();
                 }
-                guard = lock.lock().unwrap();
+                guard = lock_or_recover(lock);
                 if posted.load(Ordering::Acquire) == seen && !guard.stopped {
-                    guard = work.wait(guard).unwrap();
+                    guard = work.wait(guard).unwrap_or_else(PoisonError::into_inner);
                 }
                 continue;
             };
@@ -693,7 +694,7 @@ impl Readahead {
                 .map(Arc::new);
             drop(parent);
             let prepared = dir_fd.as_ref().and_then(|fd| prepare_dir(fd.as_fd()));
-            guard = lock.lock().unwrap();
+            guard = lock_or_recover(lock);
             guard.in_flight.remove(&path);
             // The serving thread stopped waiting for this one and read the
             // directory itself.
@@ -753,7 +754,7 @@ impl Readahead {
     /// `path` names it for the cache. The worker opens it under `parent`,
     /// so it never resolves the path itself.
     fn request(&self, path: PathBuf, parent: Arc<OwnedFd>, name: CString) {
-        let mut guard = self.state.lock.lock().unwrap();
+        let mut guard = lock_or_recover(&self.state.lock);
         if guard.cache.contains_key(&path) || guard.in_flight.contains(&path) {
             return;
         }
@@ -779,7 +780,7 @@ impl Readahead {
             completed,
             ..
         } = &*self.state;
-        let mut guard = lock.lock().unwrap();
+        let mut guard = lock_or_recover(lock);
         if let Some(prepared) = guard.take_prepared(path) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(prepared);
@@ -801,9 +802,12 @@ impl Readahead {
                     {
                         std::hint::spin_loop();
                     }
-                    guard = lock.lock().unwrap();
+                    guard = lock_or_recover(lock);
                 } else {
-                    guard = done.wait_timeout(guard, deadline - now).unwrap().0;
+                    guard = done
+                        .wait_timeout(guard, deadline - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
                 }
             }
             if let Some(prepared) = guard.take_prepared(path) {
@@ -820,7 +824,7 @@ impl Readahead {
 
     /// Drops every prepared listing and every request in flight.
     fn invalidate(&self) {
-        let mut guard = self.state.lock.lock().unwrap();
+        let mut guard = lock_or_recover(&self.state.lock);
         guard.generation += 1;
         guard.queue.clear();
         guard.skip.clear();
@@ -848,7 +852,7 @@ impl Readahead {
             return;
         };
         if let Some(prepared) = prepare_dir(dir.as_fd()) {
-            let mut guard = self.state.lock.lock().unwrap();
+            let mut guard = lock_or_recover(&self.state.lock);
             guard.order.push_back(path.to_owned());
             guard.cache.insert(path.to_owned(), prepared);
         }
