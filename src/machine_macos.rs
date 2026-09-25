@@ -549,6 +549,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Arc::clone(&fs.wake),
             ),
         ));
+        for worker in lock_or_recover(&fs.dev).start_readahead() {
+            helpers.push(("virtio-fs readahead", worker));
+        }
     }
 
     // One thread per vCPU; join them all (cpu0 ends on PSCI SYSTEM_OFF and
@@ -568,6 +571,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     stop_source.request_stop();
     for fs in &shared.fs {
         fs.wake.stop();
+        lock_or_recover(&fs.dev).stop_readahead();
     }
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     kick_until_finished(&input, deadline);

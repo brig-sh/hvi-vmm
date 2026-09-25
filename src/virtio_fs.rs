@@ -546,18 +546,35 @@ impl Readahead {
             posted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
         });
-        for _ in 0..READAHEAD_WORKERS {
-            let state = Arc::clone(&state);
-            let _ = std::thread::Builder::new()
-                .name("virtio-fs-readahead".into())
-                .spawn(move || Self::worker(&state));
-        }
         Self {
             state,
             hits: AtomicU64::new(0),
             waits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Starts the worker threads and returns their handles.
+    ///
+    /// A thread that fails to start is left out, and the rest serve alone.
+    fn start(&self) -> Vec<std::thread::JoinHandle<()>> {
+        (0..READAHEAD_WORKERS)
+            .filter_map(|_| {
+                let state = Arc::clone(&self.state);
+                std::thread::Builder::new()
+                    .name("virtio-fs-readahead".into())
+                    .spawn(move || Self::worker(&state))
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// Tells the workers to exit. Each finishes the directory it is reading
+    /// first.
+    fn stop(&self) {
+        self.state.lock.lock().unwrap().stopped = true;
+        self.state.posted.fetch_add(1, Ordering::Release);
+        self.state.work.notify_all();
     }
 
     fn worker(state: &ReadaheadShared) {
@@ -760,9 +777,7 @@ impl Readahead {
 
 impl Drop for Readahead {
     fn drop(&mut self) {
-        self.state.lock.lock().unwrap().stopped = true;
-        self.state.posted.fetch_add(1, Ordering::Release);
-        self.state.work.notify_all();
+        self.stop();
     }
 }
 
@@ -1221,6 +1236,25 @@ impl VirtioFs {
         if let Some(slot) = self.op_nanos.get(opcode as usize) {
             slot.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Starts the readahead workers and returns their handles, or none under
+    /// `cache=none`, which never serves a prepared listing.
+    ///
+    /// The workers read the shared tree, so the machine starts them after it
+    /// confines the process and joins them with its other helper threads.
+    /// Until then a READDIRPLUS finds nothing prepared and reads the host.
+    pub fn start_readahead(&self) -> Vec<std::thread::JoinHandle<()>> {
+        if self.readahead_enabled() {
+            self.readahead.start()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Tells the readahead workers to exit, for the machine to join them.
+    pub fn stop_readahead(&self) {
+        self.readahead.stop();
     }
 
     /// Returns `(hits, waits, misses)` of the READDIRPLUS readahead since boot.
@@ -7403,6 +7437,24 @@ mod tests {
         dev.handle_fuse(&request(UNLINK, sub_node, &unlink), 4096);
         assert!(dev.readahead.take(&sub).is_none());
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `boot` joins these threads after the guest stops, so they have to exit
+    // when told.
+    #[test]
+    fn readahead_workers_start_on_request_and_exit_on_stop() {
+        let (dir, dev) = fixture_with_cache(true, CachePolicy::None);
+        assert!(dev.start_readahead().is_empty());
+        let _ = fs::remove_dir_all(dir);
+
+        let (dir, dev) = fixture_with_access(true);
+        let workers = dev.start_readahead();
+        assert_eq!(workers.len(), READAHEAD_WORKERS);
+        dev.stop_readahead();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
