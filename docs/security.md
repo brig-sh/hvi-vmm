@@ -57,6 +57,14 @@ allow rule for `file-ioctl` on `/dev/tty`, plus one rule per virtio-fs export by
 resolved root path: `file-read*` for a read-only share, `file-read* file-write*`
 for a writable one.
 
+A writable export adds one more: `system-fsctl` for the single command
+`FSIOC_SYNC_VOLUME`, which is how SYNCFS writes out the export's volume
+(`sync_volume_np(3)`). It is a command filter, not a path filter, so the
+process can ask any mounted volume to write out what it already holds,
+whatever its file grants. Seatbelt checks this fsctl per mount, so a path
+filter on the rule denies every call. The process can issue no other fsctl,
+and the grant is absent when every export is read-only.
+
 Because it is process-wide and goes up before any vCPU exists, no thread
 touches guest data unconfined.
 

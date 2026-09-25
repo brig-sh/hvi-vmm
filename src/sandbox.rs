@@ -48,7 +48,10 @@
 //! subpath rule for every already-canonical export root. Read-only exports
 //! receive `file-read*`; writable exports also receive `file-write*`. The path
 //! is required to be UTF-8/control-free and SBPL-escaped before interpolation;
-//! every path outside those subtrees remains denied.
+//! every path outside those subtrees remains denied. When any export is
+//! writable it also appends one `system-fsctl` rule for `FSIOC_SYNC_VOLUME`
+//! alone, which SYNCFS uses to write out the export's volume. That filter is
+//! by command, not path, and no other fsctl is allowed.
 //!
 //! The vCPU threads are created *after* this point and that is fine:
 //! `hv_vcpu_create` and `hv_vcpu_run` on a fresh thread work under a bare
