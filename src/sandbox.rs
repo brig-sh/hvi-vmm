@@ -174,8 +174,17 @@ pub fn enter_with_shares(shares: &[(PathBuf, bool)]) -> io::Result<()> {
 }
 
 fn enter_with_paths<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io::Result<()> {
+    let policy = policy_for(roots)?;
+    install(policy)
+}
+
+/// The profile text for a set of exports: [`PROFILE`], a subtree rule per
+/// export, and the volume-sync grant when any export is writable.
+fn policy_for<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io::Result<String> {
     let mut policy = PROFILE.to_owned();
+    let mut any_writable = false;
     for (root, writable) in roots {
+        any_writable |= writable;
         let root = root.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -203,6 +212,22 @@ fn enter_with_paths<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io
             ));
         }
     }
+    if any_writable {
+        // SYNCFS on a writable export syncs the export's volume
+        // (`sync_volume_np(3)`), which is an fsctl. This allows that one
+        // command and no other; it can make a volume write out what it
+        // already holds, and nothing more. SBPL has no _IOW, hence the
+        // number.
+        policy.push_str(&format!(
+            "\n;; virtio-fs SYNCFS: sync a volume (FSIOC_SYNC_VOLUME), and no other fsctl.\n\
+             (allow system-fsctl (fsctl-command {}))\n",
+            crate::virtio_fs::FSIOC_SYNC_VOLUME
+        ));
+    }
+    Ok(policy)
+}
+
+fn install(policy: String) -> io::Result<()> {
     let profile =
         CString::new(policy).map_err(|_| io::Error::other("sandbox profile has a NUL"))?;
     let mut err: *mut libc::c_char = std::ptr::null_mut();
@@ -448,6 +473,49 @@ fn probes() -> Vec<Probe> {
             what: "create a file inside the writable export",
             expect_ok: true,
             run: |f| std::fs::write(f.export.join("inside"), b"x"),
+        },
+        Probe {
+            // SYNCFS on a writable export. Without the fsctl grant the
+            // guest's sync fails with EPERM.
+            what: "sync the writable export's volume",
+            expect_ok: true,
+            run: |f| crate::virtio_fs::sync_volume(&f.export),
+        },
+        Probe {
+            // The grant is one fsctl command, not fsctl. Only EPERM counts
+            // as the sandbox refusing: any other error means the call reached
+            // the filesystem, which is the grant being wider than it says.
+            what: "another fsctl on the writable export",
+            expect_ok: false,
+            run: |f| {
+                extern "C" {
+                    fn fsctl(
+                        path: *const libc::c_char,
+                        request: libc::c_ulong,
+                        data: *mut libc::c_void,
+                        options: libc::c_uint,
+                    ) -> libc::c_int;
+                }
+                let path = CString::new(f.export.as_os_str().as_encoded_bytes())
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+                let mut data = 0u32;
+                // `_IOW('A', 2, uint32_t)`, the command after
+                // FSIOC_SYNC_VOLUME. Safety: `path` is
+                // NUL-terminated and `data` is a live u32 of
+                // the size the command encodes.
+                let rc = unsafe {
+                    fsctl(
+                        path.as_ptr(),
+                        0x8004_4102,
+                        (&mut data as *mut u32).cast(),
+                        0,
+                    )
+                };
+                match io::Error::last_os_error() {
+                    e if rc != 0 && e.raw_os_error() == Some(libc::EPERM) => Err(e),
+                    _ => Ok(()),
+                }
+            },
         },
         Probe {
             // The same for the read-only grant, so its denial above
@@ -741,6 +809,27 @@ mod tests {
             vec![r##"(allow file-ioctl (regex #"^/dev/tty"))"##],
             "the profile's allow set changed; see the tty exception in src/sandbox.rs"
         );
+    }
+
+    /// The volume-sync grant goes with a writable export and only then: a VMM
+    /// serving read-only exports never answers SYNCFS with a sync, so it gets
+    /// no fsctl at all.
+    #[test]
+    fn only_a_writable_export_brings_the_volume_sync_grant() {
+        let grant = format!(
+            "(allow system-fsctl (fsctl-command {}))",
+            crate::virtio_fs::FSIOC_SYNC_VOLUME
+        );
+        let ro = policy_for([(Path::new("/tmp/ro"), false)]).unwrap();
+        assert!(
+            !ro.contains("system-fsctl"),
+            "read-only exports got an fsctl grant"
+        );
+        let none = policy_for(std::iter::empty()).unwrap();
+        assert!(!none.contains("system-fsctl"));
+        let rw = policy_for([(Path::new("/tmp/ro"), false), (Path::new("/tmp/rw"), true)]).unwrap();
+        assert_eq!(rw.matches("system-fsctl").count(), 1);
+        assert!(rw.contains(&grant), "{rw}");
     }
 
     /// The tty rule is only defensible because the process cannot open a tty in
