@@ -1530,6 +1530,9 @@ impl VirtioFs {
         self.fh0_listings.clear();
         self.fh0_order.clear();
         self.fh0_finished.clear();
+        // The queue and the prepared listings belong to the session that
+        // walked into them.
+        self.readahead.invalidate();
         self.sockets.clear();
         self.nodes.retain(|&node, _| node == FUSE_ROOT_ID);
         self.inode_ids.retain(|_, &mut node| node == FUSE_ROOT_ID);
@@ -11323,18 +11326,22 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // The listings are keyed by node, and a reset restarts node ids.
+    // The listings are keyed by node, and a reset restarts node ids. What the
+    // readahead queued and prepared was for the session that walked into it.
     #[test]
     fn status_reset_drops_the_fh0_listings() {
         let (dir, mut dev) = fixture_with_access(true);
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
         read_fh0_page(&mut dev, etc, 0);
         assert!(dev.fh0_listings.contains_key(&etc));
+        let etc_path = fs::canonicalize(&dir).unwrap().join("etc");
+        dev.readahead.prepare_now(&etc_path);
 
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
         dev.mmio(&mem, reg::STATUS, true, 0);
         assert!(dev.fh0_listings.is_empty());
         assert!(dev.fh0_order.is_empty());
+        assert!(dev.readahead.take(&etc_path).is_none(), "prepared survived");
         let _ = fs::remove_dir_all(dir);
     }
 
