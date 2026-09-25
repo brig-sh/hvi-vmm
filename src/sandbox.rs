@@ -468,6 +468,50 @@ fn probes() -> Vec<Probe> {
                 }
             },
         },
+        Probe {
+            // The volume-sync grant is one fsctl command, not fsctl. Only
+            // EPERM counts as the sandbox refusing: any other error means the
+            // call got past it to the filesystem, which is the grant being
+            // wider than it says, so that reads as a mismatch too -- and says
+            // what did refuse it, so the report does not claim a success.
+            what: "another fsctl on the writable export",
+            expect_ok: false,
+            run: |f| {
+                use std::os::unix::ffi::OsStrExt;
+                extern "C" {
+                    fn fsctl(
+                        path: *const libc::c_char,
+                        request: libc::c_ulong,
+                        data: *mut libc::c_void,
+                        options: libc::c_uint,
+                    ) -> libc::c_int;
+                }
+                let path = CString::new(f.export.as_os_str().as_bytes())
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+                let mut data = 0u32;
+                // `_IOW('A', 2, uint32_t)`, the command after
+                // FSIOC_SYNC_VOLUME. Safety: `path` is NUL-terminated and
+                // `data` is a live u32 of the size the command encodes.
+                let rc = unsafe {
+                    fsctl(
+                        path.as_ptr(),
+                        0x8004_4102,
+                        (&mut data as *mut u32).cast(),
+                        0,
+                    )
+                };
+                let err = io::Error::last_os_error();
+                if rc != 0 && err.raw_os_error() == Some(libc::EPERM) {
+                    return Err(err);
+                }
+                if rc != 0 {
+                    eprintln!(
+                        "  note: the sandbox let that fsctl through; the filesystem refused it ({err})"
+                    );
+                }
+                Ok(())
+            },
+        },
         // The other half: rights the VMM still needs, held as descriptors.
         Probe {
             // The grant that gives the denials above their meaning. If
@@ -483,42 +527,6 @@ fn probes() -> Vec<Probe> {
             what: "sync the writable export's volume",
             expect_ok: true,
             run: |f| crate::virtio_fs::sync_volume(&f.export),
-        },
-        Probe {
-            // The grant is one fsctl command, not fsctl. Only EPERM counts
-            // as the sandbox refusing: any other error means the call reached
-            // the filesystem, which is the grant being wider than it says.
-            what: "another fsctl on the writable export",
-            expect_ok: false,
-            run: |f| {
-                extern "C" {
-                    fn fsctl(
-                        path: *const libc::c_char,
-                        request: libc::c_ulong,
-                        data: *mut libc::c_void,
-                        options: libc::c_uint,
-                    ) -> libc::c_int;
-                }
-                let path = CString::new(f.export.as_os_str().as_encoded_bytes())
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-                let mut data = 0u32;
-                // `_IOW('A', 2, uint32_t)`, the command after
-                // FSIOC_SYNC_VOLUME. Safety: `path` is
-                // NUL-terminated and `data` is a live u32 of
-                // the size the command encodes.
-                let rc = unsafe {
-                    fsctl(
-                        path.as_ptr(),
-                        0x8004_4102,
-                        (&mut data as *mut u32).cast(),
-                        0,
-                    )
-                };
-                match io::Error::last_os_error() {
-                    e if rc != 0 && e.raw_os_error() == Some(libc::EPERM) => Err(e),
-                    _ => Ok(()),
-                }
-            },
         },
         Probe {
             // The same for the read-only grant, so its denial above

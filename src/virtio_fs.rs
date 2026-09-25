@@ -641,7 +641,7 @@ pub struct VirtioFs {
     /// succeeds: a mutation that then fails costs one extra `sync`, and
     /// missing one would cost durability.
     dirty: bool,
-    /// How many volume syncs SYNCFS has made.
+    /// How many volume syncs SYNCFS has attempted.
     ///
     /// The guards above are invisible in the reply -- a SYNCFS that syncs the
     /// host and one that skips it both answer success -- so without a counter
@@ -3034,18 +3034,26 @@ impl VirtioFs {
         // it and then calls `sync` expects those bytes on the host too, and
         // this server has closed the descriptor they would have gone through.
         //
-        // A sync of the export's volume is what reaches them: every dirty
-        // block on it goes to the disk and through the drive cache, and the
-        // call waits for that, so a closed file ends up as durable as an open
-        // one. It used to be `sync(2)`, which walks every filesystem the host
-        // has mounted and only schedules their writeback. The guest waits for
-        // this reply -- one shutting down cannot power off until it has it --
-        // and on a busy host, with network shares and disk images mounted,
-        // that walk held a guest in shutdown for minutes.
+        // A sync of the export's volume is what reaches them. The call waits
+        // for the volume's writeback and then flushes the drive cache, so a
+        // closed file on that volume ends up as durable as an open one. XNU
+        // drops the writeback's own errors, so a failure here comes from
+        // resolving the root or from the cache flush. A second volume mounted
+        // inside the export is not covered; the device does not stop at mount
+        // points, so the guest can write through one. It used to be `sync(2)`,
+        // which walks every filesystem the host has mounted and only schedules
+        // their writeback. The guest waits for this reply -- one shutting down
+        // cannot power off until it has it -- and on a busy host, with network
+        // shares and disk images mounted, that walk held a guest in shutdown
+        // for minutes.
         //
         // The cost is still the volume's, so it is only spent for a guest
         // that can write, and only once per batch of writes. A sync that
-        // fails leaves the batch pending, so the next SYNCFS tries again.
+        // fails leaves the batch pending, so the next SYNCFS tries again --
+        // and one that keeps failing is attempted on every SYNCFS. That opens
+        // nothing new: a guest that writes one byte between syncs already
+        // gets a volume sync per SYNCFS, which is all the dirty bit is there
+        // to stop a guest that has written nothing from getting.
         if self.writable && self.dirty {
             self.host_syncs.fetch_add(1, Ordering::Relaxed);
             match sync_volume(&self.root) {
