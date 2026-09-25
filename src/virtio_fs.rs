@@ -4050,7 +4050,10 @@ impl VirtioFs {
         // Each one is queued with the descriptor this listing came from, and
         // the worker opens the one name there. A worker never resolves a path,
         // so a rename of a directory above cannot send it elsewhere.
-        if plus && self.readahead_enabled() {
+        let names_a_subdirectory = batch
+            .iter()
+            .any(|(idx, entry)| *idx > 1 && entry.dtype == DT_DIR);
+        if plus && names_a_subdirectory && self.readahead_enabled() {
             let parent = listing
                 .as_ref()
                 .and_then(|listing| dup_cloexec(listing.as_fd()).ok())
