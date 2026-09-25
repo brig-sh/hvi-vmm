@@ -754,7 +754,8 @@ impl VirtioFs {
         )
     }
 
-    /// Host-wide syncs made on behalf of the guest since boot.
+    /// Volume syncs attempted on behalf of the guest since boot, failed ones
+    /// included.
     #[cfg(test)]
     fn host_sync_count(&self) -> u64 {
         self.host_syncs.load(Ordering::Relaxed)
@@ -6295,11 +6296,12 @@ mod tests {
         assert_eq!(get_u32(&out, 4), Some(0));
     }
 
-    /// `sync(2)` starts writeback on every filesystem the host has mounted,
-    /// including the ones this VM has nothing to do with. A guest holding
-    /// only read-only exports has written nothing to flush, and it reaches
-    /// SYNCFS on every `sync` it runs and once more when it powers off. It
-    /// must not be able to spend the host's disks that way.
+    /// SYNCFS on a writable export ends in a full sync of the export's
+    /// volume, drive cache included, whose cost lands on everything else on
+    /// that volume. A guest holding only read-only exports has written
+    /// nothing to flush, and it reaches SYNCFS on every `sync` it runs and
+    /// once more when it powers off. It must not be able to spend the host's
+    /// disk that way.
     #[test]
     fn read_only_export_does_not_sync_the_host() {
         let (_dir, mut dev) = fixture_with_access(false);
