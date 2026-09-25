@@ -26,7 +26,7 @@
 //! an immutable OCI cache to remain protected while an instance-owned APFS
 //! clone or an explicit volume is exported without a block image.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, Permissions};
 use std::io;
@@ -583,10 +583,14 @@ pub struct VirtioFs {
     /// requests, and a walk reads a subdirectory before it finishes its
     /// parent, so several are open at once. Each is read once and kept
     /// across the guest's own changes, as a handle's snapshot is, so the
-    /// offsets the guest holds stay valid. The least recently read goes when
-    /// there are more than [`FH0_LISTINGS_MAX`].
+    /// offsets the guest holds stay valid. There are at most
+    /// [`FH0_LISTINGS_MAX`]; see [`Self::make_room_for_fh0_listing`] for which
+    /// one goes.
     fh0_listings: HashMap<u64, Vec<DirEntryInfo>>,
+    /// The nodes in `fh0_listings`, least recently read first.
     fh0_order: VecDeque<u64>,
+    /// The nodes in `fh0_listings` whose listing a page has read to the end.
+    fh0_finished: HashSet<u64>,
     next_handle: u64,
     /// Most guest handles this export will hold open at once (#34).
     ///
@@ -740,6 +744,7 @@ impl VirtioFs {
             dir_handles: HashMap::new(),
             fh0_listings: HashMap::new(),
             fh0_order: VecDeque::new(),
+            fh0_finished: HashSet::new(),
             next_handle: 1,
             handle_limit: crate::fdlimit::guest_handle_budget(),
             parked: HashMap::new(),
@@ -863,6 +868,7 @@ impl VirtioFs {
         // Keyed by node id, and node ids restart below.
         self.fh0_listings.clear();
         self.fh0_order.clear();
+        self.fh0_finished.clear();
         self.sockets.clear();
         self.nodes.retain(|&node, _| node == FUSE_ROOT_ID);
         self.inode_ids.retain(|_, &mut node| node == FUSE_ROOT_ID);
@@ -3251,25 +3257,20 @@ impl VirtioFs {
         let max_entries = limit / min_record + 1;
         // fh 0 is never a real handle (they start at 1): the guest has
         // stopped sending OPENDIR, so the listing is read here.
+        let mut fh0_len = None;
         let batch: Vec<(usize, DirEntryInfo)> = if fh == 0 {
             let reuse = offset != 0 && self.fh0_listings.contains_key(&node);
             if !reuse {
                 let entries = self.dir_entries(&dir)?;
                 self.fh0_listings.insert(node, entries);
+                self.fh0_finished.remove(&node);
             }
-            // Every page moves its listing to the back. A reader descends into
-            // the children before it asks for the parent's next page, and
-            // evicting the parent then would re-read it under offsets that
-            // index the old listing.
             if let Some(pos) = self.fh0_order.iter().position(|&n| n == node) {
                 self.fh0_order.remove(pos);
             }
+            self.make_room_for_fh0_listing();
             self.fh0_order.push_back(node);
-            if self.fh0_order.len() > FH0_LISTINGS_MAX {
-                if let Some(oldest) = self.fh0_order.pop_front() {
-                    self.fh0_listings.remove(&oldest);
-                }
-            }
+            fh0_len = self.fh0_listings.get(&node).map(Vec::len);
             self.fh0_listings
                 .get(&node)
                 .into_iter()
@@ -3313,6 +3314,8 @@ impl VirtioFs {
             None
         };
 
+        let batch_end = batch.last().map_or(offset, |(idx, _)| idx + 1);
+        let mut full = false;
         let mut out = Vec::new();
         for (idx, entry) in batch {
             let path = if idx == 0 {
@@ -3325,6 +3328,7 @@ impl VirtioFs {
             let name = entry.name.as_bytes();
             let record_len = align8((if plus { 128 } else { 0 }) + 24 + name.len());
             if out.len() + record_len > limit {
+                full = true;
                 break;
             }
 
@@ -3412,7 +3416,43 @@ impl VirtioFs {
             out.extend_from_slice(name);
             out.resize(align8(out.len()), 0);
         }
+        if fh0_len.is_some_and(|len| !full && batch_end >= len) {
+            self.fh0_finished.insert(node);
+        }
         Ok(out)
+    }
+
+    /// Evicts fh-0 listings until one more fits under [`FH0_LISTINGS_MAX`].
+    ///
+    /// A listing a page has read to the end goes first, least recently read
+    /// first. A listing the guest is still paging through goes only when all
+    /// of them are, because the next page would re-read the directory under
+    /// offsets that index the evicted listing. A reader that descends into
+    /// the subdirectories of one page reads a listing for each before it asks
+    /// for the next page, and one page can name more than the cap.
+    fn make_room_for_fh0_listing(&mut self) {
+        while self.fh0_order.len() >= FH0_LISTINGS_MAX {
+            let pos = self
+                .fh0_order
+                .iter()
+                .position(|node| self.fh0_finished.contains(node))
+                .unwrap_or(0);
+            if let Some(node) = self.fh0_order.remove(pos) {
+                self.fh0_listings.remove(&node);
+                self.fh0_finished.remove(&node);
+            }
+        }
+    }
+
+    /// Drops the fh-0 listing of `node`, a directory the guest can no longer
+    /// read because it is gone or forgotten.
+    fn drop_fh0_listing(&mut self, node: u64) {
+        if self.fh0_listings.remove(&node).is_some() {
+            if let Some(pos) = self.fh0_order.iter().position(|&n| n == node) {
+                self.fh0_order.remove(pos);
+            }
+            self.fh0_finished.remove(&node);
+        }
     }
 
     fn statfs(&self) -> Result<Vec<u8>, i32> {
@@ -3830,8 +3870,9 @@ impl VirtioFs {
         // Node ids are never reissued, so a descriptor parked under this one
         // could not be matched again, and it would pin the inode until the
         // cache filled. A later lookup of the same file mints a new id
-        // and would not reach it.
+        // and would not reach it. The same holds for a listing.
         self.drop_parked(node);
+        self.drop_fh0_listing(node);
     }
 
     /// Records that a new handle names `node`.
@@ -3883,8 +3924,10 @@ impl VirtioFs {
             // the kernel has not forgotten): FUSE names inodes by node id,
             // and an unlinked-but-open file is still an inode to the guest.
             // FORGET, or the release of the last handle once forgotten,
-            // removes it.
+            // removes it. A directory's listing goes now: the guest cannot
+            // read a directory that is gone.
             self.inode_ids.remove(&key);
+            self.drop_fh0_listing(node_id);
             let held = self
                 .nodes
                 .get(&node_id)
@@ -9897,32 +9940,141 @@ mod tests {
         assert_eq!(get_u32(&out, 4), Some(0));
     }
 
-    // `rm -rf` reads a page of the parent, empties each child it named, then
-    // asks for the next page. Evicting the parent in between re-reads it, and
-    // the guest's offset then skips entries it never saw.
+    /// Removes `name` under `parent` and everything below it the way busybox
+    /// `rm -rf` does, and returns the errno of the final RMDIR, 0 on success.
+    ///
+    /// Each directory is read a 4 KiB page at a time with fh 0. The
+    /// directories a page names are emptied and removed before the next page
+    /// is asked for, at the offset the last page ended on.
+    fn rm_rf(dev: &mut VirtioFs, parent: u64, name: &[u8], plus: bool) -> i32 {
+        let node = lookup_node(dev, parent, name);
+        let opcode = if plus { READDIRPLUS } else { READDIR };
+        let mut offset = 0u64;
+        loop {
+            let mut read = vec![0u8; 40];
+            read[8..16].copy_from_slice(&offset.to_le_bytes());
+            read[16..20].copy_from_slice(&4096u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(opcode, node, &read), 4096 + OUT_HEADER_LEN);
+            assert_eq!(get_u32(&out, 4), Some(0));
+            let entries = parse_readdir_entries(&out[OUT_HEADER_LEN..], plus);
+            let Some(last) = entries.last() else {
+                break;
+            };
+            offset = last.1;
+            for (_, _, dtype, entry, _) in &entries {
+                if entry == "." || entry == ".." {
+                    continue;
+                }
+                if *dtype == DT_DIR {
+                    assert_eq!(rm_rf(dev, node, entry.as_bytes(), plus), 0, "{entry}");
+                } else {
+                    let mut unlink = entry.as_bytes().to_vec();
+                    unlink.push(0);
+                    let out = dev.handle_fuse(&request(UNLINK, node, &unlink), 4096);
+                    assert_eq!(get_u32(&out, 4), Some(0), "{entry}");
+                }
+            }
+        }
+        let mut rmdir = name.to_vec();
+        rmdir.push(0);
+        let out = dev.handle_fuse(&request(RMDIR, parent, &rmdir), 4096);
+        -(get_u32(&out, 4).unwrap() as i32)
+    }
+
+    // One 4 KiB READDIR page names about 128 entries, so emptying the
+    // subdirectories on the first page reads far more than
+    // `FH0_LISTINGS_MAX` listings before the parent's second page. Evicting
+    // the parent in between re-reads it without the removed entries, and the
+    // offset the guest holds then skips the ones it has not seen yet.
     #[test]
-    fn reader_keeps_its_fh0_listing_while_it_walks_the_children() {
+    fn rm_rf_empties_a_directory_wider_than_the_listing_cap() {
         let (dir, mut dev) = fixture_with_access(true);
-        let parent = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
-        let mut children = Vec::new();
-        for i in 0..FH0_LISTINGS_MAX {
-            let name = format!("d{i:02}");
-            fs::create_dir(dir.join(&name)).unwrap();
-            children.push(lookup_node(&mut dev, FUSE_ROOT_ID, name.as_bytes()));
+        for i in 0..200 {
+            fs::create_dir_all(dir.join(format!("wide/d{i:03}"))).unwrap();
         }
+        assert_eq!(rm_rf(&mut dev, FUSE_ROOT_ID, b"wide", false), 0);
+        assert!(!dir.join("wide").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
 
-        read_fh0_page(&mut dev, parent, 0);
-        for &child in &children[..FH0_LISTINGS_MAX - 1] {
-            read_fh0_page(&mut dev, child, 0);
+    // A walk that deletes nothing frees no listings, so what keeps the
+    // parent's is that its reader has not reached the end. The host removes
+    // an entry the first page named while the walk is below, as a concurrent
+    // writer would; a re-read would then skip the first entry of page two.
+    #[test]
+    fn walk_keeps_the_listing_it_has_not_finished() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..200 {
+            fs::create_dir_all(dir.join(format!("wide/d{i:03}"))).unwrap();
         }
-        read_fh0_page(&mut dev, parent, 1);
-        read_fh0_page(&mut dev, children[FH0_LISTINGS_MAX - 1], 0);
+        let wide = lookup_node(&mut dev, FUSE_ROOT_ID, b"wide");
+        let page = |dev: &mut VirtioFs, node: u64, offset: u64| {
+            let mut read = vec![0u8; 40];
+            read[8..16].copy_from_slice(&offset.to_le_bytes());
+            read[16..20].copy_from_slice(&4096u32.to_le_bytes());
+            let out = dev.handle_fuse(&request(READDIR, node, &read), 4096 + OUT_HEADER_LEN);
+            parse_readdir_entries(&out[OUT_HEADER_LEN..], false)
+        };
 
-        assert!(
-            dev.fh0_listings.contains_key(&parent),
-            "the listing being paged through was evicted"
+        let first = page(&mut dev, wide, 0);
+        for (_, _, _, name, _) in first.iter().skip(2) {
+            let child = lookup_node(&mut dev, wide, name.as_bytes());
+            let mut offset = 0;
+            while let Some(last) = page(&mut dev, child, offset).last() {
+                offset = last.1;
+            }
+        }
+        fs::remove_dir(dir.join("wide/d000")).unwrap();
+        let second = page(&mut dev, wide, first.last().unwrap().1);
+        let expected = format!("d{:03}", first.len() - 2);
+        assert_eq!(
+            second.first().map(|e| e.3.as_str()),
+            Some(expected.as_str())
         );
-        assert!(!dev.fh0_listings.contains_key(&children[0]));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A directory the guest removed or forgot cannot be read again, so its
+    // listing would only take a slot until the cap evicted it.
+    #[test]
+    fn rmdir_and_forget_drop_the_fh0_listing() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("gone")).unwrap();
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let gone = lookup_node(&mut dev, FUSE_ROOT_ID, b"gone");
+        read_fh0_page(&mut dev, etc, 0);
+        read_fh0_page(&mut dev, gone, 0);
+
+        let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"gone\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(!dev.fh0_listings.contains_key(&gone));
+        assert!(!dev.fh0_order.contains(&gone));
+
+        dev.handle_fuse(&request(FORGET, etc, &1u64.to_le_bytes()), 4096);
+        assert!(!dev.fh0_listings.contains_key(&etc));
+        assert!(dev.fh0_order.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The shape that reproduced it live: 40 children, the first 30 holding
+    // three subdirectories each, read with READDIRPLUS. A page names about 25
+    // entries, and their subtrees alone take more than `FH0_LISTINGS_MAX`
+    // listings.
+    #[test]
+    fn rm_rf_empties_nested_subtrees_bigger_than_the_listing_cap() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..40 {
+            let child = dir.join(format!("nest/c{i:02}"));
+            fs::create_dir_all(&child).unwrap();
+            fs::write(child.join("f"), b"f").unwrap();
+            if i < 30 {
+                for j in 0..3 {
+                    fs::create_dir(child.join(format!("s{j}"))).unwrap();
+                }
+            }
+        }
+        assert_eq!(rm_rf(&mut dev, FUSE_ROOT_ID, b"nest", true), 0);
+        assert!(!dir.join("nest").exists());
         let _ = fs::remove_dir_all(dir);
     }
 
