@@ -101,6 +101,7 @@ const SETLK: u32 = 32;
 const SETLKW: u32 = 33;
 const ACCESS: u32 = 34;
 const CREATE: u32 = 35;
+const INTERRUPT: u32 = 36;
 const DESTROY: u32 = 38;
 const POLL: u32 = 40;
 const BATCH_FORGET: u32 = 42;
@@ -158,6 +159,7 @@ pub fn opcode_name(opcode: u32) -> &'static str {
         SETLKW => "SETLKW",
         ACCESS => "ACCESS",
         CREATE => "CREATE",
+        INTERRUPT => "INTERRUPT",
         DESTROY => "DESTROY",
         POLL => "POLL",
         BATCH_FORGET => "BATCH_FORGET",
@@ -821,9 +823,26 @@ fn prepare_dir(dir_fd: BorrowedFd<'_>) -> Option<PreparedDir> {
     })
 }
 
-/// Returns whether a request of `opcode` leaves the share unchanged, so a
-/// prepared listing stays valid across it.
-fn opcode_is_read_only(opcode: u32) -> bool {
+/// Returns whether an OPEN with these `fuse_open_in` flags may change the
+/// file, by writing to it, truncating it or clearing its set-id bits.
+fn open_wants_write(flags: u32, open_flags: u32) -> bool {
+    flags & LINUX_O_ACCMODE != 0
+        || flags & LINUX_O_TRUNC != 0
+        || open_flags & FUSE_OPEN_KILL_SUIDGID != 0
+}
+
+/// Returns whether a request of `opcode` with `payload` leaves the share
+/// unchanged, so a prepared listing stays valid across it.
+///
+/// An OPEN is read-only when it asks for no write. A payload too short to
+/// say is taken as a write.
+fn request_is_read_only(opcode: u32, payload: &[u8]) -> bool {
+    if opcode == OPEN {
+        return match (get_u32(payload, 0), get_u32(payload, 4)) {
+            (Some(flags), Some(open_flags)) => !open_wants_write(flags, open_flags),
+            _ => false,
+        };
+    }
     matches!(
         opcode,
         LOOKUP
@@ -843,6 +862,10 @@ fn opcode_is_read_only(opcode: u32) -> bool {
             | RELEASEDIR
             | FSYNCDIR
             | GETLK
+            | SETLK
+            | SETLKW
+            | IOCTL
+            | INTERRUPT
             | ACCESS
             | DESTROY
             | POLL
@@ -1678,7 +1701,7 @@ impl VirtioFs {
         let nodeid = get_u64(raw, 16).unwrap_or(0);
         self.count_op(opcode);
         let op_start = std::time::Instant::now();
-        if !opcode_is_read_only(opcode) {
+        if !request_is_read_only(opcode, raw.get(IN_HEADER_LEN..).unwrap_or_default()) {
             self.drop_prepared();
         }
         let request_context = RequestContext {
@@ -2566,9 +2589,7 @@ impl VirtioFs {
     fn open(&mut self, node: u64, input: &[u8], directory: bool) -> Result<Vec<u8>, i32> {
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let open_flags = get_u32(input, 4).ok_or(EINVAL)?;
-        let wants_write = flags & LINUX_O_ACCMODE != 0
-            || flags & LINUX_O_TRUNC != 0
-            || open_flags & FUSE_OPEN_KILL_SUIDGID != 0;
+        let wants_write = open_wants_write(flags, open_flags);
         if wants_write && !self.writable {
             return Err(EROFS);
         }
@@ -7568,6 +7589,29 @@ mod tests {
         assert_eq!(dev.zero_copy_writes.load(Ordering::Relaxed), 1, "direct path");
 
         assert_eq!(readdirplus_size(&mut dev, sub_node, b"g"), Some(512));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `grep -r` opens every file it reaches, so an OPEN that asks for no
+    // write has to leave the prepared listings in place. One that may write
+    // still drops them.
+    #[test]
+    fn only_an_open_for_writing_drops_the_prepared_listings() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let sub = fs::canonicalize(&dir).unwrap().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f"), b"f").unwrap();
+        let sub_node = lookup_node(&mut dev, FUSE_ROOT_ID, b"sub");
+        let f = lookup_node(&mut dev, sub_node, b"f");
+
+        dev.readahead.prepare_now(&sub);
+        let out = dev.handle_fuse(&request(OPEN, f, &[0u8; 8]), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(dev.readahead.take(&sub).is_some(), "O_RDONLY kept it");
+
+        dev.readahead.prepare_now(&sub);
+        open_rw(&mut dev, f);
+        assert!(dev.readahead.take(&sub).is_none(), "O_RDWR dropped it");
         let _ = fs::remove_dir_all(dir);
     }
 
