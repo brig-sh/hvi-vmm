@@ -286,7 +286,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
     }
-    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
+    .load(
+        ram.memory(),
+        cfg.mem_bytes,
+        &gic,
+        num_cpus,
+        fdt_devices,
+        fdt::Options::default(),
+    )?;
 
     // Place the GIC regions (the device itself was created above, before the
     // DTB). The address-type constants differ per version, and v2 takes a CPU

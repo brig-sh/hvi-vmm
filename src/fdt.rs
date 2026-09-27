@@ -41,6 +41,43 @@ const IRQ_PPI: u32 = 1;
 /// GIC interrupt flag cell.
 const IRQ_LEVEL_HIGH: u32 = 4;
 
+/// Architected timer PPIs (INTID - 16), in the order the `arm,armv8-timer`
+/// binding lists them. They have to match the INTIDs Hypervisor.framework
+/// raises the timers on; the macOS backend checks the ones it can query
+/// against `hv_gic_get_intid` before a guest that owns EL2 boots. Under nVHE,
+/// the only mode the framework offers, that guest's kernel uses the EL1
+/// physical timer (PPI 14); only a VHE kernel would take the hypervisor PPI.
+pub const TIMER_PPI_SECURE_PHYS: u32 = 13;
+pub const TIMER_PPI_PHYS: u32 = 14;
+pub const TIMER_PPI_VIRT: u32 = 11;
+pub const TIMER_PPI_HYP_PHYS: u32 = 10;
+
+/// How the guest makes PSCI calls (`/psci` `method`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PsciConduit {
+    /// `HVC`, which traps to the VMM from a guest kernel at EL1.
+    #[default]
+    Hvc,
+    /// `SMC`. A guest kernel that owns EL2 takes its own `HVC` in its own
+    /// vectors, so the VMM never sees it; `SMC` still traps to the VMM. QEMU's
+    /// `virt` machine switches to `smc` for the same reason when it gives the
+    /// guest EL2.
+    Smc,
+}
+
+/// Devicetree choices that depend on how the guest is booted rather than on
+/// the device set.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    pub psci_conduit: PsciConduit,
+    /// The PPI number (INTID - 16) of the GIC maintenance interrupt, set only
+    /// when the guest owns EL2. KVM's vgic-v3 in the guest needs it described
+    /// on the GIC node and refuses to initialise without it. `None` leaves the
+    /// property out, which is right for a guest at EL1: the interrupt does
+    /// not exist there.
+    pub gic_maintenance_ppi: Option<u32>,
+}
+
 /// The virtio-mmio nodes backed by this boot.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VirtioDevices {
@@ -52,7 +89,8 @@ pub struct VirtioDevices {
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
 /// command line. When `layout.initrd_size` is non-zero, `/chosen` gets the
-/// initramfs range.
+/// initramfs range. `options` picks the PSCI conduit and whether the GIC node
+/// describes a maintenance interrupt.
 ///
 /// # Errors
 ///
@@ -64,6 +102,7 @@ pub fn build(
     num_cpus: u32,
     bootargs: &str,
     devices: VirtioDevices,
+    options: Options,
 ) -> Result<Vec<u8>, Error> {
     let mut fdt = FdtWriter::new()?;
 
@@ -93,13 +132,18 @@ pub fn build(
     fdt.property_array_u64("reg", &[layout.ram_base, layout.ram_size])?;
     fdt.end_node(mem)?;
 
-    // /psci: we service the HVC conduit in the exit loop.
+    // /psci: the exit loop services either conduit; see `PsciConduit` for
+    // why a guest that owns EL2 must be told `smc`.
     let psci = fdt.begin_node("psci")?;
     fdt.property_string_list(
         "compatible",
         vec!["arm,psci-1.0".into(), "arm,psci-0.2".into()],
     )?;
-    fdt.property_string("method", "hvc")?;
+    let method = match options.psci_conduit {
+        PsciConduit::Hvc => "hvc",
+        PsciConduit::Smc => "smc",
+    };
+    fdt.property_string("method", method)?;
     fdt.end_node(psci)?;
 
     // /cpus
@@ -128,17 +172,17 @@ pub fn build(
         "interrupts",
         &[
             IRQ_PPI,
-            13,
-            IRQ_LEVEL_HIGH, // secure physical
+            TIMER_PPI_SECURE_PHYS,
+            IRQ_LEVEL_HIGH,
             IRQ_PPI,
-            14,
-            IRQ_LEVEL_HIGH, // non-secure physical
+            TIMER_PPI_PHYS,
+            IRQ_LEVEL_HIGH,
             IRQ_PPI,
-            11,
-            IRQ_LEVEL_HIGH, // virtual
+            TIMER_PPI_VIRT,
+            IRQ_LEVEL_HIGH,
             IRQ_PPI,
-            10,
-            IRQ_LEVEL_HIGH, // hypervisor physical
+            TIMER_PPI_HYP_PHYS,
+            IRQ_LEVEL_HIGH,
         ],
     )?;
     fdt.end_node(timer)?;
@@ -161,6 +205,9 @@ pub fn build(
         "reg",
         &[gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size],
     )?;
+    if let Some(ppi) = options.gic_maintenance_ppi {
+        fdt.property_array_u32("interrupts", &[IRQ_PPI, ppi, IRQ_LEVEL_HIGH])?;
+    }
     fdt.property_phandle(PHANDLE_GIC)?;
     fdt.end_node(intc)?;
 
@@ -236,6 +283,7 @@ mod tests {
             1,
             "earlycon=pl011,0x09000000",
             VirtioDevices::default(),
+            Options::default(),
         )
         .unwrap();
         // FDT magic 0xd00dfeed, big-endian, at the front of the header.
@@ -254,6 +302,7 @@ mod tests {
             2,
             "console=ttyAMA0",
             VirtioDevices::default(),
+            Options::default(),
         )
         .unwrap();
         assert_eq!(&blob[0..4], &[0xd0, 0x0d, 0xfe, 0xed]);
@@ -262,7 +311,15 @@ mod tests {
     #[test]
     fn advertises_virtio_fs_only_when_backed() {
         let l = sample_layout(0);
-        let absent = build(&l, &GicLayout::QEMU_VIRT, 1, "", VirtioDevices::default()).unwrap();
+        let absent = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            Options::default(),
+        )
+        .unwrap();
         let present = build(
             &l,
             &GicLayout::QEMU_VIRT,
@@ -272,6 +329,7 @@ mod tests {
                 fs_count: 2,
                 ..VirtioDevices::default()
             },
+            Options::default(),
         )
         .unwrap();
         let first = format!("virtio_mmio@{:x}", crate::layout::VIRTIO_FS_BASE);
@@ -295,7 +353,15 @@ mod tests {
     #[test]
     fn intc_compatible_follows_gic_version() {
         let l = sample_layout(0);
-        let v3 = build(&l, &GicLayout::QEMU_VIRT, 1, "", VirtioDevices::default()).unwrap();
+        let v3 = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            Options::default(),
+        )
+        .unwrap();
         assert!(contains(&v3, "arm,gic-v3"));
         assert!(!contains(&v3, "arm,cortex-a15-gic"));
 
@@ -305,6 +371,7 @@ mod tests {
             1,
             "",
             VirtioDevices::default(),
+            Options::default(),
         )
         .unwrap();
         assert!(contains(&v2, "arm,cortex-a15-gic"));
@@ -317,7 +384,7 @@ mod tests {
     fn v2_reg_describes_dist_and_cpu_interface() {
         let l = sample_layout(0);
         let g = GicLayout::QEMU_VIRT_V2;
-        let blob = build(&l, &g, 1, "", VirtioDevices::default()).unwrap();
+        let blob = build(&l, &g, 1, "", VirtioDevices::default(), Options::default()).unwrap();
         let mut want = Vec::new();
         for v in [g.gicd_base, g.gicd_size, g.gicr_base, g.gicr_size] {
             want.extend_from_slice(&v.to_be_bytes());
@@ -325,6 +392,129 @@ mod tests {
         assert!(
             blob.windows(want.len()).any(|w| w == want.as_slice()),
             "GICv2 reg cell not found in the blob"
+        );
+    }
+
+    /// Returns the value of property `name` on the first node whose name
+    /// starts with `node`, walking the structure block of `blob`.
+    fn prop(blob: &[u8], node: &str, name: &str) -> Option<Vec<u8>> {
+        let be = |at: usize| u32::from_be_bytes(blob[at..at + 4].try_into().unwrap()) as usize;
+        let (off_struct, off_strings) = (be(8), be(12));
+        let mut at = off_struct;
+        let mut current = String::new();
+        loop {
+            let token = be(at);
+            at += 4;
+            match token {
+                1 => {
+                    let end = at + blob[at..].iter().position(|&b| b == 0).unwrap();
+                    current = String::from_utf8_lossy(&blob[at..end]).into_owned();
+                    at = (end + 1 + 3) & !3;
+                }
+                3 => {
+                    let (len, nameoff) = (be(at), be(at + 4));
+                    let value = &blob[at + 8..at + 8 + len];
+                    let key_at = off_strings + nameoff;
+                    let key_end = key_at + blob[key_at..].iter().position(|&b| b == 0).unwrap();
+                    if current.starts_with(node) && &blob[key_at..key_end] == name.as_bytes() {
+                        return Some(value.to_vec());
+                    }
+                    at = (at + 8 + len + 3) & !3;
+                }
+                2 | 4 => {}
+                _ => return None, // 9 = FDT_END
+            }
+        }
+    }
+
+    fn cells(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn build_with(options: Options) -> Vec<u8> {
+        build(
+            &sample_layout(0),
+            &GicLayout::QEMU_VIRT,
+            2,
+            "",
+            VirtioDevices::default(),
+            options,
+        )
+        .unwrap()
+    }
+
+    /// The default guest keeps the HVC conduit and a GIC node with no
+    /// interrupts property: nothing about a guest at EL1 changes.
+    #[test]
+    fn default_options_keep_hvc_and_no_maintenance_interrupt() {
+        let blob = build_with(Options::default());
+        assert_eq!(prop(&blob, "psci", "method").unwrap(), b"hvc\0");
+        let intc = format!("intc@{:x}", GicLayout::QEMU_VIRT.gicd_base);
+        assert!(prop(&blob, &intc, "interrupt-controller").is_some());
+        assert!(prop(&blob, &intc, "interrupts").is_none());
+    }
+
+    /// A guest that owns EL2 is told to use SMC, which still reaches the VMM,
+    /// and gets the maintenance interrupt KVM's vgic needs.
+    #[test]
+    fn nested_options_select_smc_and_describe_maintenance_ppi() {
+        let blob = build_with(Options {
+            psci_conduit: PsciConduit::Smc,
+            gic_maintenance_ppi: Some(9),
+        });
+        assert_eq!(prop(&blob, "psci", "method").unwrap(), b"smc\0");
+        let intc = format!("intc@{:x}", GicLayout::QEMU_VIRT.gicd_base);
+        assert_eq!(
+            cells(&prop(&blob, &intc, "interrupts").unwrap()),
+            [IRQ_PPI, 9, IRQ_LEVEL_HIGH]
+        );
+    }
+
+    /// The two options are independent: SMC alone adds no interrupt.
+    #[test]
+    fn smc_alone_adds_no_maintenance_interrupt() {
+        let blob = build_with(Options {
+            psci_conduit: PsciConduit::Smc,
+            gic_maintenance_ppi: None,
+        });
+        assert_eq!(prop(&blob, "psci", "method").unwrap(), b"smc\0");
+        let intc = format!("intc@{:x}", GicLayout::QEMU_VIRT.gicd_base);
+        assert!(prop(&blob, &intc, "interrupts").is_none());
+    }
+
+    /// The timer node lists the four PPIs in binding order, from the
+    /// constants the macOS backend checks against the framework.
+    #[test]
+    fn timer_ppis_come_from_the_named_constants() {
+        let blob = build_with(Options::default());
+        assert_eq!(
+            cells(&prop(&blob, "timer", "interrupts").unwrap()),
+            [
+                IRQ_PPI,
+                TIMER_PPI_SECURE_PHYS,
+                IRQ_LEVEL_HIGH,
+                IRQ_PPI,
+                TIMER_PPI_PHYS,
+                IRQ_LEVEL_HIGH,
+                IRQ_PPI,
+                TIMER_PPI_VIRT,
+                IRQ_LEVEL_HIGH,
+                IRQ_PPI,
+                TIMER_PPI_HYP_PHYS,
+                IRQ_LEVEL_HIGH,
+            ]
+        );
+        assert_eq!(
+            (
+                TIMER_PPI_SECURE_PHYS,
+                TIMER_PPI_PHYS,
+                TIMER_PPI_VIRT,
+                TIMER_PPI_HYP_PHYS
+            ),
+            (13, 14, 11, 10)
         );
     }
 }

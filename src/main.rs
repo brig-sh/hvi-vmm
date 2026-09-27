@@ -182,8 +182,9 @@ fn print_version() {
 /// builds the DTB and prints the layout.
 ///
 /// `dump-fdt --kernel <Image> [--initramfs <cpio>] [--mem-mib N] [--cmdline S]
-/// [--out <file>]`. `--out` also writes the blob. Pure, no hypervisor, so it
-/// runs anywhere the binary does.
+/// [--nested-virt] [--out <file>]`. `--out` also writes the blob.
+/// `--nested-virt` builds the blob a guest that owns EL2 gets. Pure, no
+/// hypervisor, so it runs anywhere the binary does.
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use layout::GicLayout;
@@ -193,12 +194,22 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut out = None;
+    let mut options = fdt::Options::default();
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--kernel" => kernel = it.next().cloned(),
             "--initramfs" => initramfs = it.next().cloned(),
+            // No hypervisor is asked here, so the maintenance PPI is the one
+            // Hypervisor.framework documents (`HV_GIC_INT_MAINTENANCE`, INTID
+            // 25). A real boot takes it from the framework instead.
+            "--nested-virt" => {
+                options = fdt::Options {
+                    psci_conduit: fdt::PsciConduit::Smc,
+                    gic_maintenance_ppi: Some(25 - 16),
+                };
+            }
             "--mem-mib" => {
                 mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?;
             }
@@ -225,6 +236,7 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         1,
         &cmdline,
         fdt::VirtioDevices::default(),
+        options,
     )?;
 
     println!(

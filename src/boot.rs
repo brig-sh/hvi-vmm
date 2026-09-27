@@ -31,7 +31,7 @@ use linux_loader::loader::pe::{arm64_image_header, load_dtb, PE};
 use linux_loader::loader::KernelLoader;
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryBackend};
 
-use crate::fdt::{self, VirtioDevices};
+use crate::fdt::{self, Options, VirtioDevices};
 use crate::layout::{GicLayout, GuestLayout, RAM_BASE};
 
 /// arm64 `Image` magic, "ARM\x64" read as a little-endian `u32`.
@@ -125,6 +125,9 @@ impl LoadedKernel {
     ///
     /// Errors when the images do not fit in RAM or the devicetree cannot be
     /// built.
+    // Every argument is a separate input to `fdt::build`; bundling them into
+    // a struct would only move the list.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan(
         self,
         ram_size: u64,
@@ -133,6 +136,7 @@ impl LoadedKernel {
         num_cpus: u32,
         cmdline: &str,
         devices: VirtioDevices,
+        options: Options,
     ) -> Result<Plan, String> {
         let provisional = GuestLayout::new(
             ram_size,
@@ -141,7 +145,7 @@ impl LoadedKernel {
             PROVISIONAL_DTB_SIZE,
             initrd_size,
         );
-        let dtb = fdt::build(&provisional, gic, num_cpus, cmdline, devices)
+        let dtb = fdt::build(&provisional, gic, num_cpus, cmdline, devices, options)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         let layout = GuestLayout::new(
             ram_size,
@@ -150,7 +154,7 @@ impl LoadedKernel {
             dtb.len() as u64,
             initrd_size,
         );
-        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices)
+        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices, options)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         layout.validate()?;
         Ok(Plan { layout, dtb })
@@ -192,10 +196,19 @@ impl Payload<'_> {
         gic: &GicLayout,
         num_cpus: u32,
         devices: VirtioDevices,
+        options: Options,
     ) -> Result<GuestLayout, String> {
         let kernel = LoadedKernel::load(mem, self.kernel)?;
         let initrd_size = self.initramfs.map_or(0, |v| v.len() as u64);
-        let plan = kernel.plan(ram_size, initrd_size, gic, num_cpus, self.cmdline, devices)?;
+        let plan = kernel.plan(
+            ram_size,
+            initrd_size,
+            gic,
+            num_cpus,
+            self.cmdline,
+            devices,
+            options,
+        )?;
         write_dtb(mem, plan.layout.dtb_addr, &plan.dtb)?;
         if let Some(initramfs) = self.initramfs {
             mem.get_slice(GuestAddress(plan.layout.initrd_addr), initramfs.len())
@@ -333,6 +346,7 @@ mod tests {
                 2,
                 "console=ttyAMA0",
                 VirtioDevices::default(),
+                Options::default(),
             )
             .expect("plan");
         assert_eq!(layout.dtb_addr, RAM_BASE + 0x40_0000);
@@ -347,7 +361,8 @@ mod tests {
                     &GicLayout::QEMU_VIRT,
                     1,
                     "",
-                    VirtioDevices::default()
+                    VirtioDevices::default(),
+                    Options::default(),
                 )
                 .is_err(),
             "a kernel larger than RAM does not fit"
@@ -370,6 +385,7 @@ mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             VirtioDevices::default(),
+            Options::default(),
         )
         .expect("load");
         assert_eq!(layout.kernel_addr, RAM_BASE);

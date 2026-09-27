@@ -515,7 +515,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
     }
-    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
+    .load(
+        ram.memory(),
+        cfg.mem_bytes,
+        &gic,
+        num_cpus,
+        fdt_devices,
+        fdt::Options::default(),
+    )?;
 
     let secondaries: Vec<Secondary> = (0..num_cpus)
         .map(|_| Secondary {
