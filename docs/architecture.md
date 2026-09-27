@@ -205,6 +205,10 @@ HVC goes to its own EL2 vectors), the interrupt controller the backend chose (`a
 the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock, the PL011
 console as `stdout-path`, and one `virtio_mmio@…` node per backed device.
 
+`/chosen` also carries a 64-byte `rng-seed`, fresh from the host's
+`getentropy` for every boot, because the guest has no other entropy source at
+boot. Linux credits it and overwrites the property in its in-RAM blob.
+
 The `/apb-pclk` node is load-bearing rather than decorative: the PL011 node's
 `clocks` property points at it twice, and the `amba-pl011` driver needs that
 to bind.

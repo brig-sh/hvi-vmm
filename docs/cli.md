@@ -162,6 +162,9 @@ hvi dump-fdt --kernel Image --mem-mib 1024 --out fdt.dtb
 | `--nested-virt` | off; builds the blob a guest at EL2 gets (`method = "smc"`, GIC maintenance PPI 9) |
 | `--out <file>` | none, print only |
 
+The blob it writes carries a fresh random `rng-seed`, as a boot's would. It is
+not printed, and no boot uses it.
+
 It always builds a **one-vCPU devicetree with no virtio devices**, using the
 fixed QEMU virt GIC layout rather than whatever a host would negotiate. It has
 no `--cpus`, `--disk` or `--net-stub`. Use it to check the kernel header, the
