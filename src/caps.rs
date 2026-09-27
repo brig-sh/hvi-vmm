@@ -44,22 +44,20 @@ pub const NOT_MACOS: &str = "--nested-virt is currently implemented by the macOS
 ///
 /// # Errors
 ///
-/// Errors only when Hypervisor.framework cannot say whether it supports EL2.
+/// Errors only when Hypervisor.framework cannot be asked.
 pub fn probe() -> Result<Caps, Box<dyn std::error::Error>> {
+    // The same check `boot --nested-virt` makes, so "supported" here means a
+    // boot accepts this host.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let (supported, detail) = if applevisor::prelude::VirtualMachineConfig::get_el2_supported()? {
-        (true, "Hypervisor.framework reports EL2")
-    } else {
-        (false, "Hypervisor.framework reports no EL2")
+    let (supported, detail) = match crate::machine::el2_support()? {
+        Ok(_) => (true, "Hypervisor.framework reports EL2".to_string()),
+        Err(detail) => (false, detail),
     };
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let (supported, detail) = (false, NOT_MACOS);
+    let (supported, detail) = (false, NOT_MACOS.to_string());
     Ok(Caps {
         schema_version: 1,
-        nested_virt: NestedVirt {
-            supported,
-            detail: detail.to_string(),
-        },
+        nested_virt: NestedVirt { supported, detail },
     })
 }
 

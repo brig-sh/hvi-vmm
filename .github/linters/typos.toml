@@ -18,3 +18,5 @@ controllen = "controllen"
 fter = "fter"
 # O_WRONLY, the Linux open(2) access mode the virtio-fs backend translates.
 wronly = "wronly"
+# SME, the Arm Scalable Matrix Extension, which a guest at EL2 is not shown.
+sme = "sme"

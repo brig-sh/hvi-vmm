@@ -154,6 +154,15 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
         );
     }
+    // The phrase before the colon is the one hull and brig print for the same
+    // refusal, so a caller can match it across the three layers.
+    if cfg.nested_virt {
+        return Err(
+            "nested virtualization requested but not supported by this host: \
+             --nested-virt is currently implemented by the macOS HVI backend only"
+                .into(),
+        );
+    }
     install_kick_handler();
     let num_cpus = cfg.vcpus.max(1);
 
