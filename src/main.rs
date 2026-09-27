@@ -47,6 +47,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("boot") => boot_guest(&args[2..]),
+        Some("caps") => caps(&args[2..]),
         Some("--version" | "-V" | "version") => {
             print_version();
             Ok(())
@@ -150,12 +151,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             eprintln!(
                 "hvi — a microVMM\n\nusage: hvi \
-                 <boot|dump-fdt|smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
+                 <boot|caps|dump-fdt|smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
             );
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected `boot`, `dump-fdt`, `smoke`, \
+            "unknown subcommand {other:?}; expected `boot`, `caps`, `dump-fdt`, `smoke`, \
              `sandbox-selftest`, `seccomp-selftest` or `--version`"
         )
         .into()),
@@ -176,6 +177,37 @@ fn print_version() {
         env!("CARGO_PKG_VERSION"),
         hvi::CORE_VERSION
     );
+}
+
+/// Runs `caps`, which says whether this host can give a guest EL2
+/// (`boot --nested-virt`), without creating a VM.
+///
+/// `caps [--json]`. The JSON is what hull reads; see [`hvi::caps`] for the
+/// shape. Exits 0 whether or not the host supports it.
+fn caps(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            other => return Err(format!("unknown caps arg {other:?}").into()),
+        }
+    }
+    let caps = hvi::caps::probe()?;
+    if json {
+        println!("{}", serde_json::to_string(&caps)?);
+        return Ok(());
+    }
+    let nested = &caps.nested_virt;
+    println!(
+        "nested virtualization: {} ({})",
+        if nested.supported {
+            "supported"
+        } else {
+            "not supported"
+        },
+        nested.detail
+    );
+    Ok(())
 }
 
 /// Runs `dump-fdt`, which reads the kernel header, computes the guest layout,
