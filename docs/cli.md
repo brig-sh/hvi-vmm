@@ -17,6 +17,7 @@ not apply returns a named error rather than "unknown subcommand".
 | Subcommand | Where it works | What it does |
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
+| `caps` | all three backends | Say whether this host can give a guest EL2 (`boot --nested-virt`). No VM is created. |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
 | `smoke` | macOS, Apple silicon | The M0 Hypervisor.framework test. `--shm` runs it over shared guest RAM. |
 | `smoke-shm-verify <name> <hex>` | macOS, Apple silicon | The child half of `smoke --shm`. Not for direct use. |
@@ -61,6 +62,7 @@ including a typo, silently runs the plain test.
 | `--dump-after <secs>` | none | Dump automatically after this long. Needs `--dump-memory`. `0` becomes 1. |
 | `--trace-io <path>` | none | Attach the I/O tracer. |
 | `--no-sandbox` | off | Boot unconfined. For debugging the profile or the filters. |
+| `--nested-virt` | off | Give the guest EL2, so its kernel can run KVM. macOS only, on a host where `hvi caps` says supported. See [first-boot.md](first-boot.md#guests-inside-the-guest). |
 
 ### Parsing behaviour
 
@@ -105,12 +107,14 @@ are three behaviours, not two.
 | `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored silently** | **ignored silently** |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
+| `--nested-virt` | acted on; **refused** where the host has no EL2 | **refused**, boot fails | **refused**, boot fails |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | everything else | acted on | acted on | acted on |
 
-Two of those errors appear **after** `booting <kernel> with <N> MiB ...` has
-printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` on macOS, and the shares on either Linux backend.
+These errors appear **after** `booting <kernel> with <N> MiB ...` has printed,
+because they are raised inside the backend rather than at parse time:
+`--net-tap` on macOS, the shares on either Linux backend, and `--nested-virt`
+wherever it is refused.
 
 ```text
 booting Image with 512 MiB ...
@@ -155,6 +159,7 @@ hvi dump-fdt --kernel Image --mem-mib 1024 --out fdt.dtb
 | `--initramfs <cpio>` | none, only its length is used |
 | `--mem-mib <N>` | 512 |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` |
+| `--nested-virt` | off; builds the blob a guest at EL2 gets (`method = "smc"`, GIC maintenance PPI 9) |
 | `--out <file>` | none, print only |
 
 It always builds a **one-vCPU devicetree with no virtio devices**, using the
@@ -162,6 +167,16 @@ fixed QEMU virt GIC layout rather than whatever a host would negotiate. It has
 no `--cpus`, `--disk` or `--net-stub`. Use it to check the kernel header, the
 guest layout and the placement arithmetic. It cannot show you the device set
 a real boot would describe.
+
+## `caps`
+
+Says whether `boot --nested-virt` can work on this host, without creating a
+VM. It exits 0 either way and fails only when Hypervisor.framework cannot be
+asked. `--json` prints the form hull reads; keys are only ever added:
+
+```json
+{"schemaVersion":1,"nestedVirt":{"supported":true,"detail":"Hypervisor.framework reports EL2"}}
+```
 
 ## Environment variables
 

@@ -13,12 +13,40 @@ Two mechanisms hold that boundary, and they are not the same thing.
 
 **VM isolation** is the hypervisor's. The guest runs at EL1 or in VMX
 non-root, reaches only the memory hvi mapped for it, and every device access
-leaves the guest.
+leaves the guest. A guest booted with `--nested-virt` owns EL2 as well; see
+[Nested virtualization](#nested-virtualization).
 
 **Process confinement** is hvi's own. The VMM confines itself before it
 services guest I/O, so a bug in a device backend does not start with the
 host's full syscall surface behind it. This is defence in depth. It narrows
 the consequences of a bug in hvi. It does not prevent one.
+
+## Nested virtualization
+
+`--nested-virt` is off unless asked for, and only the macOS backend has it.
+It gives the guest EL2, so the guest kernel can run KVM and start guests of
+its own.
+
+The boundary does not move. A nested guest's memory is part of the outer
+guest's RAM, its CPUs are the outer guest's vCPUs, and any device it has is
+one the outer guest provides. It reaches the host only through the devices
+hvi gives the outer guest, and it stops when hvi stops.
+
+Three things do change:
+
+- **More of Hypervisor.framework is in play.** The framework emulates EL2
+  for the guest, and hvi does not control that code. hvi's own part is
+  small: PSCI arrives through SMC, and the guest's accesses to
+  `CNTHCTL_EL2` are kept in the vCPU instead of being ignored. A PSCI
+  call that belongs to the guest's own hypervisor, from a nested guest,
+  is refused if it ever reaches hvi.
+- **hvi sees the outer guest only.** Its event ledger and plugins describe
+  what the outer guest does. Processes, memory and I/O inside a nested guest
+  show up only as work of the outer guest. A plugin's register view can be
+  the nested guest's own, with addresses that are not in the RAM hvi serves;
+  see [plugins.md](plugins.md).
+- **The guest gets a hypervisor.** Whoever boots a guest with this flag is
+  trusting the workload with one.
 
 ## What the guest can reach
 

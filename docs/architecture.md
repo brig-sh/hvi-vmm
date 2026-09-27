@@ -195,11 +195,12 @@ flowchart TB
     A["Payload::load: linux-loader PE::load(kernel)<br/>magic check, kernel@RAM_BASE+text_offset<br/>image_size read from the header"] --> B
     B["LoadedKernel::plan: GuestLayout::new<br/>dtb@align2M(kernel+image_size)<br/>initrd@align4K(dtb_end)"] --> C
     C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011<br/>virtio_mmio@… per device"] --> D
-    D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
+    D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)<br/>or 0x3c9 (EL2h) with --nested-virt"]
 ```
 
 `fdt.rs` builds the devicetree the kernel reads at `x0`. It emits PSCI with
-`method = "hvc"`, the interrupt controller the backend chose (`arm,gic-v3`, or
+`method = "hvc"` (`"smc"` for a guest booted with `--nested-virt`, whose own
+HVC goes to its own EL2 vectors), the interrupt controller the backend chose (`arm,gic-v3`, or
 `arm,cortex-a15-gic` for the compatible QEMU virt advertises for its vGICv2),
 the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock, the PL011
 console as `stdout-path`, and one `virtio_mmio@…` node per backed device.

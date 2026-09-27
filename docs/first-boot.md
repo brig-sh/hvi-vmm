@@ -208,6 +208,22 @@ wrote 1283 byte DTB to target/fdt.dtb
 This is a check of the pre-boot pipeline. It is not a boot, and a successful
 `dump-fdt` says nothing about whether the guest runs.
 
+## Guests inside the guest
+
+On a Mac where `hvi caps` says `supported`, `--nested-virt` gives the guest
+EL2, and a kernel with `CONFIG_KVM` (the one from step 3 has it) gets
+`/dev/kvm`:
+
+```sh
+./target/release/hvi boot --nested-virt \
+  --kernel target/Image --initramfs target/initramfs.cpio --mem-mib 2048 --cpus 2
+```
+
+The console shows `CPU: All CPU(s) started at EL2` and `kvm [1]: Hyp nVHE
+mode initialized successfully`, and a KVM-based VMM inside the guest can start
+guests of its own. Firecracker's static aarch64 release was tried. Without the
+flag the kernel prints `kvm [1]: HYP mode not available`.
+
 ## If it does not work
 
 | Symptom | Cause |
@@ -217,6 +233,7 @@ This is a check of the pre-boot pipeline. It is not a boot, and a successful
 | The console stops after `Run /init as init process` | The initramfs has no working `/init`, or it is built for the wrong architecture. |
 | The kernel panics at `Unable to mount root fs` | No initramfs and no `--disk`. Expected without a root filesystem. |
 | `--net-stub` gives the guest an address but no name resolution | Expected while confined. See [networking.md](networking.md#dns). |
+| `nested virtualization requested but not supported by this host` | `--nested-virt` on a host without EL2, or on Linux. `hvi caps` says which. |
 
 ## Next
 

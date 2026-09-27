@@ -15,6 +15,8 @@ three things a reader should not have to guess between:
 | virtio-fs is macOS only. | The Linux backends carry no directory sharing at all. Use a disk image. | Design |
 | A non-backend host builds a stub. | The shared code and unit tests compile everywhere. That build cannot run a guest. | Design |
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
+| KVM in a `--nested-virt` guest runs nVHE. | Hypervisor.framework does not advertise VHE, so the guest kernel runs at EL1 and keeps only KVM's hypervisor code at EL2. | Platform |
+| A `--nested-virt` guest does not see SME. | With EL2 enabled `SMCR_EL2` is undefined and Linux's EL2 setup writes it, so hvi hides SME from that guest. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
 | The arm64/KVM backend has no unit tests. | `src/machine_linux.rs` carries no `#[cfg(test)]` module. The full suite runs on both self-hosted arm64/KVM runners, so a test added there would be executed; that backend is cross-linted and booted, not unit-tested. | Defect |
 
@@ -66,6 +68,7 @@ three things a reader should not have to guess between:
 | An SNI value is a claim on the wire. | It is not proof of a connection, not application identity, and not authorization. Split ClientHellos, resumption, encrypted ClientHello and QUIC yield nothing. | Design |
 | `--dump-memory` is denied by the default sandbox. | The file is created after confinement. Use a destination inside a `--share-rw` directory, or `--no-sandbox`. See [#91](https://github.com/brig-sh/hvi-vmm/issues/91). | Defect |
 | `--dump-after` needs the guest to still be running. | A guest that stops first produces no dump and no error. | Design |
+| Nested guests are not observed. | The ledger and plugins describe the outer guest only. | Design |
 | A dump is not a checkpoint. | Raw RAM only. No register, device or virtqueue state. Nothing can restore a VM from it. | Design |
 
 ## Confinement
