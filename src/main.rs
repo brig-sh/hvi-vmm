@@ -256,6 +256,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
+    let mut virtiofsd: Option<std::path::PathBuf> = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -322,18 +323,34 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     };
                     it.next();
                 }
-                let path = std::fs::canonicalize(path)?;
-                if !path.is_dir() {
-                    return Err(
-                        format!("virtio-fs export is not a directory: {}", path.display()).into(),
-                    );
-                }
                 fs_shares.push(config::FsShare {
-                    path,
+                    path: std::path::PathBuf::from(path),
                     tag: tag.clone(),
                     mode,
                     cache,
+                    socket: None,
                 });
+            }
+            // A daemon someone else is running, named as tag=socket. urunc
+            // starts one per export outside the VMM, so the VMM has nothing
+            // to start and nothing to reap.
+            "--share-sock" => {
+                let spec = it.next().ok_or("--share-sock needs <tag>=<socket>")?;
+                let (tag, socket) = spec
+                    .split_once('=')
+                    .ok_or("--share-sock takes <tag>=<socket>")?;
+                let share = fs_shares
+                    .iter_mut()
+                    .find(|share: &&mut config::FsShare| share.tag == tag)
+                    .ok_or_else(|| {
+                        format!("--share-sock {tag:?} names no export; pass --share-ro/--share-rw first")
+                    })?;
+                share.socket = Some(std::path::PathBuf::from(socket));
+            }
+            "--virtiofsd" => {
+                virtiofsd = Some(std::path::PathBuf::from(
+                    it.next().ok_or("--virtiofsd needs a path")?,
+                ));
             }
             "--net-stub" => net = true,
             // The old name. It read as "networking", which is what the flag
@@ -367,6 +384,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown boot arg {other:?}").into()),
         }
     }
+    resolve_exports(&mut fs_shares)?;
 
     if dump_after.is_some() && dump_memory.is_none() {
         return Err("--dump-after needs --dump-memory <path>".into());
@@ -404,6 +422,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cmdline,
         disk,
         fs_shares,
+        virtiofsd,
         net,
         net_gateway,
         net_tap,
@@ -427,9 +446,91 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Resolves the directory of every export hvi serves itself, and checks it is
+/// one.
+///
+/// An export attached with `--share-sock` keeps the path it was given. The
+/// daemon behind the socket serves the directory it was started with, so hvi
+/// never opens that path, and it need not exist. This runs once every flag is
+/// read, because `--share-sock` follows the export it names.
+///
+/// # Errors
+///
+/// Returns the path and the reason when it does not resolve or is not a
+/// directory.
+fn resolve_exports(shares: &mut [config::FsShare]) -> Result<(), String> {
+    for share in shares.iter_mut().filter(|share| share.socket.is_none()) {
+        let path = std::fs::canonicalize(&share.path)
+            .map_err(|e| format!("virtio-fs export {}: {e}", share.path.display()))?;
+        if !path.is_dir() {
+            return Err(format!(
+                "virtio-fs export is not a directory: {}",
+                path.display()
+            ));
+        }
+        share.path = path;
+    }
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("hvi: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_exports;
+    use hvi::config::{CachePolicy, FsShare, ShareMode};
+    use std::path::PathBuf;
+
+    fn export(path: PathBuf, socket: Option<&str>) -> FsShare {
+        FsShare {
+            path,
+            tag: "t".into(),
+            mode: ShareMode::ReadWrite,
+            cache: CachePolicy::Auto,
+            socket: socket.map(PathBuf::from),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hvi-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn export_on_a_foreign_daemon_needs_no_directory() {
+        let missing = scratch("foreign").join("missing");
+        let mut shares = [export(missing.clone(), Some("/tmp/vhostqemu"))];
+        resolve_exports(&mut shares).expect("the directory is the daemon's");
+        assert_eq!(shares[0].path, missing);
+    }
+
+    #[test]
+    fn missing_directory_is_refused() {
+        let missing = scratch("missing").join("missing");
+        let err = resolve_exports(&mut [export(missing.clone(), None)]).unwrap_err();
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn file_is_refused() {
+        let file = scratch("file").join("file");
+        std::fs::write(&file, b"").unwrap();
+        let err = resolve_exports(&mut [export(file, None)]).unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    #[test]
+    fn directory_is_resolved() {
+        let dir = scratch("resolved");
+        let mut shares = [export(dir.join("."), None)];
+        resolve_exports(&mut shares).expect("a directory");
+        assert_eq!(shares[0].path, std::fs::canonicalize(&dir).unwrap());
     }
 }
