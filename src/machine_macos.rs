@@ -84,6 +84,80 @@ mod psci {
     pub const NOT_SUPPORTED: u64 = (-1i64) as u64;
 }
 
+/// The stop a PSCI call asks for, when it asks for the VM to end.
+fn psci_stop(fid: u64) -> Option<Stop> {
+    match fid {
+        psci::SYSTEM_OFF => Some(Stop::SystemOff),
+        psci::SYSTEM_RESET => Some(Stop::SystemReset),
+        _ => None,
+    }
+}
+
+/// How far to step PC once a PSCI call that trapped as `ec` has been
+/// serviced, or `None` when the call ended the VM and nothing resumes.
+///
+/// The two conduits return to different places. A trapped HVC reports the
+/// instruction after it, but a trapped SMC reports the SMC itself (its
+/// preferred return address is the SMC, for a monitor that emulates it).
+/// Without the step the guest re-issues the SMC with the result in X0 as the
+/// function ID and never gets past its first PSCI call. The step does not
+/// depend on the function ID: an unknown one gets NOT_SUPPORTED and the
+/// guest still has to move on.
+fn psci_resume_step(ec: Ec, fid: u64) -> Option<u64> {
+    if psci_stop(fid).is_some() {
+        return None;
+    }
+    Some(if ec == Ec::Smc { 4 } else { 0 })
+}
+
+#[cfg(test)]
+mod psci_tests {
+    use super::*;
+
+    const RESUMING: [u64; 6] = [
+        psci::VERSION,
+        psci::CPU_ON_64,
+        psci::CPU_OFF,
+        psci::FEATURES,
+        0x8400_0006, // MIGRATE_INFO_TYPE, which Linux asks for and hvi lacks
+        0xdead_beef, // not a PSCI function at all
+    ];
+
+    /// An SMC resumes past itself, whatever it asked for. This is the step
+    /// whose absence left a guest re-issuing its first PSCI call forever.
+    #[test]
+    fn smc_steps_past_the_instruction() {
+        for fid in RESUMING {
+            assert_eq!(psci_resume_step(Ec::Smc, fid), Some(4), "fid {fid:#x}");
+        }
+    }
+
+    /// A trapped HVC already reports the next instruction; stepping it too
+    /// would skip one instruction of the guest's.
+    #[test]
+    fn hvc_resumes_where_it_was_reported() {
+        for fid in RESUMING {
+            assert_eq!(psci_resume_step(Ec::Hvc, fid), Some(0), "fid {fid:#x}");
+        }
+    }
+
+    /// SYSTEM_OFF and SYSTEM_RESET end the VM over either conduit, so there
+    /// is no PC to step.
+    #[test]
+    fn stopping_calls_resume_nothing() {
+        for ec in [Ec::Hvc, Ec::Smc] {
+            assert_eq!(psci_resume_step(ec, psci::SYSTEM_OFF), None);
+            assert_eq!(psci_resume_step(ec, psci::SYSTEM_RESET), None);
+        }
+        assert!(matches!(psci_stop(psci::SYSTEM_OFF), Some(Stop::SystemOff)));
+        assert!(matches!(
+            psci_stop(psci::SYSTEM_RESET),
+            Some(Stop::SystemReset)
+        ));
+        assert!(psci_stop(0xdead_beef).is_none());
+    }
+}
+
 /// A secondary vCPU's start mailbox, filled by a PSCI `CPU_ON`.
 struct Secondary {
     mbox: Mutex<Option<(u64, u64)>>, // (entry point, context id)
@@ -728,12 +802,18 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 ExitReason::EXCEPTION => {
                     let syn = exit.exception.syndrome;
                     match Ec::from_syndrome(syn) {
-                        Ec::Hvc | Ec::Smc => {
-                            if service_psci(&vcpu, &sh) {
-                                break; // SYSTEM_OFF/RESET
+                        ec @ (Ec::Hvc | Ec::Smc) => {
+                            // Read before servicing: the reply overwrites X0.
+                            let fid = vcpu.get_reg(Reg::X0).unwrap_or(0);
+                            service_psci(&vcpu, &sh);
+                            match psci_resume_step(ec, fid) {
+                                None => break, // SYSTEM_OFF/RESET
+                                Some(0) => {}
+                                Some(step) => {
+                                    let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                                    let _ = vcpu.set_reg(Reg::PC, pc + step);
+                                }
                             }
-                            // Not restartable: the saved PC is already past
-                            // HVC/SMC.
                         }
                         Ec::DataAbort => {
                             let ipa = exit.exception.physical_address;
@@ -952,24 +1032,19 @@ impl CpuHandle for Cpu<'_> {
     }
 }
 
-/// Handles a PSCI call. Returns `true` if the VM should stop
-/// (SYSTEM_OFF/RESET).
-fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
+/// Handles a PSCI call: writes the reply, or records the stop and stops every
+/// vCPU for SYSTEM_OFF/RESET. [`psci_resume_step`] decides where the caller
+/// resumes.
+fn service_psci(vcpu: &Vcpu, sh: &Shared) {
     let fid = vcpu.get_reg(Reg::X0).unwrap_or(0);
+    if let Some(stop) = psci_stop(fid) {
+        *sh.stop.lock().unwrap() = Some(stop);
+        stop_all(sh);
+        return;
+    }
     match fid {
         psci::VERSION => {
             let _ = vcpu.set_reg(Reg::X0, 0x0001_0000); // v1.0
-            false
-        }
-        psci::SYSTEM_OFF => {
-            *sh.stop.lock().unwrap() = Some(Stop::SystemOff);
-            stop_all(sh);
-            true
-        }
-        psci::SYSTEM_RESET => {
-            *sh.stop.lock().unwrap() = Some(Stop::SystemReset);
-            stop_all(sh);
-            true
         }
         psci::FEATURES => {
             let q = vcpu.get_reg(Reg::X1).unwrap_or(0);
@@ -989,7 +1064,6 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
                     psci::NOT_SUPPORTED
                 },
             );
-            false
         }
         psci::CPU_ON_64 => {
             let target = vcpu.get_reg(Reg::X1).unwrap_or(0);
@@ -1005,15 +1079,12 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
                 psci::NOT_SUPPORTED
             };
             let _ = vcpu.set_reg(Reg::X0, ret);
-            false
         }
         psci::CPU_OFF => {
             let _ = vcpu.set_reg(Reg::X0, psci::SUCCESS);
-            false
         }
         _ => {
             let _ = vcpu.set_reg(Reg::X0, psci::NOT_SUPPORTED);
-            false
         }
     }
 }
