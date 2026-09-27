@@ -45,14 +45,9 @@ pub const QUEUE_DRIVER_LOW: u64 = VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
 pub const QUEUE_DRIVER_HIGH: u64 = VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
 pub const QUEUE_DEVICE_LOW: u64 = VIRTIO_MMIO_QUEUE_USED_LOW as u64;
 pub const QUEUE_DEVICE_HIGH: u64 = VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
-// Shared memory regions (virtio 1.2). Only virtio-fs answers them, so they
-// follow it to macOS.
-#[cfg(target_os = "macos")]
+// Shared memory regions (virtio 1.2). Only the virtio-fs devices answer them.
 pub const SHM_LEN_LOW: u64 = VIRTIO_MMIO_SHM_LEN_LOW as u64;
-#[cfg(target_os = "macos")]
 pub const SHM_LEN_HIGH: u64 = VIRTIO_MMIO_SHM_LEN_HIGH as u64;
-#[cfg(target_os = "macos")]
 pub const SHM_BASE_LOW: u64 = VIRTIO_MMIO_SHM_BASE_LOW as u64;
-#[cfg(target_os = "macos")]
 pub const SHM_BASE_HIGH: u64 = VIRTIO_MMIO_SHM_BASE_HIGH as u64;
 pub const CONFIG: u64 = VIRTIO_MMIO_CONFIG as u64;

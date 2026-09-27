@@ -310,8 +310,12 @@ Interrupt injection is the one device-facing thing that differs by backend:
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
 - **virtio-vsock** (`devices/virtio/vsock.rs`, id 19) is the exec channel. Host
   CID 2, guest CID 3, port 1024.
-- **virtio-fs** (`devices/virtio/fs/`, id 26, macOS only) serves the guest's
-  FUSE messages itself over a hiprio and a request queue. See
+- **virtio-fs** (`devices/virtio/fs/`, id 26) has one device per export, each
+  with a hiprio and a request queue. On macOS (`fs/server.rs`) the VMM answers
+  the guest's FUSE messages itself. On Linux (`fs/vhost_user.rs`) the device
+  is a transport in front of `virtiofsd`, which is handed the rings and the
+  memfd behind guest RAM over vhost-user and serves the requests in its own
+  process. See
   [storage-and-sharing.md](storage-and-sharing.md).
 
 A write of 0 to a device's STATUS register resets it: every queue returns to
@@ -403,7 +407,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`, `fs/virtiofsd.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |

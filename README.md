@@ -133,7 +133,9 @@ hvi is young. Read these before you build on it.
   the socket that needs, so the guest gets a reply with no addresses in it.
   Only `--no-sandbox` resolves.
 - **One disk and one NIC.** No hotplug, and no PCI at all.
-- **virtio-fs is macOS only**, one request queue per share, no DAX window.
+- **virtio-fs** is served in-process on macOS and by `virtiofsd` on Linux:
+  one request queue per share, no DAX window, and no file-level events on the
+  Linux path.
 - **8 vCPUs on a GICv2 arm64 host.** The guest interrupt controller follows
   the host, and GICv2 caps there.
 - **The event ledger is per packet and egress only.** It is not aggregated per
