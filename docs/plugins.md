@@ -105,6 +105,13 @@ arm64 or CR3 on x86-64. The traits hand over access and deliberately no more.
 What any of it means is your problem, which is what keeps a tool's idea of the
 guest out of the VMM.
 
+Under `--nested-virt` a vCPU can stop at EL2, and the view then reads the EL2
+registers. Under nVHE, the only mode Hypervisor.framework offers, `root` is
+TTBR0_EL2 over KVM's own hyp VA space, `tcr` is TCR_EL2 with only T0SZ, TG0
+and PS meaningful, and `current_task` means nothing. A vCPU that stopped
+inside the guest's own nested guest is at EL1 with that guest's registers,
+whose table addresses are not in the RAM `ram()` gives you.
+
 ## Putting records in the ledger
 
 A tool's records go into the same `--events` stream as the VMM's own:

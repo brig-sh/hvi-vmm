@@ -1154,19 +1154,11 @@ impl CpuHandle for Cpu<'_> {
     }
 
     fn regs(&self) -> RegsView {
-        let ttbr1 = self.vcpu.get_sys_reg(SysReg::TTBR1_EL1).unwrap_or(0);
-        RegsView {
-            // arm64's kernel-half page-table base is the walk root.
-            root: ttbr1,
-            pc: self.vcpu.get_reg(Reg::PC).unwrap_or(0),
-            cpsr: self.vcpu.get_reg(Reg::CPSR).unwrap_or(0),
-            ttbr0: self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0),
-            ttbr1,
-            sctlr: self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0),
-            sp_el1: self.vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0),
-            tcr: self.vcpu.get_sys_reg(SysReg::TCR_EL1).unwrap_or(0),
-            current_task: self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0),
-        }
+        regs_view(
+            self.vcpu.get_reg(Reg::PC).unwrap_or(0),
+            self.vcpu.get_reg(Reg::CPSR).unwrap_or(0),
+            |reg| self.vcpu.get_sys_reg(reg).unwrap_or(0),
+        )
     }
 
     fn pause(&self) -> bool {
@@ -1189,6 +1181,53 @@ impl CpuHandle for Cpu<'_> {
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {
         &self.sh.emit
+    }
+}
+
+/// `HCR_EL2.E2H`: the EL2 kernel runs with the EL1 register layout (VHE).
+const HCR_EL2_E2H: u64 = 1 << 34;
+
+/// Builds the register view from the exception level the vCPU stopped at.
+///
+/// At EL1 these are the EL1 registers, as they always were. A guest that owns
+/// EL2 can stop at EL2 as well. With `HCR_EL2.E2H` set (VHE) the kernel itself
+/// runs there and its kernel-half table is `TTBR1_EL2`. Without it (nVHE,
+/// which is what Hypervisor.framework offered on the hosts tried) EL2 runs
+/// KVM's hypervisor code, which has a single table in `TTBR0_EL2` over its
+/// own hyp VA space and no `TTBR1_EL2`; `TCR_EL2` then has the single-range
+/// layout (T0SZ, TG0, PS), and `SP_EL0` is not a task pointer. Reading the
+/// EL1 registers in either case would hand a walker the tables of whatever
+/// last ran at EL1.
+fn regs_view(pc: u64, cpsr: u64, read: impl Fn(SysReg) -> u64) -> RegsView {
+    let at_el2 = (cpsr >> 2) & 0b11 == 2;
+    if !at_el2 {
+        let ttbr1 = read(SysReg::TTBR1_EL1);
+        return RegsView {
+            // arm64's kernel-half page-table base is the walk root.
+            root: ttbr1,
+            pc,
+            cpsr,
+            ttbr0: read(SysReg::TTBR0_EL1),
+            ttbr1,
+            sctlr: read(SysReg::SCTLR_EL1),
+            sp_el1: read(SysReg::SP_EL1),
+            tcr: read(SysReg::TCR_EL1),
+            current_task: read(SysReg::SP_EL0),
+        };
+    }
+    let vhe = read(SysReg::HCR_EL2) & HCR_EL2_E2H != 0;
+    let ttbr0 = read(SysReg::TTBR0_EL2);
+    let ttbr1 = if vhe { read(SysReg::TTBR1_EL2) } else { 0 };
+    RegsView {
+        root: if vhe { ttbr1 } else { ttbr0 },
+        pc,
+        cpsr,
+        ttbr0,
+        ttbr1,
+        sctlr: read(SysReg::SCTLR_EL2),
+        sp_el1: read(SysReg::SP_EL2),
+        tcr: read(SysReg::TCR_EL2),
+        current_task: read(SysReg::SP_EL0),
     }
 }
 
@@ -2009,6 +2048,61 @@ fn gpr(idx: u8) -> Option<Reg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A register file where each register reads as a distinct value, so a
+    /// test can tell which one a field came from.
+    fn fake(reg: SysReg) -> u64 {
+        match reg {
+            SysReg::TTBR0_EL1 => 0x10,
+            SysReg::TTBR1_EL1 => 0x11,
+            SysReg::SCTLR_EL1 => 0x12,
+            SysReg::SP_EL1 => 0x13,
+            SysReg::TCR_EL1 => 0x14,
+            SysReg::SP_EL0 => 0x40,
+            SysReg::TTBR0_EL2 => 0x20,
+            SysReg::TTBR1_EL2 => 0x21,
+            SysReg::SCTLR_EL2 => 0x22,
+            SysReg::SP_EL2 => 0x23,
+            SysReg::TCR_EL2 => 0x24,
+            _ => 0,
+        }
+    }
+
+    /// The default guest is untouched by the EL2 support: a vCPU at EL1
+    /// reports the EL1 registers, whatever HCR_EL2 says.
+    #[test]
+    fn regs_view_at_el1_reads_el1() {
+        let v = regs_view(0x1000, CPSR_EL1H, |r| match r {
+            SysReg::HCR_EL2 => HCR_EL2_E2H,
+            other => fake(other),
+        });
+        assert_eq!(
+            (v.root, v.ttbr0, v.ttbr1, v.sctlr, v.sp_el1, v.tcr),
+            (0x11, 0x10, 0x11, 0x12, 0x13, 0x14)
+        );
+        assert_eq!(v.current_task, 0x40);
+    }
+
+    /// nVHE: EL2 has one table, in TTBR0_EL2, and no TTBR1_EL2 to read.
+    #[test]
+    fn regs_view_at_el2_nvhe_roots_at_ttbr0_el2() {
+        let v = regs_view(0x2000, CPSR_EL2H, fake);
+        assert_eq!(v.root, 0x20);
+        assert_eq!((v.ttbr0, v.ttbr1), (0x20, 0));
+        assert_eq!((v.sctlr, v.sp_el1, v.tcr), (0x22, 0x23, 0x24));
+    }
+
+    /// VHE: the kernel runs at EL2 with a kernel half in TTBR1_EL2.
+    #[test]
+    fn regs_view_at_el2_vhe_roots_at_ttbr1_el2() {
+        let v = regs_view(0x3000, CPSR_EL2H, |r| match r {
+            SysReg::HCR_EL2 => HCR_EL2_E2H,
+            other => fake(other),
+        });
+        assert_eq!(v.root, 0x21);
+        assert_eq!((v.ttbr0, v.ttbr1), (0x20, 0x21));
+        assert_eq!(v.current_task, 0x40);
+    }
 
     /// Both entry states name the exception level they claim, with DAIF
     /// masked and SP_ELx selected. A guest that owns EL2 but enters at EL1
