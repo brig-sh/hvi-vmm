@@ -206,6 +206,11 @@ flowchart TB
 the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock, the PL011
 console as `stdout-path`, and one `virtio_mmio@…` node per backed device.
 
+`/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
+every boot. Under HVF it is the guest's only entropy source at boot, since the
+guest has no RNDR and no SMCCC TRNG. Under KVM, KVM serves the TRNG call too.
+Linux credits the seed and overwrites the property in its in-RAM blob.
+
 The `/apb-pclk` node is load-bearing rather than decorative: the PL011 node's
 `clocks` property points at it twice, and the `amba-pl011` driver needs that
 to bind.
