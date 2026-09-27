@@ -70,17 +70,41 @@ pub const VIRTIO_VSOCK_SPI: u32 = 4;
 pub const VIRTIO_FS_BASE: u64 = 0x0d00_0600;
 pub const VIRTIO_FS_SPI: u32 = 5;
 
-/// Placement of the `index`th virtio-fs device. Each export gets an
-/// independent transport and interrupt because one virtio-fs device carries
-/// exactly one mount tag.
+/// Number of interrupts the guest's GIC is created with.
+///
+/// A multiple of 32, and the ceiling every SPI in this layout is checked
+/// against: INTID is `32 + spi`, so an export past it would be advertised in
+/// the devicetree and never delivered.
+pub const GIC_NUM_IRQS: u32 = 256;
+
+/// How many virtio-fs exports this machine has interrupts for.
+///
+/// The device window would hold far more, but the interrupt is the scarcer
+/// resource: the vGIC is created with a fixed number of IRQs, and an export
+/// whose SPI runs past it gets a devicetree entry for an interrupt the
+/// controller does not have. The guest then mounts a device that never
+/// raises one, which looks like a hang rather than a misconfiguration.
+pub const MAX_FS_DEVICES: usize = 16;
+
+/// Placement of the `index`th virtio-fs device, or `None` past
+/// [`MAX_FS_DEVICES`]. Each export gets an independent transport and
+/// interrupt because one virtio-fs device carries exactly one mount tag.
 #[must_use]
 pub fn virtio_fs_base(index: usize) -> Option<u64> {
+    if index >= MAX_FS_DEVICES {
+        return None;
+    }
     let offset = (index as u64).checked_mul(VIRTIO_SIZE)?;
     VIRTIO_FS_BASE.checked_add(offset)
 }
 
+/// Interrupt of the `index`th virtio-fs device as a GIC SPI number, or `None`
+/// past [`MAX_FS_DEVICES`].
 #[must_use]
 pub fn virtio_fs_spi(index: usize) -> Option<u32> {
+    if index >= MAX_FS_DEVICES {
+        return None;
+    }
     VIRTIO_FS_SPI.checked_add(u32::try_from(index).ok()?)
 }
 
@@ -388,7 +412,16 @@ mod tests {
             gic_end < VIRTIO_FS_BASE,
             "the GIC ends below the fs windows"
         );
-        for index in 0..16 {
+        assert_eq!(virtio_fs_base(MAX_FS_DEVICES), None);
+        assert_eq!(virtio_fs_spi(MAX_FS_DEVICES), None);
+        // Every interrupt this machine hands out has to exist in the GIC the
+        // backend creates, which is what GIC_NUM_IRQS is.
+        let last = virtio_fs_spi(MAX_FS_DEVICES - 1).expect("an interrupt");
+        assert!(
+            32 + last < GIC_NUM_IRQS,
+            "SPI {last} is past the GIC's {GIC_NUM_IRQS} interrupts"
+        );
+        for index in 0..MAX_FS_DEVICES {
             let base = virtio_fs_base(index).expect("a placement");
             let end = base + VIRTIO_SIZE;
             assert!(base >= gic_end, "fs {index} at {base:#x} runs into the GIC");

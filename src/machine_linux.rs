@@ -57,13 +57,15 @@ use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
 use crate::layout::{
-    GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
+    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::vhost_user_fs::{export_at, serve_mmio, Export};
 use crate::virtio::VirtioBlk;
 use crate::virtio_net::VirtioNet;
 use crate::virtio_vsock::VirtioVsock;
@@ -118,6 +120,8 @@ struct Shared {
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
+    /// One entry per virtio-fs export, in the order the exports were given.
+    fs: Arc<Vec<Export>>,
     emit: Arc<Mutex<Emitter>>,
     running: Arc<AtomicBool>,
     /// The vCPU threads (index = cpu id), `None` until a thread has registered
@@ -143,11 +147,8 @@ struct Shared {
 /// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
 /// plugin kept, in a field or on a thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
-    if !cfg.fs_shares.is_empty() {
-        return Err(
-            "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
-        );
-    }
+    crate::config::check_export_overlap(&cfg.fs_shares)?;
+    crate::config::check_unique_tags(&cfg.fs_shares)?;
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
@@ -277,6 +278,31 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .agent_sock
         .as_ref()
         .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
+    // virtio-fs: one transport per export, each backed by its own daemon,
+    // which runs until the VMM exits. See `attach` for the binding order.
+    let gic_end = gic.gicr_base + gic.gicr_size * u64::from(num_cpus);
+    let (_fs_daemons, fs) = crate::vhost_user_fs::attach(
+        &cfg.fs_shares,
+        cfg.virtiofsd.as_deref(),
+        shared_ram.fd(),
+        "hvi/kvm",
+        |index| {
+            let too_many = || std::io::Error::other("too many virtio-fs devices");
+            let base = virtio_fs_base(index).ok_or_else(too_many)?;
+            let spi = virtio_fs_spi(index).ok_or_else(too_many)?;
+            let end = base
+                .checked_add(VIRTIO_SIZE)
+                .ok_or_else(|| std::io::Error::other("virtio-fs MMIO address overflow"))?;
+            if base < gic_end || end > DEVICE_WINDOW_END {
+                return Err(std::io::Error::other(format!(
+                    "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
+                     between the GIC (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
+                )));
+            }
+            Ok((base, spi))
+        },
+    )?;
+
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
@@ -284,7 +310,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         blk: has_blk,
         net: has_net,
         vsock: has_vsock,
-        fs_count: 0,
+        fs_count: fs.len(),
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -328,8 +354,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vcpus.push(vcpu);
     }
 
-    // Number of SPIs (multiple of 32), then finalize the GIC.
-    let nr_irqs: u32 = 256;
+    // Number of SPIs (multiple of 32), then finalize the GIC. The layout
+    // checks its own interrupt placements against the same constant.
+    let nr_irqs: u32 = crate::layout::GIC_NUM_IRQS;
     set_gic_attr_u32(&gicfd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &nr_irqs)?;
     let init_attr = kvm_device_attr {
         flags: 0,
@@ -345,6 +372,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     set_u64(&vcpus[0], REG_PSTATE, PSTATE_EL1H_DAIF);
 
     let vm = Arc::new(vm);
+    let fs = Arc::new(fs);
     let shared = Shared {
         vm: Arc::clone(&vm),
         mem: ram,
@@ -352,6 +380,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         virtio,
         net,
         vsock,
+        fs: Arc::clone(&fs),
         emit: Arc::new(Mutex::new(emitter)),
         running: Arc::new(AtomicBool::new(true)),
         threads: Arc::new(Mutex::new((0..num_cpus).map(|_| None).collect())),
@@ -395,6 +424,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // is joined after the vCPUs; `teardown` describes the stop.
     let input = spawn_input_thread(shared.clone(), stop_source.token());
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
+    // The vhost-user interrupt threads are not joined; `stop_all` ends the
+    // connections that free them.
+    let irq_vm = Arc::clone(&shared.vm);
+    crate::vhost_user_fs::serve_all_interrupts(&shared.fs, &shared.running, move |irq, level| {
+        set_fs_line(&irq_vm, irq, level);
+    });
     if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
         helpers.push((
             "agent bridge",
@@ -728,6 +763,17 @@ fn read_device(sh: &Shared, addr: u64) -> u64 {
         dev_read(sh, sh.net.as_ref(), VIRTIO_NET_SPI, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
+    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(
+            &export.dev,
+            &sh.mem,
+            addr - export.base,
+            false,
+            0,
+            |level| {
+                set_fs_line(&sh.vm, export.irq, level);
+            },
+        )
     } else {
         0
     }
@@ -757,7 +803,24 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
         );
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
+    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(
+            &export.dev,
+            &sh.mem,
+            addr - export.base,
+            true,
+            val,
+            |level| {
+                set_fs_line(&sh.vm, export.irq, level);
+            },
+        );
     }
+}
+
+/// Sets the line of the virtio-fs export whose interrupt is `irq`, which on
+/// arm64 is a GIC SPI.
+fn set_fs_line(vm: &VmFd, irq: u32, level: bool) {
+    let _ = vm.set_irq_line(spi_gsi(irq), level);
 }
 
 /// Generic virtio-blk/net read: `mmio`, drain events to the ledger, set IRQ.
@@ -966,8 +1029,9 @@ impl CpuHandle for Cpu<'_> {
 /// Ends the VM.
 ///
 /// Clears `running`, releases the quiesce so no vCPU stays parked at a
-/// checkpoint, and kicks every vCPU out of `KVM_RUN`. Only the first call
-/// kicks; a later one just releases the quiesce again.
+/// checkpoint, ends every export's daemon connection, and kicks every vCPU
+/// out of `KVM_RUN`. Only the first call kicks. A later one releases the
+/// quiesce and ends the connections again.
 fn stop_all(sh: &Shared) {
     let was_running = sh.running.swap(false, Ordering::SeqCst);
     // A vCPU parked at a quiesce checkpoint waits on a condition variable the
@@ -975,6 +1039,7 @@ fn stop_all(sh: &Shared) {
     // and it sees `running` at the top of its loop. Released on every call,
     // since a request can follow the first release.
     sh.quiesce.release();
+    crate::vhost_user_fs::shut_down(&sh.fs);
     // One round of kicks is enough. A thread that registered before the round
     // has its `immediate_exit` byte set, and one that registers after it reads
     // `running` as false at the top of its loop.
@@ -1339,6 +1404,7 @@ mod stop_tests {
             cmdline: String::new(),
             disk: None,
             fs_shares: Vec::new(),
+            virtiofsd: None,
             net: false,
             net_gateway: None,
             net_tap: None,
