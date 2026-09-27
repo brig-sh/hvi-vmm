@@ -103,6 +103,15 @@ impl SharedRam {
             let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = std::ffi::CString::new(format!("/hvi-ram-{}-{seq}", std::process::id()))
                 .map_err(|_| io::Error::other("shm name"))?;
+            // The name is linked from here to the shm_unlink below. A test that
+            // probes the namespace takes this lock exclusively, so it never
+            // sees another test's allocation inside that window. Allocations
+            // share it, so they still overlap each other, which the collision
+            // test needs.
+            #[cfg(test)]
+            let _window = tests::NAME_WINDOW
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: valid NUL-terminated name.
             let fd = unsafe {
                 libc::shm_open(
@@ -171,6 +180,11 @@ impl SharedRam {
 mod tests {
     use super::*;
     use crate::guestmem::GuestRam;
+
+    // Read-held by every allocation between creating its name and unlinking
+    // it, and write-held by the probe below while it looks.
+    #[cfg(target_os = "macos")]
+    pub(super) static NAME_WINDOW: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     const BASE: u64 = 0x4000_0000;
     // The smallest object one region can map.
@@ -267,7 +281,13 @@ mod tests {
 
             // The probe itself. The sequence number is process-wide and
             // every allocation increments it once, so this range covers every
-            // name the test binary can have produced.
+            // name the test binary can have produced. With the window lock
+            // held, no allocation is between shm_open and shm_unlink, so a
+            // name found here is one an allocation left linked after it
+            // returned.
+            let _window = NAME_WINDOW
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for seq in 0..1024 {
                 let name = std::ffi::CString::new(format!("/hvi-ram-{pid}-{seq}")).unwrap();
                 let fd = open_by_name(&name);
