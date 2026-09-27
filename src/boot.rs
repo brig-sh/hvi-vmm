@@ -121,10 +121,13 @@ impl LoadedKernel {
     /// so the blob is built twice, once with a provisional slot and again at
     /// the settled layout.
     ///
+    /// Every call draws a fresh `/chosen/rng-seed` from the host's entropy
+    /// source. Nothing keeps it: the only copy is in the returned blob.
+    ///
     /// # Errors
     ///
-    /// Errors when the images do not fit in RAM or the devicetree cannot be
-    /// built.
+    /// Errors when the images do not fit in RAM, the host gives no entropy,
+    /// or the devicetree cannot be built.
     pub fn plan(
         self,
         ram_size: u64,
@@ -134,6 +137,7 @@ impl LoadedKernel {
         cmdline: &str,
         devices: VirtioDevices,
     ) -> Result<Plan, String> {
+        let seed = rng_seed()?;
         let provisional = GuestLayout::new(
             ram_size,
             self.addr,
@@ -141,7 +145,7 @@ impl LoadedKernel {
             PROVISIONAL_DTB_SIZE,
             initrd_size,
         );
-        let dtb = fdt::build(&provisional, gic, num_cpus, cmdline, devices)
+        let dtb = fdt::build(&provisional, gic, num_cpus, cmdline, devices, &seed)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         let layout = GuestLayout::new(
             ram_size,
@@ -150,11 +154,46 @@ impl LoadedKernel {
             dtb.len() as u64,
             initrd_size,
         );
-        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices)
+        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices, &seed)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         layout.validate()?;
         Ok(Plan { layout, dtb })
     }
+}
+
+/// Fresh bytes for the guest's `/chosen/rng-seed`, from the host's CSPRNG.
+///
+/// Linux reads them with `getrandom`, which the `libc` crate declares for
+/// both glibc and musl. macOS reads them with `getentropy`.
+///
+/// # Errors
+///
+/// Errors when the host call fails, which a host with a working kernel RNG
+/// does not do. A boot without a seed is refused over one with a guessable
+/// seed: the guest kernel would credit whatever it is given.
+fn rng_seed() -> Result<[u8; fdt::RNG_SEED_LEN], String> {
+    const N: usize = fdt::RNG_SEED_LEN;
+    let mut seed = [0u8; N];
+    // `getrandom` fails with EINTR only while it waits for the host's CRNG,
+    // and each pass blocks in the kernel, so the retry does not spin.
+    #[cfg(target_os = "linux")]
+    let ok = loop {
+        // SAFETY: `getrandom` writes at most `N` bytes into `seed`.
+        let n = unsafe { libc::getrandom(seed.as_mut_ptr().cast(), N, 0) };
+        if n != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break usize::try_from(n) == Ok(N);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: `getentropy` writes at most `N` bytes into `seed`.
+    let ok = unsafe { libc::getentropy(seed.as_mut_ptr().cast(), N) } == 0;
+    if !ok {
+        return Err(format!(
+            "reading host entropy for the guest's rng-seed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(seed)
 }
 
 /// The settled layout and the devicetree that describes it.
@@ -384,5 +423,33 @@ mod tests {
             0xd00d_feed_u32.swap_bytes(),
             "the devicetree header magic sits at dtb_addr"
         );
+    }
+
+    /// A boot's devicetree carries 64 bytes of seed that are not all zero,
+    /// and the next boot's are different: nothing is cached across plans.
+    #[test]
+    fn every_plan_draws_a_fresh_rng_seed() {
+        let kernel = LoadedKernel {
+            addr: RAM_BASE,
+            size: 0x40_0000,
+        };
+        let seed = || {
+            let Plan { dtb, .. } = kernel
+                .plan(
+                    512 << 20,
+                    0,
+                    &GicLayout::QEMU_VIRT,
+                    1,
+                    "",
+                    VirtioDevices::default(),
+                )
+                .expect("plan");
+            crate::fdt::tests::prop(&dtb, "chosen", "rng-seed").expect("rng-seed in /chosen")
+        };
+        let (first, second) = (seed(), seed());
+        assert_eq!(first.len(), fdt::RNG_SEED_LEN);
+        assert!(first.iter().any(|&b| b != 0), "an all-zero seed");
+        assert!(second.iter().any(|&b| b != 0), "an all-zero seed");
+        assert_ne!(first, second, "two boots got the same seed");
     }
 }

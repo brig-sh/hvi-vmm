@@ -41,6 +41,10 @@ const IRQ_PPI: u32 = 1;
 /// GIC interrupt flag cell.
 const IRQ_LEVEL_HIGH: u32 = 4;
 
+/// Length of `/chosen/rng-seed`, in bytes. 64 bytes is 512 bits, twice what
+/// the kernel needs before it calls its CRNG initialised.
+pub const RNG_SEED_LEN: usize = 64;
+
 /// The virtio-mmio nodes backed by this boot.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VirtioDevices {
@@ -52,7 +56,8 @@ pub struct VirtioDevices {
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
 /// command line. When `layout.initrd_size` is non-zero, `/chosen` gets the
-/// initramfs range.
+/// initramfs range. `rng_seed` goes into `/chosen/rng-seed` as it is; the
+/// caller supplies fresh bytes for every boot.
 ///
 /// # Errors
 ///
@@ -64,6 +69,7 @@ pub fn build(
     num_cpus: u32,
     bootargs: &str,
     devices: VirtioDevices,
+    rng_seed: &[u8; RNG_SEED_LEN],
 ) -> Result<Vec<u8>, Error> {
     let mut fdt = FdtWriter::new()?;
 
@@ -84,6 +90,12 @@ pub fn build(
         fdt.property_u64("linux,initrd-start", layout.initrd_addr)?;
         fdt.property_u64("linux,initrd-end", layout.initrd_end())?;
     }
+    // Under HVF the guest has no RNDR and no SMCCC TRNG, so without a seed
+    // its CRNG stays uninitialized until something blocks on getrandom, and
+    // then waits seconds for jitter entropy. Linux mixes this in at boot,
+    // credits it (random.trust_bootloader), and overwrites the property in
+    // its copy of the blob, so the bytes do not stay in guest RAM.
+    fdt.property("rng-seed", rng_seed)?;
     fdt.end_node(chosen)?;
 
     // /memory
@@ -220,8 +232,11 @@ pub fn build(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A fixed seed, so a test blob is the same every run.
+    const SEED: [u8; RNG_SEED_LEN] = [0xa5; RNG_SEED_LEN];
 
     fn sample_layout(initrd: u64) -> GuestLayout {
         GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, initrd)
@@ -236,6 +251,7 @@ mod tests {
             1,
             "earlycon=pl011,0x09000000",
             VirtioDevices::default(),
+            &SEED,
         )
         .unwrap();
         // FDT magic 0xd00dfeed, big-endian, at the front of the header.
@@ -254,6 +270,7 @@ mod tests {
             2,
             "console=ttyAMA0",
             VirtioDevices::default(),
+            &SEED,
         )
         .unwrap();
         assert_eq!(&blob[0..4], &[0xd0, 0x0d, 0xfe, 0xed]);
@@ -262,7 +279,15 @@ mod tests {
     #[test]
     fn advertises_virtio_fs_only_when_backed() {
         let l = sample_layout(0);
-        let absent = build(&l, &GicLayout::QEMU_VIRT, 1, "", VirtioDevices::default()).unwrap();
+        let absent = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+        )
+        .unwrap();
         let present = build(
             &l,
             &GicLayout::QEMU_VIRT,
@@ -272,6 +297,7 @@ mod tests {
                 fs_count: 2,
                 ..VirtioDevices::default()
             },
+            &SEED,
         )
         .unwrap();
         let first = format!("virtio_mmio@{:x}", crate::layout::VIRTIO_FS_BASE);
@@ -295,7 +321,15 @@ mod tests {
     #[test]
     fn intc_compatible_follows_gic_version() {
         let l = sample_layout(0);
-        let v3 = build(&l, &GicLayout::QEMU_VIRT, 1, "", VirtioDevices::default()).unwrap();
+        let v3 = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+        )
+        .unwrap();
         assert!(contains(&v3, "arm,gic-v3"));
         assert!(!contains(&v3, "arm,cortex-a15-gic"));
 
@@ -305,6 +339,7 @@ mod tests {
             1,
             "",
             VirtioDevices::default(),
+            &SEED,
         )
         .unwrap();
         assert!(contains(&v2, "arm,cortex-a15-gic"));
@@ -317,7 +352,7 @@ mod tests {
     fn v2_reg_describes_dist_and_cpu_interface() {
         let l = sample_layout(0);
         let g = GicLayout::QEMU_VIRT_V2;
-        let blob = build(&l, &g, 1, "", VirtioDevices::default()).unwrap();
+        let blob = build(&l, &g, 1, "", VirtioDevices::default(), &SEED).unwrap();
         let mut want = Vec::new();
         for v in [g.gicd_base, g.gicd_size, g.gicr_base, g.gicr_size] {
             want.extend_from_slice(&v.to_be_bytes());
@@ -326,5 +361,53 @@ mod tests {
             blob.windows(want.len()).any(|w| w == want.as_slice()),
             "GICv2 reg cell not found in the blob"
         );
+    }
+
+    /// Returns the value of property `name` on the first node whose name
+    /// starts with `node`, walking the structure block of `blob`.
+    pub(crate) fn prop(blob: &[u8], node: &str, name: &str) -> Option<Vec<u8>> {
+        let be = |at: usize| u32::from_be_bytes(blob[at..at + 4].try_into().unwrap()) as usize;
+        let (off_struct, off_strings) = (be(8), be(12));
+        let mut at = off_struct;
+        let mut current = String::new();
+        loop {
+            let token = be(at);
+            at += 4;
+            match token {
+                1 => {
+                    let end = at + blob[at..].iter().position(|&b| b == 0).unwrap();
+                    current = String::from_utf8_lossy(&blob[at..end]).into_owned();
+                    at = (end + 1 + 3) & !3;
+                }
+                3 => {
+                    let (len, nameoff) = (be(at), be(at + 4));
+                    let value = &blob[at + 8..at + 8 + len];
+                    let key_at = off_strings + nameoff;
+                    let key_end = key_at + blob[key_at..].iter().position(|&b| b == 0).unwrap();
+                    if current.starts_with(node) && &blob[key_at..key_end] == name.as_bytes() {
+                        return Some(value.to_vec());
+                    }
+                    at = (at + 8 + len + 3) & !3;
+                }
+                2 | 4 => {}
+                _ => return None, // 9 = FDT_END
+            }
+        }
+    }
+
+    /// `/chosen` carries the seed it was given, all 64 bytes of it.
+    #[test]
+    fn chosen_carries_the_rng_seed() {
+        let seed: [u8; RNG_SEED_LEN] = std::array::from_fn(|i| i as u8 ^ 0x5a);
+        let blob = build(
+            &sample_layout(0),
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            &seed,
+        )
+        .unwrap();
+        assert_eq!(prop(&blob, "chosen", "rng-seed").unwrap(), seed);
     }
 }
