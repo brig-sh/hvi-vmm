@@ -381,6 +381,40 @@ jobs:
             || { echo "::error::the arm64 guest did not boot"; exit 1; }
           grep -q "HVI-INITRAMFS-UP" run.log \
             || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+      - name: nested virtualization
+        run: |
+          # The default boot above must not have given the guest EL2: its
+          # kernel has KVM built in, and says so when it booted at EL1.
+          grep -q "kvm \[1\]: HYP mode not available" run.log \
+            || { echo "::error::the default boot did not stay at EL1"; exit 1; }
+          # Only some hosts can give a guest EL2 (Hypervisor.framework on
+          # macOS 15 and later, on chips that support it). Ask, and skip with
+          # a notice where the answer is no, so a runner on an older chip
+          # does not fail a change it cannot test.
+          ./target/release/hvi caps --json | tee caps.json
+          if ! python3 -c 'import json,sys; sys.exit(0 if json.load(open("caps.json"))["nestedVirt"]["supported"] else 1)'; then
+            echo "::notice::this runner reports no EL2; the nested boot is skipped"
+            exit 0
+          fi
+          # A guest at EL2 whose init lists /dev/kvm and then powers off.
+          # The marker only prints if /dev/kvm exists. The power-off is a
+          # PSCI SYSTEM_OFF over SMC, the conduit a guest at EL2 is given, so
+          # waiting for hvi to report it proves that path end to end.
+          printf '%s\n' 'ls -l /dev/kvm && echo HVI-NESTED-KVM' > target/nested-probe.sh
+          python3 tools/mk-initramfs.py --out target/nested.cpio --run target/nested-probe.sh
+          tools/boot-until.sh nested.log 180 'HVI-NESTED-KVM' 'guest stopped' -- \
+            ./target/release/hvi boot --nested-virt --cpus 2 \
+            --kernel guest/Image --initramfs target/nested.cpio --mem-mib 1024 \
+            --cmdline "earlycon console=ttyAMA0 panic=-1"
+          grep -aE "started at|kvm \[1\]|HVI-NESTED-KVM|unhandled|guest stopped" nested.log || true
+          grep -q "CPU: All CPU(s) started at EL2" nested.log \
+            || { echo "::error::the nested guest did not start at EL2"; exit 1; }
+          grep -Eq "kvm \[1\]: .*mode initialized successfully" nested.log \
+            || { echo "::error::KVM did not initialise in the nested guest"; exit 1; }
+          grep -q "HVI-NESTED-KVM" nested.log \
+            || { echo "::error::the nested guest has no /dev/kvm"; exit 1; }
+          grep -q "guest stopped: SystemOff" nested.log \
+            || { echo "::error::the nested guest did not power off over SMC"; exit 1; }
       # The tail above keeps 25 lines. When the job fails, the full log and
       # the event ledger answer what those lines cannot.
       - name: keep the boot evidence
@@ -391,6 +425,7 @@ jobs:
           path: |
             run.log
             ev.ndjson
+            nested.log
           retention-days: 7
           if-no-files-found: ignore
   boot-unikraft-hvf:
