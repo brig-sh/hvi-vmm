@@ -34,13 +34,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use applevisor::prelude::{
-    ExitReason, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
+    ExitReason, GicConfig, GicEnabled, GicIntId, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
     VirtualMachineConfig, VirtualMachineInstance,
 };
 
 use crate::boot;
 use crate::config::{check_export_overlap, BootConfig, Stop};
-use crate::esr::{DataAbort, Ec};
+use crate::esr::{self, DataAbort, Ec, SysRegAccess};
 use crate::events::Emitter;
 use crate::fdt;
 use crate::guestmem::GuestRam;
@@ -72,6 +72,73 @@ const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
 const VIRTIO_NET_INTID: u32 = 32 + VIRTIO_NET_SPI;
 const VIRTIO_VSOCK_INTID: u32 = 32 + VIRTIO_VSOCK_SPI;
 
+/// PSTATE a vCPU enters the kernel with: DAIF masked, SP_ELx selected, at EL1
+/// (`M = 0b0101`, EL1h) or, when the guest owns EL2, at EL2 (`M = 0b1001`,
+/// EL2h). The boot vCPU and every `CPU_ON` secondary must use the same one:
+/// Linux compares the mode each CPU booted in and, when they differ, prints
+/// "CPUs started in inconsistent modes" and leaves KVM disabled.
+const CPSR_EL1H: u64 = 0x3c5;
+const CPSR_EL2H: u64 = 0x3c9;
+
+/// The PSTATE every vCPU of this guest enters the kernel with.
+fn entry_cpsr(nested_virt: bool) -> u64 {
+    if nested_virt {
+        CPSR_EL2H
+    } else {
+        CPSR_EL1H
+    }
+}
+
+/// How a vCPU first enters the guest.
+enum Entry {
+    /// The boot vCPU, at the kernel with the devicetree in X0.
+    Boot { kernel: u64, dtb: u64 },
+    /// A secondary, at the entry point a PSCI `CPU_ON` named.
+    CpuOn { entry: u64, ctx: u64 },
+}
+
+/// The registers a vCPU starts with. Both kinds of entry take their PSTATE
+/// from [`entry_cpsr`] here, so a secondary cannot enter at a different
+/// exception level from the boot vCPU.
+fn entry_regs(entry: Entry, nested_virt: bool) -> Vec<(Reg, u64)> {
+    let cpsr = entry_cpsr(nested_virt);
+    match entry {
+        Entry::Boot { kernel, dtb } => vec![
+            (Reg::PC, kernel),
+            (Reg::X0, dtb),
+            (Reg::X1, 0),
+            (Reg::X2, 0),
+            (Reg::X3, 0),
+            (Reg::CPSR, cpsr),
+        ],
+        Entry::CpuOn { entry, ctx } => vec![(Reg::PC, entry), (Reg::X0, ctx), (Reg::CPSR, cpsr)],
+    }
+}
+
+/// The vCPU registers the sysreg path reads and writes. [`Vcpu`] implements
+/// it; the tests implement it over a map, so that path runs without a VM.
+trait VcpuRegs {
+    fn get(&self, reg: Reg) -> u64;
+    fn set(&self, reg: Reg, value: u64);
+    fn get_sys(&self, reg: SysReg) -> u64;
+    fn set_sys(&self, reg: SysReg, value: u64) -> Result<(), String>;
+}
+
+impl VcpuRegs for Vcpu {
+    fn get(&self, reg: Reg) -> u64 {
+        self.get_reg(reg).unwrap_or(0)
+    }
+    fn set(&self, reg: Reg, value: u64) {
+        let _ = self.set_reg(reg, value);
+    }
+    fn get_sys(&self, reg: SysReg) -> u64 {
+        self.get_sys_reg(reg).unwrap_or(0)
+    }
+    fn set_sys(&self, reg: SysReg, value: u64) -> Result<(), String> {
+        self.set_sys_reg(reg, value).map_err(|e| format!("{e:?}"))
+    }
+}
+
 /// PSCI function IDs (SMC64/HVC calling convention) we recognise.
 mod psci {
     pub const VERSION: u64 = 0x8400_0000;
@@ -82,6 +149,118 @@ mod psci {
     pub const CPU_ON_64: u64 = 0xc400_0003;
     pub const SUCCESS: u64 = 0;
     pub const NOT_SUPPORTED: u64 = (-1i64) as u64;
+}
+
+/// The stop a PSCI call asks for, when it asks for the VM to end.
+fn psci_stop(fid: u64) -> Option<Stop> {
+    match fid {
+        psci::SYSTEM_OFF => Some(Stop::SystemOff),
+        psci::SYSTEM_RESET => Some(Stop::SystemReset),
+        _ => None,
+    }
+}
+
+/// How far to step PC once a PSCI call that trapped as `ec` has been
+/// serviced, or `None` when the call ended the VM and nothing resumes.
+///
+/// The two conduits return to different places. A trapped HVC reports the
+/// instruction after it, but a trapped SMC reports the SMC itself (its
+/// preferred return address is the SMC, for a monitor that emulates it).
+/// Without the step the guest re-issues the SMC with the result in X0 as the
+/// function ID and never gets past its first PSCI call. The step does not
+/// depend on the function ID: an unknown one gets NOT_SUPPORTED and the
+/// guest still has to move on.
+fn psci_resume_step(ec: Ec, fid: u64) -> Option<u64> {
+    if psci_stop(fid).is_some() {
+        return None;
+    }
+    Some(if ec == Ec::Smc { 4 } else { 0 })
+}
+
+/// `HCR_EL2.TSC`: SMC from EL1 traps to EL2.
+const HCR_EL2_TSC: u64 = 1 << 19;
+
+/// Whether a PSCI call that trapped as `ec` from `cpsr` is the outer guest's
+/// own, and so hvi's to serve. `hcr_el2` is the guest's own (virtual)
+/// `HCR_EL2`, which only means something when the guest owns EL2.
+///
+/// A guest at EL1 has nobody but hvi above it, so its calls are always
+/// served. A guest that owns EL2 has a hypervisor of its own: from its EL2,
+/// and from EL1 with `TSC` clear (the nVHE host kernel making PSCI calls to
+/// what it takes for firmware), the call is meant for hvi. An HVC from EL1,
+/// or an SMC from EL1 with `TSC` set, belongs to the guest's own hypervisor;
+/// that is where the hardware sends it. If one ever reaches hvi it is refused
+/// with NOT_SUPPORTED, so a nested guest cannot power the outer one off or
+/// start its vCPUs.
+///
+/// The test is `TSC` and not `HCR_EL2.VM`. VM says stage 2 is on, not that a
+/// nested guest runs: protected-mode KVM runs its own host kernel with stage
+/// 2 on, and that host's PSCI calls are the guest's, not a nested guest's.
+/// KVM sets `TSC` for the guests it runs, and pKVM sets it for its host too,
+/// which then makes its own firmware calls from EL2.
+fn psci_is_ours(nested_virt: bool, ec: Ec, cpsr: u64, hcr_el2: u64) -> bool {
+    if !nested_virt || (cpsr >> 2) & 0b11 == 2 {
+        return true;
+    }
+    ec == Ec::Smc && hcr_el2 & HCR_EL2_TSC == 0
+}
+
+/// How far to step PC past a PSCI call hvi refused: it is not serviced, so
+/// no function ID can end the VM.
+fn refused_psci_step(ec: Ec) -> u64 {
+    if ec == Ec::Smc {
+        4
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod psci_tests {
+    use super::*;
+
+    const RESUMING: [u64; 6] = [
+        psci::VERSION,
+        psci::CPU_ON_64,
+        psci::CPU_OFF,
+        psci::FEATURES,
+        0x8400_0006, // MIGRATE_INFO_TYPE, which Linux asks for and hvi lacks
+        0xdead_beef, // not a PSCI function at all
+    ];
+
+    /// An SMC resumes past itself, whatever it asked for. This is the step
+    /// whose absence left a guest re-issuing its first PSCI call forever.
+    #[test]
+    fn smc_steps_past_the_instruction() {
+        for fid in RESUMING {
+            assert_eq!(psci_resume_step(Ec::Smc, fid), Some(4), "fid {fid:#x}");
+        }
+    }
+
+    /// A trapped HVC already reports the next instruction; stepping it too
+    /// would skip one instruction of the guest's.
+    #[test]
+    fn hvc_resumes_where_it_was_reported() {
+        for fid in RESUMING {
+            assert_eq!(psci_resume_step(Ec::Hvc, fid), Some(0), "fid {fid:#x}");
+        }
+    }
+
+    /// SYSTEM_OFF and SYSTEM_RESET end the VM over either conduit, so there
+    /// is no PC to step.
+    #[test]
+    fn stopping_calls_resume_nothing() {
+        for ec in [Ec::Hvc, Ec::Smc] {
+            assert_eq!(psci_resume_step(ec, psci::SYSTEM_OFF), None);
+            assert_eq!(psci_resume_step(ec, psci::SYSTEM_RESET), None);
+        }
+        assert!(matches!(psci_stop(psci::SYSTEM_OFF), Some(Stop::SystemOff)));
+        assert!(matches!(
+            psci_stop(psci::SYSTEM_RESET),
+            Some(Stop::SystemReset)
+        ));
+        assert!(psci_stop(0xdead_beef).is_none());
+    }
 }
 
 /// A secondary vCPU's start mailbox, filled by a PSCI `CPU_ON`.
@@ -191,6 +370,14 @@ struct Shared {
     /// another process.
     ram_file: Arc<std::fs::File>,
     sandbox_id: String,
+    /// The guest owns EL2 (`--nested-virt`): vCPUs enter at EL2h.
+    nested_virt: bool,
+    /// Sysreg encodings the guest trapped on from EL2 and hvi does not
+    /// model, each logged once per boot.
+    unknown_el2: Arc<UnknownEl2Traps>,
+    /// Set once a PSCI call that belonged to the guest's own hypervisor has
+    /// been refused and logged.
+    refused_psci_logged: Arc<AtomicBool>,
 }
 
 /// Boots `cfg` and runs until the guest powers off.
@@ -245,10 +432,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
     }
 
+    // EL2 for the guest is decided here, before the VM and its RAM exist, so
+    // an unsupported host is a refusal and not a guest that dies later.
+    let mut vm_config = VirtualMachineConfig::new();
+    let mut fdt_options = fdt::Options::default();
+    if cfg.nested_virt {
+        fdt_options = enable_el2(&mut vm_config)?;
+    }
+
     let mut gic_config = GicConfig::new();
     gic_config.set_distributor_base(gic.gicd_base)?;
     gic_config.set_redistributor_base(gic.gicr_base)?;
-    let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config)?;
+    let vm = VirtualMachine::with_gic(vm_config, gic_config)?;
 
     // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
     // rather than allocated by applevisor, so an out-of-process plugin can
@@ -441,7 +636,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
     }
-    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
+    .load(
+        ram.memory(),
+        cfg.mem_bytes,
+        &gic,
+        num_cpus,
+        fdt_devices,
+        fdt_options,
+    )?;
 
     let secondaries: Vec<Secondary> = (0..num_cpus)
         .map(|_| Secondary {
@@ -470,6 +672,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),
         num_cpus,
+        nested_virt: cfg.nested_virt,
+        unknown_el2: Arc::default(),
+        refused_psci_logged: Arc::default(),
     };
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
@@ -665,14 +870,22 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
     sh.handles.lock().unwrap().push(vcpu.get_handle());
+    if sh.nested_virt {
+        if let Err(e) = hide_sme(&vcpu) {
+            eprintln!("[hvi] cpu{cpu_id}: cannot hide SME from a guest at EL2: {e:?}");
+            stop_all(&sh);
+            return;
+        }
+    }
 
     if cpu_id == 0 {
-        let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
-        let _ = vcpu.set_reg(Reg::X0, sh.dtb_addr);
-        let _ = vcpu.set_reg(Reg::X1, 0);
-        let _ = vcpu.set_reg(Reg::X2, 0);
-        let _ = vcpu.set_reg(Reg::X3, 0);
-        let _ = vcpu.set_reg(Reg::CPSR, 0x3c5); // EL1h, DAIF masked
+        let entry = Entry::Boot {
+            kernel: sh.kernel_addr,
+            dtb: sh.dtb_addr,
+        };
+        for (reg, value) in entry_regs(entry, sh.nested_virt) {
+            let _ = vcpu.set_reg(reg, value);
+        }
     } else {
         // Park until the guest brings this cpu up via PSCI CPU_ON.
         let sec = &sh.secondaries[cpu_id as usize];
@@ -684,9 +897,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             Some((entry, ctx)) => {
                 drop(mbox);
                 eprintln!("[hvi] cpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
-                let _ = vcpu.set_reg(Reg::PC, entry);
-                let _ = vcpu.set_reg(Reg::X0, ctx);
-                let _ = vcpu.set_reg(Reg::CPSR, 0x3c5);
+                for (reg, value) in entry_regs(Entry::CpuOn { entry, ctx }, sh.nested_virt) {
+                    let _ = vcpu.set_reg(reg, value);
+                }
             }
             None => return, // stopped while waiting
         }
@@ -728,12 +941,38 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 ExitReason::EXCEPTION => {
                     let syn = exit.exception.syndrome;
                     match Ec::from_syndrome(syn) {
-                        Ec::Hvc | Ec::Smc => {
-                            if service_psci(&vcpu, &sh) {
-                                break; // SYSTEM_OFF/RESET
+                        ec @ (Ec::Hvc | Ec::Smc) => {
+                            // Read before servicing: the reply overwrites X0.
+                            let fid = vcpu.get_reg(Reg::X0).unwrap_or(0);
+                            let ours = !sh.nested_virt
+                                || psci_is_ours(
+                                    true,
+                                    ec,
+                                    vcpu.get_reg(Reg::CPSR).unwrap_or(0),
+                                    vcpu.get_sys_reg(SysReg::HCR_EL2).unwrap_or(0),
+                                );
+                            if !ours {
+                                let _ = vcpu.set_reg(Reg::X0, psci::NOT_SUPPORTED);
+                                if !sh.refused_psci_logged.swap(true, Ordering::Relaxed) {
+                                    eprintln!(
+                                        "[hvi] cpu{cpu_id}: refused PSCI {fid:#x} over {ec:?} \
+                                         from EL1; it belongs to the guest's own \
+                                         hypervisor (logged once)"
+                                    );
+                                }
+                                let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                                let _ = vcpu.set_reg(Reg::PC, pc + refused_psci_step(ec));
+                                continue;
                             }
-                            // Not restartable: the saved PC is already past
-                            // HVC/SMC.
+                            service_psci(&vcpu, &sh);
+                            match psci_resume_step(ec, fid) {
+                                None => break, // SYSTEM_OFF/RESET
+                                Some(0) => {}
+                                Some(step) => {
+                                    let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                                    let _ = vcpu.set_reg(Reg::PC, pc + step);
+                                }
+                            }
                         }
                         Ec::DataAbort => {
                             let ipa = exit.exception.physical_address;
@@ -787,10 +1026,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             }
                         }
                         Ec::SysReg => {
-                            // RAZ/WI: unmodeled system register.
-                            let iss = syn & 0x1ff_ffff;
-                            if iss & 1 == 1 {
-                                write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, 0);
+                            let access = SysRegAccess::from_syndrome(syn);
+                            if let Some(line) =
+                                service_sysreg(&vcpu, sh.nested_virt, access, &sh.unknown_el2)
+                            {
+                                eprintln!("[hvi] cpu{cpu_id}: {line}");
                             }
                             advance_pc(&vcpu);
                         }
@@ -914,19 +1154,11 @@ impl CpuHandle for Cpu<'_> {
     }
 
     fn regs(&self) -> RegsView {
-        let ttbr1 = self.vcpu.get_sys_reg(SysReg::TTBR1_EL1).unwrap_or(0);
-        RegsView {
-            // arm64's kernel-half page-table base is the walk root.
-            root: ttbr1,
-            pc: self.vcpu.get_reg(Reg::PC).unwrap_or(0),
-            cpsr: self.vcpu.get_reg(Reg::CPSR).unwrap_or(0),
-            ttbr0: self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0),
-            ttbr1,
-            sctlr: self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0),
-            sp_el1: self.vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0),
-            tcr: self.vcpu.get_sys_reg(SysReg::TCR_EL1).unwrap_or(0),
-            current_task: self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0),
-        }
+        regs_view(
+            self.vcpu.get_reg(Reg::PC).unwrap_or(0),
+            self.vcpu.get_reg(Reg::CPSR).unwrap_or(0),
+            |reg| self.vcpu.get_sys_reg(reg).unwrap_or(0),
+        )
     }
 
     fn pause(&self) -> bool {
@@ -952,24 +1184,244 @@ impl CpuHandle for Cpu<'_> {
     }
 }
 
-/// Handles a PSCI call. Returns `true` if the VM should stop
-/// (SYSTEM_OFF/RESET).
-fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
+/// `HCR_EL2.E2H`: the EL2 kernel runs with the EL1 register layout (VHE).
+const HCR_EL2_E2H: u64 = 1 << 34;
+
+/// Builds the register view from the exception level the vCPU stopped at.
+///
+/// At EL1 these are the EL1 registers, as they always were. A guest that owns
+/// EL2 can stop at EL2 as well. With `HCR_EL2.E2H` set (VHE) the kernel itself
+/// runs there and its kernel-half table is `TTBR1_EL2`. Without it (nVHE,
+/// which is what Hypervisor.framework offered on the hosts tried) EL2 runs
+/// KVM's hypervisor code, which has a single table in `TTBR0_EL2` over its
+/// own hyp VA space and no `TTBR1_EL2`; `TCR_EL2` then has the single-range
+/// layout (T0SZ, TG0, PS), and `SP_EL0` is not a task pointer. Reading the
+/// EL1 registers in either case would hand a walker the tables of whatever
+/// last ran at EL1.
+fn regs_view(pc: u64, cpsr: u64, read: impl Fn(SysReg) -> u64) -> RegsView {
+    let at_el2 = (cpsr >> 2) & 0b11 == 2;
+    if !at_el2 {
+        let ttbr1 = read(SysReg::TTBR1_EL1);
+        return RegsView {
+            // arm64's kernel-half page-table base is the walk root.
+            root: ttbr1,
+            pc,
+            cpsr,
+            ttbr0: read(SysReg::TTBR0_EL1),
+            ttbr1,
+            sctlr: read(SysReg::SCTLR_EL1),
+            sp_el1: read(SysReg::SP_EL1),
+            tcr: read(SysReg::TCR_EL1),
+            current_task: read(SysReg::SP_EL0),
+        };
+    }
+    let vhe = read(SysReg::HCR_EL2) & HCR_EL2_E2H != 0;
+    let ttbr0 = read(SysReg::TTBR0_EL2);
+    let ttbr1 = if vhe { read(SysReg::TTBR1_EL2) } else { 0 };
+    RegsView {
+        root: if vhe { ttbr1 } else { ttbr0 },
+        pc,
+        cpsr,
+        ttbr0,
+        ttbr1,
+        sctlr: read(SysReg::SCTLR_EL2),
+        sp_el1: read(SysReg::SP_EL2),
+        tcr: read(SysReg::TCR_EL2),
+        current_task: read(SysReg::SP_EL0),
+    }
+}
+
+/// Hides SME from a vCPU of a guest that owns EL2: clears
+/// `ID_AA64PFR1_EL1.SME` (bits 27:24) and every field of `ID_AA64SMFR0_EL1`.
+///
+/// Hypervisor.framework offers SME to a guest at EL1, but with EL2 enabled an
+/// access to `SMCR_EL2` is undefined (macOS 26.7, Apple M5 Pro). Linux's EL2
+/// setup writes `SMCR_EL2` whenever the ID register says SME is there, so
+/// without this the kernel takes an undefined-instruction exception in its
+/// hyp stub before it prints anything, and loops on it with nothing on the
+/// console. SMFR0 describes the SME features; left populated it would claim
+/// features of an extension the guest is told it does not have.
+fn hide_sme(vcpu: &Vcpu) -> applevisor::error::Result<()> {
+    let pfr1 = vcpu.get_sys_reg(SysReg::ID_AA64PFR1_EL1)?;
+    vcpu.set_sys_reg(SysReg::ID_AA64PFR1_EL1, pfr1 & !(0xf << 24))?;
+    vcpu.set_sys_reg(SysReg::ID_AA64SMFR0_EL1, 0)
+}
+
+/// Names the EL2 register a trapped access reaches, when the VMM services it
+/// for a guest that owns EL2. `None` sends the access down the RAZ/WI path.
+///
+/// Only an access made at EL2 qualifies. From EL1 or EL0 these registers are
+/// undefined, so such an access is never a write by the guest's hypervisor.
+/// Serving it would let code below that hypervisor, a nested guest included,
+/// change the hypervisor's timer control.
+///
+/// Only `CNTHCTL_EL2` is here, because it is the only EL2 register a Linux
+/// guest at EL2 was seen to trap on (macOS 26.7, Apple M5 Pro), and RAZ/WI
+/// breaks it. The guest kernel's boot-time write that lets EL1 use the
+/// physical timer was dropped, so the kernel's first `CNTP_CTL_EL0` read
+/// trapped to its own hyp stub, which cannot service it, and the guest spun
+/// there with nothing on the console. KVM in the guest also rewrites this
+/// register on every switch into and out of its own guests.
+fn el2_sysreg(cpsr: u64, access: SysRegAccess) -> Option<SysReg> {
+    if (cpsr >> 2) & 0b11 != 2 {
+        return None;
+    }
+    match access.reg {
+        esr::CNTHCTL_EL2 => Some(SysReg::CNTHCTL_EL2),
+        _ => None,
+    }
+}
+
+/// Performs `access` on `reg`, keeping the value in the vCPU through the
+/// framework, which applies it.
+fn service_el2_sysreg(vcpu: &impl VcpuRegs, reg: SysReg, access: SysRegAccess) {
+    if access.is_read {
+        write_gpr(vcpu, access.rt, vcpu.get_sys(reg));
+    } else if let Err(e) = vcpu.set_sys(reg, read_gpr(vcpu, access.rt)) {
+        eprintln!("[hvi] cannot set {reg:?} for the guest: {e}");
+    }
+}
+
+/// Sysreg encodings that a guest owning EL2 trapped on from EL2 and that hvi
+/// takes as RAZ/WI, so each is reported once per boot.
+///
+/// `CNTHCTL_EL2` was such a register until hvi modelled it, and the guest
+/// hung on it with nothing on the console to say why. The next one should
+/// leave a line naming the register.
+#[derive(Default)]
+struct UnknownEl2Traps(Mutex<std::collections::HashSet<esr::SysRegEncoding>>);
+
+impl UnknownEl2Traps {
+    /// The line to log for `access`, the first time its encoding is seen.
+    fn first(&self, access: SysRegAccess) -> Option<String> {
+        if !lock_or_recover(&self.0).insert(access.reg) {
+            return None;
+        }
+        let (op0, op1, crn, crm, op2) = access.reg;
+        Some(format!(
+            "guest EL2 {} of S{op0}_{op1}_C{crn}_C{crm}_{op2} is not modelled; RAZ/WI (logged once)",
+            if access.is_read { "read" } else { "write" }
+        ))
+    }
+}
+
+/// Services a trapped `MSR`/`MRS`: RAZ/WI for an unmodeled system register,
+/// except the EL2 ones a guest that owns EL2 relies on (see [`el2_sysreg`]).
+/// The caller steps PC past the instruction. Returns a line to log when a
+/// guest that owns EL2 made an access from EL2 that took the RAZ/WI path for
+/// the first time this boot.
+fn service_sysreg(
+    vcpu: &impl VcpuRegs,
+    nested_virt: bool,
+    access: SysRegAccess,
+    unknown: &UnknownEl2Traps,
+) -> Option<String> {
+    let at_el2 = nested_virt && (vcpu.get(Reg::CPSR) >> 2) & 0b11 == 2;
+    let el2 = if nested_virt {
+        el2_sysreg(vcpu.get(Reg::CPSR), access)
+    } else {
+        None
+    };
+    if let Some(reg) = el2 {
+        service_el2_sysreg(vcpu, reg, access);
+        return None;
+    }
+    if access.is_read {
+        write_gpr(vcpu, access.rt, 0);
+    }
+    if at_el2 {
+        unknown.first(access)
+    } else {
+        None
+    }
+}
+
+/// Turns on EL2 for the guest in `vm_config` and returns the devicetree
+/// options a guest at EL2 needs.
+///
+/// # Errors
+///
+/// Refuses when Hypervisor.framework reports no EL2 on this host, or when the
+/// framework's timer INTIDs disagree with the ones the devicetree advertises.
+fn enable_el2(
+    vm_config: &mut VirtualMachineConfig,
+) -> Result<fdt::Options, Box<dyn std::error::Error>> {
+    let ppi = el2_support()?.map_err(|detail| {
+        format!("nested virtualization requested but not supported by this host: {detail}")
+    })?;
+    vm_config.set_el2_enabled(true)?;
+    eprintln!(
+        "[hvi] nested virtualization: EL2 enabled (psci conduit smc, gic maintenance ppi {ppi})"
+    );
+    Ok(fdt::Options {
+        psci_conduit: fdt::PsciConduit::Smc,
+        gic_maintenance_ppi: Some(ppi),
+    })
+}
+
+/// Whether this host can boot a guest with `--nested-virt`: the one check
+/// both `boot` and `hvi caps` make, so `caps` saying supported means a boot
+/// accepts the host. `Ok(Ok(ppi))` carries the GIC maintenance PPI;
+/// `Ok(Err(detail))` says why not.
+///
+/// # Errors
+///
+/// Errors only when Hypervisor.framework cannot be asked.
+pub fn el2_support() -> Result<Result<u32, String>, Box<dyn std::error::Error>> {
+    if !VirtualMachineConfig::get_el2_supported()? {
+        return Ok(Err("Hypervisor.framework reports no EL2".into()));
+    }
+    // The devicetree's timer PPIs are constants. A guest at EL1 uses the
+    // virtual timer. A kernel booted at EL2 uses the EL1 physical timer (PPI
+    // 14) under nVHE, the only mode the framework offers, and would use the
+    // hypervisor timer (PPI 10) under VHE. One wired to the wrong PPI boots
+    // with a clock that never ticks, so the constants are checked against the
+    // framework before that guest runs.
+    for (id, ppi, name) in [
+        (
+            GicIntId::EL1_VIRTUAL_TIMER,
+            fdt::TIMER_PPI_VIRT,
+            "EL1 virtual",
+        ),
+        (
+            GicIntId::EL1_PHYSICAL_TIMER,
+            fdt::TIMER_PPI_PHYS,
+            "EL1 physical",
+        ),
+        (
+            GicIntId::EL2_PHYSICAL_TIMER,
+            fdt::TIMER_PPI_HYP_PHYS,
+            "EL2 physical",
+        ),
+    ] {
+        let intid = GicConfig::get_intid(id)?;
+        if intid != ppi + 16 {
+            return Ok(Err(format!(
+                "the {name} timer is INTID {intid} in Hypervisor.framework, but the \
+                 devicetree advertises PPI {ppi} (INTID {})",
+                ppi + 16
+            )));
+        }
+    }
+    let maintenance = GicConfig::get_intid(GicIntId::MAINTENANCE)?;
+    Ok(maintenance
+        .checked_sub(16)
+        .ok_or_else(|| format!("GIC maintenance interrupt {maintenance} is not a PPI")))
+}
+
+/// Handles a PSCI call: writes the reply, or records the stop and stops every
+/// vCPU for SYSTEM_OFF/RESET. [`psci_resume_step`] decides where the caller
+/// resumes.
+fn service_psci(vcpu: &Vcpu, sh: &Shared) {
     let fid = vcpu.get_reg(Reg::X0).unwrap_or(0);
+    if let Some(stop) = psci_stop(fid) {
+        *sh.stop.lock().unwrap() = Some(stop);
+        stop_all(sh);
+        return;
+    }
     match fid {
         psci::VERSION => {
             let _ = vcpu.set_reg(Reg::X0, 0x0001_0000); // v1.0
-            false
-        }
-        psci::SYSTEM_OFF => {
-            *sh.stop.lock().unwrap() = Some(Stop::SystemOff);
-            stop_all(sh);
-            true
-        }
-        psci::SYSTEM_RESET => {
-            *sh.stop.lock().unwrap() = Some(Stop::SystemReset);
-            stop_all(sh);
-            true
         }
         psci::FEATURES => {
             let q = vcpu.get_reg(Reg::X1).unwrap_or(0);
@@ -989,7 +1441,6 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
                     psci::NOT_SUPPORTED
                 },
             );
-            false
         }
         psci::CPU_ON_64 => {
             let target = vcpu.get_reg(Reg::X1).unwrap_or(0);
@@ -1005,15 +1456,12 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
                 psci::NOT_SUPPORTED
             };
             let _ = vcpu.set_reg(Reg::X0, ret);
-            false
         }
         psci::CPU_OFF => {
             let _ = vcpu.set_reg(Reg::X0, psci::SUCCESS);
-            false
         }
         _ => {
             let _ = vcpu.set_reg(Reg::X0, psci::NOT_SUPPORTED);
-            false
         }
     }
 }
@@ -1500,14 +1948,14 @@ fn kick_all(vm: &VmGic, handles: &Arc<Mutex<Vec<VcpuHandle>>>) {
 }
 
 /// Reads general-purpose register `idx` (31 = XZR, reads as 0).
-fn read_gpr(vcpu: &Vcpu, idx: u8) -> u64 {
-    gpr(idx).map_or(0, |r| vcpu.get_reg(r).unwrap_or(0))
+fn read_gpr(vcpu: &impl VcpuRegs, idx: u8) -> u64 {
+    gpr(idx).map_or(0, |r| vcpu.get(r))
 }
 
 /// Writes `value` to general-purpose register `idx` (31 = XZR, discarded).
-fn write_gpr(vcpu: &Vcpu, idx: u8, value: u64) {
+fn write_gpr(vcpu: &impl VcpuRegs, idx: u8, value: u64) {
     if let Some(r) = gpr(idx) {
-        let _ = vcpu.set_reg(r, value);
+        vcpu.set(r, value);
     }
 }
 
@@ -1595,4 +2043,291 @@ fn gpr(idx: u8) -> Option<Reg> {
         30 => Reg::X30,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A register file where each register reads as a distinct value, so a
+    /// test can tell which one a field came from.
+    fn fake(reg: SysReg) -> u64 {
+        match reg {
+            SysReg::TTBR0_EL1 => 0x10,
+            SysReg::TTBR1_EL1 => 0x11,
+            SysReg::SCTLR_EL1 => 0x12,
+            SysReg::SP_EL1 => 0x13,
+            SysReg::TCR_EL1 => 0x14,
+            SysReg::SP_EL0 => 0x40,
+            SysReg::TTBR0_EL2 => 0x20,
+            SysReg::TTBR1_EL2 => 0x21,
+            SysReg::SCTLR_EL2 => 0x22,
+            SysReg::SP_EL2 => 0x23,
+            SysReg::TCR_EL2 => 0x24,
+            _ => 0,
+        }
+    }
+
+    /// The default guest is untouched by the EL2 support: a vCPU at EL1
+    /// reports the EL1 registers, whatever HCR_EL2 says.
+    #[test]
+    fn regs_view_at_el1_reads_el1() {
+        let v = regs_view(0x1000, CPSR_EL1H, |r| match r {
+            SysReg::HCR_EL2 => HCR_EL2_E2H,
+            other => fake(other),
+        });
+        assert_eq!(
+            (v.root, v.ttbr0, v.ttbr1, v.sctlr, v.sp_el1, v.tcr),
+            (0x11, 0x10, 0x11, 0x12, 0x13, 0x14)
+        );
+        assert_eq!(v.current_task, 0x40);
+    }
+
+    /// nVHE: EL2 has one table, in TTBR0_EL2, and no TTBR1_EL2 to read.
+    #[test]
+    fn regs_view_at_el2_nvhe_roots_at_ttbr0_el2() {
+        let v = regs_view(0x2000, CPSR_EL2H, fake);
+        assert_eq!(v.root, 0x20);
+        assert_eq!((v.ttbr0, v.ttbr1), (0x20, 0));
+        assert_eq!((v.sctlr, v.sp_el1, v.tcr), (0x22, 0x23, 0x24));
+    }
+
+    /// VHE: the kernel runs at EL2 with a kernel half in TTBR1_EL2.
+    #[test]
+    fn regs_view_at_el2_vhe_roots_at_ttbr1_el2() {
+        let v = regs_view(0x3000, CPSR_EL2H, |r| match r {
+            SysReg::HCR_EL2 => HCR_EL2_E2H,
+            other => fake(other),
+        });
+        assert_eq!(v.root, 0x21);
+        assert_eq!((v.ttbr0, v.ttbr1), (0x20, 0x21));
+        assert_eq!(v.current_task, 0x40);
+    }
+
+    /// Both entry states name the exception level they claim, with DAIF
+    /// masked and SP_ELx selected. A guest that owns EL2 but enters at EL1
+    /// reports "HYP mode not available" and gets no /dev/kvm.
+    #[test]
+    fn entry_cpsr_names_the_exception_level() {
+        assert_eq!(entry_cpsr(false) & 0xf, 0b0101, "EL1h");
+        assert_eq!(entry_cpsr(true) & 0xf, 0b1001, "EL2h");
+        for cpsr in [entry_cpsr(false), entry_cpsr(true)] {
+            assert_eq!(cpsr & 0x3c0, 0x3c0, "DAIF masked");
+        }
+    }
+
+    fn cnthctl(is_read: bool) -> SysRegAccess {
+        SysRegAccess {
+            reg: esr::CNTHCTL_EL2,
+            rt: 0,
+            is_read,
+        }
+    }
+
+    /// The guest's hypervisor at EL2 reads and writes CNTHCTL_EL2 through
+    /// the VMM; RAZ/WI there hangs its kernel before the console.
+    #[test]
+    fn cnthctl_el2_is_served_at_el2() {
+        for is_read in [true, false] {
+            assert!(matches!(
+                el2_sysreg(CPSR_EL2H, cnthctl(is_read)),
+                Some(SysReg::CNTHCTL_EL2)
+            ));
+        }
+    }
+
+    /// The same access from EL1 or EL0 is not the guest's hypervisor. It
+    /// must not reach the register, or a nested guest could change the timer
+    /// control of the hypervisor running it.
+    #[test]
+    fn cnthctl_el2_is_not_served_below_el2() {
+        let el0t = 0x3c0;
+        for cpsr in [CPSR_EL1H, el0t] {
+            for is_read in [true, false] {
+                assert!(el2_sysreg(cpsr, cnthctl(is_read)).is_none());
+            }
+        }
+    }
+
+    /// Any other register at EL2 keeps the RAZ/WI path.
+    #[test]
+    fn other_sysregs_at_el2_stay_raz_wi() {
+        let cntp_ctl_el0 = SysRegAccess {
+            reg: (3, 3, 14, 2, 1),
+            rt: 0,
+            is_read: true,
+        };
+        assert!(el2_sysreg(CPSR_EL2H, cntp_ctl_el0).is_none());
+    }
+
+    /// A register file over two maps, standing in for a vCPU.
+    #[derive(Default)]
+    struct FakeRegs {
+        regs: std::cell::RefCell<std::collections::HashMap<Reg, u64>>,
+        sys: std::cell::RefCell<std::collections::HashMap<SysReg, u64>>,
+    }
+
+    impl VcpuRegs for FakeRegs {
+        fn get(&self, reg: Reg) -> u64 {
+            self.regs.borrow().get(&reg).copied().unwrap_or(0)
+        }
+        fn set(&self, reg: Reg, value: u64) {
+            self.regs.borrow_mut().insert(reg, value);
+        }
+        fn get_sys(&self, reg: SysReg) -> u64 {
+            self.sys.borrow().get(&reg).copied().unwrap_or(0)
+        }
+        fn set_sys(&self, reg: SysReg, value: u64) -> Result<(), String> {
+            self.sys.borrow_mut().insert(reg, value);
+            Ok(())
+        }
+    }
+
+    /// `msr cnthctl_el2, x3` then `mrs x5, cnthctl_el2`, from `cpsr`.
+    fn write_then_read(nested_virt: bool, cpsr: u64) -> (Option<u64>, u64) {
+        let vcpu = FakeRegs::default();
+        vcpu.set(Reg::CPSR, cpsr);
+        vcpu.set(Reg::X3, 0x3);
+        vcpu.set(Reg::X5, 0xffff);
+        let access = |rt, is_read| SysRegAccess {
+            reg: esr::CNTHCTL_EL2,
+            rt,
+            is_read,
+        };
+        let unknown = UnknownEl2Traps::default();
+        assert!(service_sysreg(&vcpu, nested_virt, access(3, false), &unknown).is_none());
+        let kept = vcpu.sys.borrow().get(&SysReg::CNTHCTL_EL2).copied();
+        assert!(service_sysreg(&vcpu, nested_virt, access(5, true), &unknown).is_none());
+        (kept, vcpu.get(Reg::X5))
+    }
+
+    /// With the guest owning EL2, its hypervisor's write reaches the vCPU's
+    /// register and its read gets that value back.
+    #[test]
+    fn nested_guest_at_el2_keeps_cnthctl_el2() {
+        assert_eq!(write_then_read(true, CPSR_EL2H), (Some(0x3), 0x3));
+    }
+
+    /// Without --nested-virt the register is RAZ/WI, as every unmodeled one
+    /// is: nothing is written and the read gives 0.
+    #[test]
+    fn default_guest_gets_raz_wi_for_cnthctl_el2() {
+        assert_eq!(write_then_read(false, CPSR_EL2H), (None, 0));
+    }
+
+    /// The same access from EL1 is RAZ/WI too, even with the guest owning
+    /// EL2.
+    #[test]
+    fn nested_guest_at_el1_gets_raz_wi_for_cnthctl_el2() {
+        assert_eq!(write_then_read(true, CPSR_EL1H), (None, 0));
+    }
+
+    /// The boot vCPU and a CPU_ON secondary enter with the same PSTATE, for
+    /// either kind of guest. A secondary at EL1 beside a boot vCPU at EL2 is
+    /// the "inconsistent modes" boot that leaves KVM off.
+    #[test]
+    fn boot_and_cpu_on_enter_at_the_same_level() {
+        let cpsr_of = |regs: Vec<(Reg, u64)>| {
+            regs.into_iter()
+                .find(|(r, _)| *r == Reg::CPSR)
+                .map(|(_, v)| v)
+        };
+        for nested_virt in [false, true] {
+            let boot = entry_regs(Entry::Boot { kernel: 1, dtb: 2 }, nested_virt);
+            let cpu_on = entry_regs(Entry::CpuOn { entry: 3, ctx: 4 }, nested_virt);
+            assert_eq!(cpsr_of(boot), Some(entry_cpsr(nested_virt)));
+            assert_eq!(cpsr_of(cpu_on), Some(entry_cpsr(nested_virt)));
+        }
+        let cpu_on = entry_regs(Entry::CpuOn { entry: 3, ctx: 4 }, false);
+        assert!(cpu_on.contains(&(Reg::PC, 3)) && cpu_on.contains(&(Reg::X0, 4)));
+    }
+
+    /// `LORC_EL1` and `MDCCINT_EL1`, which Linux touched from EL2 on the
+    /// hardware tried and hvi leaves RAZ/WI.
+    const LORC_EL1: esr::SysRegEncoding = (3, 0, 10, 4, 3);
+    const MDCCINT_EL1: esr::SysRegEncoding = (2, 0, 0, 2, 0);
+
+    fn sysreg(reg: esr::SysRegEncoding, rt: u8, is_read: bool) -> SysRegAccess {
+        SysRegAccess { reg, rt, is_read }
+    }
+
+    /// An unmodelled access from the guest's EL2 is logged the first time
+    /// its encoding is seen and never again that boot, in either direction.
+    /// It still reads as zero.
+    #[test]
+    fn unknown_el2_access_is_logged_once_per_encoding() {
+        let vcpu = FakeRegs::default();
+        vcpu.set(Reg::CPSR, CPSR_EL2H);
+        vcpu.set(Reg::X4, 0xffff);
+        let unknown = UnknownEl2Traps::default();
+        let first = service_sysreg(&vcpu, true, sysreg(LORC_EL1, 31, false), &unknown);
+        let line = first.expect("the first LORC_EL1 access is logged");
+        assert!(line.contains("write of S3_0_C10_C4_3"), "{line}");
+        assert!(service_sysreg(&vcpu, true, sysreg(LORC_EL1, 31, false), &unknown).is_none());
+        assert!(service_sysreg(&vcpu, true, sysreg(LORC_EL1, 4, true), &unknown).is_none());
+        assert_eq!(vcpu.get(Reg::X4), 0, "an unlogged read is still RAZ");
+        let other = service_sysreg(&vcpu, true, sysreg(MDCCINT_EL1, 4, true), &unknown);
+        assert!(other
+            .expect("a new encoding is logged")
+            .contains("read of S2_0_C0_C2_0"));
+    }
+
+    /// Nothing is logged for a register hvi serves, for an access from
+    /// EL1, or for a guest that does not own EL2.
+    #[test]
+    fn only_unmodelled_el2_accesses_of_a_nested_guest_are_logged() {
+        let unknown = UnknownEl2Traps::default();
+        let at = |cpsr| {
+            let vcpu = FakeRegs::default();
+            vcpu.set(Reg::CPSR, cpsr);
+            vcpu
+        };
+        let served = sysreg(esr::CNTHCTL_EL2, 3, false);
+        assert!(service_sysreg(&at(CPSR_EL2H), true, served, &unknown).is_none());
+        assert!(
+            service_sysreg(&at(CPSR_EL1H), true, sysreg(LORC_EL1, 3, false), &unknown).is_none()
+        );
+        assert!(
+            service_sysreg(&at(CPSR_EL2H), false, sysreg(LORC_EL1, 3, false), &unknown).is_none()
+        );
+        // None of the above used up LORC_EL1's one line.
+        assert!(
+            service_sysreg(&at(CPSR_EL2H), true, sysreg(LORC_EL1, 3, false), &unknown).is_some()
+        );
+    }
+
+    const EL0T: u64 = 0x3c0;
+
+    /// The path the guest's nVHE host kernel takes: SMC from EL1 with TSC
+    /// clear. It is served, and so is anything from the guest's EL2.
+    #[test]
+    fn psci_from_the_guest_hypervisor_or_its_host_is_served() {
+        assert!(psci_is_ours(true, Ec::Smc, CPSR_EL1H, 0));
+        for hcr in [0, HCR_EL2_TSC] {
+            assert!(psci_is_ours(true, Ec::Smc, CPSR_EL2H, hcr));
+            assert!(psci_is_ours(true, Ec::Hvc, CPSR_EL2H, hcr));
+        }
+    }
+
+    /// An HVC from EL1, or an SMC from EL1 with TSC set, belongs to the
+    /// guest's own hypervisor and is refused if it ever reaches hvi.
+    #[test]
+    fn psci_meant_for_the_guest_hypervisor_is_refused() {
+        assert!(!psci_is_ours(true, Ec::Smc, CPSR_EL1H, HCR_EL2_TSC));
+        assert!(!psci_is_ours(true, Ec::Smc, EL0T, HCR_EL2_TSC));
+        assert!(!psci_is_ours(true, Ec::Hvc, CPSR_EL1H, 0));
+        assert!(!psci_is_ours(true, Ec::Hvc, CPSR_EL1H, HCR_EL2_TSC));
+        assert_eq!(refused_psci_step(Ec::Smc), 4);
+        assert_eq!(refused_psci_step(Ec::Hvc), 0);
+    }
+
+    /// A guest at EL1 is unchanged: its HVC PSCI is served whatever a
+    /// meaningless HCR_EL2 read says.
+    #[test]
+    fn psci_of_a_guest_without_el2_is_always_served() {
+        for hcr in [0, HCR_EL2_TSC] {
+            assert!(psci_is_ours(false, Ec::Hvc, CPSR_EL1H, hcr));
+            assert!(psci_is_ours(false, Ec::Smc, CPSR_EL1H, hcr));
+        }
+    }
 }

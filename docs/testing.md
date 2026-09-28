@@ -91,12 +91,18 @@ console log:
 | Job | Runner | Asserts |
 | --- | --- | --- |
 | `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. Also runs the virtio-blk sizing test against a real loop device. |
-| `boot-arm64-hvf` | self-hosted Apple silicon | `hvi smoke`, `hvi smoke --shm`, then a boot reaching `Linux version` and `HVI-INITRAMFS-UP`. |
+| `boot-arm64-hvf` | self-hosted Apple silicon | `hvi smoke`, `hvi smoke --shm`, then a boot reaching `Linux version` and `HVI-INITRAMFS-UP`, and `kvm [1]: HYP mode not available` (no EL2 by default). Where `hvi caps` says supported, a `--nested-virt` boot must start at EL2, initialise KVM, have `/dev/kvm` and power off over SMC (`guest stopped: SystemOff`); otherwise that boot is skipped with a notice. |
 | `boot-unikraft-hvf` | self-hosted Apple silicon | Two public Unikraft images, over four boots. A DHCP boot asserts the banner, `Set IPv4 address 10.0.2.15` and `Listening on port 8123`, with a share attached so the VMM has to place a virtio-fs device -- no other job does. A second boot passes `netdev.ip=` and asserts the guest took `10.0.2.99` and did *not* fall through to `10.0.2.15`, which is what fails if an image loses `CONFIG_LIBUKNETDEV_EINFO_LIBPARAM`. A third boots a padded cpio -- the pinned one is two whole pages, so the job adds 512 bytes to make the length ragged -- and asserts the banner, no memory-region assertion failure, and no `nginx:` error line. |
 | `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the aarch64 seccomp selftest, a boot, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
 
 `boot-x86` skips itself with a warning when the runner has no `/dev/kvm`. A
 skip is not a pass.
+
+The nested boot in `boot-arm64-hvf` tests something only on a runner that can
+give a guest EL2: Apple M3 or later, on macOS 15 or later. Anything older
+skips it. The SME hiding that a guest at EL2 depends on is exercised only on
+M4 or later, the first chips with SME; on an M3 runner that code does
+nothing.
 
 The self-hosted lanes are withheld from pull requests opened from a fork,
 because these are persistent machines rather than ephemeral VMs. A fork still

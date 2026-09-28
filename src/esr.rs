@@ -97,9 +97,81 @@ impl DataAbort {
     }
 }
 
+/// A system register's architectural encoding, `(op0, op1, CRn, CRm, op2)`,
+/// as a trapped `MSR`/`MRS` reports it.
+pub type SysRegEncoding = (u8, u8, u8, u8, u8);
+
+/// `CNTHCTL_EL2`, the EL2 control of EL1's access to the physical timer and
+/// counter.
+pub const CNTHCTL_EL2: SysRegEncoding = (3, 4, 14, 1, 0);
+
+/// Decoded fields of a trapped `MSR`/`MRS` (EC 0x18): which register, which
+/// general-purpose register, and which way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysRegAccess {
+    pub reg: SysRegEncoding,
+    /// The `Xt` register index; 31 is XZR.
+    pub rt: u8,
+    /// True for `MRS` (the guest reads the register into `Xt`).
+    pub is_read: bool,
+}
+
+impl SysRegAccess {
+    /// Decodes the ISS of a sysreg-trap syndrome.
+    #[must_use]
+    pub fn from_syndrome(syndrome: u64) -> Self {
+        let iss = syndrome & 0x01ff_ffff;
+        let field = |shift: u32, mask: u64| ((iss >> shift) & mask) as u8;
+        SysRegAccess {
+            reg: (
+                field(20, 0x3),
+                field(14, 0x7),
+                field(10, 0xf),
+                field(1, 0xf),
+                field(17, 0x7),
+            ),
+            rt: field(5, 0x1f),
+            is_read: iss & 1 == 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two accesses a guest kernel at EL2 trapped with on hardware: its
+    /// own `msr cnthctl_el2, x0` at boot, and KVM's `mrs x2, cnthctl_el2` on
+    /// a world switch. Getting the field order wrong here would send the
+    /// register to RAZ/WI, which hangs that guest before its first line of
+    /// output.
+    #[test]
+    fn sysreg_access_decodes_cnthctl_el2() {
+        let write = SysRegAccess::from_syndrome(0x6231_3802);
+        assert_eq!(
+            write,
+            SysRegAccess {
+                reg: CNTHCTL_EL2,
+                rt: 0,
+                is_read: false,
+            }
+        );
+        let read = SysRegAccess::from_syndrome(0x6231_3843);
+        assert_eq!(read.reg, CNTHCTL_EL2);
+        assert_eq!(read.rt, 2);
+        assert!(read.is_read);
+    }
+
+    /// `mrs x0, cntp_ctl_el0` from EL1, the access that trapped when
+    /// `CNTHCTL_EL2` was lost. It must not be taken for `CNTHCTL_EL2`.
+    #[test]
+    fn sysreg_access_tells_cntp_ctl_from_cnthctl() {
+        let access = SysRegAccess::from_syndrome(0x6232_f805);
+        assert_eq!(Ec::from_syndrome(0x6232_f805), Ec::SysReg);
+        assert_eq!(access.reg, (3, 3, 14, 2, 1));
+        assert_ne!(access.reg, CNTHCTL_EL2);
+        assert!(access.is_read);
+    }
 
     #[test]
     fn hvc_class() {

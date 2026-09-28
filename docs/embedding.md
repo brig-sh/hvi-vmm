@@ -77,6 +77,7 @@ let cfg = BootConfig {
     agent_sock: None,
     plugin: None,
     sandbox: true,
+    nested_virt: false,
 };
 
 let stop = hvi::machine::boot(cfg)?;
@@ -114,6 +115,7 @@ cargo build --release --example watch_guest
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
+| `nested_virt` | `bool` | Give the guest EL2 so it can run KVM. macOS only; **fails the boot** on either Linux backend and on a Mac without EL2. `hvi::caps::probe()` asks first. |
 
 `FsShare` carries a `path`, a `tag`, a `ShareMode` and a `CachePolicy`. See
 [storage-and-sharing.md](storage-and-sharing.md).

@@ -58,23 +58,43 @@ pub enum GuestArch {
 /// `root` is the architectural translation-base register — TTBR1_EL1 on arm64,
 /// CR3 on x86-64 — named once here so a tool needs no per-backend special
 /// case. The arm64-specific registers are zero on x86-64.
+///
+/// On arm64 the registers are those of the exception level the vCPU stopped
+/// at, which `cpsr` names. A guest booted with `--nested-virt` can stop at
+/// EL2. `root` is then TTBR1_EL2 when the kernel runs there (VHE, `HCR_EL2.E2H`
+/// set), or TTBR0_EL2 when EL2 holds only KVM's hypervisor code (nVHE), which
+/// has no TTBR1_EL2; `ttbr1` is zero in that case.
+///
+/// One state the view does not mark. A vCPU of such a guest can stop while it
+/// runs a guest of the guest's own. It is at EL1 then, and the EL1 registers
+/// belong to that nested guest: their table addresses are the nested guest's
+/// intermediate physical addresses, not addresses in the RAM this VMM
+/// serves. A walk through [`GuestRam`] from them reads the wrong memory.
 #[derive(Default, Clone, Copy)]
 pub struct RegsView {
-    /// Translation-base register: TTBR1_EL1 (arm64) or CR3 (x86-64).
+    /// Translation-base register: TTBR1_EL1 (arm64) or CR3 (x86-64). At EL2
+    /// under VHE, TTBR1_EL2. At EL2 under nVHE, TTBR0_EL2: the table of KVM's
+    /// hypervisor code, whose virtual addresses are its own (hyp VA space),
+    /// not the kernel's.
     pub root: u64,
     pub pc: u64,
     pub cpsr: u64,
     pub ttbr0: u64,
     pub ttbr1: u64,
     pub sctlr: u64,
+    /// The stack pointer of the level the vCPU stopped at: SP_EL1, or SP_EL2.
     pub sp_el1: u64,
-    /// Translation control: TCR_EL1 (arm64), naming the granule and address
+    /// Translation control: TCR_EL1 on arm64, naming the granule and address
     /// size an out-of-VMM walker needs to size the page tables rather than
-    /// assume a layout. Zero on x86-64.
+    /// assume a layout. Zero on x86-64. At EL2 it is TCR_EL2, which under
+    /// nVHE has the single-range layout: only T0SZ, TG0 and PS mean what they
+    /// do in TCR_EL1; the TTBR1 fields are not there.
     pub tcr: u64,
     /// The task the vCPU is running: `SP_EL0` on arm64 (Linux keeps `current`
     /// there while in the kernel), from which a walker recovers the KASLR slide
-    /// by climbing `real_parent` to `init_task`. Zero on x86-64.
+    /// by climbing `real_parent` to `init_task`. Zero on x86-64. At EL2 under
+    /// nVHE it means nothing: KVM's hypervisor code does not keep `current`
+    /// there, and the value is whatever EL1 last left.
     pub current_task: u64,
 }
 

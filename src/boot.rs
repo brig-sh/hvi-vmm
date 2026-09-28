@@ -31,7 +31,7 @@ use linux_loader::loader::pe::{arm64_image_header, load_dtb, PE};
 use linux_loader::loader::KernelLoader;
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryBackend};
 
-use crate::fdt::{self, VirtioDevices};
+use crate::fdt::{self, Options, VirtioDevices};
 use crate::layout::{GicLayout, GuestLayout, RAM_BASE};
 
 /// arm64 `Image` magic, "ARM\x64" read as a little-endian `u32`.
@@ -121,10 +121,16 @@ impl LoadedKernel {
     /// so the blob is built twice, once with a provisional slot and again at
     /// the settled layout.
     ///
+    /// Every call draws a fresh `/chosen/rng-seed` from the host's entropy
+    /// source. Nothing keeps it: the only copy is in the returned blob.
+    ///
     /// # Errors
     ///
-    /// Errors when the images do not fit in RAM or the devicetree cannot be
-    /// built.
+    /// Errors when the images do not fit in RAM, the host gives no entropy,
+    /// or the devicetree cannot be built.
+    // Every argument is a separate input to `fdt::build`; bundling them into
+    // a struct would only move the list.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan(
         self,
         ram_size: u64,
@@ -133,7 +139,9 @@ impl LoadedKernel {
         num_cpus: u32,
         cmdline: &str,
         devices: VirtioDevices,
+        options: Options,
     ) -> Result<Plan, String> {
+        let seed = rng_seed()?;
         let provisional = GuestLayout::new(
             ram_size,
             self.addr,
@@ -141,8 +149,16 @@ impl LoadedKernel {
             PROVISIONAL_DTB_SIZE,
             initrd_size,
         );
-        let dtb = fdt::build(&provisional, gic, num_cpus, cmdline, devices)
-            .map_err(|e| format!("building the devicetree: {e}"))?;
+        let dtb = fdt::build(
+            &provisional,
+            gic,
+            num_cpus,
+            cmdline,
+            devices,
+            options,
+            &seed,
+        )
+        .map_err(|e| format!("building the devicetree: {e}"))?;
         let layout = GuestLayout::new(
             ram_size,
             self.addr,
@@ -150,11 +166,32 @@ impl LoadedKernel {
             dtb.len() as u64,
             initrd_size,
         );
-        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices)
+        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices, options, &seed)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         layout.validate()?;
         Ok(Plan { layout, dtb })
     }
+}
+
+/// Fresh bytes for the guest's `/chosen/rng-seed`, from the host's CSPRNG.
+///
+/// # Errors
+///
+/// Errors when `getentropy` fails, which a host with a working kernel RNG
+/// does not do. A boot without a seed is refused over one with a guessable
+/// seed: the guest kernel would credit whatever it is given.
+fn rng_seed() -> Result<[u8; fdt::RNG_SEED_LEN], String> {
+    let mut seed = [0u8; fdt::RNG_SEED_LEN];
+    // SAFETY: `getentropy` writes at most `len` bytes (<= 256, which it
+    // requires) into the buffer it is given, and `seed` is that long.
+    let rc = unsafe { libc::getentropy(seed.as_mut_ptr().cast(), seed.len()) };
+    if rc != 0 {
+        return Err(format!(
+            "reading host entropy for the guest's rng-seed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(seed)
 }
 
 /// The settled layout and the devicetree that describes it.
@@ -192,10 +229,19 @@ impl Payload<'_> {
         gic: &GicLayout,
         num_cpus: u32,
         devices: VirtioDevices,
+        options: Options,
     ) -> Result<GuestLayout, String> {
         let kernel = LoadedKernel::load(mem, self.kernel)?;
         let initrd_size = self.initramfs.map_or(0, |v| v.len() as u64);
-        let plan = kernel.plan(ram_size, initrd_size, gic, num_cpus, self.cmdline, devices)?;
+        let plan = kernel.plan(
+            ram_size,
+            initrd_size,
+            gic,
+            num_cpus,
+            self.cmdline,
+            devices,
+            options,
+        )?;
         write_dtb(mem, plan.layout.dtb_addr, &plan.dtb)?;
         if let Some(initramfs) = self.initramfs {
             mem.get_slice(GuestAddress(plan.layout.initrd_addr), initramfs.len())
@@ -333,6 +379,7 @@ mod tests {
                 2,
                 "console=ttyAMA0",
                 VirtioDevices::default(),
+                Options::default(),
             )
             .expect("plan");
         assert_eq!(layout.dtb_addr, RAM_BASE + 0x40_0000);
@@ -347,7 +394,8 @@ mod tests {
                     &GicLayout::QEMU_VIRT,
                     1,
                     "",
-                    VirtioDevices::default()
+                    VirtioDevices::default(),
+                    Options::default(),
                 )
                 .is_err(),
             "a kernel larger than RAM does not fit"
@@ -370,6 +418,7 @@ mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             VirtioDevices::default(),
+            Options::default(),
         )
         .expect("load");
         assert_eq!(layout.kernel_addr, RAM_BASE);
@@ -384,5 +433,34 @@ mod tests {
             0xd00d_feed_u32.swap_bytes(),
             "the devicetree header magic sits at dtb_addr"
         );
+    }
+
+    /// A boot's devicetree carries 64 bytes of seed that are not all zero,
+    /// and the next boot's are different: nothing is cached across plans.
+    #[test]
+    fn every_plan_draws_a_fresh_rng_seed() {
+        let kernel = LoadedKernel {
+            addr: RAM_BASE,
+            size: 0x40_0000,
+        };
+        let seed = || {
+            let Plan { dtb, .. } = kernel
+                .plan(
+                    512 << 20,
+                    0,
+                    &GicLayout::QEMU_VIRT,
+                    1,
+                    "",
+                    VirtioDevices::default(),
+                    Options::default(),
+                )
+                .expect("plan");
+            crate::fdt::tests::prop(&dtb, "chosen", "rng-seed").expect("rng-seed in /chosen")
+        };
+        let (first, second) = (seed(), seed());
+        assert_eq!(first.len(), fdt::RNG_SEED_LEN);
+        assert!(first.iter().any(|&b| b != 0), "an all-zero seed");
+        assert!(second.iter().any(|&b| b != 0), "an all-zero seed");
+        assert_ne!(first, second, "two boots got the same seed");
     }
 }

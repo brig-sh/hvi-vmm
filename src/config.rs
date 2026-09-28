@@ -194,6 +194,19 @@ pub struct BootConfig {
     /// irreversible, and the backend logs which one it installed, so this is
     /// never a silent "sandboxed" claim on a host that is not.
     pub sandbox: bool,
+    /// Give the guest EL2, so its kernel can run KVM and host guests of its
+    /// own. Off by default. macOS only: Hypervisor.framework offers EL2 on
+    /// Apple silicon from macOS 15 where the chip supports it, and the boot
+    /// fails with a plain error where it does not.
+    ///
+    /// What changes for observation: the guest kernel is entered at EL2. It
+    /// either stays there (VHE) or drops to EL1 and leaves KVM's hypervisor
+    /// code at EL2 (nVHE, which is what Hypervisor.framework offered on the
+    /// hosts tried). Any VM the guest starts lives inside guest RAM, and its
+    /// CPUs are the guest's vCPUs running guest code. The VMM's devices,
+    /// event ledger and plugins see the outer guest only; nothing the nested
+    /// guest does is visible to them except as work the outer guest does.
+    pub nested_virt: bool,
 }
 
 /// Why the run stopped.

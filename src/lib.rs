@@ -47,6 +47,8 @@ pub mod boot;
 /// x86-64 `bzImage` parse, boot params and the protected-mode entry.
 #[cfg(target_arch = "x86_64")]
 pub mod boot_x86;
+/// What the host lets a guest do, asked without booting one (`hvi caps`).
+pub mod caps;
 /// Backend-independent boot configuration and result types.
 pub mod config;
 /// arm64 exception syndrome decoding.

@@ -13,11 +13,15 @@ Usage:
     tools/mk-initramfs.py [--out target/initramfs.cpio]
                           [--alpine-version 3.20.10] [--cache <dir>]
                           [--keep-alive SECS] [--net-static ADDR/PLEN,GW]
+                          [--run SCRIPT]
 
 --keep-alive replaces the shell with a "HVI-INITRAMFS-UP" line, a sleep of
 SECS and a power-off, for an unattended run such as CI. --net-static replaces
 the eth0 block with a static address, a default route via GW and three pings
 of it, for a tap boot where GW is the host side of the tap. CI uses both.
+--run copies SCRIPT into the image as /run.sh and runs it where the shell
+would be, then powers off: an unattended run that has to check something from
+inside the guest (the nested-virtualization boot looks for /dev/kvm).
 
 The tarball is fetched once and cached (default: alongside --out).
 """
@@ -60,6 +64,12 @@ fi
 # console with no input would simply block forever.
 KEEP_ALIVE_TAIL = b"""/bin/busybox echo "HVI-INITRAMFS-UP"
 /bin/busybox sleep %d
+/bin/busybox poweroff -f
+"""
+
+# The same init, with the shell replaced by a caller's script (--run).
+RUN_TAIL = b"""/bin/busybox echo "HVI-INITRAMFS-UP"
+/bin/busybox sh /run.sh
 /bin/busybox poweroff -f
 """
 
@@ -128,7 +138,7 @@ class CpioWriter:
         return bytes(self.buf)
 
 
-def build(tar_bytes, keep_alive=None, net_static=None):
+def build(tar_bytes, keep_alive=None, net_static=None, run=None):
     cpio = CpioWriter()
     seen_dirs = set()
 
@@ -172,6 +182,10 @@ def build(tar_bytes, keep_alive=None, net_static=None):
         # Replace everything from the interactive shell onwards.
         head = init.split(b"# Interactive shell on the console")[0]
         init = head + KEEP_ALIVE_TAIL % keep_alive
+    elif run is not None:
+        head = init.split(b"# Interactive shell on the console")[0]
+        init = head + RUN_TAIL
+        cpio.add("run.sh", S_IFREG | 0o755, run)
     cpio.add("init", S_IFREG | 0o755, init)
     return cpio.finish()
 
@@ -195,7 +209,19 @@ def main():
         "ADDR/PLEN, route via GW, and ping GW a few times (for the CI tap "
         "boot, where GW is the host side of the tap)",
     )
+    ap.add_argument(
+        "--run",
+        metavar="SCRIPT",
+        help="run unattended: copy SCRIPT into the image as /run.sh and run "
+        "it in place of the interactive shell, then power off",
+    )
     args = ap.parse_args()
+    if args.run is not None and args.keep_alive is not None:
+        ap.error("--run and --keep-alive both replace the shell; pick one")
+    run = None
+    if args.run is not None:
+        with open(args.run, "rb") as f:
+            run = f.read()
 
     ver = args.alpine_version
     branch = "v" + ".".join(ver.split(".")[:2])
@@ -217,7 +243,7 @@ def main():
 
         tar_bytes = gzip.decompress(f.read())
 
-    out = build(tar_bytes, args.keep_alive, args.net_static)
+    out = build(tar_bytes, args.keep_alive, args.net_static, run)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(out)

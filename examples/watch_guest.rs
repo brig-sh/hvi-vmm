@@ -202,6 +202,7 @@ mod watcher {
             agent_sock: None,
             plugin: Some(Arc::new(WatchGuest::new())),
             sandbox: true,
+            nested_virt: false,
         };
 
         let stop = hvi::machine::boot(cfg)?;
