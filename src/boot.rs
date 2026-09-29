@@ -121,8 +121,9 @@ impl LoadedKernel {
     /// so the blob is built twice, once with a provisional slot and again at
     /// the settled layout.
     ///
-    /// Every call draws a fresh `/chosen/rng-seed` from the host's entropy
-    /// source. Nothing keeps it: the only copy is in the returned blob.
+    /// Every call draws a fresh `/chosen/rng-seed` and `/chosen/kaslr-seed`
+    /// from the host's entropy source. Nothing keeps them: the only copy is in
+    /// the returned blob.
     ///
     /// # Errors
     ///
@@ -137,7 +138,8 @@ impl LoadedKernel {
         cmdline: &str,
         devices: VirtioDevices,
     ) -> Result<Plan, String> {
-        let seed = rng_seed()?;
+        let seed = host_entropy::<{ fdt::RNG_SEED_LEN }>("rng-seed")?;
+        let kaslr_seed = u64::from_ne_bytes(host_entropy("kaslr-seed")?);
         let provisional = GuestLayout::new(
             ram_size,
             self.addr,
@@ -145,8 +147,16 @@ impl LoadedKernel {
             PROVISIONAL_DTB_SIZE,
             initrd_size,
         );
-        let dtb = fdt::build(&provisional, gic, num_cpus, cmdline, devices, &seed)
-            .map_err(|e| format!("building the devicetree: {e}"))?;
+        let dtb = fdt::build(
+            &provisional,
+            gic,
+            num_cpus,
+            cmdline,
+            devices,
+            &seed,
+            kaslr_seed,
+        )
+        .map_err(|e| format!("building the devicetree: {e}"))?;
         let layout = GuestLayout::new(
             ram_size,
             self.addr,
@@ -154,14 +164,15 @@ impl LoadedKernel {
             dtb.len() as u64,
             initrd_size,
         );
-        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices, &seed)
+        let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices, &seed, kaslr_seed)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         layout.validate()?;
         Ok(Plan { layout, dtb })
     }
 }
 
-/// Fresh bytes for the guest's `/chosen/rng-seed`, from the host's CSPRNG.
+/// Returns `N` fresh bytes from the host's CSPRNG for the `/chosen` seed
+/// named `what`.
 ///
 /// Linux reads them with `getrandom`, which the `libc` crate declares for
 /// both glibc and musl. macOS reads them with `getentropy`.
@@ -169,10 +180,9 @@ impl LoadedKernel {
 /// # Errors
 ///
 /// Errors when the host call fails, which a host with a working kernel RNG
-/// does not do. A boot without a seed is refused over one with a guessable
-/// seed: the guest kernel would credit whatever it is given.
-fn rng_seed() -> Result<[u8; fdt::RNG_SEED_LEN], String> {
-    const N: usize = fdt::RNG_SEED_LEN;
+/// does not do for `N` up to 256. A boot without a seed is refused over one
+/// with a guessable seed: the guest kernel would credit whatever it is given.
+fn host_entropy<const N: usize>(what: &str) -> Result<[u8; N], String> {
     let mut seed = [0u8; N];
     // `getrandom` fails with EINTR only while it waits for the host's CRNG,
     // and each pass blocks in the kernel, so the retry does not spin.
@@ -189,7 +199,7 @@ fn rng_seed() -> Result<[u8; fdt::RNG_SEED_LEN], String> {
     let ok = unsafe { libc::getentropy(seed.as_mut_ptr().cast(), N) } == 0;
     if !ok {
         return Err(format!(
-            "reading host entropy for the guest's rng-seed: {}",
+            "reading host entropy for the guest's {what}: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -425,15 +435,14 @@ mod tests {
         );
     }
 
-    /// A boot's devicetree carries 64 bytes of seed that are not all zero,
-    /// and the next boot's are different: nothing is cached across plans.
+    // A zero kaslr-seed reads as no seed, and the kernel boots without KASLR.
     #[test]
-    fn every_plan_draws_a_fresh_rng_seed() {
+    fn every_plan_draws_fresh_seeds() {
         let kernel = LoadedKernel {
             addr: RAM_BASE,
             size: 0x40_0000,
         };
-        let seed = || {
+        let seeds = || {
             let Plan { dtb, .. } = kernel
                 .plan(
                     512 << 20,
@@ -444,12 +453,17 @@ mod tests {
                     VirtioDevices::default(),
                 )
                 .expect("plan");
-            crate::fdt::tests::prop(&dtb, "chosen", "rng-seed").expect("rng-seed in /chosen")
+            let prop = |name: &str| crate::fdt::tests::prop(&dtb, "chosen", name).expect(name);
+            (prop("rng-seed"), prop("kaslr-seed"))
         };
-        let (first, second) = (seed(), seed());
-        assert_eq!(first.len(), fdt::RNG_SEED_LEN);
-        assert!(first.iter().any(|&b| b != 0), "an all-zero seed");
-        assert!(second.iter().any(|&b| b != 0), "an all-zero seed");
-        assert_ne!(first, second, "two boots got the same seed");
+        let (first, second) = (seeds(), seeds());
+        for (rng, kaslr) in [&first, &second] {
+            assert_eq!(rng.len(), fdt::RNG_SEED_LEN);
+            assert!(rng.iter().any(|&b| b != 0), "an all-zero rng-seed");
+            assert_eq!(kaslr.len(), 8);
+            assert_ne!(kaslr[..], [0; 8], "a zero kaslr-seed");
+        }
+        assert_ne!(first.0, second.0, "two boots got the same rng-seed");
+        assert_ne!(first.1, second.1, "two boots got the same kaslr-seed");
     }
 }

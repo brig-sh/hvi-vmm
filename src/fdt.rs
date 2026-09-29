@@ -56,8 +56,9 @@ pub struct VirtioDevices {
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
 /// command line. When `layout.initrd_size` is non-zero, `/chosen` gets the
-/// initramfs range. `rng_seed` goes into `/chosen/rng-seed` as it is; the
-/// caller supplies fresh bytes for every boot.
+/// initramfs range. `rng_seed` and `kaslr_seed` go into `/chosen/rng-seed`
+/// and `/chosen/kaslr-seed` as they are; the caller draws both fresh for
+/// every boot.
 ///
 /// # Errors
 ///
@@ -70,6 +71,7 @@ pub fn build(
     bootargs: &str,
     devices: VirtioDevices,
     rng_seed: &[u8; RNG_SEED_LEN],
+    kaslr_seed: u64,
 ) -> Result<Vec<u8>, Error> {
     let mut fdt = FdtWriter::new()?;
 
@@ -96,6 +98,10 @@ pub fn build(
     // credits it (random.trust_bootloader), and overwrites the property in
     // its copy of the blob, so the bytes do not stay in guest RAM.
     fdt.property("rng-seed", rng_seed)?;
+    // The arm64 kernel takes its KASLR offset only from this property or from
+    // RNDR, which an HVF guest does not have and a KVM guest has only on a
+    // host with FEAT_RNG. The kernel zeroes the property when it uses it.
+    fdt.property_u64("kaslr-seed", kaslr_seed)?;
     fdt.end_node(chosen)?;
 
     // /memory
@@ -237,6 +243,7 @@ pub(crate) mod tests {
 
     /// A fixed seed, so a test blob is the same every run.
     const SEED: [u8; RNG_SEED_LEN] = [0xa5; RNG_SEED_LEN];
+    const KASLR_SEED: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 
     fn sample_layout(initrd: u64) -> GuestLayout {
         GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, initrd)
@@ -252,6 +259,7 @@ pub(crate) mod tests {
             "earlycon=pl011,0x09000000",
             VirtioDevices::default(),
             &SEED,
+            KASLR_SEED,
         )
         .unwrap();
         // FDT magic 0xd00dfeed, big-endian, at the front of the header.
@@ -271,6 +279,7 @@ pub(crate) mod tests {
             "console=ttyAMA0",
             VirtioDevices::default(),
             &SEED,
+            KASLR_SEED,
         )
         .unwrap();
         assert_eq!(&blob[0..4], &[0xd0, 0x0d, 0xfe, 0xed]);
@@ -286,6 +295,7 @@ pub(crate) mod tests {
             "",
             VirtioDevices::default(),
             &SEED,
+            KASLR_SEED,
         )
         .unwrap();
         let present = build(
@@ -298,6 +308,7 @@ pub(crate) mod tests {
                 ..VirtioDevices::default()
             },
             &SEED,
+            KASLR_SEED,
         )
         .unwrap();
         let first = format!("virtio_mmio@{:x}", crate::layout::VIRTIO_FS_BASE);
@@ -328,6 +339,7 @@ pub(crate) mod tests {
             "",
             VirtioDevices::default(),
             &SEED,
+            KASLR_SEED,
         )
         .unwrap();
         assert!(contains(&v3, "arm,gic-v3"));
@@ -340,6 +352,7 @@ pub(crate) mod tests {
             "",
             VirtioDevices::default(),
             &SEED,
+            KASLR_SEED,
         )
         .unwrap();
         assert!(contains(&v2, "arm,cortex-a15-gic"));
@@ -352,7 +365,7 @@ pub(crate) mod tests {
     fn v2_reg_describes_dist_and_cpu_interface() {
         let l = sample_layout(0);
         let g = GicLayout::QEMU_VIRT_V2;
-        let blob = build(&l, &g, 1, "", VirtioDevices::default(), &SEED).unwrap();
+        let blob = build(&l, &g, 1, "", VirtioDevices::default(), &SEED, KASLR_SEED).unwrap();
         let mut want = Vec::new();
         for v in [g.gicd_base, g.gicd_size, g.gicr_base, g.gicr_size] {
             want.extend_from_slice(&v.to_be_bytes());
@@ -406,8 +419,29 @@ pub(crate) mod tests {
             "",
             VirtioDevices::default(),
             &seed,
+            KASLR_SEED,
         )
         .unwrap();
         assert_eq!(prop(&blob, "chosen", "rng-seed").unwrap(), seed);
+    }
+
+    // Big-endian, as every devicetree cell is; the kernel reads it with
+    // fdt64_to_cpu.
+    #[test]
+    fn chosen_carries_the_kaslr_seed() {
+        let blob = build(
+            &sample_layout(0),
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+            0x0123_4567_89ab_cdef,
+        )
+        .unwrap();
+        assert_eq!(
+            prop(&blob, "chosen", "kaslr-seed").unwrap(),
+            0x0123_4567_89ab_cdef_u64.to_be_bytes()
+        );
     }
 }
