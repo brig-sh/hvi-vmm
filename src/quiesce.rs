@@ -90,22 +90,27 @@ impl Quiesce {
         self.requested.store(true, Ordering::Release);
     }
 
-    /// Waits until `n` vCPUs have parked. Returns `false` on timeout, meaning
-    /// the guest is *not* fully quiesced and any snapshot taken now is
-    /// best-effort.
+    /// Waits until `n` vCPUs have parked, for at most `PARK_TIMEOUT`.
+    ///
+    /// Returns `false` on timeout, meaning the guest is *not* fully quiesced
+    /// and any snapshot taken now is best-effort.
     pub fn wait_for(&self, n: u32) -> bool {
+        self.wait_for_within(n, PARK_TIMEOUT)
+    }
+
+    /// Waits until `n` vCPUs have parked, for at most `timeout`.
+    fn wait_for_within(&self, n: u32, timeout: Duration) -> bool {
         if n == 0 {
             return true;
         }
-        let mut parked = self.parked.lock().unwrap();
-        while *parked < n {
-            let (next, timeout) = self.cv.wait_timeout(parked, PARK_TIMEOUT).unwrap();
-            parked = next;
-            if timeout.timed_out() {
-                return *parked >= n;
-            }
-        }
-        true
+        let parked = self.parked.lock().unwrap();
+        // One deadline covers the whole wait. Each vCPU that parks notifies,
+        // and those wakeups must not extend it.
+        let (parked, _) = self
+            .cv
+            .wait_timeout_while(parked, timeout, |parked| *parked < n)
+            .unwrap();
+        *parked >= n
     }
 
     /// Releases the quiesce and wakes every parked vCPU.
@@ -122,6 +127,7 @@ impl Quiesce {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Instant;
 
     /// A quiesce with nothing to wait for completes immediately.
     #[test]
@@ -182,5 +188,36 @@ mod tests {
         q.request();
         assert!(!q.wait_for(1), "expected a timeout with no parked threads");
         q.release();
+    }
+
+    // Each vCPU that parks wakes the requester, and a timeout taken per wakeup
+    // starts again at each one. The wakeups here come every 5 ms, so such a
+    // wait lasts until they stop.
+    #[test]
+    fn wait_for_keeps_one_deadline_across_wakeups() {
+        let q = Arc::new(Quiesce::new());
+        q.request();
+        let stop = Arc::new(AtomicBool::new(false));
+        let waker = {
+            let (q, stop) = (Arc::clone(&q), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(2) {
+                    drop(q.parked.lock().unwrap());
+                    q.cv.notify_all();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let started = Instant::now();
+        let parked = q.wait_for_within(1, Duration::from_millis(100));
+        let waited = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        waker.join().unwrap();
+        q.release();
+
+        assert!(!parked, "expected a timeout with no parked threads");
+        assert!(waited < Duration::from_secs(1), "the wait took {waited:?}");
     }
 }
