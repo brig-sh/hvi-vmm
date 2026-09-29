@@ -664,6 +664,9 @@ thread_local! {
     /// and is readable there, and it costs the other vCPU threads nothing.
     static LAST_EXIT: std::cell::Cell<Option<ExitReason>> =
         const { std::cell::Cell::new(None) };
+
+    /// The handle id of this thread's vCPU, so a kick can leave it out.
+    static OWN_VCPU: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// What this thread's vCPU last exited for, if it has run at all.
@@ -690,6 +693,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // first: the VM is stopped while this vCPU still exists, and its
     // destruction is outside the stop.
     let _stop = StopOnDrop { sh: &sh };
+    OWN_VCPU.with(|own| own.set(Some(vcpu.id())));
     let _ = vcpu.set_trap_debug_exceptions(false);
     let _ = vcpu.set_trap_debug_reg_accesses(false);
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
@@ -1521,10 +1525,20 @@ fn spawn_input_thread(
     })
 }
 
-/// Kicks every registered vCPU out of `run()`.
+/// Kicks every registered vCPU out of `run()`, except the calling thread's
+/// own.
 fn kick_all(vm: &VmGic, handles: &Arc<Mutex<Vec<VcpuHandle>>>) {
-    if let Ok(h) = handles.lock() {
-        let _ = vm.vcpus_exit(h.as_slice());
+    // A cancel a vCPU sends itself stays pending and ends its next run before
+    // the guest ran, so a plugin that kicked from `safepoint` would run again
+    // at once.
+    let own = OWN_VCPU.with(std::cell::Cell::get);
+    if let Ok(handles) = handles.lock() {
+        let others: Vec<VcpuHandle> = handles
+            .iter()
+            .filter(|handle| Some(handle.id()) != own)
+            .cloned()
+            .collect();
+        let _ = vm.vcpus_exit(&others);
     }
 }
 
