@@ -211,6 +211,12 @@ every boot. Under HVF it is the guest's only entropy source at boot, since the
 guest has no RNDR and no SMCCC TRNG. Under KVM, KVM serves the TRNG call too.
 Linux credits the seed and overwrites the property in its in-RAM blob.
 
+An 8-byte `kaslr-seed` is drawn the same way. The arm64 kernel takes its KASLR
+offset only from it or from RNDR, which an HVF guest does not have and a KVM
+guest has only on a host with FEAT_RNG. Without it the kernel logs `KASLR
+disabled due to lack of seed`. When KASLR is on, the kernel zeroes the property
+once it has read it.
+
 The `/apb-pclk` node is load-bearing rather than decorative: the PL011 node's
 `clocks` property points at it twice, and the `amba-pl011` driver needs that
 to bind.
