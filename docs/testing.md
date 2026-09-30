@@ -23,9 +23,10 @@ skipped so a run with a skip never reports a bare `ok`.
 
 Always runs: `tools/tidy.sh --check` and `cargo test`.
 
-Skipped when its tool is missing, and named: the aarch64 cross-lint (needs the
-rustup target), `cargo deny check`, the workflow lint (actionlint and
-shellcheck), and the spell check (typos).
+Skipped when its tool is missing, and named: the three cross-lints, for
+aarch64 glibc and for x86-64 and aarch64 musl (each needs its rustup target),
+`cargo deny check`, the workflow lint (actionlint and shellcheck), and the
+spell check (typos).
 
 One skip it does not count: `tools/tidy.sh` drops the comment-reflow pass when
 the nightly pinned in `pins.env` is not installed. It says so on stderr, and
@@ -60,6 +61,8 @@ Where it actually runs in CI:
 | x86-64 Linux (`ubuntu-latest`) | The full suite. On a push to `main` it runs once under `cargo llvm-cov` instead, and the profile goes to Codecov, which is what the coverage badge reads. |
 | macOS 15 | The full suite, including the macOS backend and virtio-fs. |
 | arm64 Linux | The full suite in the release profile, on both self-hosted arm64/KVM runners, reusing the live boot's build. |
+| x86-64 Linux, musl (`ubuntu-latest`) | The full suite for `x86_64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
+| arm64 Linux, musl (`ubuntu-24.04-arm`) | The full suite for `aarch64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 
 `src/machine_x86.rs` has unit tests and they run on `ubuntu-latest`, so the
 x86-64/KVM backend is unit-tested. `src/machine_linux.rs` has none.
@@ -75,10 +78,11 @@ hvi seccomp-selftest    # Linux
 ```
 
 Neither needs a hypervisor or privileges, so a hosted runner that cannot boot
-a guest can still fail a bad profile or a bad list. CI runs the seccomp one on
-hosted x86 Linux, the Seatbelt one on hosted macOS, and the aarch64 seccomp
-one on the self-hosted arm64 runners, which is the only place that list is
-exercised rather than merely compiled.
+a guest can still fail a bad profile or a bad list. CI runs the Seatbelt one
+on hosted macOS, and the seccomp one on hosted x86 Linux, on both hosted musl
+builds and on the self-hosted arm64 runners. The aarch64 list runs on the
+hosted arm64 musl build, and the self-hosted runners are the only place it
+runs on the glibc build.
 
 The macOS job asserts the success line, so a change of runner image cannot
 quietly turn the step into a no-op.

@@ -7,8 +7,9 @@ description: >-
 inputs:
   target:
     description: >-
-      Extra rustup target to install, for the cross compile-check of a backend
-      that has no runner (for example aarch64-unknown-linux-gnu). Empty
+      Extra rustup target to install, for a job that lints or builds for a
+      target other than the runner's own: a backend with no runner
+      (aarch64-unknown-linux-gnu), or another libc (the musl targets). Empty
       installs nothing beyond the host target.
     required: false
     default: ""
