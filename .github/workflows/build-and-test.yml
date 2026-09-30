@@ -105,6 +105,27 @@ jobs:
       - name: selftest
         run: ./target/x86_64-unknown-linux-musl/release/hvi seccomp-selftest
 
+  # The arm64/KVM backend against musl, on a hosted arm64 runner: the same
+  # build, unit suite and seccomp selftest as the x86-64 job above. Each
+  # architecture has its own allowlist and its own backend code, so one musl
+  # build does not stand in for the other. It needs no /dev/kvm either.
+  test-linux-musl-arm64:
+    name: Test linux/musl (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: aarch64-unknown-linux-musl
+          cache-key: aarch64-musl
+      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - run: cargo test --target aarch64-unknown-linux-musl
+      - name: selftest
+        run: ./target/aarch64-unknown-linux-musl/release/hvi seccomp-selftest
+
   # macOS / Apple silicon backend: Hypervisor.framework build and unit tests,
   # plus the ad-hoc signing step, since an unsigned binary cannot create a VM.
   # A live boot additionally needs a host that can actually call
@@ -645,15 +666,15 @@ jobs:
           cache-key: linux-arm64-${{ matrix.runner }}
       - name: build
         run: cargo build --release
-      # The hosted test job has 4 KiB pages. Guest-memory mapping constraints
+      # The hosted test jobs have 4 KiB pages. Guest-memory mapping constraints
       # follow the host page size, and these runners are where another size
       # appears in CI, so the suite runs here too. `--release` reuses the
       # build above.
       - name: unit suite
         run: cargo test --release
-      # The aarch64 allowlist is a different file from the x86 one, and the
-      # hosted seccomp job cannot run it. This is the only place it is
-      # exercised rather than merely compiled.
+      # The aarch64 allowlist is a different file from the x86 one. The hosted
+      # arm64 musl job runs it on the static musl binary. This is the only place
+      # it runs on the glibc build, and where another page size appears.
       - name: seccomp filters (aarch64)
         run: ./target/release/hvi seccomp-selftest
       - name: guest kernel

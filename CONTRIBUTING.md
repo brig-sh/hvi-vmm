@@ -18,12 +18,13 @@ toolchain the script says so and skips that pass, and CI catches what you
 missed.
 
 `tools/gates.sh` runs the CI checks a developer machine can run, in one
-command: `tidy.sh --check`, the aarch64 cross-lint, `cargo test`, `cargo deny
-check`, the workflow lint and the spell check. `tidy.sh` and `cargo test`
-always run. The other four need something the pinned toolchain does not
-supply (the `aarch64-unknown-linux-gnu` target, `cargo-deny`, `actionlint`
-plus `shellcheck`, `typos`), so each is skipped when it is missing and every
-skip it probes for is named in the closing line. One skip is not counted
+command: `tidy.sh --check`, the aarch64 cross-lint, the two musl lints, `cargo
+test`, `cargo deny check`, the workflow lint and the spell check. `tidy.sh` and
+`cargo test` always run. The rest need something the pinned toolchain does not
+supply (the `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` targets, `cargo-deny`, `actionlint` plus
+`shellcheck`, `typos`), so each is skipped when it is missing and every skip it
+probes for is named in the closing line. One skip is not counted
 there: `tidy.sh` drops the comment-reflow pass when the pinned nightly is
 missing, says so on stderr, and `gates.sh` still prints `ok`. Install that
 nightly, or CI finds what you missed. `--with-perf` adds the virtio-fs performance
@@ -42,6 +43,10 @@ tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
 
 `--lint-only` skips the fmt and reflow passes, which are target-independent
 anyway, and runs just clippy and rustdoc for that target.
+
+The musl lints work the same way, with `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl`. `tools/gates.sh` runs each cross-lint whose
+target is installed.
 
 The toolchain is pinned in `rust-toolchain.toml`, so everyone lints against the
 same compiler. `rust-version` in `Cargo.toml` (1.77) is a different thing: the
@@ -134,11 +139,12 @@ the same reusable ones.
 - **validate-code**: `tools/tidy.sh --check` on x86 Linux, which owns
   formatting for the whole tree because rustfmt does not evaluate `cfg` and so
   reaches modules that runner cannot build. Then clippy and rustdoc for the
-  arm64/KVM backend cross-checked from the same runner and for the hvf backend
-  on `macos-15`, actionlint with shellcheck over the workflows, and
-  `cargo deny check` over the lockfile.
-- **build-and-test**: the unit suite on x86 Linux and on `macos-15`, the two
-  confinement selftests, and then the live boots on the self-hosted runners.
+  arm64/KVM backend cross-checked from the same runner, for both Linux
+  backends against musl, and for the hvf backend on `macos-15`, actionlint
+  with shellcheck over the workflows, and `cargo deny check` over the lockfile.
+- **build-and-test**: the unit suite on x86 Linux, on `macos-15`, and against
+  musl on x86-64 and arm64 Linux, the two confinement selftests, and then the
+  live boots on the self-hosted runners.
 
 `tools/gates.sh` runs everything in that list a developer machine can run.
 Three checks cannot run anywhere but CI: the other host's backend, the live
@@ -154,9 +160,9 @@ artifacts when they fail, and the two arm64 boots also upload the event
 ledger.
 
 One known gap: the arm64/KVM backend has no unit tests. `src/machine_linux.rs`
-carries no test module, and no job runs a suite on arm64 Linux, so closing the
-gap needs tests and a runner for them. This waits on a decision about the
-runner pool.
+carries no test module. The suite already runs on arm64 Linux, on the
+self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner, so closing
+the gap needs only the tests.
 
 Three scheduled workflows run outside the two entry points, each reporting
 through a tracking issue so `main` stays green: the weekly dependency audit,
