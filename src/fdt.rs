@@ -246,7 +246,7 @@ pub(crate) mod tests {
     const KASLR_SEED: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 
     fn sample_layout(initrd: u64) -> GuestLayout {
-        GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, initrd)
+        GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, initrd).unwrap()
     }
 
     #[test]

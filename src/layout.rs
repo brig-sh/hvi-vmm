@@ -184,11 +184,12 @@ impl GicLayout {
     }
 }
 
-/// Rounds `v` up to the next multiple of `align` (a power of two).
+/// Rounds `v` up to the next multiple of `align` (a power of two), or returns
+/// `None` when the result does not fit in a `u64`.
 #[must_use]
-pub fn align_up(v: u64, align: u64) -> u64 {
+pub fn align_up(v: u64, align: u64) -> Option<u64> {
     debug_assert!(align.is_power_of_two());
-    (v + align - 1) & !(align - 1)
+    Some(v.checked_add(align - 1)? & !(align - 1))
 }
 
 /// The resolved placement of the three images the loader writes into guest RAM:
@@ -220,17 +221,38 @@ impl GuestLayout {
     ///
     /// `dtb_size` may be a provisional value while the DTB is still being
     /// built.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Errors when an image would end past the end of the address space. The
+    /// kernel's size comes from its `Image` header.
     pub fn new(
         ram_size: u64,
         kernel_addr: u64,
         kernel_size: u64,
         dtb_size: u64,
         initrd_size: u64,
-    ) -> Self {
-        let dtb_addr = align_up(kernel_addr + kernel_size, Self::KERNEL_ALIGN);
-        let initrd_addr = align_up(dtb_addr + dtb_size, 0x1000);
-        GuestLayout {
+    ) -> Result<Self, String> {
+        let past_the_end = || {
+            format!(
+                "guest images run past the end of the address space \
+                 (kernel {kernel_addr:#x}+{kernel_size:#x}, dtb {dtb_size:#x}, \
+                 initrd {initrd_size:#x})"
+            )
+        };
+        let dtb_addr = kernel_addr
+            .checked_add(kernel_size)
+            .and_then(|end| align_up(end, Self::KERNEL_ALIGN))
+            .ok_or_else(past_the_end)?;
+        let initrd_addr = dtb_addr
+            .checked_add(dtb_size)
+            .and_then(|end| align_up(end, 0x1000))
+            .ok_or_else(past_the_end)?;
+        initrd_addr
+            .checked_add(initrd_size)
+            .and_then(|end| align_up(end, 0x1000))
+            .ok_or_else(past_the_end)?;
+        Ok(GuestLayout {
             ram_base: RAM_BASE,
             ram_size,
             kernel_addr,
@@ -239,7 +261,7 @@ impl GuestLayout {
             dtb_size,
             initrd_addr,
             initrd_size,
-        }
+        })
     }
 
     /// Returns the end of the initrd as advertised to the guest, rounded up
@@ -255,7 +277,13 @@ impl GuestLayout {
         if self.initrd_size == 0 {
             return self.initrd_addr;
         }
-        align_up(self.initrd_addr + self.initrd_size, 0x1000)
+        // A layout from `new` has checked this sum. One built by hand that
+        // overflows reads as the top of the address space, which `validate`
+        // refuses.
+        self.initrd_addr
+            .checked_add(self.initrd_size)
+            .and_then(|end| align_up(end, 0x1000))
+            .unwrap_or(u64::MAX)
     }
 
     /// End of the last placed image; everything below must fit in RAM.
@@ -266,7 +294,12 @@ impl GuestLayout {
 
     /// Errors if the packed images would run past the end of guest RAM.
     pub fn validate(&self) -> Result<(), String> {
-        let ram_end = self.ram_base + self.ram_size;
+        let ram_end = self.ram_base.checked_add(self.ram_size).ok_or_else(|| {
+            format!(
+                "guest RAM {:#x}+{:#x} runs past the end of the address space",
+                self.ram_base, self.ram_size
+            )
+        })?;
         if self.top() > ram_end {
             return Err(format!(
                 "guest images overflow RAM: top {:#x} > ram_end {:#x} \
@@ -291,10 +324,28 @@ mod tests {
 
     #[test]
     fn align_up_rounds() {
-        assert_eq!(align_up(0, 0x1000), 0);
-        assert_eq!(align_up(1, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1000, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1001, 0x20_0000), 0x20_0000);
+        assert_eq!(align_up(0, 0x1000), Some(0));
+        assert_eq!(align_up(1, 0x1000), Some(0x1000));
+        assert_eq!(align_up(0x1000, 0x1000), Some(0x1000));
+        assert_eq!(align_up(0x1001, 0x20_0000), Some(0x20_0000));
+        assert_eq!(align_up(u64::MAX - 0xffe, 0x1000), None);
+    }
+
+    // The kernel's size is the Image header's `image_size`. A wrapped sum
+    // places the DTB at the kernel's start, and the wrapped top passes
+    // `validate`.
+    #[test]
+    fn a_layout_past_the_end_of_the_address_space_is_refused() {
+        let wraps_to_ram = u64::MAX - 0x10_0000 + 1;
+        assert!(GuestLayout::new(512 << 20, RAM_BASE, wraps_to_ram, 0x2000, 0).is_err());
+        assert!(GuestLayout::new(512 << 20, RAM_BASE, 16 << 20, u64::MAX, 0).is_err());
+        assert!(GuestLayout::new(512 << 20, RAM_BASE, 16 << 20, 0x2000, u64::MAX).is_err());
+
+        let l = GuestLayout::new(u64::MAX, RAM_BASE, 16 << 20, 0x2000, 0).unwrap();
+        assert!(
+            l.validate().is_err(),
+            "RAM that ends past the address space"
+        );
     }
 
     // Nothing on the KVM backends catches a redistributor region laid over
@@ -360,7 +411,7 @@ mod tests {
     #[test]
     fn layout_packs_without_overlap() {
         // 512 MiB RAM, 16 MiB kernel at RAM_BASE, 8 KiB dtb, 4 MiB initrd.
-        let l = GuestLayout::new(512 << 20, RAM_BASE, 16 << 20, 0x2000, 4 << 20);
+        let l = GuestLayout::new(512 << 20, RAM_BASE, 16 << 20, 0x2000, 4 << 20).unwrap();
         assert_eq!(l.kernel_addr, RAM_BASE);
         assert!(l.dtb_addr >= l.kernel_addr + l.kernel_size);
         assert_eq!(l.dtb_addr % 0x20_0000, 0, "dtb must be 2 MiB-aligned");
@@ -372,7 +423,7 @@ mod tests {
     #[test]
     fn layout_detects_overflow() {
         // 8 MiB RAM cannot hold a 16 MiB kernel.
-        let l = GuestLayout::new(8 << 20, RAM_BASE, 16 << 20, 0x2000, 0);
+        let l = GuestLayout::new(8 << 20, RAM_BASE, 16 << 20, 0x2000, 0).unwrap();
         assert!(l.validate().is_err());
     }
 
@@ -404,7 +455,7 @@ mod tests {
     #[test]
     fn the_advertised_initrd_covers_whole_pages() {
         // A ragged length: one and three quarter pages.
-        let l = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 7168);
+        let l = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 7168).unwrap();
         assert_eq!(l.initrd_addr % 0x1000, 0, "placement is page-aligned");
         assert_eq!(l.initrd_end() % 0x1000, 0, "so is the advertised end");
         assert!(
@@ -418,7 +469,7 @@ mod tests {
         assert_eq!(l.top(), l.initrd_end(), "and RAM is checked against it");
 
         // No initrd, no range: top() must not gain a page out of nowhere.
-        let none = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 0);
+        let none = GuestLayout::new(512 << 20, 0, 16 << 20, 0x2000, 0).unwrap();
         assert_eq!(none.initrd_end(), none.initrd_addr);
     }
 
