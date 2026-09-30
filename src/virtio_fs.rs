@@ -484,6 +484,13 @@ fn clock_with_sleep() -> std::time::Duration {
 /// Listings paged through with fh 0 that the device keeps at once.
 const FH0_LISTINGS_MAX: usize = 64;
 
+/// Unix sockets one export holds for the guest at once.
+///
+/// Each socket keeps its path in host memory, and the guest decides how many
+/// it binds. A service binds one or two, so 1024 leaves room for hundreds of
+/// services.
+const SOCKETS_MAX: usize = 1024;
+
 /// Prepared listings a readahead holds unconsumed. Past this, the oldest
 /// goes.
 const READAHEAD_MAX_DIRS: usize = 256;
@@ -2471,6 +2478,10 @@ impl VirtioFs {
         if taken || self.sockets.contains_key(&path) {
             return Err(EEXIST);
         }
+        // ENFILE, as for an OPEN past the handle budget (#34).
+        if self.sockets.len() >= SOCKETS_MAX {
+            return Err(ENFILE);
+        }
         let ino = self.next_socket_ino;
         self.next_socket_ino = self.next_socket_ino.saturating_add(1);
         let socket = SocketNode {
@@ -2575,19 +2586,12 @@ impl VirtioFs {
         let path = self.child_path(parent, name)?;
         // Unlinking a socket takes it out of this device and leaves the host
         // alone, because putting it there was never part of creating it.
-        if !directory && self.sockets.remove(&path).is_some() {
-            let stale: Vec<u64> = self
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.key.0 == SOCKET_DEV && node.paths.contains(&path))
-                .map(|(id, _)| *id)
-                .collect();
-            for id in stale {
-                if let Some(node) = self.nodes.remove(&id) {
-                    self.inode_ids.remove(&node.key);
-                }
-            }
+        if !directory && self.forget_socket(&path) {
             return Ok(Vec::new());
+        }
+        // The host sees a directory that holds only sockets as empty.
+        if directory && self.holds_sockets(&path) {
+            return Err(ENOTEMPTY);
         }
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         let meta = Stat::at(dirfd, &entry)?;
@@ -2615,10 +2619,36 @@ impl VirtioFs {
         let new_name = nul_name(input, next)?;
         let old_path = self.child_path(old_parent, old_name)?;
         let new_path = self.child_path(new_parent, new_name)?;
+        let new_socket = self.sockets.contains_key(&new_path);
+        if self.sockets.contains_key(&old_path) || new_socket {
+            if flags & RENAME_EXCHANGE != 0 {
+                return Err(EOPNOTSUPP);
+            }
+            if new_socket && flags & RENAME_NOREPLACE != 0 {
+                return Err(EEXIST);
+            }
+        }
+        if self.sockets.contains_key(&old_path) {
+            return self.rename_socket(&old_path, &new_path);
+        }
         let (old_fd, old_name, new_fd, new_name) = self.two_entries_at(&old_path, &new_path)?;
         let old_meta = Stat::at(old_fd.as_fd(), &old_name)?;
         let replaced = Stat::at(new_fd.as_fd(), &new_name).ok();
+        if new_socket && old_meta.is_dir() {
+            return Err(ENOTDIR);
+        }
+        // The host sees a directory that holds only sockets as empty, and
+        // would let a rename replace it.
+        if flags & RENAME_EXCHANGE == 0
+            && replaced.is_some_and(|meta| meta.is_dir())
+            && self.holds_sockets(&new_path)
+        {
+            return Err(ENOTEMPTY);
+        }
         host_rename(old_fd.as_fd(), &old_name, new_fd.as_fd(), &new_name, flags)?;
+        if new_socket {
+            self.forget_socket(&new_path);
+        }
         // Both ends now refer to something other than they did, and for a
         // directory that is true of everything beneath them too.
         let moves_directories =
@@ -2674,38 +2704,100 @@ impl VirtioFs {
     }
 
     fn rewrite_node_paths(&mut self, old: &Path, new: &Path) {
+        let moved = |path: &Path| moved_path(path, old, new);
         for node in self.nodes.values_mut() {
             for path in &mut node.paths {
-                let Ok(suffix) = path.strip_prefix(old) else {
-                    continue;
-                };
-                *path = if suffix.as_os_str().is_empty() {
-                    new.to_owned()
-                } else {
-                    new.join(suffix)
-                };
-            }
-        }
-    }
-
-    fn exchange_node_paths(&mut self, left: &Path, right: &Path) {
-        for node in self.nodes.values_mut() {
-            for path in &mut node.paths {
-                if let Ok(suffix) = path.strip_prefix(left) {
-                    *path = if suffix.as_os_str().is_empty() {
-                        right.to_owned()
-                    } else {
-                        right.join(suffix)
-                    };
-                } else if let Ok(suffix) = path.strip_prefix(right) {
-                    *path = if suffix.as_os_str().is_empty() {
-                        left.to_owned()
-                    } else {
-                        left.join(suffix)
-                    };
+                if let Some(to) = moved(path) {
+                    *path = to;
                 }
             }
         }
+        self.move_sockets(moved);
+    }
+
+    fn exchange_node_paths(&mut self, left: &Path, right: &Path) {
+        let moved =
+            |path: &Path| moved_path(path, left, right).or_else(|| moved_path(path, right, left));
+        for node in self.nodes.values_mut() {
+            for path in &mut node.paths {
+                if let Some(to) = moved(path) {
+                    *path = to;
+                }
+            }
+        }
+        self.move_sockets(moved);
+    }
+
+    /// Renames the socket at `old` to `new`, replacing what `new` names.
+    ///
+    /// The socket has no host entry, so the device moves it. A host file at
+    /// `new` is unlinked, as a rename over it would replace it, and a host
+    /// directory there answers EISDIR. The caller has already refused
+    /// RENAME_EXCHANGE, and RENAME_NOREPLACE over another socket.
+    fn rename_socket(&mut self, old: &Path, new: &Path) -> Result<Vec<u8>, i32> {
+        if old == new {
+            return Ok(Vec::new());
+        }
+        let (dirfd, entry) = self.at_relative(&self.relative_of_path(new)?)?;
+        if let Ok(meta) = Stat::at(dirfd, &entry) {
+            if meta.is_dir() {
+                return Err(EISDIR);
+            }
+            unlink_at(dirfd, &entry, false)?;
+            self.invalidate_dirs_by_type(new, false);
+            self.forget_node_path(new, &meta);
+        }
+        self.forget_socket(new);
+        self.rewrite_node_paths(old, new);
+        Ok(Vec::new())
+    }
+
+    /// Takes the socket at `path` out of the table, with its node, and returns
+    /// whether there was one.
+    fn forget_socket(&mut self, path: &Path) -> bool {
+        if self.sockets.remove(path).is_none() {
+            return false;
+        }
+        let stale: Vec<u64> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.key.0 == SOCKET_DEV && node.paths.iter().any(|p| p == path))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(node) = self.nodes.remove(&id) {
+                self.inode_ids.remove(&node.key);
+            }
+        }
+        true
+    }
+
+    /// Returns whether any socket lies below the directory at `path`.
+    fn holds_sockets(&self, path: &Path) -> bool {
+        self.sockets
+            .keys()
+            .any(|socket| socket != path && socket.starts_with(path))
+    }
+
+    /// Rekeys every socket whose path `moved` maps to a new one.
+    ///
+    /// A socket's node records its path like any other node, and
+    /// [`Self::socket_at`] finds the socket by that path. The table has to
+    /// move with the node, or the socket is lost at its new path and still
+    /// answers a lookup at the old one.
+    fn move_sockets(&mut self, moved: impl Fn(&Path) -> Option<PathBuf>) {
+        let renamed: Vec<(PathBuf, PathBuf)> = self
+            .sockets
+            .keys()
+            .filter_map(|from| moved(from).map(|to| (from.clone(), to)))
+            .collect();
+        // All are taken out before any goes back, so an exchange cannot
+        // overwrite a socket that has yet to move.
+        let sockets: Vec<(PathBuf, SocketNode)> = renamed
+            .into_iter()
+            .filter_map(|(from, to)| self.sockets.remove(&from).map(|socket| (to, socket)))
+            .collect();
+        self.sockets.extend(sockets);
     }
 
     fn create(
@@ -6244,6 +6336,17 @@ fn path_cstring(path: &Path) -> Result<CString, i32> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)
 }
 
+/// Returns where `path` is once `from` has been renamed to `to`, or `None`
+/// when `path` is neither `from` nor below it.
+fn moved_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let suffix = path.strip_prefix(from).ok()?;
+    Some(if suffix.as_os_str().is_empty() {
+        to.to_owned()
+    } else {
+        to.join(suffix)
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn guest_uid_to_host(uid: u32) -> libc::uid_t {
     if uid == guest_uid() {
@@ -7522,6 +7625,197 @@ mod tests {
             "the socket outlived its unlink"
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Binds a socket called `name` under `parent`, and returns the status the
+    /// device answered with.
+    fn mknod_socket(dev: &mut VirtioFs, parent: u64, name: &[u8]) -> i32 {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, S_IFSOCK | 0o700);
+        put_u32(&mut payload, 0); // rdev
+        put_u32(&mut payload, 0); // umask
+        put_u32(&mut payload, 0); // padding
+        payload.extend_from_slice(name);
+        payload.push(0);
+        let out = dev.handle_fuse(&request(MKNOD, parent, &payload), 4096);
+        i32::from_le_bytes(out[4..8].try_into().unwrap())
+    }
+
+    /// Returns whether GETATTR on `node` answers with a socket.
+    fn is_socket(dev: &mut VirtioFs, node: u64) -> bool {
+        let out = dev.handle_fuse(&request(GETATTR, node, &[0u8; 16]), 4096);
+        get_u32(&out, 4) == Some(0)
+            && get_u32(&out, OUT_HEADER_LEN + 16 + 60).map(|mode| mode & S_IFMT) == Some(S_IFSOCK)
+    }
+
+    #[test]
+    fn sockets_stop_at_the_table_limit() {
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..SOCKETS_MAX {
+            let name = format!("s{i}.sock");
+            assert_eq!(mknod_socket(&mut dev, FUSE_ROOT_ID, name.as_bytes()), 0);
+        }
+        assert_eq!(mknod_socket(&mut dev, FUSE_ROOT_ID, b"extra.sock"), -ENFILE);
+        assert!(!dir.join("extra.sock").exists());
+
+        // The cap is on what is held at once, so an unlink makes room.
+        let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"s0.sock\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(mknod_socket(&mut dev, FUSE_ROOT_ID, b"extra.sock"), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_socket_moves_with_its_directory() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("run")).unwrap();
+        let run = lookup_node(&mut dev, FUSE_ROOT_ID, b"run");
+        assert_eq!(mknod_socket(&mut dev, run, b"app.sock"), 0);
+        let socket = lookup_node(&mut dev, run, b"app.sock");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        rename.extend_from_slice(b"run\0moved\0");
+        let out = dev.handle_fuse(&request(RENAME, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        assert!(is_socket(&mut dev, socket), "the socket's node lost it");
+        let moved = lookup_node(&mut dev, FUSE_ROOT_ID, b"moved");
+        assert_eq!(lookup_node(&mut dev, moved, b"app.sock"), socket);
+
+        fs::create_dir(dir.join("run")).unwrap();
+        let run = lookup_node(&mut dev, FUSE_ROOT_ID, b"run");
+        assert_eq!(
+            lookup_node(&mut dev, run, b"app.sock"),
+            0,
+            "the socket still answers at its old path"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Both directories hold a socket of the same name, so a socket moved into
+    // the other directory before that one's socket has moved out would
+    // overwrite it.
+    #[test]
+    fn sockets_trade_places_with_their_directories() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("left")).unwrap();
+        fs::create_dir(dir.join("right")).unwrap();
+        let left = lookup_node(&mut dev, FUSE_ROOT_ID, b"left");
+        let right = lookup_node(&mut dev, FUSE_ROOT_ID, b"right");
+        assert_eq!(mknod_socket(&mut dev, left, b"app.sock"), 0);
+        assert_eq!(mknod_socket(&mut dev, right, b"app.sock"), 0);
+        let left_socket = lookup_node(&mut dev, left, b"app.sock");
+        let right_socket = lookup_node(&mut dev, right, b"app.sock");
+
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        put_u32(&mut rename, RENAME_EXCHANGE);
+        put_u32(&mut rename, 0);
+        rename.extend_from_slice(b"left\0right\0");
+        let out = dev.handle_fuse(&request(RENAME2, FUSE_ROOT_ID, &rename), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        // Each directory node now sits at the other's path, with its own
+        // socket still inside.
+        assert_eq!(lookup_node(&mut dev, left, b"app.sock"), left_socket);
+        assert_eq!(lookup_node(&mut dev, right, b"app.sock"), right_socket);
+        assert!(is_socket(&mut dev, left_socket));
+        assert!(is_socket(&mut dev, right_socket));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Sends RENAME2 of `old` to `new`, both under the root, and returns the
+    /// status the device answered with.
+    fn rename_at_root(dev: &mut VirtioFs, old: &[u8], new: &[u8], flags: u32) -> i32 {
+        let mut rename = Vec::new();
+        put_u64(&mut rename, FUSE_ROOT_ID);
+        put_u32(&mut rename, flags);
+        put_u32(&mut rename, 0);
+        rename.extend_from_slice(old);
+        rename.push(0);
+        rename.extend_from_slice(new);
+        rename.push(0);
+        let out = dev.handle_fuse(&request(RENAME2, FUSE_ROOT_ID, &rename), 4096);
+        i32::from_le_bytes(out[4..8].try_into().unwrap())
+    }
+
+    // The host sees a directory that holds only sockets as empty, so the
+    // device has to refuse what the host would let through.
+    #[test]
+    fn a_directory_that_holds_a_socket_is_not_empty() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::create_dir(dir.join("run")).unwrap();
+        fs::create_dir(dir.join("other")).unwrap();
+        let run = lookup_node(&mut dev, FUSE_ROOT_ID, b"run");
+        assert_eq!(mknod_socket(&mut dev, run, b"app.sock"), 0);
+
+        let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"run\0"), 4096);
+        assert_eq!(get_u32(&out, 4).map(|e| e as i32), Some(-ENOTEMPTY));
+        assert_eq!(rename_at_root(&mut dev, b"other", b"run", 0), -ENOTEMPTY);
+        assert!(dir.join("run").is_dir() && dir.join("other").is_dir());
+
+        let out = dev.handle_fuse(&request(UNLINK, run, b"app.sock\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let out = dev.handle_fuse(&request(RMDIR, FUSE_ROOT_ID, b"run\0"), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_socket_renames_and_replaces_what_its_new_name_held() {
+        let (dir, mut dev) = fixture_with_access(true);
+        assert_eq!(mknod_socket(&mut dev, FUSE_ROOT_ID, b"a.sock"), 0);
+        let socket = lookup_node(&mut dev, FUSE_ROOT_ID, b"a.sock");
+
+        assert_eq!(rename_at_root(&mut dev, b"a.sock", b"b.sock", 0), 0);
+        assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"b.sock"), socket);
+        assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"a.sock"), 0);
+        assert!(is_socket(&mut dev, socket));
+
+        // Over a host file, the file goes; over a directory, EISDIR.
+        fs::write(dir.join("file"), b"x").unwrap();
+        fs::create_dir(dir.join("dir")).unwrap();
+        assert_eq!(rename_at_root(&mut dev, b"b.sock", b"dir", 0), -EISDIR);
+        assert_eq!(rename_at_root(&mut dev, b"b.sock", b"file", 0), 0);
+        assert!(!dir.join("file").exists());
+        assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"file"), socket);
+
+        // Another socket goes too, unless the guest asked for no replace.
+        assert_eq!(mknod_socket(&mut dev, FUSE_ROOT_ID, b"c.sock"), 0);
+        assert_eq!(
+            rename_at_root(&mut dev, b"c.sock", b"file", RENAME_NOREPLACE),
+            -EEXIST
+        );
+        assert_eq!(
+            rename_at_root(&mut dev, b"c.sock", b"file", RENAME_EXCHANGE),
+            -EOPNOTSUPP
+        );
+        let replacing = lookup_node(&mut dev, FUSE_ROOT_ID, b"c.sock");
+        assert_eq!(rename_at_root(&mut dev, b"c.sock", b"file", 0), 0);
+        assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"file"), replacing);
+        assert!(!is_socket(&mut dev, socket), "the replaced socket stayed");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A host file renamed over a socket replaces it, as it would replace a
+    // file, so the stale entry must not shadow the file at that name.
+    #[test]
+    fn a_file_renamed_over_a_socket_replaces_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        assert_eq!(mknod_socket(&mut dev, FUSE_ROOT_ID, b"app.sock"), 0);
+        fs::write(dir.join("file"), b"contents").unwrap();
+        let file = lookup_node(&mut dev, FUSE_ROOT_ID, b"file");
+
+        assert_eq!(
+            rename_at_root(&mut dev, b"file", b"app.sock", RENAME_NOREPLACE),
+            -EEXIST
+        );
+        assert_eq!(rename_at_root(&mut dev, b"file", b"app.sock", 0), 0);
+        assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"app.sock"), file);
+        assert!(!is_socket(&mut dev, file));
+        assert_eq!(fs::read(dir.join("app.sock")).unwrap(), b"contents");
         let _ = fs::remove_dir_all(dir);
     }
 
