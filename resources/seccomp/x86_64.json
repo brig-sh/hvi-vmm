@@ -15,7 +15,10 @@
             {"syscall": "close", "comment": "accepted connections, dropped descriptors"},
             {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end; the stop request; the gateway relay ending; the virtio-fs daemon connections at a stop"},
             {"syscall": "fcntl", "comment": "set_nonblocking on accepted sockets"},
-            {"syscall": "ioctl", "comment": "KVM_RUN and friends; TUNSETIFF is pre-filter; the terminal restore's TCFLSH and TCSETS"},
+            {"syscall": "ioctl", "comment": "KVM_RUN and friends; TUNSETIFF is pre-filter; the terminal restore's TCFLSH and TCSETS", "args": [
+                {"index": 1, "type": "dword", "op": "ne", "val": 21522, "comment": "TIOCSTI (0x5412), which pushes a byte into a terminal's input queue"},
+                {"index": 1, "type": "dword", "op": "ne", "val": 21532, "comment": "TIOCLINUX (0x541C), whose paste subcommand pushes the selection into a virtual console's input"}
+            ]},
             {"syscall": "accept4", "comment": "control socket and the agent bridge"},
             {"syscall": "recvfrom", "comment": "agent bridge reads; the gateway relay's non-blocking receive; the stop-signal thread's read of its wake"},
             {"syscall": "recvmsg", "comment": "safety net: the control protocol's receive side"},
@@ -57,7 +60,10 @@
         "default_action": "trap",
         "filter_action": "allow",
         "filter": [
-            {"syscall": "ioctl", "comment": "KVM_RUN, KVM_IRQ_LINE, the register reads and KVM_KVMCLOCK_CTRL; the terminal restore of the fatal-signal handler and of the panic hook"},
+            {"syscall": "ioctl", "comment": "KVM_RUN, KVM_IRQ_LINE, the register reads and KVM_KVMCLOCK_CTRL; the terminal restore of the fatal-signal handler and of the panic hook", "args": [
+                {"index": 1, "type": "dword", "op": "ne", "val": 21522, "comment": "TIOCSTI (0x5412), which pushes a byte into a terminal's input queue"},
+                {"index": 1, "type": "dword", "op": "ne", "val": 21532, "comment": "TIOCLINUX (0x541C), whose paste subcommand pushes the selection into a virtual console's input"}
+            ]},
             {"syscall": "write", "comment": "guest console bytes, the I/O trace's buffer, the ledger's stderr lines about a full buffer, the wake a vCPU thread writes as it starts and as it exits, a plugin's on_batch_end wake, and the panic hook's report"},
             {"syscall": "pread64", "comment": "virtio-blk serviced inline on an MMIO exit"},
             {"syscall": "read", "comment": "a plugin doorbell drained at the safe point; this thread already holds write and pread64, so read on an fd it inherited adds no authority"},
