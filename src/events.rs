@@ -56,6 +56,9 @@ pub enum CapturedEvent {
         dns: Option<String>,
         /// TLS SNI from a ClientHello, when the flow carried one.
         sni: Option<String>,
+        /// Whether `src` is the address DHCP leased to the guest, or `None`
+        /// while the device has seen no lease.
+        src_leased: Option<bool>,
     },
 }
 
@@ -90,6 +93,10 @@ struct BlockPayload {
 #[derive(Serialize)]
 struct NetPayload {
     five_tuple: FiveTuple,
+    /// Whether `five_tuple.src_ip` is the guest's leased address, absent while
+    /// the device has seen no lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    src_ip_leased: Option<bool>,
     direction: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     guest_initiated: Option<bool>,
@@ -224,6 +231,7 @@ impl Emitter {
                 bytes,
                 dns,
                 sni,
+                src_leased,
             } => self.emit_payload(
                 "boundary",
                 "net",
@@ -235,6 +243,7 @@ impl Emitter {
                         dst_ip: dst.to_string(),
                         dst_port: *dst_port,
                     },
+                    src_ip_leased: *src_leased,
                     direction: "egress".to_string(),
                     guest_initiated: Some(true),
                     bytes: *bytes,
@@ -305,6 +314,7 @@ mod tests {
                     dst_ip: "10.0.2.3".into(),
                     dst_port: 53,
                 },
+                src_ip_leased: Some(true),
                 direction: "egress".into(),
                 guest_initiated: Some(true),
                 bytes: 72,
@@ -314,7 +324,7 @@ mod tests {
         );
         assert_eq!(
             s,
-            r#"{"sandbox_id":"vm1","ts":1,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":40000,"dst_ip":"10.0.2.3","dst_port":53},"direction":"egress","guest_initiated":true,"bytes":72,"dns":"example.com"}}"#
+            r#"{"sandbox_id":"vm1","ts":1,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":40000,"dst_ip":"10.0.2.3","dst_port":53},"src_ip_leased":true,"direction":"egress","guest_initiated":true,"bytes":72,"dns":"example.com"}}"#
         );
     }
 
@@ -365,6 +375,7 @@ mod tests {
                 bytes: 40,
                 dns: Some("crates.io".into()),
                 sni: None,
+                src_leased: Some(true),
             });
         }
         let text = std::fs::read_to_string(p).unwrap();
@@ -380,6 +391,7 @@ mod tests {
         assert_eq!(v[0]["payload"]["rw"], "w");
         assert_eq!(v[1]["source"], "net");
         assert_eq!(v[1]["payload"]["dns"], "crates.io");
+        assert_eq!(v[1]["payload"]["src_ip_leased"], true);
         assert!(v.iter().all(|e| e["provenance"] == "boundary"));
     }
 
