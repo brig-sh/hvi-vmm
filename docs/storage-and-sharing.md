@@ -55,6 +55,14 @@ through either tag, so the read-only one would promise something the writable
 one hands back. A boot that asks for both is refused, with the pair named.
 Nesting with the same mode is fine.
 
+The check covers the shares of one hvi process. Two processes can export the
+same tree, or a tree and a directory inside it, with one export writable and the
+other read-only. Neither process refuses that. A guest on the writable share can
+then store an owner and a mode on a file, setuid and setgid included (see
+[Ownership](#ownership---fs-uid-and---fs-gid)), and the other guest's kernel
+honors them. Export one tree to two sandboxes only when each may change what the
+other runs.
+
 ### Access modes
 
 A read-only share answers `EROFS` to every mutation:
