@@ -122,6 +122,13 @@ thread is allocating or freeing, and copes with each open failing. The open is
 refused rather than trapped, and the process still opens nothing. A musl build,
 whose malloc opens no file, installs the allowlist alone.
 
+In both lists the `ioctl` rule refuses `TIOCSTI` and `TIOCLINUX` on any
+descriptor, and a request that matches traps like an off-list syscall. Each
+request can push bytes into a terminal's input, and the process shares the
+operator's terminal. The kernel's own checks vary by host. Its `TIOCSTI` check
+depends on `dev.tty.legacy_tiocsti`, and neither check applies to a caller with
+`CAP_SYS_ADMIN`.
+
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
 `ppoll` alone, because aarch64 has no `poll` syscall.
@@ -154,11 +161,11 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 21 probes, 9 expect denial, 12 expect success
+hvi seccomp-selftest    # Linux: 29 probes, 15 expect denial, 14 expect success
 ```
 
-On Linux a glibc build expects 2 of the 9 denials, the two opens, to fail with
-`EPERM`, and a musl build expects all 9 to raise `SIGSYS`.
+On Linux a glibc build expects 2 of the 15 denials, the two opens, to fail
+with `EPERM`, and a musl build expects all 15 to raise `SIGSYS`.
 
 Both install the profile or the filters that actually ship and check both
 directions: what a confined thread must keep, and what it must lose. Neither
@@ -184,9 +191,10 @@ sandbox is secure.
   a thread starts in `on_attach`, before the Linux filters are armed, and stays
   unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
   as it begins, as the memory-dump plugin's `--dump-after` timer does.
-- **It does not constrain syscall arguments.** No rule in either architecture
-  file carries an argument condition, so `ioctl` and `sendmsg` are
-  unconstrained over every descriptor the process already holds.
+- **It does not constrain most syscall arguments.** Only the `ioctl` rule
+  carries conditions, and they refuse `TIOCSTI` and `TIOCLINUX`. Every other
+  `ioctl` request, and `sendmsg`, is unconstrained over every descriptor the
+  process already holds.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 
