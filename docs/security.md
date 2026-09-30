@@ -82,6 +82,13 @@ thread as that thread's first act:
 action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
 
+In both lists the `ioctl` rule refuses `TIOCSTI` and `TIOCLINUX` on any
+descriptor, and a refused request traps the same way. Each request can push
+bytes into a terminal's input, and the process shares the operator's terminal.
+The kernel's own checks vary by host. Its `TIOCSTI` check depends on
+`dev.tty.legacy_tiocsti`, and neither check applies to a caller with
+`CAP_SYS_ADMIN`.
+
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
 `ppoll` alone, because aarch64 has no `poll` syscall.
@@ -113,7 +120,7 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 20 probes, 9 expect a SIGSYS trap, 11 expect success
+hvi seccomp-selftest    # Linux: 28 probes, 15 expect a SIGSYS trap, 13 expect success
 ```
 
 Both install the profile or the filters that actually ship and check both
@@ -139,9 +146,10 @@ sandbox is secure.
 - **It does not cover every thread.** With `--dump-after`, the memory-dump
   plugin starts its timer thread before the Linux filters are armed, and that
   thread runs unfiltered for the life of the VM.
-- **It does not constrain syscall arguments.** No rule in either architecture
-  file carries an argument condition, so `ioctl` and `sendmsg` are
-  unconstrained over every descriptor the process already holds.
+- **It does not constrain most syscall arguments.** Only the `ioctl` rule
+  carries conditions, and they refuse `TIOCSTI` and `TIOCLINUX`. Every other
+  `ioctl` request, and `sendmsg`, is unconstrained over every descriptor the
+  process already holds.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 

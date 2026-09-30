@@ -94,6 +94,22 @@
 //! filter entirely, and `HVI_SECCOMP=log` installs the same filters with the
 //! mismatch action changed to `log`, which lets the kernel record what would
 //! have been killed (`dmesg`, or `auditctl`) while the VMM keeps running.
+//!
+//! # Argument conditions
+//!
+//! `ioctl` is the one rule with conditions. Both lists refuse `TIOCSTI` and
+//! `TIOCLINUX` on any descriptor, and a refused request traps like an off-list
+//! syscall. The process shares the operator's terminal. Each request can push
+//! bytes into a terminal's input, and the operator's shell reads them as typed
+//! input once hvi exits. The kernel's own checks depend on the host. On the
+//! caller's controlling terminal it refuses `TIOCSTI` only under
+//! `dev.tty.legacy_tiocsti = 0`, and it refuses neither request to a caller
+//! with `CAP_SYS_ADMIN`.
+//!
+//! Each condition compares the low 32 bits of the request (`"type": "dword"`),
+//! because the kernel reads the request as an `unsigned int`. A 64-bit
+//! comparison would pass `TIOCSTI` with a bit set above bit 31, and the kernel
+//! would still run it as `TIOCSTI`.
 
 use std::io;
 
@@ -372,6 +388,46 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::kill(1, 0) };
             },
         },
+        // The ioctl rule's conditions. Each list carries its own copy, so each
+        // list gets its own probes.
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI (vcpu)",
+            thread: Thread::Vcpu,
+            expect_ok: false,
+            run: || ioctl_on_no_descriptor(libc::TIOCSTI as libc::c_ulong),
+        },
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: false,
+            run: || ioctl_on_no_descriptor(libc::TIOCSTI as libc::c_ulong),
+        },
+        // The kernel drops bits 32-63 of the request, so these still reach it
+        // as TIOCSTI.
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI | 0xffffffff << 32 (vcpu)",
+            thread: Thread::Vcpu,
+            expect_ok: false,
+            run: || ioctl_on_no_descriptor(0xffff_ffff_0000_0000 | libc::TIOCSTI as libc::c_ulong),
+        },
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI | 0xffffffff << 32 (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: false,
+            run: || ioctl_on_no_descriptor(0xffff_ffff_0000_0000 | libc::TIOCSTI as libc::c_ulong),
+        },
+        Probe {
+            what: "paste a console selection, TIOCLINUX (vcpu)",
+            thread: Thread::Vcpu,
+            expect_ok: false,
+            run: || ioctl_on_no_descriptor(libc::TIOCLINUX as libc::c_ulong),
+        },
+        Probe {
+            what: "paste a console selection, TIOCLINUX (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: false,
+            run: || ioctl_on_no_descriptor(libc::TIOCLINUX as libc::c_ulong),
+        },
         // The other half: what a filtered thread must still be able to do.
         //
         // The flush pair earns its place: the lists first shipped allowing
@@ -511,7 +567,42 @@ fn probes() -> Vec<Probe> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             },
         },
+        // The ioctl rule refuses two requests and passes every other one.
+        Probe {
+            what: "run a vCPU, KVM_RUN (vcpu)",
+            thread: Thread::Vcpu,
+            expect_ok: true,
+            // _IO(KVMIO, 0x80)
+            run: || ioctl_on_no_descriptor(0xae80),
+        },
+        Probe {
+            what: "restore the terminal mode, TCSETS (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            // `boot` restores the terminal on the main thread, after that
+            // thread has filtered itself.
+            run: || ioctl_on_no_descriptor(libc::TCSETS as libc::c_ulong),
+        },
     ]
+}
+
+/// Calls `ioctl(-1, request, NULL)` through `syscall(2)`.
+///
+/// `syscall(2)` passes the request as a full 64-bit argument, which
+/// `libc::ioctl` cannot do on musl. The kernel refuses descriptor -1 with
+/// `EBADF` before it reads the request, so a call the filter passes reaches no
+/// terminal.
+fn ioctl_on_no_descriptor(request: libc::c_ulong) {
+    // SAFETY: an invalid descriptor and a null argument, which the kernel
+    // rejects without dereferencing anything.
+    unsafe {
+        libc::syscall(
+            libc::SYS_ioctl,
+            -1 as libc::c_long,
+            request,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
 }
 
 /// Result of running one probe in a child process.
@@ -716,6 +807,106 @@ mod tests {
                     !forbidden.contains(&name),
                     "{key} allows {name}, which defeats installing the filter after setup"
                 );
+            }
+        }
+    }
+
+    /// Runs `program` over one syscall as the kernel runs a seccomp filter and
+    /// returns the action it reaches.
+    ///
+    /// Handles the instructions seccompiler emits and panics on any other.
+    /// `struct seccomp_data` is little-endian on both architectures hvi builds
+    /// for.
+    fn run_filter(program: &[seccompiler::sock_filter], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
+        // nr at 0, arch at 4, the instruction pointer at 8, args from 16.
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        for (i, arg) in args.iter().enumerate() {
+            data[16 + 8 * i..24 + 8 * i].copy_from_slice(&arg.to_le_bytes());
+        }
+        let mut acc = 0u32;
+        let mut pc = 0usize;
+        loop {
+            let insn = &program[pc];
+            pc += 1;
+            match insn.code {
+                // BPF_LD | BPF_W | BPF_ABS
+                0x20 => {
+                    let at = insn.k as usize;
+                    acc = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+                }
+                // BPF_ALU | BPF_AND | BPF_K
+                0x54 => acc &= insn.k,
+                // BPF_JMP | BPF_JA
+                0x05 => pc += insn.k as usize,
+                // BPF_JMP | BPF_JEQ, BPF_JGT or BPF_JGE, with BPF_K
+                0x15 | 0x25 | 0x35 => {
+                    let taken = match insn.code {
+                        0x15 => acc == insn.k,
+                        0x25 => acc > insn.k,
+                        _ => acc >= insn.k,
+                    };
+                    pc += usize::from(if taken { insn.jt } else { insn.jf });
+                }
+                // BPF_RET | BPF_K
+                0x06 => return insn.k,
+                code => panic!("BPF instruction {code:#x} is not one seccompiler emits"),
+            }
+        }
+    }
+
+    // Both architecture files, compiled on whichever one the test runs on.
+    // The kernel reads the request as a 32-bit unsigned int, so every refused
+    // request is also tried with bits 32-63 set.
+    #[test]
+    fn ioctl_traps_terminal_input_requests() {
+        // Each file with its AUDIT_ARCH_* value and its ioctl syscall number.
+        let files = [
+            (
+                include_str!("../resources/seccomp/x86_64.json"),
+                TargetArch::x86_64,
+                0xc000_003e,
+                16,
+            ),
+            (
+                include_str!("../resources/seccomp/aarch64.json"),
+                TargetArch::aarch64,
+                0xc000_00b7,
+                29,
+            ),
+        ];
+        let high = 0xffff_ffff_0000_0000u64;
+        for (json, target, audit_arch, ioctl) in files {
+            let filters = seccompiler::compile_from_json(json.as_bytes(), target).unwrap();
+            for key in ["vmm", "vcpu"] {
+                let action = |request: u64| {
+                    run_filter(&filters[key], audit_arch, ioctl, [0, request, 0, 0, 0, 0])
+                };
+                for refused in [
+                    libc::TIOCSTI as libc::c_ulong,
+                    libc::TIOCLINUX as libc::c_ulong,
+                ] {
+                    for request in [refused, high | refused] {
+                        assert_eq!(
+                            action(request),
+                            libc::SECCOMP_RET_TRAP,
+                            "{target:?} {key} passes ioctl request {request:#x}"
+                        );
+                    }
+                }
+                // KVM_RUN, TCSETS, and TIOCGWINSZ one above TIOCSTI.
+                for request in [
+                    0xae80,
+                    libc::TCSETS as libc::c_ulong,
+                    libc::TIOCGWINSZ as libc::c_ulong,
+                ] {
+                    assert_eq!(
+                        action(request),
+                        libc::SECCOMP_RET_ALLOW,
+                        "{target:?} {key} refuses ioctl request {request:#x}"
+                    );
+                }
             }
         }
     }
