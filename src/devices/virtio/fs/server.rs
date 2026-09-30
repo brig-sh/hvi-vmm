@@ -230,6 +230,10 @@ const LINUX_XATTR_REPLACE: u32 = 2;
 // private, no-follow xattrs while retaining host-owner access.
 const HVI_XATTR_PREFIX: &[u8] = b"com.nofire.hvi.";
 const HVI_XATTR_LINUX_ATTR: &[u8] = b"com.nofire.hvi.linux-attr";
+/// Prefix of the attributes macOS reads to decide how it treats a file, such
+/// as `com.apple.quarantine`, `com.apple.provenance` and
+/// `com.apple.FinderInfo`.
+const HOST_XATTR_PREFIX: &[u8] = b"com.apple.";
 /// Length of the `HVI_XATTR_LINUX_ATTR` value: mode, uid and gid, each a
 /// little-endian `u32`.
 #[cfg(target_os = "macos")]
@@ -4501,6 +4505,9 @@ impl VirtioFs {
         if is_private_xattr(name) {
             return Err(EPERM);
         }
+        if is_host_xattr(name) {
+            return Err(EOPNOTSUPP);
+        }
         let value = input
             .get(value_at..value_at.checked_add(size).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
@@ -4515,6 +4522,9 @@ impl VirtioFs {
         if is_private_xattr(name) {
             return Err(ENODATA);
         }
+        if is_host_xattr(name) {
+            return Err(EOPNOTSUPP);
+        }
         let fd = self.open_entry_at(node)?;
         let value = fd_getxattr(fd.as_fd(), name)?;
         xattr_response(size, value)
@@ -4523,7 +4533,7 @@ impl VirtioFs {
     fn listxattr(&mut self, node: u64, input: &[u8]) -> Result<Vec<u8>, i32> {
         let size = get_u32(input, 0).ok_or(EINVAL)?;
         let fd = self.open_entry_at(node)?;
-        let value = filter_private_xattrs(fd_listxattr(fd.as_fd())?);
+        let value = filter_hidden_xattrs(fd_listxattr(fd.as_fd())?);
         xattr_response(size as usize, value)
     }
 
@@ -4532,6 +4542,9 @@ impl VirtioFs {
         let name = nul_name(input, 0)?;
         if is_private_xattr(name) {
             return Err(EPERM);
+        }
+        if is_host_xattr(name) {
+            return Err(EOPNOTSUPP);
         }
         let fd = self.open_entry_at(node)?;
         fd_removexattr(fd.as_fd(), name)?;
@@ -6376,14 +6389,37 @@ fn clear_suid_sgid(_path: &Path, file: &File, _ids: GuestIds) -> Result<(), i32>
     Ok(())
 }
 
-fn is_private_xattr(name: &[u8]) -> bool {
-    name.starts_with(HVI_XATTR_PREFIX)
+/// Returns whether `name` starts with `prefix`, ignoring ASCII case.
+///
+/// On a volume that folds case in attribute names, another spelling of a
+/// gated name would reach the same attribute.
+fn has_prefix_ignore_case(name: &[u8], prefix: &[u8]) -> bool {
+    name.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-fn filter_private_xattrs(value: Vec<u8>) -> Vec<u8> {
+/// Returns whether `name` is under [`HVI_XATTR_PREFIX`], the record that
+/// holds the guest's mode, uid and gid.
+fn is_private_xattr(name: &[u8]) -> bool {
+    has_prefix_ignore_case(name, HVI_XATTR_PREFIX)
+}
+
+/// Returns whether `name` is under [`HOST_XATTR_PREFIX`].
+///
+/// The guest does not see these names. Gatekeeper and LaunchServices act on
+/// them when the operator opens a file, so a guest that adds or removes one
+/// changes how the host treats that file. SETXATTR, GETXATTR and REMOVEXATTR
+/// answer EOPNOTSUPP, as a Linux filesystem does for a namespace it lacks,
+/// and LISTXATTR leaves them out.
+fn is_host_xattr(name: &[u8]) -> bool {
+    has_prefix_ignore_case(name, HOST_XATTR_PREFIX)
+}
+
+/// Drops the private and host-only names from a LISTXATTR reply.
+fn filter_hidden_xattrs(value: Vec<u8>) -> Vec<u8> {
     let mut filtered = Vec::with_capacity(value.len());
     for name in value.split(|byte| *byte == 0) {
-        if name.is_empty() || is_private_xattr(name) {
+        if name.is_empty() || is_private_xattr(name) || is_host_xattr(name) {
             continue;
         }
         filtered.extend_from_slice(name);
@@ -9428,6 +9464,102 @@ mod tests {
                 .any(|w| w == HVI_XATTR_LINUX_ATTR),
             "the device's own attribute leaked into a guest listing"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn xattr_prefix_gates_ignore_case() {
+        assert!(is_private_xattr(b"com.nofire.hvi.linux-attr"));
+        assert!(is_private_xattr(b"COM.NOFIRE.HVI.linux-attr"));
+        assert!(!is_private_xattr(b"com.nofire.hv"));
+        assert!(!is_private_xattr(b"user.com.nofire.hvi.x"));
+        assert!(is_host_xattr(b"com.apple.quarantine"));
+        assert!(is_host_xattr(b"COM.Apple.Provenance"));
+        assert!(!is_host_xattr(b"com.appl"));
+        assert!(!is_host_xattr(b"user.com.apple.x"));
+    }
+
+    // Gatekeeper decides from the quarantine attribute whether to assess a
+    // file the operator opens. A guest that strips it from a downloaded file,
+    // or plants it on another, changes how the host treats that file.
+    #[test]
+    fn guest_cannot_strip_or_plant_host_quarantine() {
+        const QUARANTINE: &[u8] = b"com.apple.quarantine";
+        const VALUE: &[u8] = b"0081;5f1a2b3c;Safari;A1B2C3D4";
+        fn status(out: &[u8]) -> i32 {
+            i32::from_le_bytes(out[4..8].try_into().unwrap())
+        }
+        let (dir, mut dev) = fixture_with_access(true);
+        let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
+        let issue = lookup_node(&mut dev, etc, b"issue");
+        let host = File::open(dir.join("etc/issue")).unwrap();
+
+        // The host's spelling, and one that differs from it in case.
+        for name in [QUARANTINE, b"COM.Apple.Quarantine"] {
+            let mut set = vec![0u8; 16];
+            set[0..4].copy_from_slice(&(VALUE.len() as u32).to_le_bytes());
+            set.extend_from_slice(name);
+            set.push(0);
+            set.extend_from_slice(VALUE);
+            let out = dev.handle_fuse(&request(SETXATTR, issue, &set), 4096);
+            assert_eq!(
+                status(&out),
+                -EOPNOTSUPP,
+                "the guest planted {}",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                fd_getxattr(host.as_fd(), name).is_err(),
+                "the attribute reached the host file"
+            );
+        }
+
+        fd_setxattr(host.as_fd(), QUARANTINE, VALUE, 0).unwrap();
+        for name in [QUARANTINE, b"COM.APPLE.QUARANTINE"] {
+            let mut remove = name.to_vec();
+            remove.push(0);
+            let out = dev.handle_fuse(&request(REMOVEXATTR, issue, &remove), 4096);
+            assert_eq!(
+                status(&out),
+                -EOPNOTSUPP,
+                "the guest stripped {}",
+                String::from_utf8_lossy(name)
+            );
+            assert_eq!(fd_getxattr(host.as_fd(), QUARANTINE).unwrap(), VALUE);
+        }
+
+        // The guest cannot read the attribute or find it in the list.
+        let mut get = vec![0u8; 8];
+        get[0..4].copy_from_slice(&64u32.to_le_bytes());
+        get.extend_from_slice(QUARANTINE);
+        get.push(0);
+        let out = dev.handle_fuse(&request(GETXATTR, issue, &get), 4096);
+        assert_eq!(status(&out), -EOPNOTSUPP);
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LISTXATTR, issue, &list), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert!(
+            !out[OUT_HEADER_LEN..]
+                .split(|byte| *byte == 0)
+                .any(|name| has_prefix_ignore_case(name, b"com.apple.")),
+            "the guest listed a com.apple. attribute"
+        );
+
+        // An attribute outside the prefix still reaches the host.
+        let mut set = vec![0u8; 16];
+        set[0..4].copy_from_slice(&(VALUE.len() as u32).to_le_bytes());
+        set.extend_from_slice(b"user.origin\0");
+        set.extend_from_slice(VALUE);
+        let out = dev.handle_fuse(&request(SETXATTR, issue, &set), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(fd_getxattr(host.as_fd(), b"user.origin").unwrap(), VALUE);
+        let mut list = vec![0u8; 8];
+        list[0..4].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(LISTXATTR, issue, &list), 4096);
+        assert!(out[OUT_HEADER_LEN..]
+            .split(|byte| *byte == 0)
+            .any(|name| name == b"user.origin"));
         let _ = fs::remove_dir_all(dir);
     }
 
