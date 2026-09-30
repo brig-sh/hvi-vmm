@@ -128,6 +128,24 @@ blocking, so it holds up no other request),
 allocation, hole punching, zeroing, seek, `copy_file_range`, `statx`,
 `statfs`, FIFOs, tmpfiles and Unix sockets.
 
+Attributes under `com.apple.` belong to the host. macOS reads them when the
+operator opens a file, and `com.apple.quarantine` decides whether Gatekeeper
+assesses it. The guest does not see the names: `LISTXATTR` leaves them out,
+and `SETXATTR`, `GETXATTR` and `REMOVEXATTR` return `EOPNOTSUPP`, which is
+what a Linux filesystem answers for a namespace it does not have. The match
+ignores letter case. A guest copy of a quarantined file therefore loses the
+quarantine, and `cp -a`, `cp --preserve=xattr`, `rsync -X` and `tar --xattrs`
+exit clean because they never see the names.
+
+The gate covers the attributes and not the bytes: a guest can write a copy of
+a quarantined file, with a new name or renamed over the original. It also
+covers only volumes that store attributes natively, such as APFS. On exFAT,
+FAT and some network volumes macOS keeps them in AppleDouble `._name` sidecar
+files. The guest can remove, truncate or replace those as ordinary files, so
+it can take attributes off a host file or put them on it. A direct create of
+a `._name` file fails only because the device stores its own mode record on a
+new file and macOS refuses attributes there; a rename onto the name works.
+
 Device nodes are refused. `OPEN` refuses anything that is not a regular file,
 because opening a FIFO under the device mutex blocked the VM.
 
