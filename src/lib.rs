@@ -49,6 +49,8 @@ pub mod boot;
 pub mod boot_x86;
 /// Backend-independent boot configuration and result types.
 pub mod config;
+/// The filter between a guest's serial console and the host's stdout.
+pub mod console;
 /// arm64 exception syndrome decoding.
 #[cfg(target_arch = "aarch64")]
 pub mod esr;

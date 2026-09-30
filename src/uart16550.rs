@@ -36,6 +36,8 @@ use std::io::{self, Write};
 use vm_superio::serial::NoEvents;
 use vm_superio::{Serial, Trigger};
 
+use crate::console::ConsoleFilter;
+
 /// The two enable bits and the data-ready bit the level is computed from. The
 /// crate keeps its register bits private, and these are the ones hvi needs to
 /// answer "is a condition still true", which is a different question from the
@@ -56,19 +58,27 @@ impl Trigger for NoTrigger {
     }
 }
 
-/// Guest transmit straight to the host's stdout, unbuffered.
+/// Guest transmit to the host's stdout through a [`ConsoleFilter`], unbuffered.
 ///
 /// Flushing per write is deliberate: the guest owns the formatting and the
 /// console is what an operator watches a boot through, so a partial line has
 /// to appear when the guest emits it rather than when a buffer happens to
 /// fill.
-struct ConsoleOut;
+struct ConsoleOut {
+    filter: ConsoleFilter,
+    /// What the filter passed of the last write, reused across writes.
+    passed: Vec<u8>,
+}
 
 impl Write for ConsoleOut {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut out = io::stdout().lock();
-        out.write_all(buf)?;
-        out.flush()?;
+        self.passed.clear();
+        self.filter.filter(buf, &mut self.passed);
+        if !self.passed.is_empty() {
+            let mut out = io::stdout().lock();
+            out.write_all(&self.passed)?;
+            out.flush()?;
+        }
         Ok(buf.len())
     }
 
@@ -86,7 +96,13 @@ impl Uart16550 {
     #[must_use]
     pub fn new() -> Self {
         Uart16550 {
-            inner: Serial::new(NoTrigger, ConsoleOut),
+            inner: Serial::new(
+                NoTrigger,
+                ConsoleOut {
+                    filter: ConsoleFilter::new(),
+                    passed: Vec::new(),
+                },
+            ),
         }
     }
 

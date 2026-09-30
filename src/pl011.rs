@@ -14,17 +14,20 @@
 
 //! Minimal PL011 UART with a receive path, enough for an interactive console.
 //!
-//! Transmit is trivial (writes to the data register stream to stdout; the
-//! kernel driver polls the flag register, which always reports the FIFO idle).
-//! Receive is interrupt-driven: a host thread pushes keystrokes into the RX
-//! FIFO and raises the UART's GIC line; the guest reads the data register on
-//! the resulting IRQ. Only the registers the Linux `amba-pl011` driver touches
-//! for that flow are modelled — data, flags, and the RX interrupt
-//! mask/status. The PrimeCell identification registers make the driver bind
-//! (`ttyAMA0`); without them only `earlycon` runs.
+//! Each byte the guest writes to the data register goes to stdout through a
+//! [`ConsoleFilter`](crate::console::ConsoleFilter); the kernel driver polls
+//! the flag register, which always reports the FIFO idle. Receive is
+//! interrupt-driven: a host thread pushes keystrokes into the RX FIFO and
+//! raises the UART's GIC line; the guest reads the data register on the
+//! resulting IRQ. Only the registers the Linux `amba-pl011` driver touches for
+//! that flow are modeled: data, flags, and the RX interrupt mask/status. The
+//! PrimeCell identification registers make the driver bind (`ttyAMA0`); without
+//! them only `earlycon` runs.
 
 use std::collections::VecDeque;
 use std::io::Write;
+
+use crate::console::ConsoleFilter;
 
 /// Data register: reads pop the RX FIFO, writes are console bytes.
 const DR: u64 = 0x000;
@@ -53,6 +56,10 @@ const RX_CAP: usize = 4096;
 /// A PL011 modelling console TX plus an interrupt-driven RX FIFO.
 pub struct Pl011 {
     out: std::io::Stdout,
+    /// The filter every transmitted byte passes through.
+    filter: ConsoleFilter,
+    /// What the filter passed of the last byte, reused across writes.
+    passed: Vec<u8>,
     rx: VecDeque<u8>,
     /// Interrupt mask (`IMSC`); only the RX bit is acted on.
     imsc: u32,
@@ -63,6 +70,8 @@ impl Pl011 {
     pub fn new() -> Self {
         Pl011 {
             out: std::io::stdout(),
+            filter: ConsoleFilter::new(),
+            passed: Vec::new(),
             rx: VecDeque::new(),
             imsc: 0,
         }
@@ -88,10 +97,13 @@ impl Pl011 {
         if is_write {
             match offset {
                 DR => {
-                    let byte = [value as u8];
-                    let mut lock = self.out.lock();
-                    let _ = lock.write_all(&byte);
-                    let _ = lock.flush();
+                    self.passed.clear();
+                    self.filter.filter(&[value as u8], &mut self.passed);
+                    if !self.passed.is_empty() {
+                        let mut lock = self.out.lock();
+                        let _ = lock.write_all(&self.passed);
+                        let _ = lock.flush();
+                    }
                 }
                 IMSC => self.imsc = value as u32,
                 // Level-based RX status clears when the FIFO drains, so the

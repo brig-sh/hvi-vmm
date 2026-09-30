@@ -32,9 +32,19 @@ Everything a hostile guest can touch, it touches through hvi:
 | virtio-fs shares | The exported tree, read-only or read-write. |
 | Network frames | Parsed by the built-in stack, or relayed. |
 | vsock | Bytes relayed to whatever listens on `--agent-sock`. |
+| Serial console | Bytes written to hvi's stdout, often the operator's terminal. |
 
 A writable share and the agent socket are the two that hand the guest reach
 into host state on purpose. Choose both deliberately.
+
+The console reaches the operator's terminal, and a terminal acts on escape
+sequences. Some of them write the clipboard, draw hyperlinks or set the window
+title. Others make the terminal answer on its input side, which hvi forwards to
+the guest, and an answer still queued at exit would reach the operator's shell.
+hvi writes console output through a filter that passes text and an allowlist of
+escape sequences for the display, and drops the rest. When it restores the
+terminal at exit, it discards the input the guest did not read. The allowlist
+is in [cli.md](cli.md#console-output).
 
 ## Confinement
 

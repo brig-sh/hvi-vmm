@@ -200,12 +200,42 @@ console reader's read of stdin when the guest stops. It is not a control
 interface.
 
 hvi puts the terminal into raw mode when stdin is a TTY and restores it when
-the boot returns normally. That restore is a destructor, and a destructor does
-not run when a signal kills the process.
+the boot returns normally. The restore discards input the guest did not read.
+That restore is a destructor, and a destructor does not run when a signal kills
+the process.
 
 CAUTION: If you kill hvi with Ctrl-C or `kill`, the terminal is left in raw
 mode. Run `stty sane` or `reset` to recover it. Stop a guest from inside it
 where you can.
+
+### Console output
+
+The guest's console output reaches stdout through a filter. It passes text and
+the C0 controls a console uses, except ENQ. Of the escape sequences, it passes:
+
+- cursor movement and position, saving and restoring the cursor, and the
+  cursor's style;
+- erasing, inserting and deleting characters and lines, scrolling, the scrolling
+  region, moving by tab stops, repeat and insert mode;
+- colors and attributes (SGR);
+- the G0 to G3 character sets (ASCII, UK and DEC line drawing) and the keypad
+  mode;
+- the DEC private modes for cursor keys, reverse video, origin, autowrap, cursor
+  blink and visibility, the alternate screen and bracketed paste;
+- the soft reset (DECSTR).
+
+`csi_allowed` and `DEC_MODES` in `src/console.rs` are the full definition. The
+filter drops every other escape sequence, every OSC, DCS, APC, PM and SOS
+string, every C1 control, and ENQ. That includes the hard reset (RIS), erasing
+the scrollback (`CSI 3 J`) and setting or clearing tab stops (HTS, TBC), which
+would change the terminal after hvi exits. Bytes that are not valid UTF-8 are
+shown as U+FFFD.
+
+A guest therefore cannot set the window title, write the clipboard, draw a
+hyperlink or enable mouse reporting. A guest program that asks the terminal a
+question, such as a cursor position report or its device attributes, gets no
+answer. When hvi restores the terminal at exit, it discards the input the guest
+did not read.
 
 ### Ctrl-]
 

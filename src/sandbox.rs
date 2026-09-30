@@ -598,7 +598,7 @@ fn probes() -> Vec<Probe> {
                     }
                     // The restore is the operation that matters: it is what
                     // runs after entry when the VMM drops its `RawTerm`.
-                    if libc::tcsetattr(f.pre_tty, libc::TCSANOW, &t) != 0 {
+                    if libc::tcsetattr(f.pre_tty, libc::TCSAFLUSH, &t) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }

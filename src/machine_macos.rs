@@ -1595,9 +1595,11 @@ impl RawTerm {
 
 impl Drop for RawTerm {
     fn drop(&mut self) {
+        // TCSAFLUSH discards unread input, so keystrokes and terminal answers
+        // still queued for the guest never reach the shell.
         // SAFETY: restoring the saved settings on fd 0.
         unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+            libc::tcsetattr(0, libc::TCSAFLUSH, &self.orig);
         }
     }
 }

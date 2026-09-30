@@ -321,7 +321,10 @@ that binds again after that starts from a device in its boot state.
 The serial console is a **PL011** on arm64 and a **16550** on x86. The x86 one
 wraps `vm-superio`'s `Serial`, which is edge-triggered, and hvi drives COM1 as
 a level line: the wrapper recomputes the level from the interrupt conditions
-rather than from the IIR, which `vm-superio` clears on read.
+rather than from the IIR, which `vm-superio` clears on read. Both write guest
+output to stdout through `console::ConsoleFilter`, which drops the escape
+sequences that change host state or make the terminal answer (see
+[security.md](security.md#what-the-guest-can-reach)).
 
 ### Used-ring ordering
 
@@ -397,7 +400,7 @@ how it works.
 | arm64 guest support | `boot.rs`, `layout.rs`, `fdt.rs`, `pl011.rs`, `esr.rs`, `fdlimit.rs` |
 | x86-64 guest support | `boot_x86.rs`, `layout_x86.rs`, `mptable.rs`, `uart16550.rs`, `rtc_cmos.rs` |
 | Guest memory | `guestmem.rs`, `sharedmem.rs` |
-| Devices | `virtio.rs`, `virtio_net.rs`, `tap.rs`, `virtio_vsock.rs`, `virtio_fs.rs` |
+| Devices | `virtio.rs`, `virtio_net.rs`, `tap.rs`, `virtio_vsock.rs`, `virtio_fs.rs`, `console.rs` |
 | Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `used_ring_litmus.rs` |
