@@ -129,6 +129,19 @@ blocking, so it holds up no other request),
 allocation, hole punching, zeroing, seek, `copy_file_range`, `statx`,
 `statfs`, FIFOs, tmpfiles and Unix sockets.
 
+Attributes under `com.apple.` keep the values the host gave them. macOS reads
+them when the operator opens a file, and `com.apple.quarantine` decides
+whether Gatekeeper assesses it. `SETXATTR` and `REMOVEXATTR` on the prefix
+return `EPERM`, and the match ignores letter case. `GETXATTR` and `LISTXATTR`
+still serve them, so a guest tool that replays every attribute it lists, such
+as `rsync -X` or `cp --preserve=xattr`, gets `EPERM` on host-created files and
+reports it. The gate covers the attributes and not the bytes: a guest can
+write a copy of a quarantined file, and the copy has no quarantine attribute,
+whether it keeps a new name or is renamed over the original. The gate also
+covers only volumes that store attributes natively, such as APFS. On exFAT,
+FAT and some network volumes macOS keeps them in AppleDouble `._name` sidecar
+files, which the guest creates and removes as ordinary files.
+
 Device nodes are refused. `OPEN` refuses anything that is not a regular file,
 because opening a FIFO under the device mutex blocked the VM.
 
