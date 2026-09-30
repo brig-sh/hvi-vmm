@@ -121,6 +121,11 @@ An interface name must be 1 to 15 bytes. A tap that cannot be opened fails the
 boot and names the interface, which is the opposite of the gateway's silent
 fallback.
 
+hvi writes the guest's frames to the tap as the guest built them. It filters no
+source MAC or IP address, and no ARP, DHCP server or router advertisement
+traffic. Put each sandbox's tap on a segment of its own, or filter on the host
+side of the tap.
+
 On macOS the flag is refused after the backend starts:
 
 ```text
@@ -159,11 +164,18 @@ properties decide what those records can be used for:
   aggregation. One DNS lookup that retransmits produces two identical records.
 - **They are egress only.** The `direction` and `guest_initiated` fields are
   constants in the code, not observations. Inbound frames produce no record.
+- **Every header field is the guest's.** The five-tuple is read from the frame
+  the guest sent, so `src_ip` is whatever address the guest wrote there.
+  `src_ip_leased` says whether it is the address DHCP leased to the guest: the
+  stub's `10.0.2.15`, or the address in the last DHCP ACK the device delivered
+  to the guest's MAC under a gateway or a tap. The field is absent while the
+  device has seen no lease, which includes a guest configured with a static
+  address. Attribute a record to a sandbox by `sandbox_id`, not by `src_ip`.
 
 A record looks like this:
 
 ```json
-{"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
+{"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"src_ip_leased":true,"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
 ```
 
 `bytes` is the length of the layer-4 slice, not the IP total length.
