@@ -30,6 +30,7 @@ three things a reader should not have to guess between:
 | An unreachable `--net-gateway` falls back to the built-in stack. | A guest comes up with no egress and exit status zero. The warning line is the only signal. | Design |
 | A tap write that fails drops the guest's frame. | The write fails when the send buffer is full, the tap is detached, its interface is down, or the kernel cannot allocate or accept the frame. The first failure writes one line to stderr. The ledger records the frame as egress before the write, so a dropped frame still appears in it. The send buffer fills only when the tap's creator lowered it. | Design |
 | A gateway frame above 64 KiB ends the relay. | The relay writes one line to stderr and shuts the gateway socket down, so the guest receives nothing more from the gateway and its own frames are dropped for the rest of the run. Every gateway's default MTU is far below 64 KiB. | Design |
+| A vsock session queues at most 256 KiB of guest output its host client has not read. | A client that stops reading stalls that session's guest writer once the queue is full. Other sessions and the vCPUs keep running. A guest that sends past the credit it was given has the session reset. | Design |
 | virtio-fs: one request queue per share, no DAX, no indirect descriptors. | Throughput ceiling per share. | Design |
 
 ## virtio-fs resource limits

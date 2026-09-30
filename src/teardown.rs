@@ -19,9 +19,11 @@
 //! own descriptor beside a [`StopToken`](crate::teardown::StopToken). `boot`
 //! requests the stop through its [`StopSource`](crate::teardown::StopSource)
 //! once the vCPU threads have exited, every poll returns, and `boot` joins the
-//! threads before it returns. Two helpers need more than the poll. The macOS
+//! threads before it returns. Three helpers need more than the poll. The macOS
 //! virtio-fs worker waits on no descriptor; it parks on a condition variable
-//! and is stopped through it. The console reader reads stdin, which the whole
+//! and is stopped through it. A vsock session's writer parks on a condition
+//! variable while it has nothing to send, and the session's reader wakes it
+//! when the reader ends. The console reader reads stdin, which the whole
 //! process shares, so a byte another reader took between the poll and the read
 //! would leave it blocked; `boot` sends it the kick signal until it has exited.
 //!
@@ -133,6 +135,35 @@ impl StopToken {
             Ok(true)
         } else {
             Err(io::Error::other("cannot be read anymore"))
+        }
+    }
+
+    /// Blocks until `fd` can take a write or the stop is requested.
+    ///
+    /// Returns `true` when `fd` has room, a hangup or an error and no stop is
+    /// requested. The write that follows either succeeds or reports the error.
+    ///
+    /// # Errors
+    ///
+    /// Errors if `poll` fails for a reason other than a signal, or if the
+    /// descriptor is not open.
+    pub fn wait_writable(&self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        let mut fds = [
+            libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+            pollfd(self.0.as_raw_fd()),
+        ];
+        poll(&mut fds, -1)?;
+        if fds[1].revents != 0 {
+            return Ok(false);
+        }
+        if fds[0].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0 {
+            Ok(true)
+        } else {
+            Err(io::Error::other("cannot be written anymore"))
         }
     }
 

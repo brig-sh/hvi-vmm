@@ -1241,12 +1241,13 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 
 /// Bridges the host agent Unix socket to the guest vsock device. Each accepted
 /// connection is opened to the guest agent (host CID 2 -> guest CID 3, port
-/// 1024) and relayed both ways by a per-connection reader thread. After any
-/// host->guest injection the vsock GIC line is raised and the vCPUs kicked so
-/// the guest drains its RX queue promptly.
+/// 1024) and relayed by a per-connection reader thread (host -> guest) and
+/// writer thread (guest -> host). After any host->guest delivery or credit
+/// update the vsock GIC line is raised and the vCPUs kicked so the guest
+/// drains its RX queue promptly.
 ///
 /// The listener is non-blocking, so the accept loop can poll it beside the stop
-/// token. The per-connection readers poll the same token, and the listener
+/// token. The per-connection threads poll the same token, and the listener
 /// thread joins the ones still running before it exits.
 fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
@@ -1258,7 +1259,7 @@ fn spawn_vsock_bridge(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         eprintln!("[hvi] vsock bridge: listening");
-        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        let mut sessions: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1271,24 +1272,38 @@ fn spawn_vsock_bridge(
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
-            // The device writes to this socket and must block, or a full send
-            // buffer would split a frame. On macOS an accepted socket inherits
-            // the listener's non-blocking flag, so blocking mode is set here.
-            if stream.set_nonblocking(false).is_err() {
-                continue;
-            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
 
             // Register the connection and send the guest agent a REQUEST.
             let mut d = lock_or_recover(&dev);
-            let port = d.add_conn(stream);
+            let Ok((port, writer)) = d.add_conn(stream) else {
+                continue;
+            };
             d.connect(&mem, port);
             let level = d.irq_level();
             drop(d);
             let _ = vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
             kick_all(&vm, &handles);
+            sessions.retain(|handle| !handle.is_finished());
+
+            // Per-connection writer thread: guest -> host.
+            sessions.push(std::thread::spawn({
+                let (dev, mem, vm) = (Arc::clone(&dev), Arc::clone(&mem), vm.clone());
+                let (handles, stop) = (Arc::clone(&handles), stop.clone());
+                move || {
+                    writer.run(&stop, |n| {
+                        let level = {
+                            let mut d = lock_or_recover(&dev);
+                            d.host_took(&mem, port, n);
+                            d.irq_level()
+                        };
+                        let _ = vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
+                        kick_all(&vm, &handles);
+                    });
+                }
+            }));
 
             // Per-connection reader thread: host -> guest.
             let dev2 = Arc::clone(&dev);
@@ -1296,8 +1311,7 @@ fn spawn_vsock_bridge(
             let vm2 = vm.clone();
             let handles2 = Arc::clone(&handles);
             let stop2 = stop.clone();
-            readers.retain(|handle| !handle.is_finished());
-            readers.push(std::thread::spawn(move || {
+            sessions.push(std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
                 loop {
@@ -1312,8 +1326,12 @@ fn spawn_vsock_bridge(
                         }
                     }
                     let n = match crate::virtio_vsock::read_host(&mut reader, &mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
                         Ok(n) => n,
+                        // The device made the socket non-blocking, and the wait
+                        // above is what blocks.
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break,
                     };
                     let level = {
                         let mut d = lock_or_recover(&dev2);
@@ -1332,8 +1350,8 @@ fn spawn_vsock_bridge(
                 kick_all(&vm2, &handles2);
             }));
         }
-        for reader in readers {
-            let _ = reader.join();
+        for session in sessions {
+            let _ = session.join();
         }
     })
 }
