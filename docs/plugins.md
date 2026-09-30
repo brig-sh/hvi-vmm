@@ -157,6 +157,22 @@ it. To hold it past the borrow, on a thread of your own or for an `SCM_RIGHTS`
 send, keep the `OwnedFd` that `try_clone_to_owned()` returns. `hvi smoke --shm`
 proves that path on macOS.
 
+The object's length is fixed for its lifetime, so a region you mapped stays
+backed for as long as you keep the mapping. On Linux the memfd carries
+`F_SEAL_SHRINK`, `F_SEAL_GROW` and `F_SEAL_SEAL`. For a holder outside the
+VMM process, `ftruncate` to a new length and `F_ADD_SEALS` fail with `EPERM`.
+That covers `on_attach`, which runs before confinement, and any process the
+descriptor was sent to. An `ftruncate` to the current length returns 0.
+Inside the VMM the seccomp filters apply, and a call a filter does not allow
+kills the whole VMM with `SIGSYS`. `ftruncate` is on neither list, so it kills
+the VMM from any thread. `F_ADD_SEALS` returns `EPERM` on a thread under the
+`vmm` filter, such as one you start with `VmHandle::spawn`. On a vCPU thread,
+where `on_safepoint`, `on_block` and egress `on_net` run, it kills the VMM. Do
+not call either from inside the VMM, and do not rely on the `EPERM` there.
+
+The object is not write-sealed, so a writable mapping still works. On macOS a
+POSIX shared-memory object refuses a second `ftruncate`.
+
 `RegsView::root` is the architectural translation-base register, TTBR1_EL1 on
 arm64 or CR3 on x86-64. The traits hand over access and deliberately no more.
 What any of it means is your problem, which is what keeps a tool's idea of the

@@ -19,6 +19,18 @@
 //! of anonymous memory changes nothing about how the guest sees it. vhost-user
 //! VMMs back guest RAM the same way. `hvi smoke --shm` tests the macOS path end
 //! to end.
+//!
+//! The object's length is fixed for its lifetime. A plugin can duplicate the
+//! descriptor and send it on. If a holder shrank the object under the live
+//! mappings, the VMM's own next access past the new end would raise `SIGBUS`,
+//! and a guest access would make `KVM_RUN` fail with `EFAULT`. The VM is lost
+//! either way. On Linux, [`SharedRam::new`] seals the memfd with
+//! `F_SEAL_SHRINK`, `F_SEAL_GROW` and `F_SEAL_SEAL`. `F_SEAL_SEAL` stops a
+//! holder from adding `F_SEAL_FUTURE_WRITE`, which would refuse every later
+//! writable mapping. The object is not write-sealed, because the guest runs
+//! from writable mappings of it. The kernel refuses `F_SEAL_WRITE` while one
+//! exists. On macOS a POSIX shared-memory object refuses a second `ftruncate`,
+//! so it needs no seal.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -55,7 +67,8 @@ impl SharedRam {
     /// Allocates `len` bytes of shareable memory.
     ///
     /// The backing object is unlinked immediately, so it is reachable only
-    /// through the returned descriptor.
+    /// through the returned descriptor. Its length stays `len` for its
+    /// lifetime: on Linux the memfd is sealed against resizing.
     pub fn new(len: usize) -> io::Result<Self> {
         let file = Self::create_object(len)?;
         Ok(Self {
@@ -73,8 +86,11 @@ impl SharedRam {
         {
             let name = c"hvi-guest-ram";
             // SAFETY: a valid NUL-terminated name; MFD_CLOEXEC keeps the
-            // descriptor out of child processes.
-            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            // descriptor out of child processes, and MFD_ALLOW_SEALING lets
+            // the seals below go on.
+            let fd = unsafe {
+                libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+            };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -82,6 +98,20 @@ impl SharedRam {
             let file = unsafe { File::from_raw_fd(fd) };
             // SAFETY: sizing a descriptor we just created.
             if unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The seals fix the object's length for its lifetime. The module
+            // docs say why these three and not F_SEAL_WRITE.
+            // SAFETY: fcntl on a descriptor we just created, with integer
+            // arguments.
+            if unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+                )
+            } != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             Ok(file)
@@ -347,5 +377,47 @@ mod tests {
                 "allocation {i} shares storage with another"
             );
         }
+    }
+
+    // The seals refuse a resize with EPERM on Linux. macOS refuses a second
+    // ftruncate of a POSIX shared-memory object with EINVAL.
+    #[test]
+    fn duplicates_cannot_resize_the_object() {
+        #[cfg(target_os = "linux")]
+        let refused = libc::EPERM;
+        #[cfg(target_os = "macos")]
+        let refused = libc::EINVAL;
+        let ram = SharedRam::new(LEN).expect("allocate");
+        // The descriptor a plugin holds.
+        let dup = File::from(ram.as_fd().try_clone_to_owned().expect("duplicate"));
+        for len in [LEN / 2, LEN * 2] {
+            let err = dup.set_len(len as u64).expect_err("the resize succeeded");
+            assert_eq!(err.raw_os_error(), Some(refused), "{err}");
+        }
+        assert_eq!(dup.metadata().expect("fstat").len(), LEN as u64);
+    }
+
+    // Either write seal would refuse later writable mappings of the object,
+    // which the guest runs from. The probe adds F_SEAL_WRITE, which every
+    // supported kernel knows. A kernel before 5.1 refuses F_SEAL_FUTURE_WRITE
+    // with EINVAL before it looks at F_SEAL_SEAL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn duplicates_cannot_add_a_seal() {
+        let ram = SharedRam::new(LEN).expect("allocate");
+        let dup = ram.as_fd().try_clone_to_owned().expect("duplicate");
+        // SAFETY: fcntl on a descriptor this test owns, with integer
+        // arguments.
+        let rc = unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_WRITE) };
+        let err = io::Error::last_os_error();
+        assert_eq!(rc, -1, "a holder added F_SEAL_WRITE");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+
+        // SAFETY: as above.
+        let seals = unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_GET_SEALS) };
+        let want = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        assert_eq!(seals & want, want, "seals {seals:#x}");
+        let unwanted = libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE;
+        assert_eq!(seals & unwanted, 0, "seals {seals:#x}");
     }
 }
