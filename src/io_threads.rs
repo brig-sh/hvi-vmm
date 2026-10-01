@@ -70,8 +70,8 @@ impl HostWork {
     /// the threads.
     ///
     /// It is for a thread that waits on something a stop token cannot reach,
-    /// such as a condition variable. The action must return at once.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// such as a condition variable, and for cleanup that waits for the stop.
+    /// The action must return at once.
     pub(crate) fn on_io_stop(&mut self, action: impl FnOnce() + Send + 'static) {
         self.io_stops.push(Box::new(action));
     }
