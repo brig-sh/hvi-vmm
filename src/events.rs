@@ -60,10 +60,10 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -202,9 +202,8 @@ impl Ledger {
     /// Opens the ledger at `path` and starts its writer, or returns a disabled
     /// ledger when `path` is `None`.
     ///
-    /// The file is created when missing and truncated. A symbolic link as the
-    /// last component of `path` is refused. Anything else at `path` other than
-    /// a regular file is refused too, since the writer writes at an offset. The
+    /// The file is opened through [`crate::private_file::open`], which states
+    /// what it refuses at `path` and what it replaces, and truncated. The
     /// writer holds a lock on the file until it exits, so a second ledger at
     /// `path`, in this process or another, is refused while the first writer
     /// still writes it. On a file system that cannot lock files, the ledger
@@ -212,9 +211,9 @@ impl Ledger {
     ///
     /// # Errors
     ///
-    /// Errors if the file cannot be opened, is a symbolic link or not a regular
-    /// file, is locked by another ledger's writer, a reader or a disk, or the
-    /// writer thread cannot be started.
+    /// Errors if the file cannot be opened, `private_file::open` refuses what
+    /// is at `path`, the file is locked by another ledger's writer, a reader or
+    /// a disk, or the writer thread cannot be started.
     pub fn new(path: Option<&str>, sandbox_id: &str) -> io::Result<Self> {
         let shared = match path {
             Some(path) => {
@@ -1023,27 +1022,10 @@ fn closed_error() -> io::Error {
 
 /// Opens the ledger file at `path` for writing and locks it.
 ///
-/// The file is truncated once it is known to be a regular file. `O_NOFOLLOW`
-/// refuses a symbolic link as the last component of `path`. `O_NONBLOCK` keeps
-/// the open of a FIFO from waiting for a reader, so the open of one with no
-/// reader fails. `O_NOCTTY` keeps a terminal from becoming the controlling one.
+/// [`crate::private_file::open`] does the open. The file is truncated once it
+/// is known to be a regular file and the lock is held.
 fn open(path: &str) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-        .map_err(|e| {
-            // `O_NOFOLLOW` refuses a link with `ELOOP`, whose message is about
-            // a loop of links. A loop of links in a parent directory also
-            // returns `ELOOP`, so the path itself is checked.
-            let is_link = || std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink());
-            if e.raw_os_error() == Some(libc::ELOOP) && is_link() {
-                io::Error::new(io::ErrorKind::InvalidInput, "a symbolic link")
-            } else {
-                e
-            }
-        })?;
+    let file = crate::private_file::open(std::path::Path::new(path))?;
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -1056,17 +1038,10 @@ fn open(path: &str) -> io::Result<File> {
         Err(TryLockError::Error(_)) => {}
     }
     // The length is read once the lock is held, since another ledger's writer
-    // can grow the file until then.
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    // An empty file is left as it is, since on ext4 a truncate makes the close
-    // of the file flush it, which delays the stop.
-    if metadata.len() > 0 {
+    // can grow the file until then. An empty file is left as it is, since on
+    // ext4 a truncate makes the close of the file flush it, which delays the
+    // stop.
+    if file.metadata()?.len() > 0 {
         file.set_len(0)?;
     }
     Ok(file)
@@ -1222,6 +1197,8 @@ fn now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
 
     // Serialize an envelope with a fixed ts and assert the exact wire bytes,
     // pinning the RawEvent wire format. These also
@@ -1906,11 +1883,35 @@ mod tests {
             .open(&path)
             .unwrap();
         let refused = Ledger::new(path.to_str(), "vm1").err().unwrap();
-        assert!(
-            refused.to_string().ends_with("not a regular file"),
-            "{refused}"
-        );
+        assert!(refused.to_string().ends_with("it is a FIFO"), "{refused}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // The ledger carries the guest's DNS names and TLS SNI.
+    #[test]
+    fn ledger_is_private_to_its_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("mode");
+        let _ = std::fs::remove_file(&path);
+        let ledger = Ledger::new(path.to_str(), "vm1").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        drop(ledger);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode & 0o077, 0, "ledger mode {mode:o}");
+    }
+
+    #[test]
+    fn ledger_refuses_a_file_with_a_second_name() {
+        let target = temp_path("second-name-target");
+        let path = temp_path("second-name");
+        std::fs::write(&target, "keep\n").unwrap();
+        let _ = std::fs::remove_file(&path);
+        std::fs::hard_link(&target, &path).unwrap();
+        let refused = Ledger::new(path.to_str(), "vm1").err().unwrap();
+        assert!(refused.to_string().ends_with("it has 2 names"), "{refused}");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(take_lines(&target), ["keep"]);
     }
 
     // The seam a plugin uses: a payload this crate has never heard of goes

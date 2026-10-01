@@ -15,6 +15,42 @@ whatever was in guest RAM, which includes keys, tokens and plaintext. Treat
 these files with the same care as the workload itself. Write them somewhere
 only you can read, and delete them when the investigation ends.
 
+## How hvi creates these files
+
+The three files, and the devicetree that `hvi dump-fdt --out` writes, are
+created the same way, whatever the umask:
+
+- If nothing is at the path, hvi creates the file at mode 0600.
+- If a regular file is there, and you own it, and it has no other name, hvi
+  truncates it. If group or other had any access to it, hvi instead removes
+  it and creates a new file at 0600, so a descriptor someone opened earlier
+  does not reach what hvi writes.
+- Anything else is refused and left untouched. That covers a symbolic link, a
+  hard link to a file with a second name, a file another user owns, a FIFO, a
+  device and a directory.
+
+Two limits. Only the last component of the path is checked for a symbolic
+link; a parent directory that is a link is followed. The check for a second
+name is a best effort, since the name count is read after the open.
+
+On macOS an access control list on the file counts as access by others, and
+the file is replaced. A directory that gives new files a list is refused, since
+the list would grant access before hvi writes anything; `chmod -a` removes it.
+On Linux the mode bits bound a POSIX ACL, so the mode is the whole check.
+
+A refusal names the path and the reason:
+
+```text
+hvi: opening the ledger /tmp/ledger.ndjson: it is a symbolic link
+```
+
+For `--events` and `--trace-io` the boot fails. For `--dump-memory` the dump
+fails, and the guest keeps running.
+
+The ledger cannot be streamed to a pipe, a FIFO or `/dev/stdout`. Write it to
+a file and follow it with `tail -F`. Use `-F`, not `-f`: if hvi replaces
+an existing file as described above, `-f` stays on the removed one.
+
 ## The event ledger
 
 ```sh
