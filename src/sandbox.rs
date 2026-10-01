@@ -277,6 +277,13 @@ pub struct SelftestFixtures {
     /// A Unix listener bound before entry (stands in for the control socket and
     /// the agent bridge).
     pre_bound: std::os::unix::net::UnixListener,
+    /// A connected socket pair made before entry, standing in for a
+    /// connection the agent bridge accepted. The bridge reads the uid of
+    /// every peer after entry.
+    pre_pair: (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ),
     /// Guest RAM mapped from a shared-memory object before entry.
     pre_mapped: crate::guestmem::GuestRam,
     /// A pty opened before entry, standing in for the guest console. The VMM
@@ -561,6 +568,11 @@ fn probes() -> Vec<Probe> {
             },
         },
         Probe {
+            what: "read the uid of a socket peer",
+            expect_ok: true,
+            run: |f| crate::agent_socket::peer_uid(&f.pre_pair.0).map(|_| ()),
+        },
+        Probe {
             // The vsock bridge clones every connection it accepts, so this
             // runs once per `exec`-style session -- after entry, on a
             // descriptor obtained after entry. Deriving a descriptor from one
@@ -708,6 +720,7 @@ pub fn selftest() -> io::Result<usize> {
             let _ = std::fs::remove_file(&path);
             std::os::unix::net::UnixListener::bind(&path)?
         },
+        pre_pair: std::os::unix::net::UnixStream::pair()?,
         pre_mapped: {
             let shared_ram =
                 crate::sharedmem::SharedRam::new(crate::guestmem::MemRegion::ALIGN as usize)?;

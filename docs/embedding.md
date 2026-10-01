@@ -147,6 +147,10 @@ ways. When either side closes, the other reads EOF: a host client that closes
 ends the guest stream, and a guest that closes, or a guest driver that resets
 the device, ends the host connection.
 
+The host client must run as the same uid as the VMM, or hvi closes the
+connection before it reaches the guest. See
+[security.md](security.md#the-agent-socket).
+
 The contract the guest side must satisfy:
 
 - Listen on **port 1024**, with the guest at **CID 3** and the host at

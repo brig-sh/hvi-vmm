@@ -41,6 +41,12 @@
 //! separate crate can link this one and supply its own the same way, which is
 //! why the VMM is a library as well as a binary. See `docs/plugins.md`.
 
+/// The host Unix socket the guest agent is reached through.
+#[cfg(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+))]
+pub mod agent_socket;
 /// arm64 `Image` header parse and placement.
 #[cfg(target_arch = "aarch64")]
 pub mod boot;

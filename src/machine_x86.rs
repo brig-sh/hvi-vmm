@@ -367,9 +367,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Every listener is bound here, before any filter goes in: the seccomp
     // allowlists permit accept4 on a listener we already hold but not socket or
     // bind, so a listener created later would be trapped.
-    let agent_listener = match &cfg.agent_sock {
-        Some(path) => Some(bind_unix(path)?),
-        None => None,
+    let (agent_listener, agent_node) = match &cfg.agent_sock {
+        Some(path) => {
+            let bound = crate::agent_socket::bind(path)?;
+            (Some((bound.listener, bound.gate)), Some(bound.node))
+        }
+        None => (None, None),
     };
     // The stop source's socket pair is created here for the same reason.
     let stop_source = StopSource::new()?;
@@ -378,11 +381,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // is joined after the vCPUs; `teardown` describes the stop.
     let input = spawn_input_thread(shared.clone(), stop_source.token());
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
-    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
+    if let (Some((listener, gate)), Some(dev)) = (agent_listener, &shared.vsock) {
         helpers.push((
             "agent bridge",
             spawn_vsock_bridge(
                 listener,
+                gate,
                 Arc::clone(dev),
                 Arc::clone(&shared.mem),
                 Arc::clone(&vm),
@@ -510,6 +514,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
     }
     lock_or_recover(&shared.emit).flush();
+    // The filters trap the stat and the unlink; see `Node::remove`.
+    if let (Some(node), false) = (&agent_node, cfg.sandbox) {
+        node.remove();
+    }
     if let Some(e) = failure {
         return Err(e);
     }
@@ -1211,8 +1219,11 @@ fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
 /// The listener is non-blocking, so the accept loop can poll it beside the stop
 /// token. The per-connection readers poll the same token, and the listener
 /// thread joins the ones still running before it exits.
+///
+/// A connection `gate` refuses is closed before it reaches the device.
 fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
+    mut gate: crate::agent_socket::PeerGate,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: Arc<VmFd>,
@@ -1233,6 +1244,9 @@ fn spawn_vsock_bridge(
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
+            if !gate.admits(&stream) {
+                continue;
+            }
             // The device writes to this socket and must block, or a full send
             // buffer would split a frame. On macOS an accepted socket inherits
             // the listener's non-blocking flag, so blocking mode is set here.
@@ -1489,20 +1503,6 @@ mod pio_tests {
         assert_eq!(via_ports & 0x04, 0, "DM clear means BCD");
         assert_eq!(via_ports & 0x02, 0x02, "24-hour mode");
     }
-}
-
-/// Binds a non-blocking Unix listener at `path`, clearing a stale socket from a
-/// previous run first (which would otherwise make `bind` fail with EADDRINUSE).
-///
-/// The listener is non-blocking so the bridge can poll it beside the stop token
-/// and then accept without blocking.
-fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
-    let _ = std::fs::remove_file(path);
-    let listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
-    })?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
 }
 
 #[cfg(test)]
