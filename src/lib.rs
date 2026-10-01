@@ -88,6 +88,7 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown payload".to_string())
 }
 
+pub mod agent_socket;
 pub mod arch;
 pub mod config;
 pub mod devices;

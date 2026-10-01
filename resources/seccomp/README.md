@@ -20,8 +20,8 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-A rule can also match an argument. Only the `ioctl` rules do, on the request
-number. `block`'s rules allow a request with `eq`:
+A rule can also match an argument. The `ioctl` rules match the request number,
+and `block`'s rules allow a request with `eq`:
 
 ```json
 {"syscall": "ioctl",
@@ -38,6 +38,9 @@ with `ne`:
     {"index": 1, "type": "dword", "op": "ne", "val": 21532, "comment": "TIOCLINUX (0x541C)"}
 ]}
 ```
+
+The `getsockopt` rule of `vmm` admits only `SOL_SOCKET` with `SO_PEERCRED`, the
+agent socket's peer check, with two `eq` conditions.
 
 - JSON has no hex literals, so `val` is decimal and the comment gives the hex.
 - Compare a request as a `dword`, the low 32 bits. The module docs say why.

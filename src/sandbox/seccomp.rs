@@ -126,12 +126,11 @@
 //!
 //! # Argument conditions
 //!
-//! A rule may match an argument as well as the syscall. Only the `ioctl` rules
-//! do, on the request number. `block` allows `ioctl` only for the requests its
-//! thread makes, so a worker cannot reach the rest of KVM's ioctls, or another
-//! descriptor's. The `ioctl` rule of `vmm` and `vcpu` refuses `TIOCSTI` and
-//! `TIOCLINUX` on any descriptor and allows every other request. A refused
-//! request traps like an off-list syscall.
+//! A rule may match an argument as well as the syscall. `block` allows `ioctl`
+//! only for the requests its thread makes, so a worker cannot reach the rest of
+//! KVM's ioctls, or another descriptor's. The `ioctl` rule of `vmm` and `vcpu`
+//! refuses `TIOCSTI` and `TIOCLINUX` on any descriptor and allows every other
+//! request. A refused request traps like an off-list syscall.
 //!
 //! The process shares the operator's terminal. Each request can push bytes
 //! into a terminal's input, and the operator's shell reads them as typed input
@@ -139,6 +138,10 @@
 //! controlling terminal it refuses `TIOCSTI` only under
 //! `dev.tty.legacy_tiocsti = 0`, and it refuses neither request to a caller
 //! with `CAP_SYS_ADMIN`.
+//!
+//! The `getsockopt` rule of `vmm` admits only `SOL_SOCKET` with `SO_PEERCRED`,
+//! which the agent bridge reads to check a peer's uid. A refused call traps
+//! like an off-list syscall.
 //!
 //! Each condition compares the low 32 bits of the request (`"type": "dword"`),
 //! because the kernel reads the request as an `unsigned int`. A 64-bit
@@ -618,6 +621,27 @@ fn probes() -> Vec<Probe> {
             },
         },
         Probe {
+            what: "read a socket option other than SO_PEERCRED (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Trapped,
+            // The getsockopt rule pins the level and the option name.
+            run: || {
+                let mut v: libc::c_int = 0;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: fd 1 is inherited, and the out-buffer is as long as
+                // the length passed with it.
+                unsafe {
+                    libc::getsockopt(
+                        1,
+                        libc::SOL_SOCKET,
+                        libc::SO_TYPE,
+                        (&mut v as *mut libc::c_int).cast(),
+                        &mut len,
+                    )
+                };
+            },
+        },
+        Probe {
             what: "send a signal to another process (vmm)",
             thread: Thread::Vmm,
             expected: Outcome::Trapped,
@@ -918,6 +942,32 @@ fn probes() -> Vec<Probe> {
             // the filter is in.
             run: || {
                 let _ = std::thread::spawn(|| 0u8).join();
+            },
+        },
+        Probe {
+            what: "read a peer's credentials (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Allowed,
+            // The agent bridge reads the uid of every connection it accepts.
+            run: || {
+                let mut cred = libc::ucred {
+                    pid: 0,
+                    uid: 0,
+                    gid: 0,
+                };
+                let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                // SAFETY: fd 1 is inherited, and the out-buffer is as long as
+                // the length passed with it. The filter passes the call before
+                // the kernel looks at the descriptor.
+                unsafe {
+                    libc::getsockopt(
+                        1,
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        (&mut cred as *mut libc::ucred).cast(),
+                        &mut len,
+                    )
+                };
             },
         },
         // The ledger writer sleeps under the vmm filter before it tries a
@@ -1480,6 +1530,97 @@ mod tests {
             libc::SECCOMP_RET_TRAP,
             "an arm64 worker raises its interrupt with an eventfd write"
         );
+    }
+
+    // seccompiler reads the level and the option name as plain numbers, so
+    // this ties them to the constants `agent_socket::peer_uid` passes. It also
+    // keeps ioctl and getsockopt the only rules with argument conditions in
+    // `vmm` and `vcpu`, which is what docs/security.md says.
+    #[test]
+    fn getsockopt_is_pinned_to_peer_credentials() {
+        // Both files, since SOL_SOCKET and SO_PEERCRED are the same on both.
+        let files = [
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/resources/seccomp/x86_64.json"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/resources/seccomp/aarch64.json"
+            )),
+        ];
+        for json in files {
+            let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+            for (key, want) in [
+                ("vmm", &["ioctl", "getsockopt"][..]),
+                ("vcpu", &["ioctl"][..]),
+            ] {
+                let conditioned: Vec<&str> = doc[key]["filter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|rule| rule.get("args").is_some())
+                    .map(|rule| rule["syscall"].as_str().unwrap())
+                    .collect();
+                assert_eq!(conditioned, want, "{key}");
+            }
+            let rule = doc["vmm"]["filter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rule| rule["syscall"] == "getsockopt")
+                .unwrap();
+            let pinned: Vec<(u64, u64)> = rule["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| {
+                    assert_eq!(arg["type"], "dword");
+                    assert_eq!(arg["op"], "eq");
+                    (arg["index"].as_u64().unwrap(), arg["val"].as_u64().unwrap())
+                })
+                .collect();
+            assert_eq!(
+                pinned,
+                vec![(1, libc::SOL_SOCKET as u64), (2, libc::SO_PEERCRED as u64)]
+            );
+        }
+    }
+
+    // Runs the compiled filters for the architecture the test runs on.
+    #[test]
+    fn getsockopt_admits_only_peer_credentials() {
+        let sol = libc::SOL_SOCKET as u64;
+        let peercred = libc::SO_PEERCRED as u64;
+        let getsockopt = |thread: Thread, level: u64, name: u64| {
+            verdict_with(
+                &installed(thread),
+                libc::SYS_getsockopt,
+                [3, level, name, 0, 0, 0],
+            )
+        };
+        assert_eq!(
+            getsockopt(Thread::Vmm, sol, peercred),
+            libc::SECCOMP_RET_ALLOW
+        );
+        for (level, name) in [
+            (sol, libc::SO_TYPE as u64),
+            (sol, libc::SO_PEERSEC as u64),
+            (libc::IPPROTO_TCP as u64, peercred),
+        ] {
+            assert_eq!(
+                getsockopt(Thread::Vmm, level, name),
+                libc::SECCOMP_RET_TRAP,
+                "vmm passes getsockopt({level}, {name})"
+            );
+        }
+        for thread in [Thread::Vcpu, Thread::Block] {
+            assert_eq!(
+                getsockopt(thread, sol, peercred),
+                libc::SECCOMP_RET_TRAP,
+                "{thread:?}"
+            );
+        }
     }
 
     /// The point of installing after setup is that the process can no longer
