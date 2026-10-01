@@ -258,17 +258,16 @@ impl PeerGate {
     /// on stderr and later ones are not, so a client that retries cannot fill
     /// the log.
     pub fn admits(&mut self, stream: &UnixStream) -> bool {
-        let who = match peer_uid(stream) {
+        let why = match peer_uid(stream) {
             Ok(uid) if uid == self.uid => return true,
-            Ok(uid) => format!("a peer running as uid {uid}"),
-            Err(e) => format!("a peer whose uid cannot be read ({e})"),
+            Ok(_) => "it runs as another user".to_string(),
+            Err(e) => format!("reading its user failed ({e})"),
         };
         if !self.reported {
             self.reported = true;
             eprintln!(
-                "[hvi] agent socket: refused {who}; only uid {} may connect. \
-                 Later refusals are not reported.",
-                self.uid
+                "[hvi] agent socket: refused a connection, {why}; only the VMM's own user \
+                 may connect. Later refusals are not reported."
             );
         }
         false
