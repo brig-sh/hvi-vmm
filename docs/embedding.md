@@ -346,6 +346,10 @@ guest's writes fail with EPIPE from then on. A guest that shuts down only its
 read half with `shutdown(SHUT_RD)` gets no more host bytes, and the host
 client's writes block once its socket fills.
 
+The host client must run as the same uid as the VMM, or hvi closes the
+connection before it reaches the guest. See
+[security.md](security.md#the-agent-socket).
+
 The contract the guest side must satisfy:
 
 - Listen on **port 1024**, with the guest at **CID 3** and the host at
