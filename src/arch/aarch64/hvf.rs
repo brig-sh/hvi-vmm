@@ -341,16 +341,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     });
     // Bind before Seatbelt is installed. Accepting on this already-open
     // listener remains allowed afterwards; acquiring a new socket does not.
-    // It is non-blocking so the bridge can poll it beside the stop token.
-    let agent_listener = match &cfg.agent_sock {
+    let (agent_listener, agent_node) = match &cfg.agent_sock {
         Some(path) => {
-            let _ = std::fs::remove_file(path);
-            let listener = std::os::unix::net::UnixListener::bind(path)
-                .map_err(|e| format!("bind agent socket {path}: {e}"))?;
-            listener.set_nonblocking(true)?;
-            Some(listener)
+            let bound = crate::agent_socket::bind(path)?;
+            (Some((bound.listener, bound.gate)), Some(bound.node))
         }
-        None => None,
+        None => (None, None),
     };
     // The stop source's socket pair is created before Seatbelt for the same
     // reason.
@@ -514,11 +510,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     );
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
     let mut readahead_stops = Vec::new();
-    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
+    if let (Some((listener, gate)), Some(dev)) = (agent_listener, &shared.vsock) {
         helpers.push((
             "agent bridge",
             spawn_vsock_bridge(
                 listener,
+                gate,
                 Arc::clone(dev),
                 Arc::clone(&shared.mem),
                 vm.clone(),
@@ -608,6 +605,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
     }
     lock_or_recover(&shared.emit).flush();
+    // The sandbox denies the stat and the unlink; see `Node::remove`.
+    if let (Some(node), false) = (&agent_node, cfg.sandbox) {
+        node.remove();
+    }
 
     // What the guest actually spent, reported once on the way out. #34 asks
     // for this number before any limit is tightened: a ceiling picked without
@@ -1249,11 +1250,14 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// host->guest injection the vsock GIC line is raised and the vCPUs kicked so
 /// the guest drains its RX queue promptly.
 ///
+/// A connection `gate` refuses is closed before it reaches the device.
+///
 /// The listener is non-blocking, so the accept loop can poll it beside the stop
 /// token. The per-connection readers poll the same token, and the listener
 /// thread joins the ones still running before it exits.
 fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
+    mut gate: crate::agent_socket::PeerGate,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
@@ -1275,6 +1279,9 @@ fn spawn_vsock_bridge(
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
+            if !gate.admits(&stream) {
+                continue;
+            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };

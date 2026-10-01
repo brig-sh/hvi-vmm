@@ -20,6 +20,10 @@
                 {"index": 1, "type": "dword", "op": "ne", "val": 21532, "comment": "TIOCLINUX (0x541C), whose paste subcommand pushes the selection into a virtual console's input"}
             ]},
             {"syscall": "accept4", "comment": "control socket and the agent bridge"},
+            {"syscall": "getsockopt", "args": [
+                {"index": 1, "type": "dword", "op": "eq", "val": 1, "comment": "SOL_SOCKET"},
+                {"index": 2, "type": "dword", "op": "eq", "val": 17, "comment": "SO_PEERCRED"}
+            ], "comment": "the agent bridge reads the uid of an accepted peer, and no other option"},
             {"syscall": "recvfrom", "comment": "agent bridge reads; the gateway relay's non-blocking receive"},
             {"syscall": "recvmsg", "comment": "safety net: the control protocol's receive side"},
             {"syscall": "sendmsg", "comment": "SCM_RIGHTS: guest-RAM fd to a plugin consumer"},

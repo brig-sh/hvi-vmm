@@ -54,7 +54,7 @@ including a typo, silently runs the plain test.
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
-| `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
+| `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. Mode 0600, and only the VMM's own uid may connect. See [security.md](security.md#the-agent-socket). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |

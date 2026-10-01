@@ -76,7 +76,7 @@ three things a reader should not have to guess between:
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
 | The `--dump-after` timer thread is unfiltered on Linux. | It starts before the filters are armed and runs unfiltered for the life of the VM. See [#92](https://github.com/brig-sh/hvi-vmm/issues/92). | Defect |
-| Only the `ioctl` seccomp rule carries argument conditions. | They refuse `TIOCSTI` and `TIOCLINUX`. Every other `ioctl` request, and `sendmsg`, is unconstrained over every descriptor the process already holds. | Design |
+| Only the `ioctl` and `getsockopt` seccomp rules carry argument conditions. | `ioctl` refuses `TIOCSTI` and `TIOCLINUX`, and `getsockopt` is pinned to `SO_PEERCRED`. Every other `ioctl` request, and `sendmsg`, is unconstrained over every descriptor the process already holds. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |
 | No external security audit. | Testing, not assurance. | Design |
