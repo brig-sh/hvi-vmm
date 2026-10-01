@@ -137,15 +137,18 @@ pub struct Emitter {
 }
 
 impl Emitter {
-    /// Opens the ledger at `path` (truncating), or returns a disabled emitter
-    /// when `path` is `None`.
+    /// Opens the ledger at `path` through [`crate::private_file::create`], or
+    /// returns a disabled emitter when `path` is `None`.
     ///
     /// # Errors
     ///
-    /// Errors if the file cannot be created.
+    /// Errors if the file cannot be created, or if `create` refuses what is
+    /// at `path`.
     pub fn new(path: Option<&str>, sandbox_id: &str) -> std::io::Result<Self> {
         let out = match path {
-            Some(p) => Some(BufWriter::new(File::create(p)?)),
+            Some(p) => Some(BufWriter::new(crate::private_file::create(
+                std::path::Path::new(p),
+            )?)),
             None => None,
         };
         Ok(Emitter {
@@ -339,6 +342,60 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2, "both lines reached the ledger");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // A local user who can write the ledger's directory, or a guest when the
+    // ledger is inside a writable share, must not be able to make the VMM
+    // truncate a host file.
+    #[test]
+    fn the_ledger_refuses_to_follow_a_planted_symlink() {
+        let tmp = std::env::temp_dir().join(format!("hvi-ledger-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("target.txt");
+        std::fs::write(&target, "operator data that must survive").unwrap();
+        let ledger = tmp.join("ledger.ndjson");
+        std::os::unix::fs::symlink(&target, &ledger).unwrap();
+
+        let result = Emitter::new(Some(ledger.to_str().unwrap()), "vm1");
+        let followed = result.is_ok()
+            && std::fs::read_to_string(&target).unwrap() != "operator data that must survive";
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            !followed,
+            "the ledger opened (and truncated) the symlink target"
+        );
+    }
+
+    // macOS lets any user hard-link another user's file into a directory
+    // they can write, so a link count above one is the same redirection.
+    #[test]
+    fn the_ledger_refuses_a_planted_hard_link() {
+        let tmp = std::env::temp_dir().join(format!("hvi-ledger-hardlink-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("target.txt");
+        std::fs::write(&target, "operator data that must survive").unwrap();
+        let ledger = tmp.join("ledger.ndjson");
+        std::fs::hard_link(&target, &ledger).unwrap();
+
+        let result = Emitter::new(Some(ledger.to_str().unwrap()), "vm1");
+        let survived = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(result.is_err(), "the ledger opened a file with two links");
+        assert_eq!(survived, "operator data that must survive");
+    }
+
+    // The ledger carries the guest's DNS names and TLS SNI.
+    #[test]
+    fn the_ledger_is_private_to_its_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("hvi-mode-{}.ndjson", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let e = Emitter::new(Some(path.to_str().unwrap()), "vm1").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        drop(e);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode & 0o077, 0, "ledger mode {mode:o}");
     }
 
     #[test]
