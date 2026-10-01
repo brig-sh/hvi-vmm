@@ -62,6 +62,10 @@ including a typo, silently runs the plain test.
 | `--trace-io <path>` | none | Attach the I/O tracer. |
 | `--no-sandbox` | off | Boot unconfined. For debugging the profile or the filters. |
 
+`--events`, `--trace-io` and `--dump-memory` create their file at mode 0600.
+They refuse a symbolic link, and any path that is not a regular file you own.
+See [observability.md](observability.md#how-hvi-creates-these-files).
+
 ### Parsing behaviour
 
 Three things about the parser are worth knowing, because none of them warns.
@@ -158,7 +162,8 @@ hvi dump-fdt --kernel Image --mem-mib 1024 --out fdt.dtb
 | `--out <file>` | none, print only |
 
 The blob it writes carries a fresh random `rng-seed` and `kaslr-seed`, as a
-boot's would. Neither is printed, and no boot uses them.
+boot's would. Neither is printed, and no boot uses them. `--out` creates its
+file the way `--events` does.
 
 It always builds a **one-vCPU devicetree with no virtio devices**, using the
 fixed QEMU virt GIC layout rather than whatever a host would negotiate. It has
