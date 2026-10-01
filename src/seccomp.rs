@@ -361,6 +361,27 @@ fn probes() -> Vec<Probe> {
             },
         },
         Probe {
+            what: "read a socket option other than SO_PEERCRED (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: false,
+            // The getsockopt rule pins the level and the option name.
+            run: || {
+                let mut v: libc::c_int = 0;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: fd 1 is inherited, and the out-buffer is as long as
+                // the length passed with it.
+                unsafe {
+                    libc::getsockopt(
+                        1,
+                        libc::SOL_SOCKET,
+                        libc::SO_TYPE,
+                        (&mut v as *mut libc::c_int).cast(),
+                        &mut len,
+                    )
+                };
+            },
+        },
+        Probe {
             what: "send a signal to another process (vmm)",
             thread: Thread::Vmm,
             expect_ok: false,
@@ -499,6 +520,32 @@ fn probes() -> Vec<Probe> {
             // the filter is in.
             run: || {
                 let _ = std::thread::spawn(|| 0u8).join();
+            },
+        },
+        Probe {
+            what: "read a peer's credentials (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            // The agent bridge checks the uid of every connection it accepts.
+            run: || {
+                let mut cred = libc::ucred {
+                    pid: 0,
+                    uid: 0,
+                    gid: 0,
+                };
+                let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                // SAFETY: fd 1 is inherited, and the out-buffer is as long as
+                // the length passed with it. The filter passes the call before
+                // the kernel looks at the descriptor.
+                unsafe {
+                    libc::getsockopt(
+                        1,
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        (&mut cred as *mut libc::ucred).cast(),
+                        &mut len,
+                    )
+                };
             },
         },
         // The debug watchdog sleeps under the vmm filter, and which syscall
@@ -684,6 +731,46 @@ mod tests {
         let extra: Vec<_> = vcpu.difference(&vmm).collect();
         assert!(extra.is_empty(), "vcpu allows what vmm does not: {extra:?}");
         assert!(vcpu.len() < vmm.len(), "vcpu should be the tighter filter");
+    }
+
+    // seccompiler reads the level and the option name as plain numbers, so
+    // this ties them to the constants `agent_socket::peer_uid` passes. It also
+    // keeps the getsockopt rule the only one with argument conditions, which
+    // is what docs/security.md says.
+    #[test]
+    fn getsockopt_is_pinned_to_peer_credentials() {
+        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
+        for key in ["vmm", "vcpu"] {
+            let conditioned: Vec<&str> = doc[key]["filter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|rule| rule.get("args").is_some())
+                .map(|rule| rule["syscall"].as_str().unwrap())
+                .collect();
+            let want: &[&str] = if key == "vmm" { &["getsockopt"] } else { &[] };
+            assert_eq!(conditioned, want, "{key}");
+        }
+        let rule = doc["vmm"]["filter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["syscall"] == "getsockopt")
+            .unwrap();
+        let pinned: Vec<(u64, u64)> = rule["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| {
+                assert_eq!(arg["type"], "dword");
+                assert_eq!(arg["op"], "eq");
+                (arg["index"].as_u64().unwrap(), arg["val"].as_u64().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            pinned,
+            vec![(1, libc::SOL_SOCKET as u64), (2, libc::SO_PEERCRED as u64)]
+        );
     }
 
     /// The point of installing after setup is that the process can no longer
