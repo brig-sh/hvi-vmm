@@ -31,10 +31,51 @@ No boot job attaches a disk or a vsock agent, so those devices are covered by
 unit tests rather than by a live boot. On any other target the build stops with
 a compile error.
 
+## Releases
+
+A `vX.Y.Z` tag builds a release: one archive per target on the
+[releases page](https://github.com/brig-sh/hvi-vmm/releases), and the same
+binaries in GHCR under `ghcr.io/brig-sh/hvi-binaries`. The Linux archives hold
+a static musl build. The macOS archive holds a binary signed with NOFire AI's
+Developer ID and notarized, so Gatekeeper runs it straight from a download and
+it needs no signing step of your own.
+
+```sh
+tag=v0.1.0
+target=aarch64-apple-darwin   # or {x86_64,aarch64}-unknown-linux-musl
+gh release download "$tag" --repo brig-sh/hvi-vmm \
+  --pattern "hvi-${tag#v}-$target.tar.gz"
+tar xzf "hvi-${tag#v}-$target.tar.gz"
+./hvi --version
+```
+
+The checksum file carries a keyless Sigstore signature, so a download can be
+traced to the release workflow that built it:
+
+```sh
+gh release download "$tag" --repo brig-sh/hvi-vmm --pattern 'SHA256SUMS*'
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.cosign.bundle \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp \
+    '^https://github\.com/brig-sh/hvi-vmm/\.github/workflows/release\.yml@refs/'
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Each binary reports its own version. A release build names the release, and a
+build between two releases names the release it sits past and the commit it
+came from, for instance `0.1.0+15.gabc1234`. A build from sources that differ
+from that commit adds `dirty`, as in `0.1.0+15.gabc1234.dirty`.
+
+Each release's notes say what it carries, generated from the commits since the
+release before it. There is no changelog file: the releases page is the
+changelog.
+
 ## Build
 
-There is no published crate and no downloadable release. Build from source.
-The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+There is no published crate. Build from source, or take a binary from a
+release. The toolchain is pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```sh
 cargo build --release
