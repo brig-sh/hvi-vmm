@@ -1,0 +1,49 @@
+name: Build, verify and publish main
+
+# Every push to main: the suites, the binaries, and once the suites pass, the
+# binaries in GHCR as <target>-<sha> for the head of the push. Those are the
+# development builds, ad-hoc signed on macOS and reporting `X.Y.Z+N.g<sha>`.
+# tag-release.yml requires this run to have passed for the commit it tags.
+#
+# One run per push, keyed on the commit and never cancelled: a run stopped
+# between a push to GHCR and its signature leaves a tag unsigned.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-code:
+    name: Validate code
+    uses: ./.github/workflows/validate-code.yml
+
+  build-and-test:
+    name: Build and test
+    uses: ./.github/workflows/build-and-test.yml
+    # A called workflow gets none of the caller's secrets unless told, and the
+    # coverage upload in it reads CODECOV_TOKEN. Without this the upload runs
+    # tokenless, never fails, and the badge stays at "unknown" with nothing in
+    # the log to say why.
+    secrets: inherit
+
+  build-binaries:
+    name: Build binaries
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+
+  publish:
+    name: Publish binaries
+    needs: [validate-code, build-and-test, build-binaries]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/publish-binaries.yml

@@ -6,3 +6,6 @@ self-hosted-runner:
     - kvm
     - nbfc
     - gicv3
+    # The Macs that hold the Developer ID and reach Apple's notary service;
+    # see the sign-macos job in build-binaries.yml.
+    - notary
