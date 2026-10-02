@@ -14,13 +14,13 @@
 
 //! The x86-64 guest on KVM, SMP-capable.
 //!
-//! The x86 counterpart of `machine_linux`. KVM gives us an in-kernel LAPIC +
+//! The x86 counterpart of `aarch64::kvm`. KVM gives us an in-kernel LAPIC +
 //! IOAPIC + PIT (`create_irq_chip`/`create_pit2`), so SMP is just: enter the
 //! BSP in long mode and run every vCPU thread — the guest brings up APs with
 //! INIT-SIPI-SIPI, handled in-kernel. We build the initial long-mode state
 //! (identity page tables, flat 64-bit segments, CR0/CR3/CR4/EFER), load the
-//! bzImage or vmlinux and write `boot_params` (see `boot_x86`), and enter at
-//! the 64-bit entry with RSI -> the zero page.
+//! bzImage or vmlinux and write `boot_params` (see `super::loader`), and enter
+//! at the 64-bit entry with RSI -> the zero page.
 //!
 //! Devices are the shared virtio-mmio blk/net/vsock (serviced on
 //! `KVM_EXIT_MMIO`) plus a 16550 serial on port I/O (`KVM_EXIT_IO`).
@@ -49,16 +49,16 @@ use std::thread::JoinHandle;
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 
-use crate::boot_x86;
-use crate::config::{BootConfig, Stop};
-use crate::events::{CapturedEvent, Emitter};
-use crate::guestmem::GuestRam;
-use crate::layout_x86::{
+use crate::arch::x86_64::layout::{
     BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR,
     PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE,
     VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
-use crate::mptable;
+use crate::arch::x86_64::loader::LoadedKernel;
+use crate::arch::x86_64::mptable;
+use crate::config::{BootConfig, Stop};
+use crate::events::{CapturedEvent, Emitter};
+use crate::guestmem::GuestRam;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
 use crate::sync::lock_or_recover;
@@ -286,7 +286,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Load the kernel, write boot_params and the command line, then place
     // the initrd and the MP table.
     let initrd_len = cfg.initramfs.as_ref().map_or(0, |v| v.len() as u64);
-    let kernel = boot_x86::LoadedKernel::load(ram.memory(), &cfg.kernel, &cmdline, initrd_len)?;
+    let kernel = LoadedKernel::load(ram.memory(), &cfg.kernel, &cmdline, initrd_len)?;
     if let (Some(addr), Some(initramfs)) = (kernel.initrd_addr, &cfg.initramfs) {
         ram.write(addr, initramfs)?;
     }
@@ -1645,7 +1645,7 @@ mod stop_tests {
         let booted = Arc::clone(&plugin);
         std::thread::spawn(move || {
             let outcome = boot(config(
-                crate::boot_x86::tests::synthetic_bzimage(),
+                crate::arch::x86_64::loader::tests::synthetic_bzimage(),
                 Some(booted),
             ))
             .map_err(|e| e.to_string());
@@ -1674,8 +1674,11 @@ mod stop_tests {
         assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = boot(config(crate::boot_x86::tests::spinning_bzimage(), None))
-                .map_err(|e| e.to_string());
+            let outcome = boot(config(
+                crate::arch::x86_64::loader::tests::spinning_bzimage(),
+                None,
+            ))
+            .map_err(|e| e.to_string());
             let _ = sender.send(outcome);
         });
         let deadline = Instant::now() + Duration::from_secs(10);

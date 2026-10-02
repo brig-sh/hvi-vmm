@@ -373,18 +373,18 @@ pub struct VirtioNet {
     queue_sel: u32,
     queues: [Queue; 2],
     interrupt_status: u32,
-    /// Captured flows, drained by the machine into the event ledger.
+    /// Captured flows, drained by the hypervisor backend into the event ledger.
     events: Vec<CapturedEvent>,
     /// When set, the device relays frames to the gvisor-tap-vsock gateway over
     /// this QEMU stream socket instead of running the built-in stack. The
-    /// machine holds a clone of the read side on a reader thread (see
-    /// `spawn_net_gateway_reader`).
+    /// hypervisor backend holds a clone of the read side on a reader thread
+    /// (see `spawn_net_gateway_reader`).
     gw: Option<UnixStream>,
     /// Whether a tap write has already failed, so only the first failure is
     /// reported.
     tap_write_reported: bool,
     /// When set, frames go to this tap instead: the container's real NIC path.
-    /// The machine keeps a cloned fd on a reader thread
+    /// The hypervisor backend keeps a cloned fd on a reader thread
     /// (`spawn_net_tap_reader`).
     tap: Option<File>,
     /// MAC handed to the guest through config space.
@@ -774,8 +774,8 @@ impl VirtioNet {
     }
 
     /// Delivers one inbound Ethernet frame into the RX queue. Public so the
-    /// machine's gateway or tap reader thread can call it under the device
-    /// lock.
+    /// hypervisor backend's gateway or tap reader thread can call it under the
+    /// device lock.
     pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) {
         self.inject_rx(mem, frame);
     }

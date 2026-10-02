@@ -334,7 +334,7 @@ jobs:
           BIN: ${{ steps.blk.outputs.bin }}
         run: |
           echo "test binary: $BIN"
-          sudo "$BIN" machine::stop_tests:: --ignored --nocapture --test-threads=1 \
+          sudo "$BIN" kvm::stop_tests:: --ignored --nocapture --test-threads=1 \
             </dev/null 2>&1 | tee stop.log || true
           grep -q "test result: ok. 3 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
@@ -699,7 +699,7 @@ jobs:
       # here, so no sudo.
       - name: run the vCPU stop tests
         run: |
-          cargo test --release --lib machine::stop_tests:: \
+          cargo test --release --lib kvm::stop_tests:: \
             -- --ignored --nocapture --test-threads=1 </dev/null 2>&1 | tee stop.log || true
           grep -q "test result: ok. 3 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }

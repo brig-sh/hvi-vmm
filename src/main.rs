@@ -31,11 +31,11 @@
 
 use std::sync::Arc;
 
+use hvi::config;
 use hvi::plugins::{Chain, IoTrace, MemoryDump};
-use hvi::{config, machine};
 
 #[cfg(target_arch = "aarch64")]
-use hvi::{boot, fdt, layout};
+use hvi::arch::aarch64::{fdt, layout, loader};
 
 /// Hosts with a real VMM backend: aarch64 on macOS (hvf) or Linux (KVM), and
 /// x86-64 on Linux (KVM).
@@ -120,9 +120,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `--shm` runs the same test over shared guest memory (the
                 // mechanism an out-of-process plugin needs on macOS).
                 if args.get(2).map(String::as_str) == Some("--shm") {
-                    hvi::smoke::run_shm()
+                    hvi::arch::aarch64::smoke::run_shm()
                 } else {
-                    hvi::smoke::run()
+                    hvi::arch::aarch64::smoke::run()
                 }
             }
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -140,7 +140,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .get(3)
                     .ok_or("smoke-shm-verify needs an expected value")?;
                 let expect = u64::from_str_radix(expect.trim_start_matches("0x"), 16)?;
-                hvi::smoke::verify_shm(name, expect)
+                hvi::arch::aarch64::smoke::verify_shm(name, expect)
             }
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             {
@@ -217,8 +217,8 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let ram_size = mem_mib << 20;
     let gic = GicLayout::QEMU_VIRT;
-    let kernel = boot::LoadedKernel::from_header(&kernel_bytes)?;
-    let boot::Plan { layout, dtb } = kernel.plan(
+    let kernel = loader::LoadedKernel::from_header(&kernel_bytes)?;
+    let loader::Plan { layout, dtb } = kernel.plan(
         ram_size,
         initrd_size,
         &gic,
@@ -436,7 +436,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     eprintln!("booting {kernel_path} with {mem_mib} MiB ...");
-    let stop = machine::boot(cfg)?;
+    let stop = hvi::boot(cfg)?;
     eprintln!("guest stopped: {stop:?}");
     Ok(())
 }

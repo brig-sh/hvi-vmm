@@ -117,7 +117,7 @@ of the dispatch path. Its cause is still open.
 Take at least five samples of that line and compare the **fast** mode, or you
 will attribute a mode flip to whatever you happened to change. A sweep of
 `FS_INLINE_BUDGET`, the per-notify inline drain budget and a constant in
-`src/machine_macos.rs`, over 1, 4 and 8 looked like a clear win for 4 until
+`src/arch/aarch64/hvf.rs`, over 1, 4 and 8 looked like a clear win for 4 until
 the sixth sample of 4 came back at 2.03 s.
 
 That record is why this page does not compare two numbers and call it a

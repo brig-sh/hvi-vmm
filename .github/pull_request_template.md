@@ -1,6 +1,6 @@
 <!--
 Title: use a conventional-commit subject, e.g. feat(x86): Add virtio-net gateway.
-Example scopes: machine, x86, virtio, boot, layout, fdt, mptable,
+Example scopes: arch, x86, virtio, boot, layout, fdt, mptable,
 uart, ci, docs.
 
 Every commit in the pull request is linted too: 72-column header, capitalized

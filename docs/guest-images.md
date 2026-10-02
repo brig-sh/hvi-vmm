@@ -131,7 +131,8 @@ MMU from a page table written at link time; the QEMU-virt one maps
 `0x0800_0000`-`0x4000_0000` as device memory, which is the range that has to
 hold for the guests here. Linux builds its early map from the devicetree and
 accepts MMIO anywhere. Every hvi device window is inside that range, so this
-costs a Linux guest nothing (see `DEVICE_WINDOW_BASE` in `src/layout.rs`).
+costs a Linux guest nothing (see `DEVICE_WINDOW_BASE` in
+`src/arch/aarch64/layout.rs`).
 
 ## The kernel command line
 

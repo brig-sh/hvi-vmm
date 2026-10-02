@@ -14,15 +14,15 @@
 
 //! The arm64 guest on KVM, SMP-capable.
 //!
-//! The Linux counterpart of `machine_macos`. KVM gives us an **in-kernel
-//! GIC** and **in-kernel PSCI**, so this backend is structurally simpler than
-//! the hvf one: secondaries are created `POWER_OFF` and brought up by the
-//! guest's own PSCI `CPU_ON` (handled entirely in-kernel — no mailbox), and
-//! interrupts are a single `set_irq_line`, which also wakes a WFI'd vCPU (no
-//! explicit kick for delivery). A kick sets the vCPU's `immediate_exit` byte
-//! and signals its thread. It gets cpu0 to its next safe point, where a plugin
-//! runs, gets the other vCPUs to theirs for a pause, and breaks every vCPU out
-//! of `KVM_RUN` when the VM stops.
+//! The Linux counterpart of `hvf`. KVM gives us an **in-kernel GIC** and
+//! **in-kernel PSCI**, so this backend is structurally simpler than the hvf
+//! one: secondaries are created `POWER_OFF` and brought up by the guest's own
+//! PSCI `CPU_ON` (handled entirely in-kernel, with no mailbox), and interrupts
+//! are a single `set_irq_line`, which also wakes a WFI'd vCPU (no explicit kick
+//! for delivery). A kick sets the vCPU's `immediate_exit` byte and signals its
+//! thread. It gets cpu0 to its next safe point, where a plugin runs, gets the
+//! other vCPUs to theirs for a pause, and breaks every vCPU out of `KVM_RUN`
+//! when the VM stops.
 //!
 //! Everything else — image/layout/DTB, virtio devices, PL011, the RawEvent
 //! ledger, and the plugin seam — is the same hypervisor-agnostic code the
@@ -51,15 +51,15 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 
-use crate::boot;
-use crate::config::{BootConfig, Stop};
-use crate::events::Emitter;
-use crate::fdt;
-use crate::guestmem::GuestRam;
-use crate::layout::{
+use crate::arch::aarch64::fdt;
+use crate::arch::aarch64::layout::{
     GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
     VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
+use crate::arch::aarch64::loader;
+use crate::config::{BootConfig, Stop};
+use crate::events::Emitter;
+use crate::guestmem::GuestRam;
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
@@ -151,7 +151,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
-    boot::LoadedKernel::from_header(&cfg.kernel)?;
+    loader::LoadedKernel::from_header(&cfg.kernel)?;
 
     let num_cpus = cfg.vcpus.max(1);
 
@@ -288,7 +288,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
-    let layout = boot::Payload {
+    let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
@@ -1396,7 +1396,7 @@ mod stop_tests {
         let booted = Arc::clone(&plugin);
         std::thread::spawn(move || {
             let outcome = boot(config(
-                crate::boot::tests::synthetic_image(0x8_0000, 0x40_0000, 0x1000),
+                crate::arch::aarch64::loader::tests::synthetic_image(0x8_0000, 0x40_0000, 0x1000),
                 Some(booted),
             ))
             .map_err(|e| e.to_string());
@@ -1425,8 +1425,11 @@ mod stop_tests {
         assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome =
-                boot(config(crate::boot::tests::spinning_image(), None)).map_err(|e| e.to_string());
+            let outcome = boot(config(
+                crate::arch::aarch64::loader::tests::spinning_image(),
+                None,
+            ))
+            .map_err(|e| e.to_string());
             let _ = sender.send(outcome);
         });
         let deadline = Instant::now() + Duration::from_secs(10);

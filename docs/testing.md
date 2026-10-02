@@ -64,9 +64,9 @@ Where it actually runs in CI:
 | x86-64 Linux, musl (`ubuntu-latest`) | The full suite for `x86_64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 | arm64 Linux, musl (`ubuntu-24.04-arm`) | The full suite for `aarch64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 
-`src/machine_x86.rs` has unit tests and they run on `ubuntu-latest`, so the
-x86-64/KVM backend is unit-tested. `src/machine_linux.rs` has only the vCPU stop
-tests, which `src/machine_x86.rs` carries too. They need `/dev/kvm`.
+`src/arch/x86_64/kvm.rs` has unit tests and they run on `ubuntu-latest`, so the
+x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm.rs` has only the vCPU
+stop tests, which `src/arch/x86_64/kvm.rs` carries too. They need `/dev/kvm`.
 
 The used-ring litmus, the virtio-fs benchmarks and the vCPU stop tests are
 `#[ignore]`d and do not run in a normal `cargo test`.
@@ -76,7 +76,7 @@ vCPU's thread and descriptors by name. Run them one at a time, with stdin
 redirected, as a user who can open `/dev/kvm`:
 
 ```sh
-cargo test --release machine::stop_tests:: -- \
+cargo test --release kvm::stop_tests:: -- \
   --ignored --test-threads=1 </dev/null
 ```
 

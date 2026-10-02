@@ -115,10 +115,10 @@ use std::path::{Path, PathBuf};
 pub const PROFILE: &str = r#"(version 1)
 ;; hvi VMM confinement -- see src/sandbox.rs for the reasoning behind each line.
 ;;
-;; Installed after the machine is built and every host resource is already
-;; open, and before any guest I/O is serviced. Seatbelt polices acquiring
-;; resources rather than using descriptors already held, so the VMM keeps
-;; working on what it has and can obtain nothing new.
+;; Installed after the VM is built and every host resource is already open, and
+;; before any guest I/O is serviced. Seatbelt polices acquiring resources rather
+;; than using descriptors already held, so the VMM keeps working on what it has
+;; and can obtain nothing new.
 ;;
 ;; sandbox_init(3) is formally deprecated (10.8) and still the mechanism in
 ;; practice (Chrome, sandbox-exec). Re-prove this profile per OS release:

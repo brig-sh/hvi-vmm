@@ -114,10 +114,10 @@ There is no `--help`. [docs/cli.md](docs/cli.md) is the flag reference.
 <img src="docs/img/guest-memory-arm64.svg" alt="arm64 guest physical address space: devices low, RAM at 1 GiB" width="720">
 
 Every backend speaks virtio-mmio, which avoids a PCI host bridge and lets one
-set of device models serve all three. The `machine_*` modules hold the
-hypervisor differences. The boot protocol differs too, and by more: arm64 uses
-an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or an
-uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
+set of device models serve all three. The backend modules under `src/arch/` hold
+the hypervisor differences. The boot protocol differs too, and by more: arm64
+uses an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or
+an uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
 
 [docs/architecture.md](docs/architecture.md) describes the whole design.
 
@@ -140,9 +140,9 @@ hvi is young. Read these before you build on it.
 - **The event ledger is per packet and egress only.** It is not aggregated per
   flow, and it is not a tamper-proof record.
 - **The arm64/KVM backend is unit-tested on its stop path only.**
-  `src/machine_linux.rs` carries only tests of how a vCPU thread that ends stops
-  the VM and how a kick ends a run, and they need `/dev/kvm`. The rest of that
-  backend is cross-linted and booted.
+  `src/arch/aarch64/kvm.rs` carries only tests of how a vCPU thread that ends
+  stops the VM and how a kick ends a run, and they need `/dev/kvm`. The rest of
+  that backend is cross-linted and booted.
 
 [docs/limitations.md](docs/limitations.md) has the full list with the
 consequences.

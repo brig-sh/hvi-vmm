@@ -51,7 +51,7 @@ pub const COM1_GSI: u32 = 4;
 
 /// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device
 /// (blk, net, vsock), with IOAPIC GSIs 5/6/7. The guest is told about these via
-/// `virtio_mmio.device=` on the kernel command line (see `boot_x86`).
+/// `virtio_mmio.device=` on the kernel command line (see `kvm::boot`).
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
 pub const VIRTIO_SIZE: u64 = 0x200;
 pub const VIRTIO_BLK_BASE: u64 = VIRTIO_MMIO_BASE;

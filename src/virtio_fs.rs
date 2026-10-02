@@ -1445,9 +1445,10 @@ impl VirtioFs {
     /// `cache=none`, which never serves a prepared listing, and the handle
     /// that stops them.
     ///
-    /// The workers read the shared tree, so the machine starts them after it
-    /// confines the process and joins them with its other helper threads.
-    /// Until then a READDIRPLUS finds nothing prepared and reads the host.
+    /// The workers read the shared tree, so the hypervisor backend starts them
+    /// after it confines the process and joins them with its other helper
+    /// threads. Until then a READDIRPLUS finds nothing prepared and reads the
+    /// host.
     pub fn start_readahead(&self) -> (Vec<std::thread::JoinHandle<()>>, ReadaheadStop) {
         let workers = if self.readahead_enabled() {
             self.readahead.start()
@@ -1546,12 +1547,12 @@ impl VirtioFs {
 
     /// Services a virtio-mmio register access.
     ///
-    /// `QUEUE_NOTIFY` never runs a FUSE request here: it only records the
-    /// queue index in `notified` and returns. That is what keeps the vCPU
-    /// off the host filesystem -- `spawn_fs_worker` (`machine_macos.rs`) is
-    /// the thread that actually calls `process_queue`, off the exit path
-    /// entirely. Every other register is handled inline here; `reset` is the
-    /// one whose work reaches the host filesystem.
+    /// `QUEUE_NOTIFY` never runs a FUSE request here: it only records the queue
+    /// index in `notified` and returns. That is what keeps the vCPU off the
+    /// host filesystem -- `spawn_fs_worker` (`arch/aarch64/hvf.rs`) is the
+    /// thread that actually calls `process_queue`, off the exit path entirely.
+    /// Every other register is handled inline here; `reset` is the one whose
+    /// work reaches the host filesystem.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
@@ -12715,10 +12716,10 @@ mod tests {
 
     // --- Stage A: `QUEUE_NOTIFY` no longer runs the request inline; it just
     // records the queue index for a worker thread (`spawn_fs_worker` in
-    // `machine_macos.rs`) to drain. The two tests below cover the part of
-    // that split this module can exercise without a live VM: that `mmio`
-    // itself does no I/O, and that the notified-bitmask/`process_queue`
-    // hand-off it feeds is race-free under concurrent access.
+    // `arch/aarch64/hvf.rs`) to drain. The two tests below cover the part of
+    // that split this module can exercise without a live VM: that `mmio` itself
+    // does no I/O, and that the notified-bitmask/`process_queue` hand-off it
+    // feeds is race-free under concurrent access.
 
     /// `mmio`'s `QUEUE_NOTIFY` arm must return having done nothing but flag
     /// the queue: no guest-memory access, no FUSE dispatch, no interrupt.

@@ -16,18 +16,18 @@
 //!
 //! Describes exactly the hardware M1 presents: RAM, the vCPUs (PSCI
 //! enable-method), a GIC (v3 or v2), the architected timer, and a PL011 UART
-//! for `earlycon`. The addresses come from [`crate::layout`] so the DTB and the
-//! actual device placement cannot drift. Interrupt encodings follow the GICv3
-//! convention (`<type number flags>`, type 0=SPI/1=PPI, flag 4=level-high);
-//! the timer PPI flags in particular are the classic first-boot tuning knob,
-//! flagged inline.
+//! for `earlycon`. The addresses come from [`crate::arch::aarch64::layout`] so
+//! the DTB and the actual device placement cannot drift. Interrupt encodings
+//! follow the GICv3 convention (`<type number flags>`, type 0=SPI/1=PPI, flag
+//! 4=level-high); the timer PPI flags in particular are the classic first-boot
+//! tuning knob, flagged inline.
 //!
 //! Phandles are fixed: `1` = GIC (the root `interrupt-parent`), `2` = the UART
 //! reference clock.
 
 use vm_fdt::{Error, FdtWriter};
 
-use crate::layout::{
+use crate::arch::aarch64::layout::{
     GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
     VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
@@ -223,11 +223,12 @@ pub fn build(
         virtio_node(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI)?;
     }
     for index in 0..devices.fs_count {
-        // The machine validates these placements before it asks us to build;
-        // checked helpers keep a pathological library caller from wrapping.
+        // The hypervisor backend validates these placements before it builds
+        // the devicetree. The checked helpers keep a pathological library
+        // caller from wrapping.
         if let (Some(base), Some(spi)) = (
-            crate::layout::virtio_fs_base(index),
-            crate::layout::virtio_fs_spi(index),
+            crate::arch::aarch64::layout::virtio_fs_base(index),
+            crate::arch::aarch64::layout::virtio_fs_spi(index),
         ) {
             virtio_node(base, spi)?;
         }
@@ -311,10 +312,14 @@ pub(crate) mod tests {
             KASLR_SEED,
         )
         .unwrap();
-        let first = format!("virtio_mmio@{:x}", crate::layout::VIRTIO_FS_BASE);
+        let first = format!(
+            "virtio_mmio@{:x}",
+            crate::arch::aarch64::layout::VIRTIO_FS_BASE
+        );
         let second = format!(
             "virtio_mmio@{:x}",
-            crate::layout::VIRTIO_FS_BASE + crate::layout::VIRTIO_SIZE
+            crate::arch::aarch64::layout::VIRTIO_FS_BASE
+                + crate::arch::aarch64::layout::VIRTIO_SIZE
         );
         assert!(!contains(&absent, &first));
         assert!(contains(&present, &first));

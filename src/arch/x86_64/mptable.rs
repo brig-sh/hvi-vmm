@@ -19,10 +19,10 @@
 //! floating pointer, a config header, then one processor entry per vCPU, a bus
 //! entry, an IOAPIC entry, and ISA interrupt entries for the 16 legacy lines.
 //! All checksums are one's-of-sum-is-zero over the relevant bytes. Returns the
-//! bytes to place at [`crate::layout_x86::MPTABLE_ADDR`]; the floating pointer
-//! sits first and points at the config table right after it.
+//! bytes to place at [`MPTABLE_ADDR`]; the floating pointer sits first and
+//! points at the config table right after it.
 
-use crate::layout_x86::MPTABLE_ADDR;
+use crate::arch::x86_64::layout::MPTABLE_ADDR;
 
 const APIC_LAPIC_BASE: u32 = 0xfee0_0000;
 const IOAPIC_BASE: u32 = 0xfec0_0000;

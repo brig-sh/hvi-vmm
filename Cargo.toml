@@ -16,9 +16,6 @@ repository = "https://github.com/brig-sh/hvi-vmm"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Pure-Rust devicetree builder used by the portable `fdt` module (and its unit
-# tests), so it must build on every host, not just the VMM targets.
-vm-fdt = "0.3.0"
 # Kernel virtio headers as bindgen output: feature bits, device ids, the mmio
 # register map and the net header layout. Every VMM target needs them, and so
 # does the portable stub build, since the shared device code and its unit tests
@@ -39,6 +36,11 @@ linux-loader = { version = "0.14.0", features = ["bzimage"] }
 # public in 0.2.172 and return `Ioctl` from 0.2.173; `Ioctl` and the TUN
 # request constants predate both.
 libc = "0.2.189"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# Pure-Rust devicetree builder for the arm64 guest's devicetree
+# (`arch::aarch64::fdt`).
+vm-fdt = "0.3.0"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = "1.0.0"

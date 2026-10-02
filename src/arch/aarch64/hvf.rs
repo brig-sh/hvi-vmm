@@ -24,8 +24,8 @@
 //! The exit-loop's timer/WFI/PC handling and the SMP hand-off are the
 //! boot-debug frontier.
 
-// Resolved once while the machine is built, before any guest request;
-// see clippy.toml.
+// Resolved once while the VM is built, before any guest request; see
+// clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
 use std::os::fd::{AsFd, BorrowedFd};
@@ -38,17 +38,17 @@ use applevisor::prelude::{
     VirtualMachineConfig, VirtualMachineInstance,
 };
 
-use crate::boot;
-use crate::config::{check_export_overlap, BootConfig, Stop};
-use crate::esr::{DataAbort, Ec};
-use crate::events::Emitter;
-use crate::fdt;
-use crate::guestmem::GuestRam;
-use crate::layout::{
+use crate::arch::aarch64::esr::{DataAbort, Ec};
+use crate::arch::aarch64::fdt;
+use crate::arch::aarch64::layout::{
     virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
     UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
+use crate::arch::aarch64::loader;
+use crate::config::{check_export_overlap, BootConfig, Stop};
+use crate::events::Emitter;
+use crate::guestmem::GuestRam;
 use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
@@ -202,7 +202,7 @@ struct Shared {
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
-    boot::LoadedKernel::from_header(&cfg.kernel)?;
+    loader::LoadedKernel::from_header(&cfg.kernel)?;
     // And exports that contradict each other, for the same reason: this is a
     // statement about the configuration, decidable before anything is built.
     check_export_overlap(&cfg.fs_shares)?;
@@ -436,7 +436,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
 
-    let layout = boot::Payload {
+    let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,

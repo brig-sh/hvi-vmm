@@ -189,8 +189,8 @@ An embedder inherits these from the process environment. They are not part of
 | The guest halts on x86-64 | Reported as `SystemOff`, because a halt records no reason. |
 
 **hvi never reboots a guest.** `SystemReset` ends the process exactly as
-`SystemOff` does. Nothing loops around `machine::boot`. An integration that
-wants a reboot calls it again.
+`SystemOff` does. Nothing loops around `hvi::boot`. An integration that wants a
+reboot calls it again.
 
 ### Signals and the terminal
 

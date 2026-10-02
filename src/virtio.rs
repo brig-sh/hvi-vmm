@@ -281,7 +281,8 @@ pub struct VirtioBlk {
     dev_feat_sel: u32,
     queue: Queue,
     interrupt_status: u32,
-    /// Captured requests, drained by the machine into the event ledger.
+    /// Captured requests, drained by the hypervisor backend into the event
+    /// ledger.
     events: Vec<CapturedEvent>,
     /// Live feed of each request to a plugin, when one asked for it. The
     /// same requests the ledger records, handed over as they happen rather
