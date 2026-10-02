@@ -15,14 +15,13 @@
 //! Minimal PL011 UART with a receive path, enough for an interactive console.
 //!
 //! Each byte the guest writes to the data register goes to stdout through a
-//! [`ConsoleFilter`](crate::console::ConsoleFilter); the kernel driver polls
-//! the flag register, which always reports the FIFO idle. Receive is
-//! interrupt-driven: a host thread pushes keystrokes into the RX FIFO and
-//! raises the UART's GIC line; the guest reads the data register on the
-//! resulting IRQ. Only the registers the Linux `amba-pl011` driver touches for
-//! that flow are modeled: data, flags, and the RX interrupt mask/status. The
-//! PrimeCell identification registers make the driver bind (`ttyAMA0`); without
-//! them only `earlycon` runs.
+//! [`ConsoleFilter`]; the kernel driver polls the flag register, which always
+//! reports the FIFO idle. Receive is interrupt-driven: a host thread pushes
+//! keystrokes into the RX FIFO and raises the UART's GIC line; the guest reads
+//! the data register on the resulting IRQ. Only the registers the Linux
+//! `amba-pl011` driver touches for that flow are modeled: data, flags, and the
+//! RX interrupt mask/status. The PrimeCell identification registers make the
+//! driver bind (`ttyAMA0`); without them only `earlycon` runs.
 
 use std::collections::VecDeque;
 use std::io::Write;

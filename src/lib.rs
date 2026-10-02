@@ -23,11 +23,10 @@
 //!
 //! All three share everything above the hypervisor: the guest memory layout,
 //! kernel image loading and the devicetree or MP table of each guest
-//! architecture ([`arch`]), virtio devices ([`virtio`], [`virtio_net`],
-//! [`virtio_vsock`]), the serial ports (`pl011`, `uart16550`) and the
-//! `RawEvent` ledger ([`events`]). On any other host the crate builds without a
-//! backend, so the deterministic core and its unit tests still compile
-//! everywhere.
+//! architecture ([`arch`]), virtio devices ([`devices::virtio`]), the serial
+//! ports ([`devices::legacy`]) and the `RawEvent` ledger ([`events`]). On any
+//! other host the crate builds without a backend, so the deterministic core and
+//! its unit tests still compile everywhere.
 //!
 //! # Plugins
 //!
@@ -46,18 +45,12 @@ pub mod arch;
 pub mod config;
 /// The filter between a guest's serial console and the host's stdout.
 pub mod console;
+pub mod devices;
 /// The `RawEvent` NDJSON ledger.
 pub mod events;
-/// Raising the open-file limit hvi runs under. virtio-fs spends the guest's
-/// concurrency out of this process's descriptor table.
-#[cfg(target_arch = "aarch64")]
-pub mod fdlimit;
 /// Guest RAM as a region collection, the VMM's writable mapping and a
 /// read-only view over its descriptor.
 pub mod guestmem;
-/// PL011 UART (arm64 console).
-#[cfg(target_arch = "aarch64")]
-pub mod pl011;
 /// The plugin seam: how a tool outside the exit loop reaches a guest.
 pub mod plugin;
 /// Plugins built on it: a memory dumper and an I/O tracer.
@@ -68,9 +61,6 @@ pub mod plugin;
 pub mod plugins;
 /// Parks every vCPU at a safe point so an observation sees a still guest.
 pub mod quiesce;
-/// MC146818 RTC / CMOS, which an x86 guest reads before it has a timer.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub mod rtc_cmos;
 /// Seatbelt confinement for the macOS backend, and the selftest that proves it.
 #[cfg(target_os = "macos")]
 pub mod sandbox;
@@ -84,29 +74,12 @@ pub mod seccomp;
 pub mod sharedmem;
 /// Taking a lock whose last holder panicked.
 pub mod sync;
-/// The tap side of virtio-net, and the portable vnet-header framing.
-pub mod tap;
 /// Ending the host-side helper threads when the guest stops.
 #[cfg(any(
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
     all(target_arch = "x86_64", target_os = "linux")
 ))]
 pub mod teardown;
-/// 16550A UART (x86 console).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub mod uart16550;
-/// Concurrency litmus test for the used-ring publish in `virtio::Queue`.
-#[cfg(test)]
-mod used_ring_litmus;
-/// virtio-blk over MMIO.
-pub mod virtio;
-/// Virtio-fs over MMIO, serving an unpacked host directory.
-#[cfg(target_os = "macos")]
-pub mod virtio_fs;
-/// virtio-net over MMIO, with a built-in stack, a tap, or a gateway relay.
-pub mod virtio_net;
-/// virtio-vsock over MMIO, bridged to a host Unix socket (guest agent).
-pub mod virtio_vsock;
 
 // The backend for the host's target. Each one exposes the same
 // `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.

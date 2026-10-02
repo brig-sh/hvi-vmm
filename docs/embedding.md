@@ -123,12 +123,12 @@ cargo build --release --example watch_guest
 Two things a caller sets are not in the struct. Both matter.
 
 **Guest file ownership.** `--fs-uid` and `--fs-gid` become two process-global
-atomics through `virtio_fs::set_guest_ids(uid, gid)`, because every share
-reads the same pair. Call it before `boot`, on macOS only:
+atomics through `devices::virtio::fs::set_guest_ids(uid, gid)`, because every
+share reads the same pair. Call it before `boot`, on macOS only:
 
 ```rust
 #[cfg(target_os = "macos")]
-hvi::virtio_fs::set_guest_ids(0, 0);
+hvi::devices::virtio::fs::set_guest_ids(0, 0);
 ```
 
 Setting it after a share is already answering hands the guest a home it cannot

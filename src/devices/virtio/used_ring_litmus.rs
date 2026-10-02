@@ -18,8 +18,8 @@
 //! that is not the vCPU thread appends completions to the used ring while the
 //! guest is running and consuming that same ring.
 
+use crate::devices::virtio::Queue;
 use crate::guestmem::GuestRam;
-use crate::virtio::Queue;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering as AOrd};
 
 const BASE: u64 = 0x4000_0000;

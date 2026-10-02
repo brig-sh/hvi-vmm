@@ -58,15 +58,15 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
+use crate::devices::legacy::pl011::Pl011;
+use crate::devices::virtio::net::VirtioNet;
+use crate::devices::virtio::queue::VirtioBlk;
+use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;
-use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
-use crate::virtio::VirtioBlk;
-use crate::virtio_net::VirtioNet;
-use crate::virtio_vsock::VirtioVsock;
 
 // --- ONE_REG ids (architectural KVM ABI, aarch64). ---------------
 // Core regs: KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
@@ -233,7 +233,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         // unusable tap fails the boot: falling back to the built-in stack
         // would put the guest on the wrong network, which from the outside is
         // indistinguishable from success.
-        let file = crate::tap::open(ifname).map_err(|e| format!("--net-tap {ifname}: {e}"))?;
+        let file = crate::devices::virtio::tap::open(ifname)
+            .map_err(|e| format!("--net-tap {ifname}: {e}"))?;
         let reader = file
             .try_clone()
             .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
@@ -256,7 +257,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Err(e) => {
                 eprintln!(
                     "[hvi/kvm] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    crate::virtio_net::stub_stack_line()
+                    crate::devices::virtio::net::stub_stack_line()
                 );
                 Some(VirtioNet::new())
             }
@@ -264,14 +265,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     } else if cfg.net {
         eprintln!(
             "[hvi/kvm] virtio-net: {}",
-            crate::virtio_net::stub_stack_line()
+            crate::devices::virtio::net::stub_stack_line()
         );
         Some(VirtioNet::new())
     } else {
         None
     };
 
-    let net = crate::virtio_net::share(net, cfg.net_mac);
+    let net = crate::devices::virtio::net::share(net, cfg.net_mac);
 
     let vsock = cfg
         .agent_sock
@@ -1202,8 +1203,8 @@ fn spawn_vsock_bridge(
 
 /// Injects tap frames into the guest.
 ///
-/// [`crate::virtio_net::TapRelay`] owns the wait and the drain. This thread
-/// supplies the delivery under the device lock and the interrupt.
+/// [`crate::devices::virtio::net::TapRelay`] owns the wait and the drain. This
+/// thread supplies the delivery under the device lock and the interrupt.
 fn spawn_net_tap_reader(
     reader: std::fs::File,
     dev: Arc<Mutex<VirtioNet>>,
@@ -1213,7 +1214,7 @@ fn spawn_net_tap_reader(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let relayed = crate::virtio_net::TapRelay::new(reader).run(&stop, |frame| {
+        let relayed = crate::devices::virtio::net::TapRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);
@@ -1230,8 +1231,8 @@ fn spawn_net_tap_reader(
 /// Injects gateway frames into the guest, each prefixed by a 4-byte big-endian
 /// length.
 ///
-/// [`crate::virtio_net::GatewayRelay`] owns the wait, the drain and the
-/// framing. This thread supplies the delivery under the device lock and the
+/// [`crate::devices::virtio::net::GatewayRelay`] owns the wait, the drain and
+/// the framing. This thread supplies the delivery under the device lock and the
 /// interrupt.
 fn spawn_net_gateway_reader(
     reader: std::os::unix::net::UnixStream,
@@ -1242,7 +1243,7 @@ fn spawn_net_gateway_reader(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let relayed = crate::virtio_net::GatewayRelay::new(reader).run(&stop, |frame| {
+        let relayed = crate::devices::virtio::net::GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);
