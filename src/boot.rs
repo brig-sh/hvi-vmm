@@ -83,8 +83,11 @@ impl LoadedKernel {
         } else {
             u64::from_le(header.text_offset)
         };
+        let addr = RAM_BASE.checked_add(text_offset).ok_or_else(|| {
+            format!("the Image's text_offset {text_offset:#x} is past the end of the address space")
+        })?;
         Ok(Self {
-            addr: RAM_BASE + text_offset,
+            addr,
             size: image_size.max(kernel.len() as u64),
         })
     }
@@ -146,7 +149,7 @@ impl LoadedKernel {
             self.size,
             PROVISIONAL_DTB_SIZE,
             initrd_size,
-        );
+        )?;
         let dtb = fdt::build(
             &provisional,
             gic,
@@ -163,7 +166,7 @@ impl LoadedKernel {
             self.size,
             dtb.len() as u64,
             initrd_size,
-        );
+        )?;
         let dtb = fdt::build(&layout, gic, num_cpus, cmdline, devices, &seed, kaslr_seed)
             .map_err(|e| format!("building the devicetree: {e}"))?;
         layout.validate()?;
@@ -337,6 +340,29 @@ pub(crate) mod tests {
         let kernel = LoadedKernel::from_header(&image).expect("an old header still places");
         assert_eq!(kernel.addr, RAM_BASE + LEGACY_TEXT_OFFSET);
         assert_eq!(kernel.size, image.len() as u64);
+    }
+
+    // `text_offset` and `image_size` are the file's, and a wrapped sum would
+    // place the devicetree inside the kernel.
+    #[test]
+    fn header_fields_past_the_address_space_are_refused() {
+        let image = synthetic_image(u64::MAX - 0x1000, 0x40_0000, 0x1000);
+        let err = LoadedKernel::from_header(&image).expect_err("text_offset wraps");
+        assert!(err.contains("text_offset"), "{err}");
+
+        let image = synthetic_image(0x8_0000, u64::MAX - 0x10_0000, 0x1000);
+        let kernel = LoadedKernel::from_header(&image).expect("the header parses");
+        let err = kernel
+            .plan(
+                512 << 20,
+                0,
+                &GicLayout::QEMU_VIRT,
+                1,
+                "",
+                VirtioDevices::default(),
+            )
+            .expect_err("image_size wraps");
+        assert!(err.contains("address space"), "{err}");
     }
 
     #[test]
