@@ -156,7 +156,9 @@ tested, not as proven.
   The budget is the process file limit less a reserve of 128. `CREATE` and
   `TMPFILE` are not counted against it, and directory descriptors cached for
   readdir are not either, so several busy exports can still exhaust the table.
-- **One request queue per share**, plus a hiprio queue. No DAX window.
+- **One request queue per share**, plus a hiprio queue. No DAX window. The
+  device reports no shared memory region, and a guest built with `FUSE_DAX`
+  binds the device without DAX.
 - The open file limit is raised when the **first share** is set up, not at
   startup, and only on macOS. A boot with no share never raises it and never
   logs the line.
