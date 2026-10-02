@@ -1,0 +1,307 @@
+name: Release
+
+# hvi's only release path. Pushing a `v*` tag builds the binaries, signs the
+# macOS one with the organization's Developer ID, publishes them to GHCR under
+# the version, and creates the GitHub release they hang off, with the notes
+# generated from the commits since the previous tag.
+#
+# A tag is the whole release. Nothing in the tree names a version, so cutting
+# one needs no pull request first.
+#
+# The release stays a draft until every job has passed. A tag that failed is
+# re-run from the tag: re-run the jobs of its run, or dispatch this workflow
+# with the tag as the ref. Either way the run builds the tag, and a rebuild
+# replaces the GHCR version tags and the draft's assets, so the two hold the
+# same bytes. A tag whose release is published is refused.
+#
+# The dispatch takes no input naming a ref. A run checks out the ref it runs
+# on, so it never builds code its own ref does not carry.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Signing imports a certificate and rewrites the runner's keychain search list,
+# so two releases at once on one Mac would race over it. Never cancelled: a run
+# stopped between a push and its signature leaves an artifact unsigned.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# The default shell runs `bash -e` without pipefail.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Reads the version out of the tag, and refuses a tag that cannot be
+  # released before anything is built or signed.
+  check-tag:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      commit: ${{ steps.check.outputs.commit }}
+    steps:
+      # The whole history, so the tag can be checked against main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check the tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A push reaches here on a `v*` tag alone. A dispatch can run on any
+          # ref, so the shape is checked rather than assumed.
+          if [ "$REF_TYPE" != tag ]; then
+            echo "::error::run this from a tag, not the $TAG $REF_TYPE"
+            exit 1
+          fi
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::$TAG is not a vX.Y.Z tag"; exit 1 ;;
+          esac
+          version=${TAG#v}
+
+          # git describe prefers an annotated tag. A lightweight one on a
+          # commit that already carries an annotated rc would build as the rc,
+          # and the version check further down would refuse it. Asked of the
+          # API, since the checkout decides how a tag ref lands locally.
+          kind=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq .object.type)
+          if [ "$kind" != tag ]; then
+            echo "::error::$TAG is a lightweight tag; tag with git tag -a"
+            exit 1
+          fi
+
+          # A release ships what main carries.
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$TAG points at $commit, which is not on main"
+            exit 1
+          fi
+
+          # Users already hold the assets of a published release and the
+          # checksums over them, so a re-run must not replace them. This job
+          # reads with a token that sees no drafts, so a draft passes here.
+          if published=$(gh release view "$TAG" --json isDraft \
+              --jq '.isDraft | not' 2>"$RUNNER_TEMP/view.err"); then
+            if [ "$published" = true ]; then
+              echo "::error::the $TAG release is published already"
+              exit 1
+            fi
+          elif ! grep -q "release not found" "$RUNNER_TEMP/view.err"; then
+            cat "$RUNNER_TEMP/view.err" >&2
+            echo "::error::could not tell whether $TAG is released"
+            exit 1
+          fi
+
+          # A version with a prerelease field (v0.2.0-rc.1) is marked as one on
+          # the release, so it does not become the download a reader lands on.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+
+  # The distributable build, with the macOS binary signed by the organization
+  # and notarized.
+  build:
+    name: Build binaries
+    needs: check-tag
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      developer-id: true
+      # No version is passed. The build derives one from the history it is
+      # built in, which on this ref is the tag, so the check that each binary
+      # reports the release version proves the binaries came from the tagged
+      # commit. Stamping the version in first would make that check prove
+      # only that the stamp happened.
+    # Named one by one, so the build sees the signing secrets and no others.
+    secrets:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+
+  # Checks what each build reports about itself before anything is published.
+  # GHCR and the release both wait on it, so neither receives a build the
+  # other would refuse.
+  verify:
+    name: Verify the binaries
+    needs: [check-tag, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: hvi-*
+          path: ${{ runner.temp }}/artifacts
+
+      # The version is derived from git rather than passed in, so a build that
+      # does not report the release version was not built from the tagged
+      # commit. A macOS binary without the Developer ID would not pass
+      # Gatekeeper once downloaded.
+      - name: Check each manifest
+        env:
+          VERSION: ${{ needs.check-tag.outputs.version }}
+          COMMIT: ${{ needs.check-tag.outputs.commit }}
+        run: |
+          for tarball in "$RUNNER_TEMP"/artifacts/hvi-*/*.tar; do
+            target=$(basename "$tarball" .tar)
+            manifest=$(tar -xOf "$tarball" binaries/manifest.json)
+            built=$(jq -r '.version' <<<"$manifest")
+            if [ "$built" != "$VERSION" ]; then
+              echo "::error::$target reports $built, release is $VERSION"
+              exit 1
+            fi
+            revision=$(jq -r '.revision' <<<"$manifest")
+            if [ "$revision" != "$COMMIT" ]; then
+              echo "::error::$target was built from $revision, not $COMMIT"
+              exit 1
+            fi
+            case "$target" in
+              *-apple-darwin)
+                if [ "$(jq -r '.signed' <<<"$manifest")" != "true" ]; then
+                  echo "::error::$target was not signed with the Developer ID"
+                  exit 1
+                fi
+                ;;
+            esac
+            echo "$target: $built from $revision"
+          done
+
+  # The same binaries in the registry, under a tag naming the version. A
+  # consumer that pulls rather than downloads pins to that tag.
+  publish:
+    name: Publish binaries
+    needs: [check-tag, verify]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/publish-binaries.yml
+    with:
+      publish-only: true
+      version-tag: ${{ needs.check-tag.outputs.tag }}
+
+  # The release itself: one archive per target, a checksum file over them, and
+  # a signature over that file. Last, so a published release always has its
+  # binaries in GHCR as well.
+  release:
+    name: Create the release
+    needs: [check-tag, verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history, so the generated notes can name the previous
+          # release.
+          fetch-depth: 0
+
+      - name: Download the binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: hvi-*
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Assemble the release archives
+        env:
+          VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          dist=$RUNNER_TEMP/release
+          mkdir -p "$dist"
+          for tarball in "$RUNNER_TEMP"/artifacts/hvi-*/*.tar; do
+            target=$(basename "$tarball" .tar)
+            work=$(mktemp -d)
+            tar -C "$work" -xf "$tarball"
+            tar -C "$work/binaries" -czf \
+              "$dist/hvi-$VERSION-$target.tar.gz" hvi manifest.json
+            rm -rf "$work"
+          done
+
+          (cd "$dist" && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat "$dist/SHA256SUMS"
+
+      # Read from the commits between this tag and the one before it, so the
+      # changelog is the release rather than a file kept beside it.
+      - name: Build the release notes
+        env:
+          TAG: ${{ needs.check-tag.outputs.tag }}
+        run: |
+          tools/changelog.sh --notes "$TAG" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || {
+            echo "::error::the notes for $TAG came out empty"; exit 1; }
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      # One signature over the checksum file rather than one per archive: the
+      # file names every archive by digest, so verifying it and then the
+      # checksums covers the whole release in two commands. The bundle holds
+      # the signature and the certificate both.
+      - name: Sign the checksums
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cd "$RUNNER_TEMP/release"
+          cosign sign-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle
+
+      # gh runs outside the checkout here, so GH_REPO names the repository.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.check-tag.outputs.tag }}
+          PRERELEASE: ${{ needs.check-tag.outputs.prerelease }}
+        run: |
+          cd "$RUNNER_TEMP/release"
+          assets="hvi-*.tar.gz SHA256SUMS SHA256SUMS.cosign.bundle"
+
+          # A draft found here is one an earlier run left, since check-tag
+          # refused a published release. Its assets are replaced with this
+          # build's, which is the one GHCR now holds.
+          # shellcheck disable=SC2086 # the asset list is several words
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber $assets
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          elif [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" --draft --verify-tag --prerelease \
+              --title "hvi $TAG" --notes-file "$RUNNER_TEMP/notes.md" $assets
+          else
+            gh release create "$TAG" --draft --verify-tag \
+              --title "hvi $TAG" --notes-file "$RUNNER_TEMP/notes.md" $assets
+          fi
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "- \(.name)"' >> "$GITHUB_STEP_SUMMARY"
