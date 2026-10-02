@@ -18,8 +18,8 @@
 //! `ExitReason::EXCEPTION` carries a syndrome whose top six bits (31:26) are
 //! the exception class (EC). The whole VMM control flow keys off the EC: MMIO
 //! (virtio) is a data abort, PSCI is an HVC/SMC, and sysreg accesses that trap
-//! land here too. Keeping the decode in one place
-//! means M1..M4 all share one classification.
+//! land here too. Keeping the decode in one place means every exit handler
+//! shares one classification.
 
 /// Exception classes we act on. Values are the architectural EC encodings
 /// (`ESR_ELx[31:26]`); anything else is surfaced as [`Ec::Other`] with the raw
@@ -38,7 +38,7 @@ pub enum Ec {
     InstructionAbort,
     /// Data abort from a lower EL — the virtio-mmio doorbell path.
     DataAbort,
-    /// `BRK` software breakpoint (used by the M0 smoke test).
+    /// `BRK` software breakpoint (used by the smoke test).
     Brk,
     /// Anything else, carrying the raw EC for diagnosis.
     Other(u8),

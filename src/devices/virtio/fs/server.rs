@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Virtio-fs over virtio-mmio.
+//! The virtio-fs device over virtio-mmio, and the FUSE server it runs.
 //!
 //! This is the directory-sharing equivalent of the macOS Virtualization
 //! framework's `VZVirtioFileSystemDeviceConfiguration`: the guest speaks the

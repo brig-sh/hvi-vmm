@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a minimal arm64 initramfs (newc cpio) for the hvi M1 boot.
+"""Build a minimal arm64 initramfs (newc cpio) for an hvi arm64 boot.
 
 Transcodes an Alpine aarch64 minirootfs tarball straight into a newc cpio in
 memory -- no root, no `cpio`/`mknod` (macOS can't create device nodes without

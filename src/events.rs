@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Emitting the VMM's observations as `RawEvent` NDJSON: one compact JSON
-//! object per line, so a reader can `tail -f` it or ingest it a line at a time
-//! without a parser for the whole file.
+//! The `RawEvent` NDJSON ledger of the VMM's observations.
+//!
+//! Each observation is one compact JSON object per line, so a reader can
+//! `tail -f` the ledger or ingest it a line at a time without a parser for the
+//! whole file.
 //!
 //! Every line is an envelope (`sandbox_id`, `ts`, `provenance`, `source`)
 //! around a payload. The VMM writes `block` (disk I/O) and `net` (flows) —
@@ -22,10 +24,10 @@
 //! the tests below, because a ledger whose format drifts is a ledger nobody can
 //! read twice.
 //!
-//! [`Emitter::emit_payload`](crate::events::Emitter::emit_payload) leaves the
-//! stream open to other sources: a plugin (see [`crate::plugin`]) names its
-//! own `source` and supplies its own payload, and its records interleave with
-//! the VMM's in one ledger. The envelope is this crate's; the payload is not.
+//! [`Emitter::emit_payload`] leaves the stream open to other sources: a plugin
+//! (see [`crate::plugin`]) names its own `source` and supplies its own payload,
+//! and its records interleave with the VMM's in one ledger. The envelope is
+//! this crate's; the payload is not.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.

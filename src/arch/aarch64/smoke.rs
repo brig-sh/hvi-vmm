@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! M0: the Hypervisor.framework smoke test.
+//! The Hypervisor.framework smoke test.
 //!
 //! Stands the backend up end to end with no Linux involved: one VM, one mapped
 //! guest page holding a two-instruction stub, one vCPU. The stub loads a marker
@@ -20,7 +20,7 @@
 //! exit whose syndrome decodes to [`Ec::Hvc`], with the marker readable back
 //! out of `x0`. That single round trip exercises VM creation, guest-RAM
 //! mapping, register programming, `hv_vcpu_run`, and the exit-syndrome decode
-//! that every later milestone's exit loop depends on.
+//! that the hvf exit loop depends on.
 //!
 //! Running this needs the `com.apple.security.hypervisor` entitlement (a live
 //! boot is not run in CI because the runner cannot sign for it). A detached
@@ -39,8 +39,8 @@ use applevisor::prelude::{MemPerms, Reg, VirtualMachine};
 use crate::arch::aarch64::esr::Ec;
 
 /// Guest-physical base of the single mapped page. Any aligned IPA works for the
-/// smoke test; `0x4000_0000` mirrors the RAM base the arm64 Linux boot (M1)
-/// will use, so the address is already familiar in later logs.
+/// smoke test; `0x4000_0000` mirrors the RAM base of the arm64 Linux boot, so
+/// the address is familiar from boot logs.
 const GUEST_BASE: u64 = 0x4000_0000;
 
 /// `MOVZ X0, #{MARKER}` — load a recognizable marker so we can prove the vCPU
@@ -55,19 +55,17 @@ const STUB: [u32; 2] = [
     0xd400_0002,
 ];
 
-/// Runs the M0 smoke test, returning an error if the backend misbehaves or the
+/// Runs the smoke test, returning an error if the backend misbehaves or the
 /// exit does not decode to the `HVC` we planted. `HypervisorError` from the
 /// `applevisor` calls converts into the boxed error via `?`; the test's own
 /// assertions fail with a plain message.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Exactly one VM per process (Hypervisor.framework constraint); GIC comes
-    // in M1 via the `with_gic` typestate.
+    // Exactly one VM per process (Hypervisor.framework constraint). The test
+    // needs no GIC, so it skips the `with_gic` typestate.
     let vm = VirtualMachine::new()?;
 
-    // One page of guest RAM, mapped RWX for the stub. `memory_create` allocates
-    // host-backed memory whose host pointer we would hand a plugin in
-    // M3 — that pointer is the zero-copy guest-RAM window the design note calls
-    // out as "free" on hvf.
+    // One page of guest RAM, allocated by `applevisor` and mapped RWX for the
+    // stub.
     let mut mem = vm.memory_create(0x1000)?;
     mem.map(GUEST_BASE, MemPerms::ReadWriteExec)?;
     for (i, insn) in STUB.iter().enumerate() {
@@ -88,7 +86,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let x0 = vcpu.get_reg(Reg::X0)?;
 
     println!(
-        "M0 exit: reason={:?} ec={:?} syndrome={:#x} x0={:#x}",
+        "smoke exit: reason={:?} ec={:?} syndrome={:#x} x0={:#x}",
         exit.reason, ec, syndrome, x0
     );
 
@@ -99,7 +97,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("stub did not run: x0={x0:#x}, expected {MARKER:#x}").into());
     }
 
-    println!("M0 smoke test OK: VM created, page mapped, vCPU ran, HVC decoded.");
+    println!("smoke test OK: VM created, page mapped, vCPU ran, HVC decoded.");
     Ok(())
 }
 

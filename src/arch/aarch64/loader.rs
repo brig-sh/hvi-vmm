@@ -20,10 +20,8 @@
 //! protocol's size cap. The header's `image_size` is the RAM the kernel needs
 //! at runtime, header through BSS, more than the file holds; [`LoadedKernel`]
 //! carries it so the layout keeps the devicetree and initramfs clear of it.
-//! [`Payload::load`](crate::arch::aarch64::loader::Payload::load) places all
-//! three images;
-//! [`LoadedKernel::plan`](crate::arch::aarch64::loader::LoadedKernel::plan)
-//! computes the placement without writing.
+//! [`Payload::load`] places all three images; [`LoadedKernel::plan`] computes
+//! the placement without writing.
 
 use std::io::Cursor;
 
