@@ -51,6 +51,7 @@ pub mod events;
 /// Guest RAM as a region collection, the VMM's writable mapping and a
 /// read-only view over its descriptor.
 pub mod guestmem;
+pub mod hypervisor;
 /// The plugin seam: how a tool outside the exit loop reaches a guest.
 pub mod plugin;
 /// Plugins built on it: a memory dumper and an I/O tracer.
@@ -59,8 +60,6 @@ pub mod plugin;
     all(target_arch = "x86_64", target_os = "linux")
 ))]
 pub mod plugins;
-/// Parks every vCPU at a safe point so an observation sees a still guest.
-pub mod quiesce;
 /// Seatbelt confinement for the macOS backend, and the selftest that proves it.
 #[cfg(target_os = "macos")]
 pub mod sandbox;
