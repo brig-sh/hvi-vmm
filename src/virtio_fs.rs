@@ -1625,6 +1625,12 @@ impl VirtioFs {
                 .map_or(0, |queue| u64::from(queue.is_ready())),
             reg::INTERRUPT_STATUS => u64::from(self.interrupt_status),
             reg::STATUS => u64::from(self.status),
+            // The device has no shared memory region, which virtio 1.2 reads
+            // as all ones. A guest built with FUSE_DAX fails its probe on a
+            // zero length.
+            reg::SHM_LEN_LOW | reg::SHM_LEN_HIGH | reg::SHM_BASE_LOW | reg::SHM_BASE_HIGH => {
+                0xffff_ffff
+            }
             _ if offset >= reg::CONFIG => self.read_config((offset - reg::CONFIG) as usize),
             _ => 0,
         }
@@ -11370,6 +11376,22 @@ mod tests {
         assert!(dev.fh0_listings.is_empty());
         assert!(dev.fh0_order.is_empty());
         assert!(dev.readahead.take(&etc_path).is_none(), "prepared survived");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A guest built with FUSE_DAX fails its probe on a zero length (#251).
+    #[test]
+    fn shm_registers_report_no_region() {
+        let (dir, mut dev) = fixture();
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        for offset in [
+            reg::SHM_LEN_LOW,
+            reg::SHM_LEN_HIGH,
+            reg::SHM_BASE_LOW,
+            reg::SHM_BASE_HIGH,
+        ] {
+            assert_eq!(dev.mmio(&mem, offset, false, 0), 0xffff_ffff, "{offset:#x}");
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
