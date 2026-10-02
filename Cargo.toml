@@ -36,6 +36,11 @@ linux-loader = { version = "0.14.0", features = ["bzimage"] }
 # public in 0.2.172 and return `Ioctl` from 0.2.173; `Ioctl` and the TUN
 # request constants predate both.
 libc = "0.2.189"
+# The 16550 register file, maintained upstream. Only the x86 backend has a
+# COM1; pl011 (arm64) and the MC146818 CMOS have no equivalent in the crate,
+# so those stay ours. The legacy devices build for every backend, whichever
+# guest uses them, so this is a common dependency.
+vm-superio = "0.8.1"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # Pure-Rust devicetree builder for the arm64 guest's devicetree
@@ -58,10 +63,6 @@ kvm-bindings = "0.14"
 seccompiler = { version = "0.5", features = ["json"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-# The 16550 register file, maintained upstream. Only the x86 backend has a
-# COM1; pl011 (arm64) and the MC146818 CMOS have no equivalent in the crate,
-# so those stay ours.
-vm-superio = "0.8.1"
 kvm-ioctls = "0.25"
 # fam-wrappers gives the CpuId FAM wrapper for KVM_GET_SUPPORTED_CPUID / SET_CPUID2.
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
