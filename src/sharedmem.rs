@@ -31,6 +31,21 @@
 //! The object is unlinked from the namespace as soon as it is created. It
 //! stays alive through the open descriptor, so the RAM cannot outlive the VMM
 //! or be opened by name by a process that was not given the descriptor.
+//!
+//! The object's length is fixed for its lifetime. A plugin can duplicate the
+//! descriptor and send it on, and without a fixed length any holder of a
+//! writable descriptor could shrink the object under the live mappings. The
+//! next access past the new end would raise `SIGBUS` in whichever process made
+//! it, a vCPU thread included.
+//!
+//! - **Linux** seals the memfd with `F_SEAL_SHRINK`, `F_SEAL_GROW` and
+//!   `F_SEAL_SEAL` before [`SharedRam::new`](crate::sharedmem::SharedRam::new)
+//!   returns. `F_SEAL_SEAL` stops a holder adding `F_SEAL_FUTURE_WRITE`, which
+//!   would refuse every later writable mapping. The object is not write-sealed,
+//!   because the guest runs from writable mappings of it, and the kernel
+//!   refuses `F_SEAL_WRITE` while one exists.
+//! - **macOS** needs no seal. A POSIX shared-memory object refuses a second
+//!   `ftruncate`, shrink or grow.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -57,7 +72,8 @@ impl SharedRam {
     /// Allocates `len` bytes of shareable memory.
     ///
     /// The backing object is unlinked immediately, so it is reachable only
-    /// through the returned descriptor.
+    /// through the returned descriptor. Its length stays `len` for its
+    /// lifetime, as the [module docs](crate::sharedmem) describe.
     pub fn new(len: usize) -> io::Result<Self> {
         let file = Self::create_object(len)?;
         Ok(Self {
@@ -75,8 +91,11 @@ impl SharedRam {
         {
             let name = c"hvi-guest-ram";
             // SAFETY: a valid NUL-terminated name; MFD_CLOEXEC keeps the
-            // descriptor out of child processes.
-            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            // descriptor out of child processes, and MFD_ALLOW_SEALING lets
+            // the seals below go on.
+            let fd = unsafe {
+                libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+            };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -84,6 +103,20 @@ impl SharedRam {
             let file = unsafe { File::from_raw_fd(fd) };
             // SAFETY: sizing a descriptor we just created.
             if unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The seals fix the object's length for its lifetime. The module
+            // docs say why these three and not F_SEAL_WRITE.
+            // SAFETY: fcntl on a descriptor we just created, with integer
+            // arguments.
+            let sealed = unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+                )
+            };
+            if sealed != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(file)
@@ -323,5 +356,82 @@ mod tests {
                 "allocation {i} shares storage with another"
             );
         }
+    }
+
+    /// Returns a duplicate of the object's descriptor, the kind a plugin
+    /// holds.
+    #[cfg(target_os = "linux")]
+    fn duplicate(ram: &SharedRam) -> File {
+        ram.file().try_clone().expect("duplicate the descriptor")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_duplicate_cannot_resize_the_object() {
+        let ram = SharedRam::new(LEN).expect("allocate");
+        let dup = duplicate(&ram);
+        for len in [LEN / 2, LEN * 2] {
+            // SAFETY: resizing a descriptor this test owns.
+            let rc = unsafe { libc::ftruncate(dup.as_raw_fd(), len as libc::off_t) };
+            let err = io::Error::last_os_error();
+            assert_eq!(rc, -1, "resizing the object to {len} bytes succeeded");
+            assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        }
+        assert_eq!(dup.metadata().expect("fstat").len(), LEN as u64);
+    }
+
+    // F_SEAL_FUTURE_WRITE would refuse every later writable mapping of the
+    // object. F_SEAL_WRITE must stay off too, because the guest runs from
+    // writable mappings.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_duplicate_cannot_add_a_seal() {
+        let ram = SharedRam::new(LEN).expect("allocate");
+        let dup = duplicate(&ram);
+        // SAFETY: fcntl on a descriptor this test owns, with integer
+        // arguments.
+        let rc = unsafe {
+            libc::fcntl(
+                dup.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_FUTURE_WRITE,
+            )
+        };
+        let err = io::Error::last_os_error();
+        assert_eq!(rc, -1, "a holder added F_SEAL_FUTURE_WRITE");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+
+        // SAFETY: as above.
+        let seals = unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_GET_SEALS) };
+        let want = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        assert_eq!(seals & want, want, "seals {seals:#x}");
+        let unwanted = libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE;
+        assert_eq!(seals & unwanted, 0, "seals {seals:#x}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writable_mapping_after_sealing_sees_the_first_mappings_writes() {
+        let ram = SharedRam::new(LEN).expect("allocate");
+        let first = view(&ram);
+        first.write(BASE + 64, b"SEALED").expect("write guest RAM");
+        let dup = duplicate(&ram);
+        // SAFETY: a new writable shared mapping of the whole object.
+        let other = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dup.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(other, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+        // SAFETY: reading 6 bytes at offset 64, inside the mapping.
+        let seen = unsafe { std::slice::from_raw_parts(other.cast::<u8>().add(64), 6) };
+        assert_eq!(seen, b"SEALED");
+        // SAFETY: unmapping the mapping made above.
+        unsafe { libc::munmap(other, LEN) };
     }
 }
