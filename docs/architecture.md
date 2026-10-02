@@ -55,7 +55,7 @@ flowchart TB
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
-            obs["plugin: the seam<br/>plugins · events ledger<br/>quiesce"]
+            obs["plugin: the seam<br/>plugins · events ledger<br/>hypervisor::quiesce"]
             conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
             gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
         end
@@ -349,10 +349,10 @@ register clears `ready`.
 
 ## 5. Concurrency and failure
 
-`quiesce.rs` parks every vCPU at a safe point so an observation sees a still
-guest. `CpuHandle::pause()` requests the quiesce, kicks the other vCPUs, and
-waits up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU never
-parks itself.
+`hypervisor/quiesce.rs` parks every vCPU at a safe point so an observation sees
+a still guest. `CpuHandle::pause()` requests the quiesce, kicks the other vCPUs,
+and waits up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU
+never parks itself.
 
 On every backend, every path that ends a vCPU's run loop ends the VM through one
 stop routine, which clears the running flag, releases the quiesce so no vCPU
@@ -408,7 +408,7 @@ how it works.
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

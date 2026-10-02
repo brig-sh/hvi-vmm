@@ -125,7 +125,7 @@ struct Shared {
     threads: Arc<Mutex<Vec<Option<VcpuThread>>>>,
     stop: Arc<Mutex<Option<Stop>>>,
     /// Parks every vCPU at a safe point so an observation sees a still guest.
-    quiesce: Arc<crate::quiesce::Quiesce>,
+    quiesce: Arc<crate::hypervisor::quiesce::Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
     /// The object backing guest RAM, for a plugin that hands the same pages to
@@ -357,7 +357,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         running: Arc::new(AtomicBool::new(true)),
         threads: Arc::new(Mutex::new((0..num_cpus).map(|_| None).collect())),
         stop: Arc::new(Mutex::new(None)),
-        quiesce: Arc::new(crate::quiesce::Quiesce::new()),
+        quiesce: Arc::new(crate::hypervisor::quiesce::Quiesce::new()),
         plugin: cfg.plugin.clone(),
         ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),

@@ -21,18 +21,18 @@
 //! the result is not trustworthy.
 //!
 //! The shape is a request flag plus a parked counter. Every vCPU calls
-//! [`Quiesce::checkpoint`](crate::quiesce::Quiesce::checkpoint) at a safe point
-//! in its run loop (between guest entries, where its registers are stable); the
-//! requester raises the flag, kicks the vCPUs out of the hypervisor so they
-//! reach that point promptly, and waits for the expected number of them to
-//! park.
+//! [`Quiesce::checkpoint`](crate::hypervisor::quiesce::Quiesce::checkpoint) at
+//! a safe point in its run loop (between guest entries, where its registers are
+//! stable); the requester raises the flag, kicks the vCPUs out of the
+//! hypervisor so they reach that point promptly, and waits for the expected
+//! number of them to park.
 //!
 //! The requester is itself a vCPU thread in the in-VMM path: cpu0 takes the
 //! snapshot. It therefore waits for `num_cpus - 1` parked threads and never
 //! parks itself, which is why
-//! [`Quiesce::wait_for`](crate::quiesce::Quiesce::wait_for) takes an explicit
-//! count rather than assuming "all of them". An external requester (a control
-//! thread) waits for all of them instead.
+//! [`Quiesce::wait_for`](crate::hypervisor::quiesce::Quiesce::wait_for) takes
+//! an explicit count rather than assuming "all of them". An external requester
+//! (a control thread) waits for all of them instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
