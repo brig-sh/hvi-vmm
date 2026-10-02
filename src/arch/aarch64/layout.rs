@@ -17,10 +17,9 @@
 //! The addresses below mirror QEMU's `virt` board so a guest kernel configured
 //! for QEMU/virt (the arm64 build of the repo guest kernel) boots unmodified:
 //! RAM at 1 GiB, the GICv3 and a PL011 UART in the low MMIO window beneath it.
-//! M1 uses the PL011 for first-boot serial output (`earlycon`); virtio-mmio
-//! devices arrive in M2. The GIC base/size must agree with what `hv_gic`
-//! actually claims, so
-//! [`GicLayout::QEMU_VIRT`](crate::arch::aarch64::layout::GicLayout::QEMU_VIRT)
+//! The PL011 carries first-boot serial output (`earlycon`), and the virtio-mmio
+//! devices have a window of their own from [`VIRTIO_BASE`]. The GIC base/size
+//! must agree with what `hv_gic` actually claims, so [`GicLayout::QEMU_VIRT`]
 //! is treated as the default and reconciled against `applevisor`'s GIC size
 //! getters when the VM is built.
 

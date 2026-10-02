@@ -18,7 +18,7 @@ not apply returns a named error rather than "unknown subcommand".
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
-| `smoke` | macOS, Apple silicon | The M0 Hypervisor.framework test. `--shm` runs it over shared guest RAM. |
+| `smoke` | macOS, Apple silicon | The Hypervisor.framework smoke test. `--shm` runs it over shared guest RAM. |
 | `smoke-shm-verify <name> <hex>` | macOS, Apple silicon | The child half of `smoke --shm`. Not for direct use. |
 | `sandbox-selftest` | macOS | Install the Seatbelt profile and probe it. |
 | `seccomp-selftest` | Linux x86-64 and aarch64 | Install the seccomp filters in child processes and probe them. |

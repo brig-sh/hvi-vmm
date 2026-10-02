@@ -35,6 +35,6 @@ fi
 codesign --sign - --entitlements "$ENTITLEMENTS" --force --options runtime "$BIN"
 
 # "$@" is safe under `set -u` even when empty (unlike an empty array). With no
-# args the binary runs the default M0 smoke test.
+# args the binary prints its usage.
 echo "running $BIN $*"
 exec "$BIN" "$@"

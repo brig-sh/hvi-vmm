@@ -14,12 +14,10 @@
 
 //! Guest physical RAM as a `vm-memory` region collection.
 //!
-//! [`GuestRamView`](crate::guestmem::GuestRamView) wraps a
-//! [`GuestMemoryMmap`](vm_memory::GuestMemoryMmap) whose regions map a
-//! shareable object, and carries the read accessors. The VMM builds one over
-//! the object a [`SharedRam`](crate::sharedmem::SharedRam) allocates; a tool
-//! that received the object's descriptor builds one over that descriptor.
-//! [`GuestRam`](crate::guestmem::GuestRam) is the VMM's writable mapping. It
+//! [`GuestRamView`] wraps a [`GuestMemoryMmap`] whose regions map a shareable
+//! object, and carries the read accessors. The VMM builds one over the object a
+//! [`SharedRam`] allocates; a tool that received the object's descriptor builds
+//! one over that descriptor. [`GuestRam`] is the VMM's writable mapping. It
 //! adds the write accessors, the host pointer and the hypervisor registration,
 //! and dereferences to the view, so a reader takes `&GuestRamView` and runs on
 //! either. The rust-vmm crates take the collection as guest memory.

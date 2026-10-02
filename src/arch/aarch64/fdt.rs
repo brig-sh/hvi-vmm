@@ -14,13 +14,13 @@
 
 //! Flattened-devicetree builder for the arm64 `virt`-style machine.
 //!
-//! Describes exactly the hardware M1 presents: RAM, the vCPUs (PSCI
-//! enable-method), a GIC (v3 or v2), the architected timer, and a PL011 UART
-//! for `earlycon`. The addresses come from [`crate::arch::aarch64::layout`] so
-//! the DTB and the actual device placement cannot drift. Interrupt encodings
-//! follow the GICv3 convention (`<type number flags>`, type 0=SPI/1=PPI, flag
-//! 4=level-high); the timer PPI flags in particular are the classic first-boot
-//! tuning knob, flagged inline.
+//! Describes the hardware an arm64 guest gets: RAM, the vCPUs (PSCI
+//! enable-method), a GIC (v3 or v2), the architected timer, a PL011 UART for
+//! `earlycon`, and one node per virtio-mmio device. The addresses come from
+//! [`crate::arch::aarch64::layout`] so the DTB and the actual device placement
+//! cannot drift. Interrupt encodings follow the GICv3 convention
+//! (`<type number flags>`, type 0=SPI/1=PPI, flag 4=level-high); the timer PPI
+//! flags in particular are the classic first-boot tuning knob, flagged inline.
 //!
 //! Phandles are fixed: `1` = GIC (the root `interrupt-parent`), `2` = the UART
 //! reference clock.

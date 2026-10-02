@@ -33,7 +33,7 @@
 //! A VMM is a useful place for a tool to stand: it holds the guest's memory, it
 //! can park the vCPUs between guest entries, and it is the other end of every
 //! virtio request. [`plugin`] offers those three things to one, and
-//! [`plugin::builtin`] ships two built on it — a guest-memory dumper and an I/O
+//! [`plugin::builtin`] ships two built on it: a guest-memory dumper and an I/O
 //! tracer.
 //!
 //! Pass a [`plugin::Plugin`] in [`config::BootConfig::plugin`] and the backend
@@ -42,25 +42,16 @@
 //! why the VMM is a library as well as a binary. See `docs/plugins.md`.
 
 pub mod arch;
-/// Backend-independent boot configuration and result types.
 pub mod config;
-/// The filter between a guest's serial console and the host's stdout.
 pub mod console;
 pub mod devices;
-/// The `RawEvent` NDJSON ledger.
 pub mod events;
-/// Guest RAM as a region collection, the VMM's writable mapping and a
-/// read-only view over its descriptor.
 pub mod guestmem;
 pub mod hypervisor;
-/// The plugin seam: how a tool outside the exit loop reaches a guest.
 pub mod plugin;
 pub mod sandbox;
-/// Guest RAM backed by a shareable object, so another process can map it.
 pub mod sharedmem;
-/// Taking a lock whose last holder panicked.
 pub mod sync;
-/// Ending the host-side helper threads when the guest stops.
 #[cfg(any(
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
     all(target_arch = "x86_64", target_os = "linux")

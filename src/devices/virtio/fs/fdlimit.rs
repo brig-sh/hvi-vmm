@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raising the open-file limit hvi runs under.
+//! The open-file limit hvi runs under, raised for the descriptors virtio-fs
+//! holds.
 //!
 //! virtio-fs pins one host file descriptor per open guest handle: a `File` in
 //! `handles` for every OPEN, another in `dir_handles` for every OPENDIR,

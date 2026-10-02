@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Taking a lock whose last holder panicked.
+//! Recovery of a lock whose last holder panicked.
 //!
 //! Rust poisons a `Mutex` when a thread panics while holding it, and
 //! `.lock().unwrap()` turns that into a second panic in every thread that

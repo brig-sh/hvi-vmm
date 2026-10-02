@@ -23,7 +23,7 @@
 //! [`hvi::plugin::builtin`] through the seam in [`hvi::plugin`]; with neither,
 //! nothing is attached and no guest memory is read for any purpose but running
 //! the guest. Another crate can link this one and supply its own
-//! [`hvi::plugin::Plugin`] the same way -- see `docs/plugins.md`.
+//! [`hvi::plugin::Plugin`] the same way; see `docs/plugins.md`.
 
 // Share paths given on the command line are resolved once, before any
 // guest runs; see clippy.toml.
@@ -127,7 +127,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             {
-                Err("`smoke` (M0 hvf test) is macOS / Apple-silicon only".into())
+                Err("`smoke` (the Hypervisor.framework test) is macOS only".into())
             }
         }
         // Child half of `smoke --shm`: reads the shared object by name from a

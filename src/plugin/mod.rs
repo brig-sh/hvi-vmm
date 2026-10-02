@@ -20,12 +20,11 @@
 //! request the guest makes. Debuggers, tracers, profilers and crash-dumpers all
 //! want one or more of those, and none of them belongs in the exit loop.
 //!
-//! So the exit loop offers them instead. An [`Plugin`](crate::plugin::Plugin)
-//! is called at two points — once at boot, and on the boot vCPU between guest
-//! entries — and from there it can read guest RAM, read that vCPU's registers,
-//! park the rest of the VM, and subscribe to the device feed.
-//! [`crate::plugin::builtin`] ships two that use this: a guest-memory dumper
-//! and an I/O tracer.
+//! So the exit loop offers them instead. A [`Plugin`] is called at two points,
+//! once at boot and on the boot vCPU between guest entries. From there it can
+//! read guest RAM, read that vCPU's registers, park the rest of the VM, and
+//! subscribe to the device feed. [`builtin`] ships two that use this: a
+//! guest-memory dumper and an I/O tracer.
 //!
 //! These traits describe *access*, and deliberately no more than that. They
 //! hand over bytes and register values; what any of it means is the caller's

@@ -12,23 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ending the host-side helper threads when the guest stops.
+//! Shutdown of the host-side helper threads when the guest stops.
 //!
 //! `boot` spawns threads that block on host descriptors: the console, the agent
 //! listener and its connections, the gateway socket, the tap. Each polls its
-//! own descriptor beside a [`StopToken`](crate::teardown::StopToken). `boot`
-//! requests the stop through its [`StopSource`](crate::teardown::StopSource)
-//! once the vCPU threads have exited, every poll returns, and `boot` joins the
-//! threads before it returns. Two helpers need more than the poll. The macOS
-//! virtio-fs worker waits on no descriptor; it parks on a condition variable
-//! and is stopped through it. The console reader reads stdin, which the whole
-//! process shares, so a byte another reader took between the poll and the read
-//! would leave it blocked; `boot` sends it the kick signal until it has exited.
+//! own descriptor beside a [`StopToken`]. `boot` requests the stop through its
+//! [`StopSource`] once the vCPU threads have exited, every poll returns, and
+//! `boot` joins the threads before it returns. Two helpers need more than the
+//! poll. The macOS virtio-fs worker waits on no descriptor; it parks on a
+//! condition variable and is stopped through it. The console reader reads
+//! stdin, which the whole process shares, so a byte another reader took between
+//! the poll and the read would leave it blocked; `boot` sends it the kick
+//! signal until it has exited.
 //!
-//! Every join is bounded by [`STOP_TIMEOUT`](crate::teardown::STOP_TIMEOUT). A
-//! helper that has not exited by the deadline is left running and `boot`
-//! returns an error naming it, since a wait `boot` cannot interrupt must not
-//! keep `boot` from returning.
+//! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
+//! the deadline is left running and `boot` returns an error naming it, since a
+//! wait `boot` cannot interrupt must not keep `boot` from returning.
 //!
 //! The request shuts down the write half of a socket pair, which leaves the
 //! read half readable for every token from then on. Dropping the `StopSource`

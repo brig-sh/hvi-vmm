@@ -20,13 +20,13 @@
 //! the terminal answer on its input side, which hvi reads as console input. An
 //! answer still queued when hvi exits is read by the operator's shell.
 //!
-//! [`ConsoleFilter`](crate::console::ConsoleFilter) passes text, the C0
-//! controls a console uses, and an allowlist of escape sequences for cursor
-//! movement, erasing, scrolling, colors and a few display modes. It drops every
-//! other escape sequence, every control string (OSC, DCS, SOS, PM and APC),
-//! every C1 control and ENQ, and it replaces malformed UTF-8 with U+FFFD. It
-//! emits an escape sequence only once the sequence is complete and allowed, so
-//! the terminal parses every byte it receives from its ground state.
+//! [`ConsoleFilter`] passes text, the C0 controls a console uses, and an
+//! allowlist of escape sequences for cursor movement, erasing, scrolling,
+//! colors and a few display modes. It drops every other escape sequence, every
+//! control string (OSC, DCS, SOS, PM and APC), every C1 control and ENQ, and it
+//! replaces malformed UTF-8 with U+FFFD. It emits an escape sequence only once
+//! the sequence is complete and allowed, so the terminal parses every byte it
+//! receives from its ground state.
 
 /// ESC, which starts every escape sequence.
 const ESC: u8 = 0x1b;
