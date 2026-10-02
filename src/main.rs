@@ -270,6 +270,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
+    let mut virtiofsd: Option<std::path::PathBuf> = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -347,7 +348,29 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     tag: tag.clone(),
                     mode,
                     cache,
+                    socket: None,
                 });
+            }
+            // A daemon someone else is running, named as tag=socket. urunc
+            // starts one per export outside the VMM, so the VMM has nothing
+            // to start and nothing to reap.
+            "--share-sock" => {
+                let spec = it.next().ok_or("--share-sock needs <tag>=<socket>")?;
+                let (tag, socket) = spec
+                    .split_once('=')
+                    .ok_or("--share-sock takes <tag>=<socket>")?;
+                let share = fs_shares
+                    .iter_mut()
+                    .find(|share: &&mut config::FsShare| share.tag == tag)
+                    .ok_or_else(|| {
+                        format!("--share-sock {tag:?} names no export; pass --share-ro/--share-rw first")
+                    })?;
+                share.socket = Some(std::path::PathBuf::from(socket));
+            }
+            "--virtiofsd" => {
+                virtiofsd = Some(std::path::PathBuf::from(
+                    it.next().ok_or("--virtiofsd needs a path")?,
+                ));
             }
             "--net-stub" => net = true,
             // The old name. It read as "networking", which is what the flag
@@ -418,6 +441,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cmdline,
         disk,
         fs_shares,
+        virtiofsd,
         net,
         net_gateway,
         net_tap,

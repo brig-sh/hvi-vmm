@@ -206,6 +206,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // And exports that contradict each other, for the same reason: this is a
     // statement about the configuration, decidable before anything is built.
     check_export_overlap(&cfg.fs_shares)?;
+    crate::config::check_unique_tags(&cfg.fs_shares)?;
+    // A vhost-user socket is the Linux backend's way of serving an export.
+    // This backend serves every export itself, so a command line that names
+    // one asked for something it will not get.
+    if let Some(share) = cfg.fs_shares.iter().find(|share| share.socket.is_some()) {
+        return Err(format!(
+            "--share-sock {:?} names a vhost-user daemon; this backend serves \
+             its own exports",
+            share.tag
+        )
+        .into());
+    }
     let num_cpus = cfg.vcpus.max(1);
 
     // In-kernel GICv3; sizes from the framework so the DTB matches hv_gic.
@@ -353,11 +365,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let stop_source = StopSource::new()?;
     let mut fs = Vec::with_capacity(cfg.fs_shares.len());
     let mut fs_access = Vec::with_capacity(cfg.fs_shares.len());
-    let mut fs_tags = std::collections::HashSet::new();
     for (index, share) in cfg.fs_shares.iter().enumerate() {
-        if !fs_tags.insert(share.tag.as_str()) {
-            return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
-        }
         let base = virtio_fs_base(index).ok_or("too many virtio-fs devices")?;
         let spi = virtio_fs_spi(index).ok_or("too many virtio-fs devices")?;
         let end = base
