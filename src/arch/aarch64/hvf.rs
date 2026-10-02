@@ -48,10 +48,10 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
+use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::fs::server::VirtioFs;
+use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::VirtioNet;
-use crate::devices::virtio::queue::VirtioBlk;
-use crate::devices::virtio::reg;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;
@@ -1200,7 +1200,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
     if !da.isv {
         return;
     }
-    let is_notify = da.is_write && offset == reg::QUEUE_NOTIFY;
+    let is_notify = da.is_write && offset == mmio::QUEUE_NOTIFY;
     {
         let mut d = lock_or_recover(&fs.dev);
         if da.is_write {

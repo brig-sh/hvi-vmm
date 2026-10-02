@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::guestmem::GuestRam;
 
-use crate::devices::virtio::{reg, Queue, QUEUE_NUM_MAX};
+use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
 
@@ -503,41 +503,41 @@ impl VirtioNet {
         let v = value as u32;
         if is_write {
             match offset {
-                reg::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                reg::DRIVER_FEATURES_SEL | reg::DRIVER_FEATURES => {}
-                reg::QUEUE_SEL => self.queue_sel = v,
-                reg::QUEUE_NUM => self.queue().set_num(v),
-                reg::QUEUE_READY => self.queue().set_ready(v, mem),
-                reg::QUEUE_NOTIFY if v as u16 == TX_QUEUE => self.process_tx(mem),
-                reg::INTERRUPT_ACK => self.interrupt_status &= !v,
-                reg::STATUS if v == 0 => self.reset(),
-                reg::STATUS => self.status = v,
-                reg::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
-                reg::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
-                reg::QUEUE_DRIVER_LOW => self.queue().set_avail_lo(v),
-                reg::QUEUE_DRIVER_HIGH => self.queue().set_avail_hi(v),
-                reg::QUEUE_DEVICE_LOW => self.queue().set_used_lo(v),
-                reg::QUEUE_DEVICE_HIGH => self.queue().set_used_hi(v),
+                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
+                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
+                mmio::QUEUE_SEL => self.queue_sel = v,
+                mmio::QUEUE_NUM => self.queue().set_num(v),
+                mmio::QUEUE_READY => self.queue().set_ready(v, mem),
+                mmio::QUEUE_NOTIFY if v as u16 == TX_QUEUE => self.process_tx(mem),
+                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
+                mmio::STATUS if v == 0 => self.reset(),
+                mmio::STATUS => self.status = v,
+                mmio::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
+                mmio::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
+                mmio::QUEUE_DRIVER_LOW => self.queue().set_avail_lo(v),
+                mmio::QUEUE_DRIVER_HIGH => self.queue().set_avail_hi(v),
+                mmio::QUEUE_DEVICE_LOW => self.queue().set_used_lo(v),
+                mmio::QUEUE_DEVICE_HIGH => self.queue().set_used_hi(v),
                 _ => {}
             }
             0
         } else {
             match offset {
-                reg::MAGIC => 0x7472_6976,
-                reg::VERSION => 2,
-                reg::DEVICE_ID => VIRTIO_NET_ID,
-                reg::VENDOR_ID => 0x4649_4f4e,
-                reg::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                reg::DEVICE_FEATURES => u64::from(F_MAC_LO),
-                reg::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
-                reg::QUEUE_READY => {
+                mmio::MAGIC => 0x7472_6976,
+                mmio::VERSION => 2,
+                mmio::DEVICE_ID => VIRTIO_NET_ID,
+                mmio::VENDOR_ID => 0x4649_4f4e,
+                mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
+                mmio::DEVICE_FEATURES => u64::from(F_MAC_LO),
+                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
+                mmio::QUEUE_READY => {
                     u64::from(self.queues[(self.queue_sel & 1) as usize].is_ready())
                 }
-                reg::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                reg::STATUS => u64::from(self.status),
+                mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
+                mmio::STATUS => u64::from(self.status),
                 // Config space: the 6-byte MAC we assign the guest.
-                _ if offset >= reg::CONFIG => {
-                    let f = (offset - reg::CONFIG) as usize;
+                _ if offset >= mmio::CONFIG => {
+                    let f = (offset - mmio::CONFIG) as usize;
                     self.mac.get(f).map_or(0, |&b| u64::from(b))
                 }
                 _ => 0,
@@ -1485,15 +1485,15 @@ mod tests {
         avail: u64,
         used: u64,
     ) {
-        net.mmio(mem, reg::QUEUE_SEL, true, u64::from(sel));
-        net.mmio(mem, reg::QUEUE_NUM, true, 8);
-        net.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        net.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        net.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        net.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        net.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        net.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        net.mmio(mem, reg::QUEUE_READY, true, 1);
+        net.mmio(mem, mmio::QUEUE_SEL, true, u64::from(sel));
+        net.mmio(mem, mmio::QUEUE_NUM, true, 8);
+        net.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        net.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
+        net.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        net.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        net.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        net.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
+        net.mmio(mem, mmio::QUEUE_READY, true, 1);
     }
 
     /// A TX chain that points back at itself must run out of budget rather
@@ -1633,7 +1633,7 @@ mod tests {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
         mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
 
-        net.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+        net.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
 
         // (a) The tap saw one write: a zero virtio_net_hdr_v1, then the frame.
         let mut got = vec![0u8; NET_HDR_LEN + frame.len()];
@@ -1692,19 +1692,19 @@ mod tests {
         let mac = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
         net.set_mac(mac);
 
-        net.mmio(&mem, reg::DEVICE_FEATURES_SEL, true, 0);
-        let feat = net.mmio(&mem, reg::DEVICE_FEATURES, false, 0);
+        net.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, 0);
+        let feat = net.mmio(&mem, mmio::DEVICE_FEATURES, false, 0);
         assert_ne!(feat & u64::from(F_MAC_LO), 0, "VIRTIO_NET_F_MAC is offered");
 
         for (i, &b) in mac.iter().enumerate() {
             assert_eq!(
-                net.mmio(&mem, reg::CONFIG + i as u64, false, 0),
+                net.mmio(&mem, mmio::CONFIG + i as u64, false, 0),
                 u64::from(b),
                 "config-space byte {i}"
             );
         }
         // Past the MAC, config space reads as zero rather than leaking state.
-        assert_eq!(net.mmio(&mem, reg::CONFIG + 6, false, 0), 0);
+        assert_eq!(net.mmio(&mem, mmio::CONFIG + 6, false, 0), 0);
     }
 
     #[test]

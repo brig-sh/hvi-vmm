@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
-use crate::devices::virtio::{reg, Queue, QUEUE_NUM_MAX};
+use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
 use crate::guestmem::GuestRam;
 use crate::sync::lock_or_recover;
 
@@ -1557,51 +1557,51 @@ impl VirtioFs {
         let v = value as u32;
         if is_write {
             match offset {
-                reg::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                reg::DRIVER_FEATURES_SEL | reg::DRIVER_FEATURES => {}
-                reg::QUEUE_SEL => self.queue_sel = v,
-                reg::QUEUE_NUM => {
+                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
+                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
+                mmio::QUEUE_SEL => self.queue_sel = v,
+                mmio::QUEUE_NUM => {
                     if let Some(queue) = self.queue() {
                         queue.set_num(v);
                     }
                 }
-                reg::QUEUE_READY => {
+                mmio::QUEUE_READY => {
                     if let Some(queue) = self.queue() {
                         queue.set_ready(v, mem);
                     }
                 }
-                reg::QUEUE_NOTIFY if (v as usize) < NUM_QUEUES => {
+                mmio::QUEUE_NOTIFY if (v as usize) < NUM_QUEUES => {
                     self.notified.fetch_or(1 << v, Ordering::Release);
                 }
-                reg::INTERRUPT_ACK => self.interrupt_status &= !v,
-                reg::STATUS if v == 0 => self.reset(),
-                reg::STATUS => self.status = v,
-                reg::QUEUE_DESC_LOW => {
+                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
+                mmio::STATUS if v == 0 => self.reset(),
+                mmio::STATUS => self.status = v,
+                mmio::QUEUE_DESC_LOW => {
                     if let Some(queue) = self.queue() {
                         queue.set_desc_lo(v);
                     }
                 }
-                reg::QUEUE_DESC_HIGH => {
+                mmio::QUEUE_DESC_HIGH => {
                     if let Some(queue) = self.queue() {
                         queue.set_desc_hi(v);
                     }
                 }
-                reg::QUEUE_DRIVER_LOW => {
+                mmio::QUEUE_DRIVER_LOW => {
                     if let Some(queue) = self.queue() {
                         queue.set_avail_lo(v);
                     }
                 }
-                reg::QUEUE_DRIVER_HIGH => {
+                mmio::QUEUE_DRIVER_HIGH => {
                     if let Some(queue) = self.queue() {
                         queue.set_avail_hi(v);
                     }
                 }
-                reg::QUEUE_DEVICE_LOW => {
+                mmio::QUEUE_DEVICE_LOW => {
                     if let Some(queue) = self.queue() {
                         queue.set_used_lo(v);
                     }
                 }
-                reg::QUEUE_DEVICE_HIGH => {
+                mmio::QUEUE_DEVICE_HIGH => {
                     if let Some(queue) = self.queue() {
                         queue.set_used_hi(v);
                     }
@@ -1612,27 +1612,27 @@ impl VirtioFs {
         }
 
         match offset {
-            reg::MAGIC => MAGIC_VALUE,
-            reg::VERSION => 2,
-            reg::DEVICE_ID => VIRTIO_FS_ID,
-            reg::VENDOR_ID => VENDOR,
-            reg::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-            reg::QUEUE_NUM_MAX if (self.queue_sel as usize) < NUM_QUEUES => {
+            mmio::MAGIC => MAGIC_VALUE,
+            mmio::VERSION => 2,
+            mmio::DEVICE_ID => VIRTIO_FS_ID,
+            mmio::VENDOR_ID => VENDOR,
+            mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
+            mmio::QUEUE_NUM_MAX if (self.queue_sel as usize) < NUM_QUEUES => {
                 u64::from(QUEUE_NUM_MAX)
             }
-            reg::QUEUE_READY => self
+            mmio::QUEUE_READY => self
                 .queues
                 .get(self.queue_sel as usize)
                 .map_or(0, |queue| u64::from(queue.is_ready())),
-            reg::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-            reg::STATUS => u64::from(self.status),
+            mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
+            mmio::STATUS => u64::from(self.status),
             // The device has no shared memory region, which virtio 1.2 reads
             // as all ones. A guest built with FUSE_DAX fails its probe on a
             // zero length.
-            reg::SHM_LEN_LOW | reg::SHM_LEN_HIGH | reg::SHM_BASE_LOW | reg::SHM_BASE_HIGH => {
+            mmio::SHM_LEN_LOW | mmio::SHM_LEN_HIGH | mmio::SHM_BASE_LOW | mmio::SHM_BASE_HIGH => {
                 0xffff_ffff
             }
-            _ if offset >= reg::CONFIG => self.read_config((offset - reg::CONFIG) as usize),
+            _ if offset >= mmio::CONFIG => self.read_config((offset - mmio::CONFIG) as usize),
             _ => 0,
         }
     }
@@ -11373,7 +11373,7 @@ mod tests {
         dev.readahead.prepare_now(&etc_path);
 
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
-        dev.mmio(&mem, reg::STATUS, true, 0);
+        dev.mmio(&mem, mmio::STATUS, true, 0);
         assert!(dev.fh0_listings.is_empty());
         assert!(dev.fh0_order.is_empty());
         assert!(dev.readahead.take(&etc_path).is_none(), "prepared survived");
@@ -11386,10 +11386,10 @@ mod tests {
         let (dir, mut dev) = fixture();
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
         for offset in [
-            reg::SHM_LEN_LOW,
-            reg::SHM_LEN_HIGH,
-            reg::SHM_BASE_LOW,
-            reg::SHM_BASE_HIGH,
+            mmio::SHM_LEN_LOW,
+            mmio::SHM_LEN_HIGH,
+            mmio::SHM_BASE_LOW,
+            mmio::SHM_BASE_HIGH,
         ] {
             assert_eq!(dev.mmio(&mem, offset, false, 0), 0xffff_ffff, "{offset:#x}");
         }
@@ -11712,15 +11712,15 @@ mod tests {
         avail: u64,
         used: u64,
     ) {
-        dev.mmio(mem, reg::QUEUE_SEL, true, u64::from(REQ_QUEUE));
-        dev.mmio(mem, reg::QUEUE_NUM, true, u64::from(size));
-        dev.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        dev.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        dev.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        dev.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        dev.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        dev.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        dev.mmio(mem, reg::QUEUE_READY, true, 1);
+        dev.mmio(mem, mmio::QUEUE_SEL, true, u64::from(REQ_QUEUE));
+        dev.mmio(mem, mmio::QUEUE_NUM, true, u64::from(size));
+        dev.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        dev.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
+        dev.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        dev.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        dev.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        dev.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
+        dev.mmio(mem, mmio::QUEUE_READY, true, 1);
     }
 
     fn write_desc(
@@ -11747,7 +11747,7 @@ mod tests {
     fn notify_head(dev: &mut VirtioFs, mem: &GuestRam, avail: u64, head: u16) {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, head).unwrap(); // avail.ring[0]
-        dev.mmio(mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mmio(mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
         dev.drain_notified(mem);
     }
 
@@ -11814,7 +11814,7 @@ mod tests {
         write_desc(&mem, desc, 0, in_buf, req.len() as u32, 0, 0);
         mem.write_u16(avail + 2, 2).unwrap();
         mem.write_u16(avail + 6, 0).unwrap();
-        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
         dev.drain_notified(&mem);
         assert_eq!(dev.nodes.len(), before, "the reply-less LOOKUP was refused");
 
@@ -11843,7 +11843,7 @@ mod tests {
         assert_eq!(dev.open_handle_count(), 2);
 
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
-        dev.mmio(&mem, reg::STATUS, true, 0);
+        dev.mmio(&mem, mmio::STATUS, true, 0);
         assert_eq!(dev.open_handle_count(), 0, "the handles were released");
         assert!(!temporary.exists(), "the unlinked tmpfile was removed");
         assert!(!dev.nodes.contains_key(&node), "the node was dropped");
@@ -12754,7 +12754,7 @@ mod tests {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = head 0
 
-        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
 
         assert_eq!(
             mem.read_u16(used + 2).unwrap(),
@@ -12833,7 +12833,7 @@ mod tests {
         }
         mem.write_u16(avail + 2, CHAINS).unwrap();
 
-        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
 
         let remaining = dev.drain_notified_bounded(&mem, 2);
         assert!(
@@ -12942,7 +12942,7 @@ mod tests {
                     mem.write_u16(avail + 2, i + 1).unwrap(); // avail.idx
                     dev.lock()
                         .unwrap()
-                        .mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+                        .mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
                     std::thread::yield_now();
                 }
             })

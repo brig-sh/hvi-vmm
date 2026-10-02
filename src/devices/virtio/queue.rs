@@ -12,113 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A minimal virtio-mmio transport with a split virtqueue and a virtio-blk
-//! device. Being the device is what lets the VMM record the guest's disk I/O
-//! as it serves it.
+//! The split virtqueue the virtio devices share.
 //!
-//! Because this VMM implements the device backend, every block request the
-//! guest issues passes through our code by construction: servicing the
-//! virtqueue and capturing the guest's disk I/O are the same act (see the
-//! `[virtio-blk]` log lines). The virtqueue machinery here is device-agnostic
-//! and will carry virtio-net (the network boundary) next.
-//!
-//! Modern virtio-mmio (version 2) is implemented — enough for the Linux
-//! `virtio_mmio` + `virtio_blk` drivers to negotiate `VIRTIO_F_VERSION_1`,
-//! set up one queue, and do reads/writes.
-// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
-// every component of a path comes from the guest. The paths here are this
-// VMM's own.
-#![allow(clippy::disallowed_methods)]
-
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::MetadataExt;
-use std::sync::Arc;
+//! A [`Queue`] holds what the driver programs into one queue and checks it
+//! against guest RAM. It also publishes completed buffers to the used ring.
 
 use crate::guestmem::GuestRam;
 
-use crate::events::CapturedEvent;
-use crate::plugin::IoSink;
-
-/// virtio-mmio register offsets (subset we implement). Shared with virtio-net.
-///
-/// The values come from `virtio-bindings`, which is bindgen output from the
-/// kernel headers, so the offsets stop being ours to get right. They are
-/// re-exported as `u64` because that is what an MMIO dispatch matches on, and
-/// under our own names where the kernel's differ: the spec calls the second and
-/// third rings *driver* and *device*, which is what the register names say,
-/// while the kernel header still calls them *avail* and *used*.
-pub(crate) mod reg {
-    use virtio_bindings::virtio_mmio::*;
-
-    pub const MAGIC: u64 = VIRTIO_MMIO_MAGIC_VALUE as u64; // "virt"
-    pub const VERSION: u64 = VIRTIO_MMIO_VERSION as u64; // 2
-    pub const DEVICE_ID: u64 = VIRTIO_MMIO_DEVICE_ID as u64;
-    pub const VENDOR_ID: u64 = VIRTIO_MMIO_VENDOR_ID as u64;
-    pub const DEVICE_FEATURES: u64 = VIRTIO_MMIO_DEVICE_FEATURES as u64;
-    pub const DEVICE_FEATURES_SEL: u64 = VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64;
-    pub const DRIVER_FEATURES: u64 = VIRTIO_MMIO_DRIVER_FEATURES as u64;
-    pub const DRIVER_FEATURES_SEL: u64 = VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64;
-    pub const QUEUE_SEL: u64 = VIRTIO_MMIO_QUEUE_SEL as u64;
-    pub const QUEUE_NUM_MAX: u64 = VIRTIO_MMIO_QUEUE_NUM_MAX as u64;
-    pub const QUEUE_NUM: u64 = VIRTIO_MMIO_QUEUE_NUM as u64;
-    pub const QUEUE_READY: u64 = VIRTIO_MMIO_QUEUE_READY as u64;
-    pub const QUEUE_NOTIFY: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
-    pub const INTERRUPT_STATUS: u64 = VIRTIO_MMIO_INTERRUPT_STATUS as u64;
-    pub const INTERRUPT_ACK: u64 = VIRTIO_MMIO_INTERRUPT_ACK as u64;
-    pub const STATUS: u64 = VIRTIO_MMIO_STATUS as u64;
-    pub const QUEUE_DESC_LOW: u64 = VIRTIO_MMIO_QUEUE_DESC_LOW as u64;
-    pub const QUEUE_DESC_HIGH: u64 = VIRTIO_MMIO_QUEUE_DESC_HIGH as u64;
-    pub const QUEUE_DRIVER_LOW: u64 = VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
-    pub const QUEUE_DRIVER_HIGH: u64 = VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
-    pub const QUEUE_DEVICE_LOW: u64 = VIRTIO_MMIO_QUEUE_USED_LOW as u64;
-    pub const QUEUE_DEVICE_HIGH: u64 = VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
-    // Shared memory regions (virtio 1.2). Only virtio-fs answers them, so
-    // they follow it to macOS.
-    #[cfg(target_os = "macos")]
-    pub const SHM_LEN_LOW: u64 = VIRTIO_MMIO_SHM_LEN_LOW as u64;
-    #[cfg(target_os = "macos")]
-    pub const SHM_LEN_HIGH: u64 = VIRTIO_MMIO_SHM_LEN_HIGH as u64;
-    #[cfg(target_os = "macos")]
-    pub const SHM_BASE_LOW: u64 = VIRTIO_MMIO_SHM_BASE_LOW as u64;
-    #[cfg(target_os = "macos")]
-    pub const SHM_BASE_HIGH: u64 = VIRTIO_MMIO_SHM_BASE_HIGH as u64;
-    pub const CONFIG: u64 = VIRTIO_MMIO_CONFIG as u64;
-}
-
-const MAGIC_VALUE: u64 = 0x7472_6976; // "virt" little-endian
-const VIRTIO_BLK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK as u64;
-const VENDOR: u64 = 0x4649_4f4e; // "NOIF"
-
-/// `VIRTIO_F_VERSION_1` -- required for a modern device. It is feature bit 32,
-/// so it lands in bit 0 of the high 32-bit word the driver selects.
-const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
-/// `VIRTIO_BLK_F_FLUSH` (low word): the guest may issue explicit cache-flush
-/// requests. Advertising and honouring it gives correct durability semantics
-/// for `fsync`/`end_fsync` workloads instead of the guest guessing.
-const F_BLK_FLUSH_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
-
 /// Descriptor flags.
-pub(crate) const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
-pub(crate) const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
-
-/// virtio-blk request types.
-const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
-const VIRTIO_BLK_T_OUT: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT; // guest -> write disk
-const VIRTIO_BLK_T_FLUSH: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_FLUSH; // flush the cache
-
-/// virtio-blk status byte.
-const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
-const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8;
-
-const SECTOR: u64 = 512;
+pub(super) const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
+pub(super) const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
 
 /// Largest queue size we advertise in `QUEUE_NUM_MAX`, and so the largest a
 /// driver may legally program.
-pub(crate) const QUEUE_NUM_MAX: u32 = 256;
+pub(super) const QUEUE_NUM_MAX: u32 = 256;
 
-/// One virtqueue's driver-programmed state. Shared with virtio-net and
-/// virtio-vsock.
+/// One virtqueue's driver-programmed state.
 ///
 /// Every field here is driver-controlled, so the fields are private and the
 /// validation lives in the setters: this is the single place where a hostile
@@ -128,7 +37,7 @@ pub(crate) const QUEUE_NUM_MAX: u32 = 256;
 /// `u32` and truncating at the point of use was a guest-triggerable panic
 /// (`0x10000` is non-zero as a `u32` and zero as a `u16`).
 #[derive(Default)]
-pub(crate) struct Queue {
+pub(super) struct Queue {
     num: u32,
     ready: bool,
     desc: u64,
@@ -273,488 +182,18 @@ impl Queue {
     }
 }
 
-/// A virtio-blk device behind a virtio-mmio transport.
-pub struct VirtioBlk {
-    file: File,
-    capacity_sectors: u64,
-    status: u32,
-    dev_feat_sel: u32,
-    queue: Queue,
-    interrupt_status: u32,
-    /// Captured requests, drained by the hypervisor backend into the event
-    /// ledger.
-    events: Vec<CapturedEvent>,
-    /// Live feed of each request to a plugin, when one asked for it. The
-    /// same requests the ledger records, handed over as they happen rather
-    /// than drained after the fact.
-    sink: Option<Arc<dyn IoSink>>,
-    /// Stable id for this backing file, so a reader can tell two disks apart.
-    disk_id: u64,
-    /// Per-request `[virtio-blk]` console tracing, off by default (it is a
-    /// synchronous stderr write per request — ruinous under fio). Enable with
-    /// `HVI_BLK_TRACE=1`; the structured ledger still records every request.
-    trace: bool,
-}
-
-/// Size in bytes of whatever is behind `file`.
-///
-/// `metadata().len()` is the *file* size, and for a block special file that is
-/// 0 -- so a disk-image path works and a block device silently advertises a
-/// zero-sector virtio-blk. That failure is unpleasant to read: the guest
-/// registers `/dev/vda` normally and then fails every read, so the console says
-/// "unable to read superblock" rather than anything about a missing disk.
-///
-/// Container runtimes hand us exactly that. urunc passes the devmapper snapshot
-/// of the container's rootfs (`/dev/mapper/...`), not a file. So ask the kernel
-/// for the device size when the path is a block device.
-fn backing_len(file: &File) -> std::io::Result<u64> {
-    let meta = file.metadata()?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        use std::os::unix::io::AsRawFd;
-
-        if meta.file_type().is_block_device() {
-            // The device size in bytes; BLKGETSIZE counts 512-byte sectors.
-            // libc declares no BLKGETSIZE64, so the request is built here.
-            const BLKGETSIZE64: libc::Ioctl = libc::_IOR::<usize>(0x12, 114);
-            let mut size: u64 = 0;
-            // SAFETY: `file` is an open block device and `size` is a live u64
-            // that the ioctl writes exactly one u64 into.
-            let rc = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size) };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            return Ok(size);
-        }
-    }
-    Ok(meta.len())
-}
-
-impl VirtioBlk {
-    /// Opens `path` read-write as the backing disk.
-    ///
-    /// # Errors
-    ///
-    /// Errors if the file cannot be opened or its length read.
-    pub fn open(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let capacity_sectors = backing_len(&file)? / SECTOR;
-        // The inode identifies the backing store across the two processes that
-        // care about it, without agreeing on a path: hvi may have been given a
-        // relative one, and the reader is given its own.
-        let disk_id = file.metadata().map(|m| m.ino()).unwrap_or(0);
-        Ok(VirtioBlk {
-            file,
-            capacity_sectors,
-            status: 0,
-            dev_feat_sel: 0,
-            queue: Queue::default(),
-            interrupt_status: 0,
-            events: Vec::new(),
-            sink: None,
-            disk_id,
-            trace: std::env::var_os("HVI_BLK_TRACE").is_some(),
-        })
-    }
-
-    /// Feeds each request to `sink` as well as the ledger.
-    pub fn set_io_sink(&mut self, sink: Arc<dyn IoSink>) {
-        self.sink = Some(sink);
-    }
-
-    /// The interrupt line level: asserted while an unacknowledged used-buffer
-    /// notification is pending.
-    #[must_use]
-    pub fn irq_level(&self) -> bool {
-        self.interrupt_status != 0
-    }
-
-    /// Drains the captured requests for the event ledger.
-    pub fn take_events(&mut self) -> Vec<CapturedEvent> {
-        std::mem::take(&mut self.events)
-    }
-
-    /// Services one MMIO access. Returns the read value (0 for writes). When
-    /// the driver notifies a queue, the virtqueue is processed inline.
-    pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let v = value as u32;
-        if is_write {
-            match offset {
-                reg::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                reg::DRIVER_FEATURES_SEL | reg::DRIVER_FEATURES => {}
-                reg::QUEUE_SEL => {} // only queue 0
-                reg::QUEUE_NUM => self.queue.set_num(v),
-                reg::QUEUE_READY => self.queue.set_ready(v, mem),
-                reg::QUEUE_NOTIFY => self.process_queue(mem),
-                reg::INTERRUPT_ACK => self.interrupt_status &= !v,
-                reg::STATUS if v == 0 => self.reset(),
-                reg::STATUS => self.status = v,
-                reg::QUEUE_DESC_LOW => self.queue.set_desc_lo(v),
-                reg::QUEUE_DESC_HIGH => self.queue.set_desc_hi(v),
-                reg::QUEUE_DRIVER_LOW => self.queue.set_avail_lo(v),
-                reg::QUEUE_DRIVER_HIGH => self.queue.set_avail_hi(v),
-                reg::QUEUE_DEVICE_LOW => self.queue.set_used_lo(v),
-                reg::QUEUE_DEVICE_HIGH => self.queue.set_used_hi(v),
-                _ => {}
-            }
-            0
-        } else {
-            match offset {
-                reg::MAGIC => MAGIC_VALUE,
-                reg::VERSION => 2,
-                reg::DEVICE_ID => VIRTIO_BLK_ID,
-                reg::VENDOR_ID => VENDOR,
-                // Low word: VIRTIO_BLK_F_FLUSH. High word: VIRTIO_F_VERSION_1.
-                reg::DEVICE_FEATURES if self.dev_feat_sel == 0 => u64::from(F_BLK_FLUSH_LO),
-                reg::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                reg::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
-                reg::QUEUE_READY => u64::from(self.queue.is_ready()),
-                reg::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                reg::STATUS => u64::from(self.status),
-                // Config space: capacity (in 512-byte sectors) at offset 0.
-                // Return the 8-byte little-endian window starting at the field
-                // so a sized (byte/half/word) read takes the right low bytes;
-                // the caller masks to the access width.
-                _ if offset >= reg::CONFIG => {
-                    let field = (offset - reg::CONFIG) as usize;
-                    let cap = self.capacity_sectors.to_le_bytes();
-                    let mut w = [0u8; 8];
-                    for (i, b) in w.iter_mut().enumerate() {
-                        if let Some(&c) = cap.get(field + i) {
-                            *b = c;
-                        }
-                    }
-                    u64::from_le_bytes(w)
-                }
-                _ => 0,
-            }
-        }
-    }
-
-    /// Resets the device, as a write of 0 to STATUS requests.
-    fn reset(&mut self) {
-        self.queue.reset();
-        self.interrupt_status = 0;
-        self.status = 0;
-        self.dev_feat_sel = 0;
-    }
-
-    /// Processes every buffer the driver has made available on queue 0.
-    fn process_queue(&mut self, mem: &GuestRam) {
-        if !self.queue.is_ready() {
-            return;
-        }
-        let Some(pending) = self.queue.pending(mem) else {
-            return;
-        };
-        let mut last = self.queue.last_avail();
-        let mut serviced = false;
-        for _ in 0..pending {
-            let Some(slot) = self.queue.avail_slot(last) else {
-                break;
-            };
-            let Ok(head) = mem.read_u16(slot) else {
-                break;
-            };
-            let used_len = self.handle_chain(mem, head);
-            self.queue.push_used(mem, head, used_len);
-            last = last.wrapping_add(1);
-            serviced = true;
-        }
-        self.queue.set_last_avail(last);
-        if serviced {
-            // Used-buffer notification.
-            self.interrupt_status |= 1;
-        }
-    }
-
-    /// Walks the descriptor chain at `head`, runs the block request, and
-    /// returns the number of device-written bytes for the used ring.
-    fn handle_chain(&mut self, mem: &GuestRam, head: u16) -> u32 {
-        // Collect readable and writable segments.
-        let mut readable = Vec::new();
-        let mut writable = Vec::new();
-        let mut d = head;
-        // A conforming chain visits each descriptor at most once, so the ring
-        // size bounds it; a cycle just runs out of budget instead of spinning.
-        for _ in 0..self.queue.size() {
-            let Some(da) = self.queue.desc_addr(d) else {
-                break;
-            };
-            let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
-                mem.read_u64(da),
-                mem.read_u32(da + 8),
-                mem.read_u16(da + 12),
-                mem.read_u16(da + 14),
-            ) else {
-                break;
-            };
-            if flags & VIRTQ_DESC_F_WRITE != 0 {
-                writable.push((addr, len));
-            } else {
-                readable.push((addr, len));
-            }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            d = next;
-        }
-        if readable.is_empty() || writable.is_empty() {
-            return 0;
-        }
-        let (saddr, _) = *writable.last().unwrap();
-        match self.handle_request(mem, &readable, &writable) {
-            Ok(written) => written,
-            Err(e) => {
-                // Always report a failure. Leaving the status byte untouched
-                // let the driver read back whatever it had put there, so a
-                // rejected or failed request could look like a success with
-                // stale data in the buffer.
-                if self.trace {
-                    eprint!("\r\n[virtio-blk] request failed: {e}\r\n");
-                }
-                let _ = mem.write_u8(saddr, VIRTIO_BLK_S_IOERR);
-                1
-            }
-        }
-    }
-
-    /// Byte offset of `sector`, once we know the whole `len`-byte access falls
-    /// inside the capacity we advertised in config space.
-    ///
-    /// The guest picks `sector`, so this is what keeps a request inside the
-    /// disk it was given: without it a write past the end simply extended the
-    /// backing file, and the multiplication wrapped in release builds.
-    fn byte_range(&self, sector: u64, len: u64) -> std::io::Result<u64> {
-        let base = sector
-            .checked_mul(SECTOR)
-            .ok_or_else(|| other("sector offset overflows"))?;
-        let end = base
-            .checked_add(len)
-            .ok_or_else(|| other("request length overflows"))?;
-        if end > self.capacity_sectors * SECTOR {
-            return Err(other(format!(
-                "request at sector {sector} (+{len} bytes) is past the {} sector capacity",
-                self.capacity_sectors
-            )));
-        }
-        Ok(base)
-    }
-
-    /// Runs a single virtio-blk request. The first readable segment is the
-    /// 16-byte header (type, _, sector); the last writable segment is the
-    /// status byte; the segments between carry data.
-    fn handle_request(
-        &mut self,
-        mem: &GuestRam,
-        readable: &[(u64, u32)],
-        writable: &[(u64, u32)],
-    ) -> std::io::Result<u32> {
-        let (haddr, _) = readable[0];
-        let typ = mem.read_u32(haddr).map_err(other)?;
-        let sector = mem.read_u64(haddr + 8).map_err(other)?;
-        // Device-written bytes (for the used ring) vs data bytes transferred
-        // (the boundary metric — the actual I/O volume).
-        let mut device_written = 0u32;
-        let mut data_bytes = 0u64;
-
-        match typ {
-            VIRTIO_BLK_T_IN => {
-                // Coalesce the data segments into one positioned read, then
-                // scatter into guest memory: one syscall per request, not one
-                // per descriptor.
-                let segs = &writable[..writable.len() - 1];
-                let total: usize = segs.iter().map(|&(_, l)| l as usize).sum();
-                let base = self.byte_range(sector, total as u64)?;
-                let mut buf = vec![0u8; total];
-                self.file.read_exact_at(&mut buf, base).map_err(other)?;
-                let mut o = 0;
-                for &(a, l) in segs {
-                    mem.write(a, &buf[o..o + l as usize]).map_err(other)?;
-                    o += l as usize;
-                    device_written += l;
-                }
-                data_bytes = total as u64;
-            }
-            VIRTIO_BLK_T_OUT => {
-                // Gather the data segments into one buffer, then one positioned
-                // write.
-                let segs = &readable[1..];
-                let total: usize = segs.iter().map(|&(_, l)| l as usize).sum();
-                let base = self.byte_range(sector, total as u64)?;
-                let mut buf = vec![0u8; total];
-                let mut o = 0;
-                for &(a, l) in segs {
-                    mem.read(a, &mut buf[o..o + l as usize]).map_err(other)?;
-                    o += l as usize;
-                }
-                self.file.write_all_at(&buf, base).map_err(other)?;
-                data_bytes = total as u64;
-            }
-            VIRTIO_BLK_T_FLUSH => {
-                // Honour the guest's cache flush (durability for fsync).
-                self.file.sync_data().map_err(other)?;
-            }
-            _ => {} // get-id / etc.: acknowledge without data.
-        }
-
-        let (saddr, _) = *writable.last().unwrap();
-        mem.write_u8(saddr, VIRTIO_BLK_S_OK).map_err(other)?;
-        device_written += 1;
-
-        // Boundary capture: the guest's disk I/O, observed at the device. The
-        // structured event is always recorded; the console line is opt-in
-        // (HVI_BLK_TRACE) because a synchronous stderr write per request would
-        // dominate the cost under a high-IOPS workload.
-        if self.trace {
-            let kind = match typ {
-                VIRTIO_BLK_T_IN => "read ",
-                VIRTIO_BLK_T_OUT => "write",
-                VIRTIO_BLK_T_FLUSH => "flush",
-                _ => "other",
-            };
-            eprint!("\r\n[virtio-blk] {kind} sector={sector} bytes={data_bytes}\r\n");
-        }
-        // Flush requests carry no data range — don't log them as I/O events.
-        if typ == VIRTIO_BLK_T_IN || typ == VIRTIO_BLK_T_OUT {
-            let write = typ == VIRTIO_BLK_T_OUT;
-            self.events.push(CapturedEvent::Block {
-                lba: sector,
-                len: data_bytes,
-                write,
-            });
-            // Same observation, handed to whoever is watching. A sink that
-            // cannot keep up accounts for that itself: a lost record must not
-            // fail the guest's I/O.
-            if let Some(sink) = self.sink.as_ref() {
-                sink.block(sector, data_bytes, self.disk_id, write);
-            }
-        }
-        Ok(device_written)
-    }
-}
-
 fn set_lo(v: u64, lo: u32) -> u64 {
     (v & 0xffff_ffff_0000_0000) | u64::from(lo)
 }
 fn set_hi(v: u64, hi: u32) -> u64 {
     (v & 0x0000_0000_ffff_ffff) | (u64::from(hi) << 32)
 }
-fn other<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
 
 #[cfg(test)]
-mod backing_len_tests {
-    use super::backing_len;
-
-    /// A plain disk image still sizes from the file length.
-    #[test]
-    fn a_regular_file_reports_its_length() {
-        let path = std::env::temp_dir().join("hvi-backing-len-test.img");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("create temp image");
-        file.set_len(4 << 20).expect("size temp image");
-        assert_eq!(backing_len(&file).expect("len"), 4 << 20);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The regression: a block special file has a file length of 0, so sizing a
-    /// virtio-blk from `metadata().len()` gives the guest a 0-sector disk. This
-    /// needs a real block device. CI creates a loop device and names it in
-    /// `HVI_BLOCK_DEV`; when the variable is set the device must be usable,
-    /// because a skip there would silently drop the coverage the CI step exists
-    /// to provide. Without it the test scans for one, and reports rather than
-    /// fails when none is openable.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_block_device_reports_the_device_size() {
-        use std::os::unix::fs::FileTypeExt;
-
-        let picked = match std::env::var("HVI_BLOCK_DEV") {
-            Ok(dev) => {
-                let file = std::fs::File::open(&dev)
-                    .unwrap_or_else(|e| panic!("HVI_BLOCK_DEV={dev}: {e}"));
-                Some((std::path::PathBuf::from(dev), file))
-            }
-            Err(_) => std::fs::read_dir("/sys/block")
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| {
-                    let path = std::path::Path::new("/dev").join(e.file_name());
-                    let file = std::fs::File::open(&path).ok()?;
-                    let is_block = file.metadata().ok()?.file_type().is_block_device();
-                    is_block.then_some((path, file))
-                })
-                .next(),
-        };
-        let Some((path, file)) = picked else {
-            eprintln!("skipping: no openable block device (needs root on most hosts)");
-            return;
-        };
-
-        let meta_len = file.metadata().expect("metadata").len();
-        let got = backing_len(&file).expect("backing_len");
-        assert_eq!(meta_len, 0, "{path:?} unexpectedly has a file length");
-        assert!(got > 0, "{path:?} sized as {got} bytes");
-        assert_eq!(
-            got % super::SECTOR,
-            0,
-            "{path:?} size is not sector-aligned"
-        );
-    }
-}
-
-#[cfg(test)]
-mod queue_tests {
+mod tests {
     use super::*;
 
     const BASE: u64 = 0x4000_0000;
-
-    /// Programs a queue the way the Linux virtio-mmio driver does: size, then
-    /// the three ring addresses, then READY last.
-    fn program_queue(
-        blk: &mut VirtioBlk,
-        mem: &GuestRam,
-        num: u32,
-        desc: u64,
-        avail: u64,
-        used: u64,
-    ) {
-        blk.mmio(mem, reg::QUEUE_NUM, true, u64::from(num));
-        blk.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        blk.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        blk.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        blk.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        blk.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        blk.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        blk.mmio(mem, reg::QUEUE_READY, true, 1);
-    }
-
-    fn dev() -> VirtioBlk {
-        VirtioBlk::open("/dev/null").unwrap()
-    }
-
-    /// Regression for the guest-triggerable panic: `0x10000` is non-zero as a
-    /// `u32` and zero as a `u16`, so the old code divided by zero on notify.
-    #[test]
-    fn queue_num_65536_is_rejected_instead_of_panicking() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 0x10000, BASE, BASE + 0x1000, BASE + 0x2000);
-        mem.write_u16(BASE + 0x1000 + 2, 1).unwrap(); // avail.idx = 1
-
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0, "not ready");
-        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0); // must not panic
-        assert_eq!(blk.queue.size(), 0, "the size was refused");
-    }
 
     #[test]
     fn queue_rejects_zero_non_power_of_two_and_over_max() {
@@ -771,128 +210,6 @@ mod queue_tests {
             q.set_num(good);
             assert_eq!(u32::from(q.size()), good, "{good} should be accepted");
         }
-    }
-
-    /// The rings must fit in guest RAM before we will service the queue, so a
-    /// driver cannot point them at unbacked addresses.
-    #[test]
-    fn queue_rejects_rings_outside_guest_ram() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-
-        // desc table for 256 entries is 4 KiB, so this one runs off the end.
-        program_queue(
-            &mut blk,
-            &mem,
-            256,
-            BASE + 0x3800,
-            BASE + 0x1000,
-            BASE + 0x2000,
-        );
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0);
-
-        // Below the RAM base is refused too.
-        program_queue(
-            &mut blk,
-            &mem,
-            256,
-            BASE - 0x1000,
-            BASE + 0x1000,
-            BASE + 0x2000,
-        );
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0);
-
-        // The same size, in bounds, is accepted.
-        program_queue(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
-    }
-
-    /// A driver that has validated its rings must not be able to move them and
-    /// keep the queue live. Every setter that feeds `rings_fit` drops `ready`,
-    /// so the bounds are re-checked before the device services anything; this
-    /// pins that, because otherwise a guest could pass the check on one set of
-    /// addresses and then be serviced on another.
-    #[test]
-    fn re_programming_a_ready_queue_clears_ready() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-
-        // Each value is deliberately a legal one, and for QUEUE_NUM a
-        // non-zero one: `is_ready` is false whenever the size is zero, so
-        // writing 0 there would pass this test without `ready` ever being
-        // cleared. What has to drop the queue is the write itself.
-        for (r, v) in [
-            (reg::QUEUE_NUM, 128),
-            (reg::QUEUE_DESC_LOW, 0),
-            (reg::QUEUE_DESC_HIGH, 0),
-            (reg::QUEUE_DRIVER_LOW, 0),
-            (reg::QUEUE_DRIVER_HIGH, 0),
-            (reg::QUEUE_DEVICE_LOW, 0),
-            (reg::QUEUE_DEVICE_HIGH, 0),
-        ] {
-            let mut blk = dev();
-            program_queue(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
-            assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
-
-            blk.mmio(&mem, r, true, v);
-            assert_eq!(
-                blk.mmio(&mem, reg::QUEUE_READY, false, 0),
-                0,
-                "writing {r:#05x} left the queue ready"
-            );
-        }
-    }
-
-    /// A chain that points back at itself must run out of budget rather than
-    /// spin. The only bound on the walk is the ring size, so the shape to
-    /// test is a cycle of *writable* descriptors: nothing accumulates, so
-    /// no other limit can end it.
-    #[test]
-    fn a_descriptor_cycle_runs_out_of_budget() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
-
-        // desc[0] -> desc[0]: a one-hop cycle, writable and F_NEXT set.
-        mem.write_u64(BASE, BASE + 0x3000).unwrap();
-        mem.write_u32(BASE + 8, 16).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
-            .unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-
-        // Terminating at all is the property. Nothing readable came out of the
-        // walk, so there is no request to serve either.
-        assert_eq!(blk.handle_chain(&mem, 0), 0);
-    }
-
-    /// A `next` that leaves the ring ends the walk, rather than reading a
-    /// descriptor the driver never programmed.
-    ///
-    /// The descriptor one past the ring is deliberately a valid, writable one
-    /// here. Without the bound the walk would find it, `writable` would be
-    /// non-empty and the request would be serviced -- so this fails loudly
-    /// rather than passing on an empty walk.
-    #[test]
-    fn a_next_index_outside_the_ring_ends_the_walk() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
-
-        // desc[0]: readable, chaining to index 4 -- one past a 4-entry ring.
-        mem.write_u64(BASE, BASE + 0x3000).unwrap();
-        mem.write_u32(BASE + 8, 16).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 4).unwrap();
-
-        // "desc[4]": in guest RAM, outside the ring, and writable, so it is
-        // exactly what an unbounded walk would pick up.
-        mem.write_u64(BASE + 64, BASE + 0x3100).unwrap();
-        mem.write_u32(BASE + 72, 16).unwrap();
-        mem.write_u16(BASE + 76, VIRTQ_DESC_F_WRITE).unwrap();
-        mem.write_u16(BASE + 78, 0).unwrap();
-
-        assert_eq!(blk.handle_chain(&mem, 0), 0, "the walk stopped at the ring");
-        assert_eq!(blk.handle_chain(&mem, 4), 0, "an out-of-ring head as well");
-        assert_eq!(blk.handle_chain(&mem, u16::MAX), 0);
     }
 
     #[test]
@@ -923,276 +240,276 @@ mod queue_tests {
         mem.write_u16(BASE + 0x1000 + 2, 0xffff).unwrap();
         assert_eq!(q.pending(&mem), None);
     }
-
-    /// The happy path still works: a conforming driver's read request is
-    /// serviced, the data lands in guest RAM and the status byte is written.
-    #[test]
-    fn conforming_queue_still_services_a_request() {
-        let path = std::env::temp_dir().join(format!("hvi-q-{}.img", std::process::id()));
-        let mut disk = vec![0u8; 1024];
-        disk[..5].copy_from_slice(b"HELLO");
-        std::fs::write(&path, &disk).unwrap();
-        let mut blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
-
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
-        let buffers = BASE + 0x4000;
-        publish_read(&mem, desc, avail, buffers);
-        let data = buffers + 0x100;
-
-        program_queue(&mut blk, &mem, 8, desc, avail, used);
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1, "ready");
-        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
-        let _ = std::fs::remove_file(&path);
-
-        let mut got = [0u8; 5];
-        mem.read(data, &mut got).unwrap();
-        assert_eq!(&got, b"HELLO", "the sector reached guest memory");
-        assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "used.idx advanced");
-        assert!(blk.irq_level(), "used-buffer interrupt asserted");
-    }
-
-    /// Publishes one read of sector 0 on `avail`, as the next entry of an
-    /// 8-entry ring at `desc`.
-    ///
-    /// The request header is at `buffers`, the data at `buffers + 0x100` and
-    /// the status byte at `buffers + 0x400`, poisoned to `0xff` so an untouched
-    /// byte is visible.
-    fn publish_read(mem: &GuestRam, desc: u64, avail: u64, buffers: u64) {
-        let (hdr, data, status) = (buffers, buffers + 0x100, buffers + 0x400);
-        mem.write_u32(hdr, VIRTIO_BLK_T_IN).unwrap();
-        mem.write_u64(hdr + 8, 0).unwrap();
-        mem.write_u8(status, 0xff).unwrap();
-        let write_descriptor = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
-            mem.write_u64(desc + i * 16, addr).unwrap();
-            mem.write_u32(desc + i * 16 + 8, len).unwrap();
-            mem.write_u16(desc + i * 16 + 12, flags).unwrap();
-            mem.write_u16(desc + i * 16 + 14, next).unwrap();
-        };
-        write_descriptor(0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
-        write_descriptor(1, data, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
-        write_descriptor(2, status, 1, VIRTQ_DESC_F_WRITE, 0);
-        let avail_idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(avail_idx % 8) * 2, 0)
-            .unwrap();
-        mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
-    }
-
-    // The re-programmed queue sits at fresh ring pages with `avail.idx` back
-    // at 0.
-    #[test]
-    fn status_reset_lets_the_re_programmed_queue_service_a_request() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-
-        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
-        publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
-        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
-        assert_eq!(
-            mem.read_u16(BASE + 0x2000 + 2).unwrap(),
-            1,
-            "used.idx before the reset"
-        );
-
-        blk.mmio(&mem, reg::STATUS, true, 0);
-        program_queue(
-            &mut blk,
-            &mem,
-            8,
-            BASE + 0x3000,
-            BASE + 0x4000,
-            BASE + 0x5000,
-        );
-        publish_read(&mem, BASE + 0x3000, BASE + 0x4000, BASE + 0x7000);
-        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
-        assert_eq!(
-            mem.read_u16(BASE + 0x5000 + 2).unwrap(),
-            1,
-            "the request published after the reset was serviced"
-        );
-        // `dev()` backs the disk with `/dev/null`, so the read fails with
-        // IOERR. A written status byte shows the chain was walked.
-        assert_eq!(
-            mem.read_u16(BASE + 0x7000 + 0x400).unwrap() as u8,
-            VIRTIO_BLK_S_IOERR
-        );
-    }
-
-    // Linux `vm_setup_vq` refuses a queue whose QUEUE_READY reads non-zero, so
-    // a stale bit fails the probe that follows a reset.
-    #[test]
-    fn status_reset_clears_queue_ready() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 1);
-
-        blk.mmio(&mem, reg::STATUS, true, 0);
-        assert_eq!(blk.mmio(&mem, reg::QUEUE_READY, false, 0), 0);
-        assert_eq!(blk.mmio(&mem, reg::STATUS, false, 0), 0);
-    }
-
-    #[test]
-    fn status_reset_selects_the_first_feature_page() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-        blk.mmio(&mem, reg::DEVICE_FEATURES_SEL, true, 1);
-        assert_eq!(
-            blk.mmio(&mem, reg::DEVICE_FEATURES, false, 0),
-            u64::from(F_VERSION_1_HI)
-        );
-
-        blk.mmio(&mem, reg::STATUS, true, 0);
-        assert_eq!(
-            blk.mmio(&mem, reg::DEVICE_FEATURES, false, 0),
-            u64::from(F_BLK_FLUSH_LO)
-        );
-    }
-
-    #[test]
-    fn status_reset_clears_the_pending_interrupt() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
-        publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
-        blk.mmio(&mem, reg::QUEUE_NOTIFY, true, 0);
-        assert!(blk.irq_level());
-
-        blk.mmio(&mem, reg::STATUS, true, 0);
-        assert!(!blk.irq_level());
-        assert_eq!(blk.mmio(&mem, reg::INTERRUPT_STATUS, false, 0), 0);
-    }
 }
 
+// A litmus test for the used-ring publish in `Queue::push_used`. It models what
+// `spawn_fs_worker` in the macOS backend does: a host thread that is not the
+// vCPU thread appends completions to the used ring while the guest is running
+// and consuming that same ring.
 #[cfg(test)]
-mod capacity_tests {
-    use super::*;
+mod ordering_tests {
+    use super::Queue;
+    use crate::guestmem::GuestRam;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering as AOrd};
 
     const BASE: u64 = 0x4000_0000;
+    const N: u32 = 256;
+    const ITERS: u32 = 4_000_000;
 
-    struct Rig {
-        path: std::path::PathBuf,
-    }
+    /// How long each arm may run for. The iteration count is the ceiling; this
+    /// is what actually ends the run anywhere the two threads cannot spin
+    /// freely.
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
-    impl Drop for Rig {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+    /// Back off while waiting on the other thread.
+    ///
+    /// A bare `spin_loop` assumes the other thread is running on another core
+    /// right now. On a runner with fewer cores than that it is a way to hold a
+    /// core doing nothing until the scheduler takes it away, which is how this
+    /// test went from half a second to tens of minutes on a hosted macOS
+    /// runner. Spin briefly for the common case, then yield so progress never
+    /// depends on there being a spare core.
+    fn wait(idle: &mut u32) {
+        *idle += 1;
+        if *idle < 64 {
+            std::hint::spin_loop();
+        } else {
+            *idle = 0;
+            std::thread::yield_now();
         }
     }
 
-    /// A 1-sector disk and a queue programmed the way Linux does it.
-    fn rig(tag: &str) -> (Rig, VirtioBlk) {
-        let path = std::env::temp_dir().join(format!("hvi-cap-{tag}-{}.img", std::process::id()));
-        std::fs::write(&path, [0xabu8; 512]).unwrap();
-        let blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
-        (Rig { path }, blk)
+    /// The head descriptor id the device hands back for completion `i`. A real
+    /// guest allocates heads from a free list, so the id in a given used slot
+    /// differs from one wrap of the ring to the next; making it `slot` would
+    /// make a stale id indistinguishable from a fresh one.
+    fn expected_head(i: u32) -> u32 {
+        (i % N + i / N) % N
     }
 
-    /// Submits one request and returns the status byte the device wrote.
-    fn submit(blk: &mut VirtioBlk, mem: &GuestRam, typ: u32, sector: u64, len: u32) -> u8 {
-        let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
-        let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
-        mem.write_u32(hdr, typ).unwrap();
-        mem.write_u64(hdr + 8, sector).unwrap();
-        // poison, so "untouched" is visible
-        mem.write_u8(status, 0xff).unwrap();
+    /// The real thing. This is what the test guards: if the release in
+    /// `Queue::push_used` is ever removed, this arm starts tearing on any
+    /// weakly ordered host.
+    fn publish_real(q: &Queue, mem: &GuestRam, _used: u64, head: u16, len: u32) {
+        q.push_used(mem, head, len);
+    }
 
-        let write_flag = if typ == VIRTIO_BLK_T_IN {
-            VIRTQ_DESC_F_WRITE
-        } else {
-            0
+    /// The publish as it was before the fence: element stores, then the index
+    /// store, with nothing in between.
+    ///
+    /// This is the harness's positive control, and it is deliberately a local
+    /// copy rather than a call into `Queue`. Pointing it at `push_used` would
+    /// make it track whatever `push_used` does, so the moment the fence landed
+    /// the control would stop tearing and the test would be asserting against
+    /// itself.
+    fn publish_unfenced(_q: &Queue, mem: &GuestRam, used: u64, head: u16, len: u32) {
+        let n = N as u16;
+        let Ok(used_idx) = mem.read_u16(used + 2) else {
+            return;
         };
-        let d = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
-            mem.write_u64(desc + i * 16, addr).unwrap();
-            mem.write_u32(desc + i * 16 + 8, len).unwrap();
-            mem.write_u16(desc + i * 16 + 12, flags).unwrap();
-            mem.write_u16(desc + i * 16 + 14, next).unwrap();
-        };
-        d(0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
-        d(1, data, len, VIRTQ_DESC_F_NEXT | write_flag, 2);
-        d(2, status, 1, VIRTQ_DESC_F_WRITE, 0);
-
-        let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 256) * 2, 0)
-            .unwrap();
-        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
-
-        blk.mmio(mem, reg::QUEUE_NUM, true, 256);
-        blk.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        blk.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        blk.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        blk.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        blk.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        blk.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        blk.mmio(mem, reg::QUEUE_READY, true, 1);
-        blk.mmio(mem, reg::QUEUE_NOTIFY, true, 0);
-        mem.read_u16(status).unwrap() as u8
+        let entry = used + 4 + u64::from(used_idx % n) * 8;
+        let _ = mem.write_u32(entry, u32::from(head));
+        let _ = mem.write_u32(entry + 4, len);
+        let _ = mem.write_u16(used + 2, used_idx.wrapping_add(1));
     }
 
-    /// Regression for the guest writing outside the disk it was advertised.
-    #[test]
-    fn write_past_the_advertised_capacity_is_refused() {
-        let (r, mut blk) = rig("out");
+    /// Runs the device thread against a guest thread that consumes the used
+    /// ring the way `virtqueue_get_buf_ctx_split` does: an acquire on
+    /// `used.idx` (the guest's `virtio_rmb`), then a read of the element it
+    /// claims to describe. Returns how many elements the guest observed stale
+    /// (i.e. how many times it would have printed "is not a head!"), how many
+    /// of those were a bogus descriptor id, and how many completions it got
+    /// through. That last count is below `ITERS` when the time budget ended the
+    /// run first.
+    fn run(publish: fn(&Queue, &GuestRam, u64, u16, u32)) -> (u32, u32, u32) {
+        let start = std::time::Instant::now();
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        assert_eq!(blk.capacity_sectors, 1);
+        let used = BASE + 0x1000;
 
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 131_072, 16);
-        assert_eq!(
-            st, VIRTIO_BLK_S_IOERR,
-            "the guest is told the request failed"
+        let mut q = Queue::default();
+        q.set_num(N);
+        q.set_used_lo(used as u32);
+        q.set_used_hi((used >> 32) as u32);
+
+        // Pre-stamp every slot with a generation the guest recognises as stale.
+        for s in 0..N {
+            let e = used + 4 + u64::from(s) * 8;
+            mem.write_u32(e, 0xdead_beef).unwrap();
+            mem.write_u32(e + 4, u32::MAX).unwrap();
+        }
+        mem.write_u16(used + 2, 0).unwrap();
+
+        let done = AtomicBool::new(false);
+        let stale = AtomicU32::new(0);
+        // A real device can never publish more than a ring's worth ahead of the
+        // guest: the descriptors are not free again until the guest consumes
+        // the used element. Without this the guest simply laps and every read
+        // is stale for reasons that have nothing to do with ordering.
+        let consumed = AtomicU32::new(0);
+        let bad_head = AtomicU32::new(0);
+        // used.idx as the guest sees it: an acquire load, not a plain read.
+        let idx_addr = mem.host_ptr(used + 2, 2).unwrap() as usize;
+
+        std::thread::scope(|s| {
+            let start = &start;
+            let q = &q;
+            let mem = &mem;
+            let done = &done;
+            let stale = &stale;
+            let consumed = &consumed;
+            let bad_head = &bad_head;
+
+            // The guest driver: poll used.idx, consume every new element.
+            s.spawn(move || {
+                let atomic_idx = unsafe { &*(idx_addr as *const AtomicU16) };
+                let mut seen: u32 = 0;
+                let mut idle = 0u32;
+                loop {
+                    let cur = atomic_idx.load(AOrd::Acquire);
+                    // How far ahead the device claims to be, as a count rather
+                    // than by chasing equality. Chasing it deadlocks: the
+                    // control arm exists to make `used.idx` observable stale,
+                    // so `cur` can appear *behind* `seen`, and "consume until
+                    // they are equal" then walks 65535 phantom entries.
+                    // `consumed` overshoots the device, its `i - consumed`
+                    // underflows to a huge number, and it waits for a guest
+                    // that has already run away. That is a real deadlock. It
+                    // needs a torn read to trigger, so it happens only on
+                    // arm64, which is where this test is meant to run.
+                    let avail = cur.wrapping_sub(seen as u16);
+                    // A real device is held to a ring's depth by the flow
+                    // control below, so anything beyond that is a stale index
+                    // rather than work. Re-read instead of chasing it.
+                    if u32::from(avail) > N {
+                        wait(&mut idle);
+                        continue;
+                    }
+                    for _ in 0..avail {
+                        let e = used + 4 + u64::from(seen % N) * 8;
+                        let id = mem.read_u32(e).unwrap();
+                        let len = mem.read_u32(e + 4).unwrap();
+                        let want_id = expected_head(seen);
+                        if len != seen || id != want_id {
+                            stale.fetch_add(1, AOrd::Relaxed);
+                        }
+                        if id != want_id {
+                            // The guest just read a descriptor id it was not
+                            // given for this slot: BAD_RING "id %u is not a
+                            // head!" and vq->broken = true.
+                            bad_head.fetch_add(1, AOrd::Relaxed);
+                        }
+                        seen = seen.wrapping_add(1);
+                        consumed.store(seen, AOrd::Release);
+                    }
+                    if done.load(AOrd::Acquire) && (seen as u16) == atomic_idx.load(AOrd::Acquire) {
+                        break;
+                    }
+                    // Independent of the device's own budget. A deadlock is a
+                    // state neither thread can end on its own, so each carries
+                    // its own way out.
+                    if start.elapsed() > BUDGET {
+                        break;
+                    }
+                    wait(&mut idle);
+                }
+            });
+
+            // The device: what the fs worker's drain does, one completion per
+            // iteration, with `len` carrying the generation.
+            s.spawn(move || {
+                let mut idle = 0u32;
+                for i in 0..ITERS {
+                    // Wall clock, not just an iteration count. These two
+                    // threads are tightly coupled, because the device may not
+                    // run more than a ring ahead. On a small virtualized runner
+                    // that costs a context switch per batch rather than a few
+                    // nanoseconds. Left unbounded it turned a 0.5-second test
+                    // into a CI job still going 47 minutes later. Whatever it
+                    // manages in the budget is enough: the assertion is that
+                    // the guarded arm never tears, and the control reports
+                    // whether it tore at all.
+                    if i % 4096 == 0 && start.elapsed() > BUDGET {
+                        break;
+                    }
+                    while i.wrapping_sub(consumed.load(AOrd::Acquire)) >= N - 1 {
+                        // The budget has to be inside this loop, not only at
+                        // the top of the iteration: this is where the device
+                        // blocks, so a check it never reaches is not a bound at
+                        // all.
+                        if start.elapsed() > BUDGET {
+                            done.store(true, AOrd::Release);
+                            return;
+                        }
+                        wait(&mut idle);
+                    }
+                    publish(q, mem, used, expected_head(i) as u16, i);
+                }
+                done.store(true, AOrd::Release);
+            });
+        });
+
+        (
+            stale.load(AOrd::Relaxed),
+            bad_head.load(AOrd::Relaxed),
+            consumed.load(AOrd::Relaxed),
+        )
+    }
+
+    /// Not part of the default suite. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release ordering_tests -- --ignored --nocapture
+    /// ```
+    ///
+    /// It is a stress test, and it is kept out of CI on purpose. Two reasons,
+    /// both learned the hard way:
+    ///
+    /// It is low-signal. On an M-series Mac the unfenced control is observed
+    /// torn 0 to 3 times in 4,000,000 completions, so a green run mostly means
+    /// the race did not happen to land, not that the ordering is right. An
+    /// earlier version of this test appeared to be far more sensitive, with
+    /// hundreds of tearings per run, but that was the harness miscounting: it
+    /// chased `used.idx` by equality, so one stale index sent it walking 65535
+    /// phantom slots and it flagged every one.
+    ///
+    /// And a stress test that spins two coupled threads is a bad CI citizen.
+    /// That same phantom walk deadlocked against the device's flow control and
+    /// left a hosted macOS job running for 47 minutes on a step that takes 36
+    /// seconds.
+    ///
+    /// What it is good for is what it was written for: showing the defect
+    /// exists, and showing a fix removes it. Remove the `fence(Release)` from
+    /// `Queue::push_used` and this fails.
+    #[ignore = "timing-dependent stress test; run explicitly with --ignored"]
+    #[test]
+    fn push_used_is_never_observed_torn() {
+        let (torn, bad, n) = run(publish_real);
+        eprintln!(
+            "push_used        : {torn} torn elements, {bad} bogus descriptor ids, in {n} completions"
         );
-        assert_eq!(
-            std::fs::metadata(&r.path).unwrap().len(),
-            512,
-            "the backing file was not extended"
+        let (ctl_torn, ctl_bad, ctl_n) = run(publish_unfenced);
+        eprintln!(
+            "unfenced control : {ctl_torn} torn elements, {ctl_bad} bogus descriptor ids, in {ctl_n} completions"
         );
-    }
 
-    #[test]
-    fn read_past_the_advertised_capacity_is_refused() {
-        let (_r, mut blk) = rig("in");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 9_999, 512);
-        assert_eq!(st, VIRTIO_BLK_S_IOERR);
-    }
+        // The guard. A bogus id is the fatal one: the guest takes a descriptor
+        // it has already freed, prints "id %u is not a head!", sets vq->broken,
+        // and every later enqueue returns -EIO for the life of the guest.
+        assert_eq!(
+            bad, 0,
+            "push_used handed the guest a descriptor id it had already freed"
+        );
+        assert_eq!(torn, 0, "push_used was observed torn");
 
-    /// A sector that would wrap the byte offset is refused rather than aliased
-    /// back into the file (release builds used to wrap silently).
-    #[test]
-    fn sector_offset_overflow_is_refused() {
-        let (r, mut blk) = rig("ovf");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, u64::MAX / 256, 16);
-        assert_eq!(st, VIRTIO_BLK_S_IOERR);
-        assert_eq!(std::fs::metadata(&r.path).unwrap().len(), 512);
-    }
-
-    /// The last sector inside the capacity still works, so the bound is not
-    /// off by one.
-    #[test]
-    fn a_request_inside_the_capacity_still_succeeds() {
-        let (_r, mut blk) = rig("ok");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512);
-        assert_eq!(st, VIRTIO_BLK_S_OK, "sector 0 of a 1-sector disk is valid");
-        let mut got = [0u8; 4];
-        mem.read(BASE + 0x5000, &mut got).unwrap();
-        assert_eq!(&got, &[0xab; 4], "the sector reached guest memory");
-    }
-
-    /// The bound is on the bytes actually transferred, so it is exact at the
-    /// end of the disk in both directions.
-    #[test]
-    fn byte_range_bounds_are_exact() {
-        let (_r, blk) = rig("rng");
-        // 1 sector = 512 bytes of capacity.
-        assert_eq!(blk.byte_range(0, 512).unwrap(), 0, "the whole disk is fine");
-        assert!(blk.byte_range(0, 513).is_err(), "one byte past is not");
-        assert!(blk.byte_range(1, 1).is_err(), "nor is one byte at sector 1");
-        // A zero-length request touches nothing, so the end offset is allowed;
-        // this matches Firecracker's `sector + num_sectors > capacity` check.
-        assert_eq!(blk.byte_range(1, 0).unwrap(), 512);
-        assert!(blk.byte_range(u64::MAX, 1).is_err(), "overflow is refused");
-        assert!(blk.byte_range(u64::MAX / 256, 16).is_err());
+        // The control says whether this host can detect the race at all. A
+        // strongly ordered one (x86) will not tear even unfenced, and then the
+        // assertions above have not been exercised -- say so rather than let a
+        // green result imply more than it does.
+        if ctl_torn == 0 {
+            eprintln!(
+                "note: the unfenced control did not tear on this host, so the check \
+                 above did not exercise the ordering it is guarding. Run it on arm64."
+            );
+        }
     }
 }

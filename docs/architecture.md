@@ -54,7 +54,7 @@ flowchart TB
         subgraph shared["Shared core"]
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
-            dev["devices/virtio: queue / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
+            dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugins · events ledger<br/>quiesce"]
             conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
             gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
@@ -305,7 +305,7 @@ Interrupt injection is the one device-facing thing that differs by backend:
 
 ### Devices
 
-- **virtio-blk** (`devices/virtio/queue.rs`, id 2) backs `--disk`. It advertises
+- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`. It advertises
   `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
@@ -338,10 +338,10 @@ carries a release fence per drain pass: free on x86, `dmb` on arm64. Without
 it an arm64 guest observed the bumped index before the element and broke its
 virtqueue with `id 65 is not a head!`.
 
-`devices/virtio/used_ring_litmus.rs` drives the real `push_used` against a
-consumer that behaves like the driver. It demonstrates the defect and the fix,
-and it does not reliably catch a regression, so it is `#[ignore]`d and run
-weekly.
+`ordering_tests` in `devices/virtio/queue.rs` drives the real `push_used`
+against a consumer that behaves like the driver. It demonstrates the defect and
+the fix, and it does not reliably catch a regression, so it is `#[ignore]`d and
+run weekly.
 
 Every descriptor-chain walker refuses an index outside the ring and caps the
 walk at the ring size, so a cycle runs out of budget. Re-programming any queue
@@ -405,10 +405,10 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
 | Guest memory | `guestmem.rs`, `sharedmem.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/used_ring_litmus.rs` |
+| Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

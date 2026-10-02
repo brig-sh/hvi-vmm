@@ -59,8 +59,8 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
+use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
-use crate::devices::virtio::queue::VirtioBlk;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;

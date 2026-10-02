@@ -31,7 +31,7 @@ use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
-use crate::devices::virtio::{reg, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::guestmem::GuestRam;
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
@@ -314,44 +314,44 @@ impl VirtioVsock {
         let v = value as u32;
         if is_write {
             match offset {
-                reg::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                reg::DRIVER_FEATURES_SEL | reg::DRIVER_FEATURES => {}
-                reg::QUEUE_SEL => self.queue_sel = v,
-                reg::QUEUE_NUM => self.queue().set_num(v),
-                reg::QUEUE_READY => self.queue().set_ready(v, mem),
-                reg::QUEUE_NOTIFY => match v as u16 {
+                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
+                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
+                mmio::QUEUE_SEL => self.queue_sel = v,
+                mmio::QUEUE_NUM => self.queue().set_num(v),
+                mmio::QUEUE_READY => self.queue().set_ready(v, mem),
+                mmio::QUEUE_NOTIFY => match v as u16 {
                     TX_QUEUE => self.process_tx(mem),
                     RX_QUEUE => self.fill_rx(mem),
                     _ => {}
                 },
-                reg::INTERRUPT_ACK => self.interrupt_status &= !v,
-                reg::STATUS if v == 0 => self.reset(),
-                reg::STATUS => self.status = v,
-                reg::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
-                reg::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
-                reg::QUEUE_DRIVER_LOW => self.queue().set_avail_lo(v),
-                reg::QUEUE_DRIVER_HIGH => self.queue().set_avail_hi(v),
-                reg::QUEUE_DEVICE_LOW => self.queue().set_used_lo(v),
-                reg::QUEUE_DEVICE_HIGH => self.queue().set_used_hi(v),
+                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
+                mmio::STATUS if v == 0 => self.reset(),
+                mmio::STATUS => self.status = v,
+                mmio::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
+                mmio::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
+                mmio::QUEUE_DRIVER_LOW => self.queue().set_avail_lo(v),
+                mmio::QUEUE_DRIVER_HIGH => self.queue().set_avail_hi(v),
+                mmio::QUEUE_DEVICE_LOW => self.queue().set_used_lo(v),
+                mmio::QUEUE_DEVICE_HIGH => self.queue().set_used_hi(v),
                 _ => {}
             }
             0
         } else {
             match offset {
-                reg::MAGIC => 0x7472_6976,
-                reg::VERSION => 2,
-                reg::DEVICE_ID => VIRTIO_VSOCK_ID,
-                reg::VENDOR_ID => 0x4649_4f4e,
-                reg::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                reg::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
-                reg::QUEUE_READY => {
+                mmio::MAGIC => 0x7472_6976,
+                mmio::VERSION => 2,
+                mmio::DEVICE_ID => VIRTIO_VSOCK_ID,
+                mmio::VENDOR_ID => 0x4649_4f4e,
+                mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
+                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
+                mmio::QUEUE_READY => {
                     u64::from(self.queues[(self.queue_sel % 3) as usize].is_ready())
                 }
-                reg::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                reg::STATUS => u64::from(self.status),
+                mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
+                mmio::STATUS => u64::from(self.status),
                 // Config space: guest CID (u64) at offset 0.
-                _ if offset >= reg::CONFIG => {
-                    let f = (offset - reg::CONFIG) as usize;
+                _ if offset >= mmio::CONFIG => {
+                    let f = (offset - mmio::CONFIG) as usize;
                     let cid = GUEST_CID.to_le_bytes();
                     cid.get(f).map_or(0, |&b| u64::from(b))
                 }
@@ -747,15 +747,15 @@ mod session_tests {
         avail: u64,
         used: u64,
     ) {
-        dev.mmio(mem, reg::QUEUE_SEL, true, u64::from(queue));
-        dev.mmio(mem, reg::QUEUE_NUM, true, 8);
-        dev.mmio(mem, reg::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        dev.mmio(mem, reg::QUEUE_DESC_HIGH, true, desc >> 32);
-        dev.mmio(mem, reg::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        dev.mmio(mem, reg::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        dev.mmio(mem, reg::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        dev.mmio(mem, reg::QUEUE_DEVICE_HIGH, true, used >> 32);
-        dev.mmio(mem, reg::QUEUE_READY, true, 1);
+        dev.mmio(mem, mmio::QUEUE_SEL, true, u64::from(queue));
+        dev.mmio(mem, mmio::QUEUE_NUM, true, 8);
+        dev.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        dev.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
+        dev.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        dev.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        dev.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        dev.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
+        dev.mmio(mem, mmio::QUEUE_READY, true, 1);
     }
 
     /// Posts descriptor `idx`, a 64-byte writable buffer at `buffer`, as the
@@ -805,7 +805,7 @@ mod session_tests {
         let second_port = dev.add_conn(second);
         dev.connect(&mem, second_port);
 
-        dev.mmio(&mem, reg::STATUS, true, 0);
+        dev.mmio(&mem, mmio::STATUS, true, 0);
         for socket in [
             &mut first_reader,
             &mut second_reader,
@@ -825,7 +825,7 @@ mod session_tests {
         );
         post_rx_buffer(&mem, BASE + 0x4000, BASE + 0x5000, 0, BASE + 0x7000);
         post_rx_buffer(&mem, BASE + 0x4000, BASE + 0x5000, 1, BASE + 0x7100);
-        dev.mmio(&mem, reg::QUEUE_NOTIFY, true, u64::from(RX_QUEUE));
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(RX_QUEUE));
         dev.host_data(&mem, first_port, b"late");
         assert_eq!(
             mem.read_u16(BASE + 0x6000 + 2).unwrap(),
