@@ -488,13 +488,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // above acquires host authority (the VM, the guest-RAM mapping, the block
     // file, the ledger, the gateway connection, the listeners, the terminal),
     // and everything below only services guest I/O with what is already open.
-    // An error here returns before there is a thread to stop. See `sandbox`.
+    // An error here returns before there is a thread to stop. See
+    // `sandbox::seatbelt`.
     //
     // Failing closed: a profile that will not install is a profile nobody has
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
     if cfg.sandbox {
-        crate::sandbox::enter_with_shares(&fs_access)
+        crate::sandbox::seatbelt::enter_with_shares(&fs_access)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         eprintln!("[hvi] seatbelt sandbox: on (deny default)");
     } else {

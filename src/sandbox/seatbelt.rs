@@ -39,24 +39,23 @@
 //!
 //! Seatbelt polices the acts of *acquiring* those resources, not I/O on
 //! descriptors already held, so the profile does not need to name any of them.
-//! That is the whole reason [`enter`](crate::sandbox::enter) is called where it
-//! is: one line later and the profile would have to grant filesystem and socket
-//! rights it can now refuse outright. The one exception is virtio-fs: directory
-//! entries and files are opened lazily as the guest requests them. When
-//! shares are configured,
-//! [`enter_with_shares`](crate::sandbox::enter_with_shares) appends one narrow
-//! subpath rule for every already-canonical export root. Read-only exports
-//! receive `file-read*`; writable exports also receive `file-write*`. The path
-//! is required to be UTF-8/control-free and SBPL-escaped before interpolation;
-//! every path outside those subtrees remains denied. When any export is
-//! writable it also appends one `system-fsctl` rule for `FSIOC_SYNC_VOLUME`
-//! alone, which SYNCFS uses to write out the export's volume. That filter is
-//! by command, not path, and no other fsctl is allowed.
+//! That is the whole reason [`enter`] is called where it is: one line later and
+//! the profile would have to grant filesystem and socket rights it can now
+//! refuse outright. The one exception is virtio-fs: directory entries and files
+//! are opened lazily as the guest requests them. When shares are configured,
+//! [`enter_with_shares`] appends one narrow subpath rule for every
+//! already-canonical export root. Read-only exports receive `file-read*`;
+//! writable exports also receive `file-write*`. The path is required to be
+//! UTF-8/control-free and SBPL-escaped before interpolation; every path outside
+//! those subtrees remains denied. When any export is writable it also appends
+//! one `system-fsctl` rule for `FSIOC_SYNC_VOLUME` alone, which SYNCFS uses to
+//! write out the export's volume. That filter is by command, not path, and no
+//! other fsctl is allowed.
 //!
 //! The vCPU threads are created *after* this point and that is fine:
 //! `hv_vcpu_create` and `hv_vcpu_run` on a fresh thread work under a bare
 //! `(deny default)` profile. That was measured, not assumed; it is also what
-//! [`selftest`](crate::sandbox::selftest) re-proves on every CI run.
+//! [`selftest`] re-proves on every CI run.
 //!
 //! # The deprecation caveat
 //!
@@ -113,7 +112,7 @@ use std::path::{Path, PathBuf};
 /// terminal the process is already sharing -- which it could disturb with
 /// escape sequences on stdout regardless.
 pub const PROFILE: &str = r#"(version 1)
-;; hvi VMM confinement -- see src/sandbox.rs for the reasoning behind each line.
+;; hvi VMM confinement -- see src/sandbox/seatbelt.rs for the reasoning behind each line.
 ;;
 ;; Installed after the VM is built and every host resource is already open, and
 ;; before any guest I/O is serviced. Seatbelt polices acquiring resources rather
@@ -820,7 +819,7 @@ mod tests {
         assert_eq!(
             allows,
             vec![r##"(allow file-ioctl (regex #"^/dev/tty"))"##],
-            "the profile's allow set changed; see the tty exception in src/sandbox.rs"
+            "the profile's allow set changed; see the tty exception in src/sandbox/seatbelt.rs"
         );
     }
 
@@ -870,7 +869,7 @@ mod tests {
                 r#"(allow file-read* (subpath "/tmp/ro"))"#,
                 fsctl.as_str(),
             ],
-            "the composed policy's allow set changed; see policy_for in src/sandbox.rs"
+            "the composed policy's allow set changed; see policy_for in src/sandbox/seatbelt.rs"
         );
     }
 

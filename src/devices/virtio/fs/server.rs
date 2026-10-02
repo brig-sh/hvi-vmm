@@ -1110,7 +1110,7 @@ struct Node {
 
 /// `fsctl` command behind `sync_volume_np(3)`: `_IOW('A', 1, uint32_t)` in
 /// XNU's `sys/fsctl.h`, which the SDK does not ship. The sandbox grants this
-/// one command and no other; see `crate::sandbox`.
+/// one command and no other; see `crate::sandbox::seatbelt`.
 pub(crate) const FSIOC_SYNC_VOLUME: u32 = 0x8004_4101;
 
 const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;

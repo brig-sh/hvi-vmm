@@ -186,13 +186,13 @@ pub struct BootConfig {
     /// this crate as a library.
     pub plugin: Option<std::sync::Arc<dyn crate::plugin::Plugin>>,
     /// Confine the VMM process before it services any guest I/O: a Seatbelt
-    /// profile on macOS (the `sandbox` module), seccomp-bpf allowlists on
-    /// Linux (the `seccomp` module). Neither is an intra-doc link, because
-    /// each module is compiled only on its own OS and the link would dangle
-    /// on every other target. On by default; `--no-sandbox` clears it, for
-    /// debugging a run the confinement breaks. Both are per-process and
-    /// irreversible, and the backend logs which one it installed, so this is
-    /// never a silent "sandboxed" claim on a host that is not.
+    /// profile on macOS (`sandbox::seatbelt`), seccomp-bpf allowlists on Linux
+    /// (`sandbox::seccomp`). Neither is an intra-doc link, because each module
+    /// is compiled only on its own OS and the link would dangle on every other
+    /// target. On by default; `--no-sandbox` clears it, for debugging a run the
+    /// confinement breaks. Both are per-process and irreversible, and the
+    /// backend logs which one it installed, so this is never a silent
+    /// "sandboxed" claim on a host that is not.
     pub sandbox: bool,
 }
 

@@ -14,7 +14,7 @@
 
 //! seccomp-bpf confinement for the Linux backends.
 //!
-//! Same argument as the macOS half (the `sandbox` module): the virtio backends
+//! Same argument as the macOS half (`sandbox::seatbelt`): the virtio backends
 //! parse guest-controlled data and they run in the same process as the vCPU
 //! threads, so a bug in one of them is a bug in something holding the host's
 //! full syscall surface. Whatever container boundary a caller wraps hvi in is
@@ -122,10 +122,16 @@ impl Thread {
 /// the filters it was reviewed with rather than reading them from a path an
 /// attacker might control.
 #[cfg(target_arch = "x86_64")]
-pub const FILTERS: &str = include_str!("../resources/seccomp/x86_64.json");
+pub const FILTERS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/seccomp/x86_64.json"
+));
 /// The allowlists, per architecture.
 #[cfg(target_arch = "aarch64")]
-pub const FILTERS: &str = include_str!("../resources/seccomp/aarch64.json");
+pub const FILTERS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/seccomp/aarch64.json"
+));
 
 /// The architecture seccompiler compiles syscall names for. Getting this wrong
 /// would compile a filter against the wrong syscall numbers, which is why it
