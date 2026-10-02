@@ -90,6 +90,8 @@ pub mod plugin;
     all(target_arch = "x86_64", target_os = "linux")
 ))]
 pub mod plugins;
+/// The files hvi writes for the operator, opened private to its user.
+pub mod private_file;
 /// Parks every vCPU at a safe point so an observation sees a still guest.
 pub mod quiesce;
 /// MC146818 RTC / CMOS, which an x86 guest reads before it has a timer.
