@@ -12,28 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The extension seam: how a tool outside the exit loop reaches a running
-//! guest.
-//!
-//! A VMM is a useful place to stand. It holds the guest's memory, it can park
-//! the vCPUs between guest entries, and it is the other end of every virtio
-//! request the guest makes. Debuggers, tracers, profilers and crash-dumpers all
-//! want one or more of those, and none of them belongs in the exit loop.
-//!
-//! So the exit loop offers them instead. An
-//! [`Plugin`](crate::plugin::Plugin) is called at two points — once at
-//! boot, and on the boot vCPU between guest entries — and from there it can
-//! read guest RAM, read that vCPU's registers, park the rest of the VM, and
-//! subscribe to the device feed. [`crate::plugins`] ships two that use this:
-//! a guest-memory dumper and an I/O tracer.
-//!
-//! These traits describe *access*, and deliberately no more than that. They
-//! hand over bytes and register values; what any of it means is the caller's
-//! problem, which is what keeps a tool's idea of the guest out of the VMM.
-//!
-//! The whole seam is optional. With no plugin the hooks are one null check
-//! on a cold path, the devices hold no sink, and no guest memory is read for
-//! any purpose but running the guest.
+//! The traits and types a plugin is written against, re-exported from
+//! [`crate::plugin`].
 
 use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Mutex};
@@ -218,11 +198,11 @@ pub trait Plugin: Send + Sync {
 /// A per-request feed of a virtio device's I/O.
 ///
 /// The VMM already records these in its ledger; a sink is for a tool that wants
-/// them live and unaggregated, as [`crate::plugins::IoTrace`] does. Every
-/// method is called with the device lock held, so an implementation must not
-/// block. [`IoSink::block`] and the egress side of [`IoSink::net`] always run
-/// on a vCPU thread. An ingress frame reaches [`IoSink::net`] from the tap or
-/// gateway reader thread under those two backends, and from a vCPU thread
+/// them live and unaggregated, as [`crate::plugin::builtin::IoTrace`] does.
+/// Every method is called with the device lock held, so an implementation must
+/// not block. [`IoSink::block`] and the egress side of [`IoSink::net`] always
+/// run on a vCPU thread. An ingress frame reaches [`IoSink::net`] from the tap
+/// or gateway reader thread under those two backends, and from a vCPU thread
 /// under the built-in stack, which generates its replies inside the transmit
 /// path.
 pub trait IoSink: Send + Sync {

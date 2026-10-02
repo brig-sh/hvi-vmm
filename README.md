@@ -11,7 +11,7 @@ guest gets the same device model on macOS and on Linux.
 
 It is a command and a Rust library. Use the command to boot a guest. Link the
 library to embed the VMM, or to attach a tool to a running guest through
-[`src/plugin.rs`](src/plugin.rs).
+[`src/plugin/`](src/plugin/).
 
 ## Platforms
 
