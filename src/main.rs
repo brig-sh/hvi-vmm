@@ -69,7 +69,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("sandbox-selftest") => {
             #[cfg(target_os = "macos")]
             {
-                let bad = hvi::sandbox::selftest()?;
+                let bad = hvi::sandbox::seatbelt::selftest()?;
                 if bad > 0 {
                     return Err(format!(
                         "{bad} sandbox probe(s) did not behave as the profile says they should"
@@ -96,7 +96,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             {
-                let bad = hvi::seccomp::selftest()?;
+                let bad = hvi::sandbox::seccomp::selftest()?;
                 if bad > 0 {
                     return Err(format!(
                         "{bad} seccomp probe(s) did not behave as the filters say they should"

@@ -16,7 +16,7 @@ files that do so say where, in their module documentation:
   src/arch/x86_64/kvm.rs      the same vCPU and VM bring-up shape
   src/arch/x86_64/mptable.rs  an MP table of the same small shape (MP spec 1.4)
   src/devices/virtio/queue.rs the virtio queue and descriptor conventions
-  src/sandbox.rs              the confinement goal, by a different mechanism
+  src/sandbox/seatbelt.rs     the confinement goal, by a different mechanism
 
 Confinement on Linux uses seccompiler, the rust-vmm crate extracted from
 Firecracker, under the Apache License, Version 2.0. The filter files in

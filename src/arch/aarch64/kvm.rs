@@ -372,12 +372,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // Arm the seccomp filters before the first thread is spawned. This compiles
     // both allowlists and fails the boot if either will not, so a bad list is
-    // an error here rather than a SIGSYS inside a device thread later.
-    // Nothing is filtered yet: each thread installs its own as it starts
-    // (see `seccomp`).
+    // an error here rather than a SIGSYS inside a device thread later. Nothing
+    // is filtered yet: each thread installs its own as it starts (see
+    // `sandbox::seccomp`).
     let allowed_counts = if cfg.sandbox {
-        crate::seccomp::arm()?;
-        Some(crate::seccomp::allowed_counts()?)
+        crate::sandbox::seccomp::arm()?;
+        Some(crate::sandbox::seccomp::allowed_counts()?)
     } else {
         None
     };
@@ -463,7 +463,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // The guest is already running by now, so a failure here stops it and is
     // reported once every thread has been joined or left running.
     let confined = if cfg.sandbox {
-        crate::seccomp::install(crate::seccomp::Thread::Vmm)
+        crate::sandbox::seccomp::install(crate::sandbox::seccomp::Thread::Vmm)
     } else {
         Ok(())
     };
@@ -476,10 +476,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             stop_all(&shared);
         }
         (Ok(()), Some((vmm, vcpu))) => {
-            if crate::seccomp::log_mode() {
+            if crate::sandbox::seccomp::log_mode() {
                 eprintln!(
                     "[hvi] seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
-                    crate::seccomp::LOG_ENV
+                    crate::sandbox::seccomp::LOG_ENV
                 );
             } else {
                 eprintln!("[hvi] seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)");
@@ -628,7 +628,7 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
     // controls: MMIO exits are serviced inline here, so the virtio device
     // models -- the code that parses guest descriptors -- run on this
     // thread.
-    crate::seccomp::install_thread(crate::seccomp::Thread::Vcpu);
+    crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vcpu);
     // Held for the whole run, so every way out ends the VM. A secondary that
     // ended alone would otherwise leave the VM running with one vCPU fewer and
     // the join in `boot` blocked. Declared before the registration so the
@@ -1073,7 +1073,7 @@ fn set_gic_attr_u32(
 /// ordinary byte, so a run with no plugin passes stdin through untouched.
 fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
+        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
         let stdin = std::io::stdin();
         let mut byte = [0u8; 1];
         loop {
@@ -1124,7 +1124,7 @@ fn spawn_vsock_bridge(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
+        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
         let mut readers: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
@@ -1213,7 +1213,7 @@ fn spawn_net_tap_reader(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
+        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
         let relayed = crate::devices::virtio::net::TapRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
@@ -1242,7 +1242,7 @@ fn spawn_net_gateway_reader(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
+        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
         let relayed = crate::devices::virtio::net::GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);

@@ -56,7 +56,7 @@ flowchart TB
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugins · events ledger<br/>hypervisor::quiesce"]
-            conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
+            conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
             gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
         end
         cli --> backend
@@ -406,7 +406,7 @@ how it works.
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
 | Guest memory | `guestmem.rs`, `sharedmem.rs` |
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
-| Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
+| Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
