@@ -98,8 +98,10 @@ reads builds a `GuestRamView` of its own over the RAM descriptor, with
 Every accessor that takes a guest address resolves it through the view's table
 of the collection's regions and fails with an `io::Error` on a range the guest
 does not own. A range that would cross from one region into the next is refused.
-`scan()` takes no guest address: it walks each region's host mapping and maps
-its hits back to guest addresses.
+`scan()` takes no guest address: it copies each region out of its host mapping
+a window at a time, matches in the copy, and maps its hits back to guest
+addresses. It never borrows the mapping as a byte slice, since the guest can
+write it during the scan.
 
 `host_ptr` is a bounds-checked raw pointer into one region for the iovec
 paths. It is a raw pointer rather than a `&mut [u8]` because a guest can point
