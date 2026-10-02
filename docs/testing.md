@@ -175,9 +175,18 @@ next green run closes it.
 
 ## Distribution
 
-There is none. No git tag exists, no workflow publishes a crate, and no
-workflow produces a release artifact. The only uploads anywhere are failure
-logs. Anything that tells a reader to install hvi is wrong.
+No crate is published. Binaries come from two lanes that call the same
+`build-binaries.yml` and `publish-binaries.yml`:
+
+- [`main-build-and-publish.yml`](../.github/workflows/main-build-and-publish.yml):
+  every push to `main`, once the suites pass, as development builds in
+  `ghcr.io/brig-sh/hvi-binaries:<target>-<sha>`.
+- [`tag-release.yml`](../.github/workflows/tag-release.yml): a `vX.Y.Z` tag, as
+  `<target>-vX.Y.Z` and a GitHub release, with the macOS binary signed with the
+  Developer ID and notarized.
+
+[CONTRIBUTING.md](../CONTRIBUTING.md#releasing) covers cutting a release, and
+the README covers verifying one.
 
 ## See also
 

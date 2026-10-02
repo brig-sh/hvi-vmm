@@ -131,8 +131,9 @@ which runners, what each boot job asserts, the toolchain versions, and the
 performance gate. What matters when you open a pull request:
 
 A pull request runs `.github/workflows/pr-build-and-verify.yml` and a push to
-`main` runs `main-build-and-verify.yml`. Both are thin entry workflows calling
-the same reusable ones.
+`main` runs `main-build-and-publish.yml`; both call the same reusable
+workflows. The main lane also publishes the push's binaries to GHCR once the
+suites pass (see Releasing below).
 
 - **validate-commits** (pull requests only, since a rebase-and-merge lands the
   commits on `main` verbatim): the commit conventions above, per commit and
@@ -177,6 +178,58 @@ External actions are pinned to commit SHAs, with the version in a comment.
 Renovate keeps those pins, the Cargo dependencies, the Rust toolchain with
 `rust-version`, the cargo-deny pin and the commitlint tooling updated
 (`.github/renovate.json`).
+
+## Releasing
+
+A release is an annotated tag on `main`. No file names a version, so there is
+no pull request to open first:
+
+```sh
+tools/changelog.sh                        # what the release would say
+git tag -a v0.2.0 -m "hvi 0.2.0"
+git push origin v0.2.0
+```
+
+`.github/workflows/tag-release.yml` takes it from there; its header lists the
+jobs.
+
+- **Shape.** `vX.Y.Z` or `vX.Y.Z-(alpha|beta|rc).N`, with no `+` metadata,
+  since the version becomes a GHCR tag. The number stands on its own so that
+  `rc.10` sorts after `rc.9`. A prerelease is marked as one on the releases
+  page.
+- **Commit.** Tag the head of a push to `main`. The main lane runs once per
+  push and the release waits for that run to pass, so a commit inside a
+  rebase-merged pull request has no run and is refused.
+- **Notes.** The commit subjects since the previous tag. Read the preview
+  before tagging: a subject is published.
+- **Re-runs.** A failed tag is re-run from the tag, by re-running its jobs or
+  by dispatching the Release workflow from it. The rebuild replaces the draft's
+  assets and the GHCR version tag.
+- **Final.** A published release is refused on a re-run. A fix ships as the
+  next version.
+
+The first release is an rc (`v0.1.0-rc.1`), since signing and notarization run
+for real only on a tag.
+
+### The changelog
+
+There is no `CHANGELOG.md`. A release's notes are generated from the
+Conventional-Commits history since the tag before it, so the releases page is
+the changelog and no copy of it can go stale. git-cliff does the generating,
+configured in [`cliff.toml`](cliff.toml) and driven by `tools/changelog.sh`.
+
+An rc's notes run from the tag before it, rc or not. A final release's notes
+run from the final before it, across its rcs, so promoting `v0.2.0-rc.2` by
+tagging `v0.2.0` on the same commit gives `v0.2.0` the whole cycle.
+
+Entries are grouped by commit type, and `ci` and `style` commits are left out
+as things a reader of a changelog does not need. Since a pull request lands
+here with a rebase-and-merge, each commit reaches `main` verbatim and becomes
+one entry, linked to its commit. That is the other reason the commit
+conventions above matter: a commit subject is published.
+
+git-cliff is pinned in [`pins.env`](pins.env); an installed binary is used
+when there is one and the pinned version runs in a container otherwise.
 
 ## AI policy
 

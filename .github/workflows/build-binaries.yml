@@ -1,0 +1,250 @@
+name: Build binaries
+
+# Build the binaries a revision ships, one artifact per target, and leave them
+# on the run for a publisher. Nothing here pushes anywhere. Static musl on
+# Linux; on macOS a hosted build, ad-hoc signed, which a release then signs with
+# the Developer ID in `sign-macos`. The suites live in build-and-test.yml.
+
+on:
+  workflow_call:
+    # No version input: each build derives its version from the history it is
+    # built in.
+    inputs:
+      developer-id:
+        description: >-
+          Whether to sign the macOS binary with the organization's Developer ID
+          and notarize it. A release passes true; other callers keep the
+          ad-hoc signature, which Gatekeeper refuses on a downloaded binary.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      MACOS_CERT_P12:
+        required: false
+      MACOS_CERT_PASSWORD:
+        required: false
+      NOTARY_KEY_P8:
+        required: false
+      NOTARY_KEY_ID:
+        required: false
+      NOTARY_ISSUER_ID:
+        required: false
+
+permissions:
+  contents: read
+
+# The default shell runs `bash -e` without pipefail.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Static musl, so a host whose glibc is older than the runner's can still
+  # start the binary. The KVM backends are compiled in by target, so each
+  # architecture is built on a runner of that architecture.
+  linux:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history, since a build derives its version from the last
+          # release tag and how far past it the build is. A shallow checkout
+          # carries no tags, so every build would report the commit alone.
+          fetch-depth: 0
+
+      # No cache for a release build. The cache is written by the main lane,
+      # and what a release ships is built from the tag alone.
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+          cache: ${{ !inputs.developer-id }}
+
+      # --locked, so a stale Cargo.lock fails here by name rather than being
+      # rewritten, reported as `dirty`, and refused later as a version that
+      # does not match the release.
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Assemble the artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          dist=$RUNNER_TEMP/binaries
+          mkdir -p "$dist"
+          cp "target/$TARGET/release/hvi" "$dist/hvi"
+
+          # A dynamically linked binary would have come from a musl target that
+          # silently fell back, and it would fail on the hosts this build is
+          # for rather than on this runner. Rust links the musl targets as a
+          # static PIE, which `file` names differently from a plain static
+          # link.
+          file "$dist/hvi"
+          file "$dist/hvi" | grep -qE "statically linked|static-pie linked" || {
+            echo "::error::$TARGET did not produce a static binary"; exit 1; }
+
+          "$dist/hvi" --version
+          .github/scripts/write-manifest.sh "$dist" \
+            component=binaries "target=$TARGET" \
+            "version=$("$dist/hvi" --version | awk '{print $2}')" \
+            signed:=false
+
+      # Tarred rather than uploaded as a file: an artifact upload resets every
+      # mode, and the binary has to come back out of it executable. Left
+      # uncompressed, since the upload compresses what it is handed.
+      - name: Pack the artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/$TARGET.tar" binaries
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hvi-${{ matrix.target }}
+          path: ${{ runner.temp }}/${{ matrix.target }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # The macOS backend is Apple silicon only, so there is one target here.
+  # Compiled on the hosted image in both lanes, so the signing Mac below never
+  # compiles anything.
+  macos:
+    name: Build aarch64-apple-darwin
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # No cache for a release build, as on Linux.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: aarch64-apple-darwin
+          cache: ${{ !inputs.developer-id }}
+
+      - name: Build
+        run: cargo build --locked --release
+
+      # Carries the Hypervisor.framework entitlement, which is all a
+      # development build needs.
+      - name: Sign ad-hoc
+        run: |
+          codesign --sign - --entitlements hvi.entitlements --force \
+            --options runtime target/release/hvi
+          codesign -dv --entitlements - target/release/hvi 2>&1 |
+            grep -qi hypervisor
+
+      - name: Assemble the artifact
+        run: |
+          dist=$RUNNER_TEMP/binaries
+          mkdir -p "$dist"
+          cp target/release/hvi "$dist/hvi"
+
+          # Copied after signing, and `cp` does not carry a signature across on
+          # every filesystem, so the copy is verified rather than the original.
+          codesign --verify --strict "$dist/hvi"
+
+          "$dist/hvi" --version
+          .github/scripts/write-manifest.sh "$dist" \
+            component=binaries target=aarch64-apple-darwin \
+            "version=$("$dist/hvi" --version | awk '{print $2}')" \
+            signed:=false
+
+      - name: Pack the artifact
+        run: tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/aarch64-apple-darwin.tar" binaries
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hvi-aarch64-apple-darwin
+          path: ${{ runner.temp }}/aarch64-apple-darwin.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # A release signs the hosted build with the Developer ID and notarizes it on
+  # a `notary` runner, which holds the certificate's route to Apple, and puts it
+  # back under the same artifact name. The `release` environment admits a `v*`
+  # tag only, so the signing secrets never reach a job running from a branch.
+  # Only the signing step sees them, and nothing built from the tree runs in it.
+  sign-macos:
+    name: Sign aarch64-apple-darwin
+    if: inputs.developer-id
+    needs: macos
+    runs-on: [self-hosted, macOS, ARM64, notary]
+    environment: release
+    # Below the keychain lock's stale age (keychain-lock.sh), which a job that
+    # takes the lock must stay under.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            hvi.entitlements
+          sparse-checkout-cone-mode: false
+
+      # The hosted image ships jq and a self-hosted Mac does not have to.
+      - name: Install jq
+        run: command -v jq >/dev/null || brew install jq
+
+      - name: Download the hosted build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: hvi-aarch64-apple-darwin
+          path: ${{ runner.temp }}/artifact
+
+      - name: Unpack the hosted build
+        run: tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/artifact/aarch64-apple-darwin.tar"
+
+      - name: Sign with the organization's Developer ID
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: .github/scripts/sign-macos.sh "$RUNNER_TEMP/binaries/hvi" hvi.entitlements
+
+      # The version comes from the hosted build's manifest rather than from
+      # running the binary here. The signature is read from the binary itself,
+      # captured before the match: under pipefail, `grep -q` would kill
+      # codesign with SIGPIPE and read as false.
+      - name: Rewrite the manifest
+        run: |
+          dist=$RUNNER_TEMP/binaries
+          version=$(jq -r .version "$dist/manifest.json")
+          signature=$(codesign -dvv "$dist/hvi" 2>&1)
+          grep -q '^Authority=Developer ID Application:' <<<"$signature" || {
+            echo "::error::the binary carries no Developer ID signature"; exit 1; }
+          .github/scripts/write-manifest.sh "$dist" \
+            component=binaries target=aarch64-apple-darwin \
+            "version=$version" signed:=true
+          rm -f "$RUNNER_TEMP/aarch64-apple-darwin.tar"
+          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/aarch64-apple-darwin.tar" binaries
+
+      # Replaces the hosted build's artifact, so the rest of the run sees the
+      # signed one only.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hvi-aarch64-apple-darwin
+          path: ${{ runner.temp }}/aarch64-apple-darwin.tar
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7

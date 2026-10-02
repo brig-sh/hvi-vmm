@@ -1,6 +1,6 @@
 # hvi
 
-[![CI](https://github.com/brig-sh/hvi-vmm/actions/workflows/main-build-and-verify.yml/badge.svg)](https://github.com/brig-sh/hvi-vmm/actions/workflows/main-build-and-verify.yml)
+[![CI](https://github.com/brig-sh/hvi-vmm/actions/workflows/main-build-and-publish.yml/badge.svg)](https://github.com/brig-sh/hvi-vmm/actions/workflows/main-build-and-publish.yml)
 [![Coverage](https://codecov.io/gh/brig-sh/hvi-vmm/graph/badge.svg)](https://codecov.io/gh/brig-sh/hvi-vmm)
 [![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbrig-sh%2Fhvi-vmm%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)](rust-toolchain.toml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -31,10 +31,59 @@ No boot job attaches a disk or a vsock agent, so those devices are covered by
 unit tests rather than by a live boot. On any other target the build stops with
 a compile error.
 
+## Releases
+
+A `vX.Y.Z` tag publishes one archive per target on the
+[releases page](https://github.com/brig-sh/hvi-vmm/releases), and the same
+binaries in GHCR as `ghcr.io/brig-sh/hvi-binaries:<target>-vX.Y.Z`. The Linux
+archives hold a static musl build. The macOS one is signed with NOFire AI's
+Developer ID and notarized, so it runs straight from a download.
+
+```sh
+tag=v0.1.0
+target=aarch64-apple-darwin   # or {x86_64,aarch64}-unknown-linux-musl
+gh release download "$tag" --repo brig-sh/hvi-vmm \
+  --pattern "hvi-${tag#v}-$target.tar.gz"
+tar xzf "hvi-${tag#v}-$target.tar.gz"
+./hvi --version
+```
+
+A download is verified through the signature on its checksum file, and a GHCR
+pull through the signature on the artifact:
+
+```sh
+gh release download "$tag" --repo brig-sh/hvi-vmm --pattern 'SHA256SUMS*'
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.cosign.bundle \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp \
+    '^https://github\.com/brig-sh/hvi-vmm/\.github/workflows/tag-release\.yml@refs/tags/v'
+sha256sum --check --ignore-missing SHA256SUMS
+
+cosign verify "ghcr.io/brig-sh/hvi-binaries:$target-$tag" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp \
+    '^https://github\.com/brig-sh/hvi-vmm/\.github/workflows/publish-binaries\.yml@refs/tags/v'
+```
+
+Every push to `main` also publishes development builds as `<target>-<sha>`,
+signed from `@refs/heads/main`, with the macOS one signed ad-hoc (Gatekeeper
+refuses it once downloaded). They are separate builds from the release of the
+same commit; each manifest's `revision` names the commit.
+
+`hvi --version` reports where a build sits: a release names the release
+(`0.1.0`), a build past one adds the distance and the commit
+(`0.1.0+15.gabc1234`), one with no release before it reports the commit alone
+(`0.0.0+gabc1234`), and edited sources add `dirty`.
+
+The release notes are generated from the commits since the previous release;
+there is no changelog file.
+
 ## Build
 
-There is no published crate and no downloadable release. Build from source.
-The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+There is no published crate. Build from source, or take a binary from a
+release. The toolchain is pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```sh
 cargo build --release
