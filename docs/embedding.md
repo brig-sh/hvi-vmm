@@ -147,6 +147,11 @@ ways. When either side closes, the other reads EOF: a host client that closes
 ends the guest stream, and a guest that closes, or a guest driver that resets
 the device, ends the host connection.
 
+A host client that stops reading holds up its own session only. hvi queues
+up to 256 KiB of the guest's bytes for it, and the guest then waits for
+credit until the client reads again. A guest that sends past that credit has
+the session reset, and the client reads EOF.
+
 The contract the guest side must satisfy:
 
 - Listen on **port 1024**, with the guest at **CID 3** and the host at

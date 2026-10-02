@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! virtio-vsock over virtio-mmio, bridged to a host Unix socket — the
+//! virtio-vsock over virtio-mmio, bridged to a host Unix socket -- the
 //! transport an `exec`-style command needs.
 //!
 //! The convention this implements: an in-guest agent serves sessions on guest
@@ -22,16 +22,25 @@
 //! stream the device opens to the guest (host CID 2 -> guest CID 3, port 1024),
 //! and bytes relay both ways.
 //!
-//! Simplifications (interactive exec, low volume): credit is advertised
-//! generously and tracked loosely; out-of-order host data is buffered until the
-//! guest accepts the connection.
+//! The device never waits on a host socket, since it runs under the device
+//! lock on a vCPU thread. Each session's socket is non-blocking. What the
+//! socket does not take waits in the session's backlog for the session's
+//! [`HostWriter`](crate::virtio_vsock::HostWriter). The `fwd_cnt` the device
+//! advertises counts only the bytes a socket took, so a backlog never holds
+//! more than `OUR_BUF_ALLOC`. A guest that sends past that credit has its
+//! session reset.
+//!
+//! The device does not track the guest's own credit (#112). Host data is
+//! buffered until the guest accepts the connection.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::guestmem::GuestRam;
+use crate::sync::lock_or_recover;
 use crate::virtio::{reg, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
@@ -59,9 +68,21 @@ const OP_RW: u16 = 5;
 const OP_CREDIT_UPDATE: u16 = 6;
 const OP_CREDIT_REQUEST: u16 = 7;
 
-/// Device to guest: the credit we advertise, so how much unread data the guest
-/// may leave outstanding with us.
+/// Device to guest: the credit we advertise, so the most guest data one session
+/// may hold before its host socket takes it.
+///
+/// It bounds each session's backlog. A guest that sends past it has the
+/// session reset.
 const OUR_BUF_ALLOC: u32 = 256 * 1024;
+/// Device to guest: how many forwarded bytes the device lets build up before it
+/// sends a credit update, unless the backlog empties first.
+///
+/// This is `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`, the most a Linux guest sends in one
+/// packet. A guest that ran out of credit hears back once a whole packet fits
+/// again.
+const CREDIT_UPDATE_STEP: u32 = 64 * 1024;
+/// Host side: the most one [`HostWriter`] write takes from the backlog.
+const WRITE_CHUNK: usize = 64 * 1024;
 /// Device to guest: the most payload we frame into one RW packet before
 /// handing it to `fill_rx`.
 ///
@@ -154,13 +175,176 @@ enum ConnState {
 
 /// One exec session: a host Unix stream mapped to a guest vsock stream.
 struct Conn {
-    // Write half (guest -> host). A clone of it is read elsewhere, so ending a
-    // session takes `shutdown`; a drop alone leaves the clone and the peer
-    // open.
-    stream: UnixStream,
+    /// The host socket and the guest bytes it has not taken yet.
+    host: Arc<HostSide>,
     state: ConnState,
-    rx_cnt: u32,          // bytes we've received from the guest (our fwd_cnt)
+    /// Bytes received from the guest.
+    rx_cnt: u32,
+    /// Bytes the host socket took, which is the `fwd_cnt` the device
+    /// advertises.
+    fwd_cnt: u32,
+    /// The `fwd_cnt` in the last header queued for the guest.
+    fwd_told: u32,
     pending_out: Vec<u8>, // host bytes buffered until the guest accepts
+}
+
+/// The host end of one session, shared by the device and the session's
+/// [`HostWriter`].
+struct HostSide {
+    /// The host socket. The session's reader thread reads a clone of it, so
+    /// ending a session takes `shutdown`. A drop alone leaves the clone and the
+    /// peer open.
+    stream: UnixStream,
+    /// The guest bytes the socket has not taken yet.
+    backlog: Mutex<Backlog>,
+    /// Signaled when bytes are queued or the session ends.
+    wake: Condvar,
+}
+
+/// Guest -> host bytes that wait for the host socket.
+#[derive(Default)]
+struct Backlog {
+    /// The bytes, in order. The credit check in `guest_data` keeps them within
+    /// [`OUR_BUF_ALLOC`].
+    bytes: VecDeque<u8>,
+    /// Set once the device lets go of the session.
+    end: Option<End>,
+}
+
+/// What is left to do for a session the device has let go of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum End {
+    /// Bytes are still queued. The writer sends them, then shuts the socket
+    /// down.
+    Flush,
+    /// The socket is shut down and nothing is queued.
+    Closed,
+}
+
+impl HostSide {
+    /// Writes `data` to the host socket without blocking, queues what the
+    /// socket does not take, and returns the number of bytes it took.
+    ///
+    /// The bytes go straight to the socket only when nothing is queued, so
+    /// they never overtake queued ones. A write that fails for good means the
+    /// socket has no reader left, so the bytes are dropped and count as taken.
+    fn send(&self, data: &[u8]) -> usize {
+        let mut backlog = lock_or_recover(&self.backlog);
+        let took = if backlog.bytes.is_empty() {
+            match (&self.stream).write(data) {
+                Ok(n) => n,
+                Err(e) if is_transient(&e) => 0,
+                Err(_) => data.len(),
+            }
+        } else {
+            0
+        };
+        if took < data.len() {
+            backlog.bytes.extend(&data[took..]);
+            self.wake.notify_one();
+        }
+        took
+    }
+
+    /// Ends the host side of a session the device has let go of.
+    ///
+    /// With `flush` set and bytes still queued, the writer sends them and then
+    /// shuts the socket down. Otherwise the queue is dropped and the socket is
+    /// shut down here.
+    fn end(&self, flush: bool) {
+        let mut backlog = lock_or_recover(&self.backlog);
+        let end = if flush && !backlog.bytes.is_empty() {
+            End::Flush
+        } else {
+            backlog.bytes.clear();
+            End::Closed
+        };
+        backlog.end = Some(end);
+        drop(backlog);
+        self.wake.notify_one();
+        if end == End::Closed {
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Moves one session's backlog to its host socket.
+///
+/// [`VirtioVsock::add_conn`] returns it. The backend runs it on a thread of its
+/// own beside the session's reader.
+pub struct HostWriter(Arc<HostSide>);
+
+#[cfg(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+))]
+impl HostWriter {
+    /// Writes the session's backlog to the host socket until the session ends
+    /// or the stop is requested.
+    ///
+    /// It waits for the socket to take bytes beside the stop token, so a host
+    /// peer that stops reading holds up this thread and no other. `took` gets
+    /// the count of every write the socket accepted, for the caller to pass to
+    /// [`VirtioVsock::host_took`] under the device lock. Once the device lets
+    /// go of the session, the writer sends what is still queued and shuts the
+    /// socket down.
+    pub fn run(&self, stop: &crate::teardown::StopToken, mut took: impl FnMut(u32)) {
+        use std::os::fd::AsFd;
+        use std::sync::PoisonError;
+        let host = &*self.0;
+        let mut chunk = vec![0u8; WRITE_CHUNK];
+        loop {
+            let n = {
+                let mut backlog = lock_or_recover(&host.backlog);
+                while backlog.bytes.is_empty() && backlog.end.is_none() {
+                    backlog = host
+                        .wake
+                        .wait(backlog)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                if backlog.bytes.is_empty() {
+                    if backlog.end == Some(End::Flush) {
+                        let _ = host.stream.shutdown(Shutdown::Both);
+                    }
+                    return;
+                }
+                let n = backlog.bytes.len().min(chunk.len());
+                for (to, from) in chunk.iter_mut().zip(&backlog.bytes) {
+                    *to = *from;
+                }
+                n
+            };
+            match stop.wait_writable(host.stream.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    eprintln!("[hvi] vsock bridge: {e}; no longer writing to the host");
+                    return;
+                }
+            }
+            let sent = match (&host.stream).write(&chunk[..n]) {
+                Ok(sent) => sent,
+                Err(e) if is_transient(&e) => continue,
+                // As in `HostSide::send`, the socket has no reader left.
+                Err(_) => n,
+            };
+            // A session that ended during the write may have cleared the queue
+            // already.
+            let mut backlog = lock_or_recover(&host.backlog);
+            let queued = backlog.bytes.len();
+            backlog.bytes.drain(..sent.min(queued));
+            drop(backlog);
+            took(sent as u32);
+        }
+    }
+}
+
+/// Returns whether a write that failed with `e` may succeed later.
+fn is_transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
 }
 
 /// A virtio-vsock device bridged to a host Unix socket.
@@ -175,6 +359,9 @@ pub struct VirtioVsock {
     /// active connections, keyed by host (local) port.
     conns: HashMap<u32, Conn>,
     next_port: u32,
+    /// Whether a guest has already sent past its credit, so only the first
+    /// reset is reported.
+    overrun_reported: bool,
 }
 
 impl VirtioVsock {
@@ -189,6 +376,7 @@ impl VirtioVsock {
             pending: VecDeque::new(),
             conns: HashMap::new(),
             next_port: 40000,
+            overrun_reported: false,
         }
     }
 
@@ -215,24 +403,40 @@ impl VirtioVsock {
         self.queue_sel = 0;
         self.pending.clear();
         for (_, conn) in self.conns.drain() {
-            let _ = conn.stream.shutdown(Shutdown::Both);
+            conn.host.end(false);
         }
     }
 
-    /// Registers a new host connection, returning its assigned local port.
-    pub fn add_conn(&mut self, stream: UnixStream) -> u32 {
+    /// Registers a new host connection and returns its assigned local port and
+    /// the writer that moves the guest's bytes to it.
+    ///
+    /// The socket goes into non-blocking mode, which its clones share, so no
+    /// write the device makes under its lock waits on the host peer.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the socket cannot be made non-blocking.
+    pub fn add_conn(&mut self, stream: UnixStream) -> io::Result<(u32, HostWriter)> {
+        stream.set_nonblocking(true)?;
         let port = self.next_port;
         self.next_port += 1;
+        let host = Arc::new(HostSide {
+            stream,
+            backlog: Mutex::default(),
+            wake: Condvar::new(),
+        });
         self.conns.insert(
             port,
             Conn {
-                stream,
+                host: Arc::clone(&host),
                 state: ConnState::New,
                 rx_cnt: 0,
+                fwd_cnt: 0,
+                fwd_told: 0,
                 pending_out: Vec::new(),
             },
         );
-        port
+        Ok((port, HostWriter(host)))
     }
 
     /// Queues a connection REQUEST to the guest agent and delivers it.
@@ -257,21 +461,43 @@ impl VirtioVsock {
 
     /// Queues host bytes for the guest (buffered until the connection is up).
     pub fn host_data(&mut self, mem: &GuestRam, host_port: u32, data: &[u8]) {
-        let rx_cnt = match self.conns.get_mut(&host_port) {
-            Some(conn) if conn.state == ConnState::Connected => conn.rx_cnt,
+        match self.conns.get_mut(&host_port) {
+            Some(conn) if conn.state == ConnState::Connected => {}
             Some(conn) => {
                 conn.pending_out.extend_from_slice(data);
                 return;
             }
             None => return,
-        };
-        self.enqueue_rw(host_port, data, rx_cnt);
+        }
+        self.enqueue_rw(host_port, data);
         self.fill_rx(mem);
     }
 
+    /// Records that the host socket of session `host_port` took `n` more of the
+    /// guest's bytes, and sends a credit update when that frees enough.
+    ///
+    /// The update goes out once the backlog is empty, or once 64 KiB
+    /// (`CREDIT_UPDATE_STEP`) have been forwarded since the guest last heard
+    /// the count.
+    pub fn host_took(&mut self, mem: &GuestRam, host_port: u32, n: u32) {
+        let Some(conn) = self.conns.get_mut(&host_port) else {
+            return;
+        };
+        conn.fwd_cnt = conn.fwd_cnt.wrapping_add(n);
+        let untold = conn.fwd_cnt.wrapping_sub(conn.fwd_told);
+        if untold > 0 && (conn.fwd_cnt == conn.rx_cnt || untold >= CREDIT_UPDATE_STEP) {
+            self.enqueue_credit(host_port);
+            self.fill_rx(mem);
+        }
+    }
+
     /// Signals the guest that the host end closed.
+    ///
+    /// The host peer may have closed only its sending half, so what the
+    /// session's backlog holds is still written before the socket shuts down.
     pub fn host_closed(&mut self, mem: &GuestRam, host_port: u32) {
-        if self.conns.remove(&host_port).is_some() {
+        if let Some(conn) = self.conns.remove(&host_port) {
+            conn.host.end(true);
             let hdr = Hdr {
                 src_cid: HOST_CID,
                 dst_cid: GUEST_CID,
@@ -288,8 +514,19 @@ impl VirtioVsock {
         }
     }
 
+    /// Returns the `fwd_cnt` to put in the next header for session `host_port`
+    /// and records it as told, or `None` when there is no such session.
+    fn tell_fwd_cnt(&mut self, host_port: u32) -> Option<u32> {
+        let conn = self.conns.get_mut(&host_port)?;
+        conn.fwd_told = conn.fwd_cnt;
+        Some(conn.fwd_cnt)
+    }
+
     /// Frames RW packet(s) for `data` into the pending queue.
-    fn enqueue_rw(&mut self, host_port: u32, data: &[u8], fwd_cnt: u32) {
+    fn enqueue_rw(&mut self, host_port: u32, data: &[u8]) {
+        let Some(fwd_cnt) = self.tell_fwd_cnt(host_port) else {
+            return;
+        };
         for chunk in data.chunks(MAX_RW) {
             let hdr = Hdr {
                 src_cid: HOST_CID,
@@ -452,38 +689,25 @@ impl VirtioVsock {
                 let queued = match self.conns.get_mut(&port) {
                     Some(c) if c.state == ConnState::Offered => {
                         c.state = ConnState::Connected;
-                        Some((std::mem::take(&mut c.pending_out), c.rx_cnt))
+                        Some(std::mem::take(&mut c.pending_out))
                     }
                     _ => None,
                 };
-                if let Some((data, rx)) = queued {
+                if let Some(data) = queued {
                     if !data.is_empty() {
-                        self.enqueue_rw(port, &data, rx);
+                        self.enqueue_rw(port, &data);
                         self.fill_rx(mem);
                     }
                 }
             }
             OP_RW => {
                 let end = HDR_LEN + (h.len as usize).min(pkt.len() - HDR_LEN);
-                // Relay guest->host bytes and compute the returned credit,
-                // dropping the connection borrow before touching the RX side.
-                // Only a completed handshake may carry data.
-                let rx = match self.conns.get_mut(&port) {
-                    Some(c) if c.state == ConnState::Connected => {
-                        let _ = c.stream.write_all(&pkt[HDR_LEN..end]);
-                        c.rx_cnt = c.rx_cnt.wrapping_add((end - HDR_LEN) as u32);
-                        Some(c.rx_cnt)
-                    }
-                    _ => None,
-                };
-                if let Some(rx) = rx {
-                    self.enqueue_credit(port, rx);
-                    self.fill_rx(mem);
-                }
+                self.guest_data(mem, port, &pkt[HDR_LEN..end]);
             }
             // Only a session the guest was offered may be torn down by it. The
             // guard is equivalent to testing inside the arm, since the fallback
-            // arm does nothing.
+            // arm does nothing. What the guest sent before it closed still
+            // reaches the host.
             OP_SHUTDOWN | OP_RST
                 if self
                     .conns
@@ -491,7 +715,7 @@ impl VirtioVsock {
                     .is_some_and(|c| c.state != ConnState::New) =>
             {
                 if let Some(conn) = self.conns.remove(&port) {
-                    let _ = conn.stream.shutdown(Shutdown::Both);
+                    conn.host.end(true);
                 }
             }
             OP_REQUEST => {
@@ -508,24 +732,82 @@ impl VirtioVsock {
                 self.pending.push_back(hdr.to_bytes().to_vec());
                 self.fill_rx(mem);
             }
-            OP_CREDIT_REQUEST => {
-                // Only answer for a live session, so credit updates cannot be
-                // used to probe which host ports exist.
-                if let Some(rx) = self
+            // Only answer for a live session, so credit updates cannot be used to
+            // probe which host ports exist.
+            OP_CREDIT_REQUEST
+                if self
                     .conns
                     .get(&port)
-                    .filter(|c| c.state == ConnState::Connected)
-                    .map(|c| c.rx_cnt)
-                {
-                    self.enqueue_credit(port, rx);
-                }
+                    .is_some_and(|c| c.state == ConnState::Connected) =>
+            {
+                self.enqueue_credit(port);
             }
             OP_CREDIT_UPDATE => {}
             _ => {}
         }
     }
 
-    fn enqueue_credit(&mut self, host_port: u32, fwd_cnt: u32) {
+    /// Relays guest bytes for session `port` to its host socket.
+    ///
+    /// Only a completed handshake may carry data. The write never blocks, and
+    /// what the socket does not take waits in the session's backlog. A guest
+    /// that sends past the credit it was given has the session reset, which
+    /// keeps the backlog within [`OUR_BUF_ALLOC`].
+    fn guest_data(&mut self, mem: &GuestRam, port: u32, data: &[u8]) {
+        let Some(conn) = self
+            .conns
+            .get_mut(&port)
+            .filter(|c| c.state == ConnState::Connected)
+        else {
+            return;
+        };
+        // The guest may have `OUR_BUF_ALLOC` bytes outstanding past the
+        // `fwd_cnt` it was last told. It cannot have seen a larger one, so a
+        // conforming guest stays within this. `fwd_cnt` is never behind
+        // `fwd_told`, so the backlog stays within it too.
+        let outstanding = conn.rx_cnt.wrapping_sub(conn.fwd_told) as usize;
+        if outstanding + data.len() > OUR_BUF_ALLOC as usize {
+            self.reset_session(mem, port);
+            return;
+        }
+        conn.rx_cnt = conn.rx_cnt.wrapping_add(data.len() as u32);
+        let took = conn.host.send(data);
+        self.host_took(mem, port, took as u32);
+    }
+
+    /// Resets session `port` because its guest sent past its credit.
+    ///
+    /// The backlog is dropped, the host socket shuts down, and the guest gets
+    /// `OP_RST`.
+    fn reset_session(&mut self, mem: &GuestRam, port: u32) {
+        let Some(conn) = self.conns.remove(&port) else {
+            return;
+        };
+        conn.host.end(false);
+        if !self.overrun_reported {
+            self.overrun_reported = true;
+            eprintln!(
+                "[hvi] virtio-vsock: the guest sent past the credit the device advertised; the \
+                 session is reset"
+            );
+        }
+        let hdr = Hdr {
+            src_cid: HOST_CID,
+            dst_cid: GUEST_CID,
+            src_port: port,
+            dst_port: AGENT_PORT,
+            typ: TYPE_STREAM,
+            op: OP_RST,
+            ..Hdr::default()
+        };
+        self.pending.push_back(hdr.to_bytes().to_vec());
+        self.fill_rx(mem);
+    }
+
+    fn enqueue_credit(&mut self, host_port: u32) {
+        let Some(fwd_cnt) = self.tell_fwd_cnt(host_port) else {
+            return;
+        };
         let hdr = Hdr {
             src_cid: HOST_CID,
             dst_cid: GUEST_CID,
@@ -712,6 +994,7 @@ mod tests {
 mod session_tests {
     use super::*;
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::time::Duration;
 
     use crate::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -794,7 +1077,7 @@ mod session_tests {
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
         }
-        let first_port = dev.add_conn(first);
+        let first_port = dev.add_conn(first).unwrap().0;
         dev.connect(&mem, first_port);
         assert_eq!(
             mem.read_u16(BASE + 0x2000 + 2).unwrap(),
@@ -802,7 +1085,7 @@ mod session_tests {
             "the first REQUEST took the one RX buffer"
         );
         // No buffer is left, so this REQUEST waits in `pending`.
-        let second_port = dev.add_conn(second);
+        let second_port = dev.add_conn(second).unwrap().0;
         dev.connect(&mem, second_port);
 
         dev.mmio(&mem, reg::STATUS, true, 0);
@@ -935,8 +1218,8 @@ mod session_tests {
 
         let (a_dev, _a) = UnixStream::pair().unwrap();
         let (b_dev, mut b_peer) = UnixStream::pair().unwrap();
-        let port_a = dev.add_conn(a_dev);
-        let port_b = dev.add_conn(b_dev);
+        let port_a = dev.add_conn(a_dev).unwrap().0;
+        let port_b = dev.add_conn(b_dev).unwrap().0;
         dev.connect(&mem, port_a);
         dev.connect(&mem, port_b);
 
@@ -954,7 +1237,8 @@ mod session_tests {
         let mut dev = VirtioVsock::new();
 
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side); // registered but never offered
+        let port = dev.add_conn(dev_side).unwrap().0; // registered but never
+                                                      // offered
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"STOLEN"));
         assert!(
@@ -970,7 +1254,7 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
         dev.connect(&mem, port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
 
@@ -1018,12 +1302,13 @@ mod session_tests {
 
         // One session in each state the guest can observe.
         let (new_dev, _new_peer) = UnixStream::pair().unwrap();
-        let new_port = dev.add_conn(new_dev); // registered, never offered
+        let new_port = dev.add_conn(new_dev).unwrap().0; // registered, never
+                                                         // offered
         let (offered_dev, _offered_peer) = UnixStream::pair().unwrap();
-        let offered_port = dev.add_conn(offered_dev);
+        let offered_port = dev.add_conn(offered_dev).unwrap().0;
         dev.connect(&mem, offered_port); // offered, never accepted
         let (live_dev, _live_peer) = UnixStream::pair().unwrap();
-        let live_port = dev.add_conn(live_dev);
+        let live_port = dev.add_conn(live_dev).unwrap().0;
         dev.connect(&mem, live_port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, live_port, &[]));
 
@@ -1062,7 +1347,7 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
 
         dev.handle_pkt(&mem, &pkt(OP_SHUTDOWN, port, &[]));
         assert!(dev.conns.contains_key(&port), "the session survived");
@@ -1085,7 +1370,7 @@ mod session_tests {
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
         }
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
         dev.connect(&mem, port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
 
@@ -1102,7 +1387,7 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
 
         dev.connect(&mem, port);
         assert_eq!(dev.conns[&port].state, ConnState::Offered);
@@ -1112,6 +1397,282 @@ mod session_tests {
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"hello"));
         assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"hello"[..]));
         assert_eq!(dev.conns[&port].rx_cnt, 5, "credit accounted");
+        assert_eq!(dev.conns[&port].fwd_cnt, 5, "and returned");
+    }
+
+    /// Shrinks the send buffer of `s`, so a few KiB fill it on every host.
+    fn shrink_send_buffer(s: &UnixStream) {
+        let size: libc::c_int = 4096;
+        // SAFETY: a live socket and an option value of the stated size.
+        let rc = unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::from_ref(&size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Returns `n` bytes of the guest's stream starting at offset `from`, in a
+    /// pattern that shows a lost or reordered chunk.
+    fn stream_bytes(from: usize, n: usize) -> Vec<u8> {
+        (from..from + n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Sends `n` bytes of the guest's stream, from offset `from`, to session
+    /// `port` in RW packets of up to 64 KiB.
+    fn guest_sends(dev: &mut VirtioVsock, mem: &GuestRam, port: u32, from: usize, n: usize) {
+        for start in (from..from + n).step_by(64 * 1024) {
+            let len = (from + n - start).min(64 * 1024);
+            dev.handle_pkt(mem, &pkt(OP_RW, port, &stream_bytes(start, len)));
+        }
+    }
+
+    /// Sends `n` guest bytes to session `port` on another thread and returns
+    /// the device when it is done, or `None` when it has not finished within
+    /// five seconds.
+    fn guest_sends_in_time(
+        mut dev: VirtioVsock,
+        mem: GuestRam,
+        port: u32,
+        n: usize,
+    ) -> Option<(VirtioVsock, GuestRam)> {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            guest_sends(&mut dev, &mem, port, 0, n);
+            let _ = done.send((dev, mem));
+        });
+        finished.recv_timeout(Duration::from_secs(5)).ok()
+    }
+
+    /// Reads what `s` holds until nothing more arrives for 200 ms.
+    fn read_available(s: &mut UnixStream) -> Vec<u8> {
+        s.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = s.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    }
+
+    // The device used to hand guest bytes to the host socket with a blocking
+    // `write_all`, on the vCPU thread and under the device lock. A host peer
+    // that stopped reading then froze the vCPU and every other session.
+    #[test]
+    fn a_host_peer_that_stops_reading_does_not_block_the_device() {
+        let mem = mem_of(0x1000);
+        let mut dev = VirtioVsock::new();
+        let (dev_side, mut peer) = UnixStream::pair().unwrap();
+        shrink_send_buffer(&dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
+        dev.connect(&mem, port);
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+
+        let total = OUR_BUF_ALLOC as usize;
+        let (dev, _mem) = guest_sends_in_time(dev, mem, port, total)
+            .expect("the device blocked on a host peer that does not read");
+        assert!(dev.conns.contains_key(&port), "a guest within its credit");
+
+        let taken = read_available(&mut peer);
+        assert!(taken.len() < total, "the socket took only part of it");
+        assert!(taken == stream_bytes(0, taken.len()));
+        for queued in &dev.pending {
+            let fwd_cnt = Hdr::parse(queued).unwrap().fwd_cnt as usize;
+            assert!(
+                fwd_cnt <= taken.len(),
+                "no header counts bytes still queued"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guest_that_sends_past_its_credit_is_reset() {
+        let mem = mem_of(0x1000);
+        let mut dev = VirtioVsock::new();
+        let (dev_side, mut peer) = UnixStream::pair().unwrap();
+        shrink_send_buffer(&dev_side);
+        // macOS refuses the option once the device has shut its end down.
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let port = dev.add_conn(dev_side).unwrap().0;
+        dev.connect(&mem, port);
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+
+        let total = OUR_BUF_ALLOC as usize + 1;
+        let (dev, _mem) = guest_sends_in_time(dev, mem, port, total)
+            .expect("the device blocked on a host peer that does not read");
+        assert!(!dev.conns.contains_key(&port), "the session was reset");
+        let reset = Hdr::parse(dev.pending.back().unwrap()).unwrap();
+        assert_eq!(
+            (reset.op, reset.src_port, reset.dst_port),
+            (OP_RST, port, AGENT_PORT)
+        );
+
+        // The host peer gets what the socket took, then EOF.
+        let mut got = Vec::new();
+        peer.read_to_end(&mut got).unwrap();
+        assert!(got.len() < total);
+        assert!(got == stream_bytes(0, got.len()));
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+        all(target_arch = "x86_64", target_os = "linux")
+    ))]
+    mod writer {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        use std::thread::JoinHandle;
+        use std::time::Instant;
+
+        use crate::teardown::{join_by, StopSource, StopToken};
+
+        /// One connected session, with the device shared the way the backends
+        /// share it.
+        struct Session {
+            dev: Arc<Mutex<VirtioVsock>>,
+            mem: Arc<GuestRam>,
+            port: u32,
+            writer: Option<HostWriter>,
+            peer: UnixStream,
+        }
+
+        /// Returns a connected session whose host socket fills after a few KiB.
+        fn session() -> Session {
+            let mem = mem_of(0x1000);
+            let mut dev = VirtioVsock::new();
+            let (dev_side, peer) = UnixStream::pair().unwrap();
+            shrink_send_buffer(&dev_side);
+            // macOS refuses the option once the device has shut its end down.
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (port, writer) = dev.add_conn(dev_side).unwrap();
+            dev.connect(&mem, port);
+            dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+            Session {
+                dev: Arc::new(Mutex::new(dev)),
+                mem: Arc::new(mem),
+                port,
+                writer: Some(writer),
+                peer,
+            }
+        }
+
+        impl Session {
+            /// Sends `n` bytes of the guest's stream, from offset `from`.
+            fn guest_sends(&self, from: usize, n: usize) {
+                let mut dev = lock_or_recover(&self.dev);
+                guest_sends(&mut dev, &self.mem, self.port, from, n);
+            }
+
+            /// Returns the session's `fwd_cnt`.
+            fn fwd_cnt(&self) -> u32 {
+                lock_or_recover(&self.dev).conns[&self.port].fwd_cnt
+            }
+
+            /// Runs the session's writer on a thread, and hands what the socket
+            /// took to the device, as the backends do.
+            fn spawn_writer(&mut self, stop: StopToken) -> JoinHandle<()> {
+                let writer = self.writer.take().unwrap();
+                let (dev, mem, port) = (Arc::clone(&self.dev), Arc::clone(&self.mem), self.port);
+                std::thread::spawn(move || {
+                    writer.run(&stop, |n| lock_or_recover(&dev).host_took(&mem, port, n));
+                })
+            }
+        }
+
+        /// Returns the deadline these tests give a thread to finish.
+        fn soon() -> Instant {
+            Instant::now() + Duration::from_secs(5)
+        }
+
+        #[test]
+        fn the_writer_drains_the_backlog_and_returns_the_credit() {
+            let source = StopSource::new().unwrap();
+            let mut s = session();
+            let window = OUR_BUF_ALLOC as usize;
+            s.guest_sends(0, window);
+            assert!(
+                (s.fwd_cnt() as usize) < window,
+                "part of it waits in the backlog"
+            );
+
+            let writer = s.spawn_writer(source.token());
+            let mut got = vec![0u8; window];
+            s.peer.read_exact(&mut got).unwrap();
+            assert!(got == stream_bytes(0, window));
+
+            // The writer reports a write after the peer may already have read
+            // it.
+            let deadline = soon();
+            while s.fwd_cnt() as usize != window {
+                assert!(Instant::now() < deadline, "the writer never reported");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let update = lock_or_recover(&s.dev)
+                .pending
+                .iter()
+                .map(|p| Hdr::parse(p).unwrap())
+                .rfind(|h| h.op == OP_CREDIT_UPDATE)
+                .expect("the guest heard nothing");
+            assert_eq!(update.fwd_cnt as usize, window);
+
+            // The returned credit covers a second window.
+            s.guest_sends(window, window);
+            s.peer.read_exact(&mut got).unwrap();
+            assert!(got == stream_bytes(window, window));
+            assert!(lock_or_recover(&s.dev).conns.contains_key(&s.port));
+
+            lock_or_recover(&s.dev).host_closed(&s.mem, s.port);
+            join_by("writer", writer, soon()).unwrap();
+        }
+
+        #[test]
+        fn a_guest_close_still_delivers_the_backlog() {
+            let source = StopSource::new().unwrap();
+            let mut s = session();
+            let window = OUR_BUF_ALLOC as usize;
+            s.guest_sends(0, window);
+            lock_or_recover(&s.dev).handle_pkt(&s.mem, &pkt(OP_SHUTDOWN, s.port, &[]));
+            assert!(!lock_or_recover(&s.dev).conns.contains_key(&s.port));
+
+            let writer = s.spawn_writer(source.token());
+            let mut got = Vec::new();
+            s.peer.read_to_end(&mut got).unwrap();
+            assert!(
+                got == stream_bytes(0, window),
+                "the host got the whole backlog"
+            );
+            join_by("writer", writer, soon()).unwrap();
+        }
+
+        #[test]
+        fn the_writer_returns_when_stopped_with_a_full_socket() {
+            let source = StopSource::new().unwrap();
+            let mut s = session();
+            s.guest_sends(0, OUR_BUF_ALLOC as usize);
+            let writer = s.spawn_writer(source.token());
+            source.request_stop();
+            join_by("writer", writer, soon()).unwrap();
+        }
+
+        #[test]
+        fn a_device_reset_drops_the_backlog_and_ends_the_writer() {
+            let source = StopSource::new().unwrap();
+            let mut s = session();
+            let window = OUR_BUF_ALLOC as usize;
+            s.guest_sends(0, window);
+            let writer = s.spawn_writer(source.token());
+            lock_or_recover(&s.dev).mmio(&s.mem, reg::STATUS, true, 0);
+            join_by("writer", writer, soon()).unwrap();
+
+            let mut got = Vec::new();
+            s.peer.read_to_end(&mut got).unwrap();
+            assert!(got.len() < window, "the backlog was dropped");
+        }
     }
 
     /// Programs the RX queue with `n` buffers of `size` bytes each, the way a
@@ -1171,7 +1732,7 @@ mod session_tests {
         program_rx_buffers(&mut dev, &mem, (desc, avail, used, data), BUFFERS, RXBUF);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
         dev.connect(&mem, port); // REQUEST takes used slot 0
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
 
@@ -1246,7 +1807,7 @@ mod session_tests {
         program_rx_buffers(&mut dev, &mem, (desc, avail, used, data), 4, HDR_LEN as u32);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
         dev.connect(&mem, port); // REQUEST is header-only and fits exactly
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "the REQUEST landed");
@@ -1296,7 +1857,7 @@ mod session_tests {
         program_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap().0;
         dev.connect(&mem, port); // REQUEST takes the first chain
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         dev.host_data(&mem, port, &vec![b'y'; BODY]);

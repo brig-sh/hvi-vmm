@@ -308,7 +308,12 @@ Interrupt injection is the one device-facing thing that differs by backend:
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
 - **virtio-vsock** (`virtio_vsock.rs`, id 19) is the exec channel. Host CID 2,
-  guest CID 3, port 1024.
+  guest CID 3, port 1024. Each host connection gets a reader thread and a
+  writer thread. The device writes the guest's bytes to a non-blocking socket
+  and queues what the socket does not take for the writer. A host client that
+  stops reading then stalls its own session and nothing else. The credit the
+  device advertises counts only bytes the socket took, which caps that queue
+  at 256 KiB.
 - **virtio-fs** (`virtio_fs.rs`, id 26, macOS only) serves the guest's FUSE
   messages itself over a hiprio and a request queue. See
   [storage-and-sharing.md](storage-and-sharing.md).

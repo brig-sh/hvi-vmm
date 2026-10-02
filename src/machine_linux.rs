@@ -458,9 +458,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // The main thread filters itself last, once everything it had to spawn
     // exists. Doing it in this order is what lets both allowlists refuse
     // `seccomp` itself: nothing is ever created underneath a filter except the
-    // per-connection vsock readers, which are spawned under it and inherit it.
-    // The guest is already running by now, so a failure here stops it and is
-    // reported once every thread has been joined or left running.
+    // per-connection vsock readers and writers, which are spawned under it and
+    // inherit it. The guest is already running by now, so a failure here stops
+    // it and is reported once every thread has been joined or left running.
     let confined = if cfg.sandbox {
         crate::seccomp::install(crate::seccomp::Thread::Vmm)
     } else {
@@ -1112,9 +1112,11 @@ fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
 
 /// Bridges the host agent Unix socket to the guest vsock device (exec).
 ///
-/// The listener is non-blocking, so the accept loop can poll it beside the stop
-/// token. The per-connection readers poll the same token, and the listener
-/// thread joins the ones still running before it exits.
+/// Each accepted connection gets a reader thread (host -> guest) and a writer
+/// thread (guest -> host). The listener is non-blocking, so the accept loop
+/// can poll it beside the stop token. The per-connection threads poll the same
+/// token, and the listener thread joins the ones still running before it
+/// exits.
 fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
@@ -1124,7 +1126,7 @@ fn spawn_vsock_bridge(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
-        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        let mut sessions: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1137,30 +1139,44 @@ fn spawn_vsock_bridge(
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
-            // The device writes to this socket and must block, or a full send
-            // buffer would split a frame. On macOS an accepted socket inherits
-            // the listener's non-blocking flag, so blocking mode is set here.
-            if stream.set_nonblocking(false).is_err() {
-                continue;
-            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
-            let port = {
+            let (port, writer) = {
                 let mut d = lock_or_recover(&dev);
-                let port = d.add_conn(stream);
+                let Ok((port, writer)) = d.add_conn(stream) else {
+                    continue;
+                };
                 d.connect(&mem, port);
                 let level = d.irq_level();
                 drop(d);
                 let _ = vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
-                port
+                (port, writer)
             };
+            sessions.retain(|handle| !handle.is_finished());
+            sessions.push(std::thread::spawn({
+                let (dev, mem, vm, stop) = (
+                    Arc::clone(&dev),
+                    Arc::clone(&mem),
+                    Arc::clone(&vm),
+                    stop.clone(),
+                );
+                move || {
+                    writer.run(&stop, |n| {
+                        let level = {
+                            let mut d = lock_or_recover(&dev);
+                            d.host_took(&mem, port, n);
+                            d.irq_level()
+                        };
+                        let _ = vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
+                    });
+                }
+            }));
             let dev2 = Arc::clone(&dev);
             let mem2 = Arc::clone(&mem);
             let vm2 = Arc::clone(&vm);
             let stop2 = stop.clone();
-            readers.retain(|handle| !handle.is_finished());
-            readers.push(std::thread::spawn(move || {
+            sessions.push(std::thread::spawn(move || {
                 use std::io::Read;
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -1176,8 +1192,12 @@ fn spawn_vsock_bridge(
                         }
                     }
                     let n = match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
                         Ok(n) => n,
+                        // The device made the socket non-blocking, and the wait
+                        // above is what blocks.
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break,
                     };
                     let level = {
                         let mut d = lock_or_recover(&dev2);
@@ -1194,8 +1214,8 @@ fn spawn_vsock_bridge(
                 let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
             }));
         }
-        for reader in readers {
-            let _ = reader.join();
+        for session in sessions {
+            let _ = session.join();
         }
     })
 }
