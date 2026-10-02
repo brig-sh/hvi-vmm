@@ -25,7 +25,7 @@ One compact JSON object per line:
 
 ```json
 {"sandbox_id":"hvi","ts":1788992154877294000,"provenance":"boundary","source":"block","payload":{"lba":0,"len":4096,"rw":"r"}}
-{"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
+{"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"src_ip_leased":true,"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
 ```
 
 The envelope is `sandbox_id`, `ts`, `provenance`, `source`, `payload`. Its
@@ -45,6 +45,9 @@ What the ledger is not:
   backwards when the host clock does.
 - **Not aggregated.** `net` records are per packet, and egress only. See
   [networking.md](networking.md#what-the-ledger-records).
+- **Not an attribution by address.** Every field of a `net` record's five-tuple
+  is read from a frame the guest built. `src_ip_leased` says whether the source
+  is the guest's leased address. Attribute records by `sandbox_id`.
 
 A boot with no block device and no network traffic produces an empty file.
 That is the normal result, not a failure.
