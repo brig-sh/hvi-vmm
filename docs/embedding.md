@@ -23,8 +23,8 @@ before signing it. Pinning a commit is the supported way to depend on hvi.
 
 ## The entry point
 
-Every backend exposes the same function. `lib.rs` aliases the right one to
-`hvi::machine` by target triple, so a caller writes one line whatever the
+Every backend exposes the same function, and the crate root re-exports the one
+for the host target as `hvi::boot`, so a caller writes one line whatever the
 host:
 
 ```rust
@@ -79,7 +79,7 @@ let cfg = BootConfig {
     sandbox: true,
 };
 
-let stop = hvi::machine::boot(cfg)?;
+let stop = hvi::boot(cfg)?;
 eprintln!("guest stopped: {stop:?}");
 ```
 
@@ -170,7 +170,7 @@ handshake.
 
 Only the backend for your host target compiles. On any other host the crate
 builds without one, so the shared code and its unit tests still compile, but
-`hvi::machine` does not exist. Gate your call:
+`hvi::boot` does not exist. Gate your call:
 
 ```rust
 #[cfg(any(

@@ -94,7 +94,7 @@ The rules CI enforces per pull request, from
 `.github/linters/commitlint.config.mjs`:
 
 - header within 72 columns, subject capitalized and without a trailing period
-- scope lowercase (machine, x86, virtio, boot, layout, fdt, ci, docs)
+- scope lowercase (arch, x86, virtio, boot, layout, fdt, ci, docs)
 - body prose wrapped at 72 columns, trailers and table rows exempt
 - a `Signed-off-by` trailer on every commit (DCO)
 
@@ -160,8 +160,8 @@ artifacts when they fail, and the two arm64 boots also upload the event
 ledger.
 
 One known gap: the arm64/KVM backend is unit-tested on its stop path only.
-`src/machine_linux.rs` carries only tests of how a vCPU thread that ends stops
-the VM and how a kick ends a run. The suite runs on arm64 Linux, on the
+`src/arch/aarch64/kvm.rs` carries only tests of how a vCPU thread that ends
+stops the VM and how a kick ends a run. The suite runs on arm64 Linux, on the
 self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the boot
 runners also run the stop tests.
 

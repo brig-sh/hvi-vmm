@@ -11,12 +11,12 @@ Parts of the x86-64 backend follow Firecracker
 Inc. or its affiliates, licensed under the Apache License, Version 2.0. The
 files that do so say where, in their module documentation:
 
-  src/boot_x86.rs    mirrors the arch::x86_64 kernel loader
-  src/layout_x86.rs  the same guest memory layout constants
-  src/machine_x86.rs the same vCPU and machine bring-up shape
-  src/mptable.rs     an MP table of the same small shape (MP spec 1.4)
-  src/virtio.rs      the virtio queue and descriptor conventions
-  src/sandbox.rs     the confinement goal, by a different mechanism
+  src/arch/x86_64/loader.rs   mirrors the arch::x86_64 kernel loader
+  src/arch/x86_64/layout.rs   the same guest memory layout constants
+  src/arch/x86_64/kvm.rs      the same vCPU and VM bring-up shape
+  src/arch/x86_64/mptable.rs  an MP table of the same small shape (MP spec 1.4)
+  src/virtio.rs               the virtio queue and descriptor conventions
+  src/sandbox.rs              the confinement goal, by a different mechanism
 
 Confinement on Linux uses seccompiler, the rust-vmm crate extracted from
 Firecracker, under the Apache License, Version 2.0. The filter files in

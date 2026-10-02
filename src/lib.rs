@@ -21,9 +21,9 @@
 //! - **Linux / aarch64** — KVM (`kvm-ioctls` / `kvm-bindings`), arm64 guest.
 //! - **Linux / x86-64** — KVM, x86-64 guest.
 //!
-//! All three share everything above the hypervisor: the guest memory layout
-//! (`layout`), kernel image loading (`boot`, `boot_x86`), devicetree
-//! builder (`fdt`), virtio devices ([`virtio`], [`virtio_net`],
+//! All three share everything above the hypervisor: the guest memory layout,
+//! kernel image loading and the devicetree or MP table of each guest
+//! architecture ([`arch`]), virtio devices ([`virtio`], [`virtio_net`],
 //! [`virtio_vsock`]), the serial ports (`pl011`, `uart16550`) and the
 //! `RawEvent` ledger ([`events`]). On any other host the crate builds without a
 //! backend, so the deterministic core and its unit tests still compile
@@ -41,44 +41,20 @@
 //! separate crate can link this one and supply its own the same way, which is
 //! why the VMM is a library as well as a binary. See `docs/plugins.md`.
 
-/// arm64 `Image` header parse and placement.
-#[cfg(target_arch = "aarch64")]
-pub mod boot;
-/// x86-64 `bzImage` parse, boot params and the protected-mode entry.
-#[cfg(target_arch = "x86_64")]
-pub mod boot_x86;
+pub mod arch;
 /// Backend-independent boot configuration and result types.
 pub mod config;
 /// The filter between a guest's serial console and the host's stdout.
 pub mod console;
-/// arm64 exception syndrome decoding.
-#[cfg(target_arch = "aarch64")]
-pub mod esr;
 /// The `RawEvent` NDJSON ledger.
 pub mod events;
 /// Raising the open-file limit hvi runs under. virtio-fs spends the guest's
 /// concurrency out of this process's descriptor table.
 #[cfg(target_arch = "aarch64")]
 pub mod fdlimit;
-/// Devicetree builder for the arm64 guest.
-///
-/// Gated to match `layout` below, which it builds from: an x86 guest is
-/// described by the MP table instead. Left ungated, this module took
-/// `crate::layout` with it into every x86 build.
-#[cfg(target_arch = "aarch64")]
-pub mod fdt;
 /// Guest RAM as a region collection, the VMM's writable mapping and a
 /// read-only view over its descriptor.
 pub mod guestmem;
-/// Guest-physical memory layout (arm64).
-#[cfg(target_arch = "aarch64")]
-pub mod layout;
-/// Guest-physical memory layout (x86-64).
-#[cfg(target_arch = "x86_64")]
-pub mod layout_x86;
-/// Intel MP table, so an x86 guest finds its CPUs without ACPI.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub mod mptable;
 /// PL011 UART (arm64 console).
 #[cfg(target_arch = "aarch64")]
 pub mod pl011;
@@ -132,21 +108,14 @@ pub mod virtio_net;
 /// virtio-vsock over MMIO, bridged to a host Unix socket (guest agent).
 pub mod virtio_vsock;
 
-// The active hypervisor backend, selected by target. All three expose the same
-// `boot(config::BootConfig) -> Result<config::Stop, _>` entry point.
+// The backend for the host's target. Each one exposes the same
+// `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[path = "machine_macos.rs"]
-pub mod machine;
+pub use arch::aarch64::hvf::boot;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-#[path = "machine_linux.rs"]
-pub mod machine;
+pub use arch::aarch64::kvm::boot;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[path = "machine_x86.rs"]
-pub mod machine;
-
-/// M0 hvf smoke test — Apple-silicon only.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub mod smoke;
+pub use arch::x86_64::kvm::boot;
 
 /// This crate's version, so a binary built against it can report which VMM core
 /// it carries. Two binaries reporting the same core ran the same VMM.

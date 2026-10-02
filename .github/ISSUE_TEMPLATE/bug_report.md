@@ -38,7 +38,7 @@ flags (--kernel, --disk, --net-stub, --cpus, --events).
 
 <!-- Fill in what applies; delete the rest. -->
 
-- Component / scope: <!-- machine, x86, virtio, boot, layout, ... -->
+- Component / scope: <!-- arch, x86, virtio, boot, layout, ... -->
 - Host backend: <!-- macOS/hvf | Linux/KVM aarch64 | Linux/KVM x86-64 -->
 - Host OS and kernel: <!-- e.g. macOS 15, or Ubuntu 24.04 / 6.8.0 -->
 - Guest kernel: <!-- arm64 Image or x86 bzImage, and version if relevant -->

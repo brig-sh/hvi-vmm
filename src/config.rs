@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Backend-independent boot configuration and result types, shared by the
-//! macOS (Hypervisor.framework) and Linux (KVM) machine backends.
+//! Backend-independent boot configuration and result types, shared by every
+//! hypervisor backend.
 
 use std::path::PathBuf;
 

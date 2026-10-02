@@ -25,10 +25,10 @@
 # the one remaining path form.
 #
 # A file that resolves host paths of its own says so with a module-level
-# `#![allow(clippy::disallowed_methods)]` and a line on why: the VMM's own
-# state directories, the block device, the ledger, the plugins, shared
-# memory, the machine backends and the Seatbelt profile's export rules.
-# `config.rs` carries the one per-site waiver, for the export root.
+# `#![allow(clippy::disallowed_methods)]` and a line on why: the VMM's own state
+# directories, the block device, the ledger, the plugins, shared memory, the
+# hypervisor backends and the Seatbelt profile's export rules. `config.rs`
+# carries the one per-site waiver, for the export root.
 disallowed-methods = [
     # std::fs, the free functions.
     { path = "std::fs::canonicalize", reason = "resolve relative to a directory descriptor instead; see clippy.toml" },

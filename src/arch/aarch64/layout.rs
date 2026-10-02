@@ -20,9 +20,9 @@
 //! M1 uses the PL011 for first-boot serial output (`earlycon`); virtio-mmio
 //! devices arrive in M2. The GIC base/size must agree with what `hv_gic`
 //! actually claims, so
-//! [`GicLayout::QEMU_VIRT`](crate::layout::GicLayout::QEMU_VIRT) is treated as
-//! the default and reconciled against `applevisor`'s GIC size getters when the
-//! VM is built.
+//! [`GicLayout::QEMU_VIRT`](crate::arch::aarch64::layout::GicLayout::QEMU_VIRT)
+//! is treated as the default and reconciled against `applevisor`'s GIC size
+//! getters when the VM is built.
 
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -51,8 +51,8 @@ pub const DEVICE_WINDOW_END: u64 = RAM_BASE;
 ///
 /// Apple silicon (M3, M4) reports a 32 MiB redistributor region ending at
 /// `0x0a0a_0000` at 1, 4 and 8 vCPUs, so this leaves about 31 MiB spare. The
-/// framework sizes that region, so the machine refuses to boot if it ever
-/// reaches here.
+/// framework sizes that region, so the hypervisor backend refuses to boot if it
+/// ever reaches here.
 pub const UART_BASE: u64 = 0x0c00_0000;
 pub const UART_SIZE: u64 = 0x1000;
 /// UART interrupt as a GIC SPI number (INTID = 32 + SPI = 33).
@@ -117,8 +117,8 @@ pub struct GicLayout {
 impl GicLayout {
     /// QEMU virt GICv3: distributor at 0x0800_0000, redistributor region at
     /// 0x080A_0000. `gicr_size` here is one 128 KiB redistributor frame (per
-    /// vCPU); the machine multiplies it by the vCPU count and checks it against
-    /// `applevisor`'s redistributor-size getter before use.
+    /// vCPU); the hypervisor backend multiplies it by the vCPU count and checks
+    /// it against `applevisor`'s redistributor-size getter before use.
     pub const QEMU_VIRT: GicLayout = GicLayout {
         version: GicVersion::V3,
         gicd_base: 0x0800_0000,

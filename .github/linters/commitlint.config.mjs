@@ -55,7 +55,7 @@ export default {
         'test',
       ],
     ],
-    // Scopes are lowercase (machine, x86, virtio, boot, layout, ci).
+    // Scopes are lowercase (arch, x86, virtio, boot, layout, ci).
     // Case is all that is held: a stricter kebab-case rule rejects a digit or
     // an underscore, and scopes like `x86` and `uart16550` carry both. A bare
     // type with no scope stays allowed.

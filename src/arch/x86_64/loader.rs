@@ -40,7 +40,7 @@ use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{load_cmdline, Cmdline, KernelLoader, KernelLoaderResult};
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
 
-use crate::layout_x86::{
+use crate::arch::x86_64::layout::{
     CMDLINE_ADDR, CMDLINE_MAX, EBDA_START, HIGH_MEM_START, KERNEL_ENTRY_OFF, RAM_BASE, ZERO_PAGE,
 };
 
@@ -132,7 +132,7 @@ impl LoadedKernel {
         let kernel_load = loaded.kernel_load.raw_value();
         let mut params = boot_params {
             hdr: match loaded.setup_header {
-                // The image's own header, `code32_start` updated by the loader.
+                // The image's own header; `linux-loader` sets `code32_start`.
                 Some(hdr) => hdr,
                 // A `vmlinux` has none. The 64-bit entry copies `boot_params`
                 // again when `version` is zero, so the version is set; the rest
@@ -231,7 +231,7 @@ fn load_kernel<M: GuestMemoryBackend>(
     }
     let loaded = BzImage::load(mem, None, &mut image, highmem)
         .map_err(|e| format!("loading the bzImage: {e}"))?;
-    // The loader checks the magic and the protocol version but not the boot
+    // `linux-loader` checks the magic and the protocol version but not the boot
     // sector signature; a file that fails it is not a bzImage.
     if loaded
         .setup_header
@@ -264,8 +264,8 @@ fn add_e820(params: &mut boot_params, addr: u64, size: u64) -> Result<(), String
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::arch::x86_64::layout::{HIGH_RAM_BASE, MMIO_GAP_START};
     use crate::guestmem::GuestRam;
-    use crate::layout_x86::{HIGH_RAM_BASE, MMIO_GAP_START};
     use linux_loader::elf::{
         Elf64_Ehdr, Elf64_Phdr, EI_CLASS, EI_DATA, EI_NIDENT, EI_VERSION, ELFCLASS64, ELFDATA2LSB,
         EM_X86_64, ET_EXEC, EV_CURRENT, PT_LOAD,
@@ -282,10 +282,10 @@ pub(crate) mod tests {
     const VMLINUX_FILESZ: u64 = 0x800;
     const VMLINUX_MEMSZ: u64 = 0x3000;
 
-    /// Builds a minimal bzImage, one setup sector carrying the fields the
-    /// loader checks (boot flag, `HdrS`, protocol 2.15, `LOADED_HIGH`, the
-    /// 1 MiB `code32_start`) and a protected-mode body with a recognisable
-    /// pattern.
+    /// Builds a minimal bzImage, one setup sector carrying the fields
+    /// `linux-loader` checks (boot flag, `HdrS`, protocol 2.15, `LOADED_HIGH`,
+    /// the 1 MiB `code32_start`) and a protected-mode body with a
+    /// recognisable pattern.
     pub(crate) fn synthetic_bzimage() -> Vec<u8> {
         let hdr = setup_header {
             setup_sects: 1, // setup area = (1 + 1) * 512 bytes
@@ -462,7 +462,7 @@ pub(crate) mod tests {
         assert!(err.contains("bzImage"), "{err}");
     }
 
-    // The loader's own checks pass; the signature check is hvi's.
+    // `linux-loader`'s own checks pass; the signature check is hvi's.
     #[test]
     fn rejects_a_bzimage_without_the_boot_sector_signature() {
         let ram = guest_ram(1024 << 20);
@@ -597,8 +597,8 @@ pub(crate) mod tests {
     // rather than written with a truncated size.
     #[test]
     fn initramfs_beyond_the_ramdisk_size_field_is_refused() {
-        // Low RAM of 5 GiB is not a layout the machine builds; it is the one
-        // shape in which a 4 GiB initramfs passes the placement check.
+        // Low RAM of 5 GiB is not a layout the hypervisor backend builds; it is
+        // the one shape in which a 4 GiB initramfs passes the placement check.
         let ram = GuestRam::from_ranges(&[(0, 5 << 30)]);
         let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 1 << 32)
             .expect_err("4 GiB initramfs");

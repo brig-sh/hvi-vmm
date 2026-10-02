@@ -18,12 +18,12 @@
 //! (Documentation/arm64/booting.rst), checks the magic, copies the file to
 //! `RAM_BASE + text_offset`, and writes the devicetree under the boot
 //! protocol's size cap. The header's `image_size` is the RAM the kernel needs
-//! at runtime, header through BSS, more than the file holds;
-//! [`LoadedKernel`](crate::boot::LoadedKernel) carries it so the layout keeps
-//! the devicetree and initramfs clear of it.
-//! [`Payload::load`](crate::boot::Payload::load) places all three images;
-//! [`LoadedKernel::plan`](crate::boot::LoadedKernel::plan) computes the
-//! placement without writing.
+//! at runtime, header through BSS, more than the file holds; [`LoadedKernel`]
+//! carries it so the layout keeps the devicetree and initramfs clear of it.
+//! [`Payload::load`](crate::arch::aarch64::loader::Payload::load) places all
+//! three images;
+//! [`LoadedKernel::plan`](crate::arch::aarch64::loader::LoadedKernel::plan)
+//! computes the placement without writing.
 
 use std::io::Cursor;
 
@@ -31,8 +31,8 @@ use linux_loader::loader::pe::{arm64_image_header, load_dtb, PE};
 use linux_loader::loader::KernelLoader;
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryBackend};
 
-use crate::fdt::{self, VirtioDevices};
-use crate::layout::{GicLayout, GuestLayout, RAM_BASE};
+use crate::arch::aarch64::fdt::{self, VirtioDevices};
+use crate::arch::aarch64::layout::{GicLayout, GuestLayout, RAM_BASE};
 
 /// arm64 `Image` magic, "ARM\x64" read as a little-endian `u32`.
 const IMAGE_MAGIC: u32 = 0x644d_5241;
@@ -106,7 +106,7 @@ impl LoadedKernel {
         let placed = Self::from_header(kernel)?;
         if placed.addr != loaded.kernel_load.raw_value() {
             return Err(format!(
-                "kernel placement disagrees with the loader: {:#x} vs {:#x}",
+                "kernel placement disagrees with linux-loader: {:#x} vs {:#x}",
                 placed.addr,
                 loaded.kernel_load.raw_value()
             ));
@@ -273,8 +273,8 @@ pub(crate) mod tests {
 
     const RAM_LEN: usize = 8 << 20;
 
-    /// Builds an `Image` with the header fields the loader reads and a body of
-    /// `body_len` bytes with a recognisable pattern.
+    /// Builds an `Image` with the header fields `linux-loader` reads and a body
+    /// of `body_len` bytes with a recognisable pattern.
     pub(crate) fn synthetic_image(text_offset: u64, image_size: u64, body_len: usize) -> Vec<u8> {
         let header = arm64_image_header {
             text_offset: text_offset.to_le(),
@@ -315,10 +315,10 @@ pub(crate) mod tests {
         );
     }
 
-    // `dump-fdt` prints the header-only placement, so it must agree with the
-    // loader, legacy rule included.
+    // `dump-fdt` prints the header-only placement, so it must agree with
+    // `linux-loader`, legacy rule included.
     #[test]
-    fn header_placement_matches_the_loader() {
+    fn header_placement_matches_linux_loader() {
         let mem = GuestRam::from_ranges(&[(RAM_BASE, RAM_LEN)]);
         for image in [
             synthetic_image(0x8_0000, 0x40_0000, 0x3000),
@@ -349,7 +349,7 @@ pub(crate) mod tests {
         assert!(err.contains("too short"), "{err}");
 
         let mem = GuestRam::from_ranges(&[(RAM_BASE, RAM_LEN)]);
-        let err = LoadedKernel::load(mem.memory(), &gz).expect_err("the loader refuses it too");
+        let err = LoadedKernel::load(mem.memory(), &gz).expect_err("linux-loader refuses it too");
         assert!(err.contains("arm64 Image"), "{err}");
     }
 
@@ -463,7 +463,9 @@ pub(crate) mod tests {
                     VirtioDevices::default(),
                 )
                 .expect("plan");
-            let prop = |name: &str| crate::fdt::tests::prop(&dtb, "chosen", name).expect(name);
+            let prop = |name: &str| {
+                crate::arch::aarch64::fdt::tests::prop(&dtb, "chosen", name).expect(name)
+            };
             (prop("rng-seed"), prop("kaslr-seed"))
         };
         let (first, second) = (seeds(), seeds());

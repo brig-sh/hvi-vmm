@@ -16,28 +16,27 @@
 //!
 //! Stands the backend up end to end with no Linux involved: one VM, one mapped
 //! guest page holding a two-instruction stub, one vCPU. The stub loads a marker
-//! into `x0` and executes `HVC #0`; a correct backend reports an
-//! `EXCEPTION` exit whose syndrome decodes to [`Ec::Hvc`](crate::esr::Ec::Hvc),
-//! with the marker readable back out of `x0`. That single round trip exercises
-//! VM creation, guest-RAM mapping, register programming, `hv_vcpu_run`, and the
-//! exit-syndrome decode that every later milestone's exit loop depends on.
+//! into `x0` and executes `HVC #0`; a correct backend reports an `EXCEPTION`
+//! exit whose syndrome decodes to [`Ec::Hvc`], with the marker readable back
+//! out of `x0`. That single round trip exercises VM creation, guest-RAM
+//! mapping, register programming, `hv_vcpu_run`, and the exit-syndrome decode
+//! that every later milestone's exit loop depends on.
 //!
 //! Running this needs the `com.apple.security.hypervisor` entitlement (a live
 //! boot is not run in CI because the runner cannot sign for it). A detached
 //! session is fine: an ad-hoc-signed, entitled hvi creates and runs a VM from a
 //! background job, so this is scriptable.
 //!
-//! [`run_shm`](crate::smoke::run_shm) is the same test over **shared** guest
-//! memory: the page is a POSIX shared-memory object mapped `MAP_SHARED` and
-//! handed to `hv_vm_map` directly, instead of an `applevisor`-owned allocation.
-//! That is the mechanism out-of-process observation needs on macOS
-//!, so this proves it end to end: the
+//! [`run_shm`] is the same test over **shared** guest memory: the page is a
+//! POSIX shared-memory object mapped `MAP_SHARED` and handed to `hv_vm_map`
+//! directly, instead of an `applevisor`-owned allocation. That is the mechanism
+//! out-of-process observation needs on macOS, so this proves it end to end: the
 //! guest executes from the shared page, writes to it, and a *separate process*
 //! reads the value back out.
 
 use applevisor::prelude::{MemPerms, Reg, VirtualMachine};
 
-use crate::esr::Ec;
+use crate::arch::aarch64::esr::Ec;
 
 /// Guest-physical base of the single mapped page. Any aligned IPA works for the
 /// smoke test; `0x4000_0000` mirrors the RAM base the arm64 Linux boot (M1)

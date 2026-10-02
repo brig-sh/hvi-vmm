@@ -209,7 +209,7 @@ impl Default for Uart16550 {
 mod tests {
     use super::*;
 
-    // COM-base offsets, as the machine passes them in.
+    // COM-base offsets, as the hypervisor backend passes them in.
     const RBR_THR: u16 = 0;
     const IER: u16 = 1;
     const IIR: u16 = 2;

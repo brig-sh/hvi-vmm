@@ -204,7 +204,7 @@ mod watcher {
             sandbox: true,
         };
 
-        let stop = hvi::machine::boot(cfg)?;
+        let stop = hvi::boot(cfg)?;
         eprintln!("[watch] guest stopped: {stop:?}");
         Ok(())
     }
@@ -222,7 +222,7 @@ fn main() {
 }
 
 // hvi compiles to a backend-less stub on every other host, so this example has
-// no `machine::boot` to call there. It still has to build, because
+// no `hvi::boot` to call there. It still has to build, because
 // `cargo clippy --all-targets` reaches examples on every target CI lints.
 #[cfg(not(any(
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),

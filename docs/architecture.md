@@ -16,24 +16,26 @@ combinations are built, selected at compile time by target triple.
 
 | Guest | Host | Backend module | Hypervisor API |
 | --- | --- | --- | --- |
-| aarch64 | macOS, Apple silicon | `machine_macos.rs` | Hypervisor.framework (`applevisor`) |
-| aarch64 | Linux | `machine_linux.rs` | KVM (`kvm-ioctls` 0.25) |
-| x86-64 | Linux | `machine_x86.rs` | KVM (`kvm-ioctls` 0.25) |
+| aarch64 | macOS, Apple silicon | `arch/aarch64/hvf.rs` | Hypervisor.framework (`applevisor`) |
+| aarch64 | Linux | `arch/aarch64/kvm.rs` | KVM (`kvm-ioctls` 0.25) |
+| x86-64 | Linux | `arch/x86_64/kvm.rs` | KVM (`kvm-ioctls` 0.25) |
 
 Two kinds of difference cut across those three, and conflating them is the
 usual mistake:
 
-- **Host differences** live in the `machine_*` modules: creating the VM,
-  mapping guest RAM, running vCPUs, injecting interrupts, and confinement.
-- **Guest-architecture differences** live in the boot and layout modules, and
-  they are larger. An arm64 guest gets an `Image`, a devicetree and PSCI. An
-  x86-64 guest gets a `bzImage` or an uncompressed `vmlinux` with a
-  `boot_params` page, an e820 map and an MP table. Some devices are
-  architecture-specific too: PL011 against 16550, and a CMOS RTC that only x86
-  needs.
+- **Host differences** live in the backend modules: creating the VM, mapping
+  guest RAM, running vCPUs, injecting interrupts, and confinement.
+- **Guest-architecture differences** live in the loader and layout modules
+  under `arch/<arch>/`, and they are larger. An arm64 guest gets an `Image`, a
+  devicetree and PSCI. An x86-64 guest gets a `bzImage` or an uncompressed
+  `vmlinux` with a `boot_params` page, an e820 map and an MP table. Some devices
+  are architecture-specific too: PL011 against 16550, and a CMOS RTC that only
+  x86 needs.
 
-Porting to a new host backend means one new `machine_*` file. Porting to a new
-guest architecture is a much larger job.
+Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file,
+its `mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` in `lib.rs`, its
+dependencies in `Cargo.toml`, and the backend `cfg` wherever it is repeated.
+Porting to a new guest architecture is a much larger job.
 
 On any other host triple the crate builds without a backend, so the shared
 code and its unit tests still compile everywhere. That build cannot run a
@@ -43,15 +45,15 @@ guest.
 flowchart TB
     subgraph host["Host process (hvi)"]
         cli["main.rs — CLI<br/>parses flags → BootConfig"]
-        subgraph backend["machine::boot(BootConfig) → Stop  (one of three, cfg-selected)"]
+        subgraph backend["hvi::boot(BootConfig) → Stop  (one of three, cfg-selected)"]
             direction LR
-            m1["machine_macos.rs<br/>Hypervisor.framework"]
-            m2["machine_linux.rs<br/>KVM / aarch64"]
-            m3["machine_x86.rs<br/>KVM / x86-64"]
+            m1["arch/aarch64/hvf.rs<br/>Hypervisor.framework"]
+            m2["arch/aarch64/kvm.rs<br/>KVM / aarch64"]
+            m3["arch/x86_64/kvm.rs<br/>KVM / x86-64"]
         end
         subgraph shared["Shared core"]
             direction LR
-            boot_["boot / boot_x86<br/>layout / layout_x86<br/>fdt / mptable"]
+            arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
             dev["virtio / virtio_net / tap<br/>virtio_vsock / virtio_fs<br/>pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugins · events ledger<br/>quiesce"]
             conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
@@ -75,8 +77,8 @@ Every backend exposes the same signature:
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
-`lib.rs` aliases the right one to `pub mod machine` by target, so the CLI and
-a linking crate use the same call. `Stop` is `SystemOff` or `SystemReset`.
+The crate root re-exports the one for the host target as `hvi::boot`, so the CLI
+and a linking crate use the same call. `Stop` is `SystemOff` or `SystemReset`.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
@@ -117,7 +119,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
 <img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, virtio-mmio window from 0x0d000000, RAM at 0x40000000" width="720">
 
-**aarch64** (`layout.rs`). Devices sit above the GIC, RAM at 1 GiB.
+**aarch64** (`arch/aarch64/layout.rs`). Devices sit above the GIC, RAM at 1 GiB.
 
 | Region | Address | Size | IRQ |
 | --- | --- | --- | --- |
@@ -138,12 +140,12 @@ range as device memory and cannot reach MMIO outside it. They sit above the
 GIC rather than below because `hv_gic`'s redistributor region is far larger
 than QEMU's and extends past QEMU virt's `0x0900_0000`.
 
-Those GIC values are the constants in `layout.rs`, and the Linux/KVM backend
-uses them through `GicLayout::for_vcpus`. **The macOS backend does not.** It
-builds its own layout: always v3, bases aligned down to what
-Hypervisor.framework requires, and both sizes taken from `hv_gic`'s own
-getters. A macOS guest is told whatever the framework reported, which is why a
-running VM logs a redistributor region that does not match the table:
+Those GIC values are the constants in `arch/aarch64/layout.rs`, and the
+Linux/KVM backend uses them through `GicLayout::for_vcpus`. **The macOS backend
+does not.** It builds its own layout: always v3, bases aligned down to what
+Hypervisor.framework requires, and both sizes taken from `hv_gic`'s own getters.
+A macOS guest is told whatever the framework reported, which is why a running VM
+logs a redistributor region that does not match the table:
 
 ```text
 [hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
@@ -151,7 +153,7 @@ running VM logs a redistributor region that does not match the table:
 
 <img src="img/guest-memory-x86.svg" alt="x86-64 guest memory: RAM from 0 to the MMIO hole at 0xd0000000, devices in the hole, RAM resuming at 4 GiB" width="720">
 
-**x86-64** (`layout_x86.rs`). RAM starts at 0 and has a hole.
+**x86-64** (`arch/x86_64/layout.rs`). RAM starts at 0 and has a hole.
 
 | Region | Address |
 | --- | --- |
@@ -200,11 +202,12 @@ flowchart TB
     D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
 ```
 
-`fdt.rs` builds the devicetree the kernel reads at `x0`. It emits PSCI with
-`method = "hvc"`, the interrupt controller the backend chose (`arm,gic-v3`, or
-`arm,cortex-a15-gic` for the compatible QEMU virt advertises for its vGICv2),
-the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock, the PL011
-console as `stdout-path`, and one `virtio_mmio@…` node per backed device.
+`arch/aarch64/fdt.rs` builds the devicetree the kernel reads at `x0`. It emits
+PSCI with `method = "hvc"`, the interrupt controller the backend chose
+(`arm,gic-v3`, or `arm,cortex-a15-gic` for the compatible QEMU virt advertises
+for its vGICv2), the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock,
+the PL011 console as `stdout-path`, and one `virtio_mmio@…` node per backed
+device.
 
 `/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
 every boot. Under HVF it is the guest's only entropy source at boot, since the
@@ -395,11 +398,11 @@ how it works.
 
 | Area | Files |
 | --- | --- |
-| Crate root and backend selection | `lib.rs` |
+| Crate root and backend selection | `lib.rs`, `arch/<arch>/mod.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
-| Backends | `machine_macos.rs`, `machine_linux.rs`, `machine_x86.rs`, `smoke.rs` |
-| arm64 guest support | `boot.rs`, `layout.rs`, `fdt.rs`, `pl011.rs`, `esr.rs`, `fdlimit.rs` |
-| x86-64 guest support | `boot_x86.rs`, `layout_x86.rs`, `mptable.rs`, `uart16550.rs`, `rtc_cmos.rs` |
+| Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
+| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`; `pl011.rs`, `fdlimit.rs` |
+| x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`; `uart16550.rs`, `rtc_cmos.rs` |
 | Guest memory | `guestmem.rs`, `sharedmem.rs` |
 | Devices | `virtio.rs`, `virtio_net.rs`, `tap.rs`, `virtio_vsock.rs`, `virtio_fs.rs`, `console.rs` |
 | Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
