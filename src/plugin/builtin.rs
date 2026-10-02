@@ -16,17 +16,14 @@
 //!
 //! Two ship with the VMM, and between them they use every part of the seam:
 //!
-//! - [`MemoryDump`](crate::plugins::MemoryDump) writes guest RAM to a file,
-//!   with the VM parked so the image is consistent. Post-mortem debugging, and
-//!   the thing you want when a guest wedges and the console has stopped
-//!   answering.
-//! - [`IoTrace`](crate::plugins::IoTrace) logs every virtio-blk request and
-//!   virtio-net frame as it crosses the device. The ledger already aggregates
-//!   flows; this is the unaggregated version, for when the aggregate is what
-//!   you distrust.
+//! - [`MemoryDump`] writes guest RAM to a file, with the VM parked so the image
+//!   is consistent. Post-mortem debugging, and the thing you want when a guest
+//!   wedges and the console has stopped answering.
+//! - [`IoTrace`] logs every virtio-blk request and virtio-net frame as it
+//!   crosses the device. The ledger already aggregates flows; this is the
+//!   unaggregated version, for when the aggregate is what you distrust.
 //!
-//! [`Chain`](crate::plugins::Chain) runs several at once, since a boot takes
-//! one plugin.
+//! [`Chain`] runs several at once, since a boot takes one plugin.
 //!
 //! These are also the worked examples. Between them they cover the two rules
 //! that are easy to get wrong and fail quietly: a pause you win, you owe (see

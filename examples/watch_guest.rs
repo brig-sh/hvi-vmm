@@ -16,8 +16,8 @@
 //! records where the boot vCPU is.
 //!
 //! This is the smallest thing that uses every rule a real plugin has to follow,
-//! so it is the file to copy from rather than the two in `src/plugins.rs`,
-//! which are bigger because they do something useful.
+//! so it is the file to copy from rather than the two in
+//! `src/plugin/builtin.rs`, which are bigger because they do something useful.
 //!
 //! Build and run it (macOS / Apple silicon shown; re-sign after every build):
 //!

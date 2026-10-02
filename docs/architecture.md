@@ -55,7 +55,7 @@ flowchart TB
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
-            obs["plugin: the seam<br/>plugins · events ledger<br/>hypervisor::quiesce"]
+            obs["plugin: the seam<br/>plugin::builtin · events ledger<br/>hypervisor::quiesce"]
             conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
             gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
         end
@@ -385,8 +385,8 @@ is and is not, including its buffering and loss behaviour, is in
 ## 7. The extension seam
 
 A VMM holds the guest's memory, can park its vCPUs, and is the other end of
-every virtio request. `plugin.rs` offers those three things to a tool, in four
-traits. The whole seam is optional: with no plugin the hooks cost one null
+every virtio request. `plugin/api.rs` offers those three things to a tool, in
+four traits. The whole seam is optional: with no plugin the hooks cost one null
 check per guest entry.
 
 The contract, the hook ordering and the rules that fail quietly are in
@@ -407,7 +407,7 @@ how it works.
 | Guest memory | `guestmem.rs`, `sharedmem.rs` |
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
-| Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
+| Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the

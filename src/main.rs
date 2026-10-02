@@ -19,11 +19,11 @@
 //! Everything of substance lives in the library, because the VMM is meant to be
 //! linked as well as run.
 //!
-//! `--dump-memory` and `--trace-io` attach the tools in [`hvi::plugins`]
-//! through the seam in [`hvi::plugin`]; with neither, nothing is attached and
-//! no guest memory is read for any purpose but running the guest. Another crate
-//! can link this one and supply its own [`hvi::plugin::Plugin`] the same way
-//! -- see `docs/plugins.md`.
+//! `--dump-memory` and `--trace-io` attach the tools in
+//! [`hvi::plugin::builtin`] through the seam in [`hvi::plugin`]; with neither,
+//! nothing is attached and no guest memory is read for any purpose but running
+//! the guest. Another crate can link this one and supply its own
+//! [`hvi::plugin::Plugin`] the same way -- see `docs/plugins.md`.
 
 // Share paths given on the command line are resolved once, before any
 // guest runs; see clippy.toml.
@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use hvi::config;
-use hvi::plugins::{Chain, IoTrace, MemoryDump};
+use hvi::plugin::builtin::{Chain, IoTrace, MemoryDump};
 
 #[cfg(target_arch = "aarch64")]
 use hvi::arch::aarch64::{fdt, layout, loader};

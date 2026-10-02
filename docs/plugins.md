@@ -6,11 +6,12 @@ the guest makes. Debuggers, tracers, profilers and crash-dumpers want one or
 more of those, and none of them belongs in the exit loop.
 
 So the exit loop offers them instead. That offer is
-[`src/plugin.rs`](../src/plugin.rs), and it is four traits wide.
+[`src/plugin/api.rs`](../src/plugin/api.rs), and it is four traits wide.
 
-[`examples/watch_guest.rs`](../examples/watch_guest.rs) is a complete
-extension in one file, compiled by CI. Read it alongside this page. The two
-tools in [`src/plugins.rs`](../src/plugins.rs) are the larger worked examples.
+[`examples/watch_guest.rs`](../examples/watch_guest.rs) is a complete extension
+in one file, compiled by CI. Read it alongside this page. The two tools in
+[`src/plugin/builtin.rs`](../src/plugin/builtin.rs) are the larger worked
+examples.
 
 For constructing the `BootConfig` that carries a plugin, read
 [embedding.md](embedding.md).
@@ -154,8 +155,8 @@ its own, not through this path.
 
 ## Running several
 
-A boot takes one plugin. `plugins::Chain` runs several, forwarding each hook
-to every member in insertion order. `attach` stops at the first error.
+A boot takes one plugin. `plugin::builtin::Chain` runs several, forwarding each
+hook to every member in insertion order. `attach` stops at the first error.
 
 ## What this is not
 
