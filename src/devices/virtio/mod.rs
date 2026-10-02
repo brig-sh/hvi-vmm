@@ -14,19 +14,19 @@
 
 //! The virtio devices over MMIO, and the split virtqueue they share.
 //!
-//! `net`, `vsock` and, on macOS, `fs` are devices. `queue` holds the split
-//! virtqueue, the virtio-mmio register offsets and virtio-blk. Each device
-//! decodes its own register window and serves its queues through `Queue`. `tap`
-//! attaches virtio-net to a host tap device and holds the `virtio_net_hdr_v1`
-//! framing every tap read and write carries.
+//! `block`, `net`, `vsock` and, on macOS, `fs` are the devices. Each decodes
+//! its own register window with the offsets in `mmio` and serves its queues
+//! through `Queue`, which `queue` holds. `tap` attaches virtio-net to a host
+//! tap device and holds the `virtio_net_hdr_v1` framing every tap read and
+//! write carries.
 
+pub mod block;
 #[cfg(target_os = "macos")]
 pub mod fs;
+pub(crate) mod mmio;
 pub mod net;
-pub mod queue;
+mod queue;
 pub mod tap;
-#[cfg(test)]
-mod used_ring_litmus;
 pub mod vsock;
 
-pub(crate) use queue::{reg, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use queue::{Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};

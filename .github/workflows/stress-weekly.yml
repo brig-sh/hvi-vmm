@@ -92,7 +92,7 @@ jobs:
           # matches it but `--ignored` then excludes it, and the step
           # reports "running 0 tests" and exits zero.
           timeout --foreground -k 30 600 "$BIN" \
-            devices::virtio::used_ring_litmus::push_used_is_never_observed_torn \
+            devices::virtio::queue::ordering_tests::push_used_is_never_observed_torn \
             --exact --include-ignored --nocapture 2>&1 | tee litmus.log
           # A filter that matches nothing also exits zero. Assert that one
           # test ran, or the lane cannot tell a pass from a test that never
@@ -131,7 +131,7 @@ jobs:
           The weekly run of the ignored used-ring litmus test failed.
 
           - Run: $run_url
-          - Test: \`src/devices/virtio/used_ring_litmus.rs\`, on an arm64 runner
+          - Test: \`ordering_tests\` in \`src/devices/virtio/queue.rs\`, on an arm64 runner
 
           A torn read points at a missing or reordered fence on the used-ring
           publish path. A timeout points at the flow-control deadlock the
