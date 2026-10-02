@@ -313,7 +313,7 @@ jobs:
           echo "test binary: $BIN"
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
           sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
-            virtio::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture \
+            devices::virtio::queue::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture \
             | tee blk.log || true
           sudo losetup -d "$LOOP"
           grep -q "test result: ok. 1 passed" blk.log \

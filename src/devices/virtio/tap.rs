@@ -24,7 +24,7 @@
 //! `parse_mac` are pure and portable, so the backends share one copy and the
 //! portable test suite covers it everywhere.
 
-use crate::virtio_net::NET_HDR_LEN;
+use crate::devices::virtio::net::NET_HDR_LEN;
 
 /// Prepends the all-zero `virtio_net_hdr_v1` a tap write must carry.
 ///

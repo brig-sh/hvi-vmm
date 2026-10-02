@@ -1,9 +1,10 @@
 # Measuring virtio-fs
 
-The unit tests in `src/virtio_fs.rs` drive the FUSE handlers directly: no
-guest, no virtqueue, no VM exits. That is the right shape for correctness, and
-it is blind to everything that decides how fast the filesystem feels. A change
-that made small writes 2.6 times slower passed every one of them.
+The unit tests in `src/devices/virtio/fs/server.rs` drive the FUSE handlers
+directly: no guest, no virtqueue, no VM exits. That is the right shape for
+correctness, and it is blind to everything that decides how fast the filesystem
+feels. A change that made small writes 2.6 times slower passed every one of
+them.
 
 Two things close that gap, and they measure different quantities.
 

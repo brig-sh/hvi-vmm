@@ -292,10 +292,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
             // The uid and gid the host's files carry inside the guest. The
-            // default is root, which suits a guest whose workload runs as
-            // root; a guest running as another user needs its own uid here,
-            // or the guest kernel refuses every write to a shared directory.
-            // See `virtio_fs::set_guest_ids`.
+            // default is root, which suits a guest whose workload runs as root;
+            // a guest running as another user needs its own uid here, or the
+            // guest kernel refuses every write to a shared directory. See
+            // `devices::virtio::fs::set_guest_ids`.
             "--fs-uid" => fs_uid = it.next().ok_or("--fs-uid needs a value")?.parse()?,
             "--fs-gid" => fs_gid = it.next().ok_or("--fs-gid needs a value")?.parse()?,
             "--share-ro" | "--share-rw" => {
@@ -362,7 +362,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--net-mac" => {
                 let v = it.next().ok_or("--net-mac needs a value")?;
                 net_mac = Some(
-                    hvi::tap::parse_mac(v)
+                    hvi::devices::virtio::tap::parse_mac(v)
                         .ok_or_else(|| format!("--net-mac is not a MAC address: {v}"))?,
                 );
             }
@@ -403,11 +403,11 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // and a device already answering with the old identity would leave the
     // guest with files it cannot write.
     //
-    // macOS only, because virtio_fs is: the Linux backend has no in-process
-    // file server. The flags still parse there so a command line is portable;
-    // on Linux they configure nothing.
+    // macOS only, because the virtio-fs server is: the Linux backend has no
+    // in-process file server. The flags still parse there so a command line is
+    // portable; on Linux they configure nothing.
     #[cfg(target_os = "macos")]
-    hvi::virtio_fs::set_guest_ids(fs_uid, fs_gid);
+    hvi::devices::virtio::fs::set_guest_ids(fs_uid, fs_gid);
     #[cfg(not(target_os = "macos"))]
     let _ = (fs_uid, fs_gid);
 

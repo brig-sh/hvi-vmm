@@ -31,8 +31,8 @@ use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
+use crate::devices::virtio::{reg, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::guestmem::GuestRam;
-use crate::virtio::{reg, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
@@ -633,10 +633,10 @@ impl VirtioVsock {
             // that holds exactly a header cannot carry a payload: splitting
             // there would hand the guest a zero-payload RW packet and push the
             // whole of the original back, consuming every buffer it posts
-            // without moving a byte. As in `virtio_net::inject_rx`, a head
-            // that can never hold what is waiting blocks the packets behind it
-            // until the guest reposts one that can; leave the queue alone
-            // rather than complete it with a partial packet.
+            // without moving a byte. As in `net::inject_rx`, a head that can
+            // never hold what is waiting blocks the packets behind it until the
+            // guest reposts one that can; leave the queue alone rather than
+            // complete it with a partial packet.
             if cap < HDR_LEN || (waiting > cap && cap == HDR_LEN) {
                 return;
             }
@@ -714,7 +714,7 @@ mod session_tests {
     use std::io::Read;
     use std::time::Duration;
 
-    use crate::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::devices::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     fn mem_of(len: usize) -> GuestRam {
         GuestRam::from_ranges(&[(0x4000_0000, len)])

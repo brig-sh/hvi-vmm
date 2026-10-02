@@ -47,16 +47,17 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
+use crate::devices::legacy::pl011::Pl011;
+use crate::devices::virtio::fs::server::VirtioFs;
+use crate::devices::virtio::net::VirtioNet;
+use crate::devices::virtio::queue::VirtioBlk;
+use crate::devices::virtio::reg;
+use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;
-use crate::pl011::Pl011;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
-use crate::virtio::{reg, VirtioBlk};
-use crate::virtio_fs::VirtioFs;
-use crate::virtio_net::VirtioNet;
-use crate::virtio_vsock::VirtioVsock;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
@@ -317,19 +318,22 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Err(e) => {
                 eprintln!(
                     "[hvi] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    crate::virtio_net::stub_stack_line()
+                    crate::devices::virtio::net::stub_stack_line()
                 );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        eprintln!("[hvi] virtio-net: {}", crate::virtio_net::stub_stack_line());
+        eprintln!(
+            "[hvi] virtio-net: {}",
+            crate::devices::virtio::net::stub_stack_line()
+        );
         Some(VirtioNet::new())
     } else {
         None
     };
 
-    let net = crate::virtio_net::share(net, cfg.net_mac);
+    let net = crate::devices::virtio::net::share(net, cfg.net_mac);
 
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
         eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
@@ -392,7 +396,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         // from the guest side took a session of guessing, and one line here
         // would have ended it in a single run.
         if index == 0 {
-            match crate::fdlimit::raise_open_file_limit() {
+            match crate::devices::virtio::fs::fdlimit::raise_open_file_limit() {
                 Ok(limit) => eprintln!("[hvi] open-file limit: {limit}"),
                 Err(e) => eprintln!(
                     "[hvi] open-file limit: could not raise it ({e}); \
@@ -624,7 +628,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             .map(|(o, c, n)| {
                 format!(
                     "{}({})={}/{:.1}ms",
-                    crate::virtio_fs::opcode_name(o),
+                    crate::devices::virtio::fs::server::opcode_name(o),
                     o,
                     c,
                     n as f64 / 1e6
@@ -1311,7 +1315,7 @@ fn spawn_vsock_bridge(
                             break;
                         }
                     }
-                    let n = match crate::virtio_vsock::read_host(&mut reader, &mut buf) {
+                    let n = match crate::devices::virtio::vsock::read_host(&mut reader, &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
@@ -1343,8 +1347,8 @@ fn spawn_vsock_bridge(
 /// queue under the device lock, raising the net GIC line and kicking the vCPUs.
 /// Exits when the gateway closes the connection or the stop is requested.
 ///
-/// [`crate::virtio_net::GatewayRelay`] owns the wait, the drain and the
-/// framing. This thread supplies the delivery under the device lock, the
+/// [`crate::devices::virtio::net::GatewayRelay`] owns the wait, the drain and
+/// the framing. This thread supplies the delivery under the device lock, the
 /// interrupt and the kick.
 fn spawn_net_gateway_reader(
     reader: std::os::unix::net::UnixStream,
@@ -1355,7 +1359,7 @@ fn spawn_net_gateway_reader(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let relayed = crate::virtio_net::GatewayRelay::new(reader).run(&stop, |frame| {
+        let relayed = crate::devices::virtio::net::GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);

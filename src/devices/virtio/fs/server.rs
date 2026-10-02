@@ -38,9 +38,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
+use crate::devices::virtio::{reg, Queue, QUEUE_NUM_MAX};
 use crate::guestmem::GuestRam;
 use crate::sync::lock_or_recover;
-use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
 const MAGIC_VALUE: u64 = 0x7472_6976;
 const VIRTIO_FS_ID: u64 = 26;
@@ -491,10 +491,10 @@ const READAHEAD_MAX_DIRS: usize = 256;
 /// Directories queued for the workers at once. Past this, the one queued
 /// earliest goes, which is the one a walk reaches last.
 ///
-/// A queued directory holds its parent's descriptor, shared with its
-/// siblings, so this also bounds the descriptors the queue holds. They are
-/// not in the guest's handle budget and come out of the VMM's reserve in
-/// [`crate::fdlimit`], which is larger.
+/// A queued directory holds its parent's descriptor, shared with its siblings,
+/// so this also bounds the descriptors the queue holds. They are not in the
+/// guest's handle budget and come out of the VMM's reserve in
+/// [`crate::devices::virtio::fs::fdlimit`], which is larger.
 const READAHEAD_MAX_QUEUED: usize = 64;
 
 /// Subdirectories a worker queues from one directory it prepared, the first
@@ -1216,11 +1216,11 @@ pub struct VirtioFs {
     /// Most guest handles this export will hold open at once (#34).
     ///
     /// Each OPEN pins a host `File` in `handles` and each OPENDIR one in
-    /// `dir_handles`, released only when the guest sends RELEASE or
-    /// RELEASEDIR -- so how much of the process's descriptor table the guest
-    /// spends was, until now, the guest's decision alone. See
-    /// [`crate::fdlimit::guest_handle_budget`] for why the number is derived
-    /// rather than written down.
+    /// `dir_handles`, released only when the guest sends RELEASE or RELEASEDIR.
+    /// Without this limit the guest alone would decide how much of the
+    /// process's descriptor table it spends. See
+    /// [`crate::devices::virtio::fs::fdlimit::guest_handle_budget`] for why the
+    /// number is derived rather than written down.
     handle_limit: usize,
     /// The most handles this export has held at once, for the report when the
     /// VM stops. The issue asks for this before any limit is tightened: a
@@ -1368,14 +1368,14 @@ impl VirtioFs {
             fh0_finished: HashSet::new(),
             readahead: Readahead::new(),
             next_handle: 1,
-            handle_limit: crate::fdlimit::guest_handle_budget(),
+            handle_limit: crate::devices::virtio::fs::fdlimit::guest_handle_budget(),
             parked: HashMap::new(),
             parked_order: VecDeque::new(),
             parked_ticks: 0,
             // A quarter of the guest's own budget: enough for the working set
             // of headers a compiler reopens, small enough that the guest can
             // still hold the handles it is entitled to.
-            parked_limit: crate::fdlimit::guest_handle_budget() / 4,
+            parked_limit: crate::devices::virtio::fs::fdlimit::guest_handle_budget() / 4,
             parked_hits: 0,
             parked_misses: 0,
             peak_handles: 0,
@@ -5028,7 +5028,7 @@ fn sync_file(file: &File, flags: u32) -> Result<(), i32> {
 /// budget on a 256-descriptor soft limit, which would let the cache meet the
 /// handle limit with no guest handle open at all.
 fn dir_cache_limit() -> usize {
-    let budget = crate::fdlimit::guest_handle_budget();
+    let budget = crate::devices::virtio::fs::fdlimit::guest_handle_budget();
     (budget / 16).clamp(128, 4096).min(budget / 4)
 }
 
@@ -8054,7 +8054,7 @@ mod tests {
     // If a change lowers either number, measure again, set the new value
     // here, and say in the commit why the path is cheaper.
     //
-    // `virtio_fs` builds on macOS only, so CI runs this test in the
+    // `devices::virtio::fs` builds on macOS only, so CI runs this test in the
     // `build-and-test-macos` job. It needs no quiet or dedicated runner.
     #[test]
     fn the_metadata_workload_spends_a_pinned_host_budget() {
@@ -11694,11 +11694,11 @@ mod tests {
     }
 
     // --- Task 3: the direct-path tests below drive a real virtqueue over a
-    // `GuestRam` backed by a plain `Vec<u8>`, the same pattern virtio_net.rs
-    // uses. Everything above this point exercises `handle_fuse` with no
-    // guest memory at all, which is the buffered path; these instead go
-    // through `mmio`/`process_queue`/`handle_chain` so the READ/WRITE direct
-    // path in `handle_fuse_desc` is what actually runs.
+    // `GuestRam` backed by a plain `Vec<u8>`, the same pattern `virtio::net`
+    // uses. Everything above this point exercises `handle_fuse` with no guest
+    // memory at all, which is the buffered path; these instead go through
+    // `mmio`/`process_queue`/`handle_chain` so the READ/WRITE direct path in
+    // `handle_fuse_desc` is what actually runs.
 
     const REQ_QUEUE: u32 = 0;
 

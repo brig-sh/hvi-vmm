@@ -3,10 +3,10 @@
 Boots a guest, mounts one virtio-fs share, runs a workload, and prints how
 long each phase took. macOS only, because that is where the device compiles.
 
-The unit tests in `src/virtio_fs.rs` drive the FUSE handlers directly, with no
-guest and no virtqueue. That is right for correctness and blind to speed: a
-change that made small writes 2.6 times slower passed every one of them. This
-is what sees that.
+The unit tests in `src/devices/virtio/fs/server.rs` drive the FUSE handlers
+directly, with no guest and no virtqueue. That is right for correctness and
+blind to speed: a change that made small writes 2.6 times slower passed every
+one of them. This is what sees that.
 
 **[docs/benchmarking.md](../../docs/benchmarking.md) is the guide**: what to
 measure, how to compare two builds, the known bimodal result, and the CI

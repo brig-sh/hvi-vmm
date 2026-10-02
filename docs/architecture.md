@@ -54,7 +54,7 @@ flowchart TB
         subgraph shared["Shared core"]
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
-            dev["virtio / virtio_net / tap<br/>virtio_vsock / virtio_fs<br/>pl011 / uart16550 / rtc_cmos"]
+            dev["devices/virtio: queue / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugins · events ledger<br/>quiesce"]
             conf["sandbox (Seatbelt)<br/>seccomp (bpf)"]
             gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
@@ -82,8 +82,8 @@ and a linking crate use the same call. `Stop` is `SystemOff` or `SystemReset`.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
-Two settings a caller supplies are not in `BootConfig`: the guest file
-ownership (`virtio_fs::set_guest_ids`, process-global) and the `HVI_*`
+Two settings a caller supplies are not in `BootConfig`: the guest file ownership
+(`devices::virtio::fs::set_guest_ids`, process-global) and the `HVI_*`
 environment variables. See
 [embedding.md](embedding.md#configuration-outside-bootconfig).
 
@@ -305,15 +305,15 @@ Interrupt injection is the one device-facing thing that differs by backend:
 
 ### Devices
 
-- **virtio-blk** (`virtio.rs`, id 2) backs `--disk`. It advertises
+- **virtio-blk** (`devices/virtio/queue.rs`, id 2) backs `--disk`. It advertises
   `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync.
-- **virtio-net** (`virtio_net.rs`, id 1) has three modes. See
+- **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
-- **virtio-vsock** (`virtio_vsock.rs`, id 19) is the exec channel. Host CID 2,
-  guest CID 3, port 1024.
-- **virtio-fs** (`virtio_fs.rs`, id 26, macOS only) serves the guest's FUSE
-  messages itself over a hiprio and a request queue. See
+- **virtio-vsock** (`devices/virtio/vsock.rs`, id 19) is the exec channel. Host
+  CID 2, guest CID 3, port 1024.
+- **virtio-fs** (`devices/virtio/fs/`, id 26, macOS only) serves the guest's
+  FUSE messages itself over a hiprio and a request queue. See
   [storage-and-sharing.md](storage-and-sharing.md).
 
 A write of 0 to a device's STATUS register resets it: every queue returns to
@@ -338,9 +338,10 @@ carries a release fence per drain pass: free on x86, `dmb` on arm64. Without
 it an arm64 guest observed the bumped index before the element and broke its
 virtqueue with `id 65 is not a head!`.
 
-`used_ring_litmus.rs` drives the real `push_used` against a consumer that
-behaves like the driver. It demonstrates the defect and the fix, and it does
-not reliably catch a regression, so it is `#[ignore]`d and run weekly.
+`devices/virtio/used_ring_litmus.rs` drives the real `push_used` against a
+consumer that behaves like the driver. It demonstrates the defect and the fix,
+and it does not reliably catch a regression, so it is `#[ignore]`d and run
+weekly.
 
 Every descriptor-chain walker refuses an index outside the ring and caps the
 walk at the ring size, so a cycle runs out of budget. Re-programming any queue
@@ -401,13 +402,13 @@ how it works.
 | Crate root and backend selection | `lib.rs`, `arch/<arch>/mod.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
 | Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
-| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`; `pl011.rs`, `fdlimit.rs` |
-| x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`; `uart16550.rs`, `rtc_cmos.rs` |
+| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
+| x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
 | Guest memory | `guestmem.rs`, `sharedmem.rs` |
-| Devices | `virtio.rs`, `virtio_net.rs`, `tap.rs`, `virtio_vsock.rs`, `virtio_fs.rs`, `console.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox.rs` (macOS), `seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin.rs`, `plugins.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `used_ring_litmus.rs` |
+| Concurrency | `quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/used_ring_litmus.rs` |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

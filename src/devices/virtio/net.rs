@@ -49,9 +49,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::guestmem::GuestRam;
 
+use crate::devices::virtio::{reg, Queue, QUEUE_NUM_MAX};
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
-use crate::virtio::{reg, Queue, QUEUE_NUM_MAX};
 
 const VIRTIO_NET_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_NET as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
@@ -303,9 +303,9 @@ impl GatewayRelay {
 /// One relay from the tap to the guest, run on the reader thread.
 ///
 /// One `read` returns exactly one frame, preceded by the `virtio_net_hdr` the
-/// tap was created with, which [`crate::tap::strip_vnet_hdr`] drops before
-/// delivery. The read buffer is [`MAX_FRAME_LEN`] bytes, so the tap accepts
-/// `NET_HDR_LEN` bytes less than the gateway.
+/// tap was created with, which [`crate::devices::virtio::tap::strip_vnet_hdr`]
+/// drops before delivery. The read buffer is [`MAX_FRAME_LEN`] bytes, so the
+/// tap accepts `NET_HDR_LEN` bytes less than the gateway.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -358,7 +358,7 @@ impl TapRelay {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(e),
                 };
-                if let Some(frame) = crate::tap::strip_vnet_hdr(&self.buf, n) {
+                if let Some(frame) = crate::devices::virtio::tap::strip_vnet_hdr(&self.buf, n) {
                     deliver(frame);
                 }
             }
@@ -615,7 +615,7 @@ impl VirtioNet {
                 mem.read_u16(da + 12).ok()?,
                 mem.read_u16(da + 14).ok()?,
             );
-            if flags & crate::virtio::VIRTQ_DESC_F_WRITE == 0 {
+            if flags & crate::devices::virtio::VIRTQ_DESC_F_WRITE == 0 {
                 // Readable segment (device-readable). The length comes from
                 // the guest, so it is checked against the ceiling before it
                 // is allowed to size an allocation, and the bytes are read
@@ -629,7 +629,7 @@ impl VirtioNet {
                 buf.resize(start + len, 0);
                 mem.read(addr, &mut buf[start..]).ok()?;
             }
-            if flags & crate::virtio::VIRTQ_DESC_F_NEXT == 0 {
+            if flags & crate::devices::virtio::VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             d = next;
@@ -690,14 +690,14 @@ impl VirtioNet {
             ) else {
                 return;
             };
-            if flags & crate::virtio::VIRTQ_DESC_F_WRITE != 0 && written < out.len() {
+            if flags & crate::devices::virtio::VIRTQ_DESC_F_WRITE != 0 && written < out.len() {
                 let n = (len as usize).min(out.len() - written);
                 if mem.write(addr, &out[written..written + n]).is_err() {
                     return;
                 }
                 written += n;
             }
-            if flags & crate::virtio::VIRTQ_DESC_F_NEXT == 0 {
+            if flags & crate::devices::virtio::VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             d = next;
@@ -741,10 +741,10 @@ impl VirtioNet {
 
     /// Writes one guest Ethernet frame to the tap, prefixed with the all-zero
     /// `virtio_net_hdr_v1` its `IFF_VNET_HDR` framing expects (see
-    /// [`crate::tap::prepend_vnet_hdr`]).
+    /// [`crate::devices::virtio::tap::prepend_vnet_hdr`]).
     fn write_to_tap(&mut self, frame: &[u8]) {
         if let Some(tap) = self.tap.as_mut() {
-            match tap.write_all(&crate::tap::prepend_vnet_hdr(frame)) {
+            match tap.write_all(&crate::devices::virtio::tap::prepend_vnet_hdr(frame)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // The tap's send buffer is full. The tap is non-blocking
@@ -1396,9 +1396,9 @@ mod tests {
             let relay = std::thread::spawn(move || {
                 TapRelay::new(dev).run(&token, |frame| tx.send(frame.to_vec()).expect("send"))
             });
-            host.send(&crate::tap::prepend_vnet_hdr(b"one"))
+            host.send(&crate::devices::virtio::tap::prepend_vnet_hdr(b"one"))
                 .expect("send");
-            host.send(&crate::tap::prepend_vnet_hdr(b"two"))
+            host.send(&crate::devices::virtio::tap::prepend_vnet_hdr(b"two"))
                 .expect("send");
             let wait = std::time::Duration::from_secs(5);
             assert_eq!(rx.recv_timeout(wait).expect("first"), b"one".to_vec());
@@ -1415,7 +1415,7 @@ mod tests {
         fn delivers_one_burst_per_wakeup() {
             let source = StopSource::new().expect("pair");
             let (host, dev) = tap_pair();
-            let frame = crate::tap::prepend_vnet_hdr(b"x");
+            let frame = crate::devices::virtio::tap::prepend_vnet_hdr(b"x");
             let mut queued = 0;
             while host.send(&frame).is_ok() {
                 queued += 1;

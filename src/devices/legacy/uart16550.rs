@@ -144,8 +144,8 @@ impl Uart16550 {
 
     /// Returns whether COM1's interrupt line should be asserted right now.
     ///
-    /// The line is high exactly when an IIR read would report an interrupt.
-    /// The [module documentation](crate::uart16550) says why.
+    /// The line is high exactly when an IIR read would report an interrupt. The
+    /// [module documentation](self) says why.
     #[must_use]
     pub fn irq_level(&self) -> bool {
         self.interrupt_id() != IIR_NONE
