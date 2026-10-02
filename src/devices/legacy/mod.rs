@@ -16,9 +16,6 @@
 //! carry its serial console, and the MC146818 CMOS RTC an x86-64 guest reads
 //! for the wall clock at boot.
 
-#[cfg(target_arch = "aarch64")]
 pub mod pl011;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod rtc_cmos;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod uart16550;
