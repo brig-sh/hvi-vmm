@@ -46,6 +46,11 @@ The stack parses the question, records the name, and asks the host to resolve
 it. It refuses a question that uses a compression pointer, and one whose name
 runs past the end of the message without room for the type and class.
 
+Each query is also logged on stderr as `[virtio-net] dns query <name>`. That
+line escapes every character outside printable ASCII (`\u{1b}` for ESC, `\n` for
+a newline), since a label may carry any byte. The ledger records the name as the
+guest sent it.
+
 **Name resolution does not work while confined.** Resolving needs a socket,
 and neither the macOS Seatbelt profile nor the Linux seccomp allowlists grant
 one. The query is still parsed and recorded, so the reply reaches the guest

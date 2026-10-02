@@ -996,7 +996,7 @@ impl VirtioNet {
             return None;
         }
         let (name, qend) = parse_dns_name(dns, 12)?;
-        eprint!("\r\n[virtio-net] dns query {name}\r\n");
+        eprint!("{}", dns_query_line(&name));
         self.capture(
             IP_UDP,
             GUEST_IP,
@@ -1144,6 +1144,15 @@ fn parse_dns_name(msg: &[u8], off: usize) -> Option<(String, usize)> {
         return None;
     }
     Some((name, qend))
+}
+
+/// Returns the stderr line that reports a DNS query for `name`.
+///
+/// The name is the guest's, and a label may carry any byte. The line reaches a
+/// terminal or a log, so every character outside printable ASCII is written as
+/// an escape. The ledger keeps the name as the guest sent it.
+fn dns_query_line(name: &str) -> String {
+    format!("\r\n[virtio-net] dns query {}\r\n", name.escape_default())
 }
 
 /// Best-effort TLS SNI from a TCP payload that begins with a TLS ClientHello.
@@ -1526,6 +1535,29 @@ mod tests {
         mem.write_u16(BASE + 142, 0).unwrap();
         assert_eq!(net.read_tx_frame(&mem, 0), None);
         assert_eq!(net.read_tx_frame(&mem, 8), None, "an out-of-ring head");
+    }
+
+    // OSC 52 with its BEL would write the operator's clipboard, and a newline
+    // would forge a second log line.
+    #[test]
+    fn a_qname_with_terminal_control_bytes_is_escaped_on_stderr() {
+        let mut msg = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        let osc: &[u8] = b"\x1b]52;c;QUJD\x07";
+        msg.push(osc.len() as u8);
+        msg.extend_from_slice(osc);
+        msg.extend_from_slice(b"\x08new\nline");
+        msg.push(0);
+        msg.extend_from_slice(&[0, 1, 0, 1]);
+        let (name, _) = parse_dns_name(&msg, 12).expect("the question is well formed");
+        assert_eq!(name, "\x1b]52;c;QUJD\x07.new\nline", "the ledger's copy");
+
+        let line = dns_query_line(&name);
+        let body = line.trim_matches(['\r', '\n']);
+        assert!(body.bytes().all(|b| (0x20..0x7f).contains(&b)), "{line:?}");
+        assert!(
+            body.ends_with(r"\u{1b}]52;c;QUJD\u{7}.new\nline"),
+            "{line:?}"
+        );
     }
 
     // Unikraft posts the virtio-net header and the frame as two descriptors
