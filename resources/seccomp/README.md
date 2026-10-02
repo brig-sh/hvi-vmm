@@ -50,6 +50,26 @@ The musl build shares the lists. musl can reach a different syscall than glibc
 for the same library call, so `hvi seccomp-selftest` run on the musl binary is
 the check for that.
 
+## Argument conditions
+
+`ioctl` is the one rule with conditions, in both lists of both files. They
+refuse two requests on any descriptor, `TIOCSTI` (0x5412) and `TIOCLINUX`
+(0x541C). A refused request matches no rule and traps like an off-list
+syscall. The module docs say why these two.
+
+```json
+{"syscall": "ioctl", "args": [
+    {"index": 1, "type": "dword", "op": "ne", "val": 21522, "comment": "TIOCSTI (0x5412)"}
+]}
+```
+
+- Every condition of a rule must hold for the rule to match. A second rule
+  for the same syscall is a second way to match.
+- JSON has no hex literals, so `val` is decimal and the comment gives the hex.
+- An `ioctl` request is compared as a `dword`, the low 32 bits. The kernel
+  reads the request as an `unsigned int`, so it runs `0xffffffff00005412` as
+  `TIOCSTI`, and a `qword` comparison would let that value through.
+
 ## Changing a list
 
 Adding a syscall is granting a right to a process that parses guest-controlled
@@ -65,7 +85,9 @@ data, so the bar is a demonstrated need, not a suspicion:
 3. `cargo test` -- the unit tests check that both lists compile for the target
    arch, that `vcpu` stays a strict subset of `vmm`, and that neither list ever
    gains `open*`, `socket`, `connect`, `execve`, `seccomp` or `prctl`, each of
-   which would undo the reason the filters go in after setup.
+   which would undo the reason the filters go in after setup. One more runs
+   the compiled `ioctl` rule of both files over the refused requests and a few
+   allowed ones.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
 
