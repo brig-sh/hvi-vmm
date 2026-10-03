@@ -22,8 +22,5 @@
 
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(target_os = "linux")]
 pub mod seccomp;

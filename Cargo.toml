@@ -11,20 +11,16 @@ repository = "https://github.com/brig-sh/hvi-vmm"
 #   macOS + aarch64  -> Apple Hypervisor.framework (applevisor)
 #   Linux + aarch64  -> KVM (kvm-ioctls / kvm-bindings), arm64 guest
 #   Linux + x86_64   -> KVM (kvm-ioctls / kvm-bindings), x86-64 guest
-# On any other host the crate builds to a stub (see src/main.rs), so the shared,
-# hypervisor-agnostic logic and its unit tests still compile everywhere.
+# On any other target the build stops with a compile error.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Kernel virtio headers as bindgen output: feature bits, device ids, the mmio
-# register map and the net header layout. Every VMM target needs them, and so
-# does the portable stub build, since the shared device code and its unit tests
-# compile everywhere.
+# register map and the net header layout. Every backend needs them.
 virtio-bindings = "0.2.7"
 # Guest RAM as a region collection, the type the rust-vmm crates take as guest
 # memory. `backend-mmap` maps each region from the shareable object in
-# `sharedmem`. The device code and its unit tests compile everywhere, so this
-# is portable too.
+# `sharedmem`.
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 # Kernel image loaders and boot configurators over that memory: the arm64
 # `Image` loader with the devicetree configurator, and the x86 `bzImage`

@@ -13,7 +13,7 @@ three things a reader should not have to guess between:
 | --- | --- | --- |
 | The backend is chosen at compile time by target triple. | There is no runtime flag to pick one. Cross-compiling checks a backend, it does not produce a runnable one for this host. | Design |
 | virtio-fs is macOS only. | The Linux backends carry no directory sharing at all. Use a disk image. | Design |
-| A non-backend host builds a stub. | The shared code and unit tests compile everywhere. That build cannot run a guest. | Design |
+| Only three host targets are supported. | aarch64 macOS, aarch64 Linux and x86-64 Linux. On any other target the build stops with a compile error. | Design |
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | The KVM backends need kernel 4.11 or newer. | hvi stops a vCPU through `kvm_run.immediate_exit` and refuses to boot without `KVM_CAP_IMMEDIATE_EXIT`, which 4.11 added. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |

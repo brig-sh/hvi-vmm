@@ -24,9 +24,9 @@ defaults:
     shell: bash
 
 jobs:
-  # Unit tests for the shared core on a cheap x86 Linux runner. Neither the
-  # macOS nor the arm64 backend compiles here (both are gated by target), so
-  # this proves the hypervisor-agnostic logic passes anywhere.
+  # Unit tests for the shared code and the x86-64 KVM backend on a cheap x86
+  # Linux runner. The macOS and arm64 backends are gated by target and have jobs
+  # of their own.
   test-portable:
     name: Test portable
     runs-on: ubuntu-latest
@@ -162,10 +162,8 @@ jobs:
       # on each release that CI sees.
       - name: seatbelt selftest
         run: |
-          # On a target that hvi does not cover, such as an Intel mac, the
-          # binary prints a notice and exits zero. A change of runner image
-          # could therefore make this step do nothing. Assert the success
-          # line, so the step cannot pass unless the probes ran.
+          # Assert the success line as well as the exit status, so the step
+          # cannot pass unless the probes ran.
           ./target/release/hvi sandbox-selftest | tee selftest.log
           grep -q "every probe matched the profile" selftest.log
 

@@ -76,22 +76,15 @@ pub fn guest_handle_budget() -> usize {
 
 /// The soft `RLIMIT_NOFILE` in force right now.
 fn current_open_file_limit() -> Option<u64> {
-    #[cfg(unix)]
-    {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes into a struct we own and fully initialised.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-            return None;
-        }
-        Some(lim.rlim_cur)
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into a struct we own and fully initialized.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
     }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    Some(lim.rlim_cur)
 }
 
 /// Raises the soft open-file limit to the hard limit, and reports what was
@@ -102,60 +95,52 @@ fn current_open_file_limit() -> Option<u64> {
 /// simply cannot serve as many open files at once, and saying so is more useful
 /// than refusing to start.
 pub fn raise_open_file_limit() -> Result<u64, String> {
-    #[cfg(unix)]
-    {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes into a struct we own and fully initialised.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-            return Err(format!(
-                "could not read the open-file limit: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let current: u64 = lim.rlim_cur;
-        let wanted = desired_limit(lim.rlim_max);
-        if current >= wanted {
-            return Ok(current);
-        }
-
-        let mut next = lim;
-        next.rlim_cur = wanted;
-        // SAFETY: setrlimit reads a struct we own and fully initialised.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
-            return Ok(wanted);
-        }
-        // Raising to the hard limit can still be refused. Try the largest value
-        // that is accepted rather than giving up on the first refusal: a
-        // partial raise is worth having, and on macOS the hard limit is
-        // reported as unlimited while the kernel enforces kern.maxfilesperproc.
-        let mut best = current;
-        let mut candidate = wanted;
-        while candidate > current {
-            let mut attempt = lim;
-            attempt.rlim_cur = candidate;
-            // SAFETY: as above.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &attempt) } == 0 {
-                best = candidate;
-                break;
-            }
-            candidate /= 2;
-        }
-        if best > current {
-            Ok(best)
-        } else {
-            Err(format!(
-                "could not raise the open-file limit above {current}: {}",
-                std::io::Error::last_os_error()
-            ))
-        }
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into a struct we own and fully initialized.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(format!(
+            "could not read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let current: u64 = lim.rlim_cur;
+    let wanted = desired_limit(lim.rlim_max);
+    if current >= wanted {
+        return Ok(current);
     }
 
-    #[cfg(not(unix))]
-    {
-        Ok(0)
+    let mut next = lim;
+    next.rlim_cur = wanted;
+    // SAFETY: setrlimit reads a struct we own and fully initialized.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
+        return Ok(wanted);
+    }
+    // Raising to the hard limit can still be refused. Try the largest value
+    // that is accepted rather than giving up on the first refusal: a partial
+    // raise is worth having, and on macOS the hard limit is reported as
+    // unlimited while the kernel enforces kern.maxfilesperproc.
+    let mut best = current;
+    let mut candidate = wanted;
+    while candidate > current {
+        let mut attempt = lim;
+        attempt.rlim_cur = candidate;
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &attempt) } == 0 {
+            best = candidate;
+            break;
+        }
+        candidate /= 2;
+    }
+    if best > current {
+        Ok(best)
+    } else {
+        Err(format!(
+            "could not raise the open-file limit above {current}: {}",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
@@ -165,7 +150,6 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
 /// is refused: the kernel caps a process at `kern.maxfilesperproc` regardless
 /// of what the hard limit claims. Clamp to something large but real, and let
 /// the halving loop above find the ceiling if even that is refused.
-#[cfg(unix)]
 fn desired_limit(hard: u64) -> u64 {
     const CEILING: u64 = 65_536;
     if hard == u64::MAX || hard == libc::RLIM_INFINITY {
@@ -174,7 +158,7 @@ fn desired_limit(hard: u64) -> u64 {
     hard.min(CEILING)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

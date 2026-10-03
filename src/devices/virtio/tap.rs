@@ -66,7 +66,6 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
 /// Checks the interface name fits an `ifreq`: 1..=15 bytes (`IFNAMSIZ` minus
 /// the terminating NUL). Pure, so the check is testable without
 /// `/dev/net/tun` -- which is also why it is only *called* on Linux.
-#[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_name(name: &str) -> std::io::Result<()> {
     if name.is_empty() || name.len() >= libc::IFNAMSIZ {
@@ -148,7 +147,6 @@ pub use attach::open;
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::validate_name;
     use super::{parse_mac, prepend_vnet_hdr, strip_vnet_hdr, NET_HDR_LEN};
 
@@ -196,7 +194,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn tap_names_are_length_checked() {
         // The name lands in a fixed `IFNAMSIZ`-byte ifreq field, NUL included:

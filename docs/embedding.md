@@ -168,9 +168,15 @@ handshake.
 
 ## Platform gating
 
-Only the backend for your host target compiles. On any other host the crate
-builds without one, so the shared code and its unit tests still compile, but
-`hvi::boot` does not exist. Gate your call:
+hvi builds for its three backend targets only: aarch64 macOS, aarch64 Linux and
+x86-64 Linux. On any other target the build stops with a compile error. A crate
+that also builds for other targets depends on hvi only for these three, and
+gates its call the same way:
+
+```toml
+[target.'cfg(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")))'.dependencies]
+hvi = { git = "https://github.com/brig-sh/hvi-vmm", rev = "<commit>" }
+```
 
 ```rust
 #[cfg(any(
@@ -178,9 +184,6 @@ builds without one, so the shared code and its unit tests still compile, but
     all(target_arch = "x86_64", target_os = "linux")
 ))]
 ```
-
-`hvi::HAS_BACKEND` is the same predicate as a `const bool`, for a runtime
-check or a clear error message.
 
 `hvi::CORE_VERSION` reports the VMM core a binary was built against. More than
 one binary is built from this crate, and two reporting the same core ran the

@@ -25,8 +25,7 @@
 //! kernel image loading and the devicetree or MP table of each guest
 //! architecture ([`arch`]), virtio devices ([`devices::virtio`]), the serial
 //! ports ([`devices::legacy`]) and the `RawEvent` ledger ([`events`]). On any
-//! other host the crate builds without a backend, so the deterministic core and
-//! its unit tests still compile everywhere.
+//! other target the build stops with a compile error.
 //!
 //! # Plugins
 //!
@@ -52,10 +51,6 @@ pub mod plugin;
 pub mod sandbox;
 pub mod sharedmem;
 pub mod sync;
-#[cfg(any(
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-    all(target_arch = "x86_64", target_os = "linux")
-))]
 pub mod teardown;
 
 // The backend for the host's target. Each one exposes the same
@@ -66,16 +61,12 @@ pub use arch::aarch64::hvf::boot;
 pub use arch::aarch64::kvm::boot;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use arch::x86_64::kvm::boot;
+#[cfg(not(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+)))]
+compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux only");
 
 /// This crate's version, so a binary built against it can report which VMM core
 /// it carries. Two binaries reporting the same core ran the same VMM.
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Whether this host has a hypervisor backend compiled in.
-pub const HAS_BACKEND: bool = cfg!(any(
-    all(
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux")
-    ),
-    all(target_arch = "x86_64", target_os = "linux")
-));
