@@ -6,12 +6,12 @@ This product is licensed under the Apache License, Version 2.0. See LICENSE.
 Third-party material
 --------------------
 
-Parts of the x86-64 backend follow Firecracker
+Parts of hvi follow Firecracker
 (https://github.com/firecracker-microvm/firecracker), Copyright Amazon.com,
-Inc. or its affiliates, licensed under the Apache License, Version 2.0. The
-files that do so say where, in their module documentation:
+Inc. or its affiliates, licensed under the Apache License, Version 2.0. These
+files follow it, each in the part named beside it:
 
-  src/arch/x86_64/loader.rs   mirrors the arch::x86_64 kernel loader
+  src/arch/x86_64/loader.rs   mirrors Firecracker's arch::x86_64 kernel loader
   src/arch/x86_64/layout.rs   the same guest memory layout constants
   src/arch/x86_64/kvm.rs      the same vCPU and VM bring-up shape
   src/arch/x86_64/mptable.rs  an MP table of the same small shape (MP spec 1.4)
