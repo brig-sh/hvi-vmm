@@ -1,11 +1,26 @@
+# The build-script helper is a member beside the VMM, which makes this manifest
+# a workspace root as well as a package.
+[workspace]
+members = ["crates/build-version"]
+resolver = "2"
+
 [package]
+# The crate carries no version. A release is a git tag, and every build takes
+# its version from the history it was built in (see build.rs), so a number
+# here would be a second answer to that question and would go stale between
+# releases. Cargo requires the field, and nothing reads it: hvi is not
+# published to a registry, and a consumer pins it by commit.
 name = "hvi"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.77"
 description = "The microVMM that runs brig's sandboxes -- Hypervisor.framework (macOS) and KVM (Linux) backends"
 license = "Apache-2.0"
 repository = "https://github.com/brig-sh/hvi-vmm"
+# Not a registry crate. It is consumed by path or by commit, and saying so
+# here refuses an accidental `cargo publish` rather than discovering the
+# decision after one.
+publish = false
 
 # The backend is chosen by target:
 #   macOS + aarch64  -> Apple Hypervisor.framework (applevisor)
@@ -74,6 +89,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "hvi"
 path = "src/main.rs"
+
+[build-dependencies]
+build-version = { path = "crates/build-version" }
 
 [profile.release]
 debug = true

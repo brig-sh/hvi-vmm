@@ -25,6 +25,12 @@ inputs:
       targets do not share one entry.
     required: false
     default: ""
+  cache:
+    description: >-
+      Restore and save the cargo cache. A build that is signed for release
+      passes false, so it is built from its own checkout alone.
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -51,6 +57,7 @@ runs:
           --component rustfmt --no-self-update
 
     - name: Cache cargo build and installed binaries
+      if: inputs.cache == 'true'
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       with:
         key: ${{ inputs.cache-key }}
