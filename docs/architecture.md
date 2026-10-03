@@ -33,13 +33,11 @@ usual mistake:
   x86 needs.
 
 Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file,
-its `mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` in `lib.rs`, its
-dependencies in `Cargo.toml`, and the backend `cfg` wherever it is repeated.
+its `mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` and its target
+in the build guard, both in `lib.rs`, and its dependencies in `Cargo.toml`.
 Porting to a new guest architecture is a much larger job.
 
-On any other host triple the crate builds without a backend, so the shared
-code and its unit tests still compile everywhere. That build cannot run a
-guest.
+On any other target the build stops with a compile error.
 
 ```mermaid
 flowchart TB

@@ -37,12 +37,7 @@ use hvi::plugin::builtin::{Chain, IoTrace, MemoryDump};
 #[cfg(target_arch = "aarch64")]
 use hvi::arch::aarch64::{fdt, layout, loader};
 
-/// Hosts with a real VMM backend: aarch64 on macOS (hvf) or Linux (KVM), and
-/// x86-64 on Linux (KVM).
-#[cfg(any(
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-    all(target_arch = "x86_64", target_os = "linux")
-))]
+/// Runs the subcommand named on the command line.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -91,10 +86,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // because a denied syscall traps: an in-process probe would end the
         // selftest at the first denial instead of reporting it.
         Some("seccomp-selftest") => {
-            #[cfg(all(
-                target_os = "linux",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
+            #[cfg(target_os = "linux")]
             {
                 let bad = hvi::sandbox::seccomp::selftest()?;
                 if bad > 0 {
@@ -106,16 +98,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("seccomp selftest: every probe matched the filters");
                 Ok(())
             }
-            #[cfg(not(all(
-                target_os = "linux",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            )))]
+            #[cfg(not(target_os = "linux"))]
             {
-                Err("`seccomp-selftest` exercises seccomp-bpf; Linux x86-64/aarch64 only".into())
+                Err("`seccomp-selftest` exercises seccomp-bpf; Linux only".into())
             }
         }
         Some("smoke") => {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(target_os = "macos")]
             {
                 // `--shm` runs the same test over shared guest memory (the
                 // mechanism an out-of-process plugin needs on macOS).
@@ -125,7 +114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     hvi::arch::aarch64::smoke::run()
                 }
             }
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            #[cfg(not(target_os = "macos"))]
             {
                 Err("`smoke` (the Hypervisor.framework test) is macOS only".into())
             }
@@ -133,7 +122,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Child half of `smoke --shm`: reads the shared object by name from a
         // process that never touched the hypervisor.
         Some("smoke-shm-verify") => {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(target_os = "macos")]
             {
                 let name = args.get(2).ok_or("smoke-shm-verify needs a shm name")?;
                 let expect = args
@@ -142,9 +131,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let expect = u64::from_str_radix(expect.trim_start_matches("0x"), 16)?;
                 hvi::arch::aarch64::smoke::verify_shm(name, expect)
             }
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            #[cfg(not(target_os = "macos"))]
             {
-                Err("`smoke-shm-verify` is macOS / Apple-silicon only".into())
+                Err("`smoke-shm-verify` is macOS only".into())
             }
         }
         None => {
@@ -183,8 +172,8 @@ fn print_version() {
 ///
 /// `dump-fdt --kernel <Image> [--initramfs <cpio>] [--mem-mib N] [--cmdline S]
 /// [--out <file>]`. `--out` also writes the blob. Pure, no hypervisor, so it
-/// runs anywhere the binary does.
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+/// runs on any arm64 host.
+#[cfg(target_arch = "aarch64")]
 fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use layout::GicLayout;
 
@@ -257,10 +246,6 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `boot --kernel <Image|bzImage|vmlinux> [flags]`. `--dump-memory <path>`
 /// writes guest RAM on the interrupt key (or after `--dump-after <secs>`);
 /// `--trace-io <path>` logs every virtio request.
-#[cfg(any(
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-    all(target_arch = "x86_64", target_os = "linux")
-))]
 fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut kernel = None;
     let mut initramfs = None;
@@ -442,25 +427,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
-    #[cfg(any(
-        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-        all(target_arch = "x86_64", target_os = "linux")
-    ))]
-    {
-        if let Err(e) = run() {
-            eprintln!("hvi: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    #[cfg(not(any(
-        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-        all(target_arch = "x86_64", target_os = "linux")
-    )))]
-    {
-        eprintln!(
-            "hvi targets aarch64 (macOS Hypervisor.framework or Linux KVM) or \
-             x86-64 (Linux KVM); nothing to run on this host."
-        );
+    if let Err(e) = run() {
+        eprintln!("hvi: {e}");
+        std::process::exit(1);
     }
 }

@@ -35,10 +35,6 @@
 //! any purpose but running the guest.
 
 mod api;
-#[cfg(any(
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-    all(target_arch = "x86_64", target_os = "linux")
-))]
 pub mod builtin;
 
 pub use api::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};

@@ -370,10 +370,7 @@ impl GuestRam {
     /// # Errors
     ///
     /// Errors if KVM refuses a slot.
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "aarch64", target_arch = "x86_64")
-    ))]
+    #[cfg(target_os = "linux")]
     pub fn register_kvm_slots(&self, vm: &kvm_ioctls::VmFd) -> io::Result<()> {
         for (index, mapping) in self.view.mapped.iter().enumerate() {
             let slot = kvm_bindings::kvm_userspace_memory_region {

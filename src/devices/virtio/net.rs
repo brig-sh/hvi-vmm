@@ -224,20 +224,12 @@ fn try_recv(stream: &UnixStream, buf: &mut [u8]) -> io::Result<usize> {
 ///
 /// The relay owns the socket's read side, the frame parser and the receive
 /// buffer for as long as it runs.
-#[cfg(any(
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-    all(target_arch = "x86_64", target_os = "linux")
-))]
 pub(crate) struct GatewayRelay {
     reader: UnixStream,
     frames: GatewayFrames,
     buf: Vec<u8>,
 }
 
-#[cfg(any(
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-    all(target_arch = "x86_64", target_os = "linux")
-))]
 impl GatewayRelay {
     /// Creates a relay over `reader`, the read side of the gateway socket.
     #[must_use]
@@ -306,19 +298,13 @@ impl GatewayRelay {
 /// tap was created with, which [`crate::devices::virtio::tap::strip_vnet_hdr`]
 /// drops before delivery. The read buffer is [`MAX_FRAME_LEN`] bytes, so the
 /// tap accepts `NET_HDR_LEN` bytes less than the gateway.
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(target_os = "linux")]
 pub(crate) struct TapRelay {
     reader: File,
     buf: Vec<u8>,
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(target_os = "linux")]
 impl TapRelay {
     /// Creates a relay over `reader`, a non-blocking clone of the tap.
     #[must_use]
@@ -1244,10 +1230,6 @@ mod tests {
         assert!(frames.next_frame().is_err());
     }
 
-    #[cfg(any(
-        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
-        all(target_arch = "x86_64", target_os = "linux")
-    ))]
     mod relay {
         use super::*;
         use crate::teardown::StopSource;
@@ -1324,10 +1306,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(target_os = "linux")]
     mod tap_relay {
         use super::*;
         use crate::teardown::StopSource;
