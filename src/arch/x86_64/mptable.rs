@@ -22,10 +22,8 @@
 //! bytes to place at [`MPTABLE_ADDR`]; the floating pointer sits first and
 //! points at the config table right after it.
 
-use crate::arch::x86_64::layout::MPTABLE_ADDR;
+use crate::arch::x86_64::layout::{IOAPIC_ADDR, LAPIC_ADDR, MPTABLE_ADDR};
 
-const APIC_LAPIC_BASE: u32 = 0xfee0_0000;
-const IOAPIC_BASE: u32 = 0xfec0_0000;
 const APIC_VERSION: u8 = 0x14;
 const CPU_ENABLED: u8 = 1;
 const CPU_BSP: u8 = 2;
@@ -76,7 +74,7 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
     io[1] = ioapic_id;
     io[2] = APIC_VERSION;
     io[3] = 1; // enabled
-    io[4..8].copy_from_slice(&IOAPIC_BASE.to_le_bytes());
+    io[4..8].copy_from_slice(&IOAPIC_ADDR.to_le_bytes());
     entries.extend_from_slice(&io);
 
     // I/O interrupt entries (8 bytes each): ISA IRQ n -> IOAPIC input n.
@@ -103,7 +101,7 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
     hdr[8..16].copy_from_slice(b"HVI     ");
     hdr[16..28].copy_from_slice(b"HVI x86 vm  ");
     hdr[34..36].copy_from_slice(&entry_count.to_le_bytes());
-    hdr[36..40].copy_from_slice(&APIC_LAPIC_BASE.to_le_bytes());
+    hdr[36..40].copy_from_slice(&LAPIC_ADDR.to_le_bytes());
 
     // Header checksum is over the header + all entries (the base table).
     let mut base = hdr.clone();

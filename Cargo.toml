@@ -72,6 +72,8 @@ kvm-ioctls = "0.25"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 # See the aarch64 section above.
 seccompiler = { version = "0.5", features = ["json"] }
+# The ACPI tables an x86-64 guest powers off and resets through.
+acpi_tables = "0.2.1"
 
 # The VMM as a library, so it can be linked as well as run.
 [lib]

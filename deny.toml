@@ -34,9 +34,9 @@ allow = [
 ]
 
 [bans]
-# The lockfile holds two versions of bitflags today. Report a duplicate
-# instead of failing on it. With 21 crates the report stays short, and a new
-# duplicate that arrives with an update is visible in the log.
+# An update can pull in a second version of a crate the tree already holds.
+# Report a duplicate instead of failing on it: the warning shows it in the log,
+# and a choice of versions made inside a dependency does not block the update.
 multiple-versions = "warn"
 wildcards = "deny"
 

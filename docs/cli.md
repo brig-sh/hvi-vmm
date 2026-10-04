@@ -188,7 +188,7 @@ An embedder inherits these from the process environment. They are not part of
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
 | A vCPU fails | `hvi: <what failed>`, exit 1. |
 | `SIGTERM`, `SIGINT` or `SIGHUP` | `guest stopped: Requested`, or `hvi: <what failed>` if the run failed, and then the process ends by that signal. |
-| The guest halts or powers off on x86-64 | The run does not end. |
+| An x86-64 guest halts, or powers off without ACPI | The run does not end. |
 
 A vCPU fails on an exit hvi does not service, on an error from the hypervisor,
 or on a panic in hvi. On macOS, an access to an address no device answers is
@@ -196,9 +196,9 @@ such an exit. The line names the vCPU and the failure. A panic in one of hvi's
 I/O threads, such as the console reader or a network relay, fails the run the
 same way, and the line names the thread.
 
-An x86-64 guest has no power-off: hvi gives it no ACPI, so Linux halts it in
-place, and KVM handles the halt without leaving the vCPU. A guest booted with
-`reboot=t` ends the run with `reboot -f`, which hvi reports as `SystemReset`.
+An x86-64 guest powers off through ACPI, so a kernel without ACPI cannot power
+off; see [guest-images.md](guest-images.md). `reboot -f` ends the run either
+way, as `SystemReset`.
 
 **hvi never reboots a guest.** `SystemReset` ends the process exactly as
 `SystemOff` does. Nothing loops around `hvi::boot`. An integration that wants a

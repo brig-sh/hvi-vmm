@@ -284,6 +284,41 @@ jobs:
               || { echo "::error::e820 lacks the usable range $range"; exit 1; }
           done
           echo "e820 split around the MMIO hole ✓"
+      # The guest powers off through the ACPI tables. To reset, Linux tries the
+      # ACPI reset register and then the i8042, so the reset run is traced and
+      # checked for the write to the reset register. The run without ACPI checks
+      # the i8042 alone. KVM handles a halt itself, so a power-off that fell back
+      # to one would end only at the timeout.
+      - name: check that power-off and reset end the run
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          sudo apt-get install -y --no-install-recommends busybox-static cpio
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          for cmd in poweroff reboot; do
+            W=$(mktemp -d); mkdir -p "$W/bin"
+            cp /bin/busybox "$W/bin/busybox"
+            printf '#!/bin/busybox sh\n/bin/busybox %s -f\n' "$cmd" > "$W/init"
+            chmod +x "$W/init"
+            ( cd "$W" && find . | cpio -o -H newc --quiet ) > "$cmd.cpio"
+          done
+          # <log name> <initramfs> <expected stop> <extra command line> [env]
+          stops() {
+            start=$(date +%s)
+            sudo ${5:+env "$5"} timeout 30 ./target/release/hvi boot --kernel "$KIMG" \
+              --initramfs "$2" --mem-mib 512 --cpus 2 --cmdline "console=ttyS0 panic=-1 $4" \
+              </dev/null 2>&1 | tee "$1.log" > /dev/null
+            rc=${PIPESTATUS[0]}
+            echo "$1: exit $rc after $(( $(date +%s) - start )) s"
+            [ "$rc" -eq 0 ] || { tail -20 "$1.log"; echo "::error::$1: hvi exited $rc"; exit 1; }
+            grep -q "guest stopped: $3" "$1.log" \
+              || { tail -20 "$1.log"; echo "::error::$1: the run did not stop as $3"; exit 1; }
+          }
+          stops poweroff poweroff.cpio SystemOff ""
+          stops reboot reboot.cpio SystemReset "" HVI_X86_TRACE=1
+          grep -q "IoOut 0x606" reboot.log \
+            || { echo "::error::the reboot did not write the ACPI reset register"; exit 1; }
+          stops reboot-no-acpi reboot.cpio SystemReset "acpi=off"
+          echo "power-off and reset end the run ✓"
       # backing_len's BLKGETSIZE64 branch self-skips when no block device is
       # openable, which is every unprivileged run — so nothing exercised it
       # live. A loop device over a sparse file is exactly the shape that broke
@@ -345,6 +380,9 @@ jobs:
             boot.log
             boot-vmlinux.log
             boot-4g.log
+            poweroff.log
+            reboot.log
+            reboot-no-acpi.log
             blk.log
             stop.log
           retention-days: 7
