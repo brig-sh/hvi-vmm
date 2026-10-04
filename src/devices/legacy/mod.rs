@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The devices a guest finds without virtio: the PL011 and 16550 UARTs that
-//! carry its serial console, and the MC146818 CMOS RTC an x86-64 guest reads
-//! for the wall clock at boot.
+//! The devices a guest finds without virtio.
+//!
+//! The PL011 and 16550 UARTs carry the serial console. An x86-64 guest reads
+//! the MC146818 CMOS RTC for the wall clock at boot, and powers off and resets
+//! through the ACPI registers.
 
+pub mod acpi_pm;
 pub mod pl011;
 pub mod rtc_cmos;
 pub mod uart16550;

@@ -117,7 +117,8 @@ set of device models serve all three. The backend modules under `src/arch/`,
 with the code the two KVM backends share in `src/hypervisor/kvm.rs`, hold the
 hypervisor differences. The boot protocol differs too, and by more: arm64 uses
 an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or an
-uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
+uncompressed `vmlinux` with `boot_params`, an e820 map, an MP table and ACPI
+tables.
 
 [docs/architecture.md](docs/architecture.md) describes the whole design.
 
