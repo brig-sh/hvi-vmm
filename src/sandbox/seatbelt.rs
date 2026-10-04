@@ -78,6 +78,8 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::devices::virtio::fs::server;
+
 /// The Seatbelt profile, in SBPL.
 ///
 /// Deny-default with exactly one exception, [documented in the profile
@@ -223,7 +225,7 @@ fn policy_for<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io::Resu
         policy.push_str(&format!(
             "\n;; virtio-fs SYNCFS: sync a volume (FSIOC_SYNC_VOLUME), and no other fsctl.\n\
              (allow system-fsctl (fsctl-command {}))\n",
-            crate::devices::virtio::fs::server::FSIOC_SYNC_VOLUME
+            server::FSIOC_SYNC_VOLUME
         ));
     }
     Ok(policy)
@@ -527,7 +529,7 @@ fn probes() -> Vec<Probe> {
             // guest's sync fails with EPERM.
             what: "sync the writable export's volume",
             expect_ok: true,
-            run: |f| crate::devices::virtio::fs::server::sync_volume(&f.export),
+            run: |f| server::sync_volume(&f.export),
         },
         Probe {
             // The same for the read-only grant, so its denial above
@@ -830,7 +832,7 @@ mod tests {
     fn only_a_writable_export_brings_the_volume_sync_grant() {
         let grant = format!(
             "(allow system-fsctl (fsctl-command {}))",
-            crate::devices::virtio::fs::server::FSIOC_SYNC_VOLUME
+            server::FSIOC_SYNC_VOLUME
         );
         let ro = policy_for([(Path::new("/tmp/ro"), false)]).unwrap();
         assert!(
@@ -859,7 +861,7 @@ mod tests {
             .collect();
         let fsctl = format!(
             "(allow system-fsctl (fsctl-command {}))",
-            crate::devices::virtio::fs::server::FSIOC_SYNC_VOLUME
+            server::FSIOC_SYNC_VOLUME
         );
         assert_eq!(
             allows,

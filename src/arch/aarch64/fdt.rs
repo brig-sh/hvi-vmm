@@ -28,8 +28,9 @@
 use vm_fdt::{Error, FdtWriter};
 
 use crate::arch::aarch64::layout::{
-    GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE,
-    VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE,
+    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 
 const PHANDLE_GIC: u32 = 1;
@@ -226,10 +227,7 @@ pub fn build(
         // The hypervisor backend validates these placements before it builds
         // the devicetree. The checked helpers keep a pathological library
         // caller from wrapping.
-        if let (Some(base), Some(spi)) = (
-            crate::arch::aarch64::layout::virtio_fs_base(index),
-            crate::arch::aarch64::layout::virtio_fs_spi(index),
-        ) {
+        if let (Some(base), Some(spi)) = (virtio_fs_base(index), virtio_fs_spi(index)) {
             virtio_node(base, spi)?;
         }
     }
@@ -241,6 +239,7 @@ pub fn build(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::arch::aarch64::layout::VIRTIO_FS_BASE;
 
     /// A fixed seed, so a test blob is the same every run.
     const SEED: [u8; RNG_SEED_LEN] = [0xa5; RNG_SEED_LEN];
@@ -312,15 +311,8 @@ pub(crate) mod tests {
             KASLR_SEED,
         )
         .unwrap();
-        let first = format!(
-            "virtio_mmio@{:x}",
-            crate::arch::aarch64::layout::VIRTIO_FS_BASE
-        );
-        let second = format!(
-            "virtio_mmio@{:x}",
-            crate::arch::aarch64::layout::VIRTIO_FS_BASE
-                + crate::arch::aarch64::layout::VIRTIO_SIZE
-        );
+        let first = format!("virtio_mmio@{:x}", VIRTIO_FS_BASE);
+        let second = format!("virtio_mmio@{:x}", VIRTIO_FS_BASE + VIRTIO_SIZE);
         assert!(!contains(&absent, &first));
         assert!(contains(&present, &first));
         assert!(contains(&present, &second));

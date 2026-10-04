@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
+use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
 use crate::guestmem::GuestRam;
 use crate::sync::lock_or_recover;
@@ -493,8 +494,8 @@ const READAHEAD_MAX_DIRS: usize = 256;
 ///
 /// A queued directory holds its parent's descriptor, shared with its siblings,
 /// so this also bounds the descriptors the queue holds. They are not in the
-/// guest's handle budget and come out of the VMM's reserve in
-/// [`crate::devices::virtio::fs::fdlimit`], which is larger.
+/// guest's handle budget and come out of the VMM's reserve in [`fdlimit`],
+/// which is larger.
 const READAHEAD_MAX_QUEUED: usize = 64;
 
 /// Subdirectories a worker queues from one directory it prepared, the first
@@ -1110,7 +1111,7 @@ struct Node {
 
 /// `fsctl` command behind `sync_volume_np(3)`: `_IOW('A', 1, uint32_t)` in
 /// XNU's `sys/fsctl.h`, which the SDK does not ship. The sandbox grants this
-/// one command and no other; see `crate::sandbox::seatbelt`.
+/// one command and no other; see `sandbox::seatbelt`.
 pub(crate) const FSIOC_SYNC_VOLUME: u32 = 0x8004_4101;
 
 const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
@@ -1219,8 +1220,8 @@ pub struct VirtioFs {
     /// `dir_handles`, released only when the guest sends RELEASE or RELEASEDIR.
     /// Without this limit the guest alone would decide how much of the
     /// process's descriptor table it spends. See
-    /// [`crate::devices::virtio::fs::fdlimit::guest_handle_budget`] for why the
-    /// number is derived rather than written down.
+    /// [`fdlimit::guest_handle_budget`] for why the number is derived rather
+    /// than written down.
     handle_limit: usize,
     /// The most handles this export has held at once, for the report when the
     /// VM stops. The issue asks for this before any limit is tightened: a
@@ -1368,14 +1369,14 @@ impl VirtioFs {
             fh0_finished: HashSet::new(),
             readahead: Readahead::new(),
             next_handle: 1,
-            handle_limit: crate::devices::virtio::fs::fdlimit::guest_handle_budget(),
+            handle_limit: fdlimit::guest_handle_budget(),
             parked: HashMap::new(),
             parked_order: VecDeque::new(),
             parked_ticks: 0,
             // A quarter of the guest's own budget: enough for the working set
             // of headers a compiler reopens, small enough that the guest can
             // still hold the handles it is entitled to.
-            parked_limit: crate::devices::virtio::fs::fdlimit::guest_handle_budget() / 4,
+            parked_limit: fdlimit::guest_handle_budget() / 4,
             parked_hits: 0,
             parked_misses: 0,
             peak_handles: 0,
@@ -5028,7 +5029,7 @@ fn sync_file(file: &File, flags: u32) -> Result<(), i32> {
 /// budget on a 256-descriptor soft limit, which would let the cache meet the
 /// handle limit with no guest handle open at all.
 fn dir_cache_limit() -> usize {
-    let budget = crate::devices::virtio::fs::fdlimit::guest_handle_budget();
+    let budget = fdlimit::guest_handle_budget();
     (budget / 16).clamp(128, 4096).min(budget / 4)
 }
 
