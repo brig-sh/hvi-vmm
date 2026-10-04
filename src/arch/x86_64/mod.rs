@@ -16,12 +16,15 @@
 //!
 //! `loader` loads a `bzImage` or an uncompressed `vmlinux` and writes the zero
 //! page, the e820 map and the command line. `layout` holds the guest-physical
-//! address map. `mptable` describes the CPUs to a guest booted without ACPI.
-//! `kvm` runs the guest on Linux.
+//! address map. `mptable` describes the CPUs to a guest booted without ACPI,
+//! and `acpi` writes the tables and serves the registers the guest powers off
+//! through. `kvm` runs the guest on Linux.
 
 pub mod layout;
 pub mod loader;
 
+#[cfg(target_os = "linux")]
+pub mod acpi;
 #[cfg(target_os = "linux")]
 pub(crate) mod kvm;
 #[cfg(target_os = "linux")]

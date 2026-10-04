@@ -190,7 +190,7 @@ An embedder inherits these from the process environment. They are not part of
 | --- | --- |
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
-| The guest halts on x86-64 | Reported as `SystemOff`, because a halt records no reason. |
+| An x86-64 guest halts | Not seen: the run goes on until hvi is killed. An x86-64 guest powers off through ACPI, so a kernel built without `CONFIG_ACPI`, or booted with `acpi=off`, halts on `poweroff`. `reboot -f` still ends its run, as `SystemReset`. |
 
 **hvi never reboots a guest.** `SystemReset` ends the process exactly as
 `SystemOff` does. Nothing loops around `hvi::boot`. An integration that wants a

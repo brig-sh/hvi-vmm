@@ -17,8 +17,9 @@
 //! Unlike arm64 (RAM at 1 GiB, devices below), x86 guest RAM starts at 0 and
 //! the low megabyte holds the legacy BIOS/real-mode area. We follow the usual
 //! Firecracker/CH placement: the 64-bit kernel at 1 MiB, the `boot_params`
-//! "zero page" and cmdline in low RAM, a minimal MP table in the EBDA, and the
-//! virtio-mmio window up in the sub-4 GiB MMIO hole.
+//! "zero page" and cmdline in low RAM, a minimal MP table in the EBDA, ACPI
+//! tables in the BIOS area, and the virtio-mmio window up in the sub-4 GiB MMIO
+//! hole.
 
 /// Guest RAM base (x86 RAM starts at physical 0).
 pub const RAM_BASE: u64 = 0x0;
@@ -32,6 +33,10 @@ pub const CMDLINE_MAX: usize = 0x1_0000;
 pub const EBDA_START: u64 = 0x9_fc00;
 /// Minimal MP floating pointer + config table, in the EBDA.
 pub const MPTABLE_ADDR: u64 = EBDA_START;
+/// ACPI tables, RSDP first, at the start of the BIOS area where the guest scans
+/// for it. The e820 map leaves the area out, so the guest never takes it for
+/// RAM.
+pub const ACPI_ADDR: u64 = 0xe_0000;
 /// Boot page tables (PML4/PDPT/PD) for the initial long-mode identity map.
 pub const PML4_ADDR: u64 = 0x9000;
 pub const PDPT_ADDR: u64 = 0xa000;
@@ -48,6 +53,27 @@ pub const BOOT_STACK: u64 = 0x6ff0;
 /// COM1 16550 UART, I/O port + IOAPIC GSI.
 pub const COM1_PORT: u16 = 0x3f8;
 pub const COM1_GSI: u32 = 4;
+
+/// The i8042 command and status port. The controller's CPU-reset command,
+/// written here, is how a guest without ACPI resets.
+pub const I8042_COMMAND_PORT: u16 = 0x64;
+/// The ACPI PM1 event block, PM1 control block and reset register, in that
+/// order, at the base a PC puts them.
+///
+/// A guest powers off by writing the S5 sleep type and SLP_EN to PM1 control.
+pub const ACPI_PM_PORT: u16 = 0x600;
+/// How many ports the registers at [`ACPI_PM_PORT`] take.
+pub const ACPI_PM_PORTS: u16 = 7;
+/// The GSI of the ACPI system control interrupt.
+///
+/// hvi never raises it, but the guest's ACPI driver needs a line for its
+/// handler. It is the IOAPIC's last line, away from the ISA lines the devices
+/// take.
+pub const SCI_GSI: u32 = 23;
+
+/// The local APIC and the IOAPIC, at the addresses a PC has them.
+pub const LAPIC_ADDR: u32 = 0xfee0_0000;
+pub const IOAPIC_ADDR: u32 = 0xfec0_0000;
 
 /// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device
 /// (blk, net, vsock), with IOAPIC GSIs 5/6/7. The guest is told about these via

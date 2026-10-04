@@ -75,7 +75,8 @@ CONFIG_OF=y                         # hvi passes a devicetree
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_RTC_DRV_CMOS=y               # not optional, see below
-CONFIG_X86_MPPARSE=y                # hvi supplies an MP table, not ACPI
+CONFIG_X86_MPPARSE=y                # the CPUs without ACPI
+CONFIG_ACPI=y                       # power off, see below
 ```
 
 hvi implements the CMOS real-time clock on x86-64 because a guest that reads
@@ -84,6 +85,14 @@ update-in-progress bit with interrupts disabled, and an unimplemented port
 reads back `0xff`, so that bit never clears and the guest spins there forever,
 before the console is up. hvi supplies the device, so this is a reason the
 device exists rather than something you configure.
+
+An x86-64 guest powers off through ACPI. hvi supplies a FADT whose PM1
+control register is a port it serves, and a MADT with the same CPUs and IOAPIC
+as the MP table. A kernel with ACPI reads the MADT, and one booted with
+`acpi=off` reads the MP table. A kernel without `CONFIG_ACPI`, or booted with
+`acpi=off`, has no way to power off: `poweroff` halts it, and hvi does not see
+the halt. `reboot` ends the run either way, through the ACPI reset register or
+the i8042's reset command.
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.
