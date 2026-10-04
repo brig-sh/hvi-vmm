@@ -1092,6 +1092,17 @@ fn now_parts() -> (u64, u32) {
 /// of the 64-bit space cannot collide.
 const SOCKET_DEV: u64 = u64::MAX;
 
+/// What the guest was last told about a pinned directory.
+#[derive(Default)]
+struct Pin {
+    /// The node id first handed out for the path. Every later reply names
+    /// the same one.
+    node: Option<u64>,
+    /// The attributes of the last directory seen at the path, reported
+    /// again when the host has something else there, or nothing.
+    meta: Option<Stat>,
+}
+
 struct Node {
     key: (u64, u64),
     paths: Vec<PathBuf>,
@@ -1178,6 +1189,10 @@ pub struct VirtioFs {
     nodes: HashMap<u64, Node>,
     inode_ids: HashMap<(u64, u64), u64>,
     next_node: u64,
+    /// Directories the guest mounts something on, and the directories
+    /// above them, by host path. Empty unless the share was given `pin=`.
+    /// See [`VirtioFs::pin`].
+    pins: HashMap<PathBuf, Pin>,
     /// Unix sockets the guest has bound inside a share, by path.
     ///
     /// They live here rather than on the host because a socket needs the
@@ -1359,6 +1374,7 @@ impl VirtioFs {
             nodes,
             inode_ids,
             next_node: FUSE_ROOT_ID + 1,
+            pins: HashMap::new(),
             sockets: HashMap::new(),
             next_socket_ino: 1,
             handles: HashMap::new(),
@@ -2080,7 +2096,8 @@ impl VirtioFs {
             self.remember_lookup(node);
             return Ok(socket_entry_out(node, socket));
         }
-        let meta = match self.stat_in_export(&path) {
+        let found = self.stat_in_export(&path);
+        let meta = match self.pinned_stat(&path, found) {
             Ok(meta) => meta,
             // A name that is not there. Under a caching policy the guest is
             // told so in a reply it may cache, rather than with ENOENT, which
@@ -2119,7 +2136,8 @@ impl VirtioFs {
             (handle.path.clone(), meta)
         } else {
             let path = self.node_path(node)?.to_owned();
-            match self.stat_in_export(&path) {
+            let found = self.stat_in_export(&path);
+            match self.pinned_stat(&path, found) {
                 Ok(meta) => (path, meta),
                 // The file was unlinked on the host while the guest holds it
                 // open. FUSE names the inode, this server resolves it by
@@ -2595,6 +2613,9 @@ impl VirtioFs {
             }
             return Ok(Vec::new());
         }
+        if self.pins.contains_key(&path) {
+            return Err(EBUSY);
+        }
         let (dirfd, entry) = self.at_relative(&self.relative_of_path(&path)?)?;
         let meta = Stat::at(dirfd, &entry)?;
         unlink_at(dirfd, &entry, directory)?;
@@ -2621,6 +2642,11 @@ impl VirtioFs {
         let new_name = nul_name(input, next)?;
         let old_path = self.child_path(old_parent, old_name)?;
         let new_path = self.child_path(new_parent, new_name)?;
+        // A pin is kept by path, and a rename would take the directory out
+        // from under it or put another one there.
+        if self.pins.contains_key(&old_path) || self.pins.contains_key(&new_path) {
+            return Err(EBUSY);
+        }
         let (old_fd, old_name, new_fd, new_name) = self.two_entries_at(&old_path, &new_path)?;
         let old_meta = Stat::at(old_fd.as_fd(), &old_name)?;
         let replaced = Stat::at(new_fd.as_fd(), &new_name).ok();
@@ -4178,6 +4204,11 @@ impl VirtioFs {
                         }
                     }
                 };
+                let meta = if idx > 1 && !self.pins.is_empty() {
+                    self.pinned_stat(&path, Ok(meta)).unwrap_or(meta)
+                } else {
+                    meta
+                };
                 let entry_node = if idx == 0 {
                     node
                 } else if idx == 1 {
@@ -4571,10 +4602,100 @@ impl VirtioFs {
                     .unwrap_or(false)
             })
             .map(PathBuf::as_path)
+            // A pinned directory keeps its path when the host has moved or
+            // removed what was there.
+            .or_else(|| {
+                self.pins
+                    .iter()
+                    .find(|(_, pin)| pin.node == Some(node))
+                    .map(|(path, _)| path.as_path())
+            })
             .ok_or(ENOENT)
     }
 
+    /// Keeps one identity in the guest for the directory at `relative`,
+    /// and for every directory between it and the export root.
+    ///
+    /// A guest that mounts a filesystem on a directory of this share
+    /// reaches the mount through the name. This server resolves names by
+    /// path, so when the host renames the directory, or one above it, and
+    /// puts another in its place, the name starts to answer with another
+    /// node id. The guest kernel then drops its entry for the name, and
+    /// the mount on it with it: the path now leads into the new host
+    /// directory. For a tmpfs meant to keep data in guest memory, what the
+    /// guest writes there afterwards lands on the host disk. A longer entry
+    /// validity does not prevent it, because a READDIRPLUS of the parent
+    /// carries the new node id too.
+    ///
+    /// A pinned path answers with the node id it was first given, in
+    /// LOOKUP and READDIRPLUS alike, and keeps answering as a directory
+    /// with the attributes last seen when the host has a file, a symlink
+    /// or nothing there. What the directory holds still follows the host
+    /// path. The guest may not rename or remove a pinned path.
+    pub fn pin(&mut self, relative: &Path) {
+        let mut path = self.root.clone();
+        for component in relative.components() {
+            path.push(component);
+            self.pins.entry(path.clone()).or_default();
+        }
+    }
+
+    /// The stat to answer with for `path`: `found`, unless the path is
+    /// pinned and no longer a directory on the host.
+    fn pinned_stat(&mut self, path: &Path, found: Result<Stat, i32>) -> Result<Stat, i32> {
+        if self.pins.is_empty() {
+            return found;
+        }
+        let Some(pin) = self.pins.get_mut(path) else {
+            return found;
+        };
+        match found {
+            Ok(meta) if meta.is_dir() => {
+                pin.meta = Some(meta);
+                Ok(meta)
+            }
+            other => pin.meta.map_or(other, Ok),
+        }
+    }
+
+    /// The node a pinned `path` was first given, moved onto the inode the
+    /// host has there now.
+    fn pinned_node(&mut self, path: &Path, key: (u64, u64)) -> Option<u64> {
+        let node = self.pins.get(path)?.node?;
+        let remembered = self.nodes.get_mut(&node)?;
+        if remembered.key != key {
+            let old = remembered.key;
+            remembered.key = key;
+            remembered.guest_attr = None;
+            if self.inode_ids.get(&old) == Some(&node) {
+                self.inode_ids.remove(&old);
+            }
+            self.inode_ids.insert(key, node);
+        }
+        if !remembered.paths.iter().any(|known| known == path) {
+            remembered.paths.push(path.to_owned());
+        }
+        Some(node)
+    }
+
     fn node_for(&mut self, path: PathBuf, meta: &Stat) -> u64 {
+        if self.pins.is_empty() {
+            return self.node_for_inode(path, meta);
+        }
+        if !self.pins.contains_key(&path) {
+            return self.node_for_inode(path, meta);
+        }
+        if let Some(node) = self.pinned_node(&path, (meta.dev(), meta.ino())) {
+            return node;
+        }
+        let node = self.node_for_inode(path.clone(), meta);
+        if let Some(pin) = self.pins.get_mut(&path) {
+            pin.node = Some(node);
+        }
+        node
+    }
+
+    fn node_for_inode(&mut self, path: PathBuf, meta: &Stat) -> u64 {
         let key = (meta.dev(), meta.ino());
         if let Some(node) = self.inode_ids.get(&key).copied() {
             let crowded = match self.nodes.get(&node) {
@@ -10431,6 +10552,163 @@ mod tests {
     /// route to a descriptor than every other lookup: `..` at the export root
     /// is the root, which has no parent to be asked through and is stated from
     /// its own descriptor.
+    /// The node id and file type a LOOKUP of `name` under `parent` reports,
+    /// or the errno.
+    fn lookup_identity(dev: &mut VirtioFs, parent: u64, name: &[u8]) -> Result<(u64, u32), i32> {
+        let mut payload = name.to_vec();
+        payload.push(0);
+        let out = dev.handle_fuse(&request(LOOKUP, parent, &payload), 4096);
+        match get_u32(&out, 4).map(|e| e as i32) {
+            Some(0) => {}
+            Some(errno) => return Err(-errno),
+            None => return Err(EINVAL),
+        }
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        // fuse_entry_out is 40 bytes of head, then fuse_attr with the mode
+        // 60 bytes in.
+        let mode = get_u32(&out, OUT_HEADER_LEN + 40 + 60).unwrap();
+        Ok((node, mode & libc::S_IFMT as u32))
+    }
+
+    /// The node id READDIRPLUS reports for `name` in the directory `node`.
+    fn readdirplus_node(dev: &mut VirtioFs, node: u64, name: &[u8]) -> Option<u64> {
+        let mut input = vec![0u8; 40];
+        input[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        let out = dev.handle_fuse(&request(READDIRPLUS, node, &input), 4096 + 16);
+        let mut pos = OUT_HEADER_LEN;
+        while pos + 152 <= out.len() {
+            let namelen = get_u32(&out, pos + 128 + 16).unwrap() as usize;
+            if &out[pos + 152..pos + 152 + namelen] == name {
+                return get_u64(&out, pos);
+            }
+            pos += align8(128 + 24 + namelen);
+        }
+        None
+    }
+
+    const DIRECTORY: u32 = libc::S_IFDIR as u32;
+
+    #[test]
+    fn a_pinned_directory_keeps_its_node_when_the_host_replaces_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("a/t")).unwrap();
+        dev.pin(Path::new("a/t"));
+        let (a, _) = lookup_identity(&mut dev, FUSE_ROOT_ID, b"a").unwrap();
+        let (t, _) = lookup_identity(&mut dev, a, b"t").unwrap();
+
+        // The mount point itself is renamed away and another put there.
+        fs::rename(root.join("a/t"), root.join("a/t.old")).unwrap();
+        fs::create_dir(root.join("a/t")).unwrap();
+        assert_eq!(lookup_identity(&mut dev, a, b"t"), Ok((t, DIRECTORY)));
+        assert_eq!(readdirplus_node(&mut dev, a, b"t"), Some(t));
+
+        // Then the directory above it, which is pinned along with it.
+        fs::rename(root.join("a"), root.join("a.old")).unwrap();
+        fs::create_dir_all(root.join("a/t")).unwrap();
+        assert_eq!(
+            lookup_identity(&mut dev, FUSE_ROOT_ID, b"a"),
+            Ok((a, DIRECTORY))
+        );
+        assert_eq!(readdirplus_node(&mut dev, FUSE_ROOT_ID, b"a"), Some(a));
+        assert_eq!(lookup_identity(&mut dev, a, b"t"), Ok((t, DIRECTORY)));
+        // What the directory holds still follows the host path.
+        fs::write(root.join("a/new"), b"x").unwrap();
+        assert!(lookup_identity(&mut dev, a, b"new").is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_pinned_directory_stays_a_directory_when_the_host_has_none() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("a/t")).unwrap();
+        dev.pin(Path::new("a/t"));
+        let (a, _) = lookup_identity(&mut dev, FUSE_ROOT_ID, b"a").unwrap();
+        let (t, _) = lookup_identity(&mut dev, a, b"t").unwrap();
+
+        // A file, then a symlink, then nothing where the mount point was.
+        fs::remove_dir(root.join("a/t")).unwrap();
+        fs::write(root.join("a/t"), b"x").unwrap();
+        assert_eq!(lookup_identity(&mut dev, a, b"t"), Ok((t, DIRECTORY)));
+        assert_eq!(readdirplus_node(&mut dev, a, b"t"), Some(t));
+        fs::remove_file(root.join("a/t")).unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("a/t")).unwrap();
+        assert_eq!(lookup_identity(&mut dev, a, b"t"), Ok((t, DIRECTORY)));
+        fs::remove_file(root.join("a/t")).unwrap();
+        assert_eq!(lookup_identity(&mut dev, a, b"t"), Ok((t, DIRECTORY)));
+
+        // And nothing where the directory above it was.
+        fs::remove_dir_all(root.join("a")).unwrap();
+        assert_eq!(
+            lookup_identity(&mut dev, FUSE_ROOT_ID, b"a"),
+            Ok((a, DIRECTORY))
+        );
+        assert_eq!(lookup_identity(&mut dev, a, b"t"), Ok((t, DIRECTORY)));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unpinned_directory_follows_the_host() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("a/t")).unwrap();
+        // A pin elsewhere in the share changes nothing for this path.
+        dev.pin(Path::new("other"));
+        let (a, _) = lookup_identity(&mut dev, FUSE_ROOT_ID, b"a").unwrap();
+        let (t, _) = lookup_identity(&mut dev, a, b"t").unwrap();
+        fs::rename(root.join("a/t"), root.join("a/t.old")).unwrap();
+        fs::create_dir(root.join("a/t")).unwrap();
+        let (swapped, _) = lookup_identity(&mut dev, a, b"t").unwrap();
+        assert_ne!(swapped, t);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_guest_cannot_rename_or_remove_a_pinned_directory() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("a/t")).unwrap();
+        fs::create_dir(root.join("free")).unwrap();
+        dev.pin(Path::new("a/t"));
+        let (a, _) = lookup_identity(&mut dev, FUSE_ROOT_ID, b"a").unwrap();
+        let errno = |out: Vec<u8>| get_u32(&out, 4).map(|e| -(e as i32));
+
+        let out = dev.handle_fuse(&request(RMDIR, a, b"t\0"), 4096);
+        assert_eq!(errno(out), Some(EBUSY));
+        // RENAME: the new parent, then both names.
+        let rename = |new_parent: u64, old: &[u8], new: &[u8]| {
+            let mut input = new_parent.to_le_bytes().to_vec();
+            input.extend_from_slice(old);
+            input.push(0);
+            input.extend_from_slice(new);
+            input.push(0);
+            input
+        };
+        let out = dev.handle_fuse(&request(RENAME, a, &rename(a, b"t", b"moved")), 4096);
+        assert_eq!(errno(out), Some(EBUSY));
+        let out = dev.handle_fuse(
+            &request(RENAME, FUSE_ROOT_ID, &rename(FUSE_ROOT_ID, b"a", b"moved")),
+            4096,
+        );
+        assert_eq!(errno(out), Some(EBUSY));
+        // Onto a pinned path as well.
+        let out = dev.handle_fuse(
+            &request(RENAME, FUSE_ROOT_ID, &rename(a, b"free", b"t")),
+            4096,
+        );
+        assert_eq!(errno(out), Some(EBUSY));
+        assert!(root.join("a/t").is_dir() && root.join("free").is_dir());
+        // Everything else in the share still moves.
+        let out = dev.handle_fuse(
+            &request(RENAME, FUSE_ROOT_ID, &rename(a, b"free", b"inside")),
+            4096,
+        );
+        assert_eq!(errno(out), Some(0));
+        assert!(root.join("a/inside").is_dir());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn lookup_of_dot_and_dotdot_resolves_by_descriptor() {
         let (dir, mut dev) = fixture();

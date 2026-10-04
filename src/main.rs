@@ -336,6 +336,24 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     };
                     it.next();
                 }
+                // Any number of trailing `pin=<dir>`, each a directory
+                // below the export, relative to it, that the guest mounts
+                // something on.
+                let mut pins = Vec::new();
+                while let Some(spec) = it.clone().next().and_then(|s| s.strip_prefix("pin=")) {
+                    let plain = !spec.is_empty()
+                        && spec
+                            .split('/')
+                            .all(|part| !part.is_empty() && part != "." && part != "..");
+                    if !plain || spec.as_bytes().contains(&0) {
+                        return Err(format!(
+                            "pin {spec:?} must be a path below the export, with no empty, `.` or `..` component"
+                        )
+                        .into());
+                    }
+                    pins.push(std::path::PathBuf::from(spec));
+                    it.next();
+                }
                 let path = std::fs::canonicalize(path)?;
                 if !path.is_dir() {
                     return Err(
@@ -347,6 +365,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     tag: tag.clone(),
                     mode,
                     cache,
+                    pins,
                 });
             }
             "--net-stub" => net = true,

@@ -409,12 +409,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         fs.push(SharedFs {
             base,
             intid: 32 + spi,
-            dev: Arc::new(Mutex::new(VirtioFs::new(
-                root,
-                &share.tag,
-                share.mode.writable(),
-                share.cache,
-            )?)),
+            dev: Arc::new(Mutex::new({
+                let mut dev = VirtioFs::new(root, &share.tag, share.mode.writable(), share.cache)?;
+                for pin in &share.pins {
+                    dev.pin(pin);
+                }
+                dev
+            })),
             wake: Arc::new(FsWake::new()),
         });
     }
