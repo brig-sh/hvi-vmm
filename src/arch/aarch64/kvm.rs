@@ -66,7 +66,7 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::quiesce::Quiesce;
 use crate::memory::{GuestRam, SharedRam};
-use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
+use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
@@ -870,7 +870,7 @@ impl VmHandle for Shared {
         self.ram_file.as_fd()
     }
 
-    fn ram_regions(&self) -> Vec<MemRegion> {
+    fn ram_regions(&self) -> Vec<RamRegion> {
         self.mem.regions()
     }
 

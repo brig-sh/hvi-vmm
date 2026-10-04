@@ -20,10 +20,13 @@
 //! writable region collection that it and the rust-vmm crates take as guest
 //! memory. A tool that received the object's descriptor maps it read-only as a
 //! [`GuestRamView`]. A `GuestRam` dereferences to the view, so code written
-//! against the view runs on either.
+//! against the view runs on either. [`RamRegion`] describes one region: where
+//! it sits in the guest and in the object.
 
 mod guest;
+mod region;
 mod shared;
 
-pub use guest::{GuestRam, GuestRamView, MemRegion};
+pub use guest::{GuestRam, GuestRamView};
+pub use region::RamRegion;
 pub use shared::SharedRam;

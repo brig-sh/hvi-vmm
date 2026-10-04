@@ -37,4 +37,4 @@
 mod api;
 pub mod builtin;
 
-pub use api::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
+pub use api::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};

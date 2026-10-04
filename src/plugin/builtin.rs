@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::memory::GuestRamView;
-use crate::plugin::{CpuHandle, IoSink, MemRegion, Plugin, VmHandle};
+use crate::plugin::{CpuHandle, IoSink, Plugin, RamRegion, VmHandle};
 
 /// Runs several plugins as one, in order.
 ///
@@ -133,7 +133,7 @@ impl MemoryDump {
 
     /// The regions this dump covers, in file order, once attached.
     #[must_use]
-    pub fn regions(&self) -> Vec<MemRegion> {
+    pub fn regions(&self) -> Vec<RamRegion> {
         match self.view.lock() {
             Ok(v) => v.as_ref().map(GuestRamView::regions).unwrap_or_default(),
             Err(_) => Vec::new(),
@@ -371,15 +371,15 @@ mod tests {
     // slices; a region larger than one slice must come out whole.
     #[test]
     fn dump_writes_the_regions_in_address_order() {
-        const ALIGN: u64 = MemRegion::ALIGN;
+        const ALIGN: u64 = RamRegion::ALIGN;
         let ram = SharedRam::new(3 * ALIGN as usize).expect("ram");
         let regions = [
-            MemRegion {
+            RamRegion {
                 gpa: 0,
                 size: ALIGN,
                 file_offset: 0,
             },
-            MemRegion {
+            RamRegion {
                 gpa: 0x1_0000_0000,
                 size: 2 * ALIGN,
                 file_offset: ALIGN,
@@ -391,9 +391,7 @@ mod tests {
             .write(0x1_0000_0000 + 2 * ALIGN - 4, b"HIGH")
             .expect("write");
 
-        let file = Arc::new(File::from(
-            ram.file().as_fd().try_clone_to_owned().expect("dup"),
-        ));
+        let file = Arc::new(File::from(ram.as_fd().try_clone_to_owned().expect("dup")));
         let view = GuestRamView::map(&[
             (Arc::clone(&file), regions[0]),
             (Arc::clone(&file), regions[1]),
