@@ -60,11 +60,14 @@ use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
-use crate::devices::virtio::net::VirtioNet;
+use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
+use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;
+use crate::hypervisor::quiesce::Quiesce;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
+use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
 
@@ -125,7 +128,7 @@ struct Shared {
     threads: Arc<Mutex<Vec<Option<VcpuThread>>>>,
     stop: Arc<Mutex<Option<Stop>>>,
     /// Parks every vCPU at a safe point so an observation sees a still guest.
-    quiesce: Arc<crate::hypervisor::quiesce::Quiesce>,
+    quiesce: Arc<Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
     /// The object backing guest RAM, for a plugin that hands the same pages to
@@ -227,14 +230,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     };
     let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
     let mut net_tap_reader: Option<std::fs::File> = None;
-    let net = if let Some(ifname) = &cfg.net_tap {
+    let net_dev = if let Some(ifname) = &cfg.net_tap {
         // urunc already created the tap and redirected the veth to it, so all
         // that is left is to attach -- that is what brings carrier up. An
         // unusable tap fails the boot: falling back to the built-in stack
         // would put the guest on the wrong network, which from the outside is
         // indistinguishable from success.
-        let file = crate::devices::virtio::tap::open(ifname)
-            .map_err(|e| format!("--net-tap {ifname}: {e}"))?;
+        let file = tap::open(ifname).map_err(|e| format!("--net-tap {ifname}: {e}"))?;
         let reader = file
             .try_clone()
             .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
@@ -257,22 +259,19 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Err(e) => {
                 eprintln!(
                     "[hvi/kvm] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    crate::devices::virtio::net::stub_stack_line()
+                    net::stub_stack_line()
                 );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        eprintln!(
-            "[hvi/kvm] virtio-net: {}",
-            crate::devices::virtio::net::stub_stack_line()
-        );
+        eprintln!("[hvi/kvm] virtio-net: {}", net::stub_stack_line());
         Some(VirtioNet::new())
     } else {
         None
     };
 
-    let net = crate::devices::virtio::net::share(net, cfg.net_mac);
+    let net = net::share(net_dev, cfg.net_mac);
 
     let vsock = cfg
         .agent_sock
@@ -357,7 +356,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         running: Arc::new(AtomicBool::new(true)),
         threads: Arc::new(Mutex::new((0..num_cpus).map(|_| None).collect())),
         stop: Arc::new(Mutex::new(None)),
-        quiesce: Arc::new(crate::hypervisor::quiesce::Quiesce::new()),
+        quiesce: Arc::new(Quiesce::new()),
         plugin: cfg.plugin.clone(),
         ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),
@@ -376,8 +375,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // is filtered yet: each thread installs its own as it starts (see
     // `sandbox::seccomp`).
     let allowed_counts = if cfg.sandbox {
-        crate::sandbox::seccomp::arm()?;
-        Some(crate::sandbox::seccomp::allowed_counts()?)
+        seccomp::arm()?;
+        Some(seccomp::allowed_counts()?)
     } else {
         None
     };
@@ -463,7 +462,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // The guest is already running by now, so a failure here stops it and is
     // reported once every thread has been joined or left running.
     let confined = if cfg.sandbox {
-        crate::sandbox::seccomp::install(crate::sandbox::seccomp::Thread::Vmm)
+        seccomp::install(seccomp::Thread::Vmm)
     } else {
         Ok(())
     };
@@ -476,10 +475,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             stop_all(&shared);
         }
         (Ok(()), Some((vmm, vcpu))) => {
-            if crate::sandbox::seccomp::log_mode() {
+            if seccomp::log_mode() {
                 eprintln!(
                     "[hvi] seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
-                    crate::sandbox::seccomp::LOG_ENV
+                    seccomp::LOG_ENV
                 );
             } else {
                 eprintln!("[hvi] seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)");
@@ -628,7 +627,7 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
     // controls: MMIO exits are serviced inline here, so the virtio device
     // models -- the code that parses guest descriptors -- run on this
     // thread.
-    crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vcpu);
+    seccomp::install_thread(seccomp::Thread::Vcpu);
     // Held for the whole run, so every way out ends the VM. A secondary that
     // ended alone would otherwise leave the VM running with one vCPU fewer and
     // the join in `boot` blocked. Declared before the registration so the
@@ -1073,7 +1072,7 @@ fn set_gic_attr_u32(
 /// ordinary byte, so a run with no plugin passes stdin through untouched.
 fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
+        seccomp::install_thread(seccomp::Thread::Vmm);
         let stdin = std::io::stdin();
         let mut byte = [0u8; 1];
         loop {
@@ -1124,7 +1123,7 @@ fn spawn_vsock_bridge(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
+        seccomp::install_thread(seccomp::Thread::Vmm);
         let mut readers: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
@@ -1203,8 +1202,8 @@ fn spawn_vsock_bridge(
 
 /// Injects tap frames into the guest.
 ///
-/// [`crate::devices::virtio::net::TapRelay`] owns the wait and the drain. This
-/// thread supplies the delivery under the device lock and the interrupt.
+/// [`TapRelay`] owns the wait and the drain. This thread supplies the delivery
+/// under the device lock and the interrupt.
 fn spawn_net_tap_reader(
     reader: std::fs::File,
     dev: Arc<Mutex<VirtioNet>>,
@@ -1213,8 +1212,8 @@ fn spawn_net_tap_reader(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
-        let relayed = crate::devices::virtio::net::TapRelay::new(reader).run(&stop, |frame| {
+        seccomp::install_thread(seccomp::Thread::Vmm);
+        let relayed = TapRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);
@@ -1231,9 +1230,8 @@ fn spawn_net_tap_reader(
 /// Injects gateway frames into the guest, each prefixed by a 4-byte big-endian
 /// length.
 ///
-/// [`crate::devices::virtio::net::GatewayRelay`] owns the wait, the drain and
-/// the framing. This thread supplies the delivery under the device lock and the
-/// interrupt.
+/// [`GatewayRelay`] owns the wait, the drain and the framing. This thread
+/// supplies the delivery under the device lock and the interrupt.
 fn spawn_net_gateway_reader(
     reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
@@ -1242,8 +1240,8 @@ fn spawn_net_gateway_reader(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        crate::sandbox::seccomp::install_thread(crate::sandbox::seccomp::Thread::Vmm);
-        let relayed = crate::devices::virtio::net::GatewayRelay::new(reader).run(&stop, |frame| {
+        seccomp::install_thread(seccomp::Thread::Vmm);
+        let relayed = GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);
@@ -1397,7 +1395,7 @@ mod stop_tests {
         let booted = Arc::clone(&plugin);
         std::thread::spawn(move || {
             let outcome = boot(config(
-                crate::arch::aarch64::loader::tests::synthetic_image(0x8_0000, 0x40_0000, 0x1000),
+                loader::tests::synthetic_image(0x8_0000, 0x40_0000, 0x1000),
                 Some(booted),
             ))
             .map_err(|e| e.to_string());
@@ -1426,11 +1424,8 @@ mod stop_tests {
         assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = boot(config(
-                crate::arch::aarch64::loader::tests::spinning_image(),
-                None,
-            ))
-            .map_err(|e| e.to_string());
+            let outcome =
+                boot(config(loader::tests::spinning_image(), None)).map_err(|e| e.to_string());
             let _ = sender.send(outcome);
         });
         let deadline = Instant::now() + Duration::from_secs(10);

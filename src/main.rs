@@ -32,6 +32,7 @@
 use std::sync::Arc;
 
 use hvi::config;
+use hvi::devices::virtio::tap;
 use hvi::plugin::builtin::{Chain, IoTrace, MemoryDump};
 
 #[cfg(target_arch = "aarch64")]
@@ -347,7 +348,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--net-mac" => {
                 let v = it.next().ok_or("--net-mac needs a value")?;
                 net_mac = Some(
-                    hvi::devices::virtio::tap::parse_mac(v)
+                    tap::parse_mac(v)
                         .ok_or_else(|| format!("--net-mac is not a MAC address: {v}"))?,
                 );
             }

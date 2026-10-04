@@ -49,13 +49,16 @@ use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
-use crate::devices::virtio::fs::server::VirtioFs;
+use crate::devices::virtio::fs::fdlimit;
+use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
-use crate::devices::virtio::net::VirtioNet;
-use crate::devices::virtio::vsock::VirtioVsock;
+use crate::devices::virtio::net::{self, GatewayRelay, VirtioNet};
+use crate::devices::virtio::vsock::{self, VirtioVsock};
 use crate::events::Emitter;
 use crate::guestmem::GuestRam;
+use crate::hypervisor::quiesce::Quiesce;
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
+use crate::sandbox::seatbelt;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
@@ -185,7 +188,7 @@ struct Shared {
     dtb_addr: u64,
     num_cpus: u32,
     /// Parks every vCPU at a safe point so an observation sees a still guest.
-    quiesce: Arc<crate::hypervisor::quiesce::Quiesce>,
+    quiesce: Arc<Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
     /// The object backing guest RAM, for a plugin that hands the same pages to
@@ -302,7 +305,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
     let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
-    let net = if let Some(sock) = &cfg.net_gateway {
+    let net_dev = if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
             Ok(stream) => match stream.try_clone() {
                 Ok(reader) => {
@@ -318,22 +321,19 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Err(e) => {
                 eprintln!(
                     "[hvi] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    crate::devices::virtio::net::stub_stack_line()
+                    net::stub_stack_line()
                 );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        eprintln!(
-            "[hvi] virtio-net: {}",
-            crate::devices::virtio::net::stub_stack_line()
-        );
+        eprintln!("[hvi] virtio-net: {}", net::stub_stack_line());
         Some(VirtioNet::new())
     } else {
         None
     };
 
-    let net = crate::devices::virtio::net::share(net, cfg.net_mac);
+    let net = net::share(net_dev, cfg.net_mac);
 
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
         eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
@@ -396,7 +396,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         // from the guest side took a session of guessing, and one line here
         // would have ended it in a single run.
         if index == 0 {
-            match crate::devices::virtio::fs::fdlimit::raise_open_file_limit() {
+            match fdlimit::raise_open_file_limit() {
                 Ok(limit) => eprintln!("[hvi] open-file limit: {limit}"),
                 Err(e) => eprintln!(
                     "[hvi] open-file limit: could not raise it ({e}); \
@@ -469,7 +469,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         stop: Arc::new(Mutex::new(None)),
         kernel_addr: layout.kernel_addr,
         dtb_addr: layout.dtb_addr,
-        quiesce: Arc::new(crate::hypervisor::quiesce::Quiesce::new()),
+        quiesce: Arc::new(Quiesce::new()),
         plugin: cfg.plugin.clone(),
         ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),
@@ -495,7 +495,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
     if cfg.sandbox {
-        crate::sandbox::seatbelt::enter_with_shares(&fs_access)
+        seatbelt::enter_with_shares(&fs_access)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         eprintln!("[hvi] seatbelt sandbox: on (deny default)");
     } else {
@@ -629,7 +629,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             .map(|(o, c, n)| {
                 format!(
                     "{}({})={}/{:.1}ms",
-                    crate::devices::virtio::fs::server::opcode_name(o),
+                    server::opcode_name(o),
                     o,
                     c,
                     n as f64 / 1e6
@@ -1316,7 +1316,7 @@ fn spawn_vsock_bridge(
                             break;
                         }
                     }
-                    let n = match crate::devices::virtio::vsock::read_host(&mut reader, &mut buf) {
+                    let n = match vsock::read_host(&mut reader, &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
@@ -1348,9 +1348,8 @@ fn spawn_vsock_bridge(
 /// queue under the device lock, raising the net GIC line and kicking the vCPUs.
 /// Exits when the gateway closes the connection or the stop is requested.
 ///
-/// [`crate::devices::virtio::net::GatewayRelay`] owns the wait, the drain and
-/// the framing. This thread supplies the delivery under the device lock, the
-/// interrupt and the kick.
+/// [`GatewayRelay`] owns the wait, the drain and the framing. This thread
+/// supplies the delivery under the device lock, the interrupt and the kick.
 fn spawn_net_gateway_reader(
     reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
@@ -1360,7 +1359,7 @@ fn spawn_net_gateway_reader(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let relayed = crate::devices::virtio::net::GatewayRelay::new(reader).run(&stop, |frame| {
+        let relayed = GatewayRelay::new(reader).run(&stop, |frame| {
             let level = {
                 let mut d = lock_or_recover(&dev);
                 d.deliver(&mem, frame);

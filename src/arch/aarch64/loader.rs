@@ -461,9 +461,7 @@ pub(crate) mod tests {
                     VirtioDevices::default(),
                 )
                 .expect("plan");
-            let prop = |name: &str| {
-                crate::arch::aarch64::fdt::tests::prop(&dtb, "chosen", name).expect(name)
-            };
+            let prop = |name: &str| fdt::tests::prop(&dtb, "chosen", name).expect(name);
             (prop("rng-seed"), prop("kaslr-seed"))
         };
         let (first, second) = (seeds(), seeds());
