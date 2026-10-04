@@ -24,6 +24,9 @@
 //!
 //! Devices are the shared virtio-mmio blk/net/vsock (serviced on
 //! `KVM_EXIT_MMIO`) plus a 16550 serial on port I/O (`KVM_EXIT_IO`).
+//! The guest powers off and resets through ACPI, whose PM1 control and reset
+//! registers are ports the exit loop serves (see `acpi`). A guest without ACPI
+//! resets through the i8042's CPU-reset command.
 //! A plugin, if the caller supplied one, sees CR3 as the walk root.
 //!
 //! Verified on a live KVM host (x86-64): boots an Ubuntu 6.8 kernel to
@@ -49,10 +52,12 @@ use std::thread::JoinHandle;
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 
+use crate::arch::x86_64::acpi;
 use crate::arch::x86_64::layout::{
-    virtio_fs_base, virtio_fs_gsi, BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE,
-    MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI,
-    VIRTIO_NET_BASE, VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR,
+    HIGH_RAM_BASE, I8042_COMMAND_PORT, MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR, PML4_ADDR,
+    RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE, VIRTIO_NET_GSI, VIRTIO_SIZE,
+    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::mptable;
@@ -75,6 +80,15 @@ use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
 const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 const REQUEST_KEY: u8 = 0x1d; // Ctrl-]
 
+/// The i8042's CPU-reset command, on [`I8042_COMMAND_PORT`].
+const I8042_RESET_CPU: u8 = 0xfe;
+/// The i8042 status the guest reads.
+///
+/// The input buffer reads empty, so the kernel's reset path sends its command
+/// at once. The other bits read set, as on a port with nothing behind it, so a
+/// guest that probes for the controller finds none at its first flush.
+const I8042_STATUS: u8 = !0x02;
+
 // Long-mode control-register values (Firecracker's boot values).
 const CR0_PE_PG: u64 = 0x8005_0033; // PE|MP|ET|NE|WP|AM|PG
 const CR4_PAE: u64 = 0x0000_0020; // PAE
@@ -90,6 +104,8 @@ struct Shared {
     uart: Arc<Mutex<Uart16550>>,
     /// The CMOS RTC: without it a guest hangs in read_persistent_clock64().
     rtc: Arc<Mutex<RtcCmos>>,
+    /// The ACPI PM1 and reset registers, where the guest powers off.
+    pm: Arc<Mutex<acpi::PmRegisters>>,
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
@@ -305,13 +321,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let cmdline = splice_kernel_args(cfg.cmdline.trim(), &ours);
 
     // Load the kernel, write boot_params and the command line, then place
-    // the initrd and the MP table.
+    // the initrd, the MP table and the ACPI tables.
     let initrd_len = cfg.initramfs.as_ref().map_or(0, |v| v.len() as u64);
     let kernel = LoadedKernel::load(ram.memory(), &cfg.kernel, &cmdline, initrd_len)?;
     if let (Some(addr), Some(initramfs)) = (kernel.initrd_addr, &cfg.initramfs) {
         ram.write(addr, initramfs)?;
     }
     ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
+    ram.write(ACPI_ADDR, &acpi::build(num_cpus))?;
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
     eprintln!(
@@ -350,6 +367,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         mem: ram,
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
+        pm: Arc::new(Mutex::new(acpi::PmRegisters::default())),
         virtio,
         net,
         vsock,
@@ -779,8 +797,14 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
                     eprintln!("[trace] cpu{cpu_id} IoIn {port:#x}");
                     n_exit += 1;
                 }
-                for b in data.iter_mut() {
-                    *b = pio_read(&sh, port);
+                // The ACPI registers are 16 bits wide, so they take the whole
+                // access. Every other port is a byte port.
+                if acpi::PmRegisters::serves(port) {
+                    lock_or_recover(&sh.pm).read(port, data);
+                } else {
+                    for b in data.iter_mut() {
+                        *b = pio_read(&sh, port);
+                    }
                 }
             }
             Ok(VcpuExit::IoOut(port, data)) => {
@@ -791,8 +815,17 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
                     );
                     n_exit += 1;
                 }
-                for &b in data.iter() {
-                    pio_write(&sh, port, b);
+                let stop = if acpi::PmRegisters::serves(port) {
+                    lock_or_recover(&sh.pm).write(port, data)
+                } else {
+                    for &b in data.iter() {
+                        pio_write(&sh, port, b);
+                    }
+                    data.iter().find_map(|&b| pio_stop(port, b))
+                };
+                if let Some(stop) = stop {
+                    *sh.stop.lock().unwrap() = Some(stop);
+                    break;
                 }
             }
             Ok(VcpuExit::MmioRead(addr, data)) => {
@@ -923,6 +956,8 @@ fn pio_dispatch_read(
         v
     } else if port == RTC_INDEX_PORT || port == RTC_DATA_PORT {
         rtc.lock().unwrap().pio_read(port)
+    } else if port == I8042_COMMAND_PORT {
+        I8042_STATUS
     } else {
         0xff
     }
@@ -943,6 +978,11 @@ fn pio_dispatch_write(
     } else if port == RTC_INDEX_PORT || port == RTC_DATA_PORT {
         rtc.lock().unwrap().pio_write(port, val);
     }
+}
+
+/// Returns the stop a byte-port write asks for, which is the i8042's CPU reset.
+fn pio_stop(port: u16, val: u8) -> Option<Stop> {
+    (port == I8042_COMMAND_PORT && val == I8042_RESET_CPU).then_some(Stop::SystemReset)
 }
 
 fn pio_read(sh: &Shared, port: u16) -> u8 {
@@ -1644,6 +1684,25 @@ mod pio_tests {
             pio_dispatch_write(&uart, &rtc, COM1_PORT, *b, set);
         }
         assert_eq!(edges.get(), 2, "the THR writes raise a second edge");
+    }
+
+    // The kernel's i8042 reset waits for the input buffer to empty before each
+    // command. A full one costs the whole poll before every try.
+    #[test]
+    fn the_i8042_takes_its_reset_command_at_once() {
+        let uart = Mutex::new(Uart16550::new());
+        let rtc = Mutex::new(RtcCmos::new());
+        let status = pio_dispatch_read(&uart, &rtc, I8042_COMMAND_PORT, |_| {
+            panic!("an i8042 read sets no COM1 line")
+        });
+        assert_eq!(status & 0x02, 0, "input buffer empty");
+        assert_eq!(status & 0x01, 0x01, "a probe's first flush still fails");
+        assert!(matches!(
+            pio_stop(I8042_COMMAND_PORT, I8042_RESET_CPU),
+            Some(Stop::SystemReset)
+        ));
+        assert!(pio_stop(I8042_COMMAND_PORT, 0xaa).is_none());
+        assert!(pio_stop(0x60, I8042_RESET_CPU).is_none());
     }
 }
 

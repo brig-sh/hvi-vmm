@@ -284,6 +284,38 @@ jobs:
               || { echo "::error::e820 lacks the usable range $range"; exit 1; }
           done
           echo "e820 split around the MMIO hole ✓"
+      # The guest powers off through the ACPI tables and resets through their
+      # reset register, or through the i8042 when it runs without ACPI. With
+      # the in-kernel irqchip a halt never reaches hvi, so a power-off that
+      # fell back to one would only end at the timeout.
+      - name: power-off and reset end the run
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          sudo apt-get install -y --no-install-recommends busybox-static cpio
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          for cmd in poweroff reboot; do
+            W=$(mktemp -d); mkdir -p "$W/bin"
+            cp /bin/busybox "$W/bin/busybox"
+            printf '#!/bin/busybox sh\n/bin/busybox %s -f\n' "$cmd" > "$W/init"
+            chmod +x "$W/init"
+            ( cd "$W" && find . | cpio -o -H newc --quiet ) > "$cmd.cpio"
+          done
+          # <log name> <initramfs> <expected stop> <extra command line>
+          stops() {
+            start=$(date +%s)
+            sudo timeout 30 ./target/release/hvi boot --kernel "$KIMG" --initramfs "$2" \
+              --mem-mib 512 --cpus 2 --cmdline "console=ttyS0 panic=-1 $4" \
+              </dev/null 2>&1 | tee "$1.log" > /dev/null
+            rc=${PIPESTATUS[0]}
+            echo "$1: exit $rc after $(( $(date +%s) - start )) s"
+            [ "$rc" -eq 0 ] || { tail -20 "$1.log"; echo "::error::$1: hvi exited $rc"; exit 1; }
+            grep -q "guest stopped: $3" "$1.log" \
+              || { tail -20 "$1.log"; echo "::error::$1: the run did not stop as $3"; exit 1; }
+          }
+          stops poweroff poweroff.cpio SystemOff ""
+          stops reboot reboot.cpio SystemReset ""
+          stops reboot-no-acpi reboot.cpio SystemReset "acpi=off"
+          echo "power-off and reset end the run ✓"
       # backing_len's BLKGETSIZE64 branch self-skips when no block device is
       # openable, which is every unprivileged run — so nothing exercised it
       # live. A loop device over a sparse file is exactly the shape that broke
@@ -430,6 +462,9 @@ jobs:
             boot-4g.log
             blk.log
             stop.log
+            poweroff.log
+            reboot.log
+            reboot-no-acpi.log
             boot-fs.log
             boot-ro.log
           retention-days: 7

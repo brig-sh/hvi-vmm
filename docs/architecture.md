@@ -28,9 +28,9 @@ usual mistake:
 - **Guest-architecture differences** live in the loader and layout modules
   under `arch/<arch>/`, and they are larger. An arm64 guest gets an `Image`, a
   devicetree and PSCI. An x86-64 guest gets a `bzImage` or an uncompressed
-  `vmlinux` with a `boot_params` page, an e820 map and an MP table. Some devices
-  are architecture-specific too: PL011 against 16550, and a CMOS RTC that only
-  x86 needs.
+  `vmlinux` with a `boot_params` page, an e820 map, an MP table and ACPI tables
+  for power-off. Some devices are architecture-specific too: PL011 against
+  16550, and a CMOS RTC that only x86 needs.
 
 Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file,
 its `mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` and its target
@@ -161,11 +161,14 @@ logs a redistributor region that does not match the table:
 | boot GDT | `0xc000` |
 | kernel command line | `0x2_0000` |
 | MP table (EBDA) | `0x9_fc00` |
+| ACPI tables: RSDP, XSDT, FADT, DSDT, FACS, MADT | `0xe_0000` |
 | `bzImage` load / 64-bit entry | `0x10_0000` / `0x10_0200` (a `vmlinux` enters at its `e_entry`) |
 | RAM, low half | `0x0` to `0xd000_0000` |
 | virtio-blk / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
 | COM1 UART | PIO `0x3f8`, GSI 4 |
 | CMOS RTC | PIO `0x70` / `0x71` |
+| i8042 status and reset command | PIO `0x64` |
+| ACPI PM1 event, PM1 control and reset registers | PIO `0x600` / `0x604` / `0x606`, SCI on GSI 23 |
 | IOAPIC / LAPIC | `0xfec0_0000` / `0xfee0_0000` |
 | RAM, high half | `0x1_0000_0000` upward |
 
@@ -250,7 +253,7 @@ decompressor, so it boots without KASLR.
 flowchart TB
     A["linux-loader BzImage::load: 0xAA55, 'HdrS', protocol ≥ 2.00, LOADED_HIGH<br/>kernel@code32_start (1 MiB), entry +0x200<br/>or Elf::load(vmlinux): PT_LOADs @p_paddr, entry e_entry"] --> B
     B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image or synthesized; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
-    C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs"] --> D
+    C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs<br/>acpi::build @0xe0000<br/>RSDP, XSDT, FADT (PM1 @0x600), DSDT (_S5),<br/>FACS, MADT: N CPUs, IOAPIC"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
     E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID +RDRAND +RDSEED"] --> F
     F["BSP: rip=entry, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
@@ -405,7 +408,7 @@ how it works.
 | CLI and configuration | `main.rs`, `config.rs` |
 | Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
-| x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
+| x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`, `fs/virtiofsd.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
