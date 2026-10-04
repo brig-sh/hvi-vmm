@@ -79,8 +79,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::devices::virtio::fs::server;
-use crate::memory::SharedRam;
-use crate::memory::{GuestRam, MemRegion};
+use crate::memory::{GuestRam, RamRegion, SharedRam};
 
 /// The Seatbelt profile, in SBPL.
 ///
@@ -712,7 +711,7 @@ pub fn selftest() -> io::Result<usize> {
             std::os::unix::net::UnixListener::bind(&path)?
         },
         pre_mapped: {
-            let shared_ram = SharedRam::new(MemRegion::ALIGN as usize)?;
+            let shared_ram = SharedRam::new(RamRegion::ALIGN as usize)?;
             GuestRam::new(&shared_ram, &[shared_ram.region_at(0)])?
         },
         pre_tty: open_pty()?,

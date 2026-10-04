@@ -28,27 +28,9 @@ use vm_memory::{
     VolatileSlice, WriteVolatile,
 };
 
-use crate::memory::SharedRam;
+use crate::memory::{RamRegion, SharedRam};
 
-/// A guest-physical span of the VM's RAM and where it sits in the object that
-/// backs it, so a process that maps the same object sees the same bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemRegion {
-    /// Guest-physical address this span starts at.
-    pub gpa: u64,
-    /// Length in bytes.
-    pub size: u64,
-    /// Offset of `gpa` within the object that backs this region.
-    pub file_offset: u64,
-}
-
-impl MemRegion {
-    /// Alignment of `gpa`, `size` and `file_offset`, 1 MiB.
-    ///
-    /// Every host page size divides it, so a region's mapping offset and its
-    /// hypervisor slot are page-aligned on any host.
-    pub const ALIGN: u64 = 1 << 20;
-
+impl RamRegion {
     /// Maps this region of `file` with `prot` as its own `MAP_SHARED` mapping,
     /// after checking that it is aligned and lies inside the file.
     ///
@@ -109,7 +91,7 @@ impl MemRegion {
 #[derive(Debug, Clone)]
 struct MappedRegion {
     /// The guest-physical span and its file offset.
-    region: MemRegion,
+    region: RamRegion,
     /// The region's mapping, shared with the collection.
     mmap: Arc<GuestRegionMmap>,
 }
@@ -147,9 +129,9 @@ impl GuestRamView {
     /// # Errors
     ///
     /// Errors if the list is empty, or if a region is empty, not
-    /// [`MemRegion::ALIGN`]-aligned, ends past its file, does not fit the
+    /// [`RamRegion::ALIGN`]-aligned, ends past its file, does not fit the
     /// address space, overlaps another, or its mapping fails.
-    pub fn map(regions: &[(Arc<File>, MemRegion)]) -> io::Result<Self> {
+    pub fn map(regions: &[(Arc<File>, RamRegion)]) -> io::Result<Self> {
         let mappings = regions
             .iter()
             .map(|(file, region)| region.map(file, libc::PROT_READ))
@@ -169,7 +151,7 @@ impl GuestRamView {
         let mapped = mappings
             .into_iter()
             .map(|mmap| MappedRegion {
-                region: MemRegion {
+                region: RamRegion {
                     gpa: mmap.start_addr().raw_value(),
                     size: mmap.len(),
                     file_offset: mmap.file_offset().map_or(0, FileOffset::start),
@@ -183,7 +165,7 @@ impl GuestRamView {
     /// Returns the regions in address order, each with its offset in the file
     /// it is mapped from.
     #[must_use]
-    pub fn regions(&self) -> Vec<MemRegion> {
+    pub fn regions(&self) -> Vec<RamRegion> {
         self.mapped.iter().map(|mapping| mapping.region).collect()
     }
 
@@ -335,9 +317,9 @@ impl GuestRam {
     /// # Errors
     ///
     /// Errors if the list is empty, or if a region is empty, not
-    /// [`MemRegion::ALIGN`]-aligned, ends past the object, does not fit the
+    /// [`RamRegion::ALIGN`]-aligned, ends past the object, does not fit the
     /// address space, overlaps another, or its mapping fails.
-    pub fn new(shared: &SharedRam, regions: &[MemRegion]) -> io::Result<Self> {
+    pub fn new(shared: &SharedRam, regions: &[RamRegion]) -> io::Result<Self> {
         let mappings = regions
             .iter()
             .map(|region| region.map(shared.file(), libc::PROT_READ | libc::PROT_WRITE))
@@ -461,7 +443,7 @@ fn out_of_ram<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Er
 mod tests {
     use super::*;
 
-    const ALIGN: usize = MemRegion::ALIGN as usize;
+    const ALIGN: usize = RamRegion::ALIGN as usize;
 
     #[test]
     fn read_write_roundtrip_and_bounds() {
@@ -533,7 +515,7 @@ mod tests {
     /// tool that received it over a socket would hold it.
     fn received(shared: &SharedRam) -> Arc<File> {
         use std::os::fd::AsFd;
-        let fd = shared.file().as_fd().try_clone_to_owned().expect("dup");
+        let fd = shared.as_fd().try_clone_to_owned().expect("dup");
         Arc::new(File::from(fd))
     }
 
@@ -545,12 +527,12 @@ mod tests {
         const HIGH_BASE: u64 = 0x1_0000_0000;
         let shared = SharedRam::new(2 * ALIGN).expect("allocate");
         let regions = [
-            MemRegion {
+            RamRegion {
                 gpa: 0,
                 size: ALIGN as u64,
                 file_offset: 0,
             },
-            MemRegion {
+            RamRegion {
                 gpa: HIGH_BASE,
                 size: ALIGN as u64,
                 file_offset: ALIGN as u64,
@@ -612,7 +594,7 @@ mod tests {
     fn regions_are_sorted_and_an_overlap_or_empty_list_is_refused() {
         const HIGH_BASE: u64 = 0x1_0000_0000;
         let shared = SharedRam::new(2 * ALIGN).expect("allocate");
-        let region = |gpa, file_offset| MemRegion {
+        let region = |gpa, file_offset| RamRegion {
             gpa,
             size: ALIGN as u64,
             file_offset,
@@ -660,7 +642,7 @@ mod tests {
     #[test]
     fn misaligned_and_empty_regions_are_refused() {
         let shared = SharedRam::new(2 * ALIGN).expect("allocate");
-        let region = |gpa, size, file_offset| MemRegion {
+        let region = |gpa, size, file_offset| RamRegion {
             gpa,
             size,
             file_offset,
@@ -691,7 +673,7 @@ mod tests {
     #[test]
     fn regions_past_the_object_end_are_refused() {
         let shared = SharedRam::new(ALIGN).expect("allocate");
-        let region = |file_offset, size| MemRegion {
+        let region = |file_offset, size| RamRegion {
             gpa: 0,
             size,
             file_offset,

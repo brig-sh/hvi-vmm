@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::events::Emitter;
 use crate::memory::GuestRam;
-pub use crate::memory::MemRegion;
+pub use crate::memory::RamRegion;
 
 /// The guest architecture a backend is running, so a tool can interpret
 /// [`RegsView`] correctly without guessing it from the host.
@@ -90,7 +90,7 @@ pub trait VmHandle: Send + Sync {
 
     /// Where the guest's RAM sits, in guest-physical terms and in the backing
     /// object. More than one region on backends that punt a hole in RAM.
-    fn ram_regions(&self) -> Vec<MemRegion>;
+    fn ram_regions(&self) -> Vec<RamRegion>;
 
     /// The `RawEvent` ledger, so a plugin's own records land in the same
     /// stream as the VMM's device observations.

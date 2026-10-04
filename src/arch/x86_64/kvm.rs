@@ -66,7 +66,7 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
 use crate::hypervisor::quiesce::Quiesce;
 use crate::memory::{GuestRam, SharedRam};
-use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
+use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
@@ -184,13 +184,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let low_bytes = cfg.mem_bytes.min(MMIO_GAP_START);
     let high_bytes = cfg.mem_bytes.saturating_sub(low_bytes);
     let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
-    let mut regions = vec![MemRegion {
+    let mut regions = vec![RamRegion {
         gpa: RAM_BASE,
         size: low_bytes,
         file_offset: 0,
     }];
     if high_bytes > 0 {
-        regions.push(MemRegion {
+        regions.push(RamRegion {
             gpa: HIGH_RAM_BASE,
             size: high_bytes,
             file_offset: low_bytes,
@@ -1037,7 +1037,7 @@ impl VmHandle for Shared {
         self.ram_file.as_fd()
     }
 
-    fn ram_regions(&self) -> Vec<MemRegion> {
+    fn ram_regions(&self) -> Vec<RamRegion> {
         // Both halves. Reporting only the low one leaves a plugin mapping
         // less than the guest has and reading nothing above the MMIO hole --
         // which looks like an empty guest, not like a missing region.

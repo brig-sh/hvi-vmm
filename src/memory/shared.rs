@@ -26,10 +26,10 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
-use crate::memory::MemRegion;
+use crate::memory::RamRegion;
 
 /// A shareable guest-RAM allocation, the descriptor of an unlinked object
 /// sized to hold the guest. The object lives as long as any mapping of it or
@@ -137,8 +137,8 @@ impl SharedRam {
 
     /// Returns the region that maps the whole object at `gpa`.
     #[must_use]
-    pub fn region_at(&self, gpa: u64) -> MemRegion {
-        MemRegion {
+    pub fn region_at(&self, gpa: u64) -> RamRegion {
+        RamRegion {
             gpa,
             size: self.len as u64,
             file_offset: 0,
@@ -165,11 +165,16 @@ impl SharedRam {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
 
-    /// Returns the backing descriptor, which stays owned here and must not be
-    /// closed.
-    #[must_use]
-    pub fn fd(&self) -> RawFd {
+impl AsFd for SharedRam {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
+impl AsRawFd for SharedRam {
+    fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
 }
@@ -186,7 +191,7 @@ mod tests {
 
     const BASE: u64 = 0x4000_0000;
     // The smallest object one region can map.
-    const LEN: usize = MemRegion::ALIGN as usize;
+    const LEN: usize = RamRegion::ALIGN as usize;
 
     /// Maps the whole object as one region at `BASE`.
     fn view(ram: &SharedRam) -> GuestRam {
@@ -218,7 +223,7 @@ mod tests {
                 ram.len(),
                 libc::PROT_READ,
                 libc::MAP_SHARED,
-                ram.fd(),
+                ram.as_raw_fd(),
                 0,
             )
         };
@@ -301,7 +306,7 @@ mod tests {
             // A memfd has no filesystem name. Its /proc link records the
             // creation name for diagnostics and is not a path: opening it
             // fails, which is what "unreachable by name" means here.
-            let link = std::fs::read_link(format!("/proc/self/fd/{}", ram.fd()))
+            let link = std::fs::read_link(format!("/proc/self/fd/{}", ram.as_raw_fd()))
                 .expect("the descriptor has a /proc link");
             let link = link.to_string_lossy().into_owned();
             assert!(
