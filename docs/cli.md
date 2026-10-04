@@ -46,8 +46,8 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
-| `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. macOS only. |
-| `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
+| `--share-ro <dir> <tag> [cache=…] [pin=<dir>]…` | none | Read-only virtio-fs share. Repeatable. macOS only. |
+| `--share-rw <dir> <tag> [cache=…] [pin=<dir>]…` | none | Read-write virtio-fs share. Repeatable. macOS only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
 | `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |

@@ -83,6 +83,34 @@ Unix sockets are served from inside the device. The socket inode lives in hvi,
 by path, and never reaches the host filesystem. The guest kernel's own socket
 table carries the traffic.
 
+### Pinned directories
+
+A guest can mount a filesystem on a directory of a share, a tmpfs for
+example. It reaches that mount through the directory's name, and hvi
+resolves names by host path. If the host renames the directory, or one above
+it, and another appears in its place, the name answers with a different node
+and the guest drops its entry for it, and the mount with it. The guest path
+then leads into the new host directory. What the guest writes to a tmpfs
+that was meant to stay in its memory lands on the host disk from then on. A
+longer entry timeout does not prevent this, because a directory listing of
+the parent reports the new node as well.
+
+Name such directories with a trailing `pin=<dir>` on the share, once per
+directory, after `cache=` if that is given. The path is relative to the
+share:
+
+```sh
+hvi boot ... --share-rw /path/to/home home pin=.cache pin=work/scratch
+```
+
+A pinned directory, and every directory between it and the share's root,
+keeps the node it was first given for as long as hvi runs. It also keeps
+answering as a directory, with the attributes last seen, when the host has a
+file or a symlink there, or nothing. What the directory holds still follows
+the host path. The guest gets `EBUSY` if it renames or removes a pinned
+directory. A directory need not exist when hvi starts: the pin takes effect
+at its first lookup. A share with no `pin=` behaves as before.
+
 ### Cache policy
 
 A trailing `cache=auto|always|none` on a share selects how long the guest may

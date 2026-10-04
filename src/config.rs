@@ -66,6 +66,11 @@ pub struct FsShare {
     pub tag: String,
     pub mode: ShareMode,
     pub cache: CachePolicy,
+    /// Directories below `path`, relative to it, that the guest mounts
+    /// something on. Each one, and every directory between it and the
+    /// export root, keeps one identity in the guest for the life of the
+    /// device. See `VirtioFs::pin`.
+    pub pins: Vec<PathBuf>,
 }
 
 /// Refuses two exports of the same host subtree that disagree on whether the
@@ -218,6 +223,7 @@ mod tests {
                 tag: format!("tag{i}"),
                 mode: *mode,
                 cache: CachePolicy::Auto,
+                pins: Vec::new(),
             })
             .collect()
     }
@@ -280,12 +286,14 @@ mod tests {
                 tag: "real".into(),
                 mode: ShareMode::ReadWrite,
                 cache: CachePolicy::Auto,
+                pins: Vec::new(),
             },
             FsShare {
                 path: dir.join("link"),
                 tag: "link".into(),
                 mode: ShareMode::ReadOnly,
                 cache: CachePolicy::Auto,
+                pins: Vec::new(),
             },
         ])
         .unwrap_err();
