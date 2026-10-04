@@ -12,24 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! COM1 for the x86 backend: `vm-superio`'s 16550, wired to hvi's IRQ model.
+//! COM1 for the x86 backend, on the 16550 register file from `vm-superio`.
 //!
-//! The register file is upstream's. What is ours is the wiring, and it needs
-//! explaining, because the two sides model the interrupt differently.
+//! hvi sets COM1's line after every access. The guest programs the pin (ISA
+//! IRQ 4) as edge-triggered, so it sees an interrupt only when the line
+//! rises. Its 8250 driver reads the interrupt identification register (IIR)
+//! until IIR reports nothing pending. So the line is high exactly when an IIR
+//! read would report an interrupt. A line left high after IIR reads empty
+//! never rises again, and the guest then waits for a THR-empty interrupt that
+//! does not come.
 //!
-//! `vm-superio` is edge-triggered: it calls `Trigger::trigger` when an
-//! interrupt becomes pending and never says when it goes away, which is what a
-//! VMM wants when the line is an eventfd handed to `KVM_IRQFD`. hvi drives
-//! COM1 as a **level** line instead -- `set_irq_line(COM1_GSI, level)` after
-//! every access -- so it needs the assert *and* the deassert.
-//!
-//! So the trigger is a no-op and the level is read back from the interrupt
-//! identification register, which is the register that answers exactly this
-//! question. The one cost is that `state()` is the only accessor that reports
-//! it without the reset-on-read side effect a guest would get, and `state()`
-//! copies the receive buffer to do it. That is one small allocation per port
-//! access, on a path that runs once per console byte; see the pull request for
-//! the boot measurement that says it does not matter here.
+//! The crate's own IIR does not keep that rule, so this module answers IIR
+//! reads itself. The crate clears every pending bit on an IIR read, and raises
+//! THR-empty only on a THR write. A 16550 also raises THR-empty when the guest
+//! enables it while the holding register is empty. An IIR read clears
+//! THR-empty only when that read reports it.
 
 use std::io::{self, Write};
 
@@ -38,16 +35,30 @@ use vm_superio::{Serial, Trigger};
 
 use crate::console::ConsoleFilter;
 
-/// The two enable bits and the data-ready bit the level is computed from. The
-/// crate keeps its register bits private, and these are the ones hvi needs to
-/// answer "is a condition still true", which is a different question from the
-/// IIR's "what should I service".
+/// The register bits the interrupt state is computed from. The crate keeps its
+/// own register bits private.
 const IER_RECEIVED_DATA: u8 = 0x01;
 const IER_THR_EMPTY: u8 = 0x02;
 const LSR_DATA_READY: u8 = 0x01;
+const LCR_DLAB: u8 = 0x80;
 
-/// The edge callback hvi does not use. The line is level-driven and its state
-/// is read from the IIR after each access, so there is nothing to do here.
+/// The COM-base offsets this module reads or intercepts. With DLAB set,
+/// offsets 0 and 1 are the divisor latch instead.
+const THR: u16 = 0;
+const IER: u16 = 1;
+const IIR: u16 = 2;
+const LCR: u16 = 3;
+
+/// The IIR interrupt IDs a read can report, by priority, and the bits that
+/// advertise the FIFOs. The Linux 8250 driver reads the FIFO bits to tell a
+/// 16550A from a 16450.
+const IIR_RECEIVED_DATA: u8 = 0x04;
+const IIR_THR_EMPTY: u8 = 0x02;
+const IIR_NONE: u8 = 0x01;
+const IIR_FIFO_ENABLED: u8 = 0xc0;
+
+/// The edge callback hvi does not use. hvi sets the line from
+/// [`Uart16550::irq_level`] after each access.
 struct NoTrigger;
 
 impl Trigger for NoTrigger {
@@ -90,6 +101,8 @@ impl Write for ConsoleOut {
 /// A 16550 UART with a host-stdout TX and a host-fed RX queue.
 pub struct Uart16550 {
     inner: Serial<NoTrigger, NoEvents, ConsoleOut>,
+    /// Whether a THR-empty interrupt is pending. IER can still mask it.
+    thr_empty_pending: bool,
 }
 
 impl Uart16550 {
@@ -103,29 +116,39 @@ impl Uart16550 {
                     passed: Vec::new(),
                 },
             ),
+            thr_empty_pending: false,
         }
     }
 
-    /// Whether COM1's interrupt line should be asserted right now.
+    /// Returns the interrupt ID an IIR read would report now, without the FIFO
+    /// bits.
     ///
-    /// Computed from the conditions, not from the IIR. `vm-superio` clears the
-    /// whole IIR when the guest reads it, which is right for a VMM whose line
-    /// is an eventfd -- the next enqueue re-triggers the edge. hvi's line is a
-    /// level, and a level has to stay asserted while the condition holds: a
-    /// guest that reads IIR to find out why it was interrupted, and has not
-    /// finished draining, must still see the line.
+    /// Received data comes first, while it is enabled and a byte is waiting.
+    /// THR-empty comes next, while it is enabled and pending. Transmit drains
+    /// synchronously, so the holding register is always empty.
     ///
-    /// So this asks the same two questions the hand-rolled device asked, in
-    /// the same order: received-data if it is enabled and a byte is waiting,
-    /// and THR-empty if it is enabled at all, because transmit drains
-    /// synchronously and the holding register is therefore always empty.
+    /// It reads the registers through `Serial::state`, which copies the
+    /// receive buffer. That allocates only while received bytes are waiting.
+    fn interrupt_id(&self) -> u8 {
+        let state = self.inner.state();
+        if state.interrupt_enable & IER_RECEIVED_DATA != 0
+            && state.line_status & LSR_DATA_READY != 0
+        {
+            IIR_RECEIVED_DATA
+        } else if state.interrupt_enable & IER_THR_EMPTY != 0 && self.thr_empty_pending {
+            IIR_THR_EMPTY
+        } else {
+            IIR_NONE
+        }
+    }
+
+    /// Returns whether COM1's interrupt line should be asserted right now.
+    ///
+    /// The line is high exactly when an IIR read would report an interrupt.
+    /// The [module documentation](crate::uart16550) says why.
     #[must_use]
     pub fn irq_level(&self) -> bool {
-        let state = self.inner.state();
-        let rda = state.interrupt_enable & IER_RECEIVED_DATA != 0
-            && state.line_status & LSR_DATA_READY != 0;
-        let thre = state.interrupt_enable & IER_THR_EMPTY != 0;
-        rda || thre
+        self.interrupt_id() != IIR_NONE
     }
 
     /// Queues a byte from the host (stdin) for the guest to read.
@@ -138,15 +161,41 @@ impl Uart16550 {
 
     /// Services an `in` from `port` (COM base + offset), returning the byte.
     pub fn pio_read(&mut self, off: u16) -> u8 {
-        self.inner.read(off as u8)
+        if off != IIR {
+            return self.inner.read(off as u8);
+        }
+        // The crate's IIR is not used, but the read keeps it in step.
+        let _ = self.inner.read(off as u8);
+        let id = self.interrupt_id();
+        if id == IIR_THR_EMPTY {
+            self.thr_empty_pending = false;
+        }
+        id | IIR_FIFO_ENABLED
     }
 
     /// Services an `out` to `port` (COM base + offset).
     pub fn pio_write(&mut self, off: u16, val: u8) {
+        // The crate's LCR and IER reads have no side effects. IER reads the
+        // divisor latch while DLAB is set, but it is not used then.
+        let dlab = self.inner.read(LCR as u8) & LCR_DLAB != 0;
+        let ier = self.inner.read(IER as u8);
         // A write fails only if the console write failed; the guest has no way
         // to be told about a host stdout that has gone away, and it must not
         // stall waiting for one.
         let _ = self.inner.write(off as u8, val);
+        if dlab {
+            return;
+        }
+        match off {
+            THR => self.thr_empty_pending = true,
+            IER => {
+                let enabled = val & IER_THR_EMPTY != 0;
+                if enabled != (ier & IER_THR_EMPTY != 0) {
+                    self.thr_empty_pending = enabled;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -164,9 +213,11 @@ mod tests {
     const RBR_THR: u16 = 0;
     const IER: u16 = 1;
     const IIR: u16 = 2;
+    const LCR: u16 = 3;
     const LSR: u16 = 5;
 
     const IER_RDA: u8 = 0x01;
+    const IER_THRI: u8 = 0x02;
     const LSR_DR: u8 = 0x01;
 
     /// The level derivation is ours, not the crate's, so it gets a test: a
@@ -237,5 +288,77 @@ mod tests {
             0b1100_0000,
             "IIR must report FIFOs enabled"
         );
+    }
+
+    // The x86 console stall: the guest enabled THR-empty and another vCPU read
+    // IIR as empty, but the line stayed high. The writes that followed raised
+    // no edge, and the guest waited for an interrupt that never came.
+    #[test]
+    fn the_line_is_low_whenever_iir_reads_empty() {
+        let mut u = Uart16550::new();
+        u.pio_write(IER, IER_THRI);
+        assert!(u.irq_level(), "enabling THR-empty asserts it");
+        assert_eq!(u.pio_read(IIR), 0xc2, "IIR reports THR-empty");
+        assert!(!u.irq_level(), "the read cleared it");
+        assert_eq!(u.pio_read(IIR), 0xc1, "nothing else is pending");
+
+        for b in b"0123456789abcdef" {
+            u.pio_write(RBR_THR, *b);
+        }
+        assert!(u.irq_level(), "the writes raise the line again");
+        assert_eq!(u.pio_read(IIR), 0xc2);
+        assert!(!u.irq_level());
+    }
+
+    // The 8250 console write saves IER, clears it, writes, and restores it.
+    #[test]
+    fn disabling_thr_empty_drops_it_and_enabling_raises_it_again() {
+        let mut u = Uart16550::new();
+        u.pio_write(IER, IER_THRI);
+        u.pio_write(IER, 0);
+        assert!(!u.irq_level());
+        assert_eq!(u.pio_read(IIR), 0xc1);
+        u.pio_write(IER, IER_THRI);
+        assert!(u.irq_level());
+    }
+
+    #[test]
+    fn an_iir_read_that_reports_received_data_keeps_thr_empty_pending() {
+        let mut u = Uart16550::new();
+        u.pio_write(IER, IER_RDA | IER_THRI);
+        u.push_rx(b'x');
+        assert_eq!(u.pio_read(IIR), 0xc4, "received data comes first");
+        assert_eq!(u.pio_read(RBR_THR), b'x');
+        assert!(u.irq_level(), "THR-empty is still pending");
+        assert_eq!(u.pio_read(IIR), 0xc2);
+        assert!(!u.irq_level());
+    }
+
+    /// Writes the baud divisor `d` the way the 8250 driver's `set_termios`
+    /// does: DLAB on, the low byte, the high byte, DLAB off.
+    fn set_divisor(u: &mut Uart16550, d: u16) {
+        u.pio_write(LCR, 0x83);
+        u.pio_write(RBR_THR, d as u8);
+        u.pio_write(IER, (d >> 8) as u8);
+        u.pio_write(LCR, 0x03);
+    }
+
+    // With DLAB set, offsets 0 and 1 are the divisor latch. Their writes must
+    // neither raise THR-empty nor clear it, or a baud change with a transmit
+    // in flight would drop the line.
+    #[test]
+    fn the_divisor_latch_leaves_the_interrupts_alone() {
+        let mut u = Uart16550::new();
+        u.pio_write(IER, IER_THRI);
+        assert_eq!(u.pio_read(IIR), 0xc2);
+        set_divisor(&mut u, 0x0201);
+        assert!(!u.irq_level(), "the divisor writes raise nothing");
+
+        u.pio_write(RBR_THR, b'x');
+        set_divisor(&mut u, 0x0001);
+        assert!(u.thr_empty_pending, "nor do they clear THR-empty");
+        assert!(u.irq_level());
+        assert_eq!(u.pio_read(IER), IER_THRI, "IER kept its value");
+        assert_eq!(u.pio_read(IIR), 0xc2);
     }
 }

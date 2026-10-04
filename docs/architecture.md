@@ -319,11 +319,12 @@ created goes with them (vsock sessions, the virtio-fs FUSE session). A driver
 that binds again after that starts from a device in its boot state.
 
 The serial console is a **PL011** on arm64 and a **16550** on x86. The x86 one
-wraps `vm-superio`'s `Serial`, which is edge-triggered, and hvi drives COM1 as
-a level line: the wrapper recomputes the level from the interrupt conditions
-rather than from the IIR, which `vm-superio` clears on read. Both write guest
-output to stdout through `console::ConsoleFilter`, which drops the escape
-sequences that change host state or make the terminal answer (see
+wraps `vm-superio`'s `Serial`. hvi sets COM1's line after every access, with
+the UART lock held. The guest programs the pin as edge-triggered, so the line
+is high exactly when an IIR read would report an interrupt. To keep it so, the
+wrapper tracks THR-empty itself and answers IIR reads. Both write guest output
+to stdout through `console::ConsoleFilter`, which drops the escape sequences
+that change host state or make the terminal answer (see
 [security.md](security.md#what-the-guest-can-reach)).
 
 ### Used-ring ordering
