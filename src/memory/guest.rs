@@ -12,27 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Guest physical RAM as a `vm-memory` region collection.
+//! The guest RAM mappings, [`GuestRamView`] and [`GuestRam`].
 //!
-//! [`GuestRamView`] wraps a [`GuestMemoryMmap`] whose regions map a shareable
-//! object, and carries the read accessors. The VMM builds one over the object a
-//! [`SharedRam`] allocates; a tool that received the object's descriptor builds
-//! one over that descriptor. [`GuestRam`] is the VMM's writable mapping. It
-//! adds the write accessors, the host pointer and the hypervisor registration,
-//! and dereferences to the view, so a reader takes `&GuestRamView` and runs on
-//! either. The rust-vmm crates take the collection as guest memory.
-//!
-//! The accessors find the region through a table kept beside the collection,
-//! built from it once.
-//!
-//! Access is through `&self`, so device backends and a plugin take a shared
-//! reference. Reads and writes race the running guest; that is inherent in
-//! observing a live VM. They stay in bounds, and a refused range is not
-//! touched.
-//!
-//! Guest RAM is not always one span. The x86 backend splits it around the
-//! sub-4 GiB MMIO hole, so it has two regions. An access never crosses from
-//! one region into the next, and an address in the gap is a device, not RAM.
+//! The accessors find a region through a table kept beside the `vm-memory`
+//! collection, built from it once.
 
 use std::fs::File;
 use std::io;
@@ -45,7 +28,7 @@ use vm_memory::{
     VolatileSlice, WriteVolatile,
 };
 
-use crate::sharedmem::SharedRam;
+use crate::memory::SharedRam;
 
 /// A guest-physical span of the VM's RAM and where it sits in the object that
 /// backs it, so a process that maps the same object sees the same bytes.
@@ -138,6 +121,15 @@ struct MappedRegion {
 /// `PROT_READ`, so nothing a tool does through the view can write the guest.
 /// The VMM's own [`GuestRam`] dereferences to this type, so code written
 /// against the view runs unchanged on either.
+///
+/// Access is through `&self`, so the device models and a plugin share one
+/// value. Reads through it, and writes through a `GuestRam`, race the running
+/// guest, which is inherent in observing a live VM. They stay in bounds, and a
+/// refused range is not touched.
+///
+/// Guest RAM is not always one span. The x86 backend splits it around the
+/// sub-4 GiB MMIO hole into two regions. An access never crosses from one
+/// region into the next, and an address in the gap is a device, not RAM.
 pub struct GuestRamView {
     /// The collection the rust-vmm crates take.
     mem: GuestMemoryMmap,
@@ -314,6 +306,10 @@ impl GuestRamView {
 
 /// Guest physical RAM as the VMM maps it, writable, one or more regions of the
 /// shareable object it allocated.
+///
+/// It adds the write accessors, the host pointer and, on Linux, the KVM memory
+/// slot registration. It dereferences to [`GuestRamView`] for the read
+/// accessors, whose documentation covers how access behaves.
 pub struct GuestRam {
     /// The mapping and the read accessors.
     view: GuestRamView,

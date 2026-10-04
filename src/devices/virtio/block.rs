@@ -32,7 +32,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
-use crate::guestmem::GuestRam;
+use crate::memory::GuestRam;
 
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::events::CapturedEvent;

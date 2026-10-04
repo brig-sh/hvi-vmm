@@ -45,11 +45,10 @@ pub mod config;
 pub mod console;
 pub mod devices;
 pub mod events;
-pub mod guestmem;
 pub mod hypervisor;
+pub mod memory;
 pub mod plugin;
 pub mod sandbox;
-pub mod sharedmem;
 pub mod sync;
 pub mod teardown;
 

@@ -64,8 +64,8 @@ use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
-use crate::guestmem::GuestRam;
 use crate::hypervisor::quiesce::Quiesce;
+use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
@@ -183,7 +183,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // needs a valid host address, so the guest is unaffected.
     let low_bytes = cfg.mem_bytes.min(MMIO_GAP_START);
     let high_bytes = cfg.mem_bytes.saturating_sub(low_bytes);
-    let shared_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
+    let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
     let mut regions = vec![MemRegion {
         gpa: RAM_BASE,
         size: low_bytes,

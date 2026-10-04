@@ -55,8 +55,8 @@ use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, GatewayRelay, VirtioNet};
 use crate::devices::virtio::vsock::{self, VirtioVsock};
 use crate::events::Emitter;
-use crate::guestmem::GuestRam;
 use crate::hypervisor::quiesce::Quiesce;
+use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sandbox::seatbelt;
 use crate::sync::lock_or_recover;
@@ -261,7 +261,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // accepts any page-aligned host pointer, so the guest gets the mapping
     // `GuestRam` made of the object. This is the path `hvi smoke --shm`
     // exercises.
-    let shared_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
+    let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
     let ram = Arc::new(GuestRam::new(
         &shared_ram,
         &[shared_ram.region_at(RAM_BASE)],

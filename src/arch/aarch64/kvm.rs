@@ -64,8 +64,8 @@ use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
-use crate::guestmem::GuestRam;
 use crate::hypervisor::quiesce::Quiesce;
+use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, MemRegion, Plugin, RegsView, VmHandle};
 use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
@@ -213,7 +213,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Guest RAM: one region at RAM_BASE, backed by a shareable object (a
     // memfd) so an out-of-process plugin can map the same pages. KVM only
     // needs a valid host address, so the guest is unaffected.
-    let shared_ram = crate::sharedmem::SharedRam::new(cfg.mem_bytes as usize)?;
+    let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
     let ram = Arc::new(GuestRam::new(
         &shared_ram,
         &[shared_ram.region_at(RAM_BASE)],

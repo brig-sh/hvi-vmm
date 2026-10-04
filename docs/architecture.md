@@ -55,7 +55,7 @@ flowchart TB
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugin::builtin · events ledger<br/>hypervisor::quiesce"]
             conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
-            gm["guestmem: GuestRam over vm-memory<br/>sharedmem: memfd / POSIX shm"]
+            gm["memory: GuestRam over vm-memory<br/>SharedRam: memfd / POSIX shm"]
         end
         cli --> backend
         backend --> shared
@@ -87,7 +87,7 @@ environment variables. See
 
 ## 2. Guest memory
 
-`GuestRam` (`guestmem.rs`) is what makes the device models host-neutral: a
+`GuestRam` (`memory/guest.rs`) is what makes the device models host-neutral: a
 wrapper over a `vm-memory` `GuestMemoryMmap` whose regions are the guest's RAM.
 Every device reads and writes guest memory only through it, and `memory()`
 returns the collection for the rust-vmm crates that take guest memory. Its read
@@ -105,7 +105,7 @@ its hits back to guest addresses.
 paths. It is a raw pointer rather than a `&mut [u8]` because a guest can point
 two descriptors at one address, which would alias the borrow.
 
-The backing object comes from `sharedmem.rs`: a memfd on Linux or a POSIX
+The backing object comes from `memory/shared.rs`: a memfd on Linux or a POSIX
 shared-memory object on macOS, unlinked from the namespace as soon as it is
 created. A tool given the descriptor builds a `GuestRamView` over the same
 pages, read-only; no other process can open them by name. Each region is a
@@ -402,7 +402,7 @@ how it works.
 | Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
-| Guest memory | `guestmem.rs`, `sharedmem.rs` |
+| Guest memory | `memory/`: `guest.rs`, `shared.rs` |
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

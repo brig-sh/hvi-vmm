@@ -32,7 +32,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
-use crate::guestmem::GuestRam;
+use crate::memory::GuestRam;
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
