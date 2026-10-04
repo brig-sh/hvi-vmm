@@ -31,8 +31,8 @@
 //! Everything the VMM normally needs from the host is acquired before the
 //! guest runs and is held as a descriptor afterwards:
 //!
-//! - guest RAM is a POSIX shared-memory object that [`crate::sharedmem`]
-//!   unlinks the moment it is mapped, so it is reachable only through the fd;
+//! - guest RAM is a POSIX shared-memory object that [`SharedRam`] unlinks the
+//!   moment it is mapped, so it is reachable only through the fd;
 //! - `hv_vm_create` / `hv_vm_map` have already happened;
 //! - the block backing file, the event ledger, the gateway socket, the control
 //!   and agent listeners, and stdio are all open by then.
@@ -79,6 +79,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::devices::virtio::fs::server;
+use crate::memory::SharedRam;
+use crate::memory::{GuestRam, MemRegion};
 
 /// The Seatbelt profile, in SBPL.
 ///
@@ -279,7 +281,7 @@ pub struct SelftestFixtures {
     /// the agent bridge).
     pre_bound: std::os::unix::net::UnixListener,
     /// Guest RAM mapped from a shared-memory object before entry.
-    pre_mapped: crate::guestmem::GuestRam,
+    pre_mapped: GuestRam,
     /// A pty opened before entry, standing in for the guest console. The VMM
     /// puts the user's terminal into raw mode before entry and restores it on
     /// the way out, i.e. *after* entry -- so if Seatbelt policed `tcsetattr` on
@@ -390,7 +392,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "open a new POSIX shared-memory object",
             expect_ok: false,
-            run: |_| crate::sharedmem::SharedRam::new(0x4000).map(|_| ()),
+            run: |_| SharedRam::new(0x4000).map(|_| ()),
         },
         Probe {
             // The companion to the profile's one allow rule: the tty ioctl is
@@ -710,9 +712,8 @@ pub fn selftest() -> io::Result<usize> {
             std::os::unix::net::UnixListener::bind(&path)?
         },
         pre_mapped: {
-            let shared_ram =
-                crate::sharedmem::SharedRam::new(crate::guestmem::MemRegion::ALIGN as usize)?;
-            crate::guestmem::GuestRam::new(&shared_ram, &[shared_ram.region_at(0)])?
+            let shared_ram = SharedRam::new(MemRegion::ALIGN as usize)?;
+            GuestRam::new(&shared_ram, &[shared_ram.region_at(0)])?
         },
         pre_tty: open_pty()?,
         dir: dir.clone(),

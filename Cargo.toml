@@ -19,8 +19,8 @@ serde_json = "1"
 # register map and the net header layout. Every backend needs them.
 virtio-bindings = "0.2.7"
 # Guest RAM as a region collection, the type the rust-vmm crates take as guest
-# memory. `backend-mmap` maps each region from the shareable object in
-# `sharedmem`.
+# memory. `backend-mmap` maps each region from the shareable object that
+# `memory::SharedRam` allocates.
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 # Kernel image loaders and boot configurators over that memory: the arm64
 # `Image` loader with the devicetree configurator, and the x86 `bzImage`

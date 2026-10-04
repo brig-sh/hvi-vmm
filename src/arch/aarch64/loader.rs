@@ -267,7 +267,7 @@ fn write_dtb<M: GuestMemoryBackend>(mem: &M, addr: u64, dtb: &[u8]) -> Result<()
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::guestmem::GuestRam;
+    use crate::memory::GuestRam;
 
     const RAM_LEN: usize = 8 << 20;
 

@@ -265,7 +265,7 @@ fn add_e820(params: &mut boot_params, addr: u64, size: u64) -> Result<(), String
 pub(crate) mod tests {
     use super::*;
     use crate::arch::x86_64::layout::{HIGH_RAM_BASE, MMIO_GAP_START};
-    use crate::guestmem::GuestRam;
+    use crate::memory::GuestRam;
     use linux_loader::elf::{
         Elf64_Ehdr, Elf64_Phdr, EI_CLASS, EI_DATA, EI_NIDENT, EI_VERSION, ELFCLASS64, ELFDATA2LSB,
         EM_X86_64, ET_EXEC, EV_CURRENT, PT_LOAD,

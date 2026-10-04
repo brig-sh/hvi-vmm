@@ -47,7 +47,7 @@ use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
-use crate::guestmem::GuestRam;
+use crate::memory::GuestRam;
 
 use crate::devices::virtio::{
     mmio, tap, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,

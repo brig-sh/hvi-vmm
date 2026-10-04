@@ -41,7 +41,7 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::guestmem::GuestRamView;
+use crate::memory::GuestRamView;
 use crate::plugin::{CpuHandle, IoSink, MemRegion, Plugin, VmHandle};
 
 /// Runs several plugins as one, in order.
@@ -325,6 +325,7 @@ impl IoSink for TraceSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{GuestRam, SharedRam};
     use std::os::fd::AsFd;
 
     /// A chain forwards each hook to every member, in order.
@@ -371,7 +372,7 @@ mod tests {
     #[test]
     fn dump_writes_the_regions_in_address_order() {
         const ALIGN: u64 = MemRegion::ALIGN;
-        let ram = crate::sharedmem::SharedRam::new(3 * ALIGN as usize).expect("ram");
+        let ram = SharedRam::new(3 * ALIGN as usize).expect("ram");
         let regions = [
             MemRegion {
                 gpa: 0,
@@ -384,7 +385,7 @@ mod tests {
                 file_offset: ALIGN,
             },
         ];
-        let writable = crate::guestmem::GuestRam::new(&ram, &regions).expect("writable side");
+        let writable = GuestRam::new(&ram, &regions).expect("writable side");
         writable.write(ALIGN - 4, b"LOW!").expect("write");
         writable
             .write(0x1_0000_0000 + 2 * ALIGN - 4, b"HIGH")

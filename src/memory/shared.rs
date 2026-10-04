@@ -12,25 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Guest RAM in a form another process can map.
+//! The shareable object behind guest RAM, [`SharedRam`].
 //!
-//! Guest RAM is allocated as an object another process can open, so a
-//! plugin that only reads guest memory can run outside the VMM process; a
-//! private anonymous mapping could not be shared that way.
-//!
-//! - **Linux** uses a `memfd`, which is passed to the plugin over the control
-//!   socket with `SCM_RIGHTS`. KVM only requires that `userspace_addr` be a
-//!   valid host address in the creating process, so backing it with a
-//!   `MAP_SHARED` memfd instead of anonymous memory changes nothing about how
-//!   the guest sees it. vhost-user VMMs back guest RAM the same way.
-//! - **macOS** has no `memfd`, so it uses a POSIX shared-memory object. The
-//!   guest mapping is then established by calling `hv_vm_map` on the region's
-//!   host pointer, rather than letting `applevisor` allocate. `hvi smoke --shm`
-//!   proves that path end to end.
-//!
-//! The object is unlinked from the namespace as soon as it is created. It
-//! stays alive through the open descriptor, so the RAM cannot outlive the VMM
-//! or be opened by name by a process that was not given the descriptor.
+//! On Linux, KVM only requires that `userspace_addr` be a valid host address in
+//! the creating process, so backing guest RAM with a `MAP_SHARED` memfd instead
+//! of anonymous memory changes nothing about how the guest sees it. vhost-user
+//! VMMs back guest RAM the same way. `hvi smoke --shm` tests the macOS path end
+//! to end.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -41,11 +29,21 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
-use crate::guestmem::MemRegion;
+use crate::memory::MemRegion;
 
 /// A shareable guest-RAM allocation, the descriptor of an unlinked object
 /// sized to hold the guest. The object lives as long as any mapping of it or
 /// this value does.
+///
+/// Because the object is unlinked, it cannot outlive the VMM, and a process can
+/// reach it only through a descriptor it was given.
+///
+/// # Platform-specific behavior
+///
+/// On Linux the object is a `memfd`, which reaches a plugin over the control
+/// socket with `SCM_RIGHTS`. macOS has no `memfd`, so the object is a POSIX
+/// shared-memory object, and the backend maps it into the guest by calling
+/// `hv_vm_map` on its host pointer rather than letting `applevisor` allocate.
 pub struct SharedRam {
     /// The unlinked object, shared with every mapping of it.
     file: Arc<File>,
@@ -179,7 +177,7 @@ impl SharedRam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guestmem::GuestRam;
+    use crate::memory::GuestRam;
 
     // Read-held by every allocation between creating its name and unlinking
     // it, and write-held by the probe below while it looks.

@@ -17,7 +17,7 @@
 //! A [`Queue`] holds what the driver programs into one queue and checks it
 //! against guest RAM. It also publishes completed buffers to the used ring.
 
-use crate::guestmem::GuestRam;
+use crate::memory::GuestRam;
 
 /// Descriptor flags.
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
@@ -249,7 +249,7 @@ mod tests {
 #[cfg(test)]
 mod ordering_tests {
     use super::Queue;
-    use crate::guestmem::GuestRam;
+    use crate::memory::GuestRam;
     use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering as AOrd};
 
     const BASE: u64 = 0x4000_0000;

@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::config::CachePolicy;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
-use crate::guestmem::GuestRam;
+use crate::memory::GuestRam;
 use crate::sync::lock_or_recover;
 
 const MAGIC_VALUE: u64 = 0x7472_6976;
