@@ -830,25 +830,31 @@ fn dump_regs(vcpu: &VcpuFd, mem: &GuestRam, cpu_id: u32, tag: &str) {
     }
 }
 
-/// Routes a port-I/O read to the device behind `port`. Returns the value and,
-/// for the serial ports, the COM1 interrupt level the caller must apply.
+/// Routes a port-I/O read to the device behind `port` and returns the value.
+///
+/// A COM1 access passes the new COM1 interrupt level to `set_com1` with the
+/// UART lock still held, so the levels reach the line in the order of the
+/// accesses. Two vCPUs that applied them out of order could leave the line
+/// high with nothing pending, and the edge-triggered pin would then miss the
+/// next interrupt.
 ///
 /// Split from [`pio_read`] so the routing is callable without a live vCPU or a
-/// VM to raise the GSI on: raising it is the only side effect that needs KVM,
-/// so it is returned rather than performed.
+/// VM to raise the GSI on.
 fn pio_dispatch_read(
     uart: &Mutex<Uart16550>,
     rtc: &Mutex<RtcCmos>,
     port: u16,
-) -> (u8, Option<bool>) {
+    set_com1: impl FnOnce(bool),
+) -> u8 {
     if (COM1_PORT..COM1_PORT + 8).contains(&port) {
         let mut u = uart.lock().unwrap();
         let v = u.pio_read(port - COM1_PORT);
-        (v, Some(u.irq_level()))
+        set_com1(u.irq_level());
+        v
     } else if port == RTC_INDEX_PORT || port == RTC_DATA_PORT {
-        (rtc.lock().unwrap().pio_read(port), None)
+        rtc.lock().unwrap().pio_read(port)
     } else {
-        (0xff, None)
+        0xff
     }
 }
 
@@ -858,31 +864,27 @@ fn pio_dispatch_write(
     rtc: &Mutex<RtcCmos>,
     port: u16,
     val: u8,
-) -> Option<bool> {
+    set_com1: impl FnOnce(bool),
+) {
     if (COM1_PORT..COM1_PORT + 8).contains(&port) {
         let mut u = uart.lock().unwrap();
         u.pio_write(port - COM1_PORT, val);
-        Some(u.irq_level())
+        set_com1(u.irq_level());
     } else if port == RTC_INDEX_PORT || port == RTC_DATA_PORT {
         rtc.lock().unwrap().pio_write(port, val);
-        None
-    } else {
-        None
     }
 }
 
 fn pio_read(sh: &Shared, port: u16) -> u8 {
-    let (v, com1_level) = pio_dispatch_read(&sh.uart, &sh.rtc, port);
-    if let Some(level) = com1_level {
+    pio_dispatch_read(&sh.uart, &sh.rtc, port, |level| {
         let _ = sh.vm.set_irq_line(COM1_GSI, level);
-    }
-    v
+    })
 }
 
 fn pio_write(sh: &Shared, port: u16, val: u8) {
-    if let Some(level) = pio_dispatch_write(&sh.uart, &sh.rtc, port, val) {
+    pio_dispatch_write(&sh.uart, &sh.rtc, port, val, |level| {
         let _ = sh.vm.set_irq_line(COM1_GSI, level);
-    }
+    });
 }
 
 fn mmio_read(sh: &Shared, addr: u64) -> u64 {
@@ -1196,12 +1198,10 @@ fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
                     continue;
                 }
             }
-            let level = {
-                let mut u = lock_or_recover(&sh.uart);
-                u.push_rx(byte[0]);
-                u.irq_level()
-            };
-            let _ = sh.vm.set_irq_line(COM1_GSI, level);
+            // Set the line under the lock, as pio_dispatch_read explains.
+            let mut u = lock_or_recover(&sh.uart);
+            u.push_rx(byte[0]);
+            let _ = sh.vm.set_irq_line(COM1_GSI, u.irq_level());
         }
     })
 }
@@ -1463,6 +1463,8 @@ mod cmdline_tests {
 
 #[cfg(test)]
 mod pio_tests {
+    use std::cell::Cell;
+
     use super::*;
 
     /// The guest reaches the RTC only through the vCPU exit handler's port
@@ -1477,10 +1479,9 @@ mod pio_tests {
 
         // out 0x70, 0x0b; in 0x71 -- status register B.
         const REG_B: u8 = 0x0b;
-        let level = pio_dispatch_write(&uart, &rtc, RTC_INDEX_PORT, REG_B);
-        assert_eq!(level, None, "the RTC drives no interrupt line");
-        let (via_ports, level) = pio_dispatch_read(&uart, &rtc, RTC_DATA_PORT);
-        assert_eq!(level, None);
+        let no_line = |_| panic!("the RTC drives no interrupt line");
+        pio_dispatch_write(&uart, &rtc, RTC_INDEX_PORT, REG_B, no_line);
+        let via_ports = pio_dispatch_read(&uart, &rtc, RTC_DATA_PORT, no_line);
 
         // The same register read straight from a device instance must match:
         // the dispatch adds routing, not behavior.
@@ -1490,6 +1491,34 @@ mod pio_tests {
         // And status B still reports what the rtc_cmos tests pin: BCD, 24h.
         assert_eq!(via_ports & 0x04, 0, "DM clear means BCD");
         assert_eq!(via_ports & 0x02, 0x02, "24-hour mode");
+    }
+
+    // The guest programs COM1's pin as edge-triggered. This is its transmit
+    // start, split across two vCPUs: one enables THR-empty, the interrupted
+    // one reads IIR, and the THR writes that follow must raise a new edge.
+    #[test]
+    fn com1_rises_again_for_the_writes_after_an_iir_read() {
+        let uart = Mutex::new(Uart16550::new());
+        let rtc = Mutex::new(RtcCmos::new());
+        let line = Cell::new(false);
+        let edges = Cell::new(0);
+        let set = |level: bool| {
+            if level && !line.get() {
+                edges.set(edges.get() + 1);
+            }
+            line.set(level);
+        };
+        const IER: u16 = COM1_PORT + 1;
+        const IIR: u16 = COM1_PORT + 2;
+
+        pio_dispatch_write(&uart, &rtc, IER, 0x02, set);
+        assert_eq!(edges.get(), 1);
+        assert_eq!(pio_dispatch_read(&uart, &rtc, IIR, set), 0xc2);
+        assert!(!line.get(), "the IIR read drops the line");
+        for b in b"0123456789abcdef" {
+            pio_dispatch_write(&uart, &rtc, COM1_PORT, *b, set);
+        }
+        assert_eq!(edges.get(), 2, "the THR writes raise a second edge");
     }
 }
 
