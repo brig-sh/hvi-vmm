@@ -43,7 +43,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
@@ -830,13 +830,51 @@ fn dump_regs(vcpu: &VcpuFd, mem: &GuestRam, cpu_id: u32, tag: &str) {
     }
 }
 
+/// A device whose interrupt line hvi sets as a level after each access.
+trait IrqLevel {
+    /// Returns whether the device's interrupt line should be asserted now.
+    fn irq_level(&self) -> bool;
+}
+
+impl IrqLevel for Uart16550 {
+    fn irq_level(&self) -> bool {
+        Uart16550::irq_level(self)
+    }
+}
+
+impl IrqLevel for VirtioBlk {
+    fn irq_level(&self) -> bool {
+        VirtioBlk::irq_level(self)
+    }
+}
+
+impl IrqLevel for VirtioNet {
+    fn irq_level(&self) -> bool {
+        VirtioNet::irq_level(self)
+    }
+}
+
+impl IrqLevel for VirtioVsock {
+    fn irq_level(&self) -> bool {
+        VirtioVsock::irq_level(self)
+    }
+}
+
+/// Sets `gsi` to the interrupt level of the device that `dev` guards.
+///
+/// It takes the lock guard, so the level reaches the line before the lock is
+/// released, in the order of the accesses. Two threads that applied their
+/// levels out of order could leave the line high with nothing pending. The
+/// guest programs every ISA pin as edge-triggered, so it would then miss the
+/// device's next interrupt.
+fn set_line<D: IrqLevel>(vm: &VmFd, gsi: u32, dev: &MutexGuard<'_, D>) {
+    let _ = vm.set_irq_line(gsi, dev.irq_level());
+}
+
 /// Routes a port-I/O read to the device behind `port` and returns the value.
 ///
 /// A COM1 access passes the new COM1 interrupt level to `set_com1` with the
-/// UART lock still held, so the levels reach the line in the order of the
-/// accesses. Two vCPUs that applied them out of order could leave the line
-/// high with nothing pending, and the edge-triggered pin would then miss the
-/// next interrupt.
+/// UART lock still held, for the reason [`set_line`] gives.
 ///
 /// Split from [`pio_read`] so the routing is callable without a live vCPU or a
 /// VM to raise the GSI on.
@@ -923,67 +961,62 @@ fn blk_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.virtio.as_ref() else {
         return 0;
     };
-    let (v, level, events) = {
+    let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.mem, off, false, 0);
-        (v, d.irq_level(), d.take_events())
+        set_line(&sh.vm, VIRTIO_BLK_GSI, &d);
+        (v, d.take_events())
     };
     drain(sh, &events);
-    let _ = sh.vm.set_irq_line(VIRTIO_BLK_GSI, level);
     v
 }
 fn blk_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.virtio.as_ref() else {
         return;
     };
-    let (level, events) = {
+    let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.mem, off, true, val);
-        (d.irq_level(), d.take_events())
+        set_line(&sh.vm, VIRTIO_BLK_GSI, &d);
+        d.take_events()
     };
     drain(sh, &events);
-    let _ = sh.vm.set_irq_line(VIRTIO_BLK_GSI, level);
 }
 fn net_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.net.as_ref() else { return 0 };
-    let (v, level, events) = {
+    let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.mem, off, false, 0);
-        (v, d.irq_level(), d.take_events())
+        set_line(&sh.vm, VIRTIO_NET_GSI, &d);
+        (v, d.take_events())
     };
     drain(sh, &events);
-    let _ = sh.vm.set_irq_line(VIRTIO_NET_GSI, level);
     v
 }
 fn net_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.net.as_ref() else { return };
-    let (level, events) = {
+    let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.mem, off, true, val);
-        (d.irq_level(), d.take_events())
+        set_line(&sh.vm, VIRTIO_NET_GSI, &d);
+        d.take_events()
     };
     drain(sh, &events);
-    let _ = sh.vm.set_irq_line(VIRTIO_NET_GSI, level);
 }
 fn vsock_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.vsock.as_ref() else {
         return 0;
     };
-    let (v, level) = {
-        let mut d = dev.lock().unwrap();
-        (d.mmio(&sh.mem, off, false, 0), d.irq_level())
-    };
-    let _ = sh.vm.set_irq_line(VIRTIO_VSOCK_GSI, level);
+    let mut d = dev.lock().unwrap();
+    let v = d.mmio(&sh.mem, off, false, 0);
+    set_line(&sh.vm, VIRTIO_VSOCK_GSI, &d);
     v
 }
 fn vsock_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.vsock.as_ref() else { return };
-    let level = {
-        let mut d = dev.lock().unwrap();
-        d.mmio(&sh.mem, off, true, val);
-        d.irq_level()
-    };
-    let _ = sh.vm.set_irq_line(VIRTIO_VSOCK_GSI, level);
+    let mut d = dev.lock().unwrap();
+    d.mmio(&sh.mem, off, true, val);
+    set_line(&sh.vm, VIRTIO_VSOCK_GSI, &d);
 }
 
 /// [`VmHandle`] over the shared VM state: what a plugin gets at attach time.
@@ -1198,10 +1231,9 @@ fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
                     continue;
                 }
             }
-            // Set the line under the lock, as pio_dispatch_read explains.
             let mut u = lock_or_recover(&sh.uart);
             u.push_rx(byte[0]);
-            let _ = sh.vm.set_irq_line(COM1_GSI, u.irq_level());
+            set_line(&sh.vm, COM1_GSI, &u);
         }
     })
 }
@@ -1246,9 +1278,7 @@ fn spawn_vsock_bridge(
                 let mut d = lock_or_recover(&dev);
                 let port = d.add_conn(stream);
                 d.connect(&mem, port);
-                let level = d.irq_level();
-                drop(d);
-                let _ = vm.set_irq_line(VIRTIO_VSOCK_GSI, level);
+                set_line(&vm, VIRTIO_VSOCK_GSI, &d);
                 port
             };
             let dev2 = Arc::clone(&dev);
@@ -1275,19 +1305,13 @@ fn spawn_vsock_bridge(
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let level = {
-                        let mut d = lock_or_recover(&dev2);
-                        d.host_data(&mem2, port, &buf[..n]);
-                        d.irq_level()
-                    };
-                    let _ = vm2.set_irq_line(VIRTIO_VSOCK_GSI, level);
-                }
-                let level = {
                     let mut d = lock_or_recover(&dev2);
-                    d.host_closed(&mem2, port);
-                    d.irq_level()
-                };
-                let _ = vm2.set_irq_line(VIRTIO_VSOCK_GSI, level);
+                    d.host_data(&mem2, port, &buf[..n]);
+                    set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
+                }
+                let mut d = lock_or_recover(&dev2);
+                d.host_closed(&mem2, port);
+                set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
             }));
         }
         for reader in readers {
@@ -1310,12 +1334,9 @@ fn spawn_net_tap_reader(
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
         let relayed = crate::virtio_net::TapRelay::new(reader).run(&stop, |frame| {
-            let level = {
-                let mut d = lock_or_recover(&dev);
-                d.deliver(&mem, frame);
-                d.irq_level()
-            };
-            let _ = vm.set_irq_line(VIRTIO_NET_GSI, level);
+            let mut d = lock_or_recover(&dev);
+            d.deliver(&mem, frame);
+            set_line(&vm, VIRTIO_NET_GSI, &d);
         });
         if let Err(e) = relayed {
             eprintln!("[hvi/x86] virtio-net: {e}; tap relay stopped");
@@ -1339,12 +1360,9 @@ fn spawn_net_gateway_reader(
     std::thread::spawn(move || {
         crate::seccomp::install_thread(crate::seccomp::Thread::Vmm);
         let relayed = crate::virtio_net::GatewayRelay::new(reader).run(&stop, |frame| {
-            let level = {
-                let mut d = lock_or_recover(&dev);
-                d.deliver(&mem, frame);
-                d.irq_level()
-            };
-            let _ = vm.set_irq_line(VIRTIO_NET_GSI, level);
+            let mut d = lock_or_recover(&dev);
+            d.deliver(&mem, frame);
+            set_line(&vm, VIRTIO_NET_GSI, &d);
         });
         if let Err(e) = relayed {
             eprintln!("[hvi/x86] virtio-net: {e}; gateway relay stopped");
@@ -1503,6 +1521,7 @@ mod pio_tests {
         let line = Cell::new(false);
         let edges = Cell::new(0);
         let set = |level: bool| {
+            assert!(uart.try_lock().is_err(), "the line is set under the lock");
             if level && !line.get() {
                 edges.set(edges.get() + 1);
             }
