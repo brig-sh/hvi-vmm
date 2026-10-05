@@ -153,8 +153,9 @@ side's writes block. A host client that writes without reading can therefore
 stall its own connection, but not the guest. A host client that streams both
 ways should read the connection while it writes to it.
 
-The guest sees a host close after the last byte written before it. A guest
-write after the host client has gone resets the guest's connection.
+Each side sees the other's close after the last byte written before it. Once
+the host client has gone, the guest's writes fail with EPIPE and its reads go
+on. The guest's connection is reset once it has every host byte.
 
 The contract the guest side must satisfy:
 

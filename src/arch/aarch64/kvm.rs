@@ -790,27 +790,23 @@ fn dev_write<D: VirtioMmio>(
     let _ = sh.vm.set_irq_line(spi_gsi(spi), level);
 }
 
+// The vsock line is set under the device lock on every path, since the bridge
+// threads drive it too.
 fn vsock_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.vsock.as_ref() else {
         return 0;
     };
-    let (v, level) = {
-        let mut d = dev.lock().unwrap();
-        let v = d.mmio(&sh.mem, off, false, 0);
-        (v, d.irq_level())
-    };
-    let _ = sh.vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
+    let mut d = dev.lock().unwrap();
+    let v = d.mmio(&sh.mem, off, false, 0);
+    let _ = sh.vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
     v
 }
 
 fn vsock_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.vsock.as_ref() else { return };
-    let level = {
-        let mut d = dev.lock().unwrap();
-        d.mmio(&sh.mem, off, true, val);
-        d.irq_level()
-    };
-    let _ = sh.vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
+    let mut d = dev.lock().unwrap();
+    d.mmio(&sh.mem, off, true, val);
+    let _ = sh.vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
 }
 
 fn drain(sh: &Shared, events: &[crate::events::CapturedEvent]) {
@@ -1145,13 +1141,12 @@ fn spawn_vsock_bridge(
             };
             let (port, writer_gate) = {
                 let mut d = lock_or_recover(&dev);
-                let port = d.add_conn(stream);
+                let Ok(port) = d.add_conn(stream) else {
+                    continue;
+                };
                 d.connect(&mem, port);
-                let level = d.irq_level();
-                let writer_gate = d.writer_gate(port);
-                drop(d);
-                let _ = vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
-                (port, writer_gate)
+                let _ = vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
+                (port, d.writer_gate(port))
             };
             let Some(writer_gate) = writer_gate else {
                 continue;
@@ -1165,18 +1160,24 @@ fn spawn_vsock_bridge(
                 stop.clone(),
             );
             relays.retain(|handle| !handle.is_finished());
-            relays.push(std::thread::spawn(move || {
-                while writer_gate.wait(|| stop3.sleep(std::time::Duration::ZERO).unwrap_or(false))
-                    && stop3.wait_writable(writer.as_fd()).unwrap_or(false)
-                {
-                    let (alive, level) = {
+            relays.push(std::thread::spawn(move || loop {
+                writer_gate.wait_open();
+                match stop3.wait_writable(writer.as_fd()) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        eprintln!("[hvi/kvm] vsock bridge: {e}; guest bytes dropped");
                         let mut d = lock_or_recover(&dev3);
-                        (d.flush_to_host(&mem3, port), d.irq_level())
-                    };
-                    let _ = vm3.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
-                    if !alive {
+                        d.host_gone(&mem3, port);
+                        let _ = vm3.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
                         break;
                     }
+                }
+                let mut d = lock_or_recover(&dev3);
+                let needed = d.flush_to_host(&mem3, port);
+                let _ = vm3.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
+                if !needed {
+                    break;
                 }
             }));
             let dev2 = Arc::clone(&dev);
@@ -1207,25 +1208,25 @@ fn spawn_vsock_bridge(
                         Err(e) if crate::devices::virtio::vsock::retry_read(&e) => continue,
                         Err(_) => break,
                     };
-                    let (gate, level) = {
+                    let gate = {
                         let mut d = lock_or_recover(&dev2);
                         let gate = d.host_data(&mem2, port, &buf[..n]);
-                        (gate, d.irq_level())
+                        let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
+                        gate
                     };
-                    let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
                     // `HostGate::wait` says why its result is not needed.
                     if let Some(gate) = gate {
                         gate.wait(|| stop2.keep_waiting(reader.as_fd()));
                     }
                 }
-                let level = {
-                    let mut d = lock_or_recover(&dev2);
-                    d.host_closed(&mem2, port);
-                    d.irq_level()
-                };
-                let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), level);
+                let mut d = lock_or_recover(&dev2);
+                d.host_closed(&mem2, port);
+                let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
             }));
         }
+        // Dropping the connections shuts their sockets down and opens their
+        // gates, so every reader and writer ends.
+        lock_or_recover(&dev).drop_conns();
         for relay in relays {
             let _ = relay.join();
         }

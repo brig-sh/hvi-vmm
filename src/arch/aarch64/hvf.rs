@@ -1164,18 +1164,17 @@ fn service_vsock(
     if !da.isv {
         return;
     }
-    let level = {
-        let mut d = lock_or_recover(dev);
-        if da.is_write {
-            let v = read_gpr(vcpu, da.reg);
-            d.mmio(&sh.mem, offset, true, v);
-        } else {
-            let v = d.mmio(&sh.mem, offset, false, 0) & width_mask(da.width);
-            write_gpr(vcpu, da.reg, v);
-        }
-        d.irq_level()
-    };
-    let _ = sh.vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
+    // Under the device lock, as on every vsock path, since the bridge threads
+    // drive the line too.
+    let mut d = lock_or_recover(dev);
+    if da.is_write {
+        let v = read_gpr(vcpu, da.reg);
+        d.mmio(&sh.mem, offset, true, v);
+    } else {
+        let v = d.mmio(&sh.mem, offset, false, 0) & width_mask(da.width);
+        write_gpr(vcpu, da.reg, v);
+    }
+    let _ = sh.vm.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
 }
 
 /// Services a virtio-fs MMIO transport access.
@@ -1285,12 +1284,13 @@ fn spawn_vsock_bridge(
 
             // Register the connection and send the guest agent a REQUEST.
             let mut d = lock_or_recover(&dev);
-            let port = d.add_conn(stream);
+            let Ok(port) = d.add_conn(stream) else {
+                continue;
+            };
             d.connect(&mem, port);
-            let level = d.irq_level();
+            let _ = vm.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
             let writer_gate = d.writer_gate(port);
             drop(d);
-            let _ = vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
             kick_all(&vm, &handles);
             let Some(writer_gate) = writer_gate else {
                 continue;
@@ -1307,19 +1307,28 @@ fn spawn_vsock_bridge(
                 stop.clone(),
             );
             relays.retain(|handle| !handle.is_finished());
-            relays.push(std::thread::spawn(move || {
-                while writer_gate.wait(|| stop3.sleep(std::time::Duration::ZERO).unwrap_or(false))
-                    && stop3.wait_writable(writer.as_fd()).unwrap_or(false)
-                {
-                    let (alive, level) = {
+            relays.push(std::thread::spawn(move || loop {
+                writer_gate.wait_open();
+                match stop3.wait_writable(writer.as_fd()) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        eprintln!("[hvi] vsock bridge: {e}; guest bytes dropped");
                         let mut d = lock_or_recover(&dev3);
-                        (d.flush_to_host(&mem3, port), d.irq_level())
-                    };
-                    let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, level);
-                    kick_all(&vm3, &handles3);
-                    if !alive {
+                        d.host_gone(&mem3, port);
+                        let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
+                        drop(d);
+                        kick_all(&vm3, &handles3);
                         break;
                     }
+                }
+                let mut d = lock_or_recover(&dev3);
+                let needed = d.flush_to_host(&mem3, port);
+                let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
+                drop(d);
+                kick_all(&vm3, &handles3);
+                if !needed {
+                    break;
                 }
             }));
 
@@ -1352,27 +1361,28 @@ fn spawn_vsock_bridge(
                         Err(e) if vsock::retry_read(&e) => continue,
                         Err(_) => break,
                     };
-                    let (gate, level) = {
+                    let gate = {
                         let mut d = lock_or_recover(&dev2);
                         let gate = d.host_data(&mem2, port, &buf[..n]);
-                        (gate, d.irq_level())
+                        let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
+                        gate
                     };
-                    let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, level);
                     kick_all(&vm2, &handles2);
                     // `HostGate::wait` says why its result is not needed.
                     if let Some(gate) = gate {
                         gate.wait(|| stop2.keep_waiting(reader.as_fd()));
                     }
                 }
-                let level = {
-                    let mut d = lock_or_recover(&dev2);
-                    d.host_closed(&mem2, port);
-                    d.irq_level()
-                };
-                let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, level);
+                let mut d = lock_or_recover(&dev2);
+                d.host_closed(&mem2, port);
+                let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
+                drop(d);
                 kick_all(&vm2, &handles2);
             }));
         }
+        // Dropping the connections shuts their sockets down and opens their
+        // gates, so every reader and writer ends.
+        lock_or_recover(&dev).drop_conns();
         for relay in relays {
             let _ = relay.join();
         }
