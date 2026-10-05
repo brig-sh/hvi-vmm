@@ -217,8 +217,25 @@ pub fn arm() -> io::Result<()> {
     for thread in [Thread::Vmm, Thread::Vcpu] {
         program(thread)?;
     }
+    keep_threads_on_the_main_arena();
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
+}
+
+/// Keeps every thread's allocations on glibc's main arena.
+///
+/// glibc reads `/proc/sys/vm/overcommit_memory` the first time it shrinks the
+/// heap of a thread arena, and the filters trap `openat`, so a glibc build
+/// would die of `SIGSYS` in the middle of a run. With one arena no thread heap
+/// exists to shrink. Called before the filtered threads start; musl has no
+/// such read, and other C libraries are left alone.
+fn keep_threads_on_the_main_arena() {
+    #[cfg(target_env = "gnu")]
+    // SAFETY: mallopt only changes allocator tuning; M_ARENA_MAX takes any
+    // positive count, and no allocation is in flight on another thread yet.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+    }
 }
 
 /// Installs `thread`'s filter if [`arm`] was called, and aborts if it cannot.
