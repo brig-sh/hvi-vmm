@@ -50,8 +50,8 @@ including a typo, silently runs the plain test.
 | `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. |
 | `--share-sock <tag>=<socket>` | none | Serve that export from a vhost-user daemon already listening on `<socket>`. Names an export given earlier on the line, so it follows its own `--share-ro`/`--share-rw`. The daemon serves the directory it was started with, so that export's directory is not used. Linux only. |
 | `--virtiofsd <path>` | search | The daemon to start for an export that brings no socket. Linux only. |
-| `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
-| `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
+| `--fs-uid <N>` | 0 | Guest uid the host's files belong to. |
+| `--fs-gid <N>` | 0 | Guest gid the host's files belong to. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
@@ -107,7 +107,7 @@ are three behaviours, not two.
 | `--share-ro`, `--share-rw` | acted on, served in-process | acted on, served by virtiofsd | acted on, served by virtiofsd |
 | `--share-sock` | **refused**, boot fails | acted on | acted on |
 | `--virtiofsd` | **ignored silently** | acted on | acted on |
-| `--fs-uid`, `--fs-gid` | acted on | **ignored silently** | **ignored silently** |
+| `--fs-uid`, `--fs-gid` | acted on | acted on, as a virtiofsd map | acted on, as a virtiofsd map |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | everything else | acted on | acted on | acted on |

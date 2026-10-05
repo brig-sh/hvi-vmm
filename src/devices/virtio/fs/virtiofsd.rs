@@ -41,6 +41,7 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::config::{CachePolicy, FsShare};
 
@@ -51,6 +52,47 @@ const WELL_KNOWN: [&str; 4] = [
     "/usr/lib/qemu/virtiofsd",
     "/usr/local/bin/virtiofsd",
 ];
+
+/// Guest uid that the VMM user's own host files carry, set by `--fs-uid`.
+static GUEST_UID: AtomicU32 = AtomicU32::new(0);
+/// Guest gid that the VMM user's own host group carries, set by `--fs-gid`.
+static GUEST_GID: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the guest uid and gid that every later daemon presents the VMM
+/// user's own files as.
+///
+/// This is the Linux side of `--fs-uid` and `--fs-gid`, with the macOS
+/// device's meaning: a host file owned by the user running hvi belongs to
+/// `uid` in the guest, a file in that user's group belongs to `gid`, and
+/// every other id passes through. Call it before the first [`spawn`].
+pub fn set_guest_ids(uid: u32, gid: u32) {
+    GUEST_UID.store(uid, Ordering::Relaxed);
+    GUEST_GID.store(gid, Ordering::Relaxed);
+}
+
+/// Returns the daemon arguments that present host `euid` and `egid` as guest
+/// `uid` and `gid`.
+///
+/// The map is bidirectional, so a file the guest creates as `uid` lands on
+/// the host owned by `euid`, which an unprivileged daemon can create. A
+/// daemon running as root needs no map: it sees and sets every owner as it
+/// is, and a map would show root's own files as the workload's. An id that
+/// already matches needs no map either.
+fn id_args(euid: u32, egid: u32, uid: u32, gid: u32) -> Vec<String> {
+    let mut args = Vec::new();
+    if euid == 0 {
+        return args;
+    }
+    if uid != euid {
+        args.push(String::from("--translate-uid"));
+        args.push(format!("map:{uid}:{euid}:1"));
+    }
+    if gid != egid {
+        args.push(String::from("--translate-gid"));
+        args.push(format!("map:{gid}:{egid}:1"));
+    }
+    args
+}
 
 /// Descriptor number the listening socket is placed on for the daemon.
 ///
@@ -199,6 +241,14 @@ pub fn spawn(binary: &Path, share: &FsShare, index: usize) -> io::Result<(Daemon
         .arg("--sandbox")
         .arg(sandbox_mode())
         .args(cache_args(share.cache))
+        .args(id_args(
+            // SAFETY: geteuid and getegid have no failure mode and touch no
+            // memory we own.
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            GUEST_UID.load(Ordering::Relaxed),
+            GUEST_GID.load(Ordering::Relaxed),
+        ))
         .arg("--announce-submounts")
         .arg("--xattr")
         .arg("--log-level")
@@ -354,6 +404,48 @@ mod tests {
     #[test]
     fn a_socket_name_is_unique_per_export() {
         assert_ne!(socket_name(0), socket_name(1));
+    }
+
+    #[test]
+    fn the_vmm_users_ids_map_to_the_guest_ids() {
+        assert_eq!(
+            id_args(1000, 1000, 501, 20),
+            [
+                "--translate-uid",
+                "map:501:1000:1",
+                "--translate-gid",
+                "map:20:1000:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_presents_the_vmm_users_files_as_root() {
+        assert_eq!(
+            id_args(1000, 1000, 0, 0),
+            [
+                "--translate-uid",
+                "map:0:1000:1",
+                "--translate-gid",
+                "map:0:1000:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_ids_need_no_map() {
+        assert!(id_args(1000, 1000, 1000, 1000).is_empty());
+        assert_eq!(
+            id_args(1000, 1000, 1000, 50),
+            ["--translate-gid", "map:50:1000:1"]
+        );
+    }
+
+    // A root daemon sees every owner as it is; a map would show root's own
+    // files as the workload's.
+    #[test]
+    fn a_root_daemon_gets_no_map() {
+        assert!(id_args(0, 0, 1000, 1000).is_empty());
     }
 
     #[test]

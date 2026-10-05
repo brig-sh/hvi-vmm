@@ -34,3 +34,5 @@ pub mod virtiofsd;
 
 #[cfg(target_os = "macos")]
 pub use server::set_guest_ids;
+#[cfg(target_os = "linux")]
+pub use virtiofsd::set_guest_ids;

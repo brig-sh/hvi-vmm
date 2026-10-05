@@ -67,7 +67,7 @@ The check covers the shares of one hvi process. Two processes can export the
 same tree, or a tree and a directory inside it, with one export writable and the
 other read-only. Neither process refuses that. A guest on the writable share can
 then store an owner and a mode on a file, setuid and setgid included (see
-[Ownership](#ownership---fs-uid-and---fs-gid-macos)), and the other guest's kernel
+[Ownership](#ownership---fs-uid-and---fs-gid)), and the other guest's kernel
 honors them. Export one tree to two sandboxes only when each may change what the
 other runs.
 
@@ -191,7 +191,7 @@ Three things about this backend are worth knowing:
 the daemon stays off the guest's console. A mount that does not come up is the
 case where `HVI_VIRTIOFSD_LOG=debug` is worth having.
 
-### Ownership: `--fs-uid` and `--fs-gid` (macOS)
+### Ownership: `--fs-uid` and `--fs-gid`
 
 Both default to 0, so a workload running as root sees the host's files as
 root. A guest running as an unprivileged user needs its own uid here, or the
@@ -203,6 +203,17 @@ private host xattr under `com.nofire.hvi.`, so a mode-000 file or an arbitrary
 guest owner survives a restart without being imposed on the host. The guest
 cannot read or forge that attribute: `SETXATTR` on the prefix returns `EPERM`,
 `GETXATTR` returns `ENODATA`, and `LISTXATTR` filters it out.
+
+On Linux each export's virtiofsd gets the same mapping as a translation map:
+`--translate-uid map:<fs-uid>:<hvi's uid>:1`, and the same for the gid. The
+map is bidirectional, so a file the guest creates as `--fs-uid` is owned on
+the host by the user running hvi. Two things differ from macOS:
+
+- No stored ownership. virtiofsd keeps no private attribute, so a file the
+  guest creates or chowns to any other uid is owned by that uid on the host,
+  and an unprivileged daemon refuses the chown with `EPERM`.
+- No map when hvi runs as root. The daemon then sees and sets every owner as
+  it is, and a map would show root's own files as the workload's.
 
 These two flags are process-global, not per share. They are set once before
 any share is served, and they are not part of `BootConfig`. See

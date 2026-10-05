@@ -128,10 +128,10 @@ Two things a caller sets are not in the struct. Both matter.
 
 **Guest file ownership.** `--fs-uid` and `--fs-gid` become two process-global
 atomics through `devices::virtio::fs::set_guest_ids(uid, gid)`, because every
-share reads the same pair. Call it before `boot`, on macOS only:
+share reads the same pair. On macOS the device maps the ids itself; on Linux
+each export's `virtiofsd` gets a translation map. Call it before `boot`:
 
 ```rust
-#[cfg(target_os = "macos")]
 hvi::devices::virtio::fs::set_guest_ids(0, 0);
 ```
 

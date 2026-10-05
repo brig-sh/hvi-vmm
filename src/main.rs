@@ -412,13 +412,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // and a device already answering with the old identity would leave the
     // guest with files it cannot write.
     //
-    // macOS only, because the virtio-fs server is: the Linux backend has no
-    // in-process file server. The flags still parse there so a command line is
-    // portable; on Linux they configure nothing.
-    #[cfg(target_os = "macos")]
+    // The macOS device maps the ids itself; on Linux each export's virtiofsd
+    // gets a translation map.
     hvi::devices::virtio::fs::set_guest_ids(fs_uid, fs_gid);
-    #[cfg(not(target_os = "macos"))]
-    let _ = (fs_uid, fs_gid);
 
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
