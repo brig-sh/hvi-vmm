@@ -147,6 +147,12 @@ ways. When either side closes, the other reads EOF: a host client that closes
 ends the guest stream, and a guest that closes, or a guest driver that resets
 the device, ends the host connection.
 
+hvi sends host bytes only as fast as the guest reads them. While the guest is
+behind, hvi stops reading the connection, so the host client's writes block.
+The guest sees a host close after the last byte written before it. A host
+client that streams both ways should read the connection while it writes to
+it.
+
 The contract the guest side must satisfy:
 
 - Listen on **port 1024**, with the guest at **CID 3** and the host at
