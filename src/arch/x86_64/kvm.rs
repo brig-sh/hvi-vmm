@@ -1252,7 +1252,7 @@ fn spawn_vsock_bridge(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         seccomp::install_thread(seccomp::Thread::Vmm);
-        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        let mut relays: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1265,28 +1265,49 @@ fn spawn_vsock_bridge(
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
-            // The device writes to this socket and must block, or a full send
-            // buffer would split a frame. On macOS an accepted socket inherits
-            // the listener's non-blocking flag, so blocking mode is set here.
-            if stream.set_nonblocking(false).is_err() {
-                continue;
-            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
-            let port = {
+            let Ok(writer) = stream.try_clone() else {
+                continue;
+            };
+            let (port, writer_gate) = {
                 let mut d = lock_or_recover(&dev);
                 let port = d.add_conn(stream);
                 d.connect(&mem, port);
                 set_line(&vm, VIRTIO_VSOCK_GSI, &d);
-                port
+                (port, d.writer_gate(port))
             };
+            let Some(writer_gate) = writer_gate else {
+                continue;
+            };
+            // Guest -> host bytes the vCPU could not send. The writer waits
+            // for the socket to take them, without the device lock.
+            let (dev3, mem3, vm3, stop3) = (
+                Arc::clone(&dev),
+                Arc::clone(&mem),
+                Arc::clone(&vm),
+                stop.clone(),
+            );
+            relays.retain(|handle| !handle.is_finished());
+            relays.push(std::thread::spawn(move || {
+                while writer_gate.wait(|| stop3.sleep(std::time::Duration::ZERO).unwrap_or(false))
+                    && stop3.wait_writable(writer.as_fd()).unwrap_or(false)
+                {
+                    let mut d = lock_or_recover(&dev3);
+                    let alive = d.flush_to_host(&mem3, port);
+                    set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
+                    if !alive {
+                        break;
+                    }
+                }
+            }));
             let dev2 = Arc::clone(&dev);
             let mem2 = Arc::clone(&mem);
             let vm2 = Arc::clone(&vm);
             let stop2 = stop.clone();
-            readers.retain(|handle| !handle.is_finished());
-            readers.push(std::thread::spawn(move || {
+            relays.retain(|handle| !handle.is_finished());
+            relays.push(std::thread::spawn(move || {
                 use std::io::Read;
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -1301,9 +1322,13 @@ fn spawn_vsock_bridge(
                             break;
                         }
                     }
+                    // `add_conn` makes the socket non-blocking, so a read can
+                    // find nothing even after the poll.
                     let n = match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
                         Ok(n) => n,
+                        Err(e) if crate::devices::virtio::vsock::retry_read(&e) => continue,
+                        Err(_) => break,
                     };
                     let gate = {
                         let mut d = lock_or_recover(&dev2);
@@ -1321,8 +1346,8 @@ fn spawn_vsock_bridge(
                 set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
             }));
         }
-        for reader in readers {
-            let _ = reader.join();
+        for relay in relays {
+            let _ = relay.join();
         }
     })
 }
