@@ -6,8 +6,8 @@ own.
 
 ## virtio-blk: `--disk <file>`
 
-`--disk` backs one block device from one host file or block device. There is
-no second disk and no hotplug.
+`--disk` backs one writable block device from one host file or block device.
+There is no hotplug.
 
 ```sh
 hvi boot --kernel <Image> --disk disk.img
@@ -25,6 +25,28 @@ Every request emits a `block` record into the ledger when `--events` is set:
 
 `HVI_BLK_TRACE=1` also logs each request to stderr. It is off by default
 because it costs a synchronous write per request.
+
+### Read-only disks: `--disk-ro <file>`
+
+`--disk-ro` adds a read-only block device and can be repeated. Each one is
+opened without write access and advertised with `VIRTIO_BLK_F_RO`, so the
+guest registers it read-only, and a write request fails with an I/O error
+before it reaches the file. One image can back the read-only disk of many
+guests at once.
+
+```sh
+hvi boot --kernel <Image> --disk upper.ext4 --disk-ro lower.ext4
+```
+
+The guest names them after `--disk`, in the order given: `/dev/vdb` and on
+with a `--disk`, `/dev/vda` and on without one. An x86-64 machine takes one
+read-only disk, on GSI 3, because the ISA lines 9 to 12 go to the virtio-fs
+exports. An arm64 machine takes four.
+
+A read-only lower image under a writable upper disk is how a guest boots a
+shared image root with ownership intact on both hosts: the guest mounts the
+two with overlayfs. A virtio-fs lower shows a Linux host's own ownership
+instead of the image's, since virtiofsd keeps no stored owner.
 
 ## virtio-fs shares
 

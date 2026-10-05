@@ -253,6 +253,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disk = None;
+    let mut disks_ro = Vec::new();
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
@@ -278,6 +279,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
+            "--disk-ro" => disks_ro.push(it.next().ok_or("--disk-ro needs a path")?.clone()),
             // The uid and gid the host's files carry inside the guest. The
             // default is root, which suits a guest whose workload runs as root;
             // a guest running as another user needs its own uid here, or the
@@ -422,6 +424,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: mem_mib << 20,
         cmdline,
         disk,
+        disks_ro,
         fs_shares,
         virtiofsd,
         net,

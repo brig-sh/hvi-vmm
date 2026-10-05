@@ -53,14 +53,14 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, virtio_ro_disk_base, virtio_ro_disk_spi, GicLayout, GicVersion,
+    DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{open_ro_disks, ro_disk_at, ReadOnlyDisk, VirtioBlk};
 use crate::devices::virtio::fs::vhost_user::{export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
@@ -121,6 +121,8 @@ struct Shared {
     mem: Arc<GuestRam>,
     pl011: Arc<Mutex<Pl011>>,
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
+    /// The read-only disks after `virtio`, in the order they were given.
+    ro_disks: Arc<Vec<ReadOnlyDisk>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// One entry per virtio-fs export, in the order the exports were given.
@@ -229,6 +231,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    let ro_disks = open_ro_disks(&cfg.disks_ro, |index| {
+        Some((virtio_ro_disk_base(index)?, virtio_ro_disk_spi(index)?))
+    })?;
+    for path in &cfg.disks_ro {
+        eprintln!("[hvi/kvm] virtio-blk (read-only): {path}");
+    }
     let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
     let mut net_tap_reader: Option<std::fs::File> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
@@ -311,6 +319,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         net: has_net,
         vsock: has_vsock,
         fs_count: fs.len(),
+        ro_disk_count: ro_disks.len(),
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -378,6 +387,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         mem: ram,
         pl011: Arc::new(Mutex::new(Pl011::new())),
         virtio,
+        ro_disks: Arc::new(ro_disks),
         net,
         vsock,
         fs: Arc::clone(&fs),
@@ -763,6 +773,8 @@ fn read_device(sh: &Shared, addr: u64) -> u64 {
         v
     } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&addr) {
         dev_read(sh, sh.virtio.as_ref(), VIRTIO_SPI, addr - VIRTIO_BASE)
+    } else if let Some(disk) = ro_disk_at(&sh.ro_disks, addr, VIRTIO_SIZE) {
+        dev_read(sh, Some(&disk.dev), disk.irq, addr - disk.base)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         dev_read(sh, sh.net.as_ref(), VIRTIO_NET_SPI, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -797,6 +809,8 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
         let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
     } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&addr) {
         dev_write(sh, sh.virtio.as_ref(), VIRTIO_SPI, addr - VIRTIO_BASE, val);
+    } else if let Some(disk) = ro_disk_at(&sh.ro_disks, addr, VIRTIO_SIZE) {
+        dev_write(sh, Some(&disk.dev), disk.irq, addr - disk.base, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         dev_write(
             sh,
@@ -942,7 +956,7 @@ impl VmHandle for Shared {
     }
 
     fn has_block(&self) -> bool {
-        self.virtio.is_some()
+        self.virtio.is_some() || !self.ro_disks.is_empty()
     }
 
     fn has_net(&self) -> bool {
@@ -950,9 +964,13 @@ impl VmHandle for Shared {
     }
 
     fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
-        if let Some(dev) = &self.virtio {
+        let disks = self
+            .virtio
+            .iter()
+            .chain(self.ro_disks.iter().map(|disk| &disk.dev));
+        for dev in disks {
             if let Ok(mut d) = dev.lock() {
-                d.set_io_sink(sink);
+                d.set_io_sink(Arc::clone(&sink));
             }
         }
     }
@@ -1441,6 +1459,7 @@ mod stop_tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disk: None,
+            disks_ro: Vec::new(),
             fs_shares: Vec::new(),
             virtiofsd: None,
             net: false,

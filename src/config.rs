@@ -186,6 +186,10 @@ pub struct BootConfig {
     pub mem_bytes: u64,
     pub cmdline: String,
     pub disk: Option<String>,
+    /// Disk images attached read-only after `disk`, each as its own
+    /// virtio-blk device. The guest sees them in order after `disk`
+    /// (`/dev/vdb` and on when `disk` is set).
+    pub disks_ro: Vec<String>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.

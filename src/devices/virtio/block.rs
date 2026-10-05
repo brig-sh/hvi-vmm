@@ -30,7 +30,7 @@
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::memory::GuestRam;
 
@@ -49,6 +49,9 @@ const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSI
 /// requests. Advertising and honouring it gives correct durability semantics
 /// for `fsync`/`end_fsync` workloads instead of the guest guessing.
 const F_BLK_FLUSH_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
+/// `VIRTIO_BLK_F_RO` (low word): the disk is read-only, so the guest
+/// registers it without write support.
+const F_BLK_RO_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
 
 /// virtio-blk request types.
 const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
@@ -60,6 +63,55 @@ const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
 const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8;
 
 const SECTOR: u64 = 512;
+
+/// A read-only virtio-blk device and the window and interrupt the machine
+/// gave it.
+pub struct ReadOnlyDisk {
+    /// The device, opened with [`VirtioBlk::open_read_only`].
+    pub dev: Arc<Mutex<VirtioBlk>>,
+    /// Guest-physical base of its MMIO window.
+    pub base: u64,
+    /// Its interrupt: an IOAPIC GSI on x86, a GIC SPI on arm64.
+    pub irq: u32,
+}
+
+/// Opens every path in `paths` read-only and places the `index`th where
+/// `place(index)` says.
+///
+/// # Errors
+///
+/// Errors if a disk cannot be opened, or `place` has no window for it.
+pub fn open_ro_disks(
+    paths: &[String],
+    place: impl Fn(usize) -> Option<(u64, u32)>,
+) -> std::io::Result<Vec<ReadOnlyDisk>> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let (base, irq) = place(index).ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "read-only disk {index} ({path}) has no interrupt line left on this machine"
+                ))
+            })?;
+            let dev = VirtioBlk::open_read_only(path)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("--disk-ro {path}: {e}")))?;
+            Ok(ReadOnlyDisk {
+                dev: Arc::new(Mutex::new(dev)),
+                base,
+                irq,
+            })
+        })
+        .collect()
+}
+
+/// Returns the read-only disk whose `size`-byte window holds `addr`.
+#[must_use]
+pub fn ro_disk_at(disks: &[ReadOnlyDisk], addr: u64, size: u64) -> Option<&ReadOnlyDisk> {
+    disks
+        .iter()
+        .find(|disk| (disk.base..disk.base + size).contains(&addr))
+}
 
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
@@ -82,6 +134,8 @@ pub struct VirtioBlk {
     /// synchronous stderr write per request — ruinous under fio). Enable with
     /// `HVI_BLK_TRACE=1`; the structured ledger still records every request.
     trace: bool,
+    /// Opened without write access and advertised as `VIRTIO_BLK_F_RO`.
+    read_only: bool,
 }
 
 /// Size in bytes of whatever is behind `file`.
@@ -126,7 +180,25 @@ impl VirtioBlk {
     ///
     /// Errors if the file cannot be opened or its length read.
     pub fn open(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_with(path, false)
+    }
+
+    /// Opens `path` read-only as the backing disk.
+    ///
+    /// The file is opened without write access, the guest is told the disk is
+    /// read-only, and a write request fails with `IOERR` before it reaches
+    /// the file.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the file cannot be opened or its length read.
+    pub fn open_read_only(path: &str) -> std::io::Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    /// Opens `path` as the backing disk, writable unless `read_only`.
+    fn open_with(path: &str, read_only: bool) -> std::io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let capacity_sectors = backing_len(&file)? / SECTOR;
         // The inode identifies the backing store across the two processes that
         // care about it, without agreeing on a path: hvi may have been given a
@@ -143,6 +215,7 @@ impl VirtioBlk {
             sink: None,
             disk_id,
             trace: std::env::var_os("HVI_BLK_TRACE").is_some(),
+            read_only,
         })
     }
 
@@ -193,8 +266,12 @@ impl VirtioBlk {
                 mmio::VERSION => 2,
                 mmio::DEVICE_ID => VIRTIO_BLK_ID,
                 mmio::VENDOR_ID => VENDOR,
-                // Low word: VIRTIO_BLK_F_FLUSH. High word: VIRTIO_F_VERSION_1.
-                mmio::DEVICE_FEATURES if self.dev_feat_sel == 0 => u64::from(F_BLK_FLUSH_LO),
+                // Low word: VIRTIO_BLK_F_FLUSH, plus VIRTIO_BLK_F_RO on a
+                // read-only disk. High word: VIRTIO_F_VERSION_1.
+                mmio::DEVICE_FEATURES if self.dev_feat_sel == 0 => {
+                    let ro = if self.read_only { F_BLK_RO_LO } else { 0 };
+                    u64::from(F_BLK_FLUSH_LO | ro)
+                }
                 mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
                 mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
                 mmio::QUEUE_READY => u64::from(self.queue.is_ready()),
@@ -364,6 +441,12 @@ impl VirtioBlk {
                     device_written += l;
                 }
                 data_bytes = total as u64;
+            }
+            VIRTIO_BLK_T_OUT if self.read_only => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "write to a read-only disk",
+                ));
             }
             VIRTIO_BLK_T_OUT => {
                 // Gather the data segments into one buffer, then one positioned
@@ -863,6 +946,41 @@ mod capacity_tests {
         blk.mmio(mem, mmio::QUEUE_READY, true, 1);
         blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
         mem.read_u16(status).unwrap() as u8
+    }
+
+    #[test]
+    fn read_only_disk_refuses_a_write_and_serves_a_read() {
+        let (r, _) = rig("ro");
+        let mut blk = VirtioBlk::open_read_only(r.path.to_str().unwrap()).unwrap();
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        mem.write(BASE + 0x5000, &[0x11u8; 512]).unwrap();
+
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 0, 512);
+        assert_eq!(st, VIRTIO_BLK_S_IOERR, "the guest is told the write failed");
+        assert_eq!(
+            std::fs::read(&r.path).unwrap(),
+            [0xabu8; 512],
+            "the file is untouched"
+        );
+
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512);
+        assert_eq!(st, VIRTIO_BLK_S_OK);
+        let mut back = [0u8; 512];
+        mem.read(BASE + 0x5000, &mut back).unwrap();
+        assert_eq!(back, [0xabu8; 512], "the read returns the file's bytes");
+    }
+
+    #[test]
+    fn only_a_read_only_disk_advertises_ro() {
+        let (r, mut rw) = rig("feat");
+        let mut ro = VirtioBlk::open_read_only(r.path.to_str().unwrap()).unwrap();
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let low = |blk: &mut VirtioBlk| {
+            blk.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, 0);
+            blk.mmio(&mem, mmio::DEVICE_FEATURES, false, 0) as u32
+        };
+        assert_eq!(low(&mut ro), F_BLK_FLUSH_LO | F_BLK_RO_LO);
+        assert_eq!(low(&mut rw), F_BLK_FLUSH_LO);
     }
 
     /// Regression for the guest writing outside the disk it was advertised.

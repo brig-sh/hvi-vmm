@@ -54,17 +54,17 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::arch::x86_64::acpi;
 use crate::arch::x86_64::layout::{
-    virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR,
-    HIGH_RAM_BASE, I8042_COMMAND_PORT, MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR, PML4_ADDR,
-    RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE, VIRTIO_NET_GSI, VIRTIO_SIZE,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    virtio_fs_base, virtio_fs_gsi, virtio_ro_disk_base, virtio_ro_disk_gsi, ACPI_ADDR, BOOT_STACK,
+    COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE, I8042_COMMAND_PORT, MMIO_GAP_START, MPTABLE_ADDR,
+    PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE,
+    VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{open_ro_disks, ro_disk_at, ReadOnlyDisk, VirtioBlk};
 use crate::devices::virtio::fs::vhost_user::{export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
@@ -107,6 +107,8 @@ struct Shared {
     /// The ACPI PM1 and reset registers, where the guest powers off.
     pm: Arc<Mutex<acpi::PmRegisters>>,
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
+    /// The read-only disks after `virtio`, in the order they were given.
+    ro_disks: Arc<Vec<ReadOnlyDisk>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// One entry per virtio-fs export, in the order the exports were given.
@@ -234,6 +236,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    let ro_disks = open_ro_disks(&cfg.disks_ro, |index| {
+        Some((virtio_ro_disk_base(index)?, virtio_ro_disk_gsi(index)?))
+    })?;
+    for path in &cfg.disks_ro {
+        eprintln!("[hvi/x86] virtio-blk (read-only): {path}");
+    }
     let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
     let mut net_tap_reader: Option<std::fs::File> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
@@ -306,6 +314,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if virtio.is_some() {
         ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_BLK_BASE:#x}:{VIRTIO_BLK_GSI}");
     }
+    // Right after the main disk, so the guest probes them next and names
+    // them in order.
+    for disk in &ro_disks {
+        ours += &format!(" virtio_mmio.device=0x200@{:#x}:{}", disk.base, disk.irq);
+    }
     if net.is_some() {
         ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_NET_BASE:#x}:{VIRTIO_NET_GSI}");
     }
@@ -369,6 +382,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
         pm: Arc::new(Mutex::new(acpi::PmRegisters::default())),
         virtio,
+        ro_disks: Arc::new(ro_disks),
         net,
         vsock,
         fs: Arc::new(fs),
@@ -1000,6 +1014,8 @@ fn pio_write(sh: &Shared, port: u16, val: u8) {
 fn mmio_read(sh: &Shared, addr: u64) -> u64 {
     if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
         blk_read(sh, addr - VIRTIO_BLK_BASE)
+    } else if let Some(disk) = ro_disk_at(&sh.ro_disks, addr, VIRTIO_SIZE) {
+        ro_disk_mmio(sh, disk, addr - disk.base, false, 0)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         net_read(sh, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -1023,6 +1039,8 @@ fn mmio_read(sh: &Shared, addr: u64) -> u64 {
 fn mmio_write(sh: &Shared, addr: u64, val: u64) {
     if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
         blk_write(sh, addr - VIRTIO_BLK_BASE, val);
+    } else if let Some(disk) = ro_disk_at(&sh.ro_disks, addr, VIRTIO_SIZE) {
+        ro_disk_mmio(sh, disk, addr - disk.base, true, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         net_write(sh, addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -1081,6 +1099,17 @@ fn blk_write(sh: &Shared, off: u64, val: u64) {
         d.take_events()
     };
     drain(sh, &events);
+}
+/// Services one access to a read-only disk's window and sets its line.
+fn ro_disk_mmio(sh: &Shared, disk: &ReadOnlyDisk, off: u64, is_write: bool, val: u64) -> u64 {
+    let (v, events) = {
+        let mut d = disk.dev.lock().unwrap();
+        let v = d.mmio(&sh.mem, off, is_write, val);
+        set_line(&sh.vm, disk.irq, &d);
+        (v, d.take_events())
+    };
+    drain(sh, &events);
+    v
 }
 fn net_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.net.as_ref() else { return 0 };
@@ -1149,7 +1178,7 @@ impl VmHandle for Shared {
     }
 
     fn has_block(&self) -> bool {
-        self.virtio.is_some()
+        self.virtio.is_some() || !self.ro_disks.is_empty()
     }
 
     fn has_net(&self) -> bool {
@@ -1157,9 +1186,13 @@ impl VmHandle for Shared {
     }
 
     fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
-        if let Some(dev) = &self.virtio {
+        let disks = self
+            .virtio
+            .iter()
+            .chain(self.ro_disks.iter().map(|disk| &disk.dev));
+        for dev in disks {
             if let Ok(mut d) = dev.lock() {
-                d.set_io_sink(sink);
+                d.set_io_sink(Arc::clone(&sink));
             }
         }
     }
@@ -1754,6 +1787,7 @@ mod stop_tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disk: None,
+            disks_ro: Vec::new(),
             fs_shares: Vec::new(),
             virtiofsd: None,
             net: false,

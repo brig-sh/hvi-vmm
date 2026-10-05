@@ -53,6 +53,8 @@ pub struct VirtioDevices {
     pub net: bool,
     pub vsock: bool,
     pub fs_count: usize,
+    /// Read-only disks after `blk`, placed by `layout::virtio_ro_disk_base`.
+    pub ro_disk_count: usize,
 }
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
@@ -216,6 +218,16 @@ pub fn build(
     };
     if devices.blk {
         virtio_node(VIRTIO_BASE, VIRTIO_SPI)?;
+    }
+    // Right after the main disk, so the guest probes them next and names
+    // them in order.
+    for index in 0..devices.ro_disk_count {
+        if let (Some(base), Some(spi)) = (
+            crate::arch::aarch64::layout::virtio_ro_disk_base(index),
+            crate::arch::aarch64::layout::virtio_ro_disk_spi(index),
+        ) {
+            virtio_node(base, spi)?;
+        }
     }
     if devices.net {
         virtio_node(VIRTIO_NET_BASE, VIRTIO_NET_SPI)?;

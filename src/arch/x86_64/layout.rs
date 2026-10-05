@@ -122,6 +122,38 @@ pub fn virtio_fs_gsi(index: usize) -> Option<u32> {
     VIRTIO_FS_GSI.checked_add(u32::try_from(index).ok()?)
 }
 
+/// Window and GSI of the read-only disk after the virtio-fs windows.
+///
+/// GSI 3 is COM2's line. This machine has no COM2, and the guest's 8250
+/// driver only requests the line when something opens `ttyS1`, so it is the
+/// one ISA line left once the exports have 9 to 12. That bounds the x86
+/// machine at [`MAX_RO_DISKS`] read-only disk.
+pub const VIRTIO_RO_DISK_BASE: u64 = VIRTIO_FS_BASE + MAX_FS_DEVICES as u64 * VIRTIO_SIZE;
+pub const VIRTIO_RO_DISK_GSI: u32 = 3;
+
+/// How many read-only disks this machine has interrupt lines for.
+pub const MAX_RO_DISKS: usize = 1;
+
+/// Returns the window base of the `index`th read-only disk, or `None` when
+/// the machine has no line left for it.
+#[must_use]
+pub fn virtio_ro_disk_base(index: usize) -> Option<u64> {
+    if index >= MAX_RO_DISKS {
+        return None;
+    }
+    VIRTIO_RO_DISK_BASE.checked_add((index as u64).checked_mul(VIRTIO_SIZE)?)
+}
+
+/// Returns the GSI of the `index`th read-only disk, or `None` when the
+/// machine has no line left for it.
+#[must_use]
+pub fn virtio_ro_disk_gsi(index: usize) -> Option<u32> {
+    if index >= MAX_RO_DISKS {
+        return None;
+    }
+    VIRTIO_RO_DISK_GSI.checked_add(u32::try_from(index).ok()?)
+}
+
 /// Base of the sub-4 GiB MMIO hole: guest RAM stops here and the remainder,
 /// if any, resumes at [`HIGH_RAM_BASE`].
 ///
@@ -147,9 +179,38 @@ pub const HIGH_RAM_BASE: u64 = 0x1_0000_0000; // 4 GiB
 #[cfg(test)]
 mod tests {
     use super::{
-        virtio_fs_base, virtio_fs_gsi, COM1_GSI, MAX_FS_DEVICES, MMIO_GAP_START, VIRTIO_BLK_GSI,
-        VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+        virtio_fs_base, virtio_fs_gsi, virtio_ro_disk_base, virtio_ro_disk_gsi, COM1_GSI,
+        MAX_FS_DEVICES, MAX_RO_DISKS, MMIO_GAP_START, VIRTIO_BLK_GSI, VIRTIO_NET_GSI, VIRTIO_SIZE,
+        VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
     };
+
+    #[test]
+    fn read_only_disks_sit_after_the_fs_windows_on_their_own_lines() {
+        let last_fs = virtio_fs_base(MAX_FS_DEVICES - 1).expect("a placement");
+        let fs_lines: Vec<u32> = (0..MAX_FS_DEVICES)
+            .map(|i| virtio_fs_gsi(i).expect("an interrupt"))
+            .collect();
+        let taken = [COM1_GSI, VIRTIO_BLK_GSI, VIRTIO_NET_GSI, VIRTIO_VSOCK_GSI];
+        for index in 0..MAX_RO_DISKS {
+            let base = virtio_ro_disk_base(index).expect("a placement");
+            assert!(
+                base >= last_fs + VIRTIO_SIZE,
+                "disk {index} overlaps an export"
+            );
+            assert!(
+                base + VIRTIO_SIZE <= MMIO_GAP_START + 0x1000,
+                "disk {index} escapes the hole"
+            );
+            let gsi = virtio_ro_disk_gsi(index).expect("an interrupt");
+            assert!(
+                !taken.contains(&gsi) && !fs_lines.contains(&gsi),
+                "GSI {gsi} is shared"
+            );
+            assert!(gsi < 16, "GSI {gsi} has no MP table entry");
+        }
+        assert_eq!(virtio_ro_disk_base(MAX_RO_DISKS), None);
+        assert_eq!(virtio_ro_disk_gsi(MAX_RO_DISKS), None);
+    }
 
     // The fs windows sit after the three fixed devices and inside the MMIO
     // hole. RAM laid over either end is the failure this guards: the guest

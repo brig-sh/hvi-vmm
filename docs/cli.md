@@ -46,6 +46,7 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
+| `--disk-ro <path>` | none | A read-only virtio-blk backing file, after `--disk`. Repeatable: one on x86-64, four on arm64. |
 | `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. |
 | `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. |
 | `--share-sock <tag>=<socket>` | none | Serve that export from a vhost-user daemon already listening on `<socket>`. Names an export given earlier on the line, so it follows its own `--share-ro`/`--share-rw`. The daemon serves the directory it was started with, so that export's directory is not used. Linux only. |
@@ -68,8 +69,8 @@ including a typo, silently runs the plain test.
 
 Three things about the parser are worth knowing, because none of them warns.
 
-**Repeating a flag is last-wins.** Only `--share-ro` and `--share-rw`
-accumulate. A second `--disk` replaces the first.
+**Repeating a flag is last-wins.** Only `--share-ro`, `--share-rw` and
+`--disk-ro` accumulate. A second `--disk` replaces the first.
 
 **A value-taking flag at the end of the line silently takes none.** These
 flags accept a missing value as "not set" rather than erroring: `--kernel`,

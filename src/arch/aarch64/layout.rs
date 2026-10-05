@@ -85,6 +85,33 @@ pub const GIC_NUM_IRQS: u32 = 256;
 /// raises one, which looks like a hang rather than a misconfiguration.
 pub const MAX_FS_DEVICES: usize = 16;
 
+/// How many read-only disks this machine has interrupts for.
+pub const MAX_RO_DISKS: usize = 4;
+
+/// First read-only disk window and SPI, after the last virtio-fs export's.
+pub const VIRTIO_RO_DISK_BASE: u64 = VIRTIO_FS_BASE + MAX_FS_DEVICES as u64 * VIRTIO_SIZE;
+pub const VIRTIO_RO_DISK_SPI: u32 = VIRTIO_FS_SPI + MAX_FS_DEVICES as u32;
+
+/// Placement of the `index`th read-only disk, or `None` past
+/// [`MAX_RO_DISKS`].
+#[must_use]
+pub fn virtio_ro_disk_base(index: usize) -> Option<u64> {
+    if index >= MAX_RO_DISKS {
+        return None;
+    }
+    VIRTIO_RO_DISK_BASE.checked_add((index as u64).checked_mul(VIRTIO_SIZE)?)
+}
+
+/// Interrupt of the `index`th read-only disk as a GIC SPI number, or `None`
+/// past [`MAX_RO_DISKS`].
+#[must_use]
+pub fn virtio_ro_disk_spi(index: usize) -> Option<u32> {
+    if index >= MAX_RO_DISKS {
+        return None;
+    }
+    VIRTIO_RO_DISK_SPI.checked_add(u32::try_from(index).ok()?)
+}
+
 /// Placement of the `index`th virtio-fs device, or `None` past
 /// [`MAX_FS_DEVICES`]. Each export gets an independent transport and
 /// interrupt because one virtio-fs device carries exactly one mount tag.
@@ -429,6 +456,28 @@ mod tests {
                 "fs {index} escapes the device map"
             );
         }
+    }
+
+    #[test]
+    fn read_only_disks_follow_the_exports_inside_the_map() {
+        let last_fs = virtio_fs_base(MAX_FS_DEVICES - 1).expect("a placement");
+        let last_fs_spi = virtio_fs_spi(MAX_FS_DEVICES - 1).expect("an interrupt");
+        for index in 0..MAX_RO_DISKS {
+            let base = virtio_ro_disk_base(index).expect("a placement");
+            assert!(
+                base >= last_fs + VIRTIO_SIZE,
+                "disk {index} overlaps an export"
+            );
+            assert!(
+                base + VIRTIO_SIZE <= DEVICE_WINDOW_END,
+                "disk {index} escapes the map"
+            );
+            let spi = virtio_ro_disk_spi(index).expect("an interrupt");
+            assert!(spi > last_fs_spi, "disk {index} shares an export's SPI");
+            assert!(32 + spi < GIC_NUM_IRQS, "SPI {spi} is past the GIC");
+        }
+        assert_eq!(virtio_ro_disk_base(MAX_RO_DISKS), None);
+        assert_eq!(virtio_ro_disk_spi(MAX_RO_DISKS), None);
     }
 
     // A ragged initrd range kills a guest that turns it into a

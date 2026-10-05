@@ -41,14 +41,14 @@ use applevisor::prelude::{
 use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, virtio_ro_disk_base, virtio_ro_disk_spi, GicLayout, GicVersion,
+    DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{open_ro_disks, ro_disk_at, ReadOnlyDisk, VirtioBlk};
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
@@ -176,6 +176,8 @@ struct Shared {
     mem: Arc<GuestRam>,
     pl011: Arc<Mutex<Pl011>>,
     virtio: Option<Arc<Mutex<VirtioBlk>>>,
+    /// The read-only disks after `virtio`, in the order they were given.
+    ro_disks: Arc<Vec<ReadOnlyDisk>>,
     net: Option<Arc<Mutex<VirtioNet>>>,
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
     fs: Vec<SharedFs>,
@@ -304,6 +306,21 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    let ro_disks = open_ro_disks(&cfg.disks_ro, |index| {
+        Some((virtio_ro_disk_base(index)?, virtio_ro_disk_spi(index)?))
+    })?;
+    for (disk, path) in ro_disks.iter().zip(&cfg.disks_ro) {
+        let end = disk.base.saturating_add(VIRTIO_SIZE);
+        if disk.base < gic_end || end > DEVICE_WINDOW_END {
+            return Err(format!(
+                "read-only disk at {:#x}..{end:#x} does not fit between the GIC \
+                 (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}",
+                disk.base
+            )
+            .into());
+        }
+        eprintln!("[hvi] virtio-blk (read-only): {path}");
+    }
     // virtio-net: gateway relay (real egress) when a gateway socket is given,
     // else the built-in user-space stack. `net_reader` carries the gateway read
     // side to the RX reader thread, spawned once the shared state exists.
@@ -438,6 +455,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         net: has_net,
         vsock: has_vsock,
         fs_count: fs.len(),
+        ro_disk_count: ro_disks.len(),
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -467,6 +485,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         mem: ram,
         pl011: Arc::new(Mutex::new(Pl011::new())),
         virtio,
+        ro_disks: Arc::new(ro_disks),
         net,
         vsock,
         fs,
@@ -794,6 +813,16 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                     );
                                 }
                                 advance_pc(&vcpu);
+                            } else if let Some(disk) = ro_disk_at(&sh.ro_disks, ipa, VIRTIO_SIZE) {
+                                service_dev(
+                                    &vcpu,
+                                    &sh,
+                                    &disk.dev,
+                                    32 + disk.irq,
+                                    ipa - disk.base,
+                                    syn,
+                                );
+                                advance_pc(&vcpu);
                             } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE)
                                 .contains(&ipa)
                             {
@@ -902,7 +931,7 @@ impl VmHandle for Shared {
     }
 
     fn has_block(&self) -> bool {
-        self.virtio.is_some()
+        self.virtio.is_some() || !self.ro_disks.is_empty()
     }
 
     fn has_net(&self) -> bool {
@@ -910,9 +939,13 @@ impl VmHandle for Shared {
     }
 
     fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
-        if let Some(dev) = &self.virtio {
+        let disks = self
+            .virtio
+            .iter()
+            .chain(self.ro_disks.iter().map(|disk| &disk.dev));
+        for dev in disks {
             if let Ok(mut d) = dev.lock() {
-                d.set_io_sink(sink);
+                d.set_io_sink(Arc::clone(&sink));
             }
         }
     }

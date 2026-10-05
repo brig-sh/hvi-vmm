@@ -306,8 +306,9 @@ Interrupt injection is the one device-facing thing that differs by backend:
 
 ### Devices
 
-- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`. It advertises
-  `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync.
+- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk` and each
+  `--disk-ro`. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a
+  real sync; a read-only disk adds `VIRTIO_BLK_F_RO` and fails a write.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
