@@ -1345,8 +1345,8 @@ fn spawn_vsock_bridge(
                 loop {
                     match stop2.wait(reader.as_fd()) {
                         Ok(true) => {}
-                        // A stop ends the connection like a peer close, so the
-                        // device releases it.
+                        // A stop ends the reader like a peer EOF. `drop_conns`
+                        // after the accept loop releases the connection.
                         Ok(false) => break,
                         Err(e) => {
                             eprintln!("[hvi] vsock bridge: {e}; connection closed");
