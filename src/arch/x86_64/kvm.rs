@@ -1305,9 +1305,16 @@ fn spawn_vsock_bridge(
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let mut d = lock_or_recover(&dev2);
-                    d.host_data(&mem2, port, &buf[..n]);
-                    set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
+                    let gate = {
+                        let mut d = lock_or_recover(&dev2);
+                        let gate = d.host_data(&mem2, port, &buf[..n]);
+                        set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
+                        gate
+                    };
+                    // `HostGate::wait` says why its result is not needed.
+                    if let Some(gate) = gate {
+                        gate.wait(|| stop2.keep_waiting(reader.as_fd()));
+                    }
                 }
                 let mut d = lock_or_recover(&dev2);
                 d.host_closed(&mem2, port);

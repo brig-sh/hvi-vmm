@@ -1320,13 +1320,17 @@ fn spawn_vsock_bridge(
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let level = {
+                    let (gate, level) = {
                         let mut d = lock_or_recover(&dev2);
-                        d.host_data(&mem2, port, &buf[..n]);
-                        d.irq_level()
+                        let gate = d.host_data(&mem2, port, &buf[..n]);
+                        (gate, d.irq_level())
                     };
                     let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, level);
                     kick_all(&vm2, &handles2);
+                    // `HostGate::wait` says why its result is not needed.
+                    if let Some(gate) = gate {
+                        gate.wait(|| stop2.keep_waiting(reader.as_fd()));
+                    }
                 }
                 let level = {
                     let mut d = lock_or_recover(&dev2);

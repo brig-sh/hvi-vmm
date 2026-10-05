@@ -135,6 +135,22 @@ impl StopToken {
         }
     }
 
+    /// Returns whether a helper that waits on something other than `fd` should
+    /// keep waiting.
+    ///
+    /// It returns `false` once the stop is requested, or once `fd` reports a
+    /// hangup or an error, and it does not block. The helper calls it at
+    /// intervals, so it notices both without polling `fd` for data.
+    #[must_use]
+    pub fn keep_waiting(&self, fd: BorrowedFd<'_>) -> bool {
+        let mut fds = [pollfd(fd.as_raw_fd()), pollfd(self.0.as_raw_fd())];
+        if poll(&mut fds, 0).is_err() {
+            return false;
+        }
+        let gone = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+        fds[1].revents == 0 && fds[0].revents & gone == 0
+    }
+
     /// Sleeps for `duration` unless the stop is requested first.
     ///
     /// Returns `true` when the whole duration passed and `false` when the stop
@@ -208,6 +224,25 @@ mod tests {
         let (reader, writer) = std::io::pipe().expect("pipe");
         drop(writer);
         assert!(source.token().wait(reader.as_fd()).expect("poll"));
+    }
+
+    // A peer that wrote and then closed leaves data and a hangup together. The
+    // vsock bridge reader relies on seeing the hangup, so it stops waiting for
+    // the guest and reads the rest of the socket.
+    #[test]
+    fn keep_waiting_ends_on_hangup_and_on_stop() {
+        let source = StopSource::new().expect("pair");
+        let token = source.token();
+        let (mut peer, idle) = UnixStream::pair().expect("pair");
+        assert!(token.keep_waiting(idle.as_fd()), "idle socket");
+        peer.write_all(b"x").expect("write");
+        assert!(token.keep_waiting(idle.as_fd()), "data alone is no hangup");
+        drop(peer);
+        assert!(!token.keep_waiting(idle.as_fd()), "the peer closed");
+
+        let (_peer, idle) = UnixStream::pair().expect("pair");
+        source.request_stop();
+        assert!(!token.keep_waiting(idle.as_fd()), "the stop was requested");
     }
 
     // Dropping the source must stop the tokens, so `boot` unwinding past its
