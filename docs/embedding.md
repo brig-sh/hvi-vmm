@@ -161,6 +161,10 @@ Each side sees the other's close after the last byte written before it. Once
 the host client has gone, the guest's writes fail with EPIPE and its reads go
 on. The guest's connection is reset once it has every host byte.
 
+Either side can also shut down only its write half with `shutdown(SHUT_WR)`.
+The other side reads EOF and can still write, and those bytes arrive. A host
+client can send a request, half-close and read the reply, and so can a guest.
+
 The contract the guest side must satisfy:
 
 - Listen on **port 1024**, with the guest at **CID 3** and the host at
