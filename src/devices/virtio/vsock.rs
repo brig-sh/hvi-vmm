@@ -35,8 +35,9 @@
 //! per-connection buffer as large as the credit we advertise, and a writer
 //! thread sends it once the socket drains. Our `fwd_cnt` counts only the bytes
 //! the socket took, so a slow host reader holds back the guest's writes. A
-//! guest that overruns that credit, or writes to a host that has gone, gets
-//! `OP_RST`.
+//! guest that overruns that credit gets `OP_RST`. A guest that writes to a host
+//! that has gone gets `OP_SHUTDOWN` for its sends, and `OP_RST` after the last
+//! host byte.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -73,6 +74,10 @@ const OP_SHUTDOWN: u16 = 4;
 const OP_RW: u16 = 5;
 const OP_CREDIT_UPDATE: u16 = 6;
 const OP_CREDIT_REQUEST: u16 = 7;
+/// `OP_SHUTDOWN` flag: the sender takes no more bytes.
+const SHUTDOWN_RCV: u32 = 1;
+/// `OP_SHUTDOWN` flag: the sender sends no more bytes.
+const SHUTDOWN_SEND: u32 = 2;
 
 /// Device to guest: the credit we advertise, so how many guest bytes may wait
 /// for the host socket on one connection.
@@ -225,8 +230,7 @@ impl HostGate {
     /// which turns `false` on a stop or a host hangup. They ignore the result
     /// and go back to the socket, whose poll tells the two apart. A stop ends
     /// the reader. After a hangup the reader drains what the peer left and
-    /// reads EOF. The bridge writers watch for a stop only, since a host that
-    /// shut down its write half still reads.
+    /// reads EOF.
     pub fn wait(&self, mut running: impl FnMut() -> bool) -> bool {
         loop {
             if !*lock_or_recover(&self.closed) {
@@ -241,14 +245,29 @@ impl HostGate {
             }
         }
     }
+
+    /// Blocks until the gate opens, with no timeout.
+    ///
+    /// The bridge writers wait here. Dropping the connection opens the gate,
+    /// and the bridge drops every connection when it stops, see
+    /// [`VirtioVsock::drop_conns`]. An idle writer therefore does not wake.
+    pub fn wait_open(&self) {
+        let mut closed = lock_or_recover(&self.closed);
+        while *closed {
+            closed = match self.opened.wait(closed) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
 }
 
 /// One exec session: a host Unix stream mapped to a guest vsock stream.
 struct Conn {
     /// The host stream, written with guest bytes.
     ///
-    /// A clone of it is read elsewhere, so ending a session takes `shutdown`.
-    /// A drop alone leaves the clone and the peer open.
+    /// A clone of it is read elsewhere, so `Drop` shuts the stream down. A
+    /// drop alone would leave the clone and the peer open.
     stream: UnixStream,
     /// Where the session is in the handshake.
     state: ConnState,
@@ -260,6 +279,24 @@ struct Conn {
     backlog: VecDeque<u8>,
     /// Whether the host end closed, so `OP_SHUTDOWN` follows the backlog.
     host_closed: bool,
+    /// Whether a send to the host failed because the host has gone.
+    ///
+    /// The guest then gets `OP_SHUTDOWN` with only the receive flag, so its
+    /// sends fail. Guest bytes already on their way are credited and dropped,
+    /// and `OP_RST` takes the place of the `OP_SHUTDOWN` that follows the
+    /// backlog.
+    host_gone: bool,
+    /// Whether the guest closed its end, so host bytes are dropped.
+    guest_closed: bool,
+    /// Whether the guest closed with `OP_RST`, so nothing more goes to it.
+    guest_reset: bool,
+    /// Whether the guest closed both directions, with `OP_RST` or with
+    /// `OP_SHUTDOWN` carrying both flags, as `close` sends it.
+    guest_full_close: bool,
+    /// Whether the guest has been told that the host end is done.
+    guest_told: bool,
+    /// Whether we sent the guest `OP_RST`.
+    reset_sent: bool,
     /// The guest's receive buffer size, from the last header it sent.
     peer_buf_alloc: u32,
     /// The bytes the guest has consumed, from the last header it sent.
@@ -362,10 +399,14 @@ impl VirtioVsock {
     ///
     /// The stream goes into non-blocking mode, so a send from a vCPU never
     /// waits on the host reader. `MSG_DONTWAIT` alone does not make a
-    /// Unix-socket send non-blocking on macOS. A stream that refuses the mode
-    /// is broken, and the first send to it fails.
-    pub fn add_conn(&mut self, stream: UnixStream) -> u32 {
-        let _ = stream.set_nonblocking(true);
+    /// Unix-socket send non-blocking on macOS.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the stream refuses non-blocking mode. The connection is not
+    /// registered then.
+    pub fn add_conn(&mut self, stream: UnixStream) -> std::io::Result<u32> {
+        stream.set_nonblocking(true)?;
         let port = self.next_port;
         self.next_port += 1;
         self.conns.insert(
@@ -377,6 +418,12 @@ impl VirtioVsock {
                 to_host: VecDeque::new(),
                 backlog: VecDeque::new(),
                 host_closed: false,
+                host_gone: false,
+                guest_closed: false,
+                guest_reset: false,
+                guest_full_close: false,
+                guest_told: false,
+                reset_sent: false,
                 peer_buf_alloc: 0,
                 peer_fwd_cnt: 0,
                 tx_cnt: 0,
@@ -384,7 +431,15 @@ impl VirtioVsock {
                 writer_gate: Arc::new(HostGate::new_closed()),
             },
         );
-        port
+        Ok(port)
+    }
+
+    /// Drops every connection, which ends their bridge threads.
+    ///
+    /// The bridge calls it once it stops accepting. Each drop shuts the host
+    /// stream down and opens both gates.
+    pub fn drop_conns(&mut self) {
+        self.conns.clear();
     }
 
     /// Queues a connection REQUEST to the guest agent and delivers it.
@@ -419,7 +474,11 @@ impl VirtioVsock {
         host_port: u32,
         data: &[u8],
     ) -> Option<Arc<HostGate>> {
-        self.conns.get_mut(&host_port)?.backlog.extend(data);
+        let conn = self.conns.get_mut(&host_port)?;
+        if conn.guest_closed {
+            return None;
+        }
+        conn.backlog.extend(data);
         self.fill_rx(mem);
         let conn = self.conns.get(&host_port)?;
         if conn.backlog.len() < HOST_BACKLOG_MAX {
@@ -436,18 +495,84 @@ impl VirtioVsock {
     /// a client that writes and closes before the accept loses nothing. The
     /// guest's `OP_RESPONSE` or `OP_RST` settles it, and a device reset drops
     /// it. An accepted connection with a backlog waits for the guest to read
-    /// it or close. A guest write to a host that has gone resets it, see
-    /// [`VirtioVsock::flush_to_host`].
+    /// it or close. Guest bytes the host socket has not taken still go out
+    /// before the connection is dropped.
     pub fn host_closed(&mut self, mem: &GuestRam, host_port: u32) {
         let Some(conn) = self.conns.get_mut(&host_port) else {
             return;
         };
-        if conn.backlog.is_empty() {
-            self.conns.remove(&host_port);
-            self.pending.push_back(Self::shutdown_pkt(host_port));
-        } else {
-            conn.host_closed = true;
+        conn.host_closed = true;
+        self.settle(host_port);
+        self.fill_rx(mem);
+    }
+
+    /// Ends what is finished of connection `host_port`.
+    ///
+    /// Once the host end closed and the guest has every host byte, the guest
+    /// gets `OP_SHUTDOWN`, or `OP_RST` when the host has gone. The connection
+    /// is dropped once the guest was told or closed its end, and the host
+    /// socket has taken every guest byte. Neither direction loses bytes to a
+    /// close of the other.
+    ///
+    /// A guest that closed with a full `OP_SHUTDOWN` gets `OP_RST` when the
+    /// connection is dropped. Linux holds a closed socket until the peer's
+    /// reset arrives, and resets it on its own only after 8 s. A guest that
+    /// shut down only its sends gets no reset: hvi ends both directions of
+    /// such a connection anyway, and the reset would end the guest's read in
+    /// an EOF that looks like a complete reply.
+    fn settle(&mut self, host_port: u32) {
+        let Some(conn) = self.conns.get_mut(&host_port) else {
+            return;
+        };
+        if conn.host_closed && conn.backlog.is_empty() && !conn.guest_told && !conn.guest_closed {
+            conn.guest_told = true;
+            let pkt = if conn.host_gone {
+                conn.reset_sent = true;
+                Self::control_pkt(host_port, OP_RST, 0)
+            } else {
+                Self::shutdown_pkt(host_port)
+            };
+            self.pending.push_back(pkt);
         }
+        if (conn.guest_told || conn.guest_closed) && conn.to_host.is_empty() {
+            if conn.guest_full_close && !conn.guest_reset && !conn.reset_sent {
+                self.pending
+                    .push_back(Self::control_pkt(host_port, OP_RST, 0));
+            }
+            self.conns.remove(&host_port);
+        }
+    }
+
+    /// Records that the host end of `host_port` has gone, as a failed send or
+    /// a failed wait for the socket shows.
+    ///
+    /// The guest bytes waiting for the host are dropped, and so are the ones
+    /// already on their way. All of them go back to the guest as credit, so
+    /// the guest can still read the backlog the host left. An `OP_SHUTDOWN`
+    /// with only the receive flag makes the guest's later sends fail with
+    /// EPIPE, and its reads go on. The guest gets `OP_RST` after the last host
+    /// byte.
+    pub fn host_gone(&mut self, mem: &GuestRam, host_port: u32) {
+        let Some(conn) = self.conns.get_mut(&host_port) else {
+            return;
+        };
+        if conn.host_gone {
+            return;
+        }
+        conn.host_gone = true;
+        if !conn.guest_closed && !conn.guest_told {
+            self.pending
+                .push_back(Self::control_pkt(host_port, OP_SHUTDOWN, SHUTDOWN_RCV));
+        }
+        let dropped = conn.to_host.len();
+        conn.to_host.clear();
+        conn.writer_gate.close();
+        conn.rx_cnt = conn.rx_cnt.wrapping_add(dropped as u32);
+        let rx = conn.rx_cnt;
+        if dropped > 0 && !conn.guest_closed {
+            self.enqueue_credit(host_port, rx);
+        }
+        self.settle(host_port);
         self.fill_rx(mem);
     }
 
@@ -469,7 +594,7 @@ impl VirtioVsock {
 
     /// Returns the `OP_SHUTDOWN` for both directions of `host_port`.
     fn shutdown_pkt(host_port: u32) -> Vec<u8> {
-        Self::control_pkt(host_port, OP_SHUTDOWN, 3)
+        Self::control_pkt(host_port, OP_SHUTDOWN, SHUTDOWN_RCV | SHUTDOWN_SEND)
     }
 
     /// Returns the writer gate of `host_port`, or `None` when there is no such
@@ -486,12 +611,11 @@ impl VirtioVsock {
     }
 
     /// Sends what the host socket takes of the guest bytes waiting for it, and
-    /// returns whether the connection is still there.
+    /// returns whether the connection still needs its bridge writer.
     ///
     /// The send never blocks. The bytes the socket took go back to the guest
     /// as credit. A send that fails for any reason but a full socket means the
-    /// host has gone, so the guest gets `OP_RST` and the connection ends. The
-    /// guest bytes would be lost otherwise, while the guest went on writing.
+    /// host has gone, see [`VirtioVsock::host_gone`].
     pub fn flush_to_host(&mut self, mem: &GuestRam, host_port: u32) -> bool {
         let Some(conn) = self.conns.get_mut(&host_port) else {
             return false;
@@ -514,10 +638,7 @@ impl VirtioVsock {
             }
         }
         if gone {
-            self.conns.remove(&host_port);
-            self.pending
-                .push_back(Self::control_pkt(host_port, OP_RST, 0));
-            self.fill_rx(mem);
+            self.host_gone(mem, host_port);
             return false;
         }
         if conn.to_host.is_empty() {
@@ -525,13 +646,16 @@ impl VirtioVsock {
         } else {
             conn.writer_gate.open();
         }
-        if sent > 0 {
+        // A guest that closed has no socket left to take credit, and Linux
+        // answers a packet for it with `OP_RST`.
+        if sent > 0 && !conn.guest_closed {
             conn.rx_cnt = conn.rx_cnt.wrapping_add(sent as u32);
             let rx = conn.rx_cnt;
             self.enqueue_credit(host_port, rx);
-            self.fill_rx(mem);
         }
-        true
+        self.settle(host_port);
+        self.fill_rx(mem);
+        self.conns.contains_key(&host_port)
     }
 
     /// Frames one RW packet from a connection's backlog into `pending`, and
@@ -539,7 +663,7 @@ impl VirtioVsock {
     ///
     /// Connections take turns, and a packet never exceeds the guest's credit.
     /// A connection whose host end closed gets its `OP_SHUTDOWN` right after
-    /// its last byte, and is dropped then.
+    /// its last byte, see [`VirtioVsock::settle`].
     fn frame_backlog(&mut self) -> bool {
         let turn = self.next_turn;
         let Some(port) = self
@@ -579,12 +703,8 @@ impl VirtioVsock {
         if conn.backlog.len() < HOST_BACKLOG_MAX {
             conn.reader_gate.open();
         }
-        let finished = conn.host_closed && conn.backlog.is_empty();
         self.pending.push_back(pkt);
-        if finished {
-            self.conns.remove(&port);
-            self.pending.push_back(Self::shutdown_pkt(port));
-        }
+        self.settle(port);
         true
     }
 
@@ -752,23 +872,36 @@ impl VirtioVsock {
             OP_RW => {
                 let end = HDR_LEN + (h.len as usize).min(pkt.len() - HDR_LEN);
                 let body = &pkt[HDR_LEN..end];
+                enum Relay {
+                    Send,
+                    Drop(u32),
+                    Overrun,
+                }
                 // Only a completed handshake may carry data, and only within
                 // the credit we advertised.
-                let overrun = match self.conns.get_mut(&port) {
-                    Some(c) if c.state == ConnState::Connected => {
-                        let overrun = c.to_host.len() + body.len() > OUR_BUF_ALLOC as usize;
-                        if !overrun {
+                let relay = match self.conns.get_mut(&port) {
+                    Some(c) if c.state == ConnState::Connected && !c.guest_closed => {
+                        if c.host_gone {
+                            c.rx_cnt = c.rx_cnt.wrapping_add(body.len() as u32);
+                            Relay::Drop(c.rx_cnt)
+                        } else if c.to_host.len() + body.len() > OUR_BUF_ALLOC as usize {
+                            Relay::Overrun
+                        } else {
                             c.to_host.extend(body);
+                            Relay::Send
                         }
-                        overrun
                     }
                     _ => return,
                 };
-                if overrun {
-                    self.conns.remove(&port);
-                    self.pending.push_back(Self::control_pkt(port, OP_RST, 0));
-                } else {
-                    self.flush_to_host(mem, port);
+                match relay {
+                    Relay::Send => {
+                        self.flush_to_host(mem, port);
+                    }
+                    Relay::Drop(rx) => self.enqueue_credit(port, rx),
+                    Relay::Overrun => {
+                        self.conns.remove(&port);
+                        self.pending.push_back(Self::control_pkt(port, OP_RST, 0));
+                    }
                 }
             }
             // Only a session the guest was offered may be torn down by it. The
@@ -780,7 +913,19 @@ impl VirtioVsock {
                     .get(&port)
                     .is_some_and(|c| c.state != ConnState::New) =>
             {
-                self.conns.remove(&port);
+                // The host still gets the guest bytes waiting for it, after an
+                // `OP_RST` too: Linux answers our full shutdown with one, and
+                // ends its own close with one after 8 s. The guest reads
+                // nothing more, so host bytes are dropped.
+                if let Some(c) = self.conns.get_mut(&port) {
+                    let both = SHUTDOWN_RCV | SHUTDOWN_SEND;
+                    c.guest_closed = true;
+                    c.guest_reset |= h.op == OP_RST;
+                    c.guest_full_close |= h.op == OP_RST || h.flags & both == both;
+                    c.backlog.clear();
+                    c.reader_gate.open();
+                    self.settle(port);
+                }
             }
             OP_REQUEST => {
                 // Guest-initiated connect: not supported here — reset it.
@@ -1035,29 +1180,33 @@ mod session_tests {
     /// Returns a well-formed packet from the guest agent to host port
     /// `dst_port`, advertising `GUEST_BUF_ALLOC` and nothing consumed.
     fn pkt(op: u16, dst_port: u32, body: &[u8]) -> Vec<u8> {
-        let mut p = credit_pkt(op, dst_port, GUEST_BUF_ALLOC, 0);
-        let mut h = Hdr::parse(&p).unwrap();
-        h.len = body.len() as u32;
-        p.copy_from_slice(&h.to_bytes());
-        p.extend_from_slice(body);
-        p
+        guest_pkt(op, dst_port, (GUEST_BUF_ALLOC, 0), body)
     }
 
     /// Returns a header-only packet from the guest agent advertising
     /// `buf_alloc` and `fwd_cnt`.
     fn credit_pkt(op: u16, dst_port: u32, buf_alloc: u32, fwd_cnt: u32) -> Vec<u8> {
+        guest_pkt(op, dst_port, (buf_alloc, fwd_cnt), &[])
+    }
+
+    /// Returns a packet from the guest agent to host port `dst_port` that
+    /// carries `body` and advertises `credit` as `(buf_alloc, fwd_cnt)`.
+    fn guest_pkt(op: u16, dst_port: u32, credit: (u32, u32), body: &[u8]) -> Vec<u8> {
         let h = Hdr {
             src_cid: GUEST_CID,
             dst_cid: HOST_CID,
             src_port: AGENT_PORT,
             dst_port,
+            len: body.len() as u32,
             typ: TYPE_STREAM,
             op,
-            buf_alloc,
-            fwd_cnt,
+            buf_alloc: credit.0,
+            fwd_cnt: credit.1,
             ..Hdr::default()
         };
-        h.to_bytes().to_vec()
+        let mut p = h.to_bytes().to_vec();
+        p.extend_from_slice(body);
+        p
     }
 
     /// Programs `queue` the way the Linux virtio-mmio driver does: select,
@@ -1117,7 +1266,7 @@ mod session_tests {
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
         }
-        let first_port = dev.add_conn(first);
+        let first_port = dev.add_conn(first).unwrap();
         dev.connect(&mem, first_port);
         assert_eq!(
             mem.read_u16(BASE + 0x2000 + 2).unwrap(),
@@ -1125,7 +1274,7 @@ mod session_tests {
             "the first REQUEST took the one RX buffer"
         );
         // No buffer is left, so this REQUEST waits in `pending`.
-        let second_port = dev.add_conn(second);
+        let second_port = dev.add_conn(second).unwrap();
         dev.connect(&mem, second_port);
 
         dev.mmio(&mem, mmio::STATUS, true, 0);
@@ -1158,8 +1307,9 @@ mod session_tests {
     }
 
     fn recv(s: &mut UnixStream, n: usize) -> Option<Vec<u8>> {
-        s.set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
+        // macOS refuses the timeout on a socket whose peer has shut down, and
+        // a read on that socket does not block anyway.
+        let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
         let mut buf = vec![0u8; n];
         s.read_exact(&mut buf).ok().map(|()| buf)
     }
@@ -1258,8 +1408,8 @@ mod session_tests {
 
         let (a_dev, _a) = UnixStream::pair().unwrap();
         let (b_dev, mut b_peer) = UnixStream::pair().unwrap();
-        let port_a = dev.add_conn(a_dev);
-        let port_b = dev.add_conn(b_dev);
+        let port_a = dev.add_conn(a_dev).unwrap();
+        let port_b = dev.add_conn(b_dev).unwrap();
         dev.connect(&mem, port_a);
         dev.connect(&mem, port_b);
 
@@ -1277,7 +1427,8 @@ mod session_tests {
         let mut dev = VirtioVsock::new();
 
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side); // registered but never offered
+        let port = dev.add_conn(dev_side).unwrap(); // registered but never
+                                                    // offered
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"STOLEN"));
         assert!(
@@ -1293,7 +1444,7 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
 
@@ -1341,12 +1492,13 @@ mod session_tests {
 
         // One session in each state the guest can observe.
         let (new_dev, _new_peer) = UnixStream::pair().unwrap();
-        let new_port = dev.add_conn(new_dev); // registered, never offered
+        let new_port = dev.add_conn(new_dev).unwrap(); // registered, never
+                                                       // offered
         let (offered_dev, _offered_peer) = UnixStream::pair().unwrap();
-        let offered_port = dev.add_conn(offered_dev);
+        let offered_port = dev.add_conn(offered_dev).unwrap();
         dev.connect(&mem, offered_port); // offered, never accepted
         let (live_dev, _live_peer) = UnixStream::pair().unwrap();
-        let live_port = dev.add_conn(live_dev);
+        let live_port = dev.add_conn(live_dev).unwrap();
         dev.connect(&mem, live_port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, live_port, &[]));
 
@@ -1385,7 +1537,7 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
 
         dev.handle_pkt(&mem, &pkt(OP_SHUTDOWN, port, &[]));
         assert!(dev.conns.contains_key(&port), "the session survived");
@@ -1408,7 +1560,7 @@ mod session_tests {
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
         }
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
 
@@ -1425,7 +1577,7 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let mut dev = VirtioVsock::new();
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
 
         dev.connect(&mem, port);
         assert_eq!(dev.conns[&port].state, ConnState::Offered);
@@ -1494,7 +1646,7 @@ mod session_tests {
         program_rx_buffers(&mut dev, &mem, (desc, avail, used, data), BUFFERS, RXBUF);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port); // REQUEST takes used slot 0
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
 
@@ -1569,7 +1721,7 @@ mod session_tests {
         program_rx_buffers(&mut dev, &mem, (desc, avail, used, data), 4, HDR_LEN as u32);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port); // REQUEST is header-only and fits exactly
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "the REQUEST landed");
@@ -1619,7 +1771,7 @@ mod session_tests {
         program_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port); // REQUEST takes the first chain
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         dev.host_data(&mem, port, &vec![b'y'; BODY]);
@@ -1652,7 +1804,7 @@ mod session_tests {
         let mut dev = VirtioVsock::new();
         program_rx_buffers(&mut dev, mem, RINGS, 8, RXBUF);
         let (dev_side, peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(mem, port);
         dev.handle_pkt(mem, &credit_pkt(OP_RESPONSE, port, buf_alloc, 0));
         (dev, port, peer)
@@ -1673,6 +1825,15 @@ mod session_tests {
                 return gate;
             }
         }
+    }
+
+    /// Returns the headers of the packets in used slots `1..`.
+    fn delivered_hdrs(mem: &GuestRam) -> Vec<Hdr> {
+        let (_, _, used, data) = RINGS;
+        let completed = mem.read_u16(used + 2).unwrap();
+        (1..u64::from(completed))
+            .map(|slot| delivered(mem, used, slot, data, RXBUF).0)
+            .collect()
     }
 
     /// Returns the packets in used slots `1..` as `(op, payload length)`.
@@ -1786,7 +1947,7 @@ mod session_tests {
     fn credit_survives_counter_wrap_and_refuses_a_bogus_fwd_cnt() {
         let mut dev = VirtioVsock::new();
         let (dev_side, _peer) = UnixStream::pair().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         let conn = dev.conns.get_mut(&port).unwrap();
         conn.peer_buf_alloc = 4096;
         conn.tx_cnt = 10;
@@ -1809,7 +1970,7 @@ mod session_tests {
         let mut dev = VirtioVsock::new();
         let (dev_side, peer) = UnixStream::pair().unwrap();
         let mut filler = dev_side.try_clone().unwrap();
-        let port = dev.add_conn(dev_side);
+        let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port);
         dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
         dev.pending.clear();
@@ -1875,15 +2036,182 @@ mod session_tests {
     }
 
     // Guest writes after the host client had gone used to be credited and
-    // dropped, so the guest went on writing into nothing.
+    // dropped, so the guest went on writing into nothing. A shutdown of the
+    // guest's sends stops that at once. The reset waits for the reader's EOF,
+    // since the socket may still hold host bytes.
     #[test]
-    fn guest_write_to_a_closed_host_resets_the_guest() {
+    fn guest_write_to_a_closed_host_shuts_down_the_guests_sends() {
         let mem = mem_of(0x10000);
         let (mut dev, port, peer) = accepted(&mem, GUEST_BUF_ALLOC);
         drop(peer);
 
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"late"));
+        let hdrs = delivered_hdrs(&mem);
+        assert_eq!(
+            hdrs.iter().map(|h| (h.op, h.flags)).collect::<Vec<_>>(),
+            [(OP_SHUTDOWN, SHUTDOWN_RCV), (OP_CREDIT_UPDATE, 0)],
+            "the guest can still send"
+        );
+
+        // A second failed send changes nothing.
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"more"));
+        dev.host_closed(&mem, port);
         assert!(!dev.conns.contains_key(&port));
-        assert_eq!(delivered_since_request(&mem), [(OP_RST, 0)]);
+        assert_eq!(
+            delivered_since_request(&mem),
+            [
+                (OP_SHUTDOWN, 0),
+                (OP_CREDIT_UPDATE, 0),
+                (OP_CREDIT_UPDATE, 0),
+                (OP_RST, 0)
+            ]
+        );
+    }
+
+    // A guest write after a full host close used to reset the connection
+    // while host bytes still waited for the guest, which then read a short
+    // input and a plain EOF.
+    #[test]
+    fn guest_write_after_the_host_has_gone_keeps_the_backlog() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, peer) = accepted(&mem, 4096);
+        assert!(dev.host_data(&mem, port, &[b'q'; 6000]).is_none());
+        drop(peer);
+
+        // The guest still advertises its 4 KiB, so the write grants nothing.
+        dev.handle_pkt(&mem, &guest_pkt(OP_RW, port, (4096, 0), b"echo"));
+        dev.host_closed(&mem, port);
+        assert!(dev.conns.contains_key(&port), "the backlog was dropped");
+
+        // The guest consumed the first 4 KiB.
+        dev.handle_pkt(&mem, &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096));
+        let got = delivered_since_request(&mem);
+        let host_bytes: usize = got
+            .iter()
+            .filter(|&&(op, _)| op == OP_RW)
+            .map(|&(_, n)| n)
+            .sum();
+        assert_eq!(host_bytes, 6000);
+        assert_eq!(got.last(), Some(&(OP_RST, 0)));
+        assert!(!dev.conns.contains_key(&port));
+    }
+
+    // A guest that wrote and closed used to lose what the host socket had not
+    // taken yet, and the host read a clean EOF.
+    #[test]
+    fn guest_close_waits_for_the_host_to_take_its_bytes() {
+        let mem = mem_of(0x1000);
+        let (mut dev, port, mut peer, filled) = host_socket_full();
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
+        dev.handle_pkt(&mem, &pkt(OP_SHUTDOWN, port, &[]));
+        assert!(
+            dev.conns.contains_key(&port),
+            "the guest's tail was dropped"
+        );
+
+        assert!(recv(&mut peer, filled).is_some());
+        assert!(!dev.flush_to_host(&mem, port), "the writer is still needed");
+        assert!(!dev.conns.contains_key(&port));
+        assert_eq!(recv(&mut peer, 4).as_deref(), Some(&b"tail"[..]));
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
+    }
+
+    #[test]
+    fn host_close_keeps_guest_bytes_the_host_has_not_taken() {
+        let mem = mem_of(0x1000);
+        let (mut dev, port, mut peer, filled) = host_socket_full();
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"reply"));
+        dev.host_closed(&mem, port);
+        let shutdown = Hdr::parse(&dev.pending.pop_front().unwrap()).unwrap();
+        assert_eq!(shutdown.op, OP_SHUTDOWN);
+        // A Linux guest with nothing left to read answers a full shutdown
+        // with OP_RST at once.
+        dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
+        assert!(
+            dev.conns.contains_key(&port),
+            "the guest's reply was dropped"
+        );
+
+        assert!(recv(&mut peer, filled).is_some());
+        assert!(!dev.flush_to_host(&mem, port));
+        assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"reply"[..]));
+        assert!(!dev.conns.contains_key(&port));
+    }
+
+    // A guest that resets after its 8 s close timeout used to take what the
+    // host socket had not taken yet with it.
+    #[test]
+    fn guest_reset_keeps_bytes_the_host_has_not_taken() {
+        let mem = mem_of(0x1000);
+        let (mut dev, port, mut peer, filled) = host_socket_full();
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
+        dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
+        assert!(
+            dev.conns.contains_key(&port),
+            "the guest's tail was dropped"
+        );
+
+        assert!(recv(&mut peer, filled).is_some());
+        assert!(!dev.flush_to_host(&mem, port));
+        assert_eq!(recv(&mut peer, 4).as_deref(), Some(&b"tail"[..]));
+        assert!(
+            dev.pending.is_empty(),
+            "a credit update or a reset went back to a guest that reset"
+        );
+    }
+
+    // Without our reset a Linux guest holds its closed socket for 8 s, then
+    // resets it on its own.
+    #[test]
+    fn guest_close_gets_a_reset_once_its_bytes_are_out() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"bye"));
+        dev.handle_pkt(
+            &mem,
+            &shutdown_from_guest(port, SHUTDOWN_RCV | SHUTDOWN_SEND),
+        );
+        assert!(!dev.conns.contains_key(&port));
+        assert_eq!(recv(&mut peer, 3).as_deref(), Some(&b"bye"[..]));
+        assert_eq!(delivered_since_request(&mem).last(), Some(&(OP_RST, 0)));
+    }
+
+    // hvi still ends both directions when the guest shuts down only its
+    // sends. A reset would turn the reply the guest waits for into an EOF
+    // that looks complete.
+    #[test]
+    fn guest_half_close_gets_no_reset() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"req"));
+        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        assert_eq!(recv(&mut peer, 3).as_deref(), Some(&b"req"[..]));
+        assert!(
+            delivered_since_request(&mem)
+                .iter()
+                .all(|&(op, _)| op != OP_RST),
+            "a half-closed guest was reset"
+        );
+    }
+
+    /// Returns an `OP_SHUTDOWN` from the guest agent carrying `flags`.
+    fn shutdown_from_guest(port: u32, flags: u32) -> Vec<u8> {
+        let mut h = Hdr::parse(&pkt(OP_SHUTDOWN, port, &[])).unwrap();
+        h.flags = flags;
+        h.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn writer_gate_wait_open_returns_once_opened() {
+        let gate = Arc::new(HostGate::new_closed());
+        let opener = Arc::clone(&gate);
+        let waiter = std::thread::spawn(move || gate.wait_open());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "a closed gate let the writer through"
+        );
+        opener.open();
+        waiter.join().unwrap();
     }
 }

@@ -1273,7 +1273,9 @@ fn spawn_vsock_bridge(
             };
             let (port, writer_gate) = {
                 let mut d = lock_or_recover(&dev);
-                let port = d.add_conn(stream);
+                let Ok(port) = d.add_conn(stream) else {
+                    continue;
+                };
                 d.connect(&mem, port);
                 set_line(&vm, VIRTIO_VSOCK_GSI, &d);
                 (port, d.writer_gate(port))
@@ -1290,16 +1292,24 @@ fn spawn_vsock_bridge(
                 stop.clone(),
             );
             relays.retain(|handle| !handle.is_finished());
-            relays.push(std::thread::spawn(move || {
-                while writer_gate.wait(|| stop3.sleep(std::time::Duration::ZERO).unwrap_or(false))
-                    && stop3.wait_writable(writer.as_fd()).unwrap_or(false)
-                {
-                    let mut d = lock_or_recover(&dev3);
-                    let alive = d.flush_to_host(&mem3, port);
-                    set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
-                    if !alive {
+            relays.push(std::thread::spawn(move || loop {
+                writer_gate.wait_open();
+                match stop3.wait_writable(writer.as_fd()) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        eprintln!("[hvi/x86] vsock bridge: {e}; guest bytes dropped");
+                        let mut d = lock_or_recover(&dev3);
+                        d.host_gone(&mem3, port);
+                        set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
                         break;
                     }
+                }
+                let mut d = lock_or_recover(&dev3);
+                let needed = d.flush_to_host(&mem3, port);
+                set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
+                if !needed {
+                    break;
                 }
             }));
             let dev2 = Arc::clone(&dev);
@@ -1346,6 +1356,9 @@ fn spawn_vsock_bridge(
                 set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
             }));
         }
+        // Dropping the connections shuts their sockets down and opens their
+        // gates, so every reader and writer ends.
+        lock_or_recover(&dev).drop_conns();
         for relay in relays {
             let _ = relay.join();
         }
