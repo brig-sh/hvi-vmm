@@ -1263,7 +1263,7 @@ fn spawn_vsock_bridge(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         eprintln!("[hvi] vsock bridge: listening");
-        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        let mut relays: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1276,13 +1276,10 @@ fn spawn_vsock_bridge(
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
-            // The device writes to this socket and must block, or a full send
-            // buffer would split a frame. On macOS an accepted socket inherits
-            // the listener's non-blocking flag, so blocking mode is set here.
-            if stream.set_nonblocking(false).is_err() {
-                continue;
-            }
             let Ok(reader) = stream.try_clone() else {
+                continue;
+            };
+            let Ok(writer) = stream.try_clone() else {
                 continue;
             };
 
@@ -1291,9 +1288,40 @@ fn spawn_vsock_bridge(
             let port = d.add_conn(stream);
             d.connect(&mem, port);
             let level = d.irq_level();
+            let writer_gate = d.writer_gate(port);
             drop(d);
             let _ = vm.gic_set_spi(VIRTIO_VSOCK_INTID, level);
             kick_all(&vm, &handles);
+            let Some(writer_gate) = writer_gate else {
+                continue;
+            };
+
+            // Per-connection writer thread: the guest -> host bytes the vCPU
+            // could not send. It waits for the socket to take them, without
+            // the device lock.
+            let (dev3, mem3, vm3, handles3, stop3) = (
+                Arc::clone(&dev),
+                Arc::clone(&mem),
+                vm.clone(),
+                Arc::clone(&handles),
+                stop.clone(),
+            );
+            relays.retain(|handle| !handle.is_finished());
+            relays.push(std::thread::spawn(move || {
+                while writer_gate.wait(|| stop3.sleep(std::time::Duration::ZERO).unwrap_or(false))
+                    && stop3.wait_writable(writer.as_fd()).unwrap_or(false)
+                {
+                    let (alive, level) = {
+                        let mut d = lock_or_recover(&dev3);
+                        (d.flush_to_host(&mem3, port), d.irq_level())
+                    };
+                    let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, level);
+                    kick_all(&vm3, &handles3);
+                    if !alive {
+                        break;
+                    }
+                }
+            }));
 
             // Per-connection reader thread: host -> guest.
             let dev2 = Arc::clone(&dev);
@@ -1301,8 +1329,8 @@ fn spawn_vsock_bridge(
             let vm2 = vm.clone();
             let handles2 = Arc::clone(&handles);
             let stop2 = stop.clone();
-            readers.retain(|handle| !handle.is_finished());
-            readers.push(std::thread::spawn(move || {
+            relays.retain(|handle| !handle.is_finished());
+            relays.push(std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
                 loop {
@@ -1316,9 +1344,13 @@ fn spawn_vsock_bridge(
                             break;
                         }
                     }
+                    // `add_conn` makes the socket non-blocking, so a read can
+                    // find nothing even after the poll.
                     let n = match vsock::read_host(&mut reader, &mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
                         Ok(n) => n,
+                        Err(e) if vsock::retry_read(&e) => continue,
+                        Err(_) => break,
                     };
                     let (gate, level) = {
                         let mut d = lock_or_recover(&dev2);
@@ -1341,8 +1373,8 @@ fn spawn_vsock_bridge(
                 kick_all(&vm2, &handles2);
             }));
         }
-        for reader in readers {
-            let _ = reader.join();
+        for relay in relays {
+            let _ = relay.join();
         }
     })
 }

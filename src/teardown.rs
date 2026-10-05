@@ -135,6 +135,23 @@ impl StopToken {
         }
     }
 
+    /// Blocks until `fd` takes a write or the stop is requested.
+    ///
+    /// Returns `true` when `fd` is writable, or reports a hangup or an error,
+    /// and no stop is requested. A write that follows a hangup or an error
+    /// returns that error.
+    ///
+    /// # Errors
+    ///
+    /// Errors if `poll` fails for a reason other than a signal.
+    pub fn wait_writable(&self, fd: BorrowedFd<'_>) -> io::Result<bool> {
+        let mut out = pollfd(fd.as_raw_fd());
+        out.events = libc::POLLOUT;
+        let mut fds = [out, pollfd(self.0.as_raw_fd())];
+        poll(&mut fds, -1)?;
+        Ok(fds[1].revents == 0)
+    }
+
     /// Returns whether a helper that waits on something other than `fd` should
     /// keep waiting.
     ///
@@ -243,6 +260,16 @@ mod tests {
         let (_peer, idle) = UnixStream::pair().expect("pair");
         source.request_stop();
         assert!(!token.keep_waiting(idle.as_fd()), "the stop was requested");
+    }
+
+    #[test]
+    fn wait_writable_reports_room_and_stop() {
+        let source = StopSource::new().expect("pair");
+        let token = source.token();
+        let (_peer, ours) = UnixStream::pair().expect("pair");
+        assert!(token.wait_writable(ours.as_fd()).expect("poll"));
+        source.request_stop();
+        assert!(!token.wait_writable(ours.as_fd()).expect("poll"));
     }
 
     // Dropping the source must stop the tokens, so `boot` unwinding past its
