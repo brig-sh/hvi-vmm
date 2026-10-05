@@ -172,10 +172,11 @@ A guest needs one of three things, or it panics at `Unable to mount root fs`.
 
 ### An initramfs
 
-The simplest. `tools/mk-initramfs.py` transcodes an Alpine aarch64 minirootfs
-tarball straight into a newc cpio archive in memory. It needs no root and no
-`cpio` command, because macOS cannot create device nodes without root and the
-cpio format carries them as metadata anyway.
+The simplest. `tools/mk-initramfs.py` transcodes an Alpine minirootfs
+tarball (aarch64, or x86-64 with `--arch x86_64`) straight into a newc cpio
+archive in memory. It needs no root and no `cpio` command, because macOS
+cannot create device nodes without root and the cpio format carries them as
+metadata anyway.
 
 ```sh
 tools/mk-initramfs.py --out target/initramfs.cpio
@@ -183,20 +184,20 @@ tools/mk-initramfs.py --out target/initramfs.cpio
 
 It injects an `/init` that mounts the pseudo-filesystems, configures `eth0`
 for the built-in network stack when there is one, prints a banner and drops to
-a shell. When the shell exits, it powers off through PSCI.
+a shell. When the shell exits, it powers off, through PSCI on arm64 and ACPI on
+x86-64.
 
 | Flag | Effect |
 | --- | --- |
 | `--out <path>` | Output, default `target/initramfs.cpio`. |
 | `--alpine-version <v>` | Default 3.20.10. |
 | `--cache <dir>` | Where the tarball is cached. Defaults beside `--out`. |
+| `--arch aarch64\|x86_64` | The guest architecture of the minirootfs. Default `aarch64`. |
 | `--keep-alive <secs>` | Replace the shell with a `HVI-INITRAMFS-UP` line, a sleep, and a power off. For an unattended run. |
 | `--net-static ADDR/PLEN,GW` | Replace the `eth0` block with a static address, a default route and three pings of the gateway. For a tap boot. |
 
 CI uses `--keep-alive`, because a shell on a console with no input blocks
 forever.
-
-**It builds an arm64 initramfs only.** For x86-64, supply your own.
 
 ### A disk image
 

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Build a minimal arm64 initramfs (newc cpio) for an hvi arm64 boot.
+"""Build a minimal initramfs (newc cpio) for an hvi boot.
 
-Transcodes an Alpine aarch64 minirootfs tarball straight into a newc cpio in
+Transcodes an Alpine minirootfs tarball straight into a newc cpio in
 memory -- no root, no `cpio`/`mknod` (macOS can't create device nodes without
 root, and the cpio format carries them as metadata anyway). Injects an `/init`
 that mounts the pseudo-filesystems, configures eth0 for the built-in network
 stack when there is one, prints a userspace banner and drops to a shell on the
 console; hvi feeds host stdin to the guest UART, and Ctrl-] is reserved for
-the plugin request key. When the shell exits, init powers off via PSCI.
+the plugin request key. When the shell exits, init powers off (PSCI on arm64,
+ACPI on x86-64).
 
 Usage:
-    tools/mk-initramfs.py [--out target/initramfs.cpio]
+    tools/mk-initramfs.py [--out target/initramfs.cpio] [--arch aarch64]
                           [--alpine-version 3.20.10] [--cache <dir>]
                           [--keep-alive SECS] [--net-static ADDR/PLEN,GW]
 
@@ -18,6 +19,7 @@ Usage:
 SECS and a power-off, for an unattended run such as CI. --net-static replaces
 the eth0 block with a static address, a default route via GW and three pings
 of it, for a tap boot where GW is the host side of the tap. CI uses both.
+--arch picks the guest architecture: aarch64 (the default) or x86_64.
 
 The tarball is fetched once and cached (default: alongside --out).
 """
@@ -48,9 +50,9 @@ fi
 /bin/busybox uname -a
 /bin/busybox echo "  alpine $(/bin/busybox cat /etc/alpine-release 2>/dev/null), type 'poweroff -f' or 'exit' to stop"
 /bin/busybox echo "==================================================="
-# Interactive shell on the console (stdin/out are /dev/console = ttyAMA0).
+# Interactive shell on the console (stdin/out are /dev/console).
 /bin/busybox sh
-# When the shell exits, power off cleanly (PSCI SYSTEM_OFF).
+# When the shell exits, power off cleanly.
 /bin/busybox poweroff -f
 """
 
@@ -128,7 +130,14 @@ class CpioWriter:
         return bytes(self.buf)
 
 
-def build(tar_bytes, keep_alive=None, net_static=None):
+# The banner line per architecture; INIT carries the arm64 one.
+BANNERS = {
+    "aarch64": b"ARM64 guest on hvi / hvf",
+    "x86_64": b"x86-64 guest on hvi / kvm",
+}
+
+
+def build(tar_bytes, keep_alive=None, net_static=None, arch="aarch64"):
     cpio = CpioWriter()
     seen_dirs = set()
 
@@ -159,7 +168,7 @@ def build(tar_bytes, keep_alive=None, net_static=None):
     ensure_dir("sys")
     cpio.add("dev/console", S_IFCHR | 0o600, rdevmajor=5, rdevminor=1)
     cpio.add("dev/null", S_IFCHR | 0o666, rdevmajor=1, rdevminor=3)
-    init = INIT
+    init = INIT.replace(BANNERS["aarch64"], BANNERS[arch])
     if net_static is not None:
         # Swap the built-in-stack eth0 block (comment included) for the static
         # tap-mode one.
@@ -179,6 +188,12 @@ def build(tar_bytes, keep_alive=None, net_static=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="target/initramfs.cpio")
+    ap.add_argument(
+        "--arch",
+        choices=sorted(BANNERS),
+        default="aarch64",
+        help="guest architecture of the Alpine minirootfs (default: aarch64)",
+    )
     ap.add_argument("--alpine-version", default="3.20.10")
     ap.add_argument("--cache", default=None)
     ap.add_argument(
@@ -199,8 +214,8 @@ def main():
 
     ver = args.alpine_version
     branch = "v" + ".".join(ver.split(".")[:2])
-    fname = f"alpine-minirootfs-{ver}-aarch64.tar.gz"
-    url = f"https://dl-cdn.alpinelinux.org/alpine/{branch}/releases/aarch64/{fname}"
+    fname = f"alpine-minirootfs-{ver}-{args.arch}.tar.gz"
+    url = f"https://dl-cdn.alpinelinux.org/alpine/{branch}/releases/{args.arch}/{fname}"
 
     cache_dir = args.cache or os.path.dirname(os.path.abspath(args.out)) or "."
     os.makedirs(cache_dir, exist_ok=True)
@@ -217,7 +232,7 @@ def main():
 
         tar_bytes = gzip.decompress(f.read())
 
-    out = build(tar_bytes, args.keep_alive, args.net_static)
+    out = build(tar_bytes, args.keep_alive, args.net_static, args.arch)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(out)

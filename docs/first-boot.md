@@ -183,9 +183,12 @@ devices need, so an x86-64 guest has a console even with the default
 `--cmdline`. Pass `console=ttyS0` anyway: the default names `ttyAMA0`, which
 is the arm64 console and does nothing here.
 
-`tools/mk-initramfs.py` builds an **arm64** initramfs only. For an x86-64
-guest, supply your own, or boot without one and let the kernel stop at the
-root-filesystem gate.
+`tools/mk-initramfs.py --arch x86_64` builds an x86-64 initramfs from the
+x86-64 Alpine minirootfs:
+
+```sh
+tools/mk-initramfs.py --arch x86_64 --out target/initramfs-x86_64.cpio
+```
 
 ### No hypervisor at all
 
