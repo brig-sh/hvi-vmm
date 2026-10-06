@@ -41,7 +41,6 @@
 // VMM's own.
 #![allow(clippy::disallowed_methods)]
 
-use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -61,14 +60,14 @@ use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
-use crate::devices::virtio::vsock::VirtioVsock;
+use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::{CapturedEvent, Emitter};
 use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView, VmHandle};
-use crate::sandbox::seccomp;
+use crate::sandbox::{confine_io_thread, seccomp};
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
@@ -361,9 +360,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Every listener is bound here, before any filter goes in: the seccomp
     // allowlists permit accept4 on a listener we already hold but not socket or
     // bind, so a listener created later would be trapped.
-    let agent_listener = match &cfg.agent_sock {
-        Some(path) => Some(bind_unix(path)?),
-        None => None,
+    let bridge = match (&cfg.agent_sock, &shared.guest.vsock) {
+        (Some(path), Some(dev)) => Some(VsockBridge::bind(
+            path,
+            Arc::clone(dev),
+            Arc::clone(&shared.guest.ram),
+        )?),
+        _ => None,
     };
     // The stop source's socket pair is created here for the same reason.
     let stop_source = StopSource::new()?;
@@ -382,15 +385,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         )
     };
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
-    if let (Some(listener), Some(dev)) = (agent_listener, &shared.guest.vsock) {
+    if let Some(bridge) = bridge {
+        let stop = stop_source.token();
         helpers.push((
             "agent bridge",
-            spawn_vsock_bridge(
-                listener,
-                Arc::clone(dev),
-                Arc::clone(&shared.guest.ram),
-                stop_source.token(),
-            ),
+            std::thread::spawn(move || {
+                confine_io_thread();
+                bridge.run(&stop);
+            }),
         ));
     }
     if let (Some(reader), Some(dev)) = (net_reader, &shared.guest.net) {
@@ -844,117 +846,6 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
     d.mmio(&sh.guest.ram, off, true, val);
 }
 
-/// Bridges the host agent Unix socket to the guest vsock device.
-///
-/// The listener is non-blocking, so the accept loop can poll it beside the stop
-/// token. The per-connection readers poll the same token, and the listener
-/// thread joins the ones still running before it exits.
-fn spawn_vsock_bridge(
-    listener: std::os::unix::net::UnixListener,
-    dev: Arc<Mutex<VirtioVsock>>,
-    mem: Arc<GuestRam>,
-    stop: StopToken,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        seccomp::install_thread(seccomp::Thread::Vmm);
-        let mut relays: Vec<JoinHandle<()>> = Vec::new();
-        loop {
-            match stop.wait(listener.as_fd()) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(e) => {
-                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; no longer accepting");
-                    break;
-                }
-            }
-            let Ok((stream, _)) = listener.accept() else {
-                continue;
-            };
-            let Ok(reader) = stream.try_clone() else {
-                continue;
-            };
-            let Ok(writer) = stream.try_clone() else {
-                continue;
-            };
-            let (port, writer_gate) = {
-                let mut d = lock_or_recover(&dev);
-                let Ok(port) = d.add_conn(stream) else {
-                    continue;
-                };
-                d.connect(&mem, port);
-                (port, d.writer_gate(port))
-            };
-            let Some(writer_gate) = writer_gate else {
-                continue;
-            };
-            // Guest -> host bytes the vCPU could not send. The writer waits
-            // for the socket to take them, without the device lock.
-            let (dev3, mem3, stop3) = (Arc::clone(&dev), Arc::clone(&mem), stop.clone());
-            relays.retain(|handle| !handle.is_finished());
-            relays.push(std::thread::spawn(move || loop {
-                writer_gate.wait_open();
-                match stop3.wait_writable(writer.as_fd()) {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(e) => {
-                        eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
-                        let mut d = lock_or_recover(&dev3);
-                        d.host_gone(&mem3, port);
-                        break;
-                    }
-                }
-                let mut d = lock_or_recover(&dev3);
-                let needed = d.flush_to_host(&mem3, port);
-                if !needed {
-                    break;
-                }
-            }));
-            let dev2 = Arc::clone(&dev);
-            let mem2 = Arc::clone(&mem);
-            let stop2 = stop.clone();
-            relays.retain(|handle| !handle.is_finished());
-            relays.push(std::thread::spawn(move || {
-                use std::io::Read;
-                let mut reader = reader;
-                let mut buf = [0u8; 8192];
-                loop {
-                    match stop2.wait(reader.as_fd()) {
-                        Ok(true) => {}
-                        // A stop ends the connection like a peer close, so the
-                        // device releases it.
-                        Ok(false) => break,
-                        Err(e) => {
-                            eprintln!("{LOG_PREFIX} vsock bridge: {e}; connection closed");
-                            break;
-                        }
-                    }
-                    // `add_conn` makes the socket non-blocking, so a read can
-                    // find nothing even after the poll.
-                    let n = match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) if crate::devices::virtio::vsock::retry_read(&e) => continue,
-                        Err(_) => break,
-                    };
-                    let gate = lock_or_recover(&dev2).host_data(&mem2, port, &buf[..n]);
-                    // `HostGate::wait` says why its result is not needed.
-                    if let Some(gate) = gate {
-                        gate.wait(|| stop2.keep_waiting(reader.as_fd()));
-                    }
-                }
-                let mut d = lock_or_recover(&dev2);
-                d.host_closed(&mem2, port);
-            }));
-        }
-        // Dropping the connections shuts their sockets down and opens their
-        // gates, so every reader and writer ends.
-        lock_or_recover(&dev).drop_conns();
-        for relay in relays {
-            let _ = relay.join();
-        }
-    })
-}
-
 /// Injects tap frames into the guest.
 ///
 /// [`TapRelay`] owns the wait and the drain. This thread supplies the delivery
@@ -1154,18 +1045,4 @@ mod pio_tests {
             Ok(())
         }
     }
-}
-
-/// Binds a non-blocking Unix listener at `path`, clearing a stale socket from a
-/// previous run first (which would otherwise make `bind` fail with EADDRINUSE).
-///
-/// The listener is non-blocking so the bridge can poll it beside the stop token
-/// and then accept without blocking.
-fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
-    let _ = std::fs::remove_file(path);
-    let listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
-    })?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
 }
