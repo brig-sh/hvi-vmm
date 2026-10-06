@@ -110,15 +110,18 @@ struct HvfIrqLine {
 }
 
 impl IrqLine for HvfIrqLine {
-    fn set_level(&self, level: bool) {
-        let _ = self.vm.gic_set_spi(self.intid, level);
+    fn set_level(&self, level: bool) -> std::io::Result<()> {
+        self.vm
+            .gic_set_spi(self.intid, level)
+            .map_err(std::io::Error::other)?;
         let Some(vcpus) = self.kick.as_ref().filter(|_| level) else {
-            return;
+            return Ok(());
         };
         // After the stop no vCPU is left to wake.
         if vcpus.is_running() && OWN_VCPU.with(std::cell::Cell::get).is_none() {
             vcpus.kicker().kick_all();
         }
+        Ok(())
     }
 }
 

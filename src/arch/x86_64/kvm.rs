@@ -1146,11 +1146,12 @@ mod pio_tests {
     }
 
     impl IrqLine for EdgeCounter {
-        fn set_level(&self, level: bool) {
+        fn set_level(&self, level: bool) -> std::io::Result<()> {
             if level && !self.high.swap(level, Ordering::SeqCst) {
                 self.edges.fetch_add(1, Ordering::SeqCst);
             }
             self.high.store(level, Ordering::SeqCst);
+            Ok(())
         }
     }
 }

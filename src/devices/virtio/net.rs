@@ -452,7 +452,7 @@ impl VirtioNet {
     }
 
     /// Sets the interrupt line to the device's level.
-    fn sync_irq(&self) {
+    fn sync_irq(&mut self) {
         self.irq.set(self.irq_level());
     }
 
@@ -1832,8 +1832,9 @@ mod tests {
     }
 
     impl IrqLine for LevelLine {
-        fn set_level(&self, level: bool) {
+        fn set_level(&self, level: bool) -> std::io::Result<()> {
             self.high.store(level, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
     }
 

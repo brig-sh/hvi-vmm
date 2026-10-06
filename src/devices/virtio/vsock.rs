@@ -385,7 +385,7 @@ impl VirtioVsock {
     }
 
     /// Sets the interrupt line to the device's level.
-    fn sync_irq(&self) {
+    fn sync_irq(&mut self) {
         self.irq.set(self.irq_level());
     }
 

@@ -14,13 +14,13 @@
 
 //! COM1 for the x86 backend, on the 16550 register file from `vm-superio`.
 //!
-//! The UART sets COM1's line after every access. The guest programs the pin
-//! (ISA IRQ 4) as edge-triggered, so it sees an interrupt only when the line
-//! rises. Its 8250 driver reads the interrupt identification register (IIR)
-//! until IIR reports nothing pending. So the line is high exactly when an IIR
-//! read would report an interrupt. A line left high after IIR reads empty never
-//! rises again, and the guest then waits for a THR-empty interrupt that does
-//! not come.
+//! The UART sets COM1's line whenever its level changes. The guest programs the
+//! pin (ISA IRQ 4) as edge-triggered, so it sees an interrupt only when the
+//! line rises. Its 8250 driver reads the interrupt identification register
+//! (IIR) until IIR reports nothing pending. So the line is high exactly when an
+//! IIR read would report an interrupt. A line left high after IIR reads empty
+//! never rises again, and the guest then waits for a THR-empty interrupt that
+//! does not come.
 //!
 //! The crate's own IIR does not keep that rule, so this module answers IIR
 //! reads itself. The crate clears every pending bit on an IIR read, and raises
@@ -59,8 +59,8 @@ const IIR_THR_EMPTY: u8 = 0x02;
 const IIR_NONE: u8 = 0x01;
 const IIR_FIFO_ENABLED: u8 = 0xc0;
 
-/// The edge callback hvi does not use. The UART sets its line from
-/// [`Uart16550::irq_level`] after each access.
+/// The edge callback hvi does not use. The UART sets its line to
+/// [`Uart16550::irq_level`] whenever that changes.
 struct NoTrigger;
 
 impl Trigger for NoTrigger {
