@@ -45,6 +45,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::signal::KICK_SIGNAL;
+
 /// How long `boot` waits for its helper threads after requesting the stop.
 ///
 /// The waits `boot` cannot interrupt are a plugin blocking in `request` and a
@@ -70,6 +72,22 @@ pub fn join_by(name: &str, thread: JoinHandle<()>, deadline: Instant) -> io::Res
     }
     let _ = thread.join();
     Ok(())
+}
+
+/// Sends the kick signal to `thread` until it has exited or `deadline` passes.
+///
+/// The signal ends a blocking read on `thread` with `EINTR`. It is sent again
+/// every millisecond, since a signal that lands before the read blocks is lost.
+/// The loop stops at the deadline when the signal cannot end the wait.
+pub(crate) fn kick_until_finished(thread: &JoinHandle<()>, deadline: Instant) {
+    use std::os::unix::thread::JoinHandleExt;
+    while !thread.is_finished() && Instant::now() < deadline {
+        // SAFETY: the handle has not been joined, so its thread id is live; the
+        // handler is a no-op. The cast is for musl, where std and libc spell
+        // `pthread_t` differently.
+        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, KICK_SIGNAL) };
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// The requesting end of a stop.

@@ -48,6 +48,7 @@ pub mod hypervisor;
 pub mod memory;
 pub mod plugin;
 pub mod sandbox;
+pub(crate) mod signal;
 pub mod sync;
 pub mod teardown;
 pub mod terminal;
