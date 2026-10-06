@@ -113,10 +113,11 @@ There is no `--help`. [docs/cli.md](docs/cli.md) is the flag reference.
 <img src="docs/img/guest-memory-arm64.svg" alt="arm64 guest physical address space: devices low, RAM at 1 GiB" width="720">
 
 Every backend speaks virtio-mmio, which avoids a PCI host bridge and lets one
-set of device models serve all three. The backend modules under `src/arch/` hold
-the hypervisor differences. The boot protocol differs too, and by more: arm64
-uses an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or
-an uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
+set of device models serve all three. The backend modules under `src/arch/`,
+with the code the two KVM backends share in `src/hypervisor/kvm.rs`, hold the
+hypervisor differences. The boot protocol differs too, and by more: arm64 uses
+an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or an
+uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
 
 [docs/architecture.md](docs/architecture.md) describes the whole design.
 

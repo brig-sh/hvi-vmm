@@ -23,8 +23,11 @@ combinations are built, selected at compile time by target triple.
 Two kinds of difference cut across those three, and conflating them is the
 usual mistake:
 
-- **Host differences** live in the backend modules: creating the VM, mapping
-  guest RAM, running vCPUs, injecting interrupts, and confinement.
+- **Host differences** live in the backend modules, and in `hypervisor/kvm.rs`
+  for what the two KVM backends share: creating the VM, mapping guest RAM,
+  entering the guest and serving its exits, and how a kick and an interrupt
+  line reach the guest. Confinement is a host difference too, and lives in
+  `sandbox/`.
 - **Guest-architecture differences** live in the loader and layout modules
   under `arch/<arch>/`, and they are larger. An arm64 guest gets an `Image`, a
   devicetree and PSCI. An x86-64 guest gets a `bzImage` or an uncompressed
@@ -32,10 +35,11 @@ usual mistake:
   are architecture-specific too: PL011 against 16550, and a CMOS RTC that only
   x86 needs.
 
-Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file,
-its `mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` and its target
-in the build guard, both in `lib.rs`, and its dependencies in `Cargo.toml`.
-Porting to a new guest architecture is a much larger job.
+Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file
+with a `Kick` and an `IrqLine` implementation and a `Guest` built from them, its
+`mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` and its target in
+the build guard, both in `lib.rs`, and its dependencies in `Cargo.toml`. Porting
+to a new guest architecture is a much larger job.
 
 On any other target the build stops with a compile error.
 
@@ -53,7 +57,9 @@ flowchart TB
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
-            obs["plugin: the seam<br/>plugin::builtin · events ledger<br/>hypervisor::quiesce"]
+            obs["plugin: the seam<br/>plugin::builtin · events ledger"]
+            vm["hypervisor: vcpus / guest / kvm / quiesce"]
+            rt["io_threads · signal<br/>terminal: filter / raw / input"]
             conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
             gm["memory: GuestRam over vm-memory<br/>SharedRam: memfd / POSIX shm"]
         end
@@ -418,7 +424,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

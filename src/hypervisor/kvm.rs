@@ -27,13 +27,17 @@ use std::sync::{Arc, Mutex};
 
 use kvm_ioctls::{VcpuFd, VmFd};
 
+use crate::config::BootConfig;
 use crate::devices::irq::IrqLine;
+use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Cpu, Guest};
 use crate::hypervisor::vcpus::Kick;
-use crate::plugin::Plugin;
+use crate::io_threads::{IoThreads, NetSource};
+use crate::plugin::{Plugin, VmHandle};
 use crate::sandbox::seccomp;
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
+use crate::teardown::StopSource;
 
 /// The [`Kick`] implementation for KVM vCPUs.
 ///
@@ -149,6 +153,42 @@ impl Drop for Registration<'_> {
             *slot = None;
         }
     }
+}
+
+/// Starts what runs beside a KVM backend's vCPUs, in the order its seccomp
+/// confinement needs.
+///
+/// The plugin attaches to the guest before anything runs. The filters are armed
+/// before the first I/O or vCPU thread exists. The agent socket and the stop
+/// source's socket pair are created before any filter goes in, since the
+/// allowlists allow accepting on a listener already held but not creating one.
+/// Then the I/O threads start, each filtering itself as it begins.
+///
+/// # Errors
+///
+/// Errors if the plugin refuses the guest, a filter does not compile, the agent
+/// socket cannot be bound or the stop source cannot be created.
+pub(crate) fn start_io_threads(
+    cfg: &BootConfig,
+    guest: &Arc<Guest<Kicker>>,
+    deliver: impl FnMut(u8) + Send + 'static,
+    net: Option<NetSource>,
+) -> Result<(seccomp::Filters, IoThreads), Box<dyn std::error::Error>> {
+    if let Some(plugin) = &cfg.plugin {
+        plugin.attach(Arc::clone(guest) as Arc<dyn VmHandle>)?;
+    }
+    let filters = seccomp::Filters::arm(cfg.sandbox)?;
+    let bridge = match (&cfg.agent_sock, &guest.vsock) {
+        (Some(path), Some(dev)) => Some(VsockBridge::bind(
+            path,
+            Arc::clone(dev),
+            Arc::clone(&guest.ram),
+        )?),
+        _ => None,
+    };
+    let source = StopSource::new()?;
+    let io_threads = IoThreads::start(source, guest, cfg.plugin.clone(), deliver, bridge, net);
+    Ok((filters, io_threads))
 }
 
 /// Runs vCPU `cpu` on the calling thread until the VM stops.

@@ -14,16 +14,16 @@
 
 //! Shutdown of the host-side helper threads when the guest stops.
 //!
-//! `boot` spawns threads that block on host descriptors: the console, the agent
-//! listener and its connections, the gateway socket, the tap. Each polls its
-//! own descriptor beside a [`StopToken`]. `boot` requests the stop through its
-//! [`StopSource`] once the vCPU threads have exited, every poll returns, and
-//! `boot` joins the threads before it returns. Two helpers need more than the
-//! poll. The macOS virtio-fs worker waits on no descriptor; it parks on a
-//! condition variable and is stopped through it. The console reader reads
-//! stdin, which the whole process shares, so a byte another reader took between
-//! the poll and the read would leave it blocked; `boot` sends it the kick
-//! signal until it has exited.
+//! `IoThreads` starts threads that block on host descriptors: the console, the
+//! agent listener and its connections, the gateway socket, the tap. Each polls
+//! its own descriptor beside a [`StopToken`]. `IoThreads::stop` requests the
+//! stop through its [`StopSource`] once the vCPU threads have exited, every
+//! poll returns, and it joins the threads before `boot` returns. Two helpers
+//! need more than the poll. The macOS virtio-fs worker waits on no descriptor;
+//! it parks on a condition variable and is stopped through it. The console
+//! reader reads stdin, which the whole process shares, so a byte another reader
+//! took between the poll and the read would leave it blocked; `IoThreads::stop`
+//! sends it the kick signal until it has exited, with `kick_until_finished`.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
 //! the deadline is left running and `boot` returns an error naming it, since a
@@ -47,9 +47,9 @@ use std::time::{Duration, Instant};
 
 use crate::signal::kick_signal;
 
-/// How long `boot` waits for its helper threads after requesting the stop.
+/// How long the stop waits for the helper threads after it is requested.
 ///
-/// The waits `boot` cannot interrupt are a plugin blocking in `request` and a
+/// The waits the stop cannot interrupt are a plugin blocking in `request` and a
 /// virtio-fs worker waiting on a host file lock.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 

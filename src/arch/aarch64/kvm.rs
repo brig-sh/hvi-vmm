@@ -33,7 +33,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 
 use kvm_bindings::{
     kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
@@ -54,19 +53,18 @@ use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
-use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
+use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
-use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
+use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Guest, VcpuRegs};
-use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker, KvmIrqLine};
-use crate::hypervisor::vcpus::{Kick, Vcpus};
+use crate::hypervisor::kvm::{kick_handle, run_vcpu, start_io_threads, Kicker, KvmIrqLine};
+use crate::hypervisor::vcpus::Vcpus;
+use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
-use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
-use crate::sandbox::{confine_io_thread, seccomp};
+use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
-use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
 use crate::LOG_PREFIX;
 
@@ -106,7 +104,7 @@ fn get_u64(vcpu: &VcpuFd, id: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// State shared across vCPU threads and the helper threads.
+/// State shared across the vCPU threads.
 #[derive(Clone)]
 struct Shared {
     /// The guest's RAM, virtio devices and vCPUs.
@@ -205,8 +203,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
-    let mut net_tap_reader: Option<std::fs::File> = None;
+    let mut net_source: Option<NetSource> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
         // urunc already created the tap and redirected the veth to it, so all
         // that is left is to attach -- that is what brings carrier up. An
@@ -218,14 +215,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             .try_clone()
             .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
         eprintln!("{LOG_PREFIX} virtio-net: tap {ifname}");
-        net_tap_reader = Some(reader);
+        net_source = Some(NetSource::Tap(reader));
         Some(VirtioNet::with_tap(file))
     } else if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
             Ok(stream) => match stream.try_clone() {
                 Ok(reader) => {
                     eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock}");
-                    net_reader = Some(reader);
+                    net_source = Some(NetSource::Gateway(reader));
                     Some(VirtioNet::with_gateway(stream))
                 }
                 Err(e) => {
@@ -350,82 +347,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         line(VIRTIO_VSOCK_SPI),
     );
 
-    // Hand the plugin the guest before any vCPU runs, so nothing happens
-    // between the first instruction and the attach.
-    if let Some(obs) = &shared.plugin {
-        obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
-    }
-
-    // Arm the seccomp filters before the first thread is spawned. This compiles
-    // both allowlists and fails the boot if either will not, so a bad list is
-    // an error here rather than a SIGSYS inside a device thread later. Nothing
-    // is filtered yet: each thread installs its own as it starts (see
-    // `sandbox::seccomp`).
-    let allowed_counts = if cfg.sandbox {
-        seccomp::arm()?;
-        Some(seccomp::allowed_counts()?)
-    } else {
-        None
-    };
-
-    // Every listener is bound here, before any filter goes in: the seccomp
-    // allowlists permit accept4 on a listener we already hold but not socket or
-    // bind, so a listener created later would be trapped.
-    let bridge = match (&cfg.agent_sock, &shared.guest.vsock) {
-        (Some(path), Some(dev)) => Some(VsockBridge::bind(
-            path,
-            Arc::clone(dev),
-            Arc::clone(&shared.guest.ram),
-        )?),
-        _ => None,
-    };
-    // The stop source's socket pair is created here for the same reason.
-    let stop_source = StopSource::new()?;
-
-    // Helper threads. Each polls its stop token beside its own descriptor and
-    // is joined after the vCPUs; `teardown` describes the stop.
-    let input = {
-        let (sh, vcpus) = (shared.clone(), Arc::clone(&shared.guest.vcpus));
-        terminal::input::spawn(
-            shared.plugin.clone(),
-            stop_source.token(),
-            move || vcpus.kicker().kick(0),
-            move |byte| lock_or_recover(&sh.pl011).push_rx(byte),
-        )
-    };
-    let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
-    if let Some(bridge) = bridge {
-        let stop = stop_source.token();
-        helpers.push((
-            "agent bridge",
-            std::thread::spawn(move || {
-                confine_io_thread();
-                bridge.run(&stop);
-            }),
-        ));
-    }
-    if let (Some(reader), Some(dev)) = (net_reader, &shared.guest.net) {
-        helpers.push((
-            "gateway relay",
-            spawn_net_gateway_reader(
-                reader,
-                Arc::clone(dev),
-                Arc::clone(&shared.guest.ram),
-                stop_source.token(),
-            ),
-        ));
-    }
-    if let (Some(reader), Some(dev)) = (net_tap_reader, &shared.guest.net) {
-        helpers.push((
-            "tap relay",
-            spawn_net_tap_reader(
-                reader,
-                Arc::clone(dev),
-                Arc::clone(&shared.guest.ram),
-                stop_source.token(),
-            ),
-        ));
-    }
+    // The plugin attach, the seccomp arm and the I/O threads, in the order the
+    // filters need. Each polls its stop token beside its own descriptor and is
+    // joined after the vCPUs; `teardown` describes the stop.
+    let (filters, io_threads) = start_io_threads(
+        &cfg,
+        &shared.guest,
+        {
+            let pl011 = Arc::clone(&shared.pl011);
+            move |byte| lock_or_recover(&pl011).push_rx(byte)
+        },
+        net_source,
+    )?;
     let _raw = terminal::RawTerm::enable();
 
     // One thread per vCPU. From here on a failure stops the guest and is
@@ -440,40 +373,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     );
     let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
 
-    // The main thread filters itself last, once everything it had to spawn
-    // exists. Doing it in this order is what lets both allowlists refuse
-    // `seccomp` itself: nothing is ever created underneath a filter except the
-    // per-connection vsock readers, which are spawned under it and inherit it.
-    // The guest is already running by now, so a failure here stops it and is
-    // reported once every thread has been joined or left running.
-    let confined = if cfg.sandbox {
-        seccomp::install(seccomp::Thread::Vmm)
-    } else {
-        Ok(())
-    };
-    match (confined, allowed_counts) {
-        (Err(e), _) => {
-            // Printed here, since a spawn failure ahead of it is the one
-            // reported.
-            eprintln!("{LOG_PREFIX} {e}");
-            failure.get_or_insert(e.into());
-            shared.guest.vcpus.stop();
-        }
-        (Ok(()), Some((vmm, vcpu))) => {
-            if seccomp::log_mode() {
-                eprintln!(
-                    "{LOG_PREFIX} seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
-                    seccomp::LOG_ENV
-                );
-            } else {
-                eprintln!(
-                    "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)"
-                );
-            }
-        }
-        (Ok(()), None) => eprintln!(
-            "{LOG_PREFIX} seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
-        ),
+    // The guest is already running by now, so a failure to filter the main
+    // thread stops it and is reported once every thread has been joined or left
+    // running.
+    if let Err(e) = filters.install() {
+        // Printed here, since a spawn failure ahead of it is the one reported.
+        eprintln!("{LOG_PREFIX} {e}");
+        failure.get_or_insert(e.into());
+        shared.guest.vcpus.stop();
     }
 
     threads.join();
@@ -481,14 +388,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // The guest has stopped. End the I/O threads (see `teardown`) and write
     // out the ledger tail, which the flush cadence alone would leave in the
     // buffer.
-    stop_source.request_stop();
-    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
-    kick_until_finished(&input, deadline);
-    for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
-        if let Err(e) = join_by(name, thread, deadline) {
-            eprintln!("{LOG_PREFIX} {e}; left running");
-            failure.get_or_insert(e.into());
-        }
+    if let Err(e) = io_threads.stop() {
+        failure.get_or_insert(e.into());
     }
     lock_or_recover(&shared.guest.ledger).flush();
     if let Some(e) = failure {
@@ -724,47 +625,4 @@ fn set_gic_attr_u32(
     };
     gic.set_device_attr(&a)?;
     Ok(())
-}
-
-/// Injects tap frames into the guest.
-///
-/// [`TapRelay`] owns the wait and the drain. This thread supplies the delivery
-/// under the device lock and the interrupt.
-fn spawn_net_tap_reader(
-    reader: std::fs::File,
-    dev: Arc<Mutex<VirtioNet>>,
-    mem: Arc<GuestRam>,
-    stop: StopToken,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        seccomp::install_thread(seccomp::Thread::Vmm);
-        let relayed = TapRelay::new(reader).run(&stop, |frame| {
-            lock_or_recover(&dev).deliver(&mem, frame);
-        });
-        if let Err(e) = relayed {
-            eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
-        }
-    })
-}
-
-/// Injects gateway frames into the guest, each prefixed by a 4-byte big-endian
-/// length.
-///
-/// [`GatewayRelay`] owns the wait, the drain and the framing. This thread
-/// supplies the delivery under the device lock and the interrupt.
-fn spawn_net_gateway_reader(
-    reader: std::os::unix::net::UnixStream,
-    dev: Arc<Mutex<VirtioNet>>,
-    mem: Arc<GuestRam>,
-    stop: StopToken,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        seccomp::install_thread(seccomp::Thread::Vmm);
-        let relayed = GatewayRelay::new(reader).run(&stop, |frame| {
-            lock_or_recover(&dev).deliver(&mem, frame);
-        });
-        if let Err(e) = relayed {
-            eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
-        }
-    })
 }

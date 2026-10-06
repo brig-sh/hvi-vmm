@@ -269,6 +269,67 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
     Ok((count("vmm"), count("vcpu")))
 }
 
+/// The seccomp filters of a run, compiled before its I/O and vCPU threads
+/// start.
+///
+/// Each thread installs its own filter as it starts, with [`install_thread`].
+/// [`Filters::install`] installs the main thread's filter, last.
+pub(crate) struct Filters {
+    /// The number of syscalls each filter allows, when the sandbox is on.
+    counts: Option<(usize, usize)>,
+}
+
+impl Filters {
+    /// Arms the seccomp filters when `sandbox` is set.
+    ///
+    /// This compiles both allowlists, so a bad list fails the boot here rather
+    /// than as a `SIGSYS` inside a device thread later. Nothing is filtered
+    /// yet: each thread installs its own as it starts.
+    ///
+    /// # Errors
+    ///
+    /// Errors if a filter does not compile.
+    pub(crate) fn arm(sandbox: bool) -> io::Result<Self> {
+        if !sandbox {
+            return Ok(Self { counts: None });
+        }
+        arm()?;
+        Ok(Self {
+            counts: Some(allowed_counts()?),
+        })
+    }
+
+    /// Filters the calling main thread and reports the confinement on stderr.
+    ///
+    /// It must run once every thread the main thread spawns exists. That order
+    /// lets both allowlists refuse `seccomp` itself, since nothing is created
+    /// under a filter except the per-connection vsock threads, which inherit
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the filter cannot be installed.
+    pub(crate) fn install(self) -> io::Result<()> {
+        let Some((vmm, vcpu)) = self.counts else {
+            eprintln!(
+                "{LOG_PREFIX} seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
+            );
+            return Ok(());
+        };
+        install(Thread::Vmm)?;
+        if log_mode() {
+            eprintln!(
+                "{LOG_PREFIX} seccomp: LOGGING ONLY ({LOG_ENV}=log) — denials are recorded, not enforced"
+            );
+        } else {
+            eprintln!(
+                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// One probe: a syscall, which filter to install first, and whether the
 /// filtered thread is supposed to survive making it.
 struct Probe {
@@ -483,8 +544,8 @@ fn probes() -> Vec<Probe> {
             what: "signal a thread of this process (vmm)",
             thread: Thread::Vmm,
             expect_ok: true,
-            // `boot` ends the console reader's blocking read with the kick
-            // signal, sent from the main thread under this filter.
+            // `IoThreads::stop` ends the console reader's blocking read with
+            // the kick signal, sent from the main thread under this filter.
             run: || {
                 use crate::signal::{install_kick_handler, kick_signal};
                 install_kick_handler();
