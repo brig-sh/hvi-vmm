@@ -25,7 +25,7 @@
 //! from a [`Kick`] implementation that owns the table of vCPU threads.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
@@ -56,6 +56,8 @@ pub(crate) struct Vcpus<K> {
     stop: Mutex<Option<Stop>>,
     /// The number of vCPUs.
     count: u32,
+    /// The number of vCPUs that have entered their run loop.
+    started: AtomicU32,
     /// The [`Kick`] implementation that kicks the vCPUs.
     kicker: K,
 }
@@ -68,6 +70,7 @@ impl<K: Kick> Vcpus<K> {
             quiesce: Quiesce::new(),
             stop: Mutex::new(None),
             count,
+            started: AtomicU32::new(0),
             kicker,
         }
     }
@@ -82,6 +85,13 @@ impl<K: Kick> Vcpus<K> {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Records that the calling vCPU entered its run loop.
+    ///
+    /// A vCPU calls it once, before its first checkpoint.
+    pub(crate) fn mark_started(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Parks the calling vCPU thread while a quiesce is in effect.
     ///
     /// A vCPU thread calls it between guest entries, where its registers and
@@ -90,15 +100,23 @@ impl<K: Kick> Vcpus<K> {
         self.quiesce.checkpoint();
     }
 
-    /// Parks every vCPU but the calling one at its next checkpoint.
+    /// Parks every started vCPU but the calling one at its next checkpoint.
     ///
-    /// The caller is a vCPU thread and does not park itself. Returns `false`
-    /// when they did not all park in time. The quiesce is then released
-    /// already, and the caller must not call [`resume`](Self::resume).
+    /// The caller is a vCPU thread and does not park itself. Only the vCPUs
+    /// that have called [`mark_started`](Self::mark_started) are waited for.
+    /// One that has not, such as a secondary that waits outside the hypervisor
+    /// for the guest to start it, cannot touch guest state. One that starts
+    /// during the wait is waited for too, and parks at its first checkpoint,
+    /// before it enters the guest. Returns `false` when they did not all park
+    /// in time. The quiesce is then released already, and the caller must not
+    /// call [`resume`](Self::resume).
     pub(crate) fn pause(&self) -> bool {
         self.quiesce.request();
         self.kicker.kick_all();
-        if self.quiesce.wait_for(self.count.saturating_sub(1)) {
+        // Read as each vCPU parks, since one that started after a single read
+        // would park in place of one still in the guest.
+        let others = || self.started.load(Ordering::SeqCst).saturating_sub(1);
+        if self.quiesce.wait_for_with(others) {
             true
         } else {
             self.quiesce.release();
@@ -219,7 +237,6 @@ impl VcpuThreads {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -290,6 +307,8 @@ mod tests {
     #[test]
     fn stop_releases_a_vcpu_parked_for_a_pause() {
         let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        vcpus.mark_started();
+        vcpus.mark_started();
         let secondary = {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || {
@@ -314,6 +333,8 @@ mod tests {
             seen: Mutex::new(None),
         };
         let vcpus = Arc::new(Vcpus::new(2, kicker));
+        vcpus.mark_started();
+        vcpus.mark_started();
         let secondary = {
             let (vcpus, resumed) = (Arc::clone(&vcpus), Arc::clone(&resumed));
             std::thread::spawn(move || {
@@ -335,10 +356,61 @@ mod tests {
         );
     }
 
+    // A secondary the guest never brings up never reaches a checkpoint, so a
+    // pause that waited for it would always time out.
+    #[test]
+    fn pause_waits_only_for_started_vcpus() {
+        let vcpus = Arc::new(Vcpus::new(3, CountingKicker::default()));
+        vcpus.mark_started();
+        let (parking, parked) = std::sync::mpsc::channel();
+        let secondary = {
+            let vcpus = Arc::clone(&vcpus);
+            std::thread::spawn(move || {
+                vcpus.mark_started();
+                parking.send(()).unwrap();
+                while vcpus.is_running() {
+                    vcpus.checkpoint();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        parked.recv().unwrap();
+        assert!(vcpus.pause(), "the started secondary did not park");
+        vcpus.resume();
+        vcpus.stop();
+        assert!(exits(&secondary));
+    }
+
+    // The guest brings a secondary up just as a pause begins, while another
+    // started vCPU stays in the guest. A count read once at the start would let
+    // the new secondary park in place of the running one.
+    #[test]
+    fn pause_waits_for_a_vcpu_that_starts_while_it_waits() {
+        let vcpus = Arc::new(Vcpus::new(3, CountingKicker::default()));
+        vcpus.mark_started();
+        vcpus.mark_started();
+        let late = {
+            let vcpus = Arc::clone(&vcpus);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                vcpus.mark_started();
+                while vcpus.is_running() {
+                    vcpus.checkpoint();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        assert!(!vcpus.pause(), "the pause returned while a vCPU ran");
+        vcpus.stop();
+        assert!(exits(&late));
+    }
+
     #[test]
     fn pause_that_times_out_releases_the_quiesce() {
         let vcpus = Vcpus::new(2, CountingKicker::default());
-        assert!(!vcpus.pause(), "no second vCPU exists to park");
+        vcpus.mark_started();
+        vcpus.mark_started();
+        assert!(!vcpus.pause(), "the second vCPU never reaches a checkpoint");
         let checkpoint = std::thread::spawn(move || vcpus.checkpoint());
         assert!(exits(&checkpoint), "the quiesce stayed requested");
     }

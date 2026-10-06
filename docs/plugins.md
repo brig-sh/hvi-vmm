@@ -38,10 +38,10 @@ what it needs. All three backends call all three hooks.
 loop, so it runs once per guest entry. A tool with nothing to do this time
 round must establish that with one atomic load and return.
 
-**2. A pause you win, you owe.** `cpu.pause()` parks every *other* vCPU and
-returns `true` once they are all there. You then owe exactly one `resume()`,
-on every path out, including early returns and error paths. Miss one and the
-VM stays parked forever.
+**2. A pause you win, you owe.** `cpu.pause()` parks every *other* vCPU that has
+started and returns `true` once they are all there. You then owe exactly one
+`resume()`, on every path out, including early returns and error paths. Miss one
+and the VM stays parked forever.
 
 `false` means they did not all park within 500 ms. The quiesce has already
 been released, and you owe nothing. Returning without a `resume()` on that

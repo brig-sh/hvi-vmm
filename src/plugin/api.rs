@@ -143,8 +143,11 @@ pub trait CpuHandle {
     /// if you need the whole VM to be still.
     fn regs(&self) -> RegsView;
 
-    /// Parks every *other* vCPU at its safe point and returns `true` once they
-    /// are all there.
+    /// Parks every *other* vCPU that has started at its safe point and returns
+    /// `true` once they are all there.
+    ///
+    /// On macOS a secondary vCPU still waiting for the guest's PSCI `CPU_ON`
+    /// has not started, and is not waited for.
     ///
     /// Returns `false` if they did not all park, in which case the quiesce has
     /// already been released and the caller owes nothing. On `true` the caller

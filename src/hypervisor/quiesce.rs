@@ -18,7 +18,7 @@
 //! Without this, reaching a safe point only guarantees that *the vCPU that
 //! reached it* is out of guest context. On an SMP guest the others keep
 //! executing while a reader walks memory, so it can observe a structure
-//! mid-update. Nothing crashes — a reader is expected to bounds-check — but
+//! mid-update. Nothing crashes, since a reader is expected to bounds-check, but
 //! the result is not trustworthy.
 //!
 //! The shape is a request flag plus a parked counter. Every vCPU calls
@@ -27,11 +27,12 @@
 //! kicks the vCPUs out of the hypervisor so they reach that point promptly, and
 //! waits for the expected number of them to park.
 //!
-//! The requester is itself a vCPU thread in the in-VMM path: cpu0 takes the
-//! snapshot. It therefore waits for `num_cpus - 1` parked threads and never
-//! parks itself, which is why [`Quiesce::wait_for`] takes an explicit count
-//! rather than assuming "all of them". An external requester (a control thread)
-//! waits for all of them instead.
+//! The requester is itself a vCPU thread in the in-VMM path, since cpu0 takes
+//! the snapshot. It waits for the other vCPUs and never parks itself, so a wait
+//! takes the number of vCPUs to wait for. [`Quiesce::wait_for`] takes a fixed
+//! number, and `wait_for_with` one it reads again as each vCPU parks, for a
+//! requester whose vCPUs can start while it waits. An external requester, such
+//! as a control thread, waits for all of them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -43,8 +44,9 @@ use std::time::Duration;
 /// snapshot proceeds anyway, degraded, rather than hanging the guest).
 const PARK_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The barrier itself. Cheap to check: the fast path is one relaxed atomic load
-/// per guest entry.
+/// The barrier itself.
+///
+/// Checking it costs one atomic load per guest entry.
 #[derive(Default)]
 pub struct Quiesce {
     /// Set while a quiesce is in effect.
@@ -68,8 +70,9 @@ impl Quiesce {
     /// Must be called where the calling vCPU is *out* of guest context, so its
     /// registers and the memory it has written are stable for the plugin.
     pub fn checkpoint(&self) {
-        // Fast path: no quiesce pending, no lock taken.
-        if !self.requested.load(Ordering::Acquire) {
+        // Fast path: no quiesce pending, no lock taken. The load is
+        // sequentially consistent to pair with the store in `request`.
+        if !self.requested.load(Ordering::SeqCst) {
             return;
         }
         let mut parked = self.parked.lock().unwrap();
@@ -86,7 +89,10 @@ impl Quiesce {
     /// the hypervisor and reach their next
     /// [`checkpoint`](Self::checkpoint).
     pub fn request(&self) {
-        self.requested.store(true, Ordering::Release);
+        // The store is sequentially consistent, as is the load in `checkpoint`.
+        // A vCPU that raises the requester's target and then loads the flag
+        // either sees the request or has its raise seen by the requester.
+        self.requested.store(true, Ordering::SeqCst);
     }
 
     /// Waits until `n` vCPUs have parked, for at most `PARK_TIMEOUT`.
@@ -94,22 +100,33 @@ impl Quiesce {
     /// Returns `false` on timeout, meaning the guest is *not* fully quiesced
     /// and any snapshot taken now is best-effort.
     pub fn wait_for(&self, n: u32) -> bool {
-        self.wait_for_within(n, PARK_TIMEOUT)
+        self.wait_for_with(|| n)
     }
 
-    /// Waits until `n` vCPUs have parked, for at most `timeout`.
-    fn wait_for_within(&self, n: u32, timeout: Duration) -> bool {
-        if n == 0 {
-            return true;
-        }
+    /// Waits until as many vCPUs have parked as `target` returns, for at most
+    /// `PARK_TIMEOUT`.
+    ///
+    /// `target` is read under the lock a vCPU parks under, again after each
+    /// park, so the wait follows a target that grows while it waits. Returns
+    /// `false` on timeout, as [`wait_for`](Self::wait_for) does.
+    pub(crate) fn wait_for_with(&self, target: impl Fn() -> u32) -> bool {
+        self.wait_for_within(target, PARK_TIMEOUT)
+    }
+
+    /// Waits until as many vCPUs have parked as `target` returns, for at most
+    /// `timeout`.
+    fn wait_for_within(&self, target: impl Fn() -> u32, timeout: Duration) -> bool {
         let parked = self.parked.lock().unwrap();
         // One deadline covers the whole wait. Each vCPU that parks notifies,
         // and those wakeups must not extend it.
-        let (parked, _) = self
+        let (_parked, result) = self
             .cv
-            .wait_timeout_while(parked, timeout, |parked| *parked < n)
+            .wait_timeout_while(parked, timeout, |parked| *parked < target())
             .unwrap();
-        *parked >= n
+        // The answer is the last check's, made under the lock. A target read
+        // again here could count a vCPU that started after it and turn a
+        // completed wait into a timeout.
+        !result.timed_out()
     }
 
     /// Releases the quiesce and wakes every parked vCPU.
@@ -210,7 +227,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        let parked = q.wait_for_within(1, Duration::from_millis(100));
+        let parked = q.wait_for_within(|| 1, Duration::from_millis(100));
         let waited = started.elapsed();
         stop.store(true, Ordering::SeqCst);
         waker.join().unwrap();
