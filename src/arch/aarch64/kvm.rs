@@ -70,6 +70,7 @@ use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, V
 use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::terminal;
 use crate::LOG_PREFIX;
 
 // --- ONE_REG ids (architectural KVM ABI, aarch64). ---------------
@@ -91,8 +92,6 @@ const REG_SP_EL0: u64 = 0x6030_0000_0010_003e;
 /// PSTATE = EL1h + DAIF masked (the arm64 Linux boot-protocol entry state).
 const PSTATE_EL1H_DAIF: u64 = 0x3c5;
 
-/// Host key that asks the plugin for an observation now: Ctrl-] (GS, 0x1d).
-const REQUEST_KEY: u8 = 0x1d;
 /// Signal used to break a vCPU out of `KVM_RUN` (snapshot / shutdown).
 const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 
@@ -396,7 +395,22 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // Helper threads. Each polls its stop token beside its own descriptor and
     // is joined after the vCPUs; `teardown` describes the stop.
-    let input = spawn_input_thread(shared.clone(), stop_source.token());
+    let input = {
+        let (sh, kick) = (shared.clone(), shared.clone());
+        terminal::input::spawn(
+            shared.plugin.clone(),
+            stop_source.token(),
+            move || kick_cpu0(&kick),
+            move |byte| {
+                let level = {
+                    let mut p = lock_or_recover(&sh.pl011);
+                    p.push_rx(byte);
+                    p.irq_level()
+                };
+                let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
+            },
+        )
+    };
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
     if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
         helpers.push((
@@ -434,7 +448,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             ),
         ));
     }
-    let _raw = RawTerm::enable();
+    let _raw = terminal::RawTerm::enable();
 
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
@@ -1068,51 +1082,6 @@ fn set_gic_attr_u32(
     Ok(())
 }
 
-/// Feeds host stdin to the guest UART.
-///
-/// With a plugin attached, [`REQUEST_KEY`] is intercepted and asks it for an
-/// observation instead of reaching the guest; with no plugin the key is an
-/// ordinary byte, so a run with no plugin passes stdin through untouched.
-fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        seccomp::install_thread(seccomp::Thread::Vmm);
-        let stdin = std::io::stdin();
-        let mut byte = [0u8; 1];
-        loop {
-            match stop.wait(stdin.as_fd()) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(e) => {
-                    eprintln!("{LOG_PREFIX} console: {e}; console input stopped");
-                    break;
-                }
-            }
-            // SAFETY: reading one byte from fd 0.
-            let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                // The kick signal: the stop is seen at the top of the loop.
-                continue;
-            }
-            if n <= 0 {
-                break;
-            }
-            if byte[0] == REQUEST_KEY {
-                if let Some(obs) = &sh.plugin {
-                    obs.request();
-                    kick_cpu0(&sh);
-                    continue;
-                }
-            }
-            let level = {
-                let mut p = lock_or_recover(&sh.pl011);
-                p.push_rx(byte[0]);
-                p.irq_level()
-            };
-            let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
-        }
-    })
-}
-
 /// Bridges the host agent Unix socket to the guest vsock device (exec).
 ///
 /// The listener is non-blocking, so the accept loop can poll it beside the stop
@@ -1293,42 +1262,6 @@ fn spawn_net_gateway_reader(
             eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
         }
     })
-}
-
-/// Puts stdin into raw mode for the guest console, restoring it on drop.
-struct RawTerm {
-    orig: libc::termios,
-}
-impl RawTerm {
-    fn enable() -> Option<RawTerm> {
-        // SAFETY: fd 0; termios is POD; calls are checked.
-        unsafe {
-            if libc::isatty(0) == 0 {
-                return None;
-            }
-            let mut orig: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(0, &mut orig) != 0 {
-                return None;
-            }
-            let mut raw = orig;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
-                return None;
-            }
-            Some(RawTerm { orig })
-        }
-    }
-}
-
-impl Drop for RawTerm {
-    fn drop(&mut self) {
-        // TCSAFLUSH discards unread input, so keystrokes and terminal answers
-        // still queued for the guest never reach the shell.
-        // SAFETY: restoring the saved settings on fd 0.
-        unsafe {
-            libc::tcsetattr(0, libc::TCSAFLUSH, &self.orig);
-        }
-    }
 }
 
 /// Binds a non-blocking Unix listener at `path`, clearing a stale socket from a

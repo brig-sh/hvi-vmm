@@ -14,9 +14,14 @@
 
 //! The operator's terminal, as the guest's serial console reaches it.
 //!
-//! The guest's console output goes to stdout through a [`ConsoleFilter`],
-//! which drops the escape sequences that would change host state.
+//! The guest's console output goes to stdout through a [`ConsoleFilter`], which
+//! drops the escape sequences that would change host state. Its input is stdin,
+//! which `RawTerm` puts in raw mode for the run and `input` reads on a thread
+//! of its own.
 
 mod filter;
+pub(crate) mod input;
+mod raw;
 
 pub use filter::ConsoleFilter;
+pub(crate) use raw::RawTerm;
