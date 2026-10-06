@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use crate::memory::GuestRam;
 
+use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
@@ -69,6 +70,8 @@ pub struct VirtioBlk {
     dev_feat_sel: u32,
     queue: Queue,
     interrupt_status: u32,
+    /// The interrupt line the device drives.
+    irq: Irq,
     /// Captured requests, drained by the hypervisor backend into the event
     /// ledger.
     events: Vec<CapturedEvent>,
@@ -139,6 +142,7 @@ impl VirtioBlk {
             dev_feat_sel: 0,
             queue: Queue::default(),
             interrupt_status: 0,
+            irq: Irq::default(),
             events: Vec::new(),
             sink: None,
             disk_id,
@@ -158,6 +162,16 @@ impl VirtioBlk {
         self.interrupt_status != 0
     }
 
+    /// Connects the device to the interrupt line it raises.
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        self.irq.connect(line);
+    }
+
+    /// Sets the interrupt line to the device's level.
+    fn sync_irq(&self) {
+        self.irq.set(self.irq_level());
+    }
+
     /// Drains the captured requests for the event ledger.
     pub fn take_events(&mut self) -> Vec<CapturedEvent> {
         std::mem::take(&mut self.events)
@@ -166,6 +180,13 @@ impl VirtioBlk {
     /// Services one MMIO access. Returns the read value (0 for writes). When
     /// the driver notifies a queue, the virtqueue is processed inline.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        let read = self.serve_mmio(mem, offset, is_write, value);
+        self.sync_irq();
+        read
+    }
+
+    /// Reads or writes register `offset`, running a queue the write notifies.
+    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
             match offset {

@@ -42,11 +42,11 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::os::fd::AsFd;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
-use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::x86_64::layout::{
     BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR,
@@ -64,7 +64,7 @@ use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
 use crate::hypervisor::guest::{Guest, VcpuRegs};
-use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker};
+use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView, VmHandle};
@@ -85,7 +85,6 @@ const PDE64_PRESENT_RW: u64 = 0x03; // present | writable (table)
 /// State shared across vCPU threads and helper threads.
 #[derive(Clone)]
 struct Shared {
-    vm: Arc<VmFd>,
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     uart: Arc<Mutex<Uart16550>>,
@@ -312,7 +311,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     let vm = Arc::new(vm);
     let shared = Shared {
-        vm: Arc::clone(&vm),
         guest: Arc::new(Guest {
             arch: GuestArch::X86_64,
             sandbox_id: cfg.sandbox_id.clone(),
@@ -331,6 +329,16 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
         plugin: cfg.plugin.clone(),
     };
+
+    // Each device sets its own interrupt line, from the methods that change its
+    // level and so under the lock that decides it.
+    let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
+    lock_or_recover(&shared.uart).connect_irq(line(COM1_GSI));
+    shared.guest.connect_irqs(
+        line(VIRTIO_BLK_GSI),
+        line(VIRTIO_NET_GSI),
+        line(VIRTIO_VSOCK_GSI),
+    );
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
@@ -369,9 +377,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             stop_source.token(),
             move || vcpus.kicker().kick(0),
             move |byte| {
-                let mut u = lock_or_recover(&sh.uart);
-                u.push_rx(byte);
-                set_line(&sh.vm, COM1_GSI, &u);
+                lock_or_recover(&sh.uart).push_rx(byte);
             },
         )
     };
@@ -383,7 +389,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 listener,
                 Arc::clone(dev),
                 Arc::clone(&shared.guest.ram),
-                Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
@@ -395,7 +400,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 reader,
                 Arc::clone(dev),
                 Arc::clone(&shared.guest.ram),
-                Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
@@ -407,7 +411,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 reader,
                 Arc::clone(dev),
                 Arc::clone(&shared.guest.ram),
-                Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
@@ -695,65 +698,12 @@ fn dump_regs(vcpu: &VcpuFd, mem: &GuestRam, cpu_id: u32, tag: &str) {
     }
 }
 
-/// A device whose interrupt line hvi sets as a level after each access.
-trait IrqLevel {
-    /// Returns whether the device's interrupt line should be asserted now.
-    fn irq_level(&self) -> bool;
-}
-
-impl IrqLevel for Uart16550 {
-    fn irq_level(&self) -> bool {
-        Uart16550::irq_level(self)
-    }
-}
-
-impl IrqLevel for VirtioBlk {
-    fn irq_level(&self) -> bool {
-        VirtioBlk::irq_level(self)
-    }
-}
-
-impl IrqLevel for VirtioNet {
-    fn irq_level(&self) -> bool {
-        VirtioNet::irq_level(self)
-    }
-}
-
-impl IrqLevel for VirtioVsock {
-    fn irq_level(&self) -> bool {
-        VirtioVsock::irq_level(self)
-    }
-}
-
-/// Sets `gsi` to the interrupt level of the device that `dev` guards.
-///
-/// It takes the lock guard, so the level reaches the line before the lock is
-/// released, in the order of the accesses. Two threads that applied their
-/// levels out of order could leave the line high with nothing pending. The
-/// guest programs every ISA pin as edge-triggered, so it would then miss the
-/// device's next interrupt.
-fn set_line<D: IrqLevel>(vm: &VmFd, gsi: u32, dev: &MutexGuard<'_, D>) {
-    let _ = vm.set_irq_line(gsi, dev.irq_level());
-}
-
 /// Routes a port-I/O read to the device behind `port` and returns the value.
 ///
-/// A COM1 access passes the new COM1 interrupt level to `set_com1` with the
-/// UART lock still held, for the reason [`set_line`] gives.
-///
-/// Split from [`pio_read`] so the routing is callable without a live vCPU or a
-/// VM to raise the GSI on.
-fn pio_dispatch_read(
-    uart: &Mutex<Uart16550>,
-    rtc: &Mutex<RtcCmos>,
-    port: u16,
-    set_com1: impl FnOnce(bool),
-) -> u8 {
+/// Split from [`pio_read`] so the routing is callable without a live vCPU.
+fn pio_dispatch_read(uart: &Mutex<Uart16550>, rtc: &Mutex<RtcCmos>, port: u16) -> u8 {
     if (COM1_PORT..COM1_PORT + 8).contains(&port) {
-        let mut u = uart.lock().unwrap();
-        let v = u.pio_read(port - COM1_PORT);
-        set_com1(u.irq_level());
-        v
+        uart.lock().unwrap().pio_read(port - COM1_PORT)
     } else if port == RTC_INDEX_PORT || port == RTC_DATA_PORT {
         rtc.lock().unwrap().pio_read(port)
     } else {
@@ -762,17 +712,9 @@ fn pio_dispatch_read(
 }
 
 /// Routes a port-I/O write; the write half of [`pio_dispatch_read`].
-fn pio_dispatch_write(
-    uart: &Mutex<Uart16550>,
-    rtc: &Mutex<RtcCmos>,
-    port: u16,
-    val: u8,
-    set_com1: impl FnOnce(bool),
-) {
+fn pio_dispatch_write(uart: &Mutex<Uart16550>, rtc: &Mutex<RtcCmos>, port: u16, val: u8) {
     if (COM1_PORT..COM1_PORT + 8).contains(&port) {
-        let mut u = uart.lock().unwrap();
-        u.pio_write(port - COM1_PORT, val);
-        set_com1(u.irq_level());
+        uart.lock().unwrap().pio_write(port - COM1_PORT, val);
     } else if port == RTC_INDEX_PORT || port == RTC_DATA_PORT {
         rtc.lock().unwrap().pio_write(port, val);
     }
@@ -780,16 +722,12 @@ fn pio_dispatch_write(
 
 /// Services an `in` from `port`.
 fn pio_read(sh: &Shared, port: u16) -> u8 {
-    pio_dispatch_read(&sh.uart, &sh.rtc, port, |level| {
-        let _ = sh.vm.set_irq_line(COM1_GSI, level);
-    })
+    pio_dispatch_read(&sh.uart, &sh.rtc, port)
 }
 
 /// Services an `out` of `val` to `port`.
 fn pio_write(sh: &Shared, port: u16, val: u8) {
-    pio_dispatch_write(&sh.uart, &sh.rtc, port, val, |level| {
-        let _ = sh.vm.set_irq_line(COM1_GSI, level);
-    });
+    pio_dispatch_write(&sh.uart, &sh.rtc, port, val);
 }
 
 /// Services an MMIO read of the virtio register at `addr`.
@@ -837,7 +775,6 @@ fn blk_read(sh: &Shared, off: u64) -> u64 {
     let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.guest.ram, off, false, 0);
-        set_line(&sh.vm, VIRTIO_BLK_GSI, &d);
         (v, d.take_events())
     };
     drain(sh, &events);
@@ -854,7 +791,6 @@ fn blk_write(sh: &Shared, off: u64, val: u64) {
     let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.guest.ram, off, true, val);
-        set_line(&sh.vm, VIRTIO_BLK_GSI, &d);
         d.take_events()
     };
     drain(sh, &events);
@@ -870,7 +806,6 @@ fn net_read(sh: &Shared, off: u64) -> u64 {
     let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.guest.ram, off, false, 0);
-        set_line(&sh.vm, VIRTIO_NET_GSI, &d);
         (v, d.take_events())
     };
     drain(sh, &events);
@@ -887,7 +822,6 @@ fn net_write(sh: &Shared, off: u64, val: u64) {
     let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.guest.ram, off, true, val);
-        set_line(&sh.vm, VIRTIO_NET_GSI, &d);
         d.take_events()
     };
     drain(sh, &events);
@@ -898,10 +832,7 @@ fn vsock_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.guest.vsock.as_ref() else {
         return 0;
     };
-    let mut d = dev.lock().unwrap();
-    let v = d.mmio(&sh.guest.ram, off, false, 0);
-    set_line(&sh.vm, VIRTIO_VSOCK_GSI, &d);
-    v
+    dev.lock().unwrap().mmio(&sh.guest.ram, off, false, 0)
 }
 
 /// Services a write of `val` to virtio-vsock register `off`.
@@ -911,7 +842,6 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
     };
     let mut d = dev.lock().unwrap();
     d.mmio(&sh.guest.ram, off, true, val);
-    set_line(&sh.vm, VIRTIO_VSOCK_GSI, &d);
 }
 
 /// Bridges the host agent Unix socket to the guest vsock device.
@@ -923,7 +853,6 @@ fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
-    vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -953,7 +882,6 @@ fn spawn_vsock_bridge(
                     continue;
                 };
                 d.connect(&mem, port);
-                set_line(&vm, VIRTIO_VSOCK_GSI, &d);
                 (port, d.writer_gate(port))
             };
             let Some(writer_gate) = writer_gate else {
@@ -961,12 +889,7 @@ fn spawn_vsock_bridge(
             };
             // Guest -> host bytes the vCPU could not send. The writer waits
             // for the socket to take them, without the device lock.
-            let (dev3, mem3, vm3, stop3) = (
-                Arc::clone(&dev),
-                Arc::clone(&mem),
-                Arc::clone(&vm),
-                stop.clone(),
-            );
+            let (dev3, mem3, stop3) = (Arc::clone(&dev), Arc::clone(&mem), stop.clone());
             relays.retain(|handle| !handle.is_finished());
             relays.push(std::thread::spawn(move || loop {
                 writer_gate.wait_open();
@@ -977,20 +900,17 @@ fn spawn_vsock_bridge(
                         eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
                         let mut d = lock_or_recover(&dev3);
                         d.host_gone(&mem3, port);
-                        set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
                         break;
                     }
                 }
                 let mut d = lock_or_recover(&dev3);
                 let needed = d.flush_to_host(&mem3, port);
-                set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
                 if !needed {
                     break;
                 }
             }));
             let dev2 = Arc::clone(&dev);
             let mem2 = Arc::clone(&mem);
-            let vm2 = Arc::clone(&vm);
             let stop2 = stop.clone();
             relays.retain(|handle| !handle.is_finished());
             relays.push(std::thread::spawn(move || {
@@ -1016,12 +936,7 @@ fn spawn_vsock_bridge(
                         Err(e) if crate::devices::virtio::vsock::retry_read(&e) => continue,
                         Err(_) => break,
                     };
-                    let gate = {
-                        let mut d = lock_or_recover(&dev2);
-                        let gate = d.host_data(&mem2, port, &buf[..n]);
-                        set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
-                        gate
-                    };
+                    let gate = lock_or_recover(&dev2).host_data(&mem2, port, &buf[..n]);
                     // `HostGate::wait` says why its result is not needed.
                     if let Some(gate) = gate {
                         gate.wait(|| stop2.keep_waiting(reader.as_fd()));
@@ -1029,7 +944,6 @@ fn spawn_vsock_bridge(
                 }
                 let mut d = lock_or_recover(&dev2);
                 d.host_closed(&mem2, port);
-                set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
             }));
         }
         // Dropping the connections shuts their sockets down and opens their
@@ -1049,7 +963,6 @@ fn spawn_net_tap_reader(
     reader: std::fs::File,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
-    vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1057,7 +970,6 @@ fn spawn_net_tap_reader(
         let relayed = TapRelay::new(reader).run(&stop, |frame| {
             let mut d = lock_or_recover(&dev);
             d.deliver(&mem, frame);
-            set_line(&vm, VIRTIO_NET_GSI, &d);
         });
         if let Err(e) = relayed {
             eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
@@ -1074,7 +986,6 @@ fn spawn_net_gateway_reader(
     reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
-    vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1082,7 +993,6 @@ fn spawn_net_gateway_reader(
         let relayed = GatewayRelay::new(reader).run(&stop, |frame| {
             let mut d = lock_or_recover(&dev);
             d.deliver(&mem, frame);
-            set_line(&vm, VIRTIO_NET_GSI, &d);
         });
         if let Err(e) = relayed {
             eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
@@ -1166,9 +1076,10 @@ mod cmdline_tests {
 
 #[cfg(test)]
 mod pio_tests {
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
+    use crate::devices::irq::IrqLine;
 
     /// The guest reaches the RTC only through the vCPU exit handler's port
     /// dispatch, so a routing slip (0x70/0x71 falling through to the 0xff
@@ -1182,9 +1093,8 @@ mod pio_tests {
 
         // out 0x70, 0x0b; in 0x71 -- status register B.
         const REG_B: u8 = 0x0b;
-        let no_line = |_| panic!("the RTC drives no interrupt line");
-        pio_dispatch_write(&uart, &rtc, RTC_INDEX_PORT, REG_B, no_line);
-        let via_ports = pio_dispatch_read(&uart, &rtc, RTC_DATA_PORT, no_line);
+        pio_dispatch_write(&uart, &rtc, RTC_INDEX_PORT, REG_B);
+        let via_ports = pio_dispatch_read(&uart, &rtc, RTC_DATA_PORT);
 
         // The same register read straight from a device instance must match:
         // the dispatch adds routing, not behavior.
@@ -1201,28 +1111,47 @@ mod pio_tests {
     // one reads IIR, and the THR writes that follow must raise a new edge.
     #[test]
     fn com1_rises_again_for_the_writes_after_an_iir_read() {
-        let uart = Mutex::new(Uart16550::new());
+        let line = Arc::new(EdgeCounter::default());
+        let mut com1 = Uart16550::new();
+        com1.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        let uart = Mutex::new(com1);
         let rtc = Mutex::new(RtcCmos::new());
-        let line = Cell::new(false);
-        let edges = Cell::new(0);
-        let set = |level: bool| {
-            assert!(uart.try_lock().is_err(), "the line is set under the lock");
-            if level && !line.get() {
-                edges.set(edges.get() + 1);
-            }
-            line.set(level);
-        };
         const IER: u16 = COM1_PORT + 1;
         const IIR: u16 = COM1_PORT + 2;
 
-        pio_dispatch_write(&uart, &rtc, IER, 0x02, set);
-        assert_eq!(edges.get(), 1);
-        assert_eq!(pio_dispatch_read(&uart, &rtc, IIR, set), 0xc2);
-        assert!(!line.get(), "the IIR read drops the line");
+        pio_dispatch_write(&uart, &rtc, IER, 0x02);
+        assert_eq!(line.edges.load(Ordering::SeqCst), 1);
+        assert_eq!(pio_dispatch_read(&uart, &rtc, IIR), 0xc2);
+        assert!(
+            !line.high.load(Ordering::SeqCst),
+            "the IIR read drops the line"
+        );
         for b in b"0123456789abcdef" {
-            pio_dispatch_write(&uart, &rtc, COM1_PORT, *b, set);
+            pio_dispatch_write(&uart, &rtc, COM1_PORT, *b);
         }
-        assert_eq!(edges.get(), 2, "the THR writes raise a second edge");
+        assert_eq!(
+            line.edges.load(Ordering::SeqCst),
+            2,
+            "the THR writes raise a second edge"
+        );
+    }
+
+    /// A line that holds its level and counts the times it rose.
+    #[derive(Default)]
+    struct EdgeCounter {
+        /// The level the line was last set to.
+        high: AtomicBool,
+        /// The number of times the line rose.
+        edges: AtomicU32,
+    }
+
+    impl IrqLine for EdgeCounter {
+        fn set_level(&self, level: bool) {
+            if level && !self.high.swap(level, Ordering::SeqCst) {
+                self.edges.fetch_add(1, Ordering::SeqCst);
+            }
+            self.high.store(level, Ordering::SeqCst);
+        }
     }
 }
 

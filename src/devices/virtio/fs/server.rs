@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::CachePolicy;
+use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
 use crate::memory::GuestRam;
@@ -1152,6 +1153,8 @@ pub struct VirtioFs {
     queue_sel: u32,
     queues: [Queue; NUM_QUEUES],
     interrupt_status: u32,
+    /// The interrupt line the device drives.
+    irq: Irq,
     /// Bitmask of queue indices notified since the last drain: bit `i` set
     /// means queue `i` had a `QUEUE_NOTIFY` land on it. Set by the vCPU
     /// thread in `mmio`, cleared by `take_notified`/`drain_notified` on the
@@ -1356,6 +1359,7 @@ impl VirtioFs {
             queue_sel: 0,
             queues: std::array::from_fn(|_| Queue::default()),
             interrupt_status: 0,
+            irq: Irq::default(),
             notified: AtomicU32::new(0),
             nodes,
             inode_ids,
@@ -1496,6 +1500,16 @@ impl VirtioFs {
         self.interrupt_status != 0
     }
 
+    /// Connects the device to the interrupt line it raises.
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        self.irq.connect(line);
+    }
+
+    /// Sets the interrupt line to the device's level.
+    fn sync_irq(&self) {
+        self.irq.set(self.irq_level());
+    }
+
     fn queue(&mut self) -> Option<&mut Queue> {
         self.queues.get_mut(self.queue_sel as usize)
     }
@@ -1555,6 +1569,13 @@ impl VirtioFs {
     /// Every other register is handled inline here; `reset` is the one whose
     /// work reaches the host filesystem.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        let read = self.serve_mmio(mem, offset, is_write, value);
+        self.sync_irq();
+        read
+    }
+
+    /// Reads or writes register `offset`.
+    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
             match offset {
@@ -1690,6 +1711,7 @@ impl VirtioFs {
                 remaining = true;
             }
         }
+        self.sync_irq();
         remaining
     }
 

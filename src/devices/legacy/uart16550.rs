@@ -14,13 +14,13 @@
 
 //! COM1 for the x86 backend, on the 16550 register file from `vm-superio`.
 //!
-//! hvi sets COM1's line after every access. The guest programs the pin (ISA
-//! IRQ 4) as edge-triggered, so it sees an interrupt only when the line
+//! The UART sets COM1's line after every access. The guest programs the pin
+//! (ISA IRQ 4) as edge-triggered, so it sees an interrupt only when the line
 //! rises. Its 8250 driver reads the interrupt identification register (IIR)
 //! until IIR reports nothing pending. So the line is high exactly when an IIR
-//! read would report an interrupt. A line left high after IIR reads empty
-//! never rises again, and the guest then waits for a THR-empty interrupt that
-//! does not come.
+//! read would report an interrupt. A line left high after IIR reads empty never
+//! rises again, and the guest then waits for a THR-empty interrupt that does
+//! not come.
 //!
 //! The crate's own IIR does not keep that rule, so this module answers IIR
 //! reads itself. The crate clears every pending bit on an IIR read, and raises
@@ -29,10 +29,12 @@
 //! THR-empty only when that read reports it.
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use vm_superio::serial::NoEvents;
 use vm_superio::{Serial, Trigger};
 
+use crate::devices::irq::{Irq, IrqLine};
 use crate::terminal::ConsoleFilter;
 
 /// The register bits the interrupt state is computed from. The crate keeps its
@@ -57,7 +59,7 @@ const IIR_THR_EMPTY: u8 = 0x02;
 const IIR_NONE: u8 = 0x01;
 const IIR_FIFO_ENABLED: u8 = 0xc0;
 
-/// The edge callback hvi does not use. hvi sets the line from
+/// The edge callback hvi does not use. The UART sets its line from
 /// [`Uart16550::irq_level`] after each access.
 struct NoTrigger;
 
@@ -103,6 +105,8 @@ pub struct Uart16550 {
     inner: Serial<NoTrigger, NoEvents, ConsoleOut>,
     /// Whether a THR-empty interrupt is pending. IER can still mask it.
     thr_empty_pending: bool,
+    /// The interrupt line the UART drives.
+    irq: Irq,
 }
 
 impl Uart16550 {
@@ -117,7 +121,15 @@ impl Uart16550 {
                 },
             ),
             thr_empty_pending: false,
+            irq: Irq::default(),
         }
+    }
+
+    /// Connects the UART to the interrupt line it raises.
+    // Only the x86-64 backend attaches a 16550.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        self.irq.connect(line);
     }
 
     /// Returns the interrupt ID an IIR read would report now, without the FIFO
@@ -157,10 +169,25 @@ impl Uart16550 {
         // not draining the console. Dropping the byte is what a real UART does
         // with an overrun.
         let _ = self.inner.enqueue_raw_bytes(&[b]);
+        self.irq.set(self.irq_level());
     }
 
-    /// Services an `in` from `port` (COM base + offset), returning the byte.
+    /// Services an `in` from register `off`, an offset from the COM base.
     pub fn pio_read(&mut self, off: u16) -> u8 {
+        let read = self.read_port(off);
+        self.irq.set(self.irq_level());
+        read
+    }
+
+    /// Services an `out` of `val` to register `off`, an offset from the COM
+    /// base.
+    pub fn pio_write(&mut self, off: u16, val: u8) {
+        self.write_port(off, val);
+        self.irq.set(self.irq_level());
+    }
+
+    /// Reads the register at offset `off`.
+    fn read_port(&mut self, off: u16) -> u8 {
         if off != IIR {
             return self.inner.read(off as u8);
         }
@@ -173,8 +200,8 @@ impl Uart16550 {
         id | IIR_FIFO_ENABLED
     }
 
-    /// Services an `out` to `port` (COM base + offset).
-    pub fn pio_write(&mut self, off: u16, val: u8) {
+    /// Writes `val` to the register at offset `off`.
+    fn write_port(&mut self, off: u16, val: u8) {
         // The crate's LCR and IER reads have no side effects. IER reads the
         // divisor latch while DLAB is set, but it is not used then.
         let dlab = self.inner.read(LCR as u8) & LCR_DLAB != 0;

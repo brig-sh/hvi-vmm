@@ -290,13 +290,17 @@ sequenceDiagram
     B->>D: mmio(off, is_write, value)
     D->>M: read/write descriptors + buffers
     D->>L: CapturedEvent (block / net / SNI)
-    D-->>B: new IRQ level
-    B->>G: inject IRQ (GIC SPI / IOAPIC GSI), resume
+    D->>G: set its IRQ line (GIC SPI / IOAPIC GSI)
+    B->>G: resume
 ```
 
-Interrupt injection is the one device-facing thing that differs by backend:
+Each device sets its own interrupt line, from the methods that change its
+interrupt level, so the line is set under the device's lock. How the line
+reaches the guest is the one device-facing thing that differs by backend:
 
-- **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3.
+- **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
+  line that rises on an I/O thread also kicks the vCPUs. The console UART's line
+  never kicks.
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
   vGICv2 and vGICv3.
 - **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7.
@@ -320,9 +324,9 @@ created goes with them (vsock sessions, the virtio-fs FUSE session). A driver
 that binds again after that starts from a device in its boot state.
 
 The serial console is a **PL011** on arm64 and a **16550** on x86. The x86 one
-wraps `vm-superio`'s `Serial`. hvi sets COM1's line after every access, with
-the UART lock held. The guest programs the pin as edge-triggered, so the line
-is high exactly when an IIR read would report an interrupt. To keep it so, the
+wraps `vm-superio`'s `Serial`. The UART sets COM1's line after every access,
+under its lock. The guest programs the pin as edge-triggered, so the line is
+high exactly when an IIR read would report an interrupt. To keep it so, the
 wrapper tracks THR-empty itself and answers IIR reads. Both write guest output
 to stdout through `terminal::ConsoleFilter`, which drops the escape sequences
 that change host state or make the terminal answer (see
@@ -408,7 +412,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

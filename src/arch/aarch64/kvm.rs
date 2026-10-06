@@ -14,23 +14,19 @@
 
 //! The arm64 guest on KVM, SMP-capable.
 //!
-//! The Linux counterpart of `hvf`. KVM gives us an **in-kernel GIC** and
-//! **in-kernel PSCI**, so this backend is structurally simpler than the hvf
-//! one: secondaries are created `POWER_OFF` and brought up by the guest's own
-//! PSCI `CPU_ON` (handled entirely in-kernel, with no mailbox), and interrupts
-//! are a single `set_irq_line`, which also wakes a WFI'd vCPU (no explicit kick
-//! for delivery). A kick sets the vCPU's `immediate_exit` byte and signals its
-//! thread. It gets cpu0 to its next safe point, where a plugin runs, gets the
-//! other vCPUs to theirs for a pause, and breaks every vCPU out of `KVM_RUN`
-//! when the VM stops.
+//! The Linux counterpart of `hvf`. KVM runs the GIC and PSCI in the kernel.
+//! Secondaries are created powered off, and the guest brings them up with PSCI
+//! `CPU_ON`, which the kernel serves. A device sets its interrupt line with
+//! `KVM_IRQ_LINE`, which also wakes a vCPU in WFI. A kick sets the vCPU's
+//! `immediate_exit` byte and signals its thread, as `hypervisor::kvm`
+//! describes.
 //!
-//! Everything else — image/layout/DTB, virtio devices, PL011, the RawEvent
-//! ledger, and the plugin seam — is the same hypervisor-agnostic code the
-//! macOS backend uses.
+//! The image and layout, the DTB, the virtio devices, the PL011, the `RawEvent`
+//! ledger and the plugin interface are the same code the macOS backend uses.
 //!
-//! The GIC version is negotiated, not chosen: KVM's vGIC borrows the host's CPU
-//! interface, so a GICv3 host serves vGICv3 and a GIC-400 host serves vGICv2
-//! only. We ask for v3 and fall back to v2, laying out the DTB to match.
+//! KVM's vGIC uses the host's CPU interface, so a GICv3 host serves vGICv3 and
+//! a GIC-400 host serves only vGICv2. The backend asks for v3, falls back to
+//! v2, and lays out the DTB to match.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -48,7 +44,7 @@ use kvm_bindings::{
     KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST,
     KVM_VGIC_V3_ADDR_TYPE_REDIST,
 };
-use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
@@ -64,7 +60,7 @@ use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Guest, VcpuRegs};
-use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker};
+use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
@@ -114,7 +110,6 @@ fn get_u64(vcpu: &VcpuFd, id: u64) -> u64 {
 /// State shared across vCPU threads and the helper threads.
 #[derive(Clone)]
 struct Shared {
-    vm: Arc<VmFd>,
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     pl011: Arc<Mutex<Pl011>>,
@@ -331,7 +326,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     let vm = Arc::new(vm);
     let shared = Shared {
-        vm: Arc::clone(&vm),
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
             sandbox_id: cfg.sandbox_id.clone(),
@@ -346,6 +340,16 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         pl011: Arc::new(Mutex::new(Pl011::new())),
         plugin: cfg.plugin.clone(),
     };
+
+    // Each device sets its own interrupt line, from the methods that change its
+    // level and so under the lock that decides it.
+    let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
+    lock_or_recover(&shared.pl011).connect_irq(line(UART_SPI));
+    shared.guest.connect_irqs(
+        line(VIRTIO_SPI),
+        line(VIRTIO_NET_SPI),
+        line(VIRTIO_VSOCK_SPI),
+    );
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
@@ -383,14 +387,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             shared.plugin.clone(),
             stop_source.token(),
             move || vcpus.kicker().kick(0),
-            move |byte| {
-                let level = {
-                    let mut p = lock_or_recover(&sh.pl011);
-                    p.push_rx(byte);
-                    p.irq_level()
-                };
-                let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
-            },
+            move |byte| lock_or_recover(&sh.pl011).push_rx(byte),
         )
     };
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
@@ -401,7 +398,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 listener,
                 Arc::clone(dev),
                 Arc::clone(&shared.guest.ram),
-                Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
@@ -413,7 +409,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 reader,
                 Arc::clone(dev),
                 Arc::clone(&shared.guest.ram),
-                Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
@@ -425,7 +420,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 reader,
                 Arc::clone(dev),
                 Arc::clone(&shared.guest.ram),
-                Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
@@ -590,25 +584,14 @@ fn on_mmio(sh: &Shared, addr: u64, _read: bool, data: &mut [u8]) {
     data[..n].copy_from_slice(&bytes[..n]);
 }
 
-/// Reads the device register at `addr` and drives its interrupt line.
+/// Reads the device register at `addr`.
 fn read_device(sh: &Shared, addr: u64) -> u64 {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
-        let (v, level) = {
-            let mut p = sh.pl011.lock().unwrap();
-            let v = p.mmio(addr - UART_BASE, false, 0);
-            (v, p.irq_level())
-        };
-        let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
-        v
+        sh.pl011.lock().unwrap().mmio(addr - UART_BASE, false, 0)
     } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_read(sh, sh.guest.block.as_ref(), VIRTIO_SPI, addr - VIRTIO_BASE)
+        dev_read(sh, sh.guest.block.as_ref(), addr - VIRTIO_BASE)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_read(
-            sh,
-            sh.guest.net.as_ref(),
-            VIRTIO_NET_SPI,
-            addr - VIRTIO_NET_BASE,
-        )
+        dev_read(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
     } else {
@@ -622,28 +605,11 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
     b[..data.len()].copy_from_slice(data);
     let val = u64::from_le_bytes(b);
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
-        let level = {
-            let mut p = sh.pl011.lock().unwrap();
-            p.mmio(addr - UART_BASE, true, val);
-            p.irq_level()
-        };
-        let _ = sh.vm.set_irq_line(spi_gsi(UART_SPI), level);
+        sh.pl011.lock().unwrap().mmio(addr - UART_BASE, true, val);
     } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_write(
-            sh,
-            sh.guest.block.as_ref(),
-            VIRTIO_SPI,
-            addr - VIRTIO_BASE,
-            val,
-        );
+        dev_write(sh, sh.guest.block.as_ref(), addr - VIRTIO_BASE, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_write(
-            sh,
-            sh.guest.net.as_ref(),
-            VIRTIO_NET_SPI,
-            addr - VIRTIO_NET_BASE,
-            val,
-        );
+        dev_write(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
     }
@@ -651,17 +617,15 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
 
 /// Services a read of register `off` of a virtio-blk or virtio-net device.
 ///
-/// The device's captured events then go to the ledger, and its line is set to
-/// its level.
-fn dev_read<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, spi: u32, off: u64) -> u64 {
+/// The device's captured events then go to the ledger.
+fn dev_read<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, off: u64) -> u64 {
     let Some(dev) = dev else { return 0 };
-    let (v, level, events) = {
+    let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.guest.ram, off, false, 0);
-        (v, d.irq_level(), d.take_events())
+        (v, d.take_events())
     };
     drain(sh, &events);
-    let _ = sh.vm.set_irq_line(spi_gsi(spi), level);
     v
 }
 
@@ -669,34 +633,22 @@ fn dev_read<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, spi: u32, o
 /// device.
 ///
 /// The device's captured events then go to the ledger.
-fn dev_write<D: VirtioMmio>(
-    sh: &Shared,
-    dev: Option<&Arc<Mutex<D>>>,
-    spi: u32,
-    off: u64,
-    val: u64,
-) {
+fn dev_write<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, off: u64, val: u64) {
     let Some(dev) = dev else { return };
-    let (level, events) = {
+    let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.guest.ram, off, true, val);
-        (d.irq_level(), d.take_events())
+        d.take_events()
     };
     drain(sh, &events);
-    let _ = sh.vm.set_irq_line(spi_gsi(spi), level);
 }
 
 /// Services a read of virtio-vsock register `off`.
-// The vsock line is set under the device lock on every path, since the bridge
-// threads drive it too.
 fn vsock_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.guest.vsock.as_ref() else {
         return 0;
     };
-    let mut d = dev.lock().unwrap();
-    let v = d.mmio(&sh.guest.ram, off, false, 0);
-    let _ = sh.vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
-    v
+    dev.lock().unwrap().mmio(&sh.guest.ram, off, false, 0)
 }
 
 /// Services a write of `val` to virtio-vsock register `off`.
@@ -704,9 +656,7 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.guest.vsock.as_ref() else {
         return;
     };
-    let mut d = dev.lock().unwrap();
-    d.mmio(&sh.guest.ram, off, true, val);
-    let _ = sh.vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
+    dev.lock().unwrap().mmio(&sh.guest.ram, off, true, val);
 }
 
 /// Moves a device's captured `events` into the ledger.
@@ -723,15 +673,11 @@ fn drain(sh: &Shared, events: &[crate::events::CapturedEvent]) {
 /// The virtio-mmio surface `dev_read`/`dev_write` need (blk and net share it).
 trait VirtioMmio {
     fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64;
-    fn irq_level(&self) -> bool;
     fn take_events(&mut self) -> Vec<crate::events::CapturedEvent>;
 }
 impl VirtioMmio for VirtioBlk {
     fn mmio(&mut self, m: &GuestRam, o: u64, w: bool, v: u64) -> u64 {
         VirtioBlk::mmio(self, m, o, w, v)
-    }
-    fn irq_level(&self) -> bool {
-        VirtioBlk::irq_level(self)
     }
     fn take_events(&mut self) -> Vec<crate::events::CapturedEvent> {
         VirtioBlk::take_events(self)
@@ -740,9 +686,6 @@ impl VirtioMmio for VirtioBlk {
 impl VirtioMmio for VirtioNet {
     fn mmio(&mut self, m: &GuestRam, o: u64, w: bool, v: u64) -> u64 {
         VirtioNet::mmio(self, m, o, w, v)
-    }
-    fn irq_level(&self) -> bool {
-        VirtioNet::irq_level(self)
     }
     fn take_events(&mut self) -> Vec<crate::events::CapturedEvent> {
         VirtioNet::take_events(self)
@@ -790,7 +733,6 @@ fn spawn_vsock_bridge(
     listener: std::os::unix::net::UnixListener,
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
-    vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -820,7 +762,6 @@ fn spawn_vsock_bridge(
                     continue;
                 };
                 d.connect(&mem, port);
-                let _ = vm.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
                 (port, d.writer_gate(port))
             };
             let Some(writer_gate) = writer_gate else {
@@ -828,12 +769,7 @@ fn spawn_vsock_bridge(
             };
             // Guest -> host bytes the vCPU could not send. The writer waits
             // for the socket to take them, without the device lock.
-            let (dev3, mem3, vm3, stop3) = (
-                Arc::clone(&dev),
-                Arc::clone(&mem),
-                Arc::clone(&vm),
-                stop.clone(),
-            );
+            let (dev3, mem3, stop3) = (Arc::clone(&dev), Arc::clone(&mem), stop.clone());
             relays.retain(|handle| !handle.is_finished());
             relays.push(std::thread::spawn(move || loop {
                 writer_gate.wait_open();
@@ -844,20 +780,17 @@ fn spawn_vsock_bridge(
                         eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
                         let mut d = lock_or_recover(&dev3);
                         d.host_gone(&mem3, port);
-                        let _ = vm3.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
                         break;
                     }
                 }
                 let mut d = lock_or_recover(&dev3);
                 let needed = d.flush_to_host(&mem3, port);
-                let _ = vm3.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
                 if !needed {
                     break;
                 }
             }));
             let dev2 = Arc::clone(&dev);
             let mem2 = Arc::clone(&mem);
-            let vm2 = Arc::clone(&vm);
             let stop2 = stop.clone();
             relays.retain(|handle| !handle.is_finished());
             relays.push(std::thread::spawn(move || {
@@ -883,12 +816,7 @@ fn spawn_vsock_bridge(
                         Err(e) if crate::devices::virtio::vsock::retry_read(&e) => continue,
                         Err(_) => break,
                     };
-                    let gate = {
-                        let mut d = lock_or_recover(&dev2);
-                        let gate = d.host_data(&mem2, port, &buf[..n]);
-                        let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
-                        gate
-                    };
+                    let gate = lock_or_recover(&dev2).host_data(&mem2, port, &buf[..n]);
                     // `HostGate::wait` says why its result is not needed.
                     if let Some(gate) = gate {
                         gate.wait(|| stop2.keep_waiting(reader.as_fd()));
@@ -896,7 +824,6 @@ fn spawn_vsock_bridge(
                 }
                 let mut d = lock_or_recover(&dev2);
                 d.host_closed(&mem2, port);
-                let _ = vm2.set_irq_line(spi_gsi(VIRTIO_VSOCK_SPI), d.irq_level());
             }));
         }
         // Dropping the connections shuts their sockets down and opens their
@@ -916,18 +843,12 @@ fn spawn_net_tap_reader(
     reader: std::fs::File,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
-    vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         seccomp::install_thread(seccomp::Thread::Vmm);
         let relayed = TapRelay::new(reader).run(&stop, |frame| {
-            let level = {
-                let mut d = lock_or_recover(&dev);
-                d.deliver(&mem, frame);
-                d.irq_level()
-            };
-            let _ = vm.set_irq_line(spi_gsi(VIRTIO_NET_SPI), level);
+            lock_or_recover(&dev).deliver(&mem, frame);
         });
         if let Err(e) = relayed {
             eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
@@ -944,18 +865,12 @@ fn spawn_net_gateway_reader(
     reader: std::os::unix::net::UnixStream,
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
-    vm: Arc<VmFd>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         seccomp::install_thread(seccomp::Thread::Vmm);
         let relayed = GatewayRelay::new(reader).run(&stop, |frame| {
-            let level = {
-                let mut d = lock_or_recover(&dev);
-                d.deliver(&mem, frame);
-                d.irq_level()
-            };
-            let _ = vm.set_irq_line(spi_gsi(VIRTIO_NET_SPI), level);
+            lock_or_recover(&dev).deliver(&mem, frame);
         });
         if let Err(e) = relayed {
             eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
