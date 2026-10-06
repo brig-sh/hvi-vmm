@@ -26,7 +26,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
-use crate::console::ConsoleFilter;
+use crate::terminal::ConsoleFilter;
 
 /// Data register: reads pop the RX FIFO, writes are console bytes.
 const DR: u64 = 0x000;

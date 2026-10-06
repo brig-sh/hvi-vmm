@@ -224,12 +224,12 @@ the C0 controls a console uses, except ENQ. Of the escape sequences, it passes:
   blink and visibility, the alternate screen and bracketed paste;
 - the soft reset (DECSTR).
 
-`csi_allowed` and `DEC_MODES` in `src/console.rs` are the full definition. The
-filter drops every other escape sequence, every OSC, DCS, APC, PM and SOS
-string, every C1 control, and ENQ. That includes the hard reset (RIS), erasing
-the scrollback (`CSI 3 J`) and setting or clearing tab stops (HTS, TBC), which
-would change the terminal after hvi exits. Bytes that are not valid UTF-8 are
-shown as U+FFFD.
+`csi_allowed` and `DEC_MODES` in `src/terminal/filter.rs` are the full
+definition. The filter drops every other escape sequence, every OSC, DCS, APC,
+PM and SOS string, every C1 control, and ENQ. That includes the hard reset
+(RIS), erasing the scrollback (`CSI 3 J`) and setting or clearing tab stops
+(HTS, TBC), which would change the terminal after hvi exits. Bytes that are not
+valid UTF-8 are shown as U+FFFD.
 
 A guest therefore cannot set the window title, write the clipboard, draw a
 hyperlink or enable mouse reporting. A guest program that asks the terminal a

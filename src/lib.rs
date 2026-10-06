@@ -42,7 +42,6 @@
 
 pub mod arch;
 pub mod config;
-pub mod console;
 pub mod devices;
 pub mod events;
 pub mod hypervisor;
@@ -51,6 +50,7 @@ pub mod plugin;
 pub mod sandbox;
 pub mod sync;
 pub mod teardown;
+pub mod terminal;
 
 // The backend for the host's target. Each one exposes the same
 // `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.
