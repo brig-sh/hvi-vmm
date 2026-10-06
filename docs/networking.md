@@ -86,11 +86,10 @@ hvi boot --kernel <Image> --net-gateway /run/hvi/gateway.qemu
 If the socket cannot be reached, hvi does not fail. It warns and falls back to
 the built-in stub stack, so a guest can come up with no egress and no error.
 
-All three backends word it the same, differing only in the tag -- `[hvi]` on
-macOS, `[hvi/kvm]` on arm64 Linux, `[hvi/x86]` on x86-64:
+All three backends word it the same:
 
 ```text
-[hvi/kvm] WARNING: gateway /run/hvi/gateway.qemu unreachable (No such file or
+[hvi] WARNING: gateway /run/hvi/gateway.qemu unreachable (No such file or
 directory (os error 2)); falling back to the built-in stub stack (guest
 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
 ```

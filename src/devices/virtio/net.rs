@@ -54,6 +54,7 @@ use crate::devices::virtio::{
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
+use crate::LOG_PREFIX;
 
 const VIRTIO_NET_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_NET as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
@@ -741,7 +742,7 @@ impl VirtioNet {
                     if !self.tap_write_reported {
                         self.tap_write_reported = true;
                         eprintln!(
-                            "[hvi] virtio-net: the tap's send buffer is full; frames are dropped \
+                            "{LOG_PREFIX} virtio-net: the tap's send buffer is full; frames are dropped \
                              while it stays full"
                         );
                     }
@@ -753,7 +754,7 @@ impl VirtioNet {
                     if !self.tap_write_reported {
                         self.tap_write_reported = true;
                         eprintln!(
-                            "[hvi] virtio-net: writing to the tap failed ({e}); frames are dropped"
+                            "{LOG_PREFIX} virtio-net: writing to the tap failed ({e}); frames are dropped"
                         );
                     }
                 }

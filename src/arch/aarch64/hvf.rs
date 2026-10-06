@@ -61,6 +61,7 @@ use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, V
 use crate::sandbox::seatbelt;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::LOG_PREFIX;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
@@ -224,7 +225,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         gicr_size: GicConfig::get_redistributor_region_size()? as u64,
     };
     eprintln!(
-        "[hvi] {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
+        "{LOG_PREFIX} {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
         gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
     );
     // Every device window has to clear the GIC, and only here is it known how
@@ -287,7 +288,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     let virtio = match &cfg.disk {
         Some(path) => {
-            eprintln!("[hvi] virtio-blk: {path}");
+            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
             Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
         }
         None => None,
@@ -309,25 +310,27 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         match std::os::unix::net::UnixStream::connect(sock) {
             Ok(stream) => match stream.try_clone() {
                 Ok(reader) => {
-                    eprintln!("[hvi] virtio-net: gvisor-tap gateway relay via {sock} (guest 10.87.0.2, gw/DNS 10.87.0.1)");
+                    eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock} (guest 10.87.0.2, gw/DNS 10.87.0.1)");
                     net_reader = Some(reader);
                     Some(VirtioNet::with_gateway(stream))
                 }
                 Err(e) => {
-                    eprintln!("[hvi] WARNING: cannot clone gateway socket ({e}); net disabled");
+                    eprintln!(
+                        "{LOG_PREFIX} WARNING: cannot clone gateway socket ({e}); net disabled"
+                    );
                     None
                 }
             },
             Err(e) => {
                 eprintln!(
-                    "[hvi] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
+                    "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
                     net::stub_stack_line()
                 );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        eprintln!("[hvi] virtio-net: {}", net::stub_stack_line());
+        eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
         Some(VirtioNet::new())
     } else {
         None
@@ -336,7 +339,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let net = net::share(net_dev, cfg.net_mac);
 
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
-        eprintln!("[hvi] virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
+        eprintln!("{LOG_PREFIX} virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
         Arc::new(Mutex::new(VirtioVsock::new()))
     });
     // Bind before Seatbelt is installed. Accepting on this already-open
@@ -397,15 +400,15 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         // would have ended it in a single run.
         if index == 0 {
             match fdlimit::raise_open_file_limit() {
-                Ok(limit) => eprintln!("[hvi] open-file limit: {limit}"),
+                Ok(limit) => eprintln!("{LOG_PREFIX} open-file limit: {limit}"),
                 Err(e) => eprintln!(
-                    "[hvi] open-file limit: could not raise it ({e}); \
+                    "{LOG_PREFIX} open-file limit: could not raise it ({e}); \
                      a busy guest may see EMFILE as I/O errors"
                 ),
             }
         }
         eprintln!(
-            "[hvi] virtio-fs[{index}]: {} as {:?} ({access})",
+            "{LOG_PREFIX} virtio-fs[{index}]: {} as {:?} ({access})",
             root.display(),
             share.tag
         );
@@ -435,7 +438,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
     if emitter.enabled() {
         eprintln!(
-            "[hvi] event ledger: {}",
+            "{LOG_PREFIX} event ledger: {}",
             cfg.events.as_deref().unwrap_or("")
         );
     }
@@ -497,9 +500,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if cfg.sandbox {
         seatbelt::enter_with_shares(&fs_access)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
-        eprintln!("[hvi] seatbelt sandbox: on (deny default)");
+        eprintln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
     } else {
-        eprintln!("[hvi] seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority");
+        eprintln!(
+            "{LOG_PREFIX} seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority"
+        );
     }
 
     // Helper threads. Each polls its stop token beside its own descriptor, or
@@ -602,7 +607,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     kick_until_finished(&input, deadline);
     for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
         if let Err(e) = join_by(name, thread, deadline) {
-            eprintln!("[hvi] {e}; left running");
+            eprintln!("{LOG_PREFIX} {e}; left running");
             failure.get_or_insert(e.into());
         }
     }
@@ -618,7 +623,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Err(poisoned) => poisoned.into_inner(),
         };
         eprintln!(
-            "[hvi] virtio-fs[{index}]: peak {} of {} guest handles",
+            "{LOG_PREFIX} virtio-fs[{index}]: peak {} of {} guest handles",
             dev.peak_handles(),
             dev.handle_limit()
         );
@@ -635,9 +640,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 )
             })
             .collect();
-        eprintln!("[hvi] virtio-fs[{index}] ops: {}", hist.join(" "));
+        eprintln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
         let (hits, waits, misses) = dev.readahead_stats();
-        eprintln!("[hvi] virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}");
+        eprintln!(
+            "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
+        );
     }
 
     if let Some(e) = failure {
@@ -686,7 +693,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         Err(e) => {
             // The secondaries would otherwise wait for a CPU_ON that cannot
             // arrive, and the join in `boot` with them.
-            eprintln!("[hvi] cpu{cpu_id}: vcpu_create failed: {e:?}");
+            eprintln!("{LOG_PREFIX} cpu{cpu_id}: vcpu_create failed: {e:?}");
             stop_all(&sh);
             return;
         }
@@ -721,7 +728,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         match mbox.take() {
             Some((entry, ctx)) => {
                 drop(mbox);
-                eprintln!("[hvi] cpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
+                eprintln!("{LOG_PREFIX} cpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
                 let _ = vcpu.set_reg(Reg::PC, entry);
                 let _ = vcpu.set_reg(Reg::X0, ctx);
                 let _ = vcpu.set_reg(Reg::CPSR, 0x3c5);
@@ -752,7 +759,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             }
 
             if let Err(e) = vcpu.run() {
-                eprintln!("[hvi] cpu{cpu_id}: vcpu run failed: {e:?}");
+                eprintln!("{LOG_PREFIX} cpu{cpu_id}: vcpu run failed: {e:?}");
                 break;
             }
             let exit = vcpu.get_exit_info();
@@ -808,7 +815,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                 advance_pc(&vcpu);
                             } else {
                                 eprintln!(
-                                    "[hvi] cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
+                                    "{LOG_PREFIX} cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
                                     vcpu.get_reg(Reg::PC).unwrap_or(0)
                                 );
                                 break;
@@ -825,7 +832,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         Ec::Other(0x01) => {} // WFx: hvf handled the wait.
                         other => {
                             eprintln!(
-                                "[hvi] cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
+                                "{LOG_PREFIX} cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
                                 vcpu.get_reg(Reg::PC).unwrap_or(0)
                             );
                             break;
@@ -840,7 +847,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                     // hvf could not say why it exited, so there is nothing to
                     // resume into.
                     eprintln!(
-                        "[hvi] cpu{cpu_id}: unknown exit reason (pc {:#x})",
+                        "{LOG_PREFIX} cpu{cpu_id}: unknown exit reason (pc {:#x})",
                         vcpu.get_reg(Reg::PC).unwrap_or(0)
                     );
                     break;
@@ -859,7 +866,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown payload".to_string());
         eprintln!(
-            "[hvi] cpu{cpu_id}: panicked ({what}); last exit {:?}, pc {:#x}",
+            "{LOG_PREFIX} cpu{cpu_id}: panicked ({what}); last exit {:?}, pc {:#x}",
             last_exit(),
             vcpu.get_reg(Reg::PC).unwrap_or(0)
         );
@@ -1260,14 +1267,14 @@ fn spawn_vsock_bridge(
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        eprintln!("[hvi] vsock bridge: listening");
+        eprintln!("{LOG_PREFIX} vsock bridge: listening");
         let mut relays: Vec<JoinHandle<()>> = Vec::new();
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("[hvi] vsock bridge: {e}; no longer accepting");
+                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; no longer accepting");
                     break;
                 }
             }
@@ -1312,7 +1319,7 @@ fn spawn_vsock_bridge(
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) => {
-                        eprintln!("[hvi] vsock bridge: {e}; guest bytes dropped");
+                        eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
                         let mut d = lock_or_recover(&dev3);
                         d.host_gone(&mem3, port);
                         let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
@@ -1348,7 +1355,7 @@ fn spawn_vsock_bridge(
                         // device releases it.
                         Ok(false) => break,
                         Err(e) => {
-                            eprintln!("[hvi] vsock bridge: {e}; connection closed");
+                            eprintln!("{LOG_PREFIX} vsock bridge: {e}; connection closed");
                             break;
                         }
                     }
@@ -1414,7 +1421,7 @@ fn spawn_net_gateway_reader(
             kick_all(&vm, &handles);
         });
         if let Err(e) = relayed {
-            eprintln!("[hvi] virtio-net: {e}; gateway relay stopped");
+            eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
         }
     })
 }
@@ -1544,7 +1551,7 @@ fn spawn_input_thread(
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("[hvi] console: {e}; console input stopped");
+                    eprintln!("{LOG_PREFIX} console: {e}; console input stopped");
                     break;
                 }
             }
