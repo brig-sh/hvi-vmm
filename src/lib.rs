@@ -45,6 +45,7 @@ pub mod config;
 pub mod devices;
 pub mod events;
 pub mod hypervisor;
+pub(crate) mod io_threads;
 pub mod memory;
 pub mod plugin;
 pub mod sandbox;

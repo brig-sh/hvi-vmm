@@ -51,17 +51,18 @@ use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
-use crate::devices::virtio::net::{self, GatewayRelay, VirtioNet};
+use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
+use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
-use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
+use crate::teardown::StopSource;
 use crate::terminal;
 use crate::LOG_PREFIX;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
@@ -607,58 +608,37 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
 
-    // Helper threads. Each polls its stop token beside its own descriptor, or
-    // takes the stop through its `FsWake`, and is joined after the vCPUs.
+    // I/O threads. Each polls its stop token beside its own descriptor, or
+    // takes the stop through its `FsWake` or `ReadaheadStop`, and is joined
+    // after the vCPUs.
     install_kick_handler();
-    let input = {
-        let kick = Arc::clone(&shared.guest.vcpus);
-        let pl011 = Arc::clone(&shared.pl011);
-        terminal::input::spawn(
-            shared.plugin.clone(),
-            stop_source.token(),
-            move || kick.kicker().kick(0),
-            move |byte| lock_or_recover(&pl011).push_rx(byte),
-        )
-    };
-    let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
+    let mut io_threads = IoThreads::start(
+        stop_source,
+        &shared.guest,
+        shared.plugin.clone(),
+        {
+            let pl011 = Arc::clone(&shared.pl011);
+            move |byte| lock_or_recover(&pl011).push_rx(byte)
+        },
+        bridge,
+        net_reader.map(NetSource::Gateway),
+    );
     let mut readahead_stops = Vec::new();
-    if let Some(bridge) = bridge {
-        let stop = stop_source.token();
-        helpers.push((
-            "agent bridge",
-            std::thread::spawn(move || {
-                bridge.run(&stop);
-            }),
-        ));
-    }
-    if let (Some(reader), Some(dev)) = (net_reader, &shared.guest.net) {
-        helpers.push((
-            "gateway relay",
-            spawn_net_gateway_reader(
-                reader,
-                Arc::clone(dev),
-                Arc::clone(&shared.guest.ram),
-                stop_source.token(),
-            ),
-        ));
-    }
     // Each virtio-fs device gets its own worker thread, which serves the
     // requests a vCPU leaves past `FS_INLINE_BUDGET`. See `spawn_fs_worker`.
     for fs in &shared.fs {
-        helpers.push((
+        io_threads.push(
             "virtio-fs worker",
             spawn_fs_worker(
                 Arc::clone(&fs.dev),
                 Arc::clone(&shared.guest.ram),
                 Arc::clone(&fs.wake),
             ),
-        ));
-        let (workers, stop) = lock_or_recover(&fs.dev).start_readahead();
-        helpers.extend(
-            workers
-                .into_iter()
-                .map(|worker| ("virtio-fs readahead", worker)),
         );
+        let (workers, stop) = lock_or_recover(&fs.dev).start_readahead();
+        for worker in workers {
+            io_threads.push("virtio-fs readahead", worker);
+        }
         readahead_stops.push(stop);
     }
 
@@ -674,20 +654,16 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // The guest has stopped. End the I/O threads (see `teardown`) and write out
     // the ledger tail, which the flush cadence alone would leave in the buffer.
-    stop_source.request_stop();
+    // The virtio-fs threads wait on no descriptor, so each gets its own stop
+    // first.
     for fs in &shared.fs {
         fs.wake.stop();
     }
     for stop in &readahead_stops {
         stop.stop();
     }
-    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
-    kick_until_finished(&input, deadline);
-    for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
-        if let Err(e) = join_by(name, thread, deadline) {
-            eprintln!("{LOG_PREFIX} {e}; left running");
-            failure.get_or_insert(e.into());
-        }
+    if let Err(e) = io_threads.stop() {
+        failure.get_or_insert(e.into());
     }
     lock_or_recover(&shared.guest.ledger).flush();
 
@@ -1141,29 +1117,6 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
             fs.wake.wake();
         }
     }
-}
-
-/// Reads gateway->guest Ethernet frames (4-byte big-endian length prefix, the
-/// gvisor-tap-vsock QEMU stream protocol) and injects each into the guest RX
-/// queue under the device lock, where the device raises its line. Exits when
-/// the gateway closes the connection or the stop is requested.
-///
-/// [`GatewayRelay`] owns the wait, the drain and the framing. This thread
-/// supplies the delivery under the device lock.
-fn spawn_net_gateway_reader(
-    reader: std::os::unix::net::UnixStream,
-    dev: Arc<Mutex<VirtioNet>>,
-    mem: Arc<GuestRam>,
-    stop: StopToken,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let relayed = GatewayRelay::new(reader).run(&stop, |frame| {
-            lock_or_recover(&dev).deliver(&mem, frame);
-        });
-        if let Err(e) = relayed {
-            eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
-        }
-    })
 }
 
 /// Runs a virtio-fs device's FUSE servicing on a thread of its own.
