@@ -411,7 +411,7 @@ how it works.
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
-| Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
+| Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the

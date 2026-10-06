@@ -73,7 +73,10 @@ exit path, is dropped. Call it from a thread of your own.
 **4. An `IoSink` must not block.** It is called with the device lock held. No
 `write(2)`, no allocation you can avoid. Count in the sink, set a dirty flag,
 and do the writing in `safepoint`, where slow things are allowed. `IoTrace` is
-the worked example.
+the worked example. A sink must not keep the `VmHandle` either: the device holds
+the sink and the handle holds the device, so the three would keep one another
+alive after `boot` returns. A sink that needs the handle keeps a `Weak` from
+`Arc::downgrade`.
 
 **5. `request` must return promptly.** It runs on the VMM's console thread, and
 the stop waits for that thread. A `request` still running a second after the

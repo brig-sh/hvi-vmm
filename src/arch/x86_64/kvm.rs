@@ -41,7 +41,7 @@
 // VMM's own.
 #![allow(clippy::disallowed_methods)]
 
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -64,10 +64,11 @@ use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
+use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
 use crate::hypervisor::kvm::{immediate_exit, kick_handle, Kicker};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
-use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
+use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seccomp;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
@@ -86,22 +87,13 @@ const PDE64_PRESENT_RW: u64 = 0x03; // present | writable (table)
 #[derive(Clone)]
 struct Shared {
     vm: Arc<VmFd>,
-    mem: Arc<GuestRam>,
+    /// The guest's RAM, virtio devices and vCPUs.
+    guest: Arc<Guest<Kicker>>,
     uart: Arc<Mutex<Uart16550>>,
     /// The CMOS RTC: without it a guest hangs in read_persistent_clock64().
     rtc: Arc<Mutex<RtcCmos>>,
-    virtio: Option<Arc<Mutex<VirtioBlk>>>,
-    net: Option<Arc<Mutex<VirtioNet>>>,
-    vsock: Option<Arc<Mutex<VirtioVsock>>>,
-    emit: Arc<Mutex<Emitter>>,
-    /// The vCPU threads, the stop and the quiesce that parks them.
-    vcpus: Arc<Vcpus<Kicker>>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
-    /// The object backing guest RAM, for a plugin that hands the same pages to
-    /// another process.
-    ram_file: Arc<std::fs::File>,
-    sandbox_id: String,
 }
 
 /// Splices the parameters we own into a caller-supplied kernel command line.
@@ -322,26 +314,29 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let vm = Arc::new(vm);
     let shared = Shared {
         vm: Arc::clone(&vm),
-        mem: ram,
+        guest: Arc::new(Guest {
+            arch: GuestArch::X86_64,
+            sandbox_id: cfg.sandbox_id.clone(),
+            ram,
+            ram_file: Arc::clone(shared_ram.file()),
+            ledger: Arc::new(Mutex::new(Emitter::new(
+                cfg.events.as_deref(),
+                &cfg.sandbox_id,
+            )?)),
+            block: virtio,
+            net,
+            vsock,
+            vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
+        }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
-        virtio,
-        net,
-        vsock,
-        emit: Arc::new(Mutex::new(Emitter::new(
-            cfg.events.as_deref(),
-            &cfg.sandbox_id,
-        )?)),
-        vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
         plugin: cfg.plugin.clone(),
-        ram_file: Arc::clone(shared_ram.file()),
-        sandbox_id: cfg.sandbox_id.clone(),
     };
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
     if let Some(obs) = &shared.plugin {
-        obs.attach(Arc::new(shared.clone()) as Arc<dyn VmHandle>)?;
+        obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
     }
 
     // Arm the seccomp filters before the first thread is spawned. This compiles
@@ -369,7 +364,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Helper threads. Each polls its stop token beside its own descriptor and
     // is joined after the vCPUs; `teardown` describes the stop.
     let input = {
-        let (sh, vcpus) = (shared.clone(), Arc::clone(&shared.vcpus));
+        let (sh, vcpus) = (shared.clone(), Arc::clone(&shared.guest.vcpus));
         terminal::input::spawn(
             shared.plugin.clone(),
             stop_source.token(),
@@ -382,37 +377,37 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         )
     };
     let mut helpers: Vec<(&str, JoinHandle<()>)> = Vec::new();
-    if let (Some(listener), Some(dev)) = (agent_listener, &shared.vsock) {
+    if let (Some(listener), Some(dev)) = (agent_listener, &shared.guest.vsock) {
         helpers.push((
             "agent bridge",
             spawn_vsock_bridge(
                 listener,
                 Arc::clone(dev),
-                Arc::clone(&shared.mem),
+                Arc::clone(&shared.guest.ram),
                 Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
     }
-    if let (Some(reader), Some(dev)) = (net_reader, &shared.net) {
+    if let (Some(reader), Some(dev)) = (net_reader, &shared.guest.net) {
         helpers.push((
             "gateway relay",
             spawn_net_gateway_reader(
                 reader,
                 Arc::clone(dev),
-                Arc::clone(&shared.mem),
+                Arc::clone(&shared.guest.ram),
                 Arc::clone(&vm),
                 stop_source.token(),
             ),
         ));
     }
-    if let (Some(reader), Some(dev)) = (net_tap_reader, &shared.net) {
+    if let (Some(reader), Some(dev)) = (net_tap_reader, &shared.guest.net) {
         helpers.push((
             "tap relay",
             spawn_net_tap_reader(
                 reader,
                 Arc::clone(dev),
-                Arc::clone(&shared.mem),
+                Arc::clone(&shared.guest.ram),
                 Arc::clone(&vm),
                 stop_source.token(),
             ),
@@ -428,7 +423,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 seccomp::install_thread(seccomp::Thread::Vmm);
                 for _ in 0..4 {
                     match watch.sleep(std::time::Duration::from_secs(2)) {
-                        Ok(true) => sh.vcpus.kicker().kick(0),
+                        Ok(true) => sh.guest.vcpus.kicker().kick(0),
                         Ok(false) => break,
                         Err(e) => {
                             eprintln!("{LOG_PREFIX} trace watchdog: {e}; trace watchdog stopped");
@@ -444,7 +439,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
-    let (threads, spawned) = shared.vcpus.spawn(
+    let (threads, spawned) = shared.guest.vcpus.spawn(
         vcpus
             .into_iter()
             .zip(kick_handles)
@@ -470,7 +465,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             // reported.
             eprintln!("{LOG_PREFIX} {e}");
             failure.get_or_insert(e.into());
-            shared.vcpus.stop();
+            shared.guest.vcpus.stop();
         }
         (Ok(()), Some((vmm, vcpu))) => {
             if seccomp::log_mode() {
@@ -503,12 +498,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             failure.get_or_insert(e.into());
         }
     }
-    lock_or_recover(&shared.emit).flush();
+    lock_or_recover(&shared.guest.ledger).flush();
     if let Some(e) = failure {
         return Err(e);
     }
 
-    Ok(shared.vcpus.stop_reason())
+    Ok(shared.guest.vcpus.stop_reason())
 }
 
 /// A flat segment descriptor for `KVM_SET_SREGS` (base 0, 4 GiB limit).
@@ -599,11 +594,11 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     // ended alone would otherwise leave the VM running with one vCPU fewer and
     // the join in `boot` blocked. Declared before the registration so the
     // registration drops first: the entry is removed before the stop kicks.
-    let _stop = sh.vcpus.stop_on_drop();
-    let _registration = sh.vcpus.kicker().register(cpu_id, kick_handle);
+    let _stop = sh.guest.vcpus.stop_on_drop();
+    let _registration = sh.guest.vcpus.kicker().register(cpu_id, kick_handle);
     // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
     // yet waits inside the run, where a kick reaches it.
-    sh.vcpus.mark_started();
+    sh.guest.vcpus.mark_started();
     let is_boot = cpu_id == 0;
     let dbg = std::env::var_os("HVI_X86_TRACE").is_some();
     let mut n_exit = 0u64;
@@ -612,12 +607,12 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         // Cleared before `running` is read, so a kick that lands from here on
         // ends the run below at once.
         immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
-        if !sh.vcpus.is_running() {
+        if !sh.guest.vcpus.is_running() {
             break;
         }
         // Safe point for every vCPU: park here while cpu0 lets a plugin
         // look at the guest.
-        sh.vcpus.checkpoint();
+        sh.guest.vcpus.checkpoint();
         // The plugin runs on cpu0, between guest entries, because only this
         // thread can read this vCPU's registers. It is on the hot path: with
         // no plugin this is a null check.
@@ -625,7 +620,7 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             if let Some(obs) = sh.plugin.clone() {
                 obs.safepoint(&Cpu {
                     vcpu: &vcpu,
-                    sh: &sh,
+                    guest: &sh.guest,
                 });
             }
         }
@@ -679,14 +674,14 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             }
             Ok(VcpuExit::Shutdown) => {
                 if dbg {
-                    dump_regs(&vcpu, &sh.mem, cpu_id, "SHUTDOWN");
+                    dump_regs(&vcpu, &sh.guest.ram, cpu_id, "SHUTDOWN");
                 }
-                sh.vcpus.set_stop_reason(Stop::SystemReset);
+                sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
                 break;
             }
             Ok(VcpuExit::Intr) => {
                 if dbg && is_boot {
-                    dump_regs(&vcpu, &sh.mem, cpu_id, "kick");
+                    dump_regs(&vcpu, &sh.guest.ram, cpu_id, "kick");
                 }
             }
             Ok(other) => {
@@ -695,13 +690,24 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             }
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
                 if dbg && is_boot {
-                    dump_regs(&vcpu, &sh.mem, cpu_id, "kick(EINTR)");
+                    dump_regs(&vcpu, &sh.guest.ram, cpu_id, "kick(EINTR)");
                 }
             }
             Err(e) => {
                 eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
                 break;
             }
+        }
+    }
+}
+
+impl VcpuRegs for VcpuFd {
+    fn regs(&self) -> RegsView {
+        // CR3 is the walk root on x86-64; the arm64 registers stay zero.
+        RegsView {
+            root: self.get_sregs().map(|s| s.cr3).unwrap_or(0),
+            pc: self.get_regs().map(|r| r.rip).unwrap_or(0),
+            ..RegsView::default()
         }
     }
 }
@@ -802,18 +808,21 @@ fn pio_dispatch_write(
     }
 }
 
+/// Services an `in` from `port`.
 fn pio_read(sh: &Shared, port: u16) -> u8 {
     pio_dispatch_read(&sh.uart, &sh.rtc, port, |level| {
         let _ = sh.vm.set_irq_line(COM1_GSI, level);
     })
 }
 
+/// Services an `out` of `val` to `port`.
 fn pio_write(sh: &Shared, port: u16, val: u8) {
     pio_dispatch_write(&sh.uart, &sh.rtc, port, val, |level| {
         let _ = sh.vm.set_irq_line(COM1_GSI, level);
     });
 }
 
+/// Services an MMIO read of the virtio register at `addr`.
 fn mmio_read(sh: &Shared, addr: u64) -> u64 {
     if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
         blk_read(sh, addr - VIRTIO_BLK_BASE)
@@ -826,6 +835,7 @@ fn mmio_read(sh: &Shared, addr: u64) -> u64 {
     }
 }
 
+/// Services an MMIO write of `val` to the virtio register at `addr`.
 fn mmio_write(sh: &Shared, addr: u64, val: u64) {
     if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
         blk_write(sh, addr - VIRTIO_BLK_BASE, val);
@@ -836,173 +846,102 @@ fn mmio_write(sh: &Shared, addr: u64, val: u64) {
     }
 }
 
+/// Moves a device's captured `events` into the ledger.
 fn drain(sh: &Shared, events: &[CapturedEvent]) {
     if events.is_empty() {
         return;
     }
-    let mut e = sh.emit.lock().unwrap();
+    let mut e = sh.guest.ledger.lock().unwrap();
     for ev in events {
         e.captured(ev);
     }
 }
 
+/// Services a read of virtio-blk register `off`.
+///
+/// The device's captured events then go to the ledger.
 fn blk_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.virtio.as_ref() else {
+    let Some(dev) = sh.guest.block.as_ref() else {
         return 0;
     };
     let (v, events) = {
         let mut d = dev.lock().unwrap();
-        let v = d.mmio(&sh.mem, off, false, 0);
+        let v = d.mmio(&sh.guest.ram, off, false, 0);
         set_line(&sh.vm, VIRTIO_BLK_GSI, &d);
         (v, d.take_events())
     };
     drain(sh, &events);
     v
 }
+
+/// Services a write of `val` to virtio-blk register `off`.
+///
+/// The device's captured events then go to the ledger.
 fn blk_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.virtio.as_ref() else {
+    let Some(dev) = sh.guest.block.as_ref() else {
         return;
     };
     let events = {
         let mut d = dev.lock().unwrap();
-        d.mmio(&sh.mem, off, true, val);
+        d.mmio(&sh.guest.ram, off, true, val);
         set_line(&sh.vm, VIRTIO_BLK_GSI, &d);
         d.take_events()
     };
     drain(sh, &events);
 }
+
+/// Services a read of virtio-net register `off`.
+///
+/// The device's captured events then go to the ledger.
 fn net_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.net.as_ref() else { return 0 };
+    let Some(dev) = sh.guest.net.as_ref() else {
+        return 0;
+    };
     let (v, events) = {
         let mut d = dev.lock().unwrap();
-        let v = d.mmio(&sh.mem, off, false, 0);
+        let v = d.mmio(&sh.guest.ram, off, false, 0);
         set_line(&sh.vm, VIRTIO_NET_GSI, &d);
         (v, d.take_events())
     };
     drain(sh, &events);
     v
 }
+
+/// Services a write of `val` to virtio-net register `off`.
+///
+/// The device's captured events then go to the ledger.
 fn net_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.net.as_ref() else { return };
+    let Some(dev) = sh.guest.net.as_ref() else {
+        return;
+    };
     let events = {
         let mut d = dev.lock().unwrap();
-        d.mmio(&sh.mem, off, true, val);
+        d.mmio(&sh.guest.ram, off, true, val);
         set_line(&sh.vm, VIRTIO_NET_GSI, &d);
         d.take_events()
     };
     drain(sh, &events);
 }
+
+/// Services a read of virtio-vsock register `off`.
 fn vsock_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.vsock.as_ref() else {
+    let Some(dev) = sh.guest.vsock.as_ref() else {
         return 0;
     };
     let mut d = dev.lock().unwrap();
-    let v = d.mmio(&sh.mem, off, false, 0);
+    let v = d.mmio(&sh.guest.ram, off, false, 0);
     set_line(&sh.vm, VIRTIO_VSOCK_GSI, &d);
     v
 }
+
+/// Services a write of `val` to virtio-vsock register `off`.
 fn vsock_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.vsock.as_ref() else { return };
+    let Some(dev) = sh.guest.vsock.as_ref() else {
+        return;
+    };
     let mut d = dev.lock().unwrap();
-    d.mmio(&sh.mem, off, true, val);
+    d.mmio(&sh.guest.ram, off, true, val);
     set_line(&sh.vm, VIRTIO_VSOCK_GSI, &d);
-}
-
-/// [`VmHandle`] over the shared VM state: what a plugin gets at attach time.
-impl VmHandle for Shared {
-    fn arch(&self) -> GuestArch {
-        GuestArch::X86_64
-    }
-
-    fn sandbox_id(&self) -> &str {
-        &self.sandbox_id
-    }
-
-    fn ram(&self) -> &GuestRam {
-        &self.mem
-    }
-
-    fn ram_fd(&self) -> BorrowedFd<'_> {
-        self.ram_file.as_fd()
-    }
-
-    fn ram_regions(&self) -> Vec<RamRegion> {
-        // Both halves. Reporting only the low one leaves a plugin mapping
-        // less than the guest has and reading nothing above the MMIO hole --
-        // which looks like an empty guest, not like a missing region.
-        self.mem.regions()
-    }
-
-    fn ledger(&self) -> &Arc<Mutex<Emitter>> {
-        &self.emit
-    }
-
-    fn has_block(&self) -> bool {
-        self.virtio.is_some()
-    }
-
-    fn has_net(&self) -> bool {
-        self.net.is_some()
-    }
-
-    fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
-        if let Some(dev) = &self.virtio {
-            if let Ok(mut d) = dev.lock() {
-                d.set_io_sink(sink);
-            }
-        }
-    }
-
-    fn set_net_sink(&self, sink: Arc<dyn IoSink>) {
-        if let Some(dev) = &self.net {
-            if let Ok(mut d) = dev.lock() {
-                d.set_io_sink(sink);
-            }
-        }
-    }
-
-    fn kick(&self) {
-        // cpu0 is the one that reaches the plugin hook.
-        self.vcpus.kicker().kick(0);
-    }
-}
-
-/// [`CpuHandle`] over the boot vCPU at a safe point. Borrows rather than
-/// clones: it lives only for the duration of one [`Plugin::safepoint`] call.
-struct Cpu<'a> {
-    vcpu: &'a VcpuFd,
-    sh: &'a Shared,
-}
-
-impl CpuHandle for Cpu<'_> {
-    fn arch(&self) -> GuestArch {
-        GuestArch::X86_64
-    }
-
-    fn ram(&self) -> &GuestRam {
-        &self.sh.mem
-    }
-
-    fn regs(&self) -> RegsView {
-        // CR3 is the walk root on x86-64; the arm64 registers stay zero.
-        RegsView {
-            root: self.vcpu.get_sregs().map(|s| s.cr3).unwrap_or(0),
-            pc: self.vcpu.get_regs().map(|r| r.rip).unwrap_or(0),
-            ..RegsView::default()
-        }
-    }
-
-    fn pause(&self) -> bool {
-        self.sh.vcpus.pause()
-    }
-
-    fn resume(&self) {
-        self.sh.vcpus.resume();
-    }
-
-    fn ledger(&self) -> &Arc<Mutex<Emitter>> {
-        &self.sh.emit
-    }
 }
 
 /// Bridges the host agent Unix socket to the guest vsock device.
@@ -1334,6 +1273,7 @@ fn bind_unix(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+    use crate::plugin::CpuHandle;
     use crate::signal::kick_signal;
     use std::fs::File;
     use std::os::fd::AsRawFd;

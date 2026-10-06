@@ -15,11 +15,13 @@
 //! The code the backends share, whichever guest architecture and hypervisor
 //! they run.
 //!
-//! `vcpus` holds the vCPU threads of a VM, from their spawn to their join, and
-//! `kvm` the kick the two KVM backends share. `quiesce` parks every vCPU at a
-//! safe point between guest entries, so a plugin that reads guest memory sees a
-//! guest that is not running.
+//! `guest` holds the guest RAM, the devices and the vCPUs every backend keeps,
+//! and is the handle a plugin gets. `vcpus` holds the vCPU threads of a VM,
+//! from their spawn to their join, and `kvm` the kick the two KVM backends
+//! share. `quiesce` parks every vCPU at a safe point between guest entries, so
+//! a plugin that reads guest memory sees a guest that is not running.
 
+pub(crate) mod guest;
 #[cfg(target_os = "linux")]
 pub(crate) mod kvm;
 pub mod quiesce;
