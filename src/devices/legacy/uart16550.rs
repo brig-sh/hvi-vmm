@@ -33,7 +33,7 @@ use std::io::{self, Write};
 use vm_superio::serial::NoEvents;
 use vm_superio::{Serial, Trigger};
 
-use crate::console::ConsoleFilter;
+use crate::terminal::ConsoleFilter;
 
 /// The register bits the interrupt state is computed from. The crate keeps its
 /// own register bits private.

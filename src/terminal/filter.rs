@@ -19,14 +19,7 @@
 //! clipboard, OSC 8 draws a hyperlink, OSC 2 sets the window title. Others make
 //! the terminal answer on its input side, which hvi reads as console input. An
 //! answer still queued when hvi exits is read by the operator's shell.
-//!
-//! [`ConsoleFilter`] passes text, the C0 controls a console uses, and an
-//! allowlist of escape sequences for cursor movement, erasing, scrolling,
-//! colors and a few display modes. It drops every other escape sequence, every
-//! control string (OSC, DCS, SOS, PM and APC), every C1 control and ENQ, and it
-//! replaces malformed UTF-8 with U+FFFD. It emits an escape sequence only once
-//! the sequence is complete and allowed, so the terminal parses every byte it
-//! receives from its ground state.
+//! [`ConsoleFilter`] passes only the sequences a console needs.
 
 /// ESC, which starts every escape sequence.
 const ESC: u8 = 0x1b;
@@ -72,9 +65,16 @@ enum State {
 
 /// A byte-at-a-time filter over guest console output.
 ///
+/// The filter passes text, the C0 controls a console uses, and an allowlist of
+/// escape sequences for cursor movement, erasing, scrolling, colors and a few
+/// display modes. It drops every other escape sequence, every control string
+/// (OSC, DCS, SOS, PM and APC), every C1 control and ENQ, and it replaces
+/// malformed UTF-8 with U+FFFD. It emits an escape sequence only once the
+/// sequence is complete and allowed, so the terminal parses every byte it
+/// receives from its ground state.
+///
 /// The filter keeps its state across calls, so a sequence split across two
-/// writes is judged as one. See the [module documentation](self) for what it
-/// passes and what it drops.
+/// writes is judged as one.
 #[derive(Debug)]
 pub struct ConsoleFilter {
     state: State,

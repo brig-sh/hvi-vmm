@@ -589,9 +589,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let _ = j.join();
     }
 
-    // The guest has stopped. End the helper threads (see `teardown`) and write
-    // out the ledger tail, which the flush cadence alone would leave in the
-    // buffer.
+    // The guest has stopped. End the I/O threads (see `teardown`) and write out
+    // the ledger tail, which the flush cadence alone would leave in the buffer.
     stop_source.request_stop();
     for fs in &shared.fs {
         fs.wake.stop();

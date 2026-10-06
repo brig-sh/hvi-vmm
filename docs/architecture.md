@@ -324,7 +324,7 @@ wraps `vm-superio`'s `Serial`. hvi sets COM1's line after every access, with
 the UART lock held. The guest programs the pin as edge-triggered, so the line
 is high exactly when an IIR read would report an interrupt. To keep it so, the
 wrapper tracks THR-empty itself and answers IIR reads. Both write guest output
-to stdout through `console::ConsoleFilter`, which drops the escape sequences
+to stdout through `terminal::ConsoleFilter`, which drops the escape sequences
 that change host state or make the terminal answer (see
 [security.md](security.md#what-the-guest-can-reach)).
 
@@ -403,7 +403,8 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`; `console.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs` |
+| Host terminal | `terminal/`: `filter.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
