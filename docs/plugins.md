@@ -64,9 +64,8 @@ kick your request waits for the next unrelated exit, or never lands.
 This is the easiest thing to get wrong, and it fails only against idle guests,
 which is to say not on your desk.
 
-`kick()` is not identical across backends. The macOS backend breaks every vCPU
-out of the hypervisor. The two KVM backends kick the boot vCPU only, which is
-the one that reaches the hook.
+`kick()` breaks the boot vCPU out of the hypervisor, since it is the one that
+reaches `safepoint`. The other vCPUs keep running.
 
 A `kick()` from the vCPU's own thread, inside `safepoint` or an `IoSink` on its
 exit path, is dropped. Call it from a thread of your own.

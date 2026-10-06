@@ -131,6 +131,15 @@ impl Kicker {
 }
 
 impl Kick for Kicker {
+    fn kick(&self, cpu: u32) {
+        let own = OWN_VCPU.with(std::cell::Cell::get);
+        if let Some(Some(handle)) = lock_or_recover(&self.handles).get(cpu as usize) {
+            if Some(handle.id()) != own {
+                let _ = self.vm.vcpus_exit(std::slice::from_ref(handle));
+            }
+        }
+    }
+
     fn kick_all(&self) {
         // A cancel a vCPU sends itself stays pending and ends its next run
         // before the guest ran, so a plugin that kicked from `safepoint` would
@@ -567,7 +576,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         terminal::input::spawn(
             shared.plugin.clone(),
             stop_source.token(),
-            move || kick.kicker().kick_all(),
+            move || kick.kicker().kick(0),
             move |byte| {
                 let level = {
                     let mut p = lock_or_recover(&pl011);
@@ -955,7 +964,8 @@ impl VmHandle for Shared {
     }
 
     fn kick(&self) {
-        self.vcpus.kicker().kick_all();
+        // cpu0 is the one that reaches the plugin hook.
+        self.vcpus.kicker().kick(0);
     }
 }
 

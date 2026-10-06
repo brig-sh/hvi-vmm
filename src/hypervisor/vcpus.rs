@@ -34,11 +34,14 @@ use crate::hypervisor::quiesce::Quiesce;
 use crate::sync::lock_or_recover;
 
 /// How the hypervisor ends a vCPU's run.
+///
+/// A kick from a vCPU's own thread is dropped: it would end that thread's next
+/// run before the guest ran.
 pub(crate) trait Kick: Send + Sync {
+    /// Ends the current or next run of vCPU `cpu`.
+    fn kick(&self, cpu: u32);
+
     /// Ends the current or next run of every vCPU but the caller's own.
-    ///
-    /// A kick from a vCPU's own thread is dropped: it would end that thread's
-    /// next run before the guest ran.
     fn kick_all(&self);
 
     /// Wakes the vCPUs that wait outside the hypervisor for the guest to start
@@ -250,6 +253,8 @@ mod tests {
     }
 
     impl Kick for CountingKicker {
+        fn kick(&self, _cpu: u32) {}
+
         fn kick_all(&self) {
             self.all.fetch_add(1, Ordering::SeqCst);
         }
@@ -269,6 +274,8 @@ mod tests {
     }
 
     impl Kick for ResumedAtKick {
+        fn kick(&self, _cpu: u32) {}
+
         fn kick_all(&self) {}
 
         fn kick_halted(&self) {
