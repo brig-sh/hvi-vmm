@@ -66,7 +66,9 @@ pub struct RegsView {
 ///
 /// It is handed over as an `Arc`, so a plugin that runs its own threads (a
 /// timer, a doorbell) can keep it and call [`VmHandle::kick`] from them. A
-/// handle kept past the end of `boot` keeps the VM and its devices alive.
+/// handle kept past the end of `boot` keeps guest RAM, the ledger and the
+/// block, net and vsock devices, and on macOS the VM. The vCPUs have exited by
+/// then, so a kick reaches none.
 pub trait VmHandle: Send + Sync {
     /// The guest architecture this VM is running.
     fn arch(&self) -> GuestArch;
