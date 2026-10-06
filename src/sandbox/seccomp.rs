@@ -97,6 +97,7 @@
 
 use std::io;
 
+use crate::LOG_PREFIX;
 use seccompiler::{BpfProgram, TargetArch};
 
 /// Which filter a thread installs on itself.
@@ -248,7 +249,7 @@ pub fn install_thread(thread: Thread) {
     }
     if let Err(e) = install(thread) {
         eprintln!(
-            "[hvi] FATAL: cannot install the {} seccomp filter: {e}",
+            "{LOG_PREFIX} FATAL: cannot install the {} seccomp filter: {e}",
             thread.key()
         );
         std::process::abort();

@@ -262,9 +262,6 @@ booting Image with 1024 MiB ...
 [hvi] seatbelt sandbox: on (deny default)
 ```
 
-The Linux backends use `[hvi/kvm]` and `[hvi/x86]` for device lines and plain
-`[hvi]` for the confinement line.
-
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
 share is configured, because the limit is raised while the first share is set
 up.

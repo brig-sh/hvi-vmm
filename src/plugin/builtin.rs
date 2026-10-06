@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::memory::GuestRamView;
 use crate::plugin::{CpuHandle, IoSink, Plugin, RamRegion, VmHandle};
+use crate::LOG_PREFIX;
 
 /// Runs several plugins as one, in order.
 ///
@@ -217,7 +218,7 @@ impl Plugin for MemoryDump {
             return;
         }
         if !cpu.pause() {
-            eprintln!("[hvi] dump: vCPUs did not park; skipping (image would be torn)");
+            eprintln!("{LOG_PREFIX} dump: vCPUs did not park; skipping (image would be torn)");
             return;
         }
         // Every path from here owes exactly one resume().
@@ -225,8 +226,11 @@ impl Plugin for MemoryDump {
         cpu.resume();
 
         match result {
-            Ok(n) => eprintln!("[hvi] dumped {n} bytes of guest RAM to {}", self.path),
-            Err(e) => eprintln!("[hvi] dump to {} failed: {e}", self.path),
+            Ok(n) => eprintln!(
+                "{LOG_PREFIX} dumped {n} bytes of guest RAM to {}",
+                self.path
+            ),
+            Err(e) => eprintln!("{LOG_PREFIX} dump to {} failed: {e}", self.path),
         }
     }
 

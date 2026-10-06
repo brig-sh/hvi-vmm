@@ -70,6 +70,7 @@ use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, V
 use crate::sandbox::seccomp;
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::LOG_PREFIX;
 
 const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 const REQUEST_KEY: u8 = 0x1d; // Ctrl-]
@@ -196,7 +197,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             file_offset: low_bytes,
         });
         eprintln!(
-            "[hvi/x86] RAM {} MiB: {} MiB at {:#x} + {} MiB at {HIGH_RAM_BASE:#x}",
+            "{LOG_PREFIX} RAM {} MiB: {} MiB at {:#x} + {} MiB at {HIGH_RAM_BASE:#x}",
             cfg.mem_bytes >> 20,
             low_bytes >> 20,
             RAM_BASE,
@@ -213,7 +214,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Devices.
     let virtio = match &cfg.disk {
         Some(path) => {
-            eprintln!("[hvi/x86] virtio-blk: {path}");
+            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
             Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
         }
         None => None,
@@ -230,32 +231,34 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let reader = file
             .try_clone()
             .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
-        eprintln!("[hvi/x86] virtio-net: tap {ifname}");
+        eprintln!("{LOG_PREFIX} virtio-net: tap {ifname}");
         net_tap_reader = Some(reader);
         Some(VirtioNet::with_tap(file))
     } else if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
             Ok(stream) => match stream.try_clone() {
                 Ok(reader) => {
-                    eprintln!("[hvi/x86] virtio-net: gvisor-tap gateway relay via {sock}");
+                    eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock}");
                     net_reader = Some(reader);
                     Some(VirtioNet::with_gateway(stream))
                 }
                 Err(e) => {
-                    eprintln!("[hvi/x86] WARNING: cannot clone gateway socket ({e}); net disabled");
+                    eprintln!(
+                        "{LOG_PREFIX} WARNING: cannot clone gateway socket ({e}); net disabled"
+                    );
                     None
                 }
             },
             Err(e) => {
                 eprintln!(
-                    "[hvi/x86] WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
+                    "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
                     net::stub_stack_line()
                 );
                 Some(VirtioNet::new())
             }
         }
     } else if cfg.net {
-        eprintln!("[hvi/x86] virtio-net: {}", net::stub_stack_line());
+        eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
         Some(VirtioNet::new())
     } else {
         None
@@ -294,7 +297,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
     eprintln!(
-        "[hvi/x86] {num_cpus} vCPU(s)  {} entry@{:#x}",
+        "{LOG_PREFIX} {num_cpus} vCPU(s)  {} entry@{:#x}",
         kernel.format, kernel.entry
     );
 
@@ -427,7 +430,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                         Ok(true) => kick_cpu0(&sh),
                         Ok(false) => break,
                         Err(e) => {
-                            eprintln!("[hvi/x86] trace watchdog: {e}; trace watchdog stopped");
+                            eprintln!("{LOG_PREFIX} trace watchdog: {e}; trace watchdog stopped");
                             break;
                         }
                     }
@@ -474,22 +477,24 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         (Err(e), _) => {
             // Printed here, since a spawn failure ahead of it is the one
             // reported.
-            eprintln!("[hvi/x86] {e}");
+            eprintln!("{LOG_PREFIX} {e}");
             failure.get_or_insert(e.into());
             stop_all(&shared);
         }
         (Ok(()), Some((vmm, vcpu))) => {
             if seccomp::log_mode() {
                 eprintln!(
-                    "[hvi] seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
+                    "{LOG_PREFIX} seccomp: LOGGING ONLY ({}=log) — denials are recorded, not enforced",
                     seccomp::LOG_ENV
                 );
             } else {
-                eprintln!("[hvi] seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)");
+                eprintln!(
+                    "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)"
+                );
             }
         }
         (Ok(()), None) => eprintln!(
-            "[hvi] seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
+            "{LOG_PREFIX} seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
         ),
     }
 
@@ -505,7 +510,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     kick_until_finished(&input, deadline);
     for (name, thread) in std::iter::once(("console reader", input)).chain(helpers) {
         if let Err(e) = join_by(name, thread, deadline) {
-            eprintln!("[hvi/x86] {e}; left running");
+            eprintln!("{LOG_PREFIX} {e}; left running");
             failure.get_or_insert(e.into());
         }
     }
@@ -801,7 +806,7 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
                 }
             }
             Ok(other) => {
-                eprintln!("[hvi/x86] cpu{cpu_id}: unhandled exit {other:?}");
+                eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
                 break;
             }
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
@@ -810,7 +815,7 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kicker: VcpuFd, sh: Shared) {
                 }
             }
             Err(e) => {
-                eprintln!("[hvi/x86] cpu{cpu_id}: KVM_RUN error: {e}");
+                eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
                 break;
             }
         }
@@ -1211,7 +1216,7 @@ fn spawn_input_thread(sh: Shared, stop: StopToken) -> JoinHandle<()> {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("[hvi/x86] console: {e}; console input stopped");
+                    eprintln!("{LOG_PREFIX} console: {e}; console input stopped");
                     break;
                 }
             }
@@ -1258,7 +1263,7 @@ fn spawn_vsock_bridge(
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("[hvi/x86] vsock bridge: {e}; no longer accepting");
+                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; no longer accepting");
                     break;
                 }
             }
@@ -1298,7 +1303,7 @@ fn spawn_vsock_bridge(
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) => {
-                        eprintln!("[hvi/x86] vsock bridge: {e}; guest bytes dropped");
+                        eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
                         let mut d = lock_or_recover(&dev3);
                         d.host_gone(&mem3, port);
                         set_line(&vm3, VIRTIO_VSOCK_GSI, &d);
@@ -1328,7 +1333,7 @@ fn spawn_vsock_bridge(
                         // device releases it.
                         Ok(false) => break,
                         Err(e) => {
-                            eprintln!("[hvi/x86] vsock bridge: {e}; connection closed");
+                            eprintln!("{LOG_PREFIX} vsock bridge: {e}; connection closed");
                             break;
                         }
                     }
@@ -1384,7 +1389,7 @@ fn spawn_net_tap_reader(
             set_line(&vm, VIRTIO_NET_GSI, &d);
         });
         if let Err(e) = relayed {
-            eprintln!("[hvi/x86] virtio-net: {e}; tap relay stopped");
+            eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
         }
     })
 }
@@ -1409,7 +1414,7 @@ fn spawn_net_gateway_reader(
             set_line(&vm, VIRTIO_NET_GSI, &d);
         });
         if let Err(e) = relayed {
-            eprintln!("[hvi/x86] virtio-net: {e}; gateway relay stopped");
+            eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
         }
     })
 }

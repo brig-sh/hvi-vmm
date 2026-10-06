@@ -52,6 +52,9 @@ pub mod sync;
 pub mod teardown;
 pub mod terminal;
 
+/// The prefix of the library's log lines on stderr.
+pub(crate) const LOG_PREFIX: &str = "[hvi]";
+
 // The backend for the host's target. Each one exposes the same
 // `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
