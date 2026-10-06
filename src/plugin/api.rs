@@ -108,12 +108,8 @@ pub trait VmHandle: Send + Sync {
     /// Feeds every virtio-net frame to `sink`. No-op with no net device.
     fn set_net_sink(&self, sink: Arc<dyn IoSink>);
 
-    /// Breaks the vCPU that runs [`Plugin::safepoint`] out of the hypervisor
-    /// so it reaches its next safe point promptly.
-    ///
-    /// How wide that is differs by backend: the macOS backend kicks every
-    /// vCPU, while the Linux and x86 backends kick the boot vCPU alone, which
-    /// is the one that reaches the hook.
+    /// Breaks the vCPU that runs [`Plugin::safepoint`], the boot vCPU, out of
+    /// the hypervisor so it reaches its next safe point promptly.
     ///
     /// A plugin that sets a pending flag from its own thread **must** call
     /// this afterwards: an idle guest sits in WFI/HLT indefinitely, and

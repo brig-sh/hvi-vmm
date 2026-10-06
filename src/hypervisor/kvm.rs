@@ -66,17 +66,15 @@ impl Kicker {
         }
         Registration { kicker: self, cpu }
     }
+}
 
-    /// Ends the current or next `KVM_RUN` of vCPU `cpu`, unless the caller is
-    /// that vCPU's own thread.
-    pub(crate) fn kick(&self, cpu: u32) {
+impl Kick for Kicker {
+    fn kick(&self, cpu: u32) {
         if let Some(Some(thread)) = lock_or_recover(&self.threads).get_mut(cpu as usize) {
             thread.kick();
         }
     }
-}
 
-impl Kick for Kicker {
     fn kick_all(&self) {
         for thread in lock_or_recover(&self.threads).iter_mut().flatten() {
             thread.kick();

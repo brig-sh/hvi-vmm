@@ -65,7 +65,7 @@ use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
 use crate::hypervisor::kvm::{immediate_exit, kick_handle, Kicker};
-use crate::hypervisor::vcpus::Vcpus;
+use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seccomp;
