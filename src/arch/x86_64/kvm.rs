@@ -601,6 +601,9 @@ fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     // registration drops first: the entry is removed before the stop kicks.
     let _stop = sh.vcpus.stop_on_drop();
     let _registration = sh.vcpus.kicker().register(cpu_id, kick_handle);
+    // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
+    // yet waits inside the run, where a kick reaches it.
+    sh.vcpus.mark_started();
     let is_boot = cpu_id == 0;
     let dbg = std::env::var_os("HVI_X86_TRACE").is_some();
     let mut n_exit = 0u64;

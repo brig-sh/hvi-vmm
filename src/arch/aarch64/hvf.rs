@@ -766,6 +766,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             None => return, // stopped while waiting
         }
     }
+    sh.vcpus.mark_started();
 
     let is_boot = cpu_id == 0;
     // The loop runs inside `catch_unwind` only for the report. A panic is

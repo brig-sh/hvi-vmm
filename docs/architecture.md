@@ -349,8 +349,11 @@ register clears `ready`.
 
 `hypervisor/quiesce.rs` parks every vCPU at a safe point so an observation sees
 a still guest. `CpuHandle::pause()` requests the quiesce, kicks the other vCPUs,
-and waits up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU
-never parks itself.
+and waits up to 500 ms for every other vCPU that has started to park. The
+calling vCPU never parks itself. Every KVM vCPU counts as started once its
+thread runs, since one the guest has not brought up waits inside `KVM_RUN`,
+where a kick reaches it. On macOS a secondary the guest has not brought up waits
+for `CPU_ON` outside the hypervisor and is not waited for.
 
 On every backend, every path that ends a vCPU's run loop ends the VM through
 `Vcpus::stop` in `hypervisor/vcpus.rs`, which clears the running flag, kicks the
