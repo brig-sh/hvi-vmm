@@ -352,17 +352,19 @@ a still guest. `CpuHandle::pause()` requests the quiesce, kicks the other vCPUs,
 and waits up to 500 ms for `num_cpus - 1` of them to park. The calling vCPU
 never parks itself.
 
-On every backend, every path that ends a vCPU's run loop ends the VM through one
-stop routine, which clears the running flag, releases the quiesce so no vCPU
-stays parked, and kicks the vCPUs out of the hypervisor. A guard held by the
-vCPU thread calls it when the thread exits, whatever ended the loop: a
-guest-requested stop, a failed entry, an unhandled exit, a failed run, or a
-panic. The vCPU threads are named `cpu0`, `cpu1` and so on, so the panic hook's
-report says which vCPU panicked. The macOS backend catches the panic at the loop
-and adds a line with the vCPU's last exit reason and its program counter. Under
-the seccomp sandbox the report has to stay unsymbolized: with `RUST_BACKTRACE`
-set it opens the binary, which the vCPU allowlist refuses, and the process dies
-of `SIGSYS` after the message.
+On every backend, every path that ends a vCPU's run loop ends the VM through
+`Vcpus::stop` in `hypervisor/vcpus.rs`, which clears the running flag, kicks the
+vCPUs out of the hypervisor, and then releases the quiesce so no vCPU stays
+parked. A guard held by the vCPU thread calls it when the thread exits, whatever
+ended the loop: a guest-requested stop, a failed entry, an unhandled exit, a
+failed run, or a panic. The kick is the backend's: `hypervisor/kvm.rs` holds the
+one the two KVM backends share, and the macOS backend kicks with
+`hv_vcpus_exit`. The vCPU threads are named `cpu0`, `cpu1` and so on, so the
+panic hook's report says which vCPU panicked. The macOS backend catches the
+panic at the loop and adds a line with the vCPU's last exit reason and its
+program counter. Under the seccomp sandbox the report has to stay unsymbolized:
+with `RUST_BACKTRACE` set it opens the binary, which the vCPU allowlist refuses,
+and the process dies of `SIGSYS` after the message.
 
 Device and ledger mutexes on the macOS backend and in the helper threads go
 through `sync::lock_or_recover`, which takes a poisoned lock so the panic that
@@ -407,7 +409,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen
