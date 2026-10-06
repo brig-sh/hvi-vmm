@@ -208,11 +208,191 @@ pub(crate) fn kick_handle(vm: &VmFd, vcpu: &VcpuFd) -> std::io::Result<VcpuFd> {
     unsafe { vm.create_vcpu_from_rawfd(descriptor.into_raw_fd()) }.map_err(std::io::Error::from)
 }
 
+// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+// every component of a path comes from the guest. These tests read this
+// process's own `/proc` entries.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod stop_tests {
     use super::*;
+    use crate::config::BootConfig;
+    use crate::plugin::CpuHandle;
     use crate::signal::install_kick_handler;
     use kvm_ioctls::Kvm;
+    use std::fs::File;
+    use std::os::fd::RawFd;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    /// Returns a kernel image the boot vCPU starts, for a test that never lets
+    /// it run.
+    fn kernel() -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        let image = crate::arch::x86_64::loader::tests::synthetic_bzimage();
+        #[cfg(target_arch = "aarch64")]
+        let image =
+            crate::arch::aarch64::loader::tests::synthetic_image(0x8_0000, 0x40_0000, 0x1000);
+        image
+    }
+
+    /// Returns a kernel image whose boot vCPU spins in the guest and never
+    /// exits.
+    fn spinning_kernel() -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        let image = crate::arch::x86_64::loader::tests::spinning_bzimage();
+        #[cfg(target_arch = "aarch64")]
+        let image = crate::arch::aarch64::loader::tests::spinning_image();
+        image
+    }
+
+    /// A plugin whose `safepoint` panics on its first call, after recording
+    /// that it was reached.
+    struct PanicAtSafepoint {
+        /// Whether `safepoint` has run.
+        reached: AtomicBool,
+    }
+
+    impl Plugin for PanicAtSafepoint {
+        fn safepoint(&self, _cpu: &dyn CpuHandle) {
+            self.reached.store(true, Ordering::SeqCst);
+            panic!("plugin failure under test");
+        }
+    }
+
+    /// Returns the configuration of a two-vCPU boot of `kernel`.
+    ///
+    /// The seccomp filters are on in a release build, so a vCPU thread exits
+    /// under the vCPU allowlist as it would in production. A debug build's std
+    /// checks every descriptor it closes with `fcntl`, which that allowlist
+    /// refuses, so there the filters stay off.
+    fn config(kernel: Vec<u8>, plugin: Option<Arc<dyn Plugin>>) -> BootConfig {
+        BootConfig {
+            kernel,
+            initramfs: None,
+            mem_bytes: 128 << 20,
+            cmdline: String::new(),
+            disk: None,
+            fs_shares: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: "stop-test".to_string(),
+            vcpus: 2,
+            agent_sock: None,
+            plugin,
+            sandbox: !cfg!(debug_assertions),
+        }
+    }
+
+    /// Returns the kernel's id for the thread named `name`, or `None` if no
+    /// thread of this process has that name.
+    fn thread_id(name: &str) -> Option<libc::pid_t> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|task| {
+                std::fs::read_to_string(task.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim_end() == name)
+            })
+            .and_then(|task| task.file_name().to_str()?.parse().ok())
+    }
+
+    /// Returns every descriptor of this process that refers to vCPU `cpu`.
+    fn vcpu_descriptors(cpu: u32) -> Vec<RawFd> {
+        let vcpu = format!("anon_inode:kvm-vcpu:{cpu}");
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == &*vcpu))
+            .filter_map(|fd| fd.file_name().to_str()?.parse().ok())
+            .collect()
+    }
+
+    // The boot vCPU's plugin panics before the first guest entry, while the
+    // secondary is in `KVM_RUN` or on its way there. `boot` returns only if the
+    // panicking thread ends the VM on its way out; a secondary left running
+    // keeps the join in `boot` blocked, so the bound is the assertion. Ignored
+    // by default: it needs a usable `/dev/kvm`, and `boot` takes the terminal
+    // into raw mode and reads stdin for the guest, so it runs on its own, by
+    // name, with `--ignored`.
+    #[test]
+    #[ignore]
+    fn plugin_panic_on_the_boot_vcpu_ends_the_vm() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let plugin = Arc::new(PanicAtSafepoint {
+            reached: AtomicBool::new(false),
+        });
+        let (sender, receiver) = mpsc::channel();
+        let booted = Arc::clone(&plugin);
+        std::thread::spawn(move || {
+            let outcome = crate::boot(config(kernel(), Some(booted))).map_err(|e| e.to_string());
+            let _ = sender.send(outcome);
+        });
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the boot vCPU's plugin panicked");
+        assert!(
+            plugin.reached.load(Ordering::SeqCst),
+            "the boot vCPU never reached the plugin"
+        );
+        // `boot` has to have run to the end and returned a stop, whichever stop
+        // it reports.
+        assert!(outcome.is_ok(), "boot failed before the stop: {outcome:?}");
+    }
+
+    // A secondary's `KVM_RUN` fails while the boot vCPU is in a guest that
+    // never exits, so `boot` returns only if the secondary's exit ends the VM.
+    // The test causes the failure from outside the VMM: it replaces the
+    // secondary's vCPU descriptor with `/dev/null`, which refuses the next
+    // `KVM_RUN`. Ignored by default, as the test above is.
+    #[test]
+    #[ignore]
+    fn failed_run_on_a_secondary_ends_the_vm() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = crate::boot(config(spinning_kernel(), None)).map_err(|e| e.to_string());
+            let _ = sender.send(outcome);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let secondary = loop {
+            if let Some(id) = thread_id("cpu1") {
+                break id;
+            }
+            assert!(Instant::now() < deadline, "the secondary never started");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        let null = File::open("/dev/null").unwrap();
+        let descriptors = vcpu_descriptors(1);
+        assert!(!descriptors.is_empty(), "the secondary has no descriptor");
+        for descriptor in descriptors {
+            // SAFETY: both descriptors are open. The vCPU handle still owns
+            // `descriptor` and closes what it now refers to.
+            let replaced = unsafe { libc::dup2(null.as_raw_fd(), descriptor) };
+            assert_eq!(replaced, descriptor);
+        }
+
+        // The signal ends a run in progress. It is repeated, since one that
+        // lands before the run starts is lost.
+        let outcome = loop {
+            // SAFETY: a signal to a thread of this process, for which `boot`
+            // installed a handler that does nothing.
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), secondary, kick_signal()) };
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(outcome) => break outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => assert!(
+                    Instant::now() < deadline,
+                    "boot did not return after the secondary's run failed"
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("boot panicked"),
+            }
+        };
+        assert!(outcome.is_ok(), "boot failed before the stop: {outcome:?}");
+    }
 
     // Ignored by default, as it needs a usable `/dev/kvm`.
     #[test]

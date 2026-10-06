@@ -159,11 +159,11 @@ Every job carries a `timeout-minutes` cap. The boot jobs upload their logs as
 artifacts when they fail, and the two arm64 boots also upload the event
 ledger.
 
-One known gap: the arm64/KVM backend is unit-tested on its stop path only.
-`src/arch/aarch64/kvm.rs` carries only tests of how a vCPU thread that ends
-stops the VM and how a kick ends a run. The suite runs on arm64 Linux, on the
-self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the boot
-runners also run the stop tests.
+One known gap: the arm64/KVM backend is unit-tested on its stop path only. Its
+only tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a vCPU
+thread that ends stops the VM and how a kick ends a run. The suite runs on arm64
+Linux, on the self-hosted boot runners and on a hosted `ubuntu-24.04-arm`
+runner; the boot runners also run the stop tests.
 
 Three scheduled workflows run outside the two entry points, each reporting
 through a tracking issue so `main` stays green: the weekly dependency audit,
