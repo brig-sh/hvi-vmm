@@ -29,7 +29,7 @@ use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
-use crate::memory::GuestRam;
+use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, RamRegion, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 
@@ -43,7 +43,7 @@ pub(crate) struct Guest<K> {
     pub(crate) ram: Arc<GuestRam>,
     /// The object backing guest RAM, for a plugin that hands the same pages to
     /// another process.
-    pub(crate) ram_file: Arc<std::fs::File>,
+    pub(crate) shared_ram: SharedRam,
     /// The `RawEvent` ledger.
     pub(crate) ledger: Arc<Mutex<Emitter>>,
     /// The virtio-blk device, when the VM has a disk.
@@ -70,7 +70,7 @@ impl<K: Kick> VmHandle for Guest<K> {
     }
 
     fn ram_fd(&self) -> BorrowedFd<'_> {
-        self.ram_file.as_fd()
+        self.shared_ram.as_fd()
     }
 
     fn ram_regions(&self) -> Vec<RamRegion> {

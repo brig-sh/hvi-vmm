@@ -337,7 +337,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             arch: GuestArch::Aarch64,
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
-            ram_file: Arc::clone(shared_ram.file()),
+            shared_ram,
             ledger: Arc::new(Mutex::new(emitter)),
             block: virtio,
             net,
