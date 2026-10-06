@@ -138,10 +138,10 @@ hvi is young. Read these before you build on it.
   the host, and GICv2 caps there.
 - **The event ledger is per packet and egress only.** It is not aggregated per
   flow, and it is not a tamper-proof record.
-- **The arm64/KVM backend is unit-tested on its stop path only.**
-  `src/arch/aarch64/kvm.rs` carries only tests of how a vCPU thread that ends
-  stops the VM and how a kick ends a run, and they need `/dev/kvm`. The rest of
-  that backend is cross-linted and booted.
+- **The arm64/KVM backend is unit-tested on its stop path only.** Its only
+  tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a vCPU thread
+  that ends stops the VM and how a kick ends a run, and they need `/dev/kvm`.
+  The rest of that backend is cross-linted and booted.
 
 [docs/limitations.md](docs/limitations.md) has the full list with the
 consequences.
