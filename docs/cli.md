@@ -194,10 +194,10 @@ reboot calls it again.
 
 ### Signals and the terminal
 
-There is no `SIGINT`, `SIGTERM` or `SIGHUP` handler. `SIGUSR1` is used
-internally. It breaks a vCPU out of `KVM_RUN` on the Linux backends and ends the
-console reader's read of stdin when the guest stops. It is not a control
-interface.
+There is no `SIGINT`, `SIGTERM` or `SIGHUP` handler. hvi uses one signal
+internally, `SIGRTMIN` on Linux and `SIGUSR1` on macOS. It breaks a vCPU out of
+`KVM_RUN` on the Linux backends and ends the console reader's read of stdin when
+the guest stops. It is not a control interface.
 
 hvi puts the terminal into raw mode when stdin is a TTY and restores it when
 the boot returns normally. The restore discards input the guest did not read.
