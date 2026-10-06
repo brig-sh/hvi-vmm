@@ -46,6 +46,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::memory::GuestRam;
 use crate::sync::lock_or_recover;
@@ -343,6 +344,8 @@ pub struct VirtioVsock {
     queues: [Queue; 3],
     /// The interrupt bits the driver has not acknowledged yet.
     interrupt_status: u32,
+    /// The interrupt line the device drives.
+    irq: Irq,
     /// Host-to-guest packets waiting for an RX buffer.
     pending: VecDeque<Vec<u8>>,
     /// The live connections, keyed by host port.
@@ -363,6 +366,7 @@ impl VirtioVsock {
             queue_sel: 0,
             queues: [Queue::default(), Queue::default(), Queue::default()],
             interrupt_status: 0,
+            irq: Irq::default(),
             pending: VecDeque::new(),
             conns: HashMap::new(),
             next_port: 40000,
@@ -373,6 +377,16 @@ impl VirtioVsock {
     #[must_use]
     pub fn irq_level(&self) -> bool {
         self.interrupt_status != 0
+    }
+
+    /// Connects the device to the interrupt line it raises.
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        self.irq.connect(line);
+    }
+
+    /// Sets the interrupt line to the device's level.
+    fn sync_irq(&self) {
+        self.irq.set(self.irq_level());
     }
 
     fn queue(&mut self) -> &mut Queue {
@@ -710,6 +724,13 @@ impl VirtioVsock {
 
     /// Services one MMIO access.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        let read = self.serve_mmio(mem, offset, is_write, value);
+        self.sync_irq();
+        read
+    }
+
+    /// Reads or writes register `offset`, running a queue the write notifies.
+    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
             match offset {
@@ -1042,6 +1063,12 @@ impl VirtioVsock {
     /// time, only when `pending` is empty, so at most one RW packet waits for
     /// an RX buffer.
     fn fill_rx(&mut self, mem: &GuestRam) {
+        self.fill_rx_buffers(mem);
+        self.sync_irq();
+    }
+
+    /// Moves pending packets into the guest's RX buffers while both last.
+    fn fill_rx_buffers(&mut self, mem: &GuestRam) {
         if !self.queues[RX_QUEUE as usize].is_ready() {
             return;
         }

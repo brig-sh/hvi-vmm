@@ -23,10 +23,11 @@
 
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kvm_ioctls::{VcpuFd, VmFd};
 
+use crate::devices::irq::IrqLine;
 use crate::hypervisor::guest::{Cpu, Guest};
 use crate::hypervisor::vcpus::Kick;
 use crate::plugin::Plugin;
@@ -82,6 +83,27 @@ impl Kick for Kicker {
         for thread in lock_or_recover(&self.threads).iter_mut().flatten() {
             thread.kick();
         }
+    }
+}
+
+/// A guest interrupt line on KVM's in-kernel interrupt controller.
+pub(crate) struct KvmIrqLine {
+    /// The VM whose interrupt controller has the line.
+    vm: Arc<VmFd>,
+    /// The line's number, as `KVM_IRQ_LINE` takes it.
+    gsi: u32,
+}
+
+impl KvmIrqLine {
+    /// Returns the line `gsi` of `vm`.
+    pub(crate) fn new(vm: Arc<VmFd>, gsi: u32) -> Self {
+        Self { vm, gsi }
+    }
+}
+
+impl IrqLine for KvmIrqLine {
+    fn set_level(&self, level: bool) {
+        let _ = self.vm.set_irq_line(self.gsi, level);
     }
 }
 

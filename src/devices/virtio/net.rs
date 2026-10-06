@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::memory::GuestRam;
 
+use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{
     mmio, tap, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
@@ -362,6 +363,8 @@ pub struct VirtioNet {
     queue_sel: u32,
     queues: [Queue; 2],
     interrupt_status: u32,
+    /// The interrupt line the device drives.
+    irq: Irq,
     /// Captured flows, drained by the hypervisor backend into the event ledger.
     events: Vec<CapturedEvent>,
     /// When set, the device relays frames to the gvisor-tap-vsock gateway over
@@ -393,6 +396,7 @@ impl VirtioNet {
             queue_sel: 0,
             queues: [Queue::default(), Queue::default()],
             interrupt_status: 0,
+            irq: Irq::default(),
             events: Vec::new(),
             gw: None,
             tap_write_reported: false,
@@ -442,6 +446,16 @@ impl VirtioNet {
         self.interrupt_status != 0
     }
 
+    /// Connects the device to the interrupt line it raises.
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        self.irq.connect(line);
+    }
+
+    /// Sets the interrupt line to the device's level.
+    fn sync_irq(&self) {
+        self.irq.set(self.irq_level());
+    }
+
     /// Drains the captured flows for the event ledger.
     pub fn take_events(&mut self) -> Vec<CapturedEvent> {
         std::mem::take(&mut self.events)
@@ -489,6 +503,13 @@ impl VirtioNet {
     /// Services one MMIO access. On a transmit-queue notify, drains the guest's
     /// TX frames (capturing them) and injects any replies into the RX queue.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        let read = self.serve_mmio(mem, offset, is_write, value);
+        self.sync_irq();
+        read
+    }
+
+    /// Reads or writes register `offset`, running a queue the write notifies.
+    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let v = value as u32;
         if is_write {
             match offset {
@@ -767,6 +788,7 @@ impl VirtioNet {
     /// device lock.
     pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) {
         self.inject_rx(mem, frame);
+        self.sync_irq();
     }
 
     /// Captures a transmitted frame for the ledger without generating a reply:
@@ -1800,5 +1822,116 @@ mod tests {
         h[2..4].copy_from_slice(&40u16.to_be_bytes());
         h[9] = 6;
         assert_ne!(checksum16(&h), 0);
+    }
+
+    /// A line that holds the level it was last set to.
+    #[derive(Default)]
+    struct LevelLine {
+        /// The level the line was last set to.
+        high: std::sync::atomic::AtomicBool,
+    }
+
+    impl IrqLine for LevelLine {
+        fn set_level(&self, level: bool) {
+            self.high.store(level, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // A vCPU acknowledges the interrupt while a reader delivers the next frame,
+    // each under the device lock. The vCPU reposts one RX buffer per
+    // acknowledgment, as a guest driver refills its ring. A line that ended low
+    // over a completed buffer would stop both: the vCPU waits for the line and
+    // the reader waits for the acknowledgment.
+    #[test]
+    fn line_never_ends_low_over_a_completed_buffer() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+        const BASE: u64 = 0x4000_0000;
+        const N: u64 = 256;
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x100000)]));
+        let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
+        let line = Arc::new(LevelLine::default());
+        let mut net = VirtioNet::new();
+        net.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        net.mmio(&mem, mmio::QUEUE_SEL, true, u64::from(RX_QUEUE));
+        net.mmio(&mem, mmio::QUEUE_NUM, true, N);
+        net.mmio(&mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
+        net.mmio(&mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
+        net.mmio(&mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
+        net.mmio(&mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
+        net.mmio(&mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
+        net.mmio(&mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
+        net.mmio(&mem, mmio::QUEUE_READY, true, 1);
+        for i in 0..N {
+            let d = desc + i * 16;
+            mem.write_u64(d, BASE + 0x4000 + i * 0x800).unwrap();
+            mem.write_u32(d + 8, 0x800).unwrap();
+            mem.write_u16(d + 12, 2).unwrap();
+            mem.write_u16(d + 14, 0).unwrap();
+            mem.write_u16(avail + 4 + i * 2, i as u16).unwrap();
+        }
+        mem.write_u16(avail + 2, N as u16).unwrap();
+
+        let udp = udp_datagram(9999, 1234, b"x");
+        let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
+        let frame = eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip);
+        let dev = Arc::new(Mutex::new(net));
+        let done = Arc::new(AtomicBool::new(false));
+        let acks = Arc::new(AtomicU32::new(0));
+
+        // The reader delivers as soon as the vCPU's acknowledgment has dropped
+        // the level, the moment the two used to race for the line.
+        let reader = {
+            let (dev, mem, done) = (Arc::clone(&dev), Arc::clone(&mem), Arc::clone(&done));
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    let mut d = dev.lock().unwrap();
+                    if !d.irq_level() {
+                        d.deliver(&mem, &frame);
+                    }
+                }
+            })
+        };
+        let vcpu = {
+            let (dev, mem, line, done, acks) = (
+                Arc::clone(&dev),
+                Arc::clone(&mem),
+                Arc::clone(&line),
+                Arc::clone(&done),
+                Arc::clone(&acks),
+            );
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if line.high.load(Ordering::SeqCst) {
+                        let mut d = dev.lock().unwrap();
+                        d.mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
+                        let idx = mem.read_u16(avail + 2).unwrap();
+                        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+                        acks.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        };
+        let start = Instant::now();
+        let (mut seen, mut quiet) = (0, 0);
+        while acks.load(Ordering::SeqCst) < 20_000 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = acks.load(Ordering::SeqCst);
+            quiet = if now == seen { quiet + 1 } else { 0 };
+            seen = now;
+            if quiet >= 20 {
+                break;
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+        vcpu.join().unwrap();
+        assert!(
+            quiet < 20,
+            "progress stopped after {} acks: the line is {} over a device level of {}",
+            acks.load(Ordering::SeqCst),
+            line.high.load(Ordering::SeqCst),
+            dev.lock().unwrap().irq_level()
+        );
     }
 }

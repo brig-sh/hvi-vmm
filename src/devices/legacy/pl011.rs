@@ -17,7 +17,7 @@
 //! Each byte the guest writes to the data register goes to stdout through a
 //! [`ConsoleFilter`]; the kernel driver polls the flag register, which always
 //! reports the FIFO idle. Receive is interrupt-driven: a host thread pushes
-//! keystrokes into the RX FIFO and raises the UART's GIC line; the guest reads
+//! keystrokes into the RX FIFO, which raises the UART's line; the guest reads
 //! the data register on the resulting IRQ. Only the registers the Linux
 //! `amba-pl011` driver touches for that flow are modeled: data, flags, and the
 //! RX interrupt mask/status. The PrimeCell identification registers make the
@@ -25,7 +25,9 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::Arc;
 
+use crate::devices::irq::{Irq, IrqLine};
 use crate::terminal::ConsoleFilter;
 
 /// Data register: reads pop the RX FIFO, writes are console bytes.
@@ -62,6 +64,8 @@ pub struct Pl011 {
     rx: VecDeque<u8>,
     /// Interrupt mask (`IMSC`); only the RX bit is acted on.
     imsc: u32,
+    /// The interrupt line the UART drives.
+    irq: Irq,
 }
 
 impl Pl011 {
@@ -73,7 +77,15 @@ impl Pl011 {
             passed: Vec::new(),
             rx: VecDeque::new(),
             imsc: 0,
+            irq: Irq::default(),
         }
+    }
+
+    /// Connects the UART to the interrupt line it raises.
+    // Only the arm64 backends attach a PL011.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        self.irq.connect(line);
     }
 
     /// Queues a received byte (from the host). Drops it if the FIFO is full.
@@ -81,11 +93,14 @@ impl Pl011 {
         if self.rx.len() < RX_CAP {
             self.rx.push_back(byte);
         }
+        self.irq.set(self.irq_level());
     }
 
-    /// Whether the UART is currently asserting its interrupt line: RX data is
-    /// waiting and the RX interrupt is unmasked. Level-triggered — the caller
-    /// drives the GIC SPI to this value after every access or RX push.
+    /// Returns whether the UART asserts its interrupt line: RX data is waiting
+    /// and the RX interrupt is unmasked.
+    ///
+    /// The line is level-triggered, and the UART sets it to this level after
+    /// every access and RX push.
     #[must_use]
     pub fn irq_level(&self) -> bool {
         !self.rx.is_empty() && (self.imsc & INT_RX != 0)
@@ -93,6 +108,13 @@ impl Pl011 {
 
     /// Services one MMIO access at register `offset`.
     pub fn mmio(&mut self, offset: u64, is_write: bool, value: u64) -> u64 {
+        let read = self.serve_mmio(offset, is_write, value);
+        self.irq.set(self.irq_level());
+        read
+    }
+
+    /// Reads or writes register `offset`.
+    fn serve_mmio(&mut self, offset: u64, is_write: bool, value: u64) -> u64 {
         if is_write {
             match offset {
                 DR => {

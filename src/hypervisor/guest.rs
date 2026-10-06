@@ -24,6 +24,7 @@
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
+use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
@@ -54,6 +55,30 @@ pub(crate) struct Guest<K> {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
+}
+
+impl<K> Guest<K> {
+    /// Connects the virtio devices the VM has to their interrupt lines.
+    ///
+    /// It takes a line for each virtio device a guest can hold, whether or not
+    /// this VM has it, so a backend that leaves one out does not build. The
+    /// line of a device the VM does not have is dropped.
+    pub(crate) fn connect_irqs(
+        &self,
+        block: Arc<dyn IrqLine>,
+        net: Arc<dyn IrqLine>,
+        vsock: Arc<dyn IrqLine>,
+    ) {
+        if let Some(dev) = &self.block {
+            lock_or_recover(dev).connect_irq(block);
+        }
+        if let Some(dev) = &self.net {
+            lock_or_recover(dev).connect_irq(net);
+        }
+        if let Some(dev) = &self.vsock {
+            lock_or_recover(dev).connect_irq(vsock);
+        }
+    }
 }
 
 impl<K: Kick> VmHandle for Guest<K> {
