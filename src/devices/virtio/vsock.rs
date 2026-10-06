@@ -42,14 +42,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
+use std::os::fd::AsFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::memory::GuestRam;
 use crate::sync::lock_or_recover;
+use crate::teardown::StopToken;
+use crate::LOG_PREFIX;
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
@@ -1139,6 +1143,180 @@ impl Default for VirtioVsock {
     }
 }
 
+/// The agent bridge, which relays the connections on the host's agent socket to
+/// the vsock device.
+///
+/// Each connection accepted on the socket is opened to the guest agent (host
+/// CID 2 to guest CID 3, port 1024) and relayed both ways. A reader thread per
+/// connection hands the host's bytes to the device, and a writer thread sends
+/// the guest's bytes the vCPU could not.
+pub(crate) struct VsockBridge {
+    /// The agent socket, non-blocking.
+    listener: UnixListener,
+    /// The device the connections are relayed to.
+    dev: Arc<Mutex<VirtioVsock>>,
+    /// Guest RAM, which the device's queues are in.
+    mem: Arc<GuestRam>,
+}
+
+impl VsockBridge {
+    /// Binds the agent socket at `path` for `dev`, first removing a stale
+    /// socket a previous run left, which would make `bind` fail with
+    /// `EADDRINUSE`.
+    ///
+    /// The listener is non-blocking, so the accept loop can poll it beside the
+    /// stop token and then accept without blocking. It must be bound before the
+    /// seccomp filters go in, since they allow accepting on a listener already
+    /// held but not creating one.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the socket cannot be bound.
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This path is the
+    // operator's.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn bind(
+        path: &str,
+        dev: Arc<Mutex<VirtioVsock>>,
+        mem: Arc<GuestRam>,
+    ) -> std::io::Result<Self> {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
+        })?;
+        listener.set_nonblocking(true)?;
+        Ok(Self { listener, dev, mem })
+    }
+
+    /// Accepts and relays agent connections until `stop` is requested.
+    ///
+    /// The per-connection threads poll the same token, and this thread joins
+    /// the ones still running before it returns. On Linux they inherit the
+    /// seccomp filter of the thread that runs this.
+    pub(crate) fn run(self, stop: &StopToken) {
+        let Self { listener, dev, mem } = self;
+        let mut relays: Vec<JoinHandle<()>> = Vec::new();
+        loop {
+            match stop.wait(listener.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; no longer accepting");
+                    break;
+                }
+            }
+            let Ok((stream, _)) = listener.accept() else {
+                continue;
+            };
+            let Ok(reader) = stream.try_clone() else {
+                continue;
+            };
+            let Ok(writer) = stream.try_clone() else {
+                continue;
+            };
+            // Register the connection and send the guest agent a REQUEST.
+            let (port, writer_gate) = {
+                let mut d = lock_or_recover(&dev);
+                let Ok(port) = d.add_conn(stream) else {
+                    continue;
+                };
+                d.connect(&mem, port);
+                (port, d.writer_gate(port))
+            };
+            let Some(writer_gate) = writer_gate else {
+                continue;
+            };
+            relays.retain(|handle| !handle.is_finished());
+            relays.push(Self::spawn_writer(
+                &dev,
+                &mem,
+                stop,
+                port,
+                writer,
+                writer_gate,
+            ));
+            relays.push(Self::spawn_reader(&dev, &mem, stop, port, reader));
+        }
+        // Dropping the connections shuts their sockets down and opens their
+        // gates, so every reader and writer ends.
+        lock_or_recover(&dev).drop_conns();
+        for relay in relays {
+            let _ = relay.join();
+        }
+    }
+
+    /// Spawns the thread that sends connection `port` the guest's bytes the
+    /// vCPU could not. It waits for the socket to take them, without the device
+    /// lock.
+    fn spawn_writer(
+        dev: &Arc<Mutex<VirtioVsock>>,
+        mem: &Arc<GuestRam>,
+        stop: &StopToken,
+        port: u32,
+        writer: UnixStream,
+        gate: Arc<HostGate>,
+    ) -> JoinHandle<()> {
+        let (dev, mem, stop) = (Arc::clone(dev), Arc::clone(mem), stop.clone());
+        std::thread::spawn(move || loop {
+            gate.wait_open();
+            match stop.wait_writable(writer.as_fd()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
+                    lock_or_recover(&dev).host_gone(&mem, port);
+                    break;
+                }
+            }
+            if !lock_or_recover(&dev).flush_to_host(&mem, port) {
+                break;
+            }
+        })
+    }
+
+    /// Spawns the thread that hands connection `port`'s bytes from the host to
+    /// the device.
+    fn spawn_reader(
+        dev: &Arc<Mutex<VirtioVsock>>,
+        mem: &Arc<GuestRam>,
+        stop: &StopToken,
+        port: u32,
+        mut reader: UnixStream,
+    ) -> JoinHandle<()> {
+        let (dev, mem, stop) = (Arc::clone(dev), Arc::clone(mem), stop.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stop.wait(reader.as_fd()) {
+                    Ok(true) => {}
+                    // A stop ends the connection like a peer close, so the
+                    // device releases it.
+                    Ok(false) => break,
+                    Err(e) => {
+                        eprintln!("{LOG_PREFIX} vsock bridge: {e}; connection closed");
+                        break;
+                    }
+                }
+                // `add_conn` makes the socket non-blocking, so a read can find
+                // nothing even after the poll.
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if retry_read(&e) => continue,
+                    Err(_) => break,
+                };
+                let gate = lock_or_recover(&dev).host_data(&mem, port, &buf[..n]);
+                // `HostGate::wait` says why its result is not needed.
+                if let Some(gate) = gate {
+                    gate.wait(|| stop.keep_waiting(reader.as_fd()));
+                }
+            }
+            lock_or_recover(&dev).host_closed(&mem, port);
+        })
+    }
+}
+
 /// Returns whether a bridge read that failed with `e` should poll again.
 ///
 /// The host socket is non-blocking, so a read after a poll that reported it
@@ -1149,11 +1327,6 @@ pub fn retry_read(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
     )
-}
-
-/// Reads from a host connection until EOF (helper for the reader thread).
-pub fn read_host(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
-    stream.read(buf)
 }
 
 #[cfg(test)]
