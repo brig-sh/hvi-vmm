@@ -24,3 +24,12 @@
 pub mod seatbelt;
 #[cfg(target_os = "linux")]
 pub mod seccomp;
+
+/// Confines the calling host-side I/O thread.
+///
+/// On Linux the thread installs the `vmm` seccomp filter on itself. On macOS
+/// the Seatbelt profile already covers the whole process.
+pub(crate) fn confine_io_thread() {
+    #[cfg(target_os = "linux")]
+    seccomp::install_thread(seccomp::Thread::Vmm);
+}
