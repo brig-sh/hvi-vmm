@@ -295,8 +295,10 @@ sequenceDiagram
 ```
 
 Each device sets its own interrupt line, from the methods that change its
-interrupt level, so the line is set under the device's lock. How the line
-reaches the guest is the one device-facing thing that differs by backend:
+interrupt level, so the line is set under the device's lock. A device sets the
+line only when the level differs from the one the line last took, so it tries
+again after a failure. How the line reaches the guest is the one device-facing
+thing that differs by backend:
 
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
   line that rises on an I/O thread also kicks the vCPUs. The console UART's line
@@ -324,12 +326,12 @@ created goes with them (vsock sessions, the virtio-fs FUSE session). A driver
 that binds again after that starts from a device in its boot state.
 
 The serial console is a **PL011** on arm64 and a **16550** on x86. The x86 one
-wraps `vm-superio`'s `Serial`. The UART sets COM1's line after every access,
-under its lock. The guest programs the pin as edge-triggered, so the line is
-high exactly when an IIR read would report an interrupt. To keep it so, the
-wrapper tracks THR-empty itself and answers IIR reads. Both write guest output
-to stdout through `terminal::ConsoleFilter`, which drops the escape sequences
-that change host state or make the terminal answer (see
+wraps `vm-superio`'s `Serial`. The UART sets COM1's line whenever its level
+changes, under its lock. The guest programs the pin as edge-triggered, so the
+line is high exactly when an IIR read would report an interrupt. To keep it so,
+the wrapper tracks THR-empty itself and answers IIR reads. Both write guest
+output to stdout through `terminal::ConsoleFilter`, which drops the escape
+sequences that change host state or make the terminal answer (see
 [security.md](security.md#what-the-guest-can-reach)).
 
 ### Used-ring ordering

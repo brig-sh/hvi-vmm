@@ -99,8 +99,8 @@ impl Pl011 {
     /// Returns whether the UART asserts its interrupt line: RX data is waiting
     /// and the RX interrupt is unmasked.
     ///
-    /// The line is level-triggered, and the UART sets it to this level after
-    /// every access and RX push.
+    /// The line is level-triggered, and the UART sets it to this level whenever
+    /// an access or an RX push changes it.
     #[must_use]
     pub fn irq_level(&self) -> bool {
         !self.rx.is_empty() && (self.imsc & INT_RX != 0)

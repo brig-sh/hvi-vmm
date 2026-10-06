@@ -102,8 +102,8 @@ impl KvmIrqLine {
 }
 
 impl IrqLine for KvmIrqLine {
-    fn set_level(&self, level: bool) {
-        let _ = self.vm.set_irq_line(self.gsi, level);
+    fn set_level(&self, level: bool) -> std::io::Result<()> {
+        Ok(self.vm.set_irq_line(self.gsi, level)?)
     }
 }
 
