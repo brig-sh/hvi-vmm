@@ -68,8 +68,9 @@ use crate::hypervisor::quiesce::Quiesce;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seccomp;
+use crate::signal::{install_kick_handler, KICK_SIGNAL};
 use crate::sync::lock_or_recover;
-use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
 use crate::LOG_PREFIX;
 
@@ -91,9 +92,6 @@ const REG_SP_EL0: u64 = 0x6030_0000_0010_003e;
 
 /// PSTATE = EL1h + DAIF masked (the arm64 Linux boot-protocol entry state).
 const PSTATE_EL1H_DAIF: u64 = 0x3c5;
-
-/// Signal used to break a vCPU out of `KVM_RUN` (snapshot / shutdown).
-const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 
 /// KVM GSI for SPI `spi` (our layout SPI number; INTID = 32 + spi).
 fn spi_gsi(spi: u32) -> u32 {
@@ -1011,42 +1009,6 @@ fn kick_all(sh: &Shared) {
 fn kick_cpu0(sh: &Shared) {
     if let Some(Some(thread)) = lock_or_recover(&sh.threads).first_mut() {
         thread.kick();
-    }
-}
-
-/// Sends the kick signal to `thread` until it has exited or `deadline` passes.
-///
-/// The console reader can be blocked in a read of stdin, a descriptor it shares
-/// with the rest of the process, where the stop token cannot reach it. The
-/// signal ends the read with `EINTR`; it is repeated because a signal that
-/// lands before the read blocks is lost. A wait the signal cannot end, such as
-/// a plugin blocking in `request`, ends the loop at the deadline instead.
-fn kick_until_finished(thread: &JoinHandle<()>, deadline: std::time::Instant) {
-    use std::os::unix::thread::JoinHandleExt;
-    while !thread.is_finished() && std::time::Instant::now() < deadline {
-        // SAFETY: the handle has not been joined, so its thread id is live;
-        // the handler is a no-op. The cast is for musl, where std and libc
-        // spell `pthread_t` differently.
-        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, KICK_SIGNAL) };
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
-/// Installs a no-op handler for the kick signal.
-///
-/// The handler is installed without `SA_RESTART`, so a blocking call the signal
-/// interrupts returns `EINTR` instead of resuming: `KVM_RUN` on a vCPU thread,
-/// or the console reader's read of stdin.
-fn install_kick_handler() {
-    extern "C" fn noop(_: libc::c_int) {}
-    // SAFETY: installing a trivial signal handler before the helper threads
-    // exist.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = noop as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0;
-        libc::sigaction(KICK_SIGNAL, &sa, std::ptr::null_mut());
     }
 }
 

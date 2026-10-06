@@ -59,8 +59,9 @@ use crate::hypervisor::quiesce::Quiesce;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seatbelt;
+use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
-use crate::teardown::{join_by, StopSource, StopToken, STOP_TIMEOUT};
+use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
 use crate::LOG_PREFIX;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
@@ -68,8 +69,6 @@ use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
 type VmGic = VirtualMachineInstance<GicEnabled>;
 
-/// The signal that ends the console reader's blocking read at stop.
-const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
 /// GIC INTIDs: SPIs start at 32.
 const UART_INTID: u32 = 32 + UART_SPI;
 const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
@@ -1500,42 +1499,6 @@ fn width_mask(width: u8) -> u64 {
         u64::MAX
     } else {
         (1u64 << (width * 8)) - 1
-    }
-}
-
-/// Sends the kick signal to `thread` until it has exited or `deadline` passes.
-///
-/// The console reader can be blocked in a read of stdin, a descriptor it shares
-/// with the rest of the process, where the stop token cannot reach it. The
-/// signal ends the read with `EINTR`; it is repeated because a signal that
-/// lands before the read blocks is lost. A wait the signal cannot end, such as
-/// a plugin blocking in `request`, ends the loop at the deadline instead.
-fn kick_until_finished(thread: &JoinHandle<()>, deadline: std::time::Instant) {
-    use std::os::unix::thread::JoinHandleExt;
-    while !thread.is_finished() && std::time::Instant::now() < deadline {
-        // SAFETY: the handle has not been joined, so its thread id is live;
-        // the handler is a no-op. The cast is for musl, where std and libc
-        // spell `pthread_t` differently.
-        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, KICK_SIGNAL) };
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
-/// Installs a no-op handler for the kick signal.
-///
-/// The handler is installed without `SA_RESTART`, so a blocking call the signal
-/// interrupts returns `EINTR` instead of resuming: the console reader's read of
-/// stdin.
-fn install_kick_handler() {
-    extern "C" fn noop(_: libc::c_int) {}
-    // SAFETY: installing a trivial signal handler before the helper threads
-    // exist.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = noop as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0;
-        libc::sigaction(KICK_SIGNAL, &sa, std::ptr::null_mut());
     }
 }
 
