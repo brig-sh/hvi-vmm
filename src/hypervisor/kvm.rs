@@ -27,7 +27,10 @@ use std::sync::Mutex;
 
 use kvm_ioctls::{VcpuFd, VmFd};
 
+use crate::hypervisor::guest::{Cpu, Guest};
 use crate::hypervisor::vcpus::Kick;
+use crate::plugin::Plugin;
+use crate::sandbox::seccomp;
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
 
@@ -122,6 +125,61 @@ impl Drop for Registration<'_> {
     fn drop(&mut self) {
         if let Some(slot) = lock_or_recover(&self.kicker.threads).get_mut(self.cpu as usize) {
             *slot = None;
+        }
+    }
+}
+
+/// Runs vCPU `cpu` on the calling thread until the VM stops.
+///
+/// Each pass clears the vCPU's `immediate_exit` byte, checks the running flag,
+/// parks at the quiesce checkpoint, lets `plugin` look at the guest from the
+/// boot vCPU, and then calls `run`. `run` enters the guest once, services the
+/// exit, and returns `false` to end the loop. Every way out of the loop ends
+/// the VM, a panic included.
+pub(crate) fn run_vcpu(
+    cpu: u32,
+    mut vcpu: VcpuFd,
+    kick_handle: VcpuFd,
+    guest: &Guest<Kicker>,
+    plugin: Option<&dyn Plugin>,
+    mut run: impl FnMut(&mut VcpuFd) -> bool,
+) {
+    // The vCPU filter goes in before this thread touches anything the guest
+    // controls. MMIO exits are serviced on this thread, so the virtio device
+    // models, which parse guest descriptors, run under it.
+    seccomp::install_thread(seccomp::Thread::Vcpu);
+    // The guard lives for the whole run, so every way out ends the VM. A
+    // secondary that ended alone would leave the VM running with one vCPU fewer
+    // and the join in `boot` blocked. It is declared before the registration,
+    // so the registration drops first and the entry is gone before the stop
+    // kicks.
+    let _stop = guest.vcpus.stop_on_drop();
+    let _registration = guest.vcpus.kicker().register(cpu, kick_handle);
+    // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
+    // yet waits inside the run, where a kick reaches it.
+    guest.vcpus.mark_started();
+    let is_boot = cpu == 0;
+
+    loop {
+        // The byte is cleared before the running flag is read, so a kick that
+        // lands from here on ends the run below at once.
+        immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
+        if !guest.vcpus.is_running() {
+            break;
+        }
+        // Safe point for every vCPU: park here while cpu0 lets a plugin look at
+        // the guest.
+        guest.vcpus.checkpoint();
+        // The plugin runs on cpu0, between guest entries, because only this
+        // thread can read this vCPU's registers. It is on the hot path: with no
+        // plugin this is a null check.
+        if is_boot {
+            if let Some(plugin) = plugin {
+                plugin.safepoint(&Cpu { vcpu: &vcpu, guest });
+            }
+        }
+        if !run(&mut vcpu) {
+            break;
         }
     }
 }

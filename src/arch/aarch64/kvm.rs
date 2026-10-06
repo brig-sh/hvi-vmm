@@ -37,7 +37,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::os::fd::AsFd;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -64,8 +63,8 @@ use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
-use crate::hypervisor::kvm::{immediate_exit, kick_handle, Kicker};
+use crate::hypervisor::guest::{Guest, VcpuRegs};
+use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
@@ -504,90 +503,64 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 }
 
 /// Runs one vCPU until the VM stops, servicing its MMIO and PSCI exits.
-fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
-    // The tight filter, installed before this thread touches anything the guest
-    // controls: MMIO exits are serviced inline here, so the virtio device
-    // models -- the code that parses guest descriptors -- run on this
-    // thread.
-    seccomp::install_thread(seccomp::Thread::Vcpu);
-    // Held for the whole run, so every way out ends the VM. A secondary that
-    // ended alone would otherwise leave the VM running with one vCPU fewer and
-    // the join in `boot` blocked. Declared before the registration so the
-    // registration drops first: the entry is removed before the stop kicks.
-    let _stop = sh.guest.vcpus.stop_on_drop();
-    let _registration = sh.guest.vcpus.kicker().register(cpu_id, kick_handle);
-    // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
-    // yet waits inside the run, where a kick reaches it.
-    sh.guest.vcpus.mark_started();
-    let is_boot = cpu_id == 0;
-
-    loop {
-        // Cleared before `running` is read, so a kick that lands from here on
-        // ends the run below at once.
-        immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
-        if !sh.guest.vcpus.is_running() {
-            break;
-        }
-        // Safe point for every vCPU: park here while cpu0 lets a plugin
-        // look at the guest.
-        sh.guest.vcpus.checkpoint();
-        // The plugin runs on cpu0, between guest entries, because only this
-        // thread can read this vCPU's registers. It is on the hot path: with
-        // no plugin this is a null check.
-        if is_boot {
-            if let Some(obs) = sh.plugin.clone() {
-                obs.safepoint(&Cpu {
-                    vcpu: &vcpu,
-                    guest: &sh.guest,
-                });
+fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
+    run_vcpu(
+        cpu_id,
+        vcpu,
+        kick_handle,
+        &sh.guest,
+        sh.plugin.as_deref(),
+        |vcpu| {
+            match vcpu.run() {
+                Ok(VcpuExit::MmioRead(addr, data)) => on_mmio(&sh, addr, true, data),
+                Ok(VcpuExit::MmioWrite(addr, data)) => {
+                    // Copy out first: `data` borrows the run struct.
+                    let mut buf = [0u8; 8];
+                    let n = data.len().min(8);
+                    buf[..n].copy_from_slice(&data[..n]);
+                    on_mmio_write(&sh, addr, &buf[..n]);
+                }
+                Ok(VcpuExit::SystemEvent(evtype, _)) => {
+                    // PSCI SYSTEM_RESET vs SYSTEM_OFF (and anything else ->
+                    // off).
+                    let s = if evtype == KVM_SYSTEM_EVENT_RESET {
+                        Stop::SystemReset
+                    } else {
+                        Stop::SystemOff
+                    };
+                    sh.guest.vcpus.set_stop_reason(s);
+                    return false;
+                }
+                Ok(VcpuExit::Hlt) => return false,
+                // Kicked for a snapshot or a stop; the loop checks which.
+                Ok(VcpuExit::Intr) => {}
+                Ok(VcpuExit::FailEntry(reason, cpu)) => {
+                    eprintln!(
+                        "{LOG_PREFIX} cpu{cpu_id}: KVM entry failed reason={reason:#x} cpu={cpu}"
+                    );
+                    return false;
+                }
+                Ok(other) => {
+                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
+                    return false;
+                }
+                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                    // A run that a kick cut short has completed the MMIO exit
+                    // before it and left `exit_reason` as it was. Linux 5.0 to
+                    // 5.2, and the stable series that took that change back to
+                    // 4.14, complete the exit again on the next run, which
+                    // skips one more guest instruction, so the reason is
+                    // cleared here.
+                    vcpu.get_kvm_run().exit_reason = KVM_EXIT_INTR;
+                }
+                Err(e) => {
+                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
+                    return false;
+                }
             }
-        }
-
-        match vcpu.run() {
-            Ok(VcpuExit::MmioRead(addr, data)) => on_mmio(&sh, addr, true, data),
-            Ok(VcpuExit::MmioWrite(addr, data)) => {
-                // Copy out first: `data` borrows the run struct.
-                let mut buf = [0u8; 8];
-                let n = data.len().min(8);
-                buf[..n].copy_from_slice(&data[..n]);
-                on_mmio_write(&sh, addr, &buf[..n]);
-            }
-            Ok(VcpuExit::SystemEvent(evtype, _)) => {
-                // PSCI SYSTEM_RESET vs SYSTEM_OFF (and anything else -> off).
-                let s = if evtype == KVM_SYSTEM_EVENT_RESET {
-                    Stop::SystemReset
-                } else {
-                    Stop::SystemOff
-                };
-                sh.guest.vcpus.set_stop_reason(s);
-                break;
-            }
-            Ok(VcpuExit::Hlt) => break,
-            Ok(VcpuExit::Intr) => {} // kicked (snapshot / shutdown) — loop re-checks
-            Ok(VcpuExit::FailEntry(reason, cpu)) => {
-                eprintln!(
-                    "{LOG_PREFIX} cpu{cpu_id}: KVM entry failed reason={reason:#x} cpu={cpu}"
-                );
-                break;
-            }
-            Ok(other) => {
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
-                break;
-            }
-            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
-                // A run that a kick cut short has completed the MMIO exit
-                // before it and left `exit_reason` as it was. Linux 5.0 to 5.2,
-                // and the stable series that took that change back to 4.14,
-                // complete the exit again on the next run, which skips one more
-                // guest instruction, so the reason is cleared here.
-                vcpu.get_kvm_run().exit_reason = KVM_EXIT_INTR;
-            }
-            Err(e) => {
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
-                break;
-            }
-        }
-    }
+            true
+        },
+    );
 }
 
 impl VcpuRegs for VcpuFd {
@@ -1012,7 +985,7 @@ mod stop_tests {
     use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::os::fd::RawFd;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 

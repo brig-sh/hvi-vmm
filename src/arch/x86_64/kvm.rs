@@ -42,7 +42,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::os::fd::AsFd;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -64,8 +63,8 @@ use crate::devices::virtio::net::{self, GatewayRelay, TapRelay, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
-use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
-use crate::hypervisor::kvm::{immediate_exit, kick_handle, Kicker};
+use crate::hypervisor::guest::{Guest, VcpuRegs};
+use crate::hypervisor::kvm::{kick_handle, run_vcpu, Kicker};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView, VmHandle};
@@ -584,121 +583,92 @@ fn write_boot_gdt(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Runs one vCPU until the VM stops, servicing its port I/O and MMIO exits.
-fn run_cpu(cpu_id: u32, mut vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
-    // The tight filter, installed before this thread touches anything the guest
-    // controls: MMIO exits are serviced inline here, so the virtio device
-    // models -- the code that parses guest descriptors -- run on this
-    // thread.
-    seccomp::install_thread(seccomp::Thread::Vcpu);
-    // Held for the whole run, so every way out ends the VM. A secondary that
-    // ended alone would otherwise leave the VM running with one vCPU fewer and
-    // the join in `boot` blocked. Declared before the registration so the
-    // registration drops first: the entry is removed before the stop kicks.
-    let _stop = sh.guest.vcpus.stop_on_drop();
-    let _registration = sh.guest.vcpus.kicker().register(cpu_id, kick_handle);
-    // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
-    // yet waits inside the run, where a kick reaches it.
-    sh.guest.vcpus.mark_started();
-    let is_boot = cpu_id == 0;
+fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     let dbg = std::env::var_os("HVI_X86_TRACE").is_some();
     let mut n_exit = 0u64;
-
-    loop {
-        // Cleared before `running` is read, so a kick that lands from here on
-        // ends the run below at once.
-        immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
-        if !sh.guest.vcpus.is_running() {
-            break;
-        }
-        // Safe point for every vCPU: park here while cpu0 lets a plugin
-        // look at the guest.
-        sh.guest.vcpus.checkpoint();
-        // The plugin runs on cpu0, between guest entries, because only this
-        // thread can read this vCPU's registers. It is on the hot path: with
-        // no plugin this is a null check.
-        if is_boot {
-            if let Some(obs) = sh.plugin.clone() {
-                obs.safepoint(&Cpu {
-                    vcpu: &vcpu,
-                    guest: &sh.guest,
-                });
-            }
-        }
-
-        match vcpu.run() {
-            Ok(VcpuExit::IoIn(port, data)) => {
-                if dbg && n_exit < 80 {
-                    eprintln!("[trace] cpu{cpu_id} IoIn {port:#x}");
-                    n_exit += 1;
+    run_vcpu(
+        cpu_id,
+        vcpu,
+        kick_handle,
+        &sh.guest,
+        sh.plugin.as_deref(),
+        |vcpu| {
+            match vcpu.run() {
+                Ok(VcpuExit::IoIn(port, data)) => {
+                    if dbg && n_exit < 80 {
+                        eprintln!("[trace] cpu{cpu_id} IoIn {port:#x}");
+                        n_exit += 1;
+                    }
+                    for b in data.iter_mut() {
+                        *b = pio_read(&sh, port);
+                    }
                 }
-                for b in data.iter_mut() {
-                    *b = pio_read(&sh, port);
+                Ok(VcpuExit::IoOut(port, data)) => {
+                    if dbg && n_exit < 80 {
+                        eprintln!(
+                            "[trace] cpu{cpu_id} IoOut {port:#x} = {:02x?}",
+                            &data[..data.len().min(4)]
+                        );
+                        n_exit += 1;
+                    }
+                    for &b in data.iter() {
+                        pio_write(&sh, port, b);
+                    }
                 }
-            }
-            Ok(VcpuExit::IoOut(port, data)) => {
-                if dbg && n_exit < 80 {
-                    eprintln!(
-                        "[trace] cpu{cpu_id} IoOut {port:#x} = {:02x?}",
-                        &data[..data.len().min(4)]
-                    );
-                    n_exit += 1;
+                Ok(VcpuExit::MmioRead(addr, data)) => {
+                    if dbg && n_exit < 80 {
+                        eprintln!("[trace] cpu{cpu_id} MmioRead {addr:#x}");
+                        n_exit += 1;
+                    }
+                    let val = mmio_read(&sh, addr);
+                    let n = data.len().min(8);
+                    data[..n].copy_from_slice(&val.to_le_bytes()[..n]);
                 }
-                for &b in data.iter() {
-                    pio_write(&sh, port, b);
+                Ok(VcpuExit::MmioWrite(addr, data)) => {
+                    if dbg && n_exit < 80 {
+                        eprintln!("[trace] cpu{cpu_id} MmioWrite {addr:#x}");
+                        n_exit += 1;
+                    }
+                    let mut b = [0u8; 8];
+                    let n = data.len().min(8);
+                    b[..n].copy_from_slice(&data[..n]);
+                    mmio_write(&sh, addr, u64::from_le_bytes(b));
                 }
-            }
-            Ok(VcpuExit::MmioRead(addr, data)) => {
-                if dbg && n_exit < 80 {
-                    eprintln!("[trace] cpu{cpu_id} MmioRead {addr:#x}");
-                    n_exit += 1;
+                Ok(VcpuExit::Hlt) => {
+                    if dbg {
+                        eprintln!("[trace] cpu{cpu_id} HLT");
+                    }
+                    return false;
                 }
-                let val = mmio_read(&sh, addr);
-                let n = data.len().min(8);
-                data[..n].copy_from_slice(&val.to_le_bytes()[..n]);
-            }
-            Ok(VcpuExit::MmioWrite(addr, data)) => {
-                if dbg && n_exit < 80 {
-                    eprintln!("[trace] cpu{cpu_id} MmioWrite {addr:#x}");
-                    n_exit += 1;
+                Ok(VcpuExit::Shutdown) => {
+                    if dbg {
+                        dump_regs(vcpu, &sh.guest.ram, cpu_id, "SHUTDOWN");
+                    }
+                    sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
+                    return false;
                 }
-                let mut b = [0u8; 8];
-                let n = data.len().min(8);
-                b[..n].copy_from_slice(&data[..n]);
-                mmio_write(&sh, addr, u64::from_le_bytes(b));
-            }
-            Ok(VcpuExit::Hlt) => {
-                if dbg {
-                    eprintln!("[trace] cpu{cpu_id} HLT");
+                Ok(VcpuExit::Intr) => {
+                    if dbg && cpu_id == 0 {
+                        dump_regs(vcpu, &sh.guest.ram, cpu_id, "kick");
+                    }
                 }
-                break;
-            }
-            Ok(VcpuExit::Shutdown) => {
-                if dbg {
-                    dump_regs(&vcpu, &sh.guest.ram, cpu_id, "SHUTDOWN");
+                Ok(other) => {
+                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
+                    return false;
                 }
-                sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
-                break;
-            }
-            Ok(VcpuExit::Intr) => {
-                if dbg && is_boot {
-                    dump_regs(&vcpu, &sh.guest.ram, cpu_id, "kick");
+                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                    if dbg && cpu_id == 0 {
+                        dump_regs(vcpu, &sh.guest.ram, cpu_id, "kick(EINTR)");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
+                    return false;
                 }
             }
-            Ok(other) => {
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
-                break;
-            }
-            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
-                if dbg && is_boot {
-                    dump_regs(&vcpu, &sh.guest.ram, cpu_id, "kick(EINTR)");
-                }
-            }
-            Err(e) => {
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
-                break;
-            }
-        }
-    }
+            true
+        },
+    );
 }
 
 impl VcpuRegs for VcpuFd {
@@ -1278,7 +1248,7 @@ mod stop_tests {
     use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::os::fd::RawFd;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
