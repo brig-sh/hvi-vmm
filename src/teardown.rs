@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::signal::KICK_SIGNAL;
+use crate::signal::kick_signal;
 
 /// How long `boot` waits for its helper threads after requesting the stop.
 ///
@@ -85,7 +85,7 @@ pub(crate) fn kick_until_finished(thread: &JoinHandle<()>, deadline: Instant) {
         // SAFETY: the handle has not been joined, so its thread id is live; the
         // handler is a no-op. The cast is for musl, where std and libc spell
         // `pthread_t` differently.
-        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, KICK_SIGNAL) };
+        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, kick_signal()) };
         std::thread::sleep(Duration::from_millis(1));
     }
 }

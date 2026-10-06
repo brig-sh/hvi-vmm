@@ -486,16 +486,11 @@ fn probes() -> Vec<Probe> {
             // `boot` ends the console reader's blocking read with the kick
             // signal, sent from the main thread under this filter.
             run: || {
-                extern "C" fn noop(_: libc::c_int) {}
-                // SAFETY: a no-op handler for SIGUSR1 installed in this child,
-                // then the signal sent to the calling thread itself.
-                unsafe {
-                    let mut sa: libc::sigaction = std::mem::zeroed();
-                    sa.sa_sigaction = noop as *const () as usize;
-                    libc::sigemptyset(&mut sa.sa_mask);
-                    libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
-                    libc::pthread_kill(libc::pthread_self(), libc::SIGUSR1);
-                }
+                use crate::signal::{install_kick_handler, kick_signal};
+                install_kick_handler();
+                // SAFETY: the kick signal, which now has a no-op handler in
+                // this child, sent to the calling thread itself.
+                unsafe { libc::pthread_kill(libc::pthread_self(), kick_signal()) };
             },
         },
         Probe {

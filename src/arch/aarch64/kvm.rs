@@ -68,7 +68,7 @@ use crate::hypervisor::quiesce::Quiesce;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seccomp;
-use crate::signal::{install_kick_handler, KICK_SIGNAL};
+use crate::signal::{install_kick_handler, kick_signal};
 use crate::sync::lock_or_recover;
 use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
@@ -580,7 +580,7 @@ impl VcpuThread {
         }
         immediate_exit(&mut self.vcpu).store(1, Ordering::SeqCst);
         // SAFETY: pthread_kill to a live thread handle; no-op handler.
-        unsafe { libc::pthread_kill(self.tid as libc::pthread_t, KICK_SIGNAL) };
+        unsafe { libc::pthread_kill(self.tid as libc::pthread_t, kick_signal()) };
     }
 }
 
@@ -1387,7 +1387,7 @@ mod stop_tests {
         let outcome = loop {
             // SAFETY: a signal to a thread of this process, for which `boot`
             // installed a handler that does nothing.
-            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), secondary, KICK_SIGNAL) };
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), secondary, kick_signal()) };
             match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(outcome) => break outcome,
                 Err(mpsc::RecvTimeoutError::Timeout) => assert!(
