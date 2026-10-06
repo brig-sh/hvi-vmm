@@ -29,7 +29,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -55,7 +54,7 @@ use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, GatewayRelay, VirtioNet};
 use crate::devices::virtio::vsock::{self, VirtioVsock};
 use crate::events::Emitter;
-use crate::hypervisor::quiesce::Quiesce;
+use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sandbox::seatbelt;
@@ -91,6 +90,69 @@ mod psci {
 struct Secondary {
     mbox: Mutex<Option<(u64, u64)>>, // (entry point, context id)
     cv: Condvar,
+}
+
+/// The [`Kick`] implementation for Hypervisor.framework vCPUs.
+///
+/// It holds each vCPU's handle and the secondaries' `CPU_ON` mailboxes. A kick
+/// is `hv_vcpus_exit`. It ends a run in progress, and one that reaches a vCPU
+/// outside its run stays pending and ends its next run at once. A secondary
+/// that waits for `CPU_ON` is in no run, so the stop also wakes its mailbox.
+struct Kicker {
+    /// The VM the vCPUs belong to.
+    vm: VmGic,
+    /// Each vCPU's handle indexed by vCPU id, `None` until its thread has
+    /// created the vCPU.
+    handles: Mutex<Vec<Option<VcpuHandle>>>,
+    /// The `CPU_ON` mailboxes of the secondaries.
+    secondaries: Vec<Secondary>,
+}
+
+impl Kicker {
+    /// Returns a table for `count` vCPUs of `vm`, none of them registered.
+    fn new(vm: VmGic, count: u32, secondaries: Vec<Secondary>) -> Self {
+        Self {
+            vm,
+            handles: Mutex::new((0..count).map(|_| None).collect()),
+            secondaries,
+        }
+    }
+
+    /// Registers `vcpu`, which the calling thread created, as vCPU `cpu`.
+    ///
+    /// It also records the vCPU as the calling thread's own, so a kick from
+    /// this thread leaves it out.
+    fn register(&self, cpu: u32, vcpu: &Vcpu) {
+        OWN_VCPU.with(|own| own.set(Some(vcpu.id())));
+        if let Some(slot) = lock_or_recover(&self.handles).get_mut(cpu as usize) {
+            *slot = Some(vcpu.get_handle());
+        }
+    }
+}
+
+impl Kick for Kicker {
+    fn kick_all(&self) {
+        // A cancel a vCPU sends itself stays pending and ends its next run
+        // before the guest ran, so a plugin that kicked from `safepoint` would
+        // run again at once.
+        let own = OWN_VCPU.with(std::cell::Cell::get);
+        let others: Vec<VcpuHandle> = lock_or_recover(&self.handles)
+            .iter()
+            .flatten()
+            .filter(|handle| Some(handle.id()) != own)
+            .cloned()
+            .collect();
+        let _ = self.vm.vcpus_exit(&others);
+    }
+
+    fn kick_halted(&self) {
+        for sec in self.secondaries.iter() {
+            // The lock is taken so a secondary cannot be between its check of
+            // the running flag and its wait when the notify lands.
+            let _mbox = lock_or_recover(&sec.mbox);
+            sec.cv.notify_all();
+        }
+    }
 }
 
 /// One tagged virtio-fs export, its dynamically assigned transport slot, and
@@ -179,15 +241,10 @@ struct Shared {
     vsock: Option<Arc<Mutex<VirtioVsock>>>,
     fs: Vec<SharedFs>,
     emit: Arc<Mutex<Emitter>>,
-    running: Arc<AtomicBool>,
-    handles: Arc<Mutex<Vec<VcpuHandle>>>,
-    secondaries: Arc<Vec<Secondary>>,
-    stop: Arc<Mutex<Option<Stop>>>,
+    /// The vCPU threads, the stop and the quiesce that parks them.
+    vcpus: Arc<Vcpus<Kicker>>,
     kernel_addr: u64,
     dtb_addr: u64,
-    num_cpus: u32,
-    /// Parks every vCPU at a safe point so an observation sees a still guest.
-    quiesce: Arc<Quiesce>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
     /// The object backing guest RAM, for a plugin that hands the same pages to
@@ -454,6 +511,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             cv: Condvar::new(),
         })
         .collect();
+    let kicker = Kicker::new(vm.clone(), num_cpus, secondaries);
 
     let shared = Shared {
         vm: vm.clone(),
@@ -464,17 +522,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vsock,
         fs,
         emit: Arc::new(Mutex::new(emitter)),
-        running: Arc::new(AtomicBool::new(true)),
-        handles: Arc::new(Mutex::new(Vec::new())),
-        secondaries: Arc::new(secondaries),
-        stop: Arc::new(Mutex::new(None)),
+        vcpus: Arc::new(Vcpus::new(num_cpus, kicker)),
         kernel_addr: layout.kernel_addr,
         dtb_addr: layout.dtb_addr,
-        quiesce: Arc::new(Quiesce::new()),
         plugin: cfg.plugin.clone(),
         ram_file: Arc::clone(shared_ram.file()),
         sandbox_id: cfg.sandbox_id.clone(),
-        num_cpus,
     };
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
@@ -509,12 +562,12 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // takes the stop through its `FsWake`, and is joined after the vCPUs.
     install_kick_handler();
     let input = {
-        let (kick_vm, kick_handles) = (vm.clone(), Arc::clone(&shared.handles));
+        let kick = Arc::clone(&shared.vcpus);
         let (vm, pl011) = (vm.clone(), Arc::clone(&shared.pl011));
         terminal::input::spawn(
             shared.plugin.clone(),
             stop_source.token(),
-            move || kick_all(&kick_vm, &kick_handles),
+            move || kick.kicker().kick_all(),
             move |byte| {
                 let level = {
                     let mut p = lock_or_recover(&pl011);
@@ -535,7 +588,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Arc::clone(dev),
                 Arc::clone(&shared.mem),
                 vm.clone(),
-                Arc::clone(&shared.handles),
+                Arc::clone(&shared.vcpus),
                 stop_source.token(),
             ),
         ));
@@ -548,7 +601,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Arc::clone(dev),
                 Arc::clone(&shared.mem),
                 vm.clone(),
-                Arc::clone(&shared.handles),
+                Arc::clone(&shared.vcpus),
                 stop_source.token(),
             ),
         ));
@@ -564,7 +617,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 fs.intid,
                 Arc::clone(&shared.mem),
                 vm.clone(),
-                Arc::clone(&shared.handles),
+                Arc::clone(&shared.vcpus),
                 Arc::clone(&fs.wake),
             ),
         ));
@@ -580,27 +633,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
-    let mut failure: Option<Box<dyn std::error::Error>> = None;
-    let mut joins = Vec::new();
-    for cpu in 0..num_cpus {
-        let sh = shared.clone();
-        // The thread is named after its vCPU, so the panic hook's report says
-        // which one panicked.
-        let spawned = std::thread::Builder::new()
-            .name(format!("cpu{cpu}"))
-            .spawn(move || run_cpu(cpu, sh));
-        match spawned {
-            Ok(join) => joins.push(join),
-            Err(e) => {
-                failure = Some(format!("spawning the cpu{cpu} thread: {e}").into());
-                stop_all(&shared);
-                break;
-            }
-        }
-    }
-    for j in joins {
-        let _ = j.join();
-    }
+    let (threads, spawned) = shared
+        .vcpus
+        .spawn((0..num_cpus).map(|_| shared.clone()), run_cpu);
+    let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
+    threads.join();
 
     // The guest has stopped. End the I/O threads (see `teardown`) and write out
     // the ledger tail, which the flush cadence alone would leave in the buffer.
@@ -658,21 +695,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if let Some(e) = failure {
         return Err(e);
     }
-    let stop = shared.stop.lock().unwrap().unwrap_or(Stop::SystemOff);
-    Ok(stop)
-}
-
-/// A guard that ends the VM when dropped.
-///
-/// The drop calls [`stop_all`], on a panic as on a return.
-struct StopOnDrop<'a> {
-    sh: &'a Shared,
-}
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        stop_all(self.sh);
-    }
+    Ok(shared.vcpus.stop_reason())
 }
 
 thread_local! {
@@ -702,7 +725,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // The secondaries would otherwise wait for a CPU_ON that cannot
             // arrive, and the join in `boot` with them.
             eprintln!("{LOG_PREFIX} cpu{cpu_id}: vcpu_create failed: {e:?}");
-            stop_all(&sh);
+            sh.vcpus.stop();
             return;
         }
     };
@@ -711,13 +734,12 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // and the join in `boot` blocked. Declared after the vCPU so it drops
     // first: the VM is stopped while this vCPU still exists, and its
     // destruction is outside the stop.
-    let _stop = StopOnDrop { sh: &sh };
-    OWN_VCPU.with(|own| own.set(Some(vcpu.id())));
+    let _stop = sh.vcpus.stop_on_drop();
     let _ = vcpu.set_trap_debug_exceptions(false);
     let _ = vcpu.set_trap_debug_reg_accesses(false);
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
-    sh.handles.lock().unwrap().push(vcpu.get_handle());
+    sh.vcpus.kicker().register(cpu_id, &vcpu);
 
     if cpu_id == 0 {
         let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
@@ -728,9 +750,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         let _ = vcpu.set_reg(Reg::CPSR, 0x3c5); // EL1h, DAIF masked
     } else {
         // Park until the guest brings this cpu up via PSCI CPU_ON.
-        let sec = &sh.secondaries[cpu_id as usize];
+        let sec = &sh.vcpus.kicker().secondaries[cpu_id as usize];
         let mut mbox = sec.mbox.lock().unwrap();
-        while mbox.is_none() && sh.running.load(Ordering::SeqCst) {
+        while mbox.is_none() && sh.vcpus.is_running() {
             mbox = sec.cv.wait(mbox).unwrap();
         }
         match mbox.take() {
@@ -750,10 +772,10 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // reported with where the guest was and what it last did, and the guard
     // ends the VM on the way out.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        while sh.running.load(Ordering::SeqCst) {
+        while sh.vcpus.is_running() {
             // Safe point for every vCPU: park here while cpu0 lets a plugin
             // look at the guest.
-            sh.quiesce.checkpoint();
+            sh.vcpus.checkpoint();
             // The plugin runs on cpu0, between guest entries, because only this
             // thread can read this vCPU's registers. It is on the hot path:
             // with no plugin this is a null check.
@@ -932,7 +954,7 @@ impl VmHandle for Shared {
     }
 
     fn kick(&self) {
-        kick_all(&self.vm, &self.handles);
+        self.vcpus.kicker().kick_all();
     }
 }
 
@@ -969,21 +991,11 @@ impl CpuHandle for Cpu<'_> {
     }
 
     fn pause(&self) -> bool {
-        // cpu0 drives this, so it waits for the *other* vCPUs and never parks
-        // itself. On failure the quiesce is released here, so a caller that
-        // gets `false` owes nothing.
-        self.sh.quiesce.request();
-        kick_all(&self.sh.vm, &self.sh.handles);
-        if self.sh.quiesce.wait_for(self.sh.num_cpus.saturating_sub(1)) {
-            true
-        } else {
-            self.sh.quiesce.release();
-            false
-        }
+        self.sh.vcpus.pause()
     }
 
     fn resume(&self) {
-        self.sh.quiesce.release();
+        self.sh.vcpus.resume();
     }
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {
@@ -1001,11 +1013,11 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
             false
         }
         psci::SYSTEM_OFF => {
-            *sh.stop.lock().unwrap() = Some(Stop::SystemOff);
+            sh.vcpus.set_stop_reason(Stop::SystemOff);
             true
         }
         psci::SYSTEM_RESET => {
-            *sh.stop.lock().unwrap() = Some(Stop::SystemReset);
+            sh.vcpus.set_stop_reason(Stop::SystemReset);
             true
         }
         psci::FEATURES => {
@@ -1033,8 +1045,9 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
             let entry = vcpu.get_reg(Reg::X2).unwrap_or(0);
             let ctx = vcpu.get_reg(Reg::X3).unwrap_or(0);
             let idx = (target & 0xff) as usize; // aff0
-            let ret = if idx != 0 && idx < sh.num_cpus as usize {
-                let sec = &sh.secondaries[idx];
+            let secondaries = &sh.vcpus.kicker().secondaries;
+            let ret = if idx != 0 && idx < secondaries.len() {
+                let sec = &secondaries[idx];
                 *sec.mbox.lock().unwrap() = Some((entry, ctx));
                 sec.cv.notify_all();
                 psci::SUCCESS
@@ -1052,36 +1065,6 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
             let _ = vcpu.set_reg(Reg::X0, psci::NOT_SUPPORTED);
             false
         }
-    }
-}
-
-/// Ends the VM.
-///
-/// Clears `running`, releases the quiesce so no vCPU stays parked at a
-/// checkpoint, kicks every vCPU out of `run()` and wakes the secondaries still
-/// waiting for `CPU_ON`. Only the first call kicks; a later one just releases
-/// the quiesce again.
-fn stop_all(sh: &Shared) {
-    let was_running = sh.running.swap(false, Ordering::SeqCst);
-    // A vCPU parked at a quiesce checkpoint waits on a condition variable the
-    // kick cannot end. Releasing sends it on to its run, which the kick ends,
-    // and it sees `running` at the top of its loop. Released on every call,
-    // since a request can follow the first release.
-    sh.quiesce.release();
-    // One round of kicks is enough. A vCPU that has not entered its run yet
-    // keeps the cancel pending and leaves that run at once, and a secondary
-    // reads `running` under the mailbox lock the first round notified under.
-    if !was_running {
-        return;
-    }
-    if let Ok(handles) = sh.handles.lock() {
-        let _ = sh.vm.vcpus_exit(handles.as_slice());
-    }
-    for sec in sh.secondaries.iter() {
-        // The lock is taken so a secondary cannot be between its check of
-        // `running` and its wait when the notify lands.
-        let _mbox = lock_or_recover(&sec.mbox);
-        sec.cv.notify_all();
     }
 }
 
@@ -1271,7 +1254,7 @@ fn spawn_vsock_bridge(
     dev: Arc<Mutex<VirtioVsock>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
-    handles: Arc<Mutex<Vec<VcpuHandle>>>,
+    vcpus: Arc<Vcpus<Kicker>>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1305,7 +1288,7 @@ fn spawn_vsock_bridge(
             let _ = vm.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
             let writer_gate = d.writer_gate(port);
             drop(d);
-            kick_all(&vm, &handles);
+            vcpus.kicker().kick_all();
             let Some(writer_gate) = writer_gate else {
                 continue;
             };
@@ -1313,11 +1296,11 @@ fn spawn_vsock_bridge(
             // Per-connection writer thread: the guest -> host bytes the vCPU
             // could not send. It waits for the socket to take them, without
             // the device lock.
-            let (dev3, mem3, vm3, handles3, stop3) = (
+            let (dev3, mem3, vm3, vcpus3, stop3) = (
                 Arc::clone(&dev),
                 Arc::clone(&mem),
                 vm.clone(),
-                Arc::clone(&handles),
+                Arc::clone(&vcpus),
                 stop.clone(),
             );
             relays.retain(|handle| !handle.is_finished());
@@ -1332,7 +1315,7 @@ fn spawn_vsock_bridge(
                         d.host_gone(&mem3, port);
                         let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
                         drop(d);
-                        kick_all(&vm3, &handles3);
+                        vcpus3.kicker().kick_all();
                         break;
                     }
                 }
@@ -1340,7 +1323,7 @@ fn spawn_vsock_bridge(
                 let needed = d.flush_to_host(&mem3, port);
                 let _ = vm3.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
                 drop(d);
-                kick_all(&vm3, &handles3);
+                vcpus3.kicker().kick_all();
                 if !needed {
                     break;
                 }
@@ -1350,7 +1333,7 @@ fn spawn_vsock_bridge(
             let dev2 = Arc::clone(&dev);
             let mem2 = Arc::clone(&mem);
             let vm2 = vm.clone();
-            let handles2 = Arc::clone(&handles);
+            let vcpus2 = Arc::clone(&vcpus);
             let stop2 = stop.clone();
             relays.retain(|handle| !handle.is_finished());
             relays.push(std::thread::spawn(move || {
@@ -1381,7 +1364,7 @@ fn spawn_vsock_bridge(
                         let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
                         gate
                     };
-                    kick_all(&vm2, &handles2);
+                    vcpus2.kicker().kick_all();
                     // `HostGate::wait` says why its result is not needed.
                     if let Some(gate) = gate {
                         gate.wait(|| stop2.keep_waiting(reader.as_fd()));
@@ -1391,7 +1374,7 @@ fn spawn_vsock_bridge(
                 d.host_closed(&mem2, port);
                 let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
                 drop(d);
-                kick_all(&vm2, &handles2);
+                vcpus2.kicker().kick_all();
             }));
         }
         // Dropping the connections shuts their sockets down and opens their
@@ -1415,7 +1398,7 @@ fn spawn_net_gateway_reader(
     dev: Arc<Mutex<VirtioNet>>,
     mem: Arc<GuestRam>,
     vm: VmGic,
-    handles: Arc<Mutex<Vec<VcpuHandle>>>,
+    vcpus: Arc<Vcpus<Kicker>>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1426,7 +1409,7 @@ fn spawn_net_gateway_reader(
                 d.irq_level()
             };
             let _ = vm.gic_set_spi(VIRTIO_NET_INTID, level);
-            kick_all(&vm, &handles);
+            vcpus.kicker().kick_all();
         });
         if let Err(e) = relayed {
             eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
@@ -1467,7 +1450,7 @@ fn spawn_fs_worker(
     intid: u32,
     mem: Arc<GuestRam>,
     vm: VmGic,
-    handles: Arc<Mutex<Vec<VcpuHandle>>>,
+    vcpus: Arc<Vcpus<Kicker>>,
     wake: Arc<FsWake>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1482,7 +1465,7 @@ fn spawn_fs_worker(
             }
             // Outside the lock: `kick_all` takes the vCPU-handle mutex, and it
             // does not need to be atomic with the line, only to follow it.
-            kick_all(&vm, &handles);
+            vcpus.kicker().kick_all();
         }
         // A wake that arrived with the stop was cleared by that last `park`,
         // and the chains it announced are still in the ring. `stop` runs only
@@ -1499,23 +1482,6 @@ fn width_mask(width: u8) -> u64 {
         u64::MAX
     } else {
         (1u64 << (width * 8)) - 1
-    }
-}
-
-/// Kicks every registered vCPU out of `run()`, except the calling thread's
-/// own.
-fn kick_all(vm: &VmGic, handles: &Arc<Mutex<Vec<VcpuHandle>>>) {
-    // A cancel a vCPU sends itself stays pending and ends its next run before
-    // the guest ran, so a plugin that kicked from `safepoint` would run again
-    // at once.
-    let own = OWN_VCPU.with(std::cell::Cell::get);
-    if let Ok(handles) = handles.lock() {
-        let others: Vec<VcpuHandle> = handles
-            .iter()
-            .filter(|handle| Some(handle.id()) != own)
-            .cloned()
-            .collect();
-        let _ = vm.vcpus_exit(&others);
     }
 }
 
