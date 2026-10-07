@@ -352,6 +352,9 @@ pub struct VirtioVsock {
     /// The port whose backlog `frame_backlog` serves first, so connections
     /// take turns.
     next_turn: u32,
+    /// Whether a receive buffer outside guest RAM has already been returned,
+    /// so only the first one is logged.
+    rx_fault_reported: bool,
 }
 
 impl VirtioVsock {
@@ -367,6 +370,7 @@ impl VirtioVsock {
             conns: HashMap::new(),
             next_port: 40000,
             next_turn: 0,
+            rx_fault_reported: false,
         }
     }
 
@@ -1036,15 +1040,36 @@ impl VirtioVsock {
         head
     }
 
+    /// Writes `pkt` across the segments of an RX chain and returns the number
+    /// of bytes written, or `None` when a segment lies outside guest RAM.
+    fn write_chain(mem: &GuestRam, segs: &[(u64, u32)], pkt: &[u8]) -> Option<usize> {
+        let mut off = 0usize;
+        for &(addr, len) in segs {
+            if off == pkt.len() {
+                break;
+            }
+            let n = (pkt.len() - off).min(len as usize);
+            mem.write(addr, &pkt[off..off + n]).ok()?;
+            off += n;
+        }
+        Some(off)
+    }
+
     /// Delivers pending host -> guest packets into the guest's RX buffers.
     ///
     /// Packets in `pending` go out in order. Backlog is framed one packet at a
     /// time, only when `pending` is empty, so at most one RW packet waits for
     /// an RX buffer.
+    ///
+    /// A buffer that lies outside guest RAM goes back to the guest empty, and
+    /// the packet stays at the front of `pending` for the next buffer. A pass
+    /// hands back at most one ring's worth of such buffers, so a guest that
+    /// keeps posting them cannot hold the vCPU here.
     fn fill_rx(&mut self, mem: &GuestRam) {
         if !self.queues[RX_QUEUE as usize].is_ready() {
             return;
         }
+        let mut faults = 0u16;
         loop {
             if self.pending.is_empty() && !self.frame_backlog() {
                 return;
@@ -1088,20 +1113,29 @@ impl VirtioVsock {
             } else {
                 pkt
             };
-            let mut off = 0usize;
-            for (addr, len) in segs {
-                if off == pkt.len() {
-                    break;
-                }
-                let n = (pkt.len() - off).min(len as usize);
-                if mem.write(addr, &pkt[off..off + n]).is_err() {
-                    return;
-                }
-                off += n;
-            }
-            self.queues[RX_QUEUE as usize].push_used(mem, head, off as u32);
+            // A buffer outside guest RAM cannot take the packet. The guest gets
+            // that buffer back empty, so it keeps the descriptor, and the
+            // packet goes back to the front of the queue for the next buffer.
+            // An RW packet's bytes already count against the guest's credit,
+            // and dropping the packet would lose that credit.
+            let written = Self::write_chain(mem, &segs, &pkt);
+            self.queues[RX_QUEUE as usize].push_used(mem, head, written.unwrap_or(0) as u32);
             self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
             self.interrupt_status |= 1;
+            if written.is_none() {
+                self.pending.push_front(pkt);
+                if !self.rx_fault_reported {
+                    self.rx_fault_reported = true;
+                    eprintln!(
+                        "[hvi] virtio-vsock: a receive buffer lies outside guest RAM; it is \
+                         returned empty and the data waits for the next buffer"
+                    );
+                }
+                faults += 1;
+                if faults >= self.queues[RX_QUEUE as usize].size() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -2213,5 +2247,96 @@ mod session_tests {
         );
         opener.open();
         waiter.join().unwrap();
+    }
+
+    /// Returns the `(id, len)` of used slot `u`.
+    fn used_entry(mem: &GuestRam, used: u64, u: u64) -> (u32, u32) {
+        let entry = used + 4 + u * 8;
+        (
+            mem.read_u32(entry).unwrap(),
+            mem.read_u32(entry + 4).unwrap(),
+        )
+    }
+
+    /// Returns a device with three RX buffers and a connected session on the
+    /// returned port.
+    ///
+    /// The session's `OP_REQUEST` takes buffer 0.
+    fn connected_with_three_buffers(mem: &GuestRam) -> (VirtioVsock, u32, UnixStream) {
+        let mut dev = VirtioVsock::new();
+        program_rx_buffers(&mut dev, mem, RINGS, 3, RXBUF);
+        let (dev_side, peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side).unwrap();
+        dev.connect(mem, port);
+        dev.handle_pkt(mem, &pkt(OP_RESPONSE, port, &[]));
+        (dev, port, peer)
+    }
+
+    #[test]
+    fn rx_buffer_outside_guest_ram_is_returned_and_the_packet_kept() {
+        let (desc, _, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
+        // Buffer 1 now points past the end of guest RAM.
+        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
+
+        dev.host_data(&mem, port, b"intact");
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0), "returned empty");
+        let (hdr, body) = delivered(&mem, used, 2, data, RXBUF);
+        assert_eq!((hdr.op, hdr.len), (OP_RW, 6));
+        assert_eq!(body, b"intact");
+        assert!(dev.pending.is_empty());
+    }
+
+    #[test]
+    fn packet_waits_while_every_rx_buffer_is_outside_guest_ram() {
+        let (desc, avail, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
+        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
+        mem.write_u64(desc + 32, BASE + 0x20_0000).unwrap();
+
+        dev.host_data(&mem, port, b"intact");
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0));
+        assert_eq!(used_entry(&mem, used, 2), (2, 0));
+        assert_eq!(dev.pending.len(), 1, "the packet is still queued");
+
+        // The guest reposts buffer 1 inside guest RAM.
+        post_rx_buffer(&mem, desc, avail, 1, data + 0x4000);
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(RX_QUEUE));
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 4);
+        let (id, len) = used_entry(&mem, used, 3);
+        assert_eq!((id, len as usize), (1, HDR_LEN + 6));
+        let mut buf = vec![0u8; HDR_LEN + 6];
+        mem.read(data + 0x4000, &mut buf).unwrap();
+        assert_eq!(Hdr::parse(&buf).unwrap().op, OP_RW);
+        assert_eq!(&buf[HDR_LEN..], b"intact");
+        assert!(dev.pending.is_empty());
+    }
+
+    #[test]
+    fn split_packet_keeps_its_order_past_a_buffer_outside_guest_ram() {
+        const SMALL: u32 = HDR_LEN as u32 + 16;
+        let (desc, _, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let mut dev = VirtioVsock::new();
+        program_rx_buffers(&mut dev, &mem, RINGS, 5, SMALL);
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side).unwrap();
+        dev.connect(&mem, port);
+        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
+
+        let sent: Vec<u8> = (0..40u8).collect();
+        dev.host_data(&mem, port, &sent);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 5);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0));
+        let got: Vec<u8> = (2..5)
+            .flat_map(|slot| delivered(&mem, used, slot, data, SMALL).1)
+            .collect();
+        assert_eq!(got, sent);
+        assert!(dev.pending.is_empty());
     }
 }
