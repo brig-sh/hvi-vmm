@@ -185,7 +185,7 @@ impl StopToken {
 }
 
 /// Builds a `pollfd` that waits for `fd` to become readable.
-fn pollfd(fd: libc::c_int) -> libc::pollfd {
+pub(crate) fn pollfd(fd: libc::c_int) -> libc::pollfd {
     libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -194,7 +194,7 @@ fn pollfd(fd: libc::c_int) -> libc::pollfd {
 }
 
 /// Polls `fds`, retrying when a signal interrupts the call.
-fn poll(fds: &mut [libc::pollfd], timeout_millis: libc::c_int) -> io::Result<()> {
+pub(crate) fn poll(fds: &mut [libc::pollfd], timeout_millis: libc::c_int) -> io::Result<()> {
     loop {
         // SAFETY: `fds` is a live slice of `pollfd` and the length matches.
         let ret =

@@ -1351,9 +1351,19 @@ fn spawn_vsock_bridge(
                         gate.wait(|| stop2.keep_waiting(reader.as_fd()));
                     }
                 }
-                let mut d = lock_or_recover(&dev2);
-                d.host_closed(&mem2, port);
-                set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
+                let half_open = {
+                    let mut d = lock_or_recover(&dev2);
+                    let half_open = d.host_closed(&mem2, port);
+                    set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
+                    half_open
+                };
+                // A host that shut down only its write half can still close,
+                // and an idle guest would not find out.
+                if half_open && crate::devices::virtio::vsock::wait_host_close(&reader, &stop2) {
+                    let mut d = lock_or_recover(&dev2);
+                    d.host_closed_fully(&mem2, port);
+                    set_line(&vm2, VIRTIO_VSOCK_GSI, &d);
+                }
             }));
         }
         // Dropping the connections shuts their sockets down and opens their

@@ -44,11 +44,15 @@
 //! guest byte, and host bytes keep flowing to the guest. A host that shuts
 //! down only its write half reaches the guest as an `OP_SHUTDOWN` that says
 //! the host sends nothing more, and guest bytes keep flowing to the host. The
-//! connection is dropped once both directions are done.
+//! bridge watches such a host stream until it closes for good. A guest that
+//! receives nothing more stops the bridge from reading the host socket, so the
+//! host's writes back up. The connection is dropped once both directions are
+//! done.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -56,6 +60,7 @@ use std::time::Duration;
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::memory::GuestRam;
 use crate::sync::lock_or_recover;
+use crate::teardown::{poll, pollfd, StopToken};
 
 const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
 /// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
@@ -127,6 +132,9 @@ const HOST_BACKLOG_MAX: usize = 64 * 1024;
 /// How often [`HostGate::wait`] checks whether its reader should stop
 /// waiting, for a stop or a host hangup.
 const GATE_POLL: Duration = Duration::from_millis(100);
+/// How often [`wait_host_close`] checks whether a host that shut down only its
+/// write half has closed its end.
+const HALF_CLOSE_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Default)]
 struct Hdr {
@@ -198,7 +206,8 @@ enum ConnState {
 /// to move the connection along.
 ///
 /// Each connection has two. The reader's gate closes when the backlog reaches
-/// `HOST_BACKLOG_MAX`, and opens when the guest has taken enough of it. The
+/// `HOST_BACKLOG_MAX`, and opens when the guest has taken enough of it. It
+/// stays closed once the guest receives nothing more. The
 /// writer's gate is open while guest bytes wait for the host socket. Dropping
 /// the connection opens both.
 #[derive(Default)]
@@ -289,10 +298,12 @@ struct Conn {
     /// Whether the bridge reader read EOF, so the host sends nothing more and
     /// `OP_SHUTDOWN` follows the backlog.
     host_eof: bool,
-    /// Whether the host closed both halves of its end, as seen at EOF.
+    /// Whether the host stream can neither read nor write.
     ///
     /// The guest's `OP_SHUTDOWN` then says that the host receives nothing
     /// more either. A host that shut down only its write half still reads.
+    /// It is checked at EOF, before the `OP_SHUTDOWN` that follows the
+    /// backlog, and by the bridge reader while the host is half open.
     host_hung_up: bool,
     /// Whether a send to the host failed because the host has gone.
     ///
@@ -303,7 +314,8 @@ struct Conn {
     host_gone: bool,
     /// Whether the host stream's write half was shut down.
     host_write_shut: bool,
-    /// Whether the guest receives nothing more, so host bytes are dropped.
+    /// Whether the guest receives nothing more, so the bridge reader waits on
+    /// a closed gate and the host's writes back up.
     guest_rcv_shut: bool,
     /// Whether the guest sends nothing more, so the host stream's write half
     /// shuts down once `to_host` drains.
@@ -340,9 +352,16 @@ impl Conn {
     /// Returns whether the guest closed both directions with `OP_SHUTDOWN`.
     ///
     /// Linux holds such a socket until the peer's `OP_RST` arrives, and
-    /// resets it on its own only after 8 s.
+    /// resets it on its own only after 8 s. A guest `OP_RST` sets both flags
+    /// too, so the callers check `guest_reset` first.
     fn guest_full_close(&self) -> bool {
-        self.guest_rcv_shut && self.guest_send_shut && !self.guest_reset
+        self.guest_rcv_shut && self.guest_send_shut
+    }
+
+    /// Returns whether the host shut down only its write half, so it can still
+    /// close its end with no event the device sees.
+    fn host_half_open(&self) -> bool {
+        self.host_eof && !self.host_hung_up && !self.host_gone
     }
 
     /// Returns whether host to guest is done, so the guest reads nothing more
@@ -509,6 +528,10 @@ impl VirtioVsock {
     /// The bytes go out as the guest's credit and receive buffers allow, and
     /// not before the guest accepts the connection. The caller should not
     /// read more from the host socket until the returned gate opens.
+    ///
+    /// A guest that receives nothing more gets none of them. The gate stays
+    /// closed then, so the host's writes back up and are not read only to be
+    /// dropped.
     pub fn host_data(
         &mut self,
         mem: &GuestRam,
@@ -517,7 +540,8 @@ impl VirtioVsock {
     ) -> Option<Arc<HostGate>> {
         let conn = self.conns.get_mut(&host_port)?;
         if conn.guest_rcv_shut {
-            return None;
+            conn.reader_gate.close();
+            return Some(Arc::clone(&conn.reader_gate));
         }
         conn.backlog.extend(data);
         self.fill_rx(mem);
@@ -543,12 +567,34 @@ impl VirtioVsock {
     /// it. An accepted connection with a backlog waits for the guest to read
     /// it or close. Guest bytes the host socket has not taken still go out
     /// before the connection is dropped.
-    pub fn host_closed(&mut self, mem: &GuestRam, host_port: u32) {
+    ///
+    /// Returns whether the host is half open. The bridge reader then waits in
+    /// [`wait_host_close`] and calls [`VirtioVsock::host_closed_fully`].
+    pub fn host_closed(&mut self, mem: &GuestRam, host_port: u32) -> bool {
         let Some(conn) = self.conns.get_mut(&host_port) else {
-            return;
+            return false;
         };
         conn.host_eof = true;
         conn.host_hung_up = peer_hung_up(&conn.stream);
+        self.settle(host_port);
+        self.fill_rx(mem);
+        self.conns.get(&host_port).is_some_and(Conn::host_half_open)
+    }
+
+    /// Records that a host that shut down only its write half has closed its
+    /// end.
+    ///
+    /// The guest then learns that the host receives nothing more, as after a
+    /// full close, so a guest that sends nothing does not hold the connection
+    /// open for a client that has gone.
+    pub fn host_closed_fully(&mut self, mem: &GuestRam, host_port: u32) {
+        let Some(conn) = self.conns.get_mut(&host_port) else {
+            return;
+        };
+        if !conn.host_half_open() {
+            return;
+        }
+        conn.host_hung_up = true;
         self.settle(host_port);
         self.fill_rx(mem);
     }
@@ -581,16 +627,26 @@ impl VirtioVsock {
             conn.host_write_shut = true;
             let _ = conn.stream.shutdown(Shutdown::Write);
         }
-        let listening = !conn.guest_reset && !conn.reset_sent && !conn.guest_full_close();
-        if listening && conn.host_eof && conn.backlog.is_empty() && conn.told != SHUTDOWN_BOTH {
+        let guest_open = !conn.guest_reset && !conn.reset_sent && !conn.guest_full_close();
+        if guest_open && conn.host_eof && conn.backlog.is_empty() && conn.told != SHUTDOWN_BOTH {
             if conn.host_gone {
                 conn.reset_sent = true;
                 let pkt = Self::control_pkt(host_port, OP_RST, 0, conn.rx_cnt);
                 self.pending.push_back(pkt);
             } else {
-                let mut flags = SHUTDOWN_SEND;
+                // The host may have closed while the guest read the backlog.
+                if conn.told == 0 && !conn.host_hung_up {
+                    conn.host_hung_up = peer_hung_up(&conn.stream);
+                }
+                // A guest that receives nothing more needs to hear only that
+                // the host receives nothing more either.
+                let mut flags = if conn.guest_rcv_shut {
+                    0
+                } else {
+                    SHUTDOWN_SEND
+                };
                 if conn.host_hung_up {
-                    flags |= SHUTDOWN_RCV;
+                    flags |= SHUTDOWN_BOTH;
                 }
                 if flags & !conn.told != 0 {
                     conn.told |= flags;
@@ -636,21 +692,20 @@ impl VirtioVsock {
             return;
         }
         conn.host_gone = true;
-        // The reset `settle` sends right away tells the guest that too.
-        let reset_due = conn.host_eof && conn.backlog.is_empty();
-        let listening = !conn.guest_send_shut && !conn.reset_sent;
-        if listening && conn.told & SHUTDOWN_RCV == 0 && !reset_due {
-            conn.told |= SHUTDOWN_RCV;
-            let pkt = Self::control_pkt(host_port, OP_SHUTDOWN, SHUTDOWN_RCV, conn.rx_cnt);
-            self.pending.push_back(pkt);
-        }
         let dropped = conn.to_host.len();
         conn.to_host.clear();
         conn.writer_gate.close();
         conn.rx_cnt = conn.rx_cnt.wrapping_add(dropped as u32);
-        let rx = conn.rx_cnt;
-        if dropped > 0 && !conn.guest_send_shut {
-            self.enqueue_credit(host_port, rx);
+        // The `OP_SHUTDOWN` carries the credit for the dropped bytes. Any other
+        // guest needs none: it sends nothing more, already knows that the host
+        // receives nothing more, or gets the reset `settle` sends right away,
+        // which carries the credit too.
+        let reset_due = conn.host_eof && conn.backlog.is_empty();
+        let guest_sends = !conn.guest_send_shut && !conn.reset_sent;
+        if guest_sends && conn.told & SHUTDOWN_RCV == 0 && !reset_due {
+            conn.told |= SHUTDOWN_RCV;
+            let pkt = Self::control_pkt(host_port, OP_SHUTDOWN, SHUTDOWN_RCV, conn.rx_cnt);
+            self.pending.push_back(pkt);
         }
         self.settle(host_port);
         self.fill_rx(mem);
@@ -995,10 +1050,11 @@ impl VirtioVsock {
                     .is_some_and(|c| c.state != ConnState::New) =>
             {
                 // Each flag ends one direction, and the other keeps flowing.
-                // A guest that reads nothing more gets no more host bytes. The
-                // host still gets the guest bytes waiting for it, after an
-                // `OP_RST` too. Linux answers our full shutdown with one, and
-                // ends its own close with one after 8 s.
+                // A guest that reads nothing more gets no more host bytes, and
+                // the bridge stops reading them. The host still gets the guest
+                // bytes waiting for it, after an `OP_RST` too. Linux answers
+                // our full shutdown with one, and ends its own close with one
+                // after 8 s.
                 if let Some(c) = self.conns.get_mut(&port) {
                     let flags = if h.op == OP_RST {
                         SHUTDOWN_BOTH
@@ -1009,7 +1065,7 @@ impl VirtioVsock {
                     if flags & SHUTDOWN_RCV != 0 {
                         c.guest_rcv_shut = true;
                         c.backlog.clear();
-                        c.reader_gate.open();
+                        c.reader_gate.close();
                     }
                     if flags & SHUTDOWN_SEND != 0 {
                         c.guest_send_shut = true;
@@ -1050,19 +1106,10 @@ impl VirtioVsock {
         self.fill_rx(mem);
     }
 
+    /// Queues an `OP_CREDIT_UPDATE` for `host_port` that advertises `fwd_cnt`.
     fn enqueue_credit(&mut self, host_port: u32, fwd_cnt: u32) {
-        let hdr = Hdr {
-            src_cid: HOST_CID,
-            dst_cid: GUEST_CID,
-            src_port: host_port,
-            dst_port: AGENT_PORT,
-            typ: TYPE_STREAM,
-            op: OP_CREDIT_UPDATE,
-            buf_alloc: OUR_BUF_ALLOC,
-            fwd_cnt,
-            ..Hdr::default()
-        };
-        self.pending.push_back(hdr.to_bytes().to_vec());
+        let pkt = Self::control_pkt(host_port, OP_CREDIT_UPDATE, 0, fwd_cnt);
+        self.pending.push_back(pkt);
     }
 
     /// Returns the writable segments of RX descriptor chain `head`, in order,
@@ -1214,33 +1261,41 @@ pub fn retry_read(e: &std::io::Error) -> bool {
     )
 }
 
-/// Returns whether the peer of `stream` closed both halves of its end, and not
-/// only its write half.
+/// Returns whether `stream` can neither read nor write, which after a read of
+/// EOF means that its peer closed both halves of its end.
 ///
-/// A read of EOF does not tell the two apart. Polled for `POLLIN`, macOS
-/// reports `POLLHUP` for a half-close too, and Linux only for a full close.
-/// Polled for `POLLOUT` alone, both report `POLLHUP` only once the stream can
-/// neither read nor write. That is after a full close, or after a half-close
-/// of a stream whose own write half is already shut down. The poll does not
-/// wait.
+/// A read of EOF does not tell a full close from a half-close. Polled for
+/// `POLLIN`, macOS reports `POLLHUP` for a half-close too, and Linux only for a
+/// full close. Polled for `POLLOUT` alone, Linux reports `POLLHUP` only once
+/// the stream can neither read nor write. macOS reports it then too, and also
+/// as soon as our own write half is shut down. The callers ask only after EOF,
+/// where both mean the same. The poll does not wait.
 ///
 /// A failed poll reads as a half-close. A full close misread that way is
-/// found by the next send to the host, see [`VirtioVsock::host_gone`].
+/// found by [`wait_host_close`] or by the next send to the host, see
+/// [`VirtioVsock::host_gone`].
 fn peer_hung_up(stream: &UnixStream) -> bool {
-    let mut fd = libc::pollfd {
-        fd: std::os::fd::AsRawFd::as_raw_fd(stream),
-        events: libc::POLLOUT,
-        revents: 0,
-    };
+    let mut fds = [pollfd(stream.as_raw_fd())];
+    fds[0].events = libc::POLLOUT;
+    let gone = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    poll(&mut fds, 0).is_ok() && fds[0].revents & gone != 0
+}
+
+/// Blocks until the host end of `stream`, which shut down only its write
+/// half, can neither read nor write, and returns `false` if `stop` is
+/// requested first.
+///
+/// After a half-close nothing else watches the host stream. The bridge reader
+/// has read EOF, and an idle guest sends nothing that could fail. On macOS a
+/// later close raises no event a poll can wait for, so this checks every
+/// `HALF_CLOSE_POLL`. A connection the device dropped reads as closed too.
+pub fn wait_host_close(stream: &UnixStream, stop: &StopToken) -> bool {
     loop {
-        // SAFETY: one pollfd for a descriptor `stream` owns, and a zero
-        // timeout.
-        let rc = unsafe { libc::poll(&mut fd, 1, 0) };
-        if rc >= 0 {
-            return fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        if !matches!(stop.sleep(HALF_CLOSE_POLL), Ok(true)) {
             return false;
+        }
+        if peer_hung_up(stream) {
+            return true;
         }
     }
 }
@@ -2054,7 +2109,7 @@ mod session_tests {
 
         assert!(dev.host_data(&mem, port, &[b'q'; 6000]).is_none());
         drop(peer);
-        dev.host_closed(&mem, port);
+        assert!(!dev.host_closed(&mem, port), "a full close read as half");
         assert!(dev.conns.contains_key(&port));
         assert_eq!(delivered_since_request(&mem), [(OP_RW, 4096)]);
 
@@ -2185,9 +2240,11 @@ mod session_tests {
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"late"));
         let hdrs = delivered_hdrs(&mem);
         assert_eq!(
-            hdrs.iter().map(|h| (h.op, h.flags)).collect::<Vec<_>>(),
-            [(OP_SHUTDOWN, SHUTDOWN_RCV), (OP_CREDIT_UPDATE, 0)],
-            "the guest can still send"
+            hdrs.iter()
+                .map(|h| (h.op, h.flags, h.fwd_cnt))
+                .collect::<Vec<_>>(),
+            [(OP_SHUTDOWN, SHUTDOWN_RCV, 4)],
+            "the shutdown carries no credit for the dropped bytes"
         );
 
         // A second failed send changes nothing.
@@ -2196,12 +2253,7 @@ mod session_tests {
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(
             delivered_since_request(&mem),
-            [
-                (OP_SHUTDOWN, 0),
-                (OP_CREDIT_UPDATE, 0),
-                (OP_CREDIT_UPDATE, 0),
-                (OP_RST, 0)
-            ]
+            [(OP_SHUTDOWN, 0), (OP_CREDIT_UPDATE, 0), (OP_RST, 0)]
         );
     }
 
@@ -2253,26 +2305,32 @@ mod session_tests {
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
     }
 
+    // A host that closed both halves with guest bytes still waiting for it
+    // ends both directions. The bytes stay with the bridge writer, whose
+    // failed send drops them and the connection.
     #[test]
-    fn host_close_keeps_guest_bytes_the_host_has_not_taken() {
+    fn host_close_leaves_guest_bytes_to_the_writer() {
         let mem = mem_of(0x1000);
-        let (mut dev, port, mut peer, filled) = host_socket_full();
+        let (mut dev, port, peer, _) = host_socket_full();
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"reply"));
-        dev.host_closed(&mem, port);
+        drop(peer);
+        assert!(!dev.host_closed(&mem, port), "a full close read as half");
         let shutdown = Hdr::parse(&dev.pending.pop_front().unwrap()).unwrap();
-        assert_eq!(shutdown.op, OP_SHUTDOWN);
+        assert_eq!((shutdown.op, shutdown.flags), (OP_SHUTDOWN, SHUTDOWN_BOTH));
         // A Linux guest with nothing left to read answers a full shutdown
         // with OP_RST at once.
         dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
         assert!(
             dev.conns.contains_key(&port),
-            "the guest's reply was dropped"
+            "the connection went before the writer"
         );
 
-        assert!(recv(&mut peer, filled).is_some());
         assert!(!dev.flush_to_host(&mem, port));
-        assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"reply"[..]));
         assert!(!dev.conns.contains_key(&port));
+        assert!(
+            dev.pending.is_empty(),
+            "a packet went to a guest that reset"
+        );
     }
 
     // A guest that resets after its 8 s close timeout used to take what the
@@ -2354,9 +2412,7 @@ mod session_tests {
 
     /// Returns the header of the last packet the device delivered.
     fn last_delivered(mem: &GuestRam) -> Hdr {
-        let (_, _, used, data) = RINGS;
-        let completed = mem.read_u16(used + 2).unwrap();
-        delivered(mem, used, u64::from(completed) - 1, data, RXBUF).0
+        *delivered_hdrs(mem).last().unwrap()
     }
 
     /// Returns how many `OP_RST` the device delivered after the REQUEST.
@@ -2491,7 +2547,8 @@ mod session_tests {
     }
 
     // A guest that reads nothing more drops the host's bytes, and its own
-    // still reach the host.
+    // still reach the host. The bridge reader used to take every host byte
+    // and drop it, so the host wrote into nothing at full speed.
     #[test]
     fn guest_shut_rd_drops_host_bytes_and_keeps_writing() {
         let mem = mem_of(0x10000);
@@ -2499,7 +2556,11 @@ mod session_tests {
         assert!(dev.host_data(&mem, port, b"unread").is_none());
         dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
         assert!(dev.conns[&port].backlog.is_empty());
-        assert!(dev.host_data(&mem, port, b"more").is_none());
+        let gate = dev.host_data(&mem, port, b"more");
+        assert!(
+            gate.is_some_and(|gate| !gate.wait(|| false)),
+            "the reader goes on reading host bytes nobody takes"
+        );
         assert!(dev.conns[&port].backlog.is_empty());
 
         dev.handle_pkt(&mem, &pkt(OP_RW, port, b"still"));
@@ -2516,6 +2577,110 @@ mod session_tests {
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
         assert_eq!(resets_delivered(&mem), 0);
+    }
+
+    // A gate the reader already waits on, with the backlog full, stays
+    // closed too.
+    #[test]
+    fn guest_shut_rd_keeps_a_waiting_reader_waiting() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, _peer) = accepted(&mem, 0);
+        let gate = fill_until_gated(&mut dev, &mem, port);
+        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
+        assert!(dev.conns[&port].backlog.is_empty());
+        assert!(!gate.wait(|| false), "the reader goes on reading");
+
+        // Dropping the connection still lets the reader go.
+        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        assert!(!dev.conns.contains_key(&port));
+        assert!(gate.wait(|| false), "the reader waits forever");
+    }
+
+    // A guest that reads nothing more needs no word of a host half-close. A
+    // later full close tells it that the host receives nothing more, so its
+    // sends fail.
+    #[test]
+    fn guest_shut_rd_hears_only_of_a_full_host_close() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, peer) = accepted(&mem, GUEST_BUF_ALLOC);
+        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert!(dev.host_closed(&mem, port), "the host is half open");
+        assert!(
+            delivered_hdrs(&mem).is_empty(),
+            "a needless shutdown went out"
+        );
+
+        drop(peer);
+        dev.host_closed_fully(&mem, port);
+        let last = last_delivered(&mem);
+        assert_eq!((last.op, last.flags), (OP_SHUTDOWN, SHUTDOWN_BOTH));
+        assert!(!dev.conns.contains_key(&port));
+        assert_eq!(delivered_hdrs(&mem).len(), 1);
+    }
+
+    // A host that half-closed and then closed was not seen while the guest
+    // stayed idle. The guest kept the connection, and a later write of its own
+    // succeeded into nothing.
+    #[test]
+    fn host_close_after_a_half_close_reaches_an_idle_guest() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
+        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"hi"));
+        assert_eq!(recv(&mut peer, 2).as_deref(), Some(&b"hi"[..]));
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert!(dev.host_closed(&mem, port), "the host is half open");
+        assert_eq!(last_delivered(&mem).flags, SHUTDOWN_SEND);
+
+        let source = crate::teardown::StopSource::new().unwrap();
+        let stream = dev.conns[&port].stream.try_clone().unwrap();
+        let token = source.token();
+        let watcher = std::thread::spawn(move || wait_host_close(&stream, &token));
+        std::thread::sleep(HALF_CLOSE_POLL * 2);
+        assert!(!watcher.is_finished(), "a half-close read as a close");
+
+        drop(peer);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !watcher.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        source.request_stop();
+        assert!(watcher.join().unwrap(), "the close was not seen");
+        dev.host_closed_fully(&mem, port);
+        let last = last_delivered(&mem);
+        assert_eq!(
+            (last.op, last.flags, last.fwd_cnt),
+            (OP_SHUTDOWN, SHUTDOWN_BOTH, 2)
+        );
+        assert!(!dev.conns.contains_key(&port));
+        assert_eq!(resets_delivered(&mem), 0);
+    }
+
+    #[test]
+    fn wait_host_close_ends_on_a_stop() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let source = crate::teardown::StopSource::new().unwrap();
+        let token = source.token();
+        let watcher = std::thread::spawn(move || wait_host_close(&ours, &token));
+        source.request_stop();
+        assert!(!watcher.join().unwrap());
+    }
+
+    // The host closes while the guest still reads its backlog. The shutdown
+    // after the last byte says so, rather than leaving it to the watch.
+    #[test]
+    fn host_close_while_the_backlog_drains_goes_out_with_the_shutdown() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, peer) = accepted(&mem, 4096);
+        assert!(dev.host_data(&mem, port, &[b'q'; 6000]).is_none());
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert!(dev.host_closed(&mem, port), "the host is half open");
+        drop(peer);
+
+        dev.handle_pkt(&mem, &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096));
+        let last = last_delivered(&mem);
+        assert_eq!((last.op, last.flags), (OP_SHUTDOWN, SHUTDOWN_BOTH));
+        assert!(!dev.conns.contains_key(&port));
     }
 
     #[test]

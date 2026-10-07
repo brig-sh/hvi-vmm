@@ -160,6 +160,10 @@ on. The guest's connection is reset once it has every host byte.
 Either side can also shut down only its write half with `shutdown(SHUT_WR)`.
 The other side reads EOF and can still write, and those bytes arrive. A host
 client can send a request, half-close and read the reply, and so can a guest.
+A host client that half-closes and later closes is seen within about 100 ms,
+and the guest's writes fail with EPIPE from then on. A guest that shuts down
+only its read half with `shutdown(SHUT_RD)` gets no more host bytes, and the
+host client's writes block once its socket fills.
 
 The contract the guest side must satisfy:
 
