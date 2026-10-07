@@ -377,6 +377,9 @@ pub struct VirtioNet {
     tap: Option<File>,
     /// MAC handed to the guest through config space.
     mac: [u8; 6],
+    /// The address a DHCP ACK delivered from the gateway or the tap leased to
+    /// `mac`.
+    lease: Option<Ipv4Addr>,
     /// Live feed of every frame to a plugin, when one asked for it.
     /// Every L2 frame crossing the device goes in raw and unparsed, whichever
     /// backend carries it, so the reader decodes it with its own stack.
@@ -397,6 +400,7 @@ impl VirtioNet {
             tap_write_reported: false,
             tap: None,
             mac: GUEST_MAC,
+            lease: None,
             sink: None,
         }
     }
@@ -467,7 +471,21 @@ impl VirtioNet {
             bytes,
             dns,
             sni: None,
+            src_leased: self.leased().map(|a| a == src),
         });
+    }
+
+    /// Returns the address leased to the guest, or `None` while the device has
+    /// seen no lease.
+    ///
+    /// The built-in stack leases [`GUEST_IP`] itself. Under a gateway or a tap
+    /// the lease is the one a DHCP ACK delivered to the guest's MAC carried.
+    fn leased(&self) -> Option<Ipv4Addr> {
+        if self.gw.is_none() && self.tap.is_none() {
+            Some(GUEST_IP)
+        } else {
+            self.lease
+        }
     }
 
     fn queue(&mut self) -> &mut Queue {
@@ -765,6 +783,9 @@ impl VirtioNet {
     /// hypervisor backend's gateway or tap reader thread can call it under the
     /// device lock.
     pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) {
+        if let Some(addr) = dhcp_ack_for(frame, self.mac) {
+            self.lease = Some(addr);
+        }
         self.inject_rx(mem, frame);
     }
 
@@ -798,6 +819,7 @@ impl VirtioNet {
                     bytes: l4.len() as u64,
                     dns: None,
                     sni,
+                    src_leased: self.leased().map(|a| a == src),
                 });
             }
             IP_UDP if l4.len() >= 8 => {
@@ -875,7 +897,7 @@ impl VirtioNet {
                     self.capture(IP_UDP, src, sport, dst, dport, payload.len() as u64, None);
                     self.handle_dhcp(&payload[8..])
                 } else if dport == 53 && dst == DNS_IP {
-                    self.handle_dns(sport, &payload[8..])
+                    self.handle_dns(src, sport, &payload[8..])
                 } else {
                     eprint!("\r\n[virtio-net] udp {src}:{sport} -> {dst}:{dport}\r\n");
                     self.capture(IP_UDP, src, sport, dst, dport, payload.len() as u64, None);
@@ -918,29 +940,11 @@ impl VirtioNet {
     /// address (10.0.2.15) so an `ip=dhcp` boot (as a container runtime
     /// configures) lands on an address consistent with our ARP/DNS/gateway.
     fn handle_dhcp(&mut self, bootp: &[u8]) -> Option<Vec<u8>> {
-        if bootp.len() < 240 || bootp[0] != 1 || bootp[236..240] != [0x63, 0x82, 0x53, 0x63] {
-            return None; // not a BOOTP request with the DHCP magic cookie
+        if bootp.first() != Some(&1) {
+            return None; // not a BOOTP request
         }
-        // Find option 53 (message type): 1=DISCOVER, 3=REQUEST.
-        let mut msg_type = 0u8;
-        let mut i = 240;
-        while i < bootp.len() {
-            match bootp[i] {
-                255 => break, // end
-                0 => i += 1,  // pad
-                code => {
-                    let len = *bootp.get(i + 1)? as usize;
-                    let data = i + 2;
-                    if data + len > bootp.len() {
-                        break;
-                    }
-                    if code == 53 && len >= 1 {
-                        msg_type = bootp[data];
-                    }
-                    i = data + len;
-                }
-            }
-        }
+        // 1=DISCOVER, 3=REQUEST.
+        let msg_type = dhcp_message_type(bootp)?;
         let reply_type = match msg_type {
             1 => 2, // DISCOVER -> OFFER
             3 => 5, // REQUEST  -> ACK
@@ -979,7 +983,7 @@ impl VirtioNet {
     }
 
     /// Captures the queried name, resolves it through the host, and replies.
-    fn handle_dns(&mut self, client_port: u16, dns: &[u8]) -> Option<Vec<u8>> {
+    fn handle_dns(&mut self, src: Ipv4Addr, client_port: u16, dns: &[u8]) -> Option<Vec<u8>> {
         if dns.len() < 12 {
             return None;
         }
@@ -987,7 +991,7 @@ impl VirtioNet {
         eprint!("{}", dns_query_line(&name));
         self.capture(
             IP_UDP,
-            GUEST_IP,
+            src,
             client_port,
             DNS_IP,
             53,
@@ -1141,6 +1145,57 @@ fn parse_dns_name(msg: &[u8], off: usize) -> Option<(String, usize)> {
 /// an escape. The ledger keeps the name as the guest sent it.
 fn dns_query_line(name: &str) -> String {
     format!("\r\n[virtio-net] dns query {}\r\n", name.escape_default())
+}
+
+/// Returns the DHCP message type (option 53) of a BOOTP message, or `None`
+/// when it has no DHCP magic cookie or no message type.
+fn dhcp_message_type(bootp: &[u8]) -> Option<u8> {
+    if bootp.len() < 240 || bootp[236..240] != [0x63, 0x82, 0x53, 0x63] {
+        return None;
+    }
+    let mut msg_type = None;
+    let mut i = 240;
+    while i < bootp.len() {
+        match bootp[i] {
+            255 => break, // end
+            0 => i += 1,  // pad
+            code => {
+                let len = *bootp.get(i + 1)? as usize;
+                let data = i + 2;
+                if data + len > bootp.len() {
+                    break;
+                }
+                if code == 53 && len >= 1 {
+                    msg_type = Some(bootp[data]);
+                }
+                i = data + len;
+            }
+        }
+    }
+    msg_type
+}
+
+/// Returns the address a DHCP ACK in `frame` leases to `mac`, or `None` when
+/// the frame is not a DHCP ACK for `mac`.
+fn dhcp_ack_for(frame: &[u8], mac: [u8; 6]) -> Option<Ipv4Addr> {
+    if u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]) != ETH_IPV4 {
+        return None;
+    }
+    let ip = &frame[14..];
+    if ip.len() < 20 || ip[9] != IP_UDP {
+        return None;
+    }
+    let udp = ip.get(((ip[0] & 0x0f) as usize) * 4..)?;
+    if udp.get(0..4)? != [0, 67, 0, 68] {
+        return None;
+    }
+    let bootp = udp.get(8..)?;
+    if bootp.first() != Some(&2) || bootp.get(28..34)? != mac || dhcp_message_type(bootp) != Some(5)
+    {
+        return None;
+    }
+    let addr = Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19]);
+    (!addr.is_unspecified()).then_some(addr)
 }
 
 /// Best-effort TLS SNI from a TCP payload that begins with a TLS ClientHello.
@@ -1539,6 +1594,76 @@ mod tests {
         );
     }
 
+    // Returns the ledger's lease flag for one UDP frame from `src`, run
+    // through the stub stack or, in a relay mode, through `observe_tx`.
+    fn lease_flag(net: &mut VirtioNet, src: Ipv4Addr, relay: bool) -> Option<bool> {
+        let udp = udp_datagram(1234, 9999, b"x");
+        let ip = ipv4_packet(src, Ipv4Addr::new(1, 2, 3, 4), IP_UDP, &udp);
+        let frame = eth_frame(OUR_MAC, GUEST_MAC, ETH_IPV4, &ip);
+        if relay {
+            net.observe_tx(&frame);
+        } else {
+            net.handle_frame(&frame);
+        }
+        match net.take_events().pop() {
+            Some(CapturedEvent::NetFlow {
+                src: got,
+                src_leased,
+                ..
+            }) => {
+                assert_eq!(got, src, "the record keeps the source on the wire");
+                src_leased
+            }
+            _ => panic!("expected a NetFlow event"),
+        }
+    }
+
+    #[test]
+    fn the_stub_ledger_flags_a_source_it_did_not_lease() {
+        let mut net = VirtioNet::new();
+        assert_eq!(lease_flag(&mut net, GUEST_IP, false), Some(true));
+        assert_eq!(
+            lease_flag(&mut net, Ipv4Addr::new(10, 0, 2, 99), false),
+            Some(false)
+        );
+    }
+
+    // Under a gateway the lease is the one the gateway's ACK carried to the
+    // guest's MAC. An ACK for another MAC, and an OFFER, lease nothing.
+    #[test]
+    fn relayed_flow_is_checked_against_the_lease_delivered_to_the_guest() {
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        let (_peer, dev) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut net = VirtioNet::with_gateway(dev);
+        let leased = Ipv4Addr::new(10, 87, 0, 2);
+        let reply = |mac: [u8; 6], msg_type: u8| {
+            let mut bootp = bootp_discover(mac);
+            bootp[0] = 2; // op = reply
+            bootp[16..20].copy_from_slice(&leased.octets()); // yiaddr
+            bootp[242] = msg_type;
+            let udp = udp_datagram(67, 68, &bootp);
+            let ip = ipv4_packet(
+                Ipv4Addr::new(10, 87, 0, 1),
+                Ipv4Addr::BROADCAST,
+                IP_UDP,
+                &udp,
+            );
+            eth_frame(mac, OUR_MAC, ETH_IPV4, &ip)
+        };
+        assert_eq!(lease_flag(&mut net, leased, true), None, "no lease seen");
+
+        net.deliver(&mem, &reply([0x02, 0, 0, 0, 0, 0x99], 5));
+        net.deliver(&mem, &reply(GUEST_MAC, 2));
+        assert_eq!(lease_flag(&mut net, leased, true), None, "still no lease");
+
+        net.deliver(&mem, &reply(GUEST_MAC, 5));
+        assert_eq!(lease_flag(&mut net, leased, true), Some(true));
+        assert_eq!(
+            lease_flag(&mut net, Ipv4Addr::new(10, 87, 0, 3), true),
+            Some(false)
+        );
+    }
+
     // Unikraft posts the virtio-net header and the frame as two descriptors
     // where Linux posts one buffer; filling only the head completes a short
     // packet the driver rejects.
@@ -1780,7 +1905,7 @@ mod tests {
         assert_eq!(parse_dns_name(&truncated, 12), None);
 
         let mut net = VirtioNet::new();
-        assert_eq!(net.handle_dns(1234, &truncated), None);
+        assert_eq!(net.handle_dns(GUEST_IP, 1234, &truncated), None);
     }
 
     #[test]
