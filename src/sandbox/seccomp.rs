@@ -59,8 +59,8 @@
 //! it matters most: MMIO exits are serviced inline on the vCPU thread, so the
 //! virtio device models -- the code that parses guest descriptors -- run there.
 //! `vmm` covers the main thread and the host-side I/O threads (the console
-//! reader, the agent bridge and its per-connection readers, the tap and
-//! gateway readers, and the debug watchdog when it is enabled).
+//! reader, the agent bridge and its per-connection readers and writers, the tap
+//! and gateway readers, and the debug watchdog when it is enabled).
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
@@ -74,11 +74,11 @@
 //! ```
 //!
 //! Nothing is ever spawned *underneath* a filter except the per-connection
-//! vsock readers, which the agent bridge creates and which correctly inherit
-//! `vmm`. Had the main thread instead installed its filter first and relied on
-//! inheritance, every thread wanting a filter of its own would have needed
-//! `seccomp` allowed, which hands a compromised backend the ability to install
-//! filters. The order above costs nothing and avoids that.
+//! vsock readers and writers, which the agent bridge creates and which
+//! correctly inherit `vmm`. Had the main thread instead installed its filter
+//! first and relied on inheritance, every thread wanting a filter of its own
+//! would have needed `seccomp` allowed, which hands a compromised backend the
+//! ability to install filters. The order above costs nothing and avoids that.
 //!
 //! Everything acquired during setup is finished by the time any filter is in,
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
@@ -224,9 +224,9 @@ pub fn arm() -> io::Result<()> {
 /// Installs `thread`'s filter if [`arm`] was called, and aborts if it cannot.
 ///
 /// Called at the top of each thread hvi spawns *before* the main thread filters
-/// itself. Not called by the per-connection vsock readers: those are spawned by
-/// an already-filtered thread and correctly inherit its filter -- calling
-/// `seccomp` from under a filter that does not allow it would trap.
+/// itself. Not called by the per-connection vsock readers and writers: those
+/// are spawned by an already-filtered thread and correctly inherit its filter
+/// -- calling `seccomp` from under a filter that does not allow it would trap.
 ///
 /// Aborting rather than returning an error is deliberate. There is no
 /// meaningful recovery inside a worker thread: continuing would run a
@@ -478,6 +478,29 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::recv(1, std::ptr::null_mut(), 0, libc::MSG_DONTWAIT) };
             },
         },
+        // `UnixStream::write` is a `send` with `MSG_NOSIGNAL`. The vCPU thread
+        // makes it for the gateway and for virtio-vsock, and each vsock
+        // writer makes it under the vmm filter.
+        Probe {
+            what: "send on an inherited descriptor (vcpu)",
+            thread: Thread::Vcpu,
+            expect_ok: true,
+            run: || {
+                // SAFETY: a zero-length send on fd 1, which we inherited. The
+                // filter has passed the call before the kernel looks at the
+                // descriptor.
+                unsafe { libc::send(1, std::ptr::null(), 0, libc::MSG_NOSIGNAL) };
+            },
+        },
+        Probe {
+            what: "send on an inherited descriptor (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            run: || {
+                // SAFETY: as above.
+                unsafe { libc::send(1, std::ptr::null(), 0, libc::MSG_NOSIGNAL) };
+            },
+        },
         Probe {
             what: "signal a thread of this process (vmm)",
             thread: Thread::Vmm,
@@ -501,8 +524,8 @@ fn probes() -> Vec<Probe> {
             what: "spawn a thread (vmm)",
             thread: Thread::Vmm,
             expect_ok: true,
-            // The agent bridge spawns a reader per accepted connection, after
-            // the filter is in.
+            // The agent bridge spawns a reader and a writer per accepted
+            // connection, after the filter is in.
             run: || {
                 let _ = std::thread::spawn(|| 0u8).join();
             },

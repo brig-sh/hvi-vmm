@@ -18,12 +18,13 @@
 //! listener and its connections, the gateway socket, the tap. Each polls its
 //! own descriptor beside a [`StopToken`]. `boot` requests the stop through its
 //! [`StopSource`] once the vCPU threads have exited, every poll returns, and
-//! `boot` joins the threads before it returns. Two helpers need more than the
-//! poll. The macOS virtio-fs worker waits on no descriptor; it parks on a
-//! condition variable and is stopped through it. The console reader reads
-//! stdin, which the whole process shares, so a byte another reader took between
-//! the poll and the read would leave it blocked; `boot` sends it the kick
-//! signal until it has exited.
+//! `boot` joins the threads before it returns. Three helpers need more than
+//! the poll. The macOS virtio-fs worker waits on no descriptor; it parks on a
+//! condition variable and is stopped through it. A vsock connection's writer
+//! parks on its gate while it has nothing to send, and the bridge opens every
+//! gate when it stops. The console reader reads stdin, which the whole process
+//! shares, so a byte another reader took between the poll and the read would
+//! leave it blocked; `boot` sends it the kick signal until it has exited.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
 //! the deadline is left running and `boot` returns an error naming it, since a
