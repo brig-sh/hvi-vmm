@@ -40,6 +40,7 @@ three things a reader should not have to guess between:
 | The node table has no cap. | `FORGET` is what shrinks it between device resets. A guest that never sends one grows the table until it resets the device. Guest-driven, unbounded. See [#34](https://github.com/brig-sh/hvi-vmm/issues/34). | Defect |
 | `SETLKW` blocks under the device mutex. | A guest waiting on a lock stalls that whole device, and stalls the vCPU that issued the request when the queue was shallow enough to drain inline. See [#32](https://github.com/brig-sh/hvi-vmm/issues/32). | Defect |
 | The handle budget is per export, the descriptor table is per process. | Each export refuses `OPEN`/`OPENDIR` past its own budget with `ENFILE`. `CREATE`, `TMPFILE` and cached directory descriptors are not counted, so several busy exports can still exhaust the table. | Defect |
+| An export holds at most 1024 guest Unix sockets. | `MKNOD` of one more answers `ENFILE`, as an `OPEN` past the handle budget does. Unlinking one makes room. | Design |
 | The open file limit is raised when the first share is set up. | A boot with no share never raises it and never logs the line. macOS only. | Design |
 | A node keeps at most 16 alias paths. | A file with more than 16 hard links inside a share can lose a name from the table. | Design |
 | Symlink expansion stops at 40. | Deeply chained links end as `ELOOP`. | Design |

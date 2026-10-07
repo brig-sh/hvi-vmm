@@ -81,7 +81,13 @@ because opening a FIFO under the device mutex blocked the VM.
 
 Unix sockets are served from inside the device. The socket inode lives in hvi,
 by path, and never reaches the host filesystem. The guest kernel's own socket
-table carries the traffic.
+table carries the traffic. An export holds at most 1024 of them, and `MKNOD`
+of one more answers `ENFILE`, as an `OPEN` past the handle budget does.
+
+A socket moves with a rename of itself or of a directory above it. The host
+sees a directory that holds only sockets as empty, so the device answers
+`ENOTEMPTY` to an `RMDIR` of it, and to a rename that would replace it. An
+exchange that involves a socket answers `EOPNOTSUPP`.
 
 ### Cache policy
 
