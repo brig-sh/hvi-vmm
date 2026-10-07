@@ -52,10 +52,11 @@ the check for that.
 
 ## Argument conditions
 
-`ioctl` is the one rule with conditions, in both lists of both files. They
-refuse two requests on any descriptor, `TIOCSTI` (0x5412) and `TIOCLINUX`
-(0x541C). A refused request matches no rule and traps like an off-list
-syscall. The module docs say why these two.
+Two rules carry conditions. `ioctl` has them in both lists of both files, and
+they refuse two requests on any descriptor, `TIOCSTI` (0x5412) and `TIOCLINUX`
+(0x541C). `getsockopt` has them in the `vmm` list, and they admit only
+`SOL_SOCKET` with `SO_PEERCRED`, the agent socket's peer check. A refused call
+matches no rule and traps like an off-list syscall. The module docs say why.
 
 ```json
 {"syscall": "ioctl", "args": [

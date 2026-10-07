@@ -40,6 +40,7 @@
 //! separate crate can link this one and supply its own the same way, which is
 //! why the VMM is a library as well as a binary. See `docs/plugins.md`.
 
+pub mod agent_socket;
 pub mod arch;
 pub mod config;
 pub mod console;

@@ -46,6 +46,33 @@ escape sequences for the display, and drops the rest. When it restores the
 terminal at exit, it discards the input the guest did not read. The allowlist
 is in [cli.md](cli.md#console-output).
 
+## The agent socket
+
+`--agent-sock` names the host end of the vsock bridge to the guest agent. A
+process that connects to it gets a session with the agent, so hvi limits who
+can connect:
+
+- **The node is mode 0600.** hvi sets it right after the bind, whatever the
+  umask.
+- **Every peer is checked.** hvi reads the uid of each connection it accepts,
+  with `getpeereid` on macOS and `SO_PEERCRED` on Linux. A peer running as
+  any other uid is closed before it reaches the guest, and that includes
+  root. The first refusal is reported on stderr.
+- **The bind replaces only a stale socket.** A socket at the path that
+  refuses a connection is removed, and hvi binds in its place. A socket that
+  accepts a connection fails the boot. So does anything that is not a socket,
+  a symbolic link included.
+
+These are the only access controls on the socket. A user who can write the
+directory it is in can remove the node and bind their own at the path, so
+put the socket in a directory only you can write.
+
+On a clean stop, hvi removes the node only under `--no-sandbox`. The removal
+needs a stat and an unlink, and a confined process may make neither: Seatbelt
+denies both outside a writable share, and the seccomp filters on Linux trap
+both. The node left behind is stale, and the next boot at the same path
+replaces it.
+
 ## Confinement
 
 On by default. `--no-sandbox` turns it off, for debugging a run the profile or
@@ -86,7 +113,7 @@ thread as that thread's first act:
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the main thread and the host-side I/O threads | 47 syscalls | 48 syscalls |
+| `vmm` | the main thread and the host-side I/O threads | 48 syscalls | 49 syscalls |
 
 `vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
 action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
@@ -129,8 +156,8 @@ vulnerability report.
 ## The selftests
 
 ```sh
-hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 28 probes, 15 expect a SIGSYS trap, 13 expect success
+hvi sandbox-selftest    # macOS: 26 probes, 15 expect denial, 11 expect success
+hvi seccomp-selftest    # Linux: 30 probes, 16 expect a SIGSYS trap, 14 expect success
 ```
 
 Both install the profile or the filters that actually ship and check both
@@ -156,8 +183,9 @@ sandbox is secure.
 - **It does not cover every thread.** With `--dump-after`, the memory-dump
   plugin starts its timer thread before the Linux filters are armed, and that
   thread runs unfiltered for the life of the VM.
-- **It does not constrain most syscall arguments.** Only the `ioctl` rule
-  carries conditions, and they refuse `TIOCSTI` and `TIOCLINUX`. Every other
+- **It constrains the arguments of two syscalls.** The `ioctl` rule refuses
+  `TIOCSTI` and `TIOCLINUX`, and `getsockopt` in the `vmm` list is pinned to
+  `SOL_SOCKET` and `SO_PEERCRED` for the agent socket's peer check. Every other
   `ioctl` request, and `sendmsg`, is unconstrained over every descriptor the
   process already holds.
 - **It does not remove the risk of an escape.** It reduces what an escape
