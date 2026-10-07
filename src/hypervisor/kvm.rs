@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use kvm_ioctls::{VcpuFd, VmFd};
 
-use crate::config::BootConfig;
+use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Cpu, Guest};
@@ -38,6 +38,8 @@ use crate::sandbox::seccomp;
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
 use crate::teardown::StopSource;
+use crate::terminal;
+use crate::LOG_PREFIX;
 
 /// The [`Kick`] implementation for KVM vCPUs.
 ///
@@ -191,6 +193,63 @@ pub(crate) fn start_io_threads(
     Ok((filters, io_threads))
 }
 
+/// Runs the guest on one thread per vCPU and returns how it asked to stop.
+///
+/// Each vCPU thread runs `run` with its id, its vCPU, its kick handle and a
+/// clone of `shared`. Once they exist the calling thread installs its own
+/// filter, and once they have exited it stops `io_threads` and writes out the
+/// ledger tail. The terminal stays in raw mode until this returns.
+///
+/// # Errors
+///
+/// Errors if a vCPU thread cannot be spawned, the calling thread cannot be
+/// filtered or an I/O thread does not stop. Each failure stops the guest, and
+/// the first one is returned once every thread has been joined or left running.
+pub(crate) fn run_guest<S: Clone + Send + 'static>(
+    guest: &Guest<Kicker>,
+    shared: &S,
+    vcpus: Vec<VcpuFd>,
+    kick_handles: Vec<VcpuFd>,
+    run: fn(u32, VcpuFd, VcpuFd, S),
+    filters: seccomp::Filters,
+    io_threads: IoThreads,
+) -> Result<Stop, Box<dyn std::error::Error>> {
+    let _raw = terminal::RawTerm::enable();
+
+    let (threads, spawned) = guest.vcpus.spawn(
+        vcpus
+            .into_iter()
+            .zip(kick_handles)
+            .map(|(vcpu, kick_handle)| (vcpu, kick_handle, shared.clone(), run)),
+        |id, (vcpu, kick_handle, shared, run)| run(id, vcpu, kick_handle, shared),
+    );
+    let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
+
+    // The guest is already running by now, so a failure to filter the main
+    // thread stops it like any other failure.
+    if let Err(e) = filters.install() {
+        // The error is printed here, since a spawn failure ahead of it is the
+        // one returned.
+        eprintln!("{LOG_PREFIX} {e}");
+        failure.get_or_insert(e.into());
+        guest.vcpus.stop();
+    }
+
+    threads.join();
+
+    // The guest has stopped. End the I/O threads (see `teardown`) and write out
+    // the ledger tail, which the flush cadence alone would leave in the buffer.
+    if let Err(e) = io_threads.stop() {
+        failure.get_or_insert(e.into());
+    }
+    lock_or_recover(&guest.ledger).flush();
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    Ok(guest.vcpus.stop_reason())
+}
+
 /// Runs vCPU `cpu` on the calling thread until the VM stops.
 ///
 /// Each pass clears the vCPU's `immediate_exit` byte, checks the running flag,
@@ -212,9 +271,9 @@ pub(crate) fn run_vcpu(
     seccomp::install_thread(seccomp::Thread::Vcpu);
     // The guard lives for the whole run, so every way out ends the VM. A
     // secondary that ended alone would leave the VM running with one vCPU fewer
-    // and the join in `boot` blocked. It is declared before the registration,
-    // so the registration drops first and the entry is gone before the stop
-    // kicks.
+    // and the join in `run_guest` blocked. It is declared before the
+    // registration, so the registration drops first and the entry is gone
+    // before the stop kicks.
     let _stop = guest.vcpus.stop_on_drop();
     let _registration = guest.vcpus.kicker().register(cpu, kick_handle);
     // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
@@ -376,10 +435,10 @@ mod stop_tests {
     // The boot vCPU's plugin panics before the first guest entry, while the
     // secondary is in `KVM_RUN` or on its way there. `boot` returns only if the
     // panicking thread ends the VM on its way out; a secondary left running
-    // keeps the join in `boot` blocked, so the bound is the assertion. Ignored
-    // by default: it needs a usable `/dev/kvm`, and `boot` takes the terminal
-    // into raw mode and reads stdin for the guest, so it runs on its own, by
-    // name, with `--ignored`.
+    // keeps the join in `run_guest` blocked, so the bound is the assertion.
+    // Ignored by default: it needs a usable `/dev/kvm`, and `boot` takes the
+    // terminal into raw mode and reads stdin for the guest, so it runs on its
+    // own, by name, with `--ignored`.
     #[test]
     #[ignore]
     fn plugin_panic_on_the_boot_vcpu_ends_the_vm() {
