@@ -62,7 +62,9 @@ use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
 use crate::hypervisor::guest::{Guest, VcpuRegs};
-use crate::hypervisor::kvm::{kick_handle, run_vcpu, start_io_threads, Kicker, KvmIrqLine};
+use crate::hypervisor::kvm::{
+    kick_handle, run_guest, run_vcpu, start_io_threads, Kicker, KvmIrqLine,
+};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
@@ -70,7 +72,6 @@ use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView};
 use crate::sandbox::confine_io_thread;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
-use crate::terminal;
 use crate::LOG_PREFIX;
 
 // Long-mode control-register values (Firecracker's boot values).
@@ -370,44 +371,16 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             }),
         );
     }
-    let _raw = terminal::RawTerm::enable();
 
-    // One thread per vCPU. From here on a failure stops the guest and is
-    // reported once every thread has been joined or left running, and the first
-    // failure is the one reported.
-    let (threads, spawned) = shared.guest.vcpus.spawn(
-        vcpus
-            .into_iter()
-            .zip(kick_handles)
-            .map(|(vcpu, kick_handle)| (vcpu, kick_handle, shared.clone())),
-        |id, (vcpu, kick_handle, sh)| run_cpu(id, vcpu, kick_handle, sh),
-    );
-    let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
-
-    // The guest is already running by now, so a failure to filter the main
-    // thread stops it and is reported once every thread has been joined or left
-    // running.
-    if let Err(e) = filters.install() {
-        // Printed here, since a spawn failure ahead of it is the one reported.
-        eprintln!("{LOG_PREFIX} {e}");
-        failure.get_or_insert(e.into());
-        shared.guest.vcpus.stop();
-    }
-
-    threads.join();
-
-    // The guest has stopped. End the I/O threads (see `teardown`) and write
-    // out the ledger tail, which the flush cadence alone would leave in the
-    // buffer.
-    if let Err(e) = io_threads.stop() {
-        failure.get_or_insert(e.into());
-    }
-    lock_or_recover(&shared.guest.ledger).flush();
-    if let Some(e) = failure {
-        return Err(e);
-    }
-
-    Ok(shared.guest.vcpus.stop_reason())
+    run_guest(
+        &shared.guest,
+        &shared,
+        vcpus,
+        kick_handles,
+        run_cpu,
+        filters,
+        io_threads,
+    )
 }
 
 /// A flat segment descriptor for `KVM_SET_SREGS` (base 0, 4 GiB limit).
