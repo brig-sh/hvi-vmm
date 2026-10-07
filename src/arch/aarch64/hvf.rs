@@ -1345,8 +1345,8 @@ fn spawn_vsock_bridge(
                 loop {
                     match stop2.wait(reader.as_fd()) {
                         Ok(true) => {}
-                        // A stop ends the connection like a peer close, so the
-                        // device releases it.
+                        // A stop ends the reader like a peer EOF. `drop_conns`
+                        // after the accept loop releases the connection.
                         Ok(false) => break,
                         Err(e) => {
                             eprintln!("[hvi] vsock bridge: {e}; connection closed");
@@ -1374,10 +1374,19 @@ fn spawn_vsock_bridge(
                     }
                 }
                 let mut d = lock_or_recover(&dev2);
-                d.host_closed(&mem2, port);
+                let half_open = d.host_closed(&mem2, port);
                 let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
                 drop(d);
                 kick_all(&vm2, &handles2);
+                // A host that shut down only its write half can still close,
+                // and an idle guest would not find out.
+                if half_open && vsock::wait_host_close(&reader, &stop2) {
+                    let mut d = lock_or_recover(&dev2);
+                    d.host_closed_fully(&mem2, port);
+                    let _ = vm2.gic_set_spi(VIRTIO_VSOCK_INTID, d.irq_level());
+                    drop(d);
+                    kick_all(&vm2, &handles2);
+                }
             }));
         }
         // Dropping the connections shuts their sockets down and opens their
