@@ -284,6 +284,38 @@ jobs:
               || { echo "::error::e820 lacks the usable range $range"; exit 1; }
           done
           echo "e820 split around the MMIO hole ✓"
+      # The guest powers off through the ACPI tables and resets through their
+      # reset register, or through the i8042 when it runs without ACPI. With
+      # the in-kernel irqchip a halt never reaches hvi, so a power-off that
+      # fell back to one would only end at the timeout.
+      - name: power-off and reset end the run
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          sudo apt-get install -y --no-install-recommends busybox-static cpio
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          for cmd in poweroff reboot; do
+            W=$(mktemp -d); mkdir -p "$W/bin"
+            cp /bin/busybox "$W/bin/busybox"
+            printf '#!/bin/busybox sh\n/bin/busybox %s -f\n' "$cmd" > "$W/init"
+            chmod +x "$W/init"
+            ( cd "$W" && find . | cpio -o -H newc --quiet ) > "$cmd.cpio"
+          done
+          # <log name> <initramfs> <expected stop> <extra command line>
+          stops() {
+            start=$(date +%s)
+            sudo timeout 30 ./target/release/hvi boot --kernel "$KIMG" --initramfs "$2" \
+              --mem-mib 512 --cpus 2 --cmdline "console=ttyS0 panic=-1 $4" \
+              </dev/null 2>&1 | tee "$1.log" > /dev/null
+            rc=${PIPESTATUS[0]}
+            echo "$1: exit $rc after $(( $(date +%s) - start )) s"
+            [ "$rc" -eq 0 ] || { tail -20 "$1.log"; echo "::error::$1: hvi exited $rc"; exit 1; }
+            grep -q "guest stopped: $3" "$1.log" \
+              || { tail -20 "$1.log"; echo "::error::$1: the run did not stop as $3"; exit 1; }
+          }
+          stops poweroff poweroff.cpio SystemOff ""
+          stops reboot reboot.cpio SystemReset ""
+          stops reboot-no-acpi reboot.cpio SystemReset "acpi=off"
+          echo "power-off and reset end the run ✓"
       # backing_len's BLKGETSIZE64 branch self-skips when no block device is
       # openable, which is every unprivileged run — so nothing exercised it
       # live. A loop device over a sparse file is exactly the shape that broke
@@ -336,6 +368,87 @@ jobs:
             </dev/null 2>&1 | tee stop.log || true
           grep -q "test result: ok. 3 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
+      # The vhost-user handover runs on the vCPU thread that services the
+      # guest's DRIVER_OK write, so it is the seccomp filter for that thread
+      # that has to allow it. A missing entry there does not fail a unit test:
+      # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
+      - name: virtio-fs export served by virtiofsd
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
+          VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
+          echo "daemon: $VFSD"; "$VFSD" --version
+          KREL=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)
+          # The distribution kernel builds virtiofs as a module, so the guest
+          # loads it before it can mount anything.
+          W=$(mktemp -d); mkdir -p "$W/bin"
+          cp /bin/busybox "$W/bin/busybox"
+          for a in sh mount ls cat echo sleep insmod poweroff sync; do ln -sf busybox "$W/bin/$a"; done
+          unzstd -f -o "$W/virtiofs.ko" "/lib/modules/$KREL/kernel/fs/fuse/virtiofs.ko.zst"
+          {
+            echo '#!/bin/sh'
+            echo 'export PATH=/bin'
+            echo '/bin/busybox mount -t proc proc /proc'
+            echo '/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null'
+            echo 'insmod /virtiofs.ko'
+            echo 'mkdir -p /mnt/s'
+            echo 'mount -t virtiofs hvishare /mnt/s && echo FS-MOUNT-OK'
+            echo 'cat /mnt/s/hello.txt && echo FS-READ-OK'
+            echo 'echo from-guest > /mnt/s/from-guest.txt && sync && echo FS-WRITE-OK'
+            echo 'echo FS-DONE'
+            echo '/bin/busybox sleep 2'
+            echo 'poweroff -f'
+          } > "$W/init"
+          chmod +x "$W/init"
+          ( cd "$W" && find . | cpio -o -H newc --quiet | gzip -1 ) > fs-initramfs.cpio.gz
+          rm -rf share && mkdir share && echo "hello from the host" > share/hello.txt
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          # The guest does its work in a couple of seconds and powers off.
+          sudo timeout 30 ./target/release/hvi boot --kernel "$KIMG" \
+            --initramfs fs-initramfs.cpio.gz --mem-mib 1024 --cpus 2 \
+            --virtiofsd "$VFSD" --share-rw "$PWD/share" hvishare \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-fs.log || true
+          grep -qa "seccomp: on" boot-fs.log \
+            || { echo "::error::the share boot ran without seccomp enforcement"; exit 1; }
+          for marker in FS-MOUNT-OK FS-READ-OK FS-WRITE-OK; do
+            grep -qa "$marker" boot-fs.log || { echo "::error::$marker missing"; exit 1; }
+          done
+          # The write has to have reached the host, not just the guest's cache.
+          grep -q from-guest share/from-guest.txt \
+            || { echo "::error::the guest's write never reached the host"; exit 1; }
+          grep -q "guest stopped: SystemOff" boot-fs.log \
+            || { echo "::error::the share boot did not power off"; exit 1; }
+          echo "virtio-fs export served end to end ✓"
+      # A read-only export needs --readonly, which arrived in virtiofsd 1.11.
+      # On an older daemon the gate has to refuse the boot rather than serve
+      # the export writable. On a newer one the export has to be served. The
+      # runner's daemon decides which of the two this step checks.
+      - name: the virtiofsd version gate on a read-only export
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
+          VER=$("$VFSD" --version | awk '{print $2}')
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          mkdir -p share-ro
+          sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 512 \
+            --virtiofsd "$VFSD" --share-ro "$PWD/share-ro" ro \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-ro.log || true
+          case "$VER" in
+            1.[0-9].*|1.10.*)
+              grep -q "has no --readonly" boot-ro.log \
+                || { echo "::error::virtiofsd $VER served a read-only export it cannot enforce"; cat boot-ro.log; exit 1; }
+              echo "read-only export refused on virtiofsd $VER ✓" ;;
+            # The line naming the daemon is printed once it starts. The guest
+            # kernel runs only after the daemon has answered the handshake.
+            *)
+              if ! grep -qE 'virtio-fs\[0\]: .* \(read-only\) via ' boot-ro.log \
+                || ! grep -qa "Linux version" boot-ro.log; then
+                echo "::error::virtiofsd $VER has --readonly, but the read-only export was not served"
+                cat boot-ro.log
+                exit 1
+              fi
+              echo "read-only export served by virtiofsd $VER ✓" ;;
+          esac
       # The searches above keep only the lines they match. When the job
       # fails, the full log answers what those lines cannot.
       - name: keep the boot evidence
@@ -349,6 +462,11 @@ jobs:
             boot-4g.log
             blk.log
             stop.log
+            poweroff.log
+            reboot.log
+            reboot-no-acpi.log
+            boot-fs.log
+            boot-ro.log
           retention-days: 7
           if-no-files-found: ignore
 

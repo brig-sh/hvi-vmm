@@ -116,7 +116,8 @@ Every backend speaks virtio-mmio, which avoids a PCI host bridge and lets one
 set of device models serve all three. The backend modules under `src/arch/` hold
 the hypervisor differences. The boot protocol differs too, and by more: arm64
 uses an `Image` header, a devicetree and PSCI, while x86-64 uses a `bzImage` or
-an uncompressed `vmlinux` with `boot_params`, an e820 map and an MP table.
+an uncompressed `vmlinux` with `boot_params`, an e820 map, an MP table and
+ACPI tables.
 
 [docs/architecture.md](docs/architecture.md) describes the whole design.
 
@@ -133,7 +134,9 @@ hvi is young. Read these before you build on it.
   the socket that needs, so the guest gets a reply with no addresses in it.
   Only `--no-sandbox` resolves.
 - **One disk and one NIC.** No hotplug, and no PCI at all.
-- **virtio-fs is macOS only**, one request queue per share, no DAX window.
+- **virtio-fs** is served in-process on macOS and by `virtiofsd` on Linux:
+  one request queue per share, no DAX window, and no file-level events on the
+  Linux path.
 - **8 vCPUs on a GICv2 arm64 host.** The guest interrupt controller follows
   the host, and GICv2 caps there.
 - **The event ledger is per packet and egress only.** It is not aggregated per

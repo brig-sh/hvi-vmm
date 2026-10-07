@@ -17,8 +17,9 @@
 //! Unlike arm64 (RAM at 1 GiB, devices below), x86 guest RAM starts at 0 and
 //! the low megabyte holds the legacy BIOS/real-mode area. We follow the usual
 //! Firecracker/CH placement: the 64-bit kernel at 1 MiB, the `boot_params`
-//! "zero page" and cmdline in low RAM, a minimal MP table in the EBDA, and the
-//! virtio-mmio window up in the sub-4 GiB MMIO hole.
+//! "zero page" and cmdline in low RAM, a minimal MP table in the EBDA, ACPI
+//! tables in the BIOS area, and the virtio-mmio window up in the sub-4 GiB MMIO
+//! hole.
 
 /// Guest RAM base (x86 RAM starts at physical 0).
 pub const RAM_BASE: u64 = 0x0;
@@ -32,6 +33,10 @@ pub const CMDLINE_MAX: usize = 0x1_0000;
 pub const EBDA_START: u64 = 0x9_fc00;
 /// Minimal MP floating pointer + config table, in the EBDA.
 pub const MPTABLE_ADDR: u64 = EBDA_START;
+/// ACPI tables, RSDP first, at the start of the BIOS area where the guest scans
+/// for it. The e820 map leaves the area out, so the guest never takes it for
+/// RAM.
+pub const ACPI_ADDR: u64 = 0xe_0000;
 /// Boot page tables (PML4/PDPT/PD) for the initial long-mode identity map.
 pub const PML4_ADDR: u64 = 0x9000;
 pub const PDPT_ADDR: u64 = 0xa000;
@@ -49,6 +54,27 @@ pub const BOOT_STACK: u64 = 0x6ff0;
 pub const COM1_PORT: u16 = 0x3f8;
 pub const COM1_GSI: u32 = 4;
 
+/// The i8042 command and status port. The controller's CPU-reset command,
+/// written here, is how a guest without ACPI resets.
+pub const I8042_COMMAND_PORT: u16 = 0x64;
+/// The ACPI PM1 event block, PM1 control block and reset register, in that
+/// order, at the base a PC puts them.
+///
+/// A guest powers off by writing the S5 sleep type and SLP_EN to PM1 control.
+pub const ACPI_PM_PORT: u16 = 0x600;
+/// How many ports the registers at [`ACPI_PM_PORT`] take.
+pub const ACPI_PM_PORTS: u16 = 7;
+/// The GSI of the ACPI system control interrupt.
+///
+/// hvi never raises it, but the guest's ACPI driver needs a line for its
+/// handler. It is the IOAPIC's last line, away from the ISA lines the devices
+/// take.
+pub const SCI_GSI: u32 = 23;
+
+/// The local APIC and the IOAPIC, at the addresses a PC has them.
+pub const LAPIC_ADDR: u32 = 0xfee0_0000;
+pub const IOAPIC_ADDR: u32 = 0xfec0_0000;
+
 /// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device
 /// (blk, net, vsock), with IOAPIC GSIs 5/6/7. The guest is told about these via
 /// `virtio_mmio.device=` on the kernel command line (see `kvm::boot`).
@@ -60,6 +86,41 @@ pub const VIRTIO_VSOCK_BASE: u64 = VIRTIO_MMIO_BASE + 0x400;
 pub const VIRTIO_BLK_GSI: u32 = 5;
 pub const VIRTIO_NET_GSI: u32 = 6;
 pub const VIRTIO_VSOCK_GSI: u32 = 7;
+
+/// First virtio-fs window, one 0x200 page per export, and the first GSI they
+/// take.
+///
+/// The MP table describes ISA IRQs 0..15 and nothing above them, so an export
+/// has to take one of those lines. 9 to 12 are the ones no device in this
+/// machine claims: 8 is the RTC, 13 the FPU, and 14 and 15 the IDE pair that
+/// a guest kernel probes whether or not we have a disk. That bounds the x86
+/// machine at [`MAX_FS_DEVICES`] exports, where arm64 has a full SPI range to
+/// hand out.
+pub const VIRTIO_FS_BASE: u64 = VIRTIO_MMIO_BASE + 0x600;
+pub const VIRTIO_FS_GSI: u32 = 9;
+
+/// How many virtio-fs exports this machine has interrupt lines for.
+pub const MAX_FS_DEVICES: usize = 4;
+
+/// Returns the window base of the `index`th virtio-fs export, or `None` when
+/// the machine has no line left for it.
+#[must_use]
+pub fn virtio_fs_base(index: usize) -> Option<u64> {
+    if index >= MAX_FS_DEVICES {
+        return None;
+    }
+    VIRTIO_FS_BASE.checked_add((index as u64).checked_mul(VIRTIO_SIZE)?)
+}
+
+/// Returns the GSI of the `index`th virtio-fs export, or `None` when the
+/// machine has no line left for it.
+#[must_use]
+pub fn virtio_fs_gsi(index: usize) -> Option<u32> {
+    if index >= MAX_FS_DEVICES {
+        return None;
+    }
+    VIRTIO_FS_GSI.checked_add(u32::try_from(index).ok()?)
+}
 
 /// Base of the sub-4 GiB MMIO hole: guest RAM stops here and the remainder,
 /// if any, resumes at [`HIGH_RAM_BASE`].
@@ -82,3 +143,47 @@ pub const MMIO_GAP_START: u64 = VIRTIO_MMIO_BASE;
 
 /// Where guest RAM resumes above the MMIO hole.
 pub const HIGH_RAM_BASE: u64 = 0x1_0000_0000; // 4 GiB
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        virtio_fs_base, virtio_fs_gsi, COM1_GSI, MAX_FS_DEVICES, MMIO_GAP_START, VIRTIO_BLK_GSI,
+        VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    };
+
+    // The fs windows sit after the three fixed devices and inside the MMIO
+    // hole. RAM laid over either end is the failure this guards: the guest
+    // then finds no virtio magic and never probes the device.
+    #[test]
+    fn every_fs_window_is_inside_the_device_hole() {
+        for index in 0..MAX_FS_DEVICES {
+            let base = virtio_fs_base(index).expect("a placement");
+            assert!(
+                base >= VIRTIO_VSOCK_BASE + VIRTIO_SIZE,
+                "fs {index} overlaps vsock"
+            );
+            assert!(
+                base + VIRTIO_SIZE <= MMIO_GAP_START + 0x1000,
+                "fs {index} escapes the hole"
+            );
+        }
+        assert_eq!(virtio_fs_base(MAX_FS_DEVICES), None);
+    }
+
+    // An interrupt shared with another device delivers one guest's completion
+    // to the other's handler.
+    #[test]
+    fn no_fs_interrupt_is_claimed_by_another_device() {
+        let taken = [COM1_GSI, VIRTIO_BLK_GSI, VIRTIO_NET_GSI, VIRTIO_VSOCK_GSI];
+        let mut seen = Vec::new();
+        for index in 0..MAX_FS_DEVICES {
+            let gsi = virtio_fs_gsi(index).expect("an interrupt");
+            assert!(!taken.contains(&gsi), "fs {index} takes GSI {gsi}");
+            assert!(!seen.contains(&gsi), "GSI {gsi} handed out twice");
+            // The MP table writes ISA entries for IRQs 0..15 only.
+            assert!(gsi < 16, "GSI {gsi} has no MP table entry");
+            seen.push(gsi);
+        }
+        assert_eq!(virtio_fs_gsi(MAX_FS_DEVICES), None);
+    }
+}

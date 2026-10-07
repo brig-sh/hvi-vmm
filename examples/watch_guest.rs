@@ -185,6 +185,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
         disk: None,
         fs_shares: Vec::new(),
+        virtiofsd: None,
         net: true,
         net_gateway: None,
         net_tap: None,
