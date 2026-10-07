@@ -110,6 +110,13 @@ it. To hold it past the borrow, on a thread of your own or for an `SCM_RIGHTS`
 send, keep the `OwnedFd` that `try_clone_to_owned()` returns. `hvi smoke --shm`
 proves that path on macOS.
 
+The object's length is fixed for its lifetime, so a region you mapped stays
+backed for as long as you keep the mapping. On Linux the memfd carries
+`F_SEAL_SHRINK`, `F_SEAL_GROW` and `F_SEAL_SEAL`. `ftruncate` and
+`F_ADD_SEALS` fail with `EPERM` through `ram_fd()` and through every duplicate
+of it. The object is not write-sealed, so a writable mapping still works. On
+macOS a POSIX shared-memory object refuses a second `ftruncate`.
+
 `RegsView::root` is the architectural translation-base register, TTBR1_EL1 on
 arm64 or CR3 on x86-64. The traits hand over access and deliberately no more.
 What any of it means is your problem, which is what keeps a tool's idea of the
