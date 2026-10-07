@@ -48,6 +48,7 @@ pub mod events;
 pub mod hypervisor;
 pub mod memory;
 pub mod plugin;
+pub mod private_file;
 pub mod sandbox;
 pub mod sync;
 pub mod teardown;

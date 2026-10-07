@@ -151,7 +151,7 @@ impl MemoryDump {
                 "memory dump was never attached",
             ));
         };
-        let mut out = File::create(&self.path)?;
+        let mut out = crate::private_file::create(std::path::Path::new(&self.path))?;
         let mut written = 0u64;
         // Written straight from the mapping in 1 MiB slices, one call per
         // slice. macOS refuses a single write longer than `INT_MAX` bytes, so a
@@ -252,14 +252,16 @@ pub struct IoTrace {
 }
 
 impl IoTrace {
-    /// Traces to `path` (truncating).
+    /// Traces to `path`, opened through [`crate::private_file::create`].
     ///
     /// # Errors
     ///
-    /// Errors if the file cannot be created.
+    /// Errors if the file cannot be created, or if `create` refuses what is
+    /// at `path`.
     pub fn new(path: &str) -> std::io::Result<Self> {
+        let file = crate::private_file::create(std::path::Path::new(path))?;
         Ok(IoTrace {
-            out: Arc::new(Mutex::new(BufWriter::new(File::create(path)?))),
+            out: Arc::new(Mutex::new(BufWriter::new(file))),
             dirty: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -410,6 +412,19 @@ mod tests {
         let low_end = ALIGN as usize;
         assert_eq!(&image[low_end - 4..low_end], b"LOW!");
         assert_eq!(&image[image.len() - 4..], b"HIGH");
+    }
+
+    #[test]
+    fn trace_is_private_to_its_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("hvi-trace-{}-mode.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = IoTrace::new(path.to_str().unwrap()).expect("trace");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        drop(t);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode & 0o077, 0, "trace mode {mode:o}");
     }
 
     /// A trace writes one line per event, in the order the device saw them.

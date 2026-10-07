@@ -15,6 +15,31 @@ whatever was in guest RAM, which includes keys, tokens and plaintext. Treat
 these files with the same care as the workload itself. Write them somewhere
 only you can read, and delete them when the investigation ends.
 
+## How hvi creates these files
+
+The three files, and the devicetree that `hvi dump-fdt --out` writes, are
+created the same way, whatever the umask:
+
+- If nothing is at the path, hvi creates the file at mode 0600.
+- If a regular file is there, and you own it, and it has no other name, hvi
+  truncates it. If group or other had any access to it, hvi first sets it to
+  0600.
+- Anything else is refused and left untouched. That covers a symbolic link, a
+  hard link to a file with a second name, a file another user owns, a FIFO, a
+  device and a directory.
+
+A refusal names the path and the reason:
+
+```text
+hvi: refusing to write /tmp/ledger.ndjson: it is a symbolic link
+```
+
+For `--events` and `--trace-io` the boot fails. For `--dump-memory` the dump
+fails, and the guest keeps running.
+
+The ledger cannot be streamed to a pipe, a FIFO or `/dev/stdout`. Write it to
+a file and follow it with `tail -f`.
+
 ## The event ledger
 
 ```sh
