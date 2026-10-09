@@ -1084,8 +1084,8 @@ fn service_vsock(
 /// `mmio`, so this then serves a shallow queue at once and wakes the device's
 /// worker thread, `spawn_fs_worker`, for the rest.
 ///
-/// The device sets its line from `mmio` and from the worker's completions, both
-/// under the same mutex, so the line follows the last change to the interrupt
+/// The device sets its line in `mmio` and at the end of every drain. Both run
+/// under the device mutex, so the line follows the last change to the interrupt
 /// status.
 fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);

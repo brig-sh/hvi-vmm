@@ -38,7 +38,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | The node table has no cap. | `FORGET` is what shrinks it between device resets. A guest that never sends one grows the table until it resets the device. Guest-driven, unbounded. See [#34](https://github.com/brig-sh/hvi-vmm/issues/34). | Defect |
-| `SETLKW` blocks under the device mutex. | A guest waiting on a lock stalls that whole device, and stalls the vCPU that issued the request when the queue was shallow enough to drain inline. See [#32](https://github.com/brig-sh/hvi-vmm/issues/32). | Defect |
+| `SETLKW` blocks under the device mutex. | A guest waiting on a lock stalls that whole device, and any vCPU that accesses the device while it waits. That includes the vCPU that issued the request when the queue was shallow enough to drain inline. `boot` waits for the vCPUs with no deadline, so it does not return until the lock is released. See [#32](https://github.com/brig-sh/hvi-vmm/issues/32). | Defect |
 | The handle budget is per export, the descriptor table is per process. | Each export refuses `OPEN`/`OPENDIR` past its own budget with `ENFILE`. `CREATE`, `TMPFILE` and cached directory descriptors are not counted, so several busy exports can still exhaust the table. | Defect |
 | The open file limit is raised when the first share is set up. | A boot with no share never raises it and never logs the line. macOS only. | Design |
 | A node keeps at most 16 alias paths. | A file with more than 16 hard links inside a share can lose a name from the table. | Design |
@@ -75,7 +75,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
-| The `--dump-after` timer thread is unfiltered on Linux. | It starts before the filters are armed and runs unfiltered for the life of the VM. See [#92](https://github.com/brig-sh/hvi-vmm/issues/92). | Defect |
+| A thread a plugin starts in `attach` is unfiltered on Linux. | It starts before the filters are armed and stays unfiltered. The `--dump-after` timer thread is one. It ends when it fires, `--dump-after` seconds after the boot starts. See [#92](https://github.com/brig-sh/hvi-vmm/issues/92). | Defect |
 | No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |

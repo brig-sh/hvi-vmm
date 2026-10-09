@@ -1155,29 +1155,18 @@ pub struct VirtioFs {
     interrupt_status: u32,
     /// The interrupt line the device drives.
     irq: Irq,
-    /// Bitmask of queue indices notified since the last drain: bit `i` set
-    /// means queue `i` had a `QUEUE_NOTIFY` land on it. Set by the vCPU
-    /// thread in `mmio`, cleared by `take_notified`/`drain_notified` on the
-    /// worker thread and by `reset` on the vCPU thread.
+    /// Bitmask of the queues notified since the last drain, with bit `i` set
+    /// for queue `i`.
     ///
-    /// This was a plain `u32`, and it was sound only because every caller
-    /// held the device mutex. #32 has to stop holding that mutex across a
-    /// syscall that blocks, and the moment it does, two threads reach this
-    /// field at once and a plain `u32` is a data race the compiler says
-    /// nothing about. Making it atomic is independent of that work and
-    /// correct either way, so it goes first.
+    /// `mmio` sets a bit on a `QUEUE_NOTIFY`. A drain takes the whole mask
+    /// through `take_notified` and sets a bit again for a queue it leaves work
+    /// on. `reset` clears it. A bit is a flag rather than a count, so a queue
+    /// notified twice before a drain gets one pass.
     ///
-    /// The orderings carry the notify itself. The vCPU fills the descriptor
-    /// table and the avail ring before it sets a bit, so the set is a
-    /// release; the worker must not see the bit before those writes, so the
-    /// take is an acquire.
-    ///
-    /// A notify that lands while the worker is mid-drain just sets a bit the
-    /// worker's next `take_notified` in the same drain pass will see. This is
-    /// a bitmask, not a count, so a queue notified twice before a drain still
-    /// costs one `process_queue` call. The worker's post-drain recheck (see
-    /// `spawn_fs_worker`) catches a notify that lands after the drain but
-    /// before the worker parks again.
+    /// The set is a release and the take an acquire, so a drain on another
+    /// thread sees the descriptor table and avail ring the guest wrote before
+    /// the notify. Every access also holds the device mutex, but the orderings
+    /// keep the field sound without it.
     notified: AtomicU32,
     nodes: HashMap<u64, Node>,
     inode_ids: HashMap<(u64, u64), u64>,
@@ -1562,12 +1551,11 @@ impl VirtioFs {
 
     /// Services a virtio-mmio register access.
     ///
-    /// `QUEUE_NOTIFY` never runs a FUSE request here: it only records the queue
-    /// index in `notified` and returns. That is what keeps the vCPU off the
-    /// host filesystem -- `spawn_fs_worker` (`arch/aarch64/hvf.rs`) is the
-    /// thread that actually calls `process_queue`, off the exit path entirely.
-    /// Every other register is handled inline here; `reset` is the one whose
-    /// work reaches the host filesystem.
+    /// A `QUEUE_NOTIFY` records the queue index in `notified` and runs no FUSE
+    /// request. The requests run in a later drain, `drain_notified_bounded` on
+    /// the vCPU thread or `drain_notified` on the worker thread. Every other
+    /// register is handled here, and only `reset` does work that reaches the
+    /// host filesystem.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let read = self.serve_mmio(mem, offset, is_write, value);
         self.sync_irq();
@@ -1673,17 +1661,18 @@ impl VirtioFs {
     }
 
     /// Clears and returns the set of queues notified since the last call.
-    /// Only `drain_notified` calls this; kept separate so a test can
-    /// observe the bitmask `mmio` left behind without also draining it.
+    ///
+    /// Only `drain_notified_bounded` calls it. It is a separate method so a
+    /// test can read the bitmask `mmio` left without draining it.
     pub(crate) fn take_notified(&mut self) -> u32 {
         self.notified.swap(0, Ordering::Acquire)
     }
 
     /// Drains every queue flagged by a `QUEUE_NOTIFY` since the last drain.
     ///
-    /// The worker thread's half of the notify split: it takes the bits `mmio`
-    /// set in `notified` and calls `process_queue` for each. Always called
-    /// with the device mutex held, and never from the vCPU thread.
+    /// The worker thread calls it, with the device mutex held, to serve every
+    /// chain on each flagged queue with no budget. A vCPU thread never calls
+    /// it.
     pub(crate) fn drain_notified(&mut self, mem: &GuestRam) {
         self.drain_notified_bounded(mem, u16::MAX);
     }
@@ -11716,12 +11705,12 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // --- Task 3: the direct-path tests below drive a real virtqueue over a
-    // `GuestRam` backed by a plain `Vec<u8>`, the same pattern `virtio::net`
-    // uses. Everything above this point exercises `handle_fuse` with no guest
-    // memory at all, which is the buffered path; these instead go through
-    // `mmio`/`process_queue`/`handle_chain` so the READ/WRITE direct path in
-    // `handle_fuse_desc` is what actually runs.
+    // The direct-path tests below drive a real virtqueue over a `GuestRam`
+    // backed by a plain `Vec<u8>`, the same pattern `virtio::net` uses.
+    // Everything above this point exercises `handle_fuse` with no guest memory,
+    // which is the buffered path. These tests go through
+    // `mmio`/`drain_notified`/`handle_chain` instead, so the READ/WRITE direct
+    // path in `handle_fuse_desc` is what runs.
 
     const REQ_QUEUE: u32 = 0;
 
@@ -11762,11 +11751,13 @@ mod tests {
         mem.write_u16(da + 14, next).unwrap();
     }
 
-    /// Publishes `head` as the one available buffer, notifies the device,
-    /// then drains it -- standing in for the worker thread that does the
-    /// draining in production (Stage A moved that off `mmio` itself; see
-    /// `queue_notify_only_records_the_index_and_does_no_io` below for a test
-    /// of `mmio`'s half of that split in isolation).
+    /// Publishes `head` as the one available buffer, notifies the device, then
+    /// drains it.
+    ///
+    /// The drain stands in for the one that follows a notify in production, on
+    /// a vCPU or the worker.
+    /// `queue_notify_only_records_the_index_and_does_no_io` tests `mmio`'s half
+    /// on its own.
     fn notify_head(dev: &mut VirtioFs, mem: &GuestRam, avail: u64, head: u16) {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, head).unwrap(); // avail.ring[0]
@@ -12737,17 +12728,13 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // --- Stage A: `QUEUE_NOTIFY` no longer runs the request inline; it just
-    // records the queue index for a worker thread (`spawn_fs_worker` in
-    // `arch/aarch64/hvf.rs`) to drain. The two tests below cover the part of
-    // that split this module can exercise without a live VM: that `mmio` itself
-    // does no I/O, and that the notified-bitmask/`process_queue` hand-off it
-    // feeds is race-free under concurrent access.
+    // A `QUEUE_NOTIFY` runs no request. It records the queue index for a drain,
+    // which runs on a vCPU up to a budget and on the worker thread past it
+    // (`spawn_fs_worker` in `arch/aarch64/hvf.rs`). The tests below cover what
+    // this module can check without a live VM: `mmio` does no I/O, a bounded
+    // drain strands nothing, and the notified bitmask is race-free under
+    // concurrent access.
 
-    /// `mmio`'s `QUEUE_NOTIFY` arm must return having done nothing but flag
-    /// the queue: no guest-memory access, no FUSE dispatch, no interrupt.
-    /// `drain_notified` -- the worker's call, never the vCPU's -- is what
-    /// actually runs the request.
     #[test]
     fn queue_notify_only_records_the_index_and_does_no_io() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -12886,22 +12873,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The failure mode Stage A must rule out is notify-during-drain: a
-    /// `QUEUE_NOTIFY` landing on the vCPU thread while the worker thread is
-    /// mid-`drain_notified` must never leave a published request stranded.
-    ///
-    /// This drives `mmio`/`drain_notified` from two real threads sharing an
-    /// `Arc<Mutex<VirtioFs>>`, the same sharing `spawn_fs_worker` uses in
-    /// production: one thread publishes `REQS` independent single-request
-    /// notifies back to back (racing however the scheduler interleaves it
-    /// with the other thread's drains), the other drains in a tight loop.
-    /// After the producer has fully joined -- so every one of its `mmio`
-    /// calls has completed and is visible to whichever thread next takes the
-    /// lock -- one guaranteed final `drain_notified` call is what a real
-    /// worker's post-drain-recheck-before-park does; skipping it is exactly
-    /// the classic lost-wakeup bug this test exists to catch. Every request
-    /// must show up in the used ring exactly once: none stranded, none
-    /// double-serviced.
     #[test]
     fn concurrent_notifies_during_a_drain_leave_nothing_stranded() {
         const REQS: u16 = 64;
@@ -12981,10 +12952,10 @@ mod tests {
                     dev.lock().unwrap().drain_notified(&mem);
                     std::thread::yield_now();
                 }
-                // The post-drain recheck a real worker does right before
-                // parking again -- guaranteed to observe every notify the
-                // producer made, since `producer.join()` happened-before
-                // `stop.store`, below.
+                // Stands in for the worker's last pass after its stop. It sees
+                // every notify the producer made, since `producer.join()`
+                // happens before `stop.store` below. A worker without this pass
+                // would strand the requests notified after its last drain.
                 dev.lock().unwrap().drain_notified(&mem);
             })
         };

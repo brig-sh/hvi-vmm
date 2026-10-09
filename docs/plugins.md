@@ -166,9 +166,11 @@ hook to every member in insertion order. `attach` stops at the first error.
   There is no `cdylib`, no `dlopen`, no `libloading`. A tool is linked at
   compile time.
 - **Not a stable ABI.** There is no released version and no tag. Pin a commit.
-- **Not separately confined.** A plugin runs inside the VMM process, under the
-  same Seatbelt profile or seccomp filters, with the same authority. A plugin
-  is part of the trusted VMM, not a sandboxed guest of it.
+- **Not separately confined.** A plugin runs inside the VMM process, with the
+  same authority. `attach` runs before the confinement is installed. The other
+  hooks run under the same Seatbelt profile or seccomp filters as the VMM. On
+  Linux a thread started in `attach` stays unfiltered (see [Known
+  limits](limitations.md#confinement)). A plugin is part of the trusted VMM.
 
 ## Shipping one out of tree
 

@@ -48,10 +48,14 @@ connection are closed, and every thread it started itself has exited, with one
 exception: a helper thread still running one second after the stop is left
 running and `boot` returns an error naming it. The waits it cannot interrupt are
 a plugin blocking in `request` and a virtio-fs worker waiting on a host file
-lock. A plugin that keeps the `Arc<dyn VmHandle>` it was given keeps guest RAM,
-the ledger file and the block, net and vsock devices until it drops the handle.
-On macOS it also keeps the VM. The vCPUs have exited, so a kick reaches none.
-The tap under `--net-tap` keeps its carrier up. The disk stays open. The gateway
+lock. On macOS such a lock wait can also stall a vCPU, and then `boot` does not
+return until the lock is released (see [Known
+limits](limitations.md#virtio-fs-resource-limits)). A plugin that keeps the
+`Arc<dyn VmHandle>` it was given keeps guest RAM, the ledger file and the block,
+net and vsock devices until it drops the handle. It also keeps the VM, through
+the vCPU kicker on macOS and through the interrupt line of each block, net or
+vsock device on Linux. The vCPUs have exited, so a kick reaches none. The tap
+under `--net-tap` keeps its carrier up. The disk stays open. The gateway
 connection under `--net-gateway` stays on the handle, but the relay shut it down
 as it ended, so it carries nothing. A thread the plugin started from `attach` is
 not joined, and holds the handle for as long as it runs. On macOS a second

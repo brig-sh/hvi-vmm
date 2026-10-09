@@ -146,9 +146,10 @@ sandbox is secure.
 - **It does not drop privilege.** There is no uid, gid or capability change
   anywhere in hvi. The process keeps the identity it was started with.
   Confinement narrows what it may ask the kernel for, nothing else.
-- **It does not cover every thread.** With `--dump-after`, the memory-dump
-  plugin starts its timer thread before the Linux filters are armed, and that
-  thread runs unfiltered for the life of the VM.
+- **It does not cover every thread.** A thread a plugin starts in `attach`
+  starts before the Linux filters are armed and stays unfiltered. The
+  memory-dump plugin's `--dump-after` timer is one. It ends when it fires,
+  `--dump-after` seconds after the boot starts.
 - **It does not constrain syscall arguments.** No rule in either architecture
   file carries an argument condition, so `ioctl` and `sendmsg` are
   unconstrained over every descriptor the process already holds.

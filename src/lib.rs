@@ -36,9 +36,10 @@
 //! tracer.
 //!
 //! Pass a [`plugin::Plugin`] in [`config::BootConfig::plugin`] and the backend
-//! calls it; pass `None` and the hooks are one null check on a cold path. A
-//! separate crate can link this one and supply its own the same way, which is
-//! why the VMM is a library as well as a binary. See `docs/plugins.md`.
+//! calls it; pass `None` and the hooks cost a null check per guest entry of the
+//! boot vCPU, per block read or write and per network frame. A separate crate
+//! can link this one and supply its own the same way, which is why the VMM is a
+//! library as well as a binary. See `docs/plugins.md`.
 
 pub mod arch;
 pub mod config;
