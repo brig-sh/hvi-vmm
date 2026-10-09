@@ -147,11 +147,10 @@ costs a Linux guest nothing (see `DEVICE_WINDOW_BASE` in
 The default is `earlycon console=ttyAMA0 panic=-1`, which names the arm64
 console.
 
-hvi appends what its own devices need, and only on x86-64:
-`console=ttyS0`, plus one `virtio_mmio.device=<size>@<addr>:<irq>` for each
-backed device, because that guest has no devicetree and no PCI bus to discover
-them on. On arm64 the devicetree describes the devices, so nothing is
-appended.
+hvi appends `console=ttyS0`, and only on x86-64. The devices are described
+to the guest out of band: by the devicetree on arm64, and by the ACPI DSDT on
+x86-64, where each virtio-mmio device is an `LNRO0005` entry the kernel's
+`virtio_mmio` driver binds to.
 
 Because hvi appends `console=ttyS0` itself, an x86-64 guest gets console
 output even with the default. The default's `console=ttyAMA0` is simply inert
@@ -204,8 +203,9 @@ hvi boot --kernel <bzImage> --disk rootfs.img \
          --cmdline "console=ttyS0 root=/dev/vda rw panic=-1"
 ```
 
-The guest sees the disk as `/dev/vda`. One disk, no partition table required,
-no hotplug.
+The guest sees the disk as `/dev/vda`. No partition table is required. Up to
+four disks attach, and no hotplug; see
+[storage-and-sharing.md](storage-and-sharing.md).
 
 ### A virtio-fs share, on macOS
 

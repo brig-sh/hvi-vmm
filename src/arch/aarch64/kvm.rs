@@ -48,20 +48,20 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    mpidr_affinity, place_virtio_fs, GicLayout, GicVersion, GIC_NUM_IRQS, MPIDR_AFFINITY_MASK,
-    RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI,
-    VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
+    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
+use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
@@ -207,13 +207,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     ram.register_kvm_slots(&vm)?;
 
     // Devices (same modules as the macOS backend).
-    let virtio = match &cfg.disk {
-        Some(path) => {
-            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
-        }
-        None => None,
-    };
+    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
     let mut net_source: Option<NetSource> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
         // urunc already created the tap and redirected the veth to it, so all
@@ -269,11 +263,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).map_err(std::io::Error::other)
     })?;
 
-    let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
     let fdt_devices = fdt::VirtioDevices {
-        blk: has_blk,
+        blk_count: disks.len(),
         net: has_net,
         vsock: has_vsock,
         fs_count: fs.len(),
@@ -361,7 +354,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             ram,
             shared_ram,
             ledger: Arc::new(Mutex::new(emitter)),
-            block: virtio,
+            disks,
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(
@@ -381,7 +374,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
     lock_or_recover(&shared.pl011).connect_irq(line(UART_SPI));
     shared.guest.connect_irqs(
-        line(VIRTIO_SPI),
+        // `open_disks` refused more disks than there are SPIs.
+        |index| line(virtio_blk_spi(index).expect("an SPI per disk")),
         line(VIRTIO_NET_SPI),
         line(VIRTIO_VSOCK_SPI),
     );
@@ -481,8 +475,8 @@ fn on_mmio(sh: &Shared, addr: u64, _read: bool, data: &mut [u8]) {
 fn read_device(sh: &Shared, addr: u64) -> u64 {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, false, 0)
-    } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_read(sh, sh.guest.block.as_ref(), addr - VIRTIO_BASE)
+    } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
+        dev_read(sh, Some(dev), off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         dev_read(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -501,8 +495,8 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
     let val = u64::from_le_bytes(b);
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, true, val);
-    } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_write(sh, sh.guest.block.as_ref(), addr - VIRTIO_BASE, val);
+    } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
+        dev_write(sh, Some(dev), off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         dev_write(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {

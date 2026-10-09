@@ -254,7 +254,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut initramfs = None;
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
-    let mut disk = None;
+    let mut disks = Vec::new();
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares: Vec<config::FsShare> = Vec::new();
@@ -282,7 +282,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--initramfs" => initramfs = it.next().cloned(),
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
-            "--disk" => disk = it.next().cloned(),
+            "--disk" => push_disk(&mut disks, it.next())?,
             // The old names of `uid=` and `gid=` on an `--fs path=` export.
             // They apply to every `--share-ro`/`--share-rw` export, which is
             // what they did when the identity was one per process. Kept
@@ -456,7 +456,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         initramfs: initramfs.map(std::fs::read).transpose()?,
         mem_bytes: mem_mib << 20,
         cmdline,
-        disk,
+        disks,
         fs_shares,
         fs,
         net,
@@ -505,11 +505,95 @@ fn export_dir(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     Ok(resolved)
 }
 
+/// Appends the disk `--disk` names to `disks`.
+///
+/// A disk's position in the list is its serial `disk<N>` unless its spec
+/// sets one.
+///
+/// # Errors
+///
+/// Errors when the spec is missing or malformed, or the list is already full.
+fn push_disk(disks: &mut Vec<config::DiskConfig>, spec: Option<&String>) -> Result<(), String> {
+    let spec = spec.ok_or_else(|| format!("--disk needs {}", config::DiskConfig::SYNTAX))?;
+    if disks.len() == config::MAX_DISKS {
+        return Err(format!(
+            "--disk {spec}: at most {} disks",
+            config::MAX_DISKS
+        ));
+    }
+    disks.push(config::DiskConfig::parse(spec)?);
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run() {
         // stderr can be a closed pipe, where `eprintln!` would panic, so a
         // failed write is ignored.
         let _ = writeln!(std::io::stderr(), "hvi: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_disk;
+    use hvi::config::{DiskConfig, MAX_DISKS};
+
+    fn parse(args: &[&str]) -> Result<Vec<DiskConfig>, String> {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        let mut disks = Vec::new();
+        let mut it = args.iter();
+        while let Some(flag) = it.next() {
+            assert_eq!(flag, "--disk");
+            push_disk(&mut disks, it.next())?;
+        }
+        Ok(disks)
+    }
+
+    // Each --disk adds a disk, in command-line order, whichever form it takes.
+    #[test]
+    fn every_disk_flag_adds_a_disk_in_order() {
+        let disks = parse(&[
+            "--disk",
+            "path=lower.img,readonly=on,serial=lower",
+            "--disk",
+            "upper.img",
+            "--disk",
+            "path=c.img",
+        ])
+        .unwrap();
+        assert_eq!(
+            disks,
+            [
+                DiskConfig {
+                    path: "lower.img".into(),
+                    read_only: true,
+                    serial: Some("lower".into()),
+                },
+                DiskConfig::rw("upper.img"),
+                DiskConfig::rw("c.img"),
+            ]
+        );
+        assert_eq!(disks[1].serial_at(1), "disk1", "upper.img answers as disk1");
+    }
+
+    #[test]
+    fn five_disks_are_refused() {
+        let mut args = Vec::new();
+        for _ in 0..MAX_DISKS {
+            args.extend(["--disk", "x.img"]);
+        }
+        assert_eq!(parse(&args).unwrap().len(), MAX_DISKS);
+        args.extend(["--disk", "y.img"]);
+        let err = parse(&args).unwrap_err();
+        assert!(err.contains("at most 4 disks"), "{err}");
+    }
+
+    #[test]
+    fn disk_flag_needs_a_spec() {
+        let err = parse(&["--disk"]).unwrap_err();
+        assert!(err.contains("--disk needs"), "{err}");
+        let err = parse(&["--disk", "path=a.img,readonly=maybe"]).unwrap_err();
+        assert!(err.contains("not on or off"), "{err}");
     }
 }

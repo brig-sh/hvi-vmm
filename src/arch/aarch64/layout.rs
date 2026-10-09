@@ -23,6 +23,8 @@
 //! is treated as the default and reconciled against `applevisor`'s GIC size
 //! getters when the VM is built.
 
+use crate::config::MAX_DISKS;
+
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
 
@@ -58,7 +60,19 @@ pub const UART_SIZE: u64 = 0x1000;
 pub const UART_SPI: u32 = 1;
 
 /// virtio-mmio device windows and interrupts, above the GIC and clear of the
-/// UART. Slot 0 = virtio-blk, slot 1 = virtio-net; each is one 0x200 page.
+/// UART. Each device is one 0x200 page with its own SPI, in this order:
+///
+/// | window from `VIRTIO_BASE` | SPI     | device                   |
+/// |---------------------------|---------|--------------------------|
+/// | `+0x0000`                 | 2       | virtio-blk, disk 0       |
+/// | `+0x0200`                 | 3       | virtio-net               |
+/// | `+0x0400`                 | 4       | virtio-vsock             |
+/// | `+0x0600` .. `+0x0a00`    | 5 .. 7  | virtio-blk, disks 1 .. 3 |
+/// | `+0x0c00 + i * 0x200`     | `8 + i` | virtio-fs export `i`     |
+///
+/// The guest learns every window from the devicetree, so none of these is a
+/// contract. Disk 0, net and vsock keep the addresses they had when the disk
+/// was the only one.
 pub const VIRTIO_SIZE: u64 = 0x0200;
 pub const VIRTIO_BASE: u64 = 0x0d00_0000;
 pub const VIRTIO_SPI: u32 = 2;
@@ -66,8 +80,11 @@ pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
 pub const VIRTIO_NET_SPI: u32 = 3;
 pub const VIRTIO_VSOCK_BASE: u64 = 0x0d00_0400;
 pub const VIRTIO_VSOCK_SPI: u32 = 4;
-pub const VIRTIO_FS_BASE: u64 = 0x0d00_0600;
-pub const VIRTIO_FS_SPI: u32 = 5;
+/// Window and SPI of disk 1. Disks 2 and 3 follow, one slot each.
+pub const VIRTIO_BLK_EXTRA_BASE: u64 = 0x0d00_0600;
+pub const VIRTIO_BLK_EXTRA_SPI: u32 = 5;
+pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
+pub const VIRTIO_FS_SPI: u32 = VIRTIO_BLK_EXTRA_SPI + MAX_DISKS as u32 - 1;
 
 /// Number of interrupts the guest's GIC is created with.
 ///
@@ -131,6 +148,28 @@ pub fn place_virtio_fs(
         }
     }
     Ok((base, spi))
+}
+
+/// Placement of the virtio-blk device for disk `index`, or `None` past
+/// [`MAX_DISKS`].
+#[must_use]
+pub fn virtio_blk_base(index: usize) -> Option<u64> {
+    match index {
+        0 => Some(VIRTIO_BASE),
+        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_BASE + (i as u64 - 1) * VIRTIO_SIZE),
+        _ => None,
+    }
+}
+
+/// The SPI of the virtio-blk device for disk `index`, or `None` past
+/// [`MAX_DISKS`].
+#[must_use]
+pub fn virtio_blk_spi(index: usize) -> Option<u32> {
+    match index {
+        0 => Some(VIRTIO_SPI),
+        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_SPI + (i as u32 - 1)),
+        _ => None,
+    }
 }
 
 /// GICv3 placement, defaulting to the QEMU virt values.
@@ -532,6 +571,43 @@ mod tests {
         place_virtio_fs(0, &gic, Some(GIC_NUM_IRQS)).expect("an export");
     }
 
+    // Every disk adds a window and an SPI. Neither may land on another
+    // device, and the exports start right after the last disk slot.
+    #[test]
+    fn disk_windows_and_spis_clash_with_no_other_device() {
+        let mut windows = vec![
+            ("uart", UART_BASE, UART_SPI),
+            ("net", VIRTIO_NET_BASE, VIRTIO_NET_SPI),
+            ("vsock", VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI),
+        ];
+        for i in 0..32 {
+            windows.push(("fs", virtio_fs_base(i).unwrap(), virtio_fs_spi(i).unwrap()));
+        }
+        for i in 0..MAX_DISKS {
+            windows.push((
+                "blk",
+                virtio_blk_base(i).expect("a disk slot"),
+                virtio_blk_spi(i).expect("a disk SPI"),
+            ));
+        }
+        for (a, (na, base_a, spi_a)) in windows.iter().enumerate() {
+            for (nb, base_b, spi_b) in windows.iter().skip(a + 1) {
+                let overlap = base_a < &(base_b + VIRTIO_SIZE) && base_b < &(base_a + VIRTIO_SIZE);
+                assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
+                assert_ne!(spi_a, spi_b, "{na} and {nb} share SPI {spi_a}");
+            }
+        }
+        assert_eq!(virtio_blk_base(0), Some(VIRTIO_BASE), "disk 0 stays put");
+        assert_eq!(virtio_blk_spi(0), Some(VIRTIO_SPI));
+        assert_eq!(virtio_blk_base(1), Some(0x0d00_0600));
+        assert_eq!(virtio_blk_spi(1), Some(5));
+        assert_eq!(virtio_blk_spi(3), Some(7));
+        assert_eq!(virtio_blk_base(MAX_DISKS), None);
+        assert_eq!(virtio_blk_spi(MAX_DISKS), None);
+        assert_eq!(virtio_fs_base(0), Some(0x0d00_0c00));
+        assert_eq!(virtio_fs_spi(0), Some(8));
+    }
+
     // A ragged initrd range kills a guest that turns it into a
     // memory-region descriptor.
     #[test]
@@ -564,12 +640,14 @@ mod tests {
         // 32 MiB on this host. Sizing the check from `V2_MAX_CPUS` would
         // check a GIC far smaller than the one the windows must clear.
         let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
+        let last_disk = virtio_blk_base(MAX_DISKS - 1).unwrap();
         let windows = [
             ("uart", UART_BASE, UART_SIZE),
             ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
             ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
             ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
             ("virtio-fs", VIRTIO_FS_BASE, VIRTIO_SIZE),
+            ("last virtio-blk", last_disk, VIRTIO_SIZE),
         ];
         for (name, base, size) in windows {
             assert!(
