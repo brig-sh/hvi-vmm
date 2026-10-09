@@ -564,8 +564,9 @@ fn probes() -> Vec<Probe> {
                 let _ = std::thread::spawn(|| 0u8).join();
             },
         },
-        // The debug watchdog sleeps under the vmm filter, and which syscall
-        // a sleep reaches depends on std and the libc.
+        // The teardown sleeps under the vmm filter, between kicks and while it
+        // waits for a thread to finish. Which syscall a sleep reaches depends
+        // on std and the libc.
         Probe {
             what: "sleep (vmm)",
             thread: Thread::Vmm,
