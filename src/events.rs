@@ -37,6 +37,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -44,8 +45,14 @@ use serde::Serialize;
 /// A captured observation a device hands to the emitter (kept transport-free so
 /// the devices don't depend on serde or the clock).
 pub enum CapturedEvent {
-    /// A virtio-blk request: starting sector, data bytes, and direction.
-    Block { lba: u64, len: u64, write: bool },
+    /// A virtio-blk request: the disk's serial, starting sector, data bytes,
+    /// and direction.
+    Block {
+        disk: Arc<str>,
+        lba: u64,
+        len: u64,
+        write: bool,
+    },
     /// A guest IPv4 flow observed at virtio-net.
     NetFlow {
         proto: u8,
@@ -80,6 +87,8 @@ struct RawEvent<'a, P: Serialize> {
 
 #[derive(Serialize)]
 struct BlockPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lba: Option<u64>,
     len: u64,
@@ -206,10 +215,16 @@ impl Emitter {
             return;
         }
         match ev {
-            CapturedEvent::Block { lba, len, write } => self.emit_payload(
+            CapturedEvent::Block {
+                disk,
+                lba,
+                len,
+                write,
+            } => self.emit_payload(
                 "boundary",
                 "block",
                 &BlockPayload {
+                    disk: Some(disk.to_string()),
                     lba: Some(*lba),
                     len: *len,
                     rw: if *write { "w" } else { "r" }.to_string(),
@@ -281,6 +296,7 @@ mod tests {
             "boundary",
             "block",
             BlockPayload {
+                disk: Some("disk0".into()),
                 lba: Some(2048),
                 len: 4096,
                 rw: "w".into(),
@@ -289,7 +305,7 @@ mod tests {
         );
         assert_eq!(
             s,
-            r#"{"sandbox_id":"vm1","ts":1,"provenance":"boundary","source":"block","payload":{"lba":2048,"len":4096,"rw":"w"}}"#
+            r#"{"sandbox_id":"vm1","ts":1,"provenance":"boundary","source":"block","payload":{"disk":"disk0","lba":2048,"len":4096,"rw":"w"}}"#
         );
     }
 
@@ -328,6 +344,7 @@ mod tests {
         let p = path.to_str().unwrap();
         let mut e = Emitter::new(Some(p), "vm1").unwrap();
         let block = CapturedEvent::Block {
+            disk: "disk0".into(),
             lba: 8,
             len: 4096,
             write: true,
@@ -353,6 +370,7 @@ mod tests {
         {
             let mut e = Emitter::new(Some(p), "vm1").unwrap();
             e.captured(&CapturedEvent::Block {
+                disk: "disk0".into(),
                 lba: 8,
                 len: 4096,
                 write: true,
