@@ -45,9 +45,10 @@ including a typo, silently runs the plain test.
 | `--mem-mib <N>` | 512 | Guest RAM. On x86-64 it is split around the MMIO hole. |
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
-| `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
+| `--disk <path>` | none | A writable virtio-blk disk. Repeatable, up to 4 disks. A failure to open, or a lock another hvi holds on the image, fails the boot. |
+| `--disk path=<path>[,readonly=on\|off][,serial=<id>]` | none | The same disk with options, in Cloud Hypervisor's form. `readonly=on` opens the image `O_RDONLY` and advertises `VIRTIO_BLK_F_RO`. `serial` is what the guest reads from `/sys/block/vdX/serial`, 1 to 20 printable ASCII bytes, `disk<N>` by default with `N` the disk's position. Two disks may not share one. |
 | `--fs tag=<tag>,path=<dir>[,readonly=on\|off][,cache=auto\|always\|none][,uid=<n>][,gid=<n>]` | none | virtio-fs export of `<dir>`, which hvi serves itself. Writable unless `readonly=on`; `cache` defaults to `auto`; `uid` and `gid` are the guest owner of the host user's files, 0 by default. Repeatable. macOS only. |
-| `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. Cloud Hypervisor's syntax and defaults: one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable. Linux only. |
+| `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. Cloud Hypervisor's syntax and defaults: one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable, up to 11 exports on x86-64. Linux only. |
 | `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
 | `--fs-uid <N>`, `--fs-gid <N>` | 0 | Deprecated: `uid=` and `gid=` on every `--share-ro`/`--share-rw` export. An `--fs` export keeps its own. Each prints a note. No effect on Linux. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
@@ -66,15 +67,18 @@ including a typo, silently runs the plain test.
 
 Three things about the parser are worth knowing, because none of them warns.
 
-**Repeating a flag is last-wins.** Only `--fs`, `--share-ro` and `--share-rw`
-accumulate. A second `--disk` replaces the first.
+**Repeating a flag is last-wins.** Only `--fs`, `--share-ro`, `--share-rw` and
+`--disk` accumulate. Each `--disk` adds a disk, in command-line order, and a
+fifth fails the boot. Before hvi had more than one disk slot, a second `--disk`
+replaced the first without a word; a caller that relied on that now gets two
+disks.
 
 **A value-taking flag at the end of the line silently takes none.** These
 flags accept a missing value as "not set" rather than erroring: `--kernel`,
-`--initramfs`, `--disk`, `--net-gateway`, `--net-tap`, `--events`,
-`--agent-sock`, `--dump-memory`, `--trace-io`. So `hvi boot --kernel Image
---disk` boots with no disk. `--net-mac` is not among them: it is parsed where
-it is read, so a missing or malformed value fails the boot.
+`--initramfs`, `--net-gateway`, `--net-tap`, `--events`, `--agent-sock`,
+`--dump-memory`, `--trace-io`. So `hvi boot --kernel Image --events` boots with
+no ledger. `--net-mac` and `--disk` are not among them: a missing or malformed
+value fails the boot.
 
 `--kernel` is the one where that matters, because it is required. It is not
 caught by the parser. A trailing `hvi boot --kernel` parses to "not set" and
@@ -281,7 +285,7 @@ Every backend logs what it set up on stderr before the guest runs. On macOS:
 ```text
 booting Image with 1024 MiB ...
 [hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
-[hvi] virtio-blk: /path/to/disk.img
+[hvi] virtio-blk[0]: /path/to/disk.img (rw, serial disk0)
 [hvi] virtio-net: built-in stub stack (guest 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
 [hvi] open-file limit: 1048576
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)

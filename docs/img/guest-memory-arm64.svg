@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 520" width="720" height="520" role="img" aria-labelledby="t d">
   <title id="t">arm64 guest physical address space</title>
-  <desc id="d">Address-ordered map of the arm64 guest. Devices sit above the GIC: the GIC at 0x08000000, the PL011 UART at 0x0c000000, and a virtio-mmio window of 0x200-byte device pages starting at 0x0d000000 (block, net, vsock, then one page per virtio-fs share). Guest RAM is one contiguous span starting at 0x40000000, with the kernel, devicetree blob and initramfs packed upward from its base. Addresses are ordered but not to scale.</desc>
+  <desc id="d">Address-ordered map of the arm64 guest. Devices sit above the GIC: the GIC at 0x08000000, the PL011 UART at 0x0c000000, and a virtio-mmio window of 0x200-byte device pages starting at 0x0d000000 (disk 0, net, vsock, disks 1 to 3, then one page per virtio-fs share). Guest RAM is one contiguous span starting at 0x40000000, with the kernel, devicetree blob and initramfs packed upward from its base. Addresses are ordered but not to scale.</desc>
 
   <rect x="0" y="0" width="720" height="520" fill="#f6f7f9"/>
 
@@ -38,17 +38,19 @@
   <text x="420" y="493" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">sizes the redistributor region.</text>
 
   <!-- virtio window -->
-  <rect x="24" y="230" width="380" height="112" rx="6" fill="#dcfce7" stroke="#22c55e" stroke-width="1.5"/>
+  <rect x="24" y="230" width="380" height="126" rx="6" fill="#dcfce7" stroke="#22c55e" stroke-width="1.5"/>
   <text x="40" y="252" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#166534">virtio-mmio window, 0x200 per device</text>
-  <text x="40" y="272" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0000  virtio-blk           SPI 2  INTID 34</text>
+  <text x="40" y="272" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0000  virtio-blk, disk 0   SPI 2  INTID 34</text>
   <text x="40" y="290" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0200  virtio-net           SPI 3  INTID 35</text>
   <text x="40" y="308" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0400  virtio-vsock         SPI 4  INTID 36</text>
-  <text x="40" y="326" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0600  virtio-fs share i    SPI 5+i INTID 37+i</text>
+  <text x="40" y="326" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0600  virtio-blk, disk i   SPI 4+i INTID 36+i</text>
+  <text x="40" y="344" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#15803d">0x0d00_0c00  virtio-fs share i    SPI 8+i INTID 40+i</text>
 
   <text x="420" y="272" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">One 0x200 page per device.</text>
-  <text x="420" y="289" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">virtio-fs shares extend the</text>
-  <text x="420" y="306" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">window: share <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i</tspan> at base</text>
-  <text x="420" y="323" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">+ <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i * 0x200</tspan>. macOS only.</text>
+  <text x="420" y="289" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">Disks 1 to 3 follow vsock.</text>
+  <text x="420" y="306" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">virtio-fs shares extend the</text>
+  <text x="420" y="323" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">window: share <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i</tspan> at base</text>
+  <text x="420" y="340" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">+ <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i * 0x200</tspan>.</text>
 
   <!-- UART -->
   <rect x="24" y="358" width="380" height="48" rx="6" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.5"/>

@@ -32,10 +32,12 @@ use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::config;
 use crate::memory::GuestRam;
+use crate::LOG_PREFIX;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -209,7 +211,8 @@ impl VirtioBlk {
     /// # Errors
     ///
     /// Errors if the file cannot be opened or its length read.
-    pub fn open(path: &str) -> std::io::Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open(path: &str) -> std::io::Result<Self> {
         Self::open_as(path, false, "")
     }
 
@@ -623,6 +626,52 @@ impl VirtioBlk {
         }
         Ok(device_written)
     }
+}
+
+/// Opens every disk in `disks` in order, each with the [`serial_at`] its
+/// position, and logs each one.
+///
+/// [`serial_at`]: config::DiskConfig::serial_at
+///
+/// # Errors
+///
+/// Errors when [`config::check_disks`] refuses the list, when one image backs
+/// two disks of which one is writable, or when a disk does not open. The
+/// message names the disk and its path.
+pub fn open_disks(disks: &[config::DiskConfig]) -> Result<Vec<Arc<Mutex<VirtioBlk>>>, String> {
+    config::check_disks(disks)?;
+    let mut opened: Vec<(Arc<Mutex<VirtioBlk>>, u64)> = Vec::new();
+    for (index, disk) in disks.iter().enumerate() {
+        let serial = disk.serial_at(index);
+        let fail =
+            |e: &dyn std::fmt::Display| format!("virtio-blk disk {index} ({}): {e}", disk.path);
+        // The lock would refuse this too, with a message about another process.
+        // Here the other holder is known, so the message names it.
+        let id = std::fs::metadata(&disk.path)
+            .map(|meta| disk_id(&meta))
+            .map_err(|e| fail(&e))?;
+        if let Some(earlier) = opened.iter().position(|(_, other)| *other == id) {
+            let earlier_writes = !disks[earlier].read_only;
+            if earlier_writes || !disk.read_only {
+                return Err(fail(&format!(
+                    "the same image is disk {earlier}, {}",
+                    if earlier_writes {
+                        "which this guest writes"
+                    } else {
+                        "and only one of the two may be writable"
+                    }
+                )));
+            }
+        }
+        let blk = VirtioBlk::open_as(&disk.path, disk.read_only, &serial).map_err(|e| fail(&e))?;
+        let mode = if disk.read_only { "ro" } else { "rw" };
+        eprintln!(
+            "{LOG_PREFIX} virtio-blk[{index}]: {} ({mode}, serial {serial})",
+            disk.path
+        );
+        opened.push((Arc::new(Mutex::new(blk)), id));
+    }
+    Ok(opened.into_iter().map(|(blk, _)| blk).collect())
 }
 
 /// Writes `src` across the guest segments `segs`, each up to its length, and
@@ -1314,6 +1363,33 @@ mod capacity_tests {
         VirtioBlk::open_as(path, true, "").expect("the lock went with the writer");
     }
 
+    // One image may back two read-only disks of a guest. With a writer among
+    // them the message names the other disk, where the lock alone would say
+    // "elsewhere".
+    #[test]
+    fn open_disks_names_the_other_disk_on_one_image() {
+        use std::os::unix::fs::PermissionsExt;
+        let (r, blk) = ro_rig("twice", "");
+        drop(blk);
+        // The writer below has to get as far as the duplicate check.
+        std::fs::set_permissions(&r.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = r.path.to_str().unwrap();
+        let ro = |serial: &str| config::DiskConfig {
+            path: path.to_string(),
+            read_only: true,
+            serial: Some(serial.to_string()),
+        };
+        assert_eq!(open_disks(&[ro("a"), ro("b")]).unwrap().len(), 2);
+        let refused = |disks: &[config::DiskConfig]| match open_disks(disks) {
+            Ok(_) => panic!("one image opened twice with a writer"),
+            Err(err) => err,
+        };
+        let err = refused(&[ro("a"), config::DiskConfig::rw(path)]);
+        assert!(err.contains("disk 1") && err.contains("is disk 0"), "{err}");
+        let err = refused(&[config::DiskConfig::rw(path), ro("b")]);
+        assert!(err.contains("which this guest writes"), "{err}");
+    }
+
     #[test]
     fn get_id_returns_the_zero_padded_serial() {
         let (_r, mut blk) = ro_rig("id", "disk1");
@@ -1345,6 +1421,32 @@ mod capacity_tests {
         let mut got = [0u8; 4];
         mem.read(BASE + 0x5000, &mut got).unwrap();
         assert_eq!(&got, b"dis\xff");
+    }
+
+    // The guest finds its disks by serial, so position N in the disk list has
+    // to answer GET_ID with disk<N> and keep its own access mode.
+    #[test]
+    fn open_disks_gives_each_position_its_serial_and_mode() {
+        let (a, _) = ro_rig("argv-a", "");
+        let (b, _) = rig("argv-b");
+        let disks = open_disks(&[
+            config::DiskConfig::ro(a.path.to_str().unwrap()),
+            config::DiskConfig::rw(b.path.to_str().unwrap()),
+        ])
+        .unwrap();
+        assert_eq!(disks.len(), 2);
+        for (index, (dev, read_only)) in disks.iter().zip([true, false]).enumerate() {
+            let mut blk = dev.lock().unwrap();
+            assert_eq!(blk.read_only(), read_only, "disk {index}");
+            let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+            let st = submit(&mut blk, &mem, VIRTIO_BLK_T_GET_ID, 0, 20);
+            assert_eq!(st, 0, "disk {index} answered GET_ID");
+            let mut got = [0u8; 20];
+            mem.read(BASE + 0x5000, &mut got).unwrap();
+            let mut want = [0u8; 20];
+            want[..5].copy_from_slice(format!("disk{index}").as_bytes());
+            assert_eq!(got, want, "disk {index}");
+        }
     }
 
     #[test]

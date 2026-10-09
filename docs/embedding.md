@@ -77,7 +77,9 @@ stays on the handle, but the relay shut it down as it ended, so it carries
 nothing. A thread the plugin started with `VmHandle::spawn` is joined with the
 I/O threads. One it started any other way is not joined, and holds the handle
 for as long as it runs. On macOS a second `boot` fails while such a handle
-exists, because Hypervisor.framework allows one VM per process.
+exists, because Hypervisor.framework allows one VM per process. On either host
+the handle also holds the disks' image locks, so a second `boot` on the same
+writable image fails with "the image is open elsewhere" while it lives.
 
 ## A minimal caller
 
@@ -89,7 +91,7 @@ let cfg = BootConfig {
     initramfs: Some(std::fs::read("initramfs.cpio")?),
     mem_bytes: 1024 << 20,
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
-    disk: None,
+    disks: Vec::new(),
     fs_shares: Vec::new(),
     fs: Vec::new(),
     net: true,
@@ -128,7 +130,7 @@ cargo build --release --example watch_guest
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
-| `disk` | `Option<String>` | One virtio-blk backing file. |
+| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
 | `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
 | `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
 | `net` | `bool` | The built-in stub stack. |

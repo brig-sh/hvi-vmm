@@ -20,6 +20,8 @@
 //! RAM, the MP table in the EBDA and the ACPI tables in the BIOS area. The
 //! virtio-mmio window is in the sub-4 GiB MMIO hole.
 
+use crate::config::MAX_DISKS;
+
 /// Guest RAM base (x86 RAM starts at physical 0).
 pub const RAM_BASE: u64 = 0x0;
 
@@ -71,9 +73,27 @@ pub const LAPIC_ADDR: u32 = 0xfee0_0000;
 /// The IOAPIC's base address, where a PC has it.
 pub const IOAPIC_ADDR: u32 = 0xfec0_0000;
 
-/// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device
-/// (blk, net, vsock), with IOAPIC GSIs 5/6/7. The guest is told about these via
-/// `virtio_mmio.device=` on the kernel command line (see `kvm::boot`).
+/// How many input lines the IOAPIC has, which is the GSI bound for every
+/// device.
+pub const IOAPIC_INPUTS: u8 = 24;
+
+/// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device,
+/// each on its own IOAPIC GSI. The guest learns them from the ACPI DSDT (see
+/// `acpi.rs`), so none of these is a contract.
+///
+/// | window from `VIRTIO_MMIO_BASE` | GSI      | device                   |
+/// |--------------------------------|----------|--------------------------|
+/// | `+0x000`                       | 5        | virtio-blk, disk 0       |
+/// | `+0x200`                       | 6        | virtio-net               |
+/// | `+0x400`                       | 7        | virtio-vsock             |
+/// | `+0x600` .. `+0xa00`           | 9 .. 11  | virtio-blk, disks 1 .. 3 |
+/// | `+0xc00 + i * 0x200`           | `12 + i` | virtio-fs export `i`     |
+///
+/// COM1 holds GSI 4 and the guest's rtc-cmos driver claims 8, so the disks
+/// after the first start at 9. The exports run up to the ACPI SCI on the
+/// IOAPIC's last line, [`SCI_GSI`], which bounds them at [`MAX_FS_DEVICES`].
+/// Lines 16 to 22 have no ISA IRQ, so a guest reaches a device on one only
+/// through the DSDT.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
 pub const VIRTIO_SIZE: u64 = 0x200;
 pub const VIRTIO_BLK_BASE: u64 = VIRTIO_MMIO_BASE;
@@ -82,21 +102,37 @@ pub const VIRTIO_VSOCK_BASE: u64 = VIRTIO_MMIO_BASE + 0x400;
 pub const VIRTIO_BLK_GSI: u32 = 5;
 pub const VIRTIO_NET_GSI: u32 = 6;
 pub const VIRTIO_VSOCK_GSI: u32 = 7;
+/// Window and GSI of disk 1. Disks 2 and 3 follow, one slot each.
+pub const VIRTIO_BLK_EXTRA_BASE: u64 = VIRTIO_MMIO_BASE + 0x600;
+pub const VIRTIO_BLK_EXTRA_GSI: u32 = 9;
+/// Window and GSI of export 0. The others follow, one slot each.
+pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
+pub const VIRTIO_FS_GSI: u32 = VIRTIO_BLK_EXTRA_GSI + MAX_DISKS as u32 - 1;
+/// How many virtio-fs exports this machine has interrupt lines for: the lines
+/// from [`VIRTIO_FS_GSI`] up to the SCI.
+pub const MAX_FS_DEVICES: usize = (SCI_GSI - VIRTIO_FS_GSI) as usize;
 
-/// First virtio-fs window, one 0x200 page per export, and the first GSI they
-/// take.
-///
-/// The MP table describes ISA IRQs 0..15 and nothing above them, so an export
-/// has to take one of those lines. 9 to 12 are the ones no device in this
-/// machine claims: 8 is the RTC, 13 the FPU, and 14 and 15 the IDE pair that
-/// a guest kernel probes whether or not we have a disk. That bounds the x86
-/// machine at [`MAX_FS_DEVICES`] exports, where arm64 has a full SPI range to
-/// hand out.
-pub const VIRTIO_FS_BASE: u64 = VIRTIO_MMIO_BASE + 0x600;
-pub const VIRTIO_FS_GSI: u32 = 9;
+/// Placement of the virtio-blk device for disk `index`, or `None` past
+/// [`MAX_DISKS`].
+#[must_use]
+pub fn virtio_blk_base(index: usize) -> Option<u64> {
+    match index {
+        0 => Some(VIRTIO_BLK_BASE),
+        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_BASE + (i as u64 - 1) * VIRTIO_SIZE),
+        _ => None,
+    }
+}
 
-/// How many virtio-fs exports this machine has interrupt lines for.
-pub const MAX_FS_DEVICES: usize = 4;
+/// The GSI of the virtio-blk device for disk `index`, or `None` past
+/// [`MAX_DISKS`].
+#[must_use]
+pub fn virtio_blk_gsi(index: usize) -> Option<u32> {
+    match index {
+        0 => Some(VIRTIO_BLK_GSI),
+        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_GSI + i as u32 - 1),
+        _ => None,
+    }
+}
 
 /// Returns the window base of the `index`th virtio-fs export, or `None` when
 /// the machine has no line left for it.
@@ -105,7 +141,7 @@ pub fn virtio_fs_base(index: usize) -> Option<u64> {
     if index >= MAX_FS_DEVICES {
         return None;
     }
-    VIRTIO_FS_BASE.checked_add((index as u64).checked_mul(VIRTIO_SIZE)?)
+    Some(VIRTIO_FS_BASE + index as u64 * VIRTIO_SIZE)
 }
 
 /// Returns the GSI of the `index`th virtio-fs export, or `None` when the
@@ -115,7 +151,7 @@ pub fn virtio_fs_gsi(index: usize) -> Option<u32> {
     if index >= MAX_FS_DEVICES {
         return None;
     }
-    VIRTIO_FS_GSI.checked_add(u32::try_from(index).ok()?)
+    Some(VIRTIO_FS_GSI + index as u32)
 }
 
 /// Base of the sub-4 GiB MMIO hole: guest RAM stops here and the remainder,
@@ -142,44 +178,80 @@ pub const HIGH_RAM_BASE: u64 = 0x1_0000_0000; // 4 GiB
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        virtio_fs_base, virtio_fs_gsi, COM1_GSI, MAX_FS_DEVICES, MMIO_GAP_START, VIRTIO_BLK_GSI,
-        VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
-    };
+    use super::*;
 
-    // The fs windows sit after the three fixed devices and inside the MMIO
-    // hole. RAM laid over either end is the failure this guards: the guest
-    // then finds no virtio magic and never probes the device.
+    // Every device adds a window and a GSI. Neither may land on another device,
+    // every window has to sit in the MMIO hole, and every GSI has to be an
+    // IOAPIC input no legacy device claims.
     #[test]
-    fn every_fs_window_is_inside_the_device_hole() {
-        for index in 0..MAX_FS_DEVICES {
-            let base = virtio_fs_base(index).expect("a placement");
-            assert!(
-                base >= VIRTIO_VSOCK_BASE + VIRTIO_SIZE,
-                "fs {index} overlaps vsock"
-            );
-            assert!(
-                base + VIRTIO_SIZE <= MMIO_GAP_START + 0x1000,
-                "fs {index} escapes the hole"
-            );
+    fn no_device_shares_a_window_or_a_gsi_with_another() {
+        let rtc_gsi = 8;
+        let mut devices = vec![
+            ("net".to_string(), VIRTIO_NET_BASE, VIRTIO_NET_GSI),
+            ("vsock".to_string(), VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI),
+        ];
+        for i in 0..MAX_DISKS {
+            devices.push((
+                format!("disk {i}"),
+                virtio_blk_base(i).expect("a disk slot"),
+                virtio_blk_gsi(i).expect("a disk GSI"),
+            ));
         }
-        assert_eq!(virtio_fs_base(MAX_FS_DEVICES), None);
+        for i in 0..MAX_FS_DEVICES {
+            devices.push((
+                format!("export {i}"),
+                virtio_fs_base(i).expect("an export slot"),
+                virtio_fs_gsi(i).expect("an export GSI"),
+            ));
+        }
+        for (a, (na, base_a, gsi_a)) in devices.iter().enumerate() {
+            assert!(
+                *gsi_a < u32::from(IOAPIC_INPUTS),
+                "{na} GSI {gsi_a} is not an IOAPIC input"
+            );
+            assert!(
+                ![COM1_GSI, rtc_gsi, SCI_GSI].contains(gsi_a),
+                "{na} takes another device's GSI {gsi_a}"
+            );
+            assert!(*base_a >= MMIO_GAP_START, "{na} is in RAM");
+            assert!(
+                base_a + VIRTIO_SIZE <= MMIO_GAP_START + 0x4000,
+                "{na} escapes the hole"
+            );
+            for (nb, base_b, gsi_b) in devices.iter().skip(a + 1) {
+                let overlap = base_a < &(base_b + VIRTIO_SIZE) && base_b < &(base_a + VIRTIO_SIZE);
+                assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
+                assert_ne!(gsi_a, gsi_b, "{na} and {nb} share GSI {gsi_a}");
+            }
+        }
     }
 
-    // An interrupt shared with another device delivers one guest's completion
-    // to the other's handler.
+    // Disk 0 keeps the window and the GSI it had when it was the only disk, the
+    // others follow vsock, and the exports follow the disks up to the IOAPIC's
+    // last line.
     #[test]
-    fn no_fs_interrupt_is_claimed_by_another_device() {
-        let taken = [COM1_GSI, VIRTIO_BLK_GSI, VIRTIO_NET_GSI, VIRTIO_VSOCK_GSI];
-        let mut seen = Vec::new();
-        for index in 0..MAX_FS_DEVICES {
-            let gsi = virtio_fs_gsi(index).expect("an interrupt");
-            assert!(!taken.contains(&gsi), "fs {index} takes GSI {gsi}");
-            assert!(!seen.contains(&gsi), "GSI {gsi} handed out twice");
-            // The MP table writes ISA entries for IRQs 0..15 only.
-            assert!(gsi < 16, "GSI {gsi} has no MP table entry");
-            seen.push(gsi);
-        }
+    fn disks_and_exports_take_fixed_slots_in_order() {
+        assert_eq!(
+            virtio_blk_base(0),
+            Some(VIRTIO_BLK_BASE),
+            "disk 0 stays put"
+        );
+        assert_eq!(virtio_blk_gsi(0), Some(VIRTIO_BLK_GSI));
+        assert_eq!(virtio_blk_base(1), Some(0xd000_0600));
+        assert_eq!(virtio_blk_gsi(1), Some(9));
+        assert_eq!(virtio_blk_base(3), Some(0xd000_0a00));
+        assert_eq!(virtio_blk_gsi(3), Some(11));
+        assert_eq!(virtio_blk_base(MAX_DISKS), None);
+        assert_eq!(virtio_blk_gsi(MAX_DISKS), None);
+        assert_eq!(virtio_fs_base(0), Some(0xd000_0c00));
+        assert_eq!(virtio_fs_gsi(0), Some(12));
+        assert_eq!(MAX_FS_DEVICES, 11);
+        assert_eq!(
+            virtio_fs_gsi(MAX_FS_DEVICES - 1),
+            Some(22),
+            "the SCI holds 23"
+        );
+        assert_eq!(virtio_fs_base(MAX_FS_DEVICES), None);
         assert_eq!(virtio_fs_gsi(MAX_FS_DEVICES), None);
     }
 }

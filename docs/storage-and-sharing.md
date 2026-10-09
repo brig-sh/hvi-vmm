@@ -1,21 +1,55 @@
 # Disks and directory shares
 
-A guest gets storage two ways: one virtio-blk disk, and any number of
+A guest gets storage two ways: up to four virtio-blk disks, and any number of
 virtio-fs directory shares. A guest can have both at once, and either on its
 own.
 
-## virtio-blk: `--disk <file>`
+## virtio-blk: `--disk <file>` and `--disk path=<file>,...`
 
-`--disk` backs one block device from one host file or block device. There is
-no second disk and no hotplug.
+Each `--disk` backs one block device from one host file or block device. The
+flag is repeatable, at most four disks in all, and takes either a bare path or
+Cloud Hypervisor's `path=<file>[,readonly=on|off][,serial=<id>]`. There is no
+hotplug.
 
 ```sh
-hvi boot --kernel <Image> --disk disk.img
+hvi boot --kernel <Image> \
+  --disk path=lower.img,readonly=on,serial=lower --disk path=upper.img,serial=upper
 ```
 
-The guest sees `/dev/vda`. hvi advertises `VIRTIO_BLK_F_FLUSH` and honours a
-flush request with a real sync, so a filesystem's barriers are not silently
-dropped.
+Every disk is its own virtio-mmio device. hvi advertises `VIRTIO_BLK_F_FLUSH`
+and honours a flush request with a real sync, so a filesystem's barriers are not
+silently dropped.
+
+A `readonly=on` disk is opened `O_RDONLY`, so an image hvi may not write still
+attaches. hvi advertises `VIRTIO_BLK_F_RO` for it and refuses any write the
+guest sends anyway with an I/O error. A flush on it succeeds, since nothing was
+written.
+
+The image is locked for as long as the guest has it open: shared for a read-only
+disk, exclusive for a writable one, with `flock`. A second hvi on a writable
+image fails to boot, and so does an hvi writing an image another hvi reads. Any
+number of guests can read one image, which is how one lower image serves many
+sandboxes. Within one guest, an image may back two read-only disks and nothing
+else. The lock is between hvi processes: Cloud Hypervisor and QEMU lock with
+`fcntl`, which `flock` does not see. A writable block device is also opened
+`O_EXCL` on Linux, so it holds against another device node for the same device
+and against a mount; a read-only open claims nothing, so a reader through
+another node is not held against a writer. The lock on a block device is retried
+for a second while udev holds the device after `losetup`. On a filesystem
+without a lock service, such as NFS without lockd, the lock fails and so does
+the boot.
+
+The guest sees the disks as `/dev/vda`, `/dev/vdb` and so on, in command-line
+order. That order follows probing and is not a contract. Each disk also has a
+serial, which the guest reads from `/sys/block/vdX/serial`. `serial=` sets it, 1
+to 20 printable ASCII bytes, and a disk without one answers `disk<N>` with `N`
+its 0-based position. Two disks may not share a serial. Pick a disk by serial:
+
+```sh
+for d in /sys/block/vd*; do
+  [ "$(cat "$d/serial")" = lower ] && echo "/dev/${d##*/}"
+done
+```
 
 Every request emits a `block` record into the ledger when `--events` is set:
 

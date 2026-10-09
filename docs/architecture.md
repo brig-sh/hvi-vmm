@@ -123,7 +123,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
 ### Guest memory maps
 
-<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, virtio-mmio window from 0x0d000000, RAM at 0x40000000" width="720">
+<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, virtio-mmio window from 0x0d000000 with disk 0, net, vsock, disks 1 to 3 and the virtio-fs shares, RAM at 0x40000000" width="720">
 
 **aarch64** (`arch/aarch64/layout.rs`). Devices sit above the GIC, RAM at 1 GiB.
 
@@ -133,10 +133,11 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 | GIC CPU interface (v2) | `0x0801_0000` | `0x1_0000` shared | |
 | GIC redistributor (v3) | `0x080A_0000` | `0x2_0000` per vCPU | |
 | PL011 UART | `0x0c00_0000` | `0x1000` | SPI 1, INTID 33 |
-| virtio-blk | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
+| virtio-blk, disk 0 | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
 | virtio-net | `0x0d00_0200` | `0x200` | SPI 3, INTID 35 |
 | virtio-vsock | `0x0d00_0400` | `0x200` | SPI 4, INTID 36 |
-| virtio-fs share `i` | `0x0d00_0600 + i * 0x200` | `0x200` | SPI `5 + i`, INTID `37 + i` |
+| virtio-blk, disk `i` from 1 to 3 | `0x0d00_0600 + (i - 1) * 0x200` | `0x200` | SPI `4 + i`, INTID `36 + i` |
+| virtio-fs share `i` | `0x0d00_0c00 + i * 0x200` | `0x200` | SPI `8 + i`, INTID `40 + i` |
 | RAM | `0x4000_0000` | `--mem-mib` | |
 
 INTID is `32 + SPI` on both backends. Every device window sits inside
@@ -172,7 +173,9 @@ logs a redistributor region that does not match the table:
 | ACPI tables: RSDP, DSDT, FACS, FADT, MADT, XSDT | `0xe_0000` |
 | `bzImage` load / 64-bit entry | `0x10_0000` / `0x10_0200` (a `vmlinux` enters at its `e_entry`) |
 | RAM, low half | `0x0` to `0xd000_0000` |
-| virtio-blk / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
+| virtio-blk disk 0 / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
+| virtio-blk disks 1 / 2 / 3 | `0xd000_0600` / `0xd000_0800` / `0xd000_0a00`, GSIs 9 / 10 / 11 |
+| virtio-fs export `i`, up to 11 | `0xd000_0c00 + i * 0x200`, GSI `12 + i` |
 | COM1 UART | PIO `0x3f8`, GSI 4 |
 | CMOS RTC | PIO `0x70` / `0x71` |
 | i8042 status and reset command | PIO `0x64` |
@@ -310,9 +313,11 @@ leave those checks armed.
 Only vCPU 0 is initialised. The APs are brought up by the guest itself, with
 INIT-SIPI-SIPI serviced by the in-kernel LAPIC.
 
-hvi appends `console=ttyS0` and one `virtio_mmio.device=` entry per attached
-device to the command line, spliced in before the first standalone `--`, so
-arguments meant for `init` are not read by the kernel.
+hvi appends `console=ttyS0` to the command line, spliced in before the first
+standalone `--`, so arguments meant for `init` are not read by the kernel. The
+devices are not on the command line. Each virtio-mmio device is an `LNRO0005`
+entry in the ACPI DSDT with its window and its GSI, as on Firecracker. A guest
+that does not read ACPI finds no device.
 
 ## 4. Device model
 
@@ -345,12 +350,17 @@ thing that differs by backend:
   never kicks.
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
   vGICv2 and vGICv3.
-- **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7.
+- **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7
+  and 9 to 22.
 
 ### Devices
 
-- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`. It advertises
-  `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync.
+- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`, one device
+  per disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real
+  sync, adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with
+  the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image
+  is locked while open, shared for a read-only disk and exclusive for a
+  writable one.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.

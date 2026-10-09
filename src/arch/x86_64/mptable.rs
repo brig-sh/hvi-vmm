@@ -17,12 +17,12 @@
 //!
 //! Layout follows the MP spec 1.4 and mirrors Firecracker's small table: an MP
 //! floating pointer, a config header, then one processor entry per vCPU, a bus
-//! entry, an IOAPIC entry, and ISA interrupt entries for the 16 legacy lines.
-//! All checksums are one's-of-sum-is-zero over the relevant bytes. Returns the
-//! bytes to place at [`MPTABLE_ADDR`]; the floating pointer sits first and
-//! points at the config table right after it.
+//! entry, an IOAPIC entry, and an interrupt entry for each of the IOAPIC's 24
+//! inputs, as Firecracker writes them. All checksums are one's-of-sum-is-zero
+//! over the relevant bytes. Returns the bytes to place at [`MPTABLE_ADDR`]; the
+//! floating pointer sits first and points at the config table right after it.
 
-use crate::arch::x86_64::layout::{IOAPIC_ADDR, LAPIC_ADDR, MPTABLE_ADDR};
+use crate::arch::x86_64::layout::{IOAPIC_ADDR, IOAPIC_INPUTS, LAPIC_ADDR, MPTABLE_ADDR};
 use crate::arch::x86_64::MAX_VCPUS;
 
 const APIC_VERSION: u8 = 0x14;
@@ -87,8 +87,10 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
     io[4..8].copy_from_slice(&IOAPIC_ADDR.to_le_bytes());
     entries.extend_from_slice(&io);
 
-    // I/O interrupt entries (8 bytes each): ISA IRQ n -> IOAPIC input n.
-    for irq in 0u8..16 {
+    // I/O interrupt entries (8 bytes each): ISA IRQ n -> IOAPIC input n, for
+    // every input the IOAPIC has. The ACPI tables describe the devices on lines
+    // past 15; the entries here keep the two tables in step.
+    for irq in 0u8..IOAPIC_INPUTS {
         let mut it = vec![0u8; 8];
         it[0] = ENTRY_IOINT;
         it[1] = 0; // INT
@@ -99,7 +101,7 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
         it[7] = irq; // dest IOAPIC intin
         entries.extend_from_slice(&it);
     }
-    let entry_count = num_cpus as u16 + 1 /*bus*/ + 1 /*ioapic*/ + 16 /*ioint*/;
+    let entry_count = num_cpus as u16 + 1 /*bus*/ + 1 /*ioapic*/ + u16::from(IOAPIC_INPUTS);
 
     // --- config header (44 bytes) ---
     let mut hdr = vec![0u8; 44];
