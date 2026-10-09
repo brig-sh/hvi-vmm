@@ -45,9 +45,10 @@ including a typo, silently runs the plain test.
 | `--mem-mib <N>` | 512 | Guest RAM. On x86-64 it is split around the MMIO hole. |
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
-| `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
-| `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. macOS only. |
-| `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
+| `--disk <path>` | none | A writable virtio-blk disk. Repeatable, up to 4 disks with `--disk-ro`. A failure to open fails the boot. |
+| `--disk-ro <path>` | none | A read-only virtio-blk disk, opened `O_RDONLY` and advertised with `VIRTIO_BLK_F_RO`. Repeatable, counted with `--disk`. |
+| `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable, up to 16 shares in all. macOS only. |
+| `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable, up to 16 shares in all. macOS only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
 | `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
@@ -66,15 +67,16 @@ including a typo, silently runs the plain test.
 
 Three things about the parser are worth knowing, because none of them warns.
 
-**Repeating a flag is last-wins.** Only `--share-ro` and `--share-rw`
-accumulate. A second `--disk` replaces the first.
+**Repeating a flag is last-wins.** Only `--share-ro`, `--share-rw`,
+`--disk` and `--disk-ro` accumulate. `--disk` and `--disk-ro` fill one list
+in command-line order, and a fifth disk fails the boot.
 
 **A value-taking flag at the end of the line silently takes none.** These
 flags accept a missing value as "not set" rather than erroring: `--kernel`,
-`--initramfs`, `--disk`, `--net-gateway`, `--net-tap`, `--events`,
-`--agent-sock`, `--dump-memory`, `--trace-io`. So `hvi boot --kernel Image
---disk` boots with no disk. `--net-mac` is not among them: it is parsed where
-it is read, so a missing or malformed value fails the boot.
+`--initramfs`, `--net-gateway`, `--net-tap`, `--events`, `--agent-sock`,
+`--dump-memory`, `--trace-io`. So `hvi boot --kernel Image --events` boots
+with no ledger. `--net-mac`, `--disk` and `--disk-ro` are not among them: a
+missing or malformed value fails the boot.
 
 `--kernel` is the one where that matters, because it is required. It is not
 caught by the parser. A trailing `hvi boot --kernel` parses to "not set" and
@@ -254,7 +256,7 @@ Every backend logs what it set up on stderr before the guest runs. On macOS:
 ```text
 booting Image with 1024 MiB ...
 [hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
-[hvi] virtio-blk: /path/to/disk.img
+[hvi] virtio-blk[0]: /path/to/disk.img (rw, serial disk0)
 [hvi] virtio-net: built-in stub stack (guest 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
 [hvi] open-file limit: 1048576
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)

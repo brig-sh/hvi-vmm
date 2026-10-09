@@ -68,7 +68,7 @@ let cfg = BootConfig {
     initramfs: Some(std::fs::read("initramfs.cpio")?),
     mem_bytes: 1024 << 20,
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
-    disk: None,
+    disks: Vec::new(),
     fs_shares: Vec::new(),
     net: true,
     net_gateway: None,
@@ -105,7 +105,7 @@ cargo build --release --example watch_guest
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
-| `disk` | `Option<String>` | One virtio-blk backing file. |
+| `disks` | `Vec<DiskSpec>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskSpec::rw(path)` or `DiskSpec::ro(path)`. The disk at index `N` has the serial `disk<N>`. |
 | `fs_shares` | `Vec<FsShare>` | virtio-fs exports. macOS only: a non-empty vector **fails the boot** on either Linux backend. |
 | `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |

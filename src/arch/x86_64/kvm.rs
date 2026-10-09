@@ -47,21 +47,21 @@ use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::x86_64::layout::{
-    BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR,
-    PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE,
-    VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    virtio_blk_base, virtio_blk_gsi, BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE,
+    MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_NET_BASE, VIRTIO_NET_GSI,
+    VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
-use crate::hypervisor::guest::{Guest, VcpuRegs};
+use crate::hypervisor::guest::{Disk, Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, Kicker, KvmIrqLine,
 };
@@ -130,6 +130,30 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
     }
 }
 
+/// Returns the parameters hvi adds to the kernel command line: the console,
+/// and one `virtio_mmio.device=` per attached device.
+///
+/// The disks come first and in order, so Linux registers them in that order.
+/// The guest still has to tell them apart by serial.
+fn device_args(disks: usize, net: bool, vsock: bool) -> String {
+    let mut ours = String::from("console=ttyS0");
+    let mut device = |base: u64, gsi: u32| {
+        ours += &format!(" virtio_mmio.device={VIRTIO_SIZE:#x}@{base:#x}:{gsi}");
+    };
+    for index in 0..disks {
+        if let (Some(base), Some(gsi)) = (virtio_blk_base(index), virtio_blk_gsi(index)) {
+            device(base, gsi);
+        }
+    }
+    if net {
+        device(VIRTIO_NET_BASE, VIRTIO_NET_GSI);
+    }
+    if vsock {
+        device(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI);
+    }
+    ours
+}
+
 /// Boots `cfg` on KVM (x86-64) and runs until the guest powers off.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
@@ -194,13 +218,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     vm.create_pit2(kvm_pit_config::default())?;
 
     // Devices.
-    let virtio = match &cfg.disk {
-        Some(path) => {
-            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
-        }
-        None => None,
-    };
+    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
     let mut net_source: Option<NetSource> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
         // urunc already created the tap and redirected the veth to it, so all
@@ -255,16 +273,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Kernel command line: caller's args + ttyS0 console + virtio-mmio device
     // descriptors for whatever we attached. (KASLR works now that the guest
     // CPUID advertises RDRAND, so no nokaslr.)
-    let mut ours = String::from("console=ttyS0");
-    if virtio.is_some() {
-        ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_BLK_BASE:#x}:{VIRTIO_BLK_GSI}");
-    }
-    if net.is_some() {
-        ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_NET_BASE:#x}:{VIRTIO_NET_GSI}");
-    }
-    if vsock.is_some() {
-        ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_VSOCK_BASE:#x}:{VIRTIO_VSOCK_GSI}");
-    }
+    let ours = device_args(disks.len(), net.is_some(), vsock.is_some());
     let cmdline = splice_kernel_args(cfg.cmdline.trim(), &ours);
 
     // Load the kernel, write boot_params and the command line, then place
@@ -318,7 +327,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 cfg.events.as_deref(),
                 &cfg.sandbox_id,
             )?)),
-            block: virtio,
+            disks,
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
@@ -333,7 +342,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
     lock_or_recover(&shared.uart).connect_irq(line(COM1_GSI));
     shared.guest.connect_irqs(
-        line(VIRTIO_BLK_GSI),
+        // `open_disks` refused more disks than there are GSIs.
+        |index| line(virtio_blk_gsi(index).expect("a GSI per disk")),
         line(VIRTIO_NET_GSI),
         line(VIRTIO_VSOCK_GSI),
     );
@@ -607,8 +617,8 @@ fn pio_write(sh: &Shared, port: u16, val: u8) {
 
 /// Services an MMIO read of the virtio register at `addr`.
 fn mmio_read(sh: &Shared, addr: u64) -> u64 {
-    if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
-        blk_read(sh, addr - VIRTIO_BLK_BASE)
+    if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
+        blk_read(sh, dev, off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         net_read(sh, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -620,8 +630,8 @@ fn mmio_read(sh: &Shared, addr: u64) -> u64 {
 
 /// Services an MMIO write of `val` to the virtio register at `addr`.
 fn mmio_write(sh: &Shared, addr: u64, val: u64) {
-    if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
-        blk_write(sh, addr - VIRTIO_BLK_BASE, val);
+    if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
+        blk_write(sh, dev, off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         net_write(sh, addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -640,13 +650,10 @@ fn drain(sh: &Shared, events: &[CapturedEvent]) {
     }
 }
 
-/// Services a read of virtio-blk register `off`.
+/// Services a read of register `off` of the virtio-blk device `dev`.
 ///
 /// The device's captured events then go to the ledger.
-fn blk_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.guest.block.as_ref() else {
-        return 0;
-    };
+fn blk_read(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
     let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.guest.ram, off, false, 0);
@@ -656,13 +663,10 @@ fn blk_read(sh: &Shared, off: u64) -> u64 {
     v
 }
 
-/// Services a write of `val` to virtio-blk register `off`.
+/// Services a write of `val` to register `off` of the virtio-blk device `dev`.
 ///
 /// The device's captured events then go to the ledger.
-fn blk_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.guest.block.as_ref() else {
-        return;
-    };
+fn blk_write(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
     let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.guest.ram, off, true, val);
@@ -721,7 +725,26 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
 
 #[cfg(test)]
 mod cmdline_tests {
-    use super::splice_kernel_args;
+    use super::{device_args, splice_kernel_args};
+
+    // Linux registers `virtio_mmio.device=` devices in command-line order, so
+    // the disks lead and keep their argv order.
+    #[test]
+    fn device_args_list_every_disk_first_and_in_order() {
+        assert_eq!(
+            device_args(3, true, false),
+            "console=ttyS0 virtio_mmio.device=0x200@0xd0000000:5 \
+             virtio_mmio.device=0x200@0xd0000600:9 \
+             virtio_mmio.device=0x200@0xd0000800:10 \
+             virtio_mmio.device=0x200@0xd0000200:6"
+        );
+        assert_eq!(device_args(0, false, false), "console=ttyS0");
+        assert_eq!(
+            device_args(1, false, true),
+            "console=ttyS0 virtio_mmio.device=0x200@0xd0000000:5 \
+             virtio_mmio.device=0x200@0xd0000400:7"
+        );
+    }
 
     const OURS: &str = "console=ttyS0 virtio_mmio.device=0x200@0xd0000000:5";
 

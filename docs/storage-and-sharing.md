@@ -1,20 +1,36 @@
 # Disks and directory shares
 
-A guest gets storage two ways: one virtio-blk disk, and any number of
+A guest gets storage two ways: up to four virtio-blk disks, and up to 16
 virtio-fs directory shares on macOS.
 
-## virtio-blk: `--disk <file>`
+## virtio-blk: `--disk <file>` and `--disk-ro <file>`
 
-`--disk` backs one block device from one host file or block device. There is
-no second disk and no hotplug.
+Each `--disk` or `--disk-ro` backs one block device from one host file or
+block device. Both flags are repeatable and fill one list, at most four disks
+in all. There is no hotplug.
 
 ```sh
-hvi boot --kernel <Image> --disk disk.img
+hvi boot --kernel <Image> --disk-ro lower.img --disk upper.img
 ```
 
-The guest sees `/dev/vda`. hvi advertises `VIRTIO_BLK_F_FLUSH` and honours a
-flush request with a real sync, so a filesystem's barriers are not silently
-dropped.
+Every disk is its own virtio-mmio device. hvi advertises `VIRTIO_BLK_F_FLUSH`
+and honours a flush request with a real sync, so a filesystem's barriers are
+not silently dropped.
+
+A `--disk-ro` disk is opened `O_RDONLY`, so an image hvi may not write still
+attaches. hvi advertises `VIRTIO_BLK_F_RO` for it and refuses any write the
+guest sends anyway with an I/O error.
+
+The guest sees the disks as `/dev/vda`, `/dev/vdb` and so on, in command-line
+order. That order follows probing and is not a contract. Each disk also has a
+serial, `disk<N>` with `N` its 0-based position across both flags, and the
+guest reads it from `/sys/block/vdX/serial`. Pick a disk by serial:
+
+```sh
+for d in /sys/block/vd*; do
+  [ "$(cat "$d/serial")" = disk1 ] && echo "/dev/${d##*/}"
+done
+```
 
 Every request emits a `block` record into the ledger when `--events` is set:
 

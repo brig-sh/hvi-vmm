@@ -30,9 +30,11 @@
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::config;
 use crate::memory::GuestRam;
+use crate::LOG_PREFIX;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -527,6 +529,32 @@ impl VirtioBlk {
         }
         Ok(device_written)
     }
+}
+
+/// Opens every disk in `disks` in order, with the serial
+/// [`config::disk_serial`] of its position, and logs each one.
+///
+/// # Errors
+///
+/// Errors when there are more than [`config::MAX_DISKS`] disks, or one of them
+/// does not open. The message names the path.
+pub fn open_disks(disks: &[config::DiskSpec]) -> Result<Vec<Arc<Mutex<VirtioBlk>>>, String> {
+    config::check_disks(disks)?;
+    disks
+        .iter()
+        .enumerate()
+        .map(|(index, disk)| {
+            let serial = config::disk_serial(index);
+            let blk = VirtioBlk::open_as(&disk.path, disk.read_only, &serial)
+                .map_err(|e| format!("virtio-blk disk {index} ({}): {e}", disk.path))?;
+            let mode = if disk.read_only { "ro" } else { "rw" };
+            eprintln!(
+                "{LOG_PREFIX} virtio-blk[{index}]: {} ({mode}, serial {serial})",
+                disk.path
+            );
+            Ok(Arc::new(Mutex::new(blk)))
+        })
+        .collect()
 }
 
 fn other<E: std::fmt::Display>(e: E) -> std::io::Error {
@@ -1146,6 +1174,32 @@ mod capacity_tests {
         let mut got = [0u8; 4];
         mem.read(BASE + 0x5000, &mut got).unwrap();
         assert_eq!(&got, b"dis\xff");
+    }
+
+    // The guest finds its disks by serial, so position N in the disk list
+    // has to answer GET_ID with disk<N> and keep its own access mode.
+    #[test]
+    fn open_disks_gives_each_position_its_serial_and_mode() {
+        let (a, _) = ro_rig("argv-a", "");
+        let (b, _) = rig("argv-b");
+        let disks = open_disks(&[
+            config::DiskSpec::ro(a.path.to_str().unwrap()),
+            config::DiskSpec::rw(b.path.to_str().unwrap()),
+        ])
+        .unwrap();
+        assert_eq!(disks.len(), 2);
+        for (index, (dev, read_only)) in disks.iter().zip([true, false]).enumerate() {
+            let mut blk = dev.lock().unwrap();
+            assert_eq!(blk.read_only(), read_only, "disk {index}");
+            let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+            let st = submit(&mut blk, &mem, VIRTIO_BLK_T_GET_ID, 0, 20);
+            assert_eq!(st, 0, "disk {index} answered GET_ID");
+            let mut got = [0u8; 20];
+            mem.read(BASE + 0x5000, &mut got).unwrap();
+            let mut want = [0u8; 20];
+            want[..5].copy_from_slice(format!("disk{index}").as_bytes());
+            assert_eq!(got, want, "disk {index}");
+        }
     }
 
     #[test]

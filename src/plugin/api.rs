@@ -98,13 +98,16 @@ pub trait VmHandle: Send + Sync {
     /// stream as the VMM's device observations.
     fn ledger(&self) -> &Arc<Mutex<Emitter>>;
 
-    /// Whether this VM has a virtio-blk device.
+    /// Returns whether this VM has at least one virtio-blk disk.
     fn has_block(&self) -> bool;
 
     /// Whether this VM has a virtio-net device.
     fn has_net(&self) -> bool;
 
-    /// Feeds every virtio-blk request to `sink`. No-op with no block device.
+    /// Feeds every virtio-blk request, on every disk, to `sink`.
+    ///
+    /// [`IoSink::block`] carries a `disk_id` that tells the disks apart. No-op
+    /// with no disk.
     fn set_block_sink(&self, sink: Arc<dyn IoSink>);
 
     /// Feeds every virtio-net frame to `sink`. No-op with no net device.

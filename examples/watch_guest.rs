@@ -183,7 +183,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         initramfs: args.get(2).map(std::fs::read).transpose()?,
         mem_bytes: 512 << 20,
         cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
-        disk: None,
+        disks: Vec::new(),
         fs_shares: Vec::new(),
         net: true,
         net_gateway: None,

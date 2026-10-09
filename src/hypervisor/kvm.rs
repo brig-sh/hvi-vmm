@@ -393,7 +393,7 @@ mod stop_tests {
             initramfs: None,
             mem_bytes: 128 << 20,
             cmdline: String::new(),
-            disk: None,
+            disks: Vec::new(),
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,
