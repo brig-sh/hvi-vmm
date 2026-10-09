@@ -86,12 +86,14 @@ reads back `0xff`, so that bit never clears and the guest spins there forever,
 before the console is up. hvi supplies the device, so this is a reason the
 device exists rather than something you configure.
 
-An x86-64 guest powers off through ACPI. hvi supplies a FADT whose PM1 control
-register is a port it serves, and a MADT that lists the same CPUs and IOAPIC as
-the MP table. A kernel without `CONFIG_ACPI`, or booted with `acpi=off`, reads
-the MP table instead and has no way to power off: `poweroff` halts it, and hvi
-does not see the halt. `reboot -f` ends the run either way, through the ACPI
-reset register or the i8042's reset command.
+An x86-64 guest finds its devices and powers off through ACPI. hvi supplies a
+DSDT that describes every virtio-mmio device, a FADT whose PM1 control register
+is a port it serves, and a MADT that lists the same CPUs and IOAPIC as the MP
+table. A kernel without `CONFIG_ACPI`, or booted with `acpi=off`, reads the MP
+table instead: it finds its CPUs, but no virtio device, and it has no way to
+power off: `poweroff` halts it, and hvi does not see the halt. The command
+`reboot -f` ends the run either way, through the ACPI reset register or the
+i8042's reset command.
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.
@@ -147,11 +149,10 @@ costs a Linux guest nothing (see `DEVICE_WINDOW_BASE` in
 The default is `earlycon console=ttyAMA0 panic=-1`, which names the arm64
 console.
 
-hvi appends what its own devices need, and only on x86-64:
-`console=ttyS0`, plus one `virtio_mmio.device=<size>@<addr>:<irq>` for each
-backed device, because that guest has no devicetree and no PCI bus to discover
-them on. On arm64 the devicetree describes the devices, so nothing is
-appended.
+hvi appends `console=ttyS0`, and only on x86-64. The devices are described to
+the guest out of band: by the devicetree on arm64, and by the ACPI DSDT on
+x86-64, where each virtio-mmio device is an `LNRO0005` entry the kernel's
+`virtio_mmio` driver binds to.
 
 Because hvi appends `console=ttyS0` itself, an x86-64 guest gets console
 output even with the default. The default's `console=ttyAMA0` is simply inert
@@ -204,8 +205,9 @@ hvi boot --kernel <bzImage> --disk rootfs.img \
          --cmdline "console=ttyS0 root=/dev/vda rw panic=-1"
 ```
 
-The guest sees the disk as `/dev/vda`. One disk, no partition table required,
-no hotplug.
+The guest sees the disk as `/dev/vda`. No partition table is required. Up to
+four disks attach, and no hotplug; see
+[storage-and-sharing.md](storage-and-sharing.md).
 
 ### A virtio-fs share, on macOS
 

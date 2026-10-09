@@ -24,7 +24,7 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| One virtio-blk disk. | No second disk, no hotplug, no PCI at all. | Design |
+| At most four virtio-blk disks. | No hotplug, no PCI at all. | Design |
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |
@@ -33,7 +33,9 @@ three things a reader should not have to guess between:
 | A gateway frame above 64 KiB ends the relay. | The relay writes one line to stderr and shuts the gateway socket down, so the guest receives nothing more from the gateway and its own frames are dropped for the rest of the run. Every gateway's default MTU is far below 64 KiB. | Design |
 | virtio-fs: one request queue per share on macOS, and no DAX window on either host. The macOS device also takes no indirect descriptors. A Linux export takes as many request queues as `num_queues=` and its daemon allow. | Throughput ceiling per share. | Design |
 | virtio-fs: the export overlap check covers one process. | Two hvi processes can export the same tree, or a tree and a directory inside it, with one writable and one read-only. An owner and a mode a guest stores through the writable export, setuid and setgid included, reach the other guest. See [storage-and-sharing.md](storage-and-sharing.md#virtio-fs-shares). | Design |
-| An x86-64 KVM guest has interrupt lines for four exports, an arm64 KVM guest for 219. | The next export fails the boot rather than taking an interrupt the controller does not have. | Design |
+| An x86-64 KVM guest has interrupt lines for 11 exports, an arm64 KVM guest for 216. | The next export fails the boot rather than taking an interrupt the controller does not have. | Design |
+| A disk image is locked while a guest has it open. | A writable image takes an exclusive `flock` and a read-only one a shared `flock`, so a second hvi on a writable image, or an hvi writing an image another hvi reads, fails to boot with "the image is open elsewhere". Many guests can read one image. The lock holds against other hvi processes: Cloud Hypervisor and QEMU take OFD locks, which `flock` does not see, and a filesystem without a lock service, such as NFS without lockd, refuses the lock and so the boot. A writable block device is also opened `O_EXCL` on Linux, which holds against another device node for it and against a mount; a read-only open through another node is not held against a writer. | Design |
+| An x86-64 guest finds its devices through ACPI. | The DSDT describes every virtio-mmio device; the kernel command line carries no `virtio_mmio.device=`. A kernel without `CONFIG_ACPI`, or booted with `acpi=off`, sees no disk, network, vsock or export. | Design |
 | A Linux export's daemon that stops answering holds the thread waiting on it. | During boot that is the boot. Once the guest runs, only a device reset waits for the daemon's answer, so it is the vCPU that wrote the reset, until the VMM stops and ends the connection. | Design |
 | A Linux export's daemon that exits ends that export. | The guest's requests on it get no answer and hang. hvi does not reconnect and does not restart the daemon. | Design |
 | A Linux export's kicks and completions pass through hvi. | hvi has no ioeventfd or irqfd. A queue notify exits to hvi, which signals the daemon, and a completion wakes an hvi thread, which sets the line. Both could go to KVM instead. | Design |

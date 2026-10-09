@@ -26,11 +26,11 @@
 //!
 //! The FADT is not hardware-reduced. A hardware-reduced guest drops the legacy
 //! PIC and numbers its interrupts dynamically, so the ISA lines the console and
-//! the `virtio_mmio.device=` devices use would no longer reach their drivers.
+//! the virtio-mmio devices use would no longer reach their drivers.
 //!
 //! [`PmRegisters`]: crate::devices::legacy::acpi_pm::PmRegisters
 
-use acpi_tables::aml::{Name, Package};
+use acpi_tables::aml::{Device, Interrupt, Memory32Fixed, Name, Package, ResourceTemplate, Scope};
 use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags, FADT};
 use acpi_tables::gas::{AccessSize, AddressSpace, GAS};
@@ -64,21 +64,82 @@ const IAPC_VGA_NOT_PRESENT: u16 = 1 << 2;
 /// The IA-PC boot architecture flag that says the guest must not enable MSI.
 const IAPC_MSI_NOT_SUPPORTED: u16 = 1 << 3;
 
-/// Builds the tables for `num_cpus` vCPUs, as the bytes to write at
-/// [`ACPI_ADDR`].
+/// The `_HID` of a virtio-mmio transport, which the guest's `virtio_mmio`
+/// driver binds to.
+const VIRTIO_MMIO_HID: &str = "LNRO0005";
+
+/// One virtio-mmio device the DSDT describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioDevice {
+    /// Guest-physical base of the device's register window.
+    pub base: u64,
+    /// Size of the window.
+    pub size: u64,
+    /// The IOAPIC line the device raises.
+    pub gsi: u32,
+}
+
+/// Builds the tables for `num_cpus` vCPUs and the virtio-mmio `devices`, as the
+/// bytes to write at [`ACPI_ADDR`].
+///
+/// The guest finds the devices in the DSDT, as it does on Firecracker, so the
+/// kernel command line carries no `virtio_mmio.device=`. A guest that does not
+/// read ACPI finds no device, and the DSDT is the only description there is of
+/// a device on an IOAPIC line past 15, which Linux maps through ACPI.
 ///
 /// # Panics
 ///
-/// Panics if `num_cpus` exceeds [`MAX_VCPUS`].
+/// Panics if `num_cpus` exceeds [`MAX_VCPUS`], if there are 100 devices or
+/// more, or if a device's window does not fit in 32 bits.
 #[must_use]
-pub fn build(num_cpus: u32) -> Vec<u8> {
+pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     assert!(
         num_cpus <= MAX_VCPUS,
         "{num_cpus} vCPUs, at most {MAX_VCPUS}"
     );
+    assert!(devices.len() < 100, "{} devices, at most 99", devices.len());
     let mut tables = Tables::new();
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, OEM_TABLE_ID, OEM_REVISION);
     Name::new("_S5_".into(), &Package::new(vec![&SLP_TYP_S5])).to_aml_bytes(&mut dsdt);
+    // The ISA lines are edge-triggered and active-high, and a device on a line
+    // past them is wired the same way, so one description fits every device.
+    let resources: Vec<(Memory32Fixed, Interrupt)> = devices
+        .iter()
+        .map(|device| {
+            let base = u32::try_from(device.base).expect("a window under 4 GiB");
+            let size = u32::try_from(device.size).expect("a window under 4 GiB");
+            (
+                Memory32Fixed::new(true, base, size),
+                Interrupt::new(true, true, false, false, device.gsi),
+            )
+        })
+        .collect();
+    let crs: Vec<ResourceTemplate> = resources
+        .iter()
+        .map(|(memory, interrupt)| ResourceTemplate::new(vec![memory, interrupt]))
+        .collect();
+    let names: Vec<[Name; 3]> = crs
+        .iter()
+        .enumerate()
+        .map(|(index, crs)| {
+            [
+                Name::new("_HID".into(), &VIRTIO_MMIO_HID),
+                Name::new("_UID".into(), &index),
+                Name::new("_CRS".into(), crs),
+            ]
+        })
+        .collect();
+    let entries: Vec<Device> = names
+        .iter()
+        .enumerate()
+        .map(|(index, [hid, uid, crs])| {
+            Device::new(format!("VR{index:02}").as_str().into(), vec![hid, uid, crs])
+        })
+        .collect();
+    if !entries.is_empty() {
+        let children: Vec<&dyn Aml> = entries.iter().map(|d| d as &dyn Aml).collect();
+        Scope::new("\\_SB_".into(), children).to_aml_bytes(&mut dsdt);
+    }
     let dsdt = tables.place(&dsdt, 1);
     let facs = tables.place(&FACS::new(), FACS_ALIGN);
     let fadt = tables.place(&build_fadt(dsdt, facs), 1);
@@ -251,7 +312,7 @@ mod tests {
     // The guest scans 0xe0000-0xfffff on 16-byte boundaries for the RSDP.
     #[test]
     fn rsdp_sits_where_the_guest_scans() {
-        let blob = build(MAX_VCPUS);
+        let blob = build(MAX_VCPUS, &[]);
         assert_eq!(&blob[0..8], b"RSD PTR ");
         assert!((0xe_0000..HIGH_MEM_START).contains(&ACPI_ADDR));
         assert_eq!(ACPI_ADDR % 16, 0);
@@ -260,7 +321,7 @@ mod tests {
 
     #[test]
     fn every_checksum_sums_to_zero() {
-        let blob = build(4);
+        let blob = build(4, &[]);
         assert_eq!(sum(&blob[..20]), 0, "RSDP, ACPI 1.0 part");
         assert_eq!(sum(&blob[..Rsdp::len()]), 0, "RSDP, extended");
         let fadt = fadt(&blob);
@@ -275,7 +336,7 @@ mod tests {
 
     #[test]
     fn tables_chain_from_the_rsdp() {
-        let blob = build(2);
+        let blob = build(2, &[]);
         let entries = xsdt_entries(&blob);
         assert_eq!(entries.len(), 2, "the FADT and the MADT");
         let fadt = fadt(&blob);
@@ -290,7 +351,7 @@ mod tests {
     // A guest that finds ACPI tables reads its CPUs from the MADT alone.
     #[test]
     fn madt_lists_every_cpu_and_the_ioapic() {
-        let blob = build(3);
+        let blob = build(3, &[]);
         let madt = table(&blob, xsdt_entries(&blob)[1]);
         assert_eq!(u32_at(madt, HEADER_LEN), LAPIC_ADDR);
         let mut at = HEADER_LEN + 8;
@@ -315,7 +376,7 @@ mod tests {
 
     #[test]
     fn madt_ids_stay_distinct_at_the_vcpu_cap() {
-        let blob = build(MAX_VCPUS);
+        let blob = build(MAX_VCPUS, &[]);
         let madt = table(&blob, xsdt_entries(&blob)[1]);
         let mut at = HEADER_LEN + 8;
         let mut apic_ids = Vec::new();
@@ -335,7 +396,7 @@ mod tests {
 
     #[test]
     fn fadt_names_the_pm_registers() {
-        let blob = build(1);
+        let blob = build(1, &[]);
         let fadt = fadt(&blob);
         let flags = u32_at(fadt, FADT_FLAGS);
         assert_eq!(flags & FADT_HW_REDUCED_ACPI, 0, "not hardware-reduced");
@@ -364,7 +425,7 @@ mod tests {
     // test decodes it from there and writes it as ACPICA's legacy sleep does.
     #[test]
     fn s5_package_powers_off() {
-        let blob = build(1);
+        let blob = build(1, &[]);
         let dsdt = table(&blob, u64_at(fadt(&blob), FADT_X_DSDT));
         let name = dsdt.windows(4).position(|w| w == b"_S5_").unwrap();
         let package = &dsdt[name + 4..];
@@ -381,5 +442,44 @@ mod tests {
             pm.write(PM1_CONTROL, &off.to_le_bytes()),
             Some(Stop::SystemOff)
         ));
+    }
+
+    // The guest's virtio_mmio driver binds to LNRO0005 devices under \_SB_, and
+    // takes each one's window and line from its _CRS.
+    #[test]
+    fn dsdt_describes_every_virtio_mmio_device() {
+        let devices = [
+            MmioDevice {
+                base: 0xd000_0000,
+                size: 0x200,
+                gsi: 5,
+            },
+            MmioDevice {
+                base: 0xd000_1000,
+                size: 0x200,
+                gsi: 23,
+            },
+        ];
+        let blob = build(1, &devices);
+        let dsdt = table(&blob, u64_at(fadt(&blob), FADT_X_DSDT));
+        let count = |needle: &[u8]| dsdt.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(count(b"LNRO0005"), 2, "one _HID per device");
+        assert_eq!(count(b"VR00"), 1);
+        assert_eq!(count(b"VR01"), 1);
+        for device in devices {
+            // Memory32Fixed: tag 0x86, length 9, read-write, base, length.
+            let mut memory = vec![0x86, 9, 0, 1];
+            memory.extend((device.base as u32).to_le_bytes());
+            memory.extend((device.size as u32).to_le_bytes());
+            assert_eq!(count(&memory), 1, "window of {device:?}");
+            // Extended IRQ: tag 0x89, length 6, consumer edge high exclusive,
+            // one line.
+            let mut irq = vec![0x89, 6, 0, 0b11, 1];
+            irq.extend(device.gsi.to_le_bytes());
+            assert_eq!(count(&irq), 1, "line of {device:?}");
+        }
+        let none = build(1, &[]);
+        let dsdt = table(&none, u64_at(fadt(&none), FADT_X_DSDT));
+        assert!(!dsdt.windows(8).any(|w| w == b"LNRO0005"));
     }
 }
