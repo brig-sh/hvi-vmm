@@ -59,6 +59,10 @@ const VIRTIO_BLK_T_FLUSH: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_FLUSH;
 /// virtio-blk status byte.
 const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
 const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8;
+/// The device does not implement this request type (virtio 1.2, 5.2.6).
+/// Answering `S_OK` instead tells the driver a request it depends on, such as
+/// a discard, did its work when it did nothing at all.
+const VIRTIO_BLK_S_UNSUPP: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_UNSUPP as u8;
 
 const SECTOR: u64 = 512;
 
@@ -368,7 +372,7 @@ impl VirtioBlk {
         let mut device_written = 0u32;
         let mut data_bytes = 0u64;
 
-        match typ {
+        let status = match typ {
             VIRTIO_BLK_T_IN => {
                 // Coalesce the data segments into one positioned read, then
                 // scatter into guest memory: one syscall per request, not one
@@ -385,6 +389,7 @@ impl VirtioBlk {
                     device_written += l;
                 }
                 data_bytes = total as u64;
+                VIRTIO_BLK_S_OK
             }
             VIRTIO_BLK_T_OUT => {
                 // Gather the data segments into one buffer, then one positioned
@@ -400,16 +405,21 @@ impl VirtioBlk {
                 }
                 self.file.write_all_at(&buf, base).map_err(other)?;
                 data_bytes = total as u64;
+                VIRTIO_BLK_S_OK
             }
             VIRTIO_BLK_T_FLUSH => {
                 // Honour the guest's cache flush (durability for fsync).
                 self.file.sync_data().map_err(other)?;
+                VIRTIO_BLK_S_OK
             }
-            _ => {} // get-id / etc.: acknowledge without data.
-        }
+            // Every request type this device does not implement, discard and
+            // write-zeroes among them. None of them were negotiated, but a
+            // driver that sends one anyway must learn that nothing happened.
+            _ => VIRTIO_BLK_S_UNSUPP,
+        };
 
         let (saddr, _) = *writable.last().unwrap();
-        mem.write_u8(saddr, VIRTIO_BLK_S_OK).map_err(other)?;
+        mem.write_u8(saddr, status).map_err(other)?;
         device_written += 1;
 
         // Boundary capture: the guest's disk I/O, observed at the device. The
@@ -935,6 +945,32 @@ mod capacity_tests {
         let mut got = [0u8; 4];
         mem.read(BASE + 0x5000, &mut got).unwrap();
         assert_eq!(&got, &[0xab; 4], "the sector reached guest memory");
+    }
+
+    /// A request type the device does not implement is answered `S_UNSUPP`,
+    /// not `S_OK`: a driver told its discard succeeded would trust a range
+    /// that still holds the old data.
+    #[test]
+    fn an_unknown_request_type_is_unsupported() {
+        let (r, mut blk) = rig("unsupp");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let discard = virtio_bindings::virtio_blk::VIRTIO_BLK_T_DISCARD;
+        let write_zeroes = virtio_bindings::virtio_blk::VIRTIO_BLK_T_WRITE_ZEROES;
+        for typ in [discard, write_zeroes, 0xdead_beef] {
+            let st = submit(&mut blk, &mem, typ, 0, 16);
+            // The wire value from the spec, not the constant the device uses.
+            assert_eq!(st, 2, "type {typ:#x} is VIRTIO_BLK_S_UNSUPP");
+            // Only the status byte was written: used.len of the newest entry.
+            let used = BASE + 0x3000;
+            let slot = u64::from(mem.read_u16(used + 2).unwrap().wrapping_sub(1) % 256);
+            assert_eq!(mem.read_u32(used + 4 + slot * 8 + 4).unwrap(), 1);
+        }
+        assert_eq!(
+            std::fs::read(&r.path).unwrap(),
+            [0xabu8; 512],
+            "nothing reached the disk"
+        );
+        assert!(blk.take_events().is_empty(), "and no I/O was recorded");
     }
 
     /// The bound is on the bytes actually transferred, so it is exact at the
