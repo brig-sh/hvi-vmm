@@ -112,15 +112,23 @@ impl<K: Kick> Vcpus<K> {
     /// for the guest to start it, cannot touch guest state. One that starts
     /// during the wait is waited for too, and parks at its first checkpoint,
     /// before it enters the guest. Returns `false` when they did not all park
-    /// in time. The quiesce is then released already, and the caller must not
-    /// call [`resume`](Self::resume).
+    /// in time, or when the VM stopped during the wait. The quiesce is then
+    /// released already, and the caller must not call [`resume`](Self::resume).
     pub(crate) fn pause(&self) -> bool {
         self.quiesce.request();
         self.kicker.kick_all();
         // Read as each vCPU parks, since one that started after a single read
-        // would park in place of one still in the guest.
-        let others = || self.started.load(Ordering::SeqCst).saturating_sub(1);
-        if self.quiesce.wait_for_with(others) {
+        // would park in place of one still in the guest. A stopped VM needs no
+        // more vCPUs to park, since a vCPU that has left its loop never parks.
+        // The stop releases the quiesce, which wakes the wait.
+        let others = || {
+            if self.is_running() {
+                self.started.load(Ordering::SeqCst).saturating_sub(1)
+            } else {
+                0
+            }
+        };
+        if self.quiesce.wait_for_with(others) && self.is_running() {
             true
         } else {
             self.quiesce.release();
@@ -480,6 +488,29 @@ mod tests {
         assert!(!vcpus.pause(), "the pause returned while a vCPU ran");
         vcpus.stop();
         assert!(exits(&late));
+    }
+
+    // A started vCPU that leaves its loop during the wait never parks.
+    #[test]
+    fn pause_ends_when_the_vm_stops_during_the_wait() {
+        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        vcpus.mark_started();
+        vcpus.mark_started();
+        let stopper = {
+            let vcpus = Arc::clone(&vcpus);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                vcpus.stop();
+            })
+        };
+        let start = Instant::now();
+        assert!(!vcpus.pause(), "the pause succeeded on a stopped VM");
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "the pause waited {:?} after the stop",
+            start.elapsed()
+        );
+        stopper.join().unwrap();
     }
 
     #[test]
