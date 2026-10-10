@@ -38,7 +38,8 @@ What the ledger is not:
   not of wall time. Events emitted just before a guest goes quiet stay in the
   buffer until something else is emitted or the emitter is dropped. A killed VMM
   loses the tail. A guest that stops on its own does not: `boot` flushes the
-  ledger before it returns.
+  ledger before it returns. A thread left running at the stop can hold the
+  ledger, and that run then ends without its tail.
 - **Not tamper-proof.** It is an ordinary file written by the VMM process.
   Nothing signs, chains or seals it.
 - **Not monotonic.** `ts` is host wall-clock nanoseconds. It can move

@@ -34,7 +34,8 @@
 //! So take the lock and carry on. The panic that poisoned it is reported where
 //! it happened.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 /// Locks `m`, taking the guard even if the previous holder panicked.
 ///
@@ -44,6 +45,24 @@ pub fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Locks `m` if it is free by `deadline`, taking the guard even if the previous
+/// holder panicked.
+///
+/// Returns `None` when the lock is still held at `deadline`. It tries the lock
+/// each millisecond until then.
+pub fn try_lock_until<T>(m: &Mutex<T>, deadline: Instant) -> Option<MutexGuard<'_, T>> {
+    loop {
+        match m.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TryLockError::WouldBlock) => return None,
+        }
     }
 }
 
@@ -70,6 +89,17 @@ mod tests {
         assert_eq!(*lock_or_recover(&m), 7, "the write before the panic stands");
         *lock_or_recover(&m) += 1;
         assert_eq!(*lock_or_recover(&m), 8, "and the lock still works after");
+    }
+
+    #[test]
+    fn lock_held_past_the_deadline_is_not_taken() {
+        let m = Mutex::new(0u32);
+        let guard = m.lock().unwrap();
+        let start = Instant::now();
+        assert!(try_lock_until(&m, start + Duration::from_millis(20)).is_none());
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        drop(guard);
+        assert!(try_lock_until(&m, Instant::now()).is_some());
     }
 
     /// An unpoisoned lock behaves exactly like `lock().unwrap()`.

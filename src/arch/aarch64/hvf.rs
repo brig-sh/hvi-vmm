@@ -55,6 +55,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
+use crate::hypervisor::run::{run_to_stop, Waker};
 use crate::hypervisor::vcpus::{panic_message, Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -135,7 +136,7 @@ struct Kicker {
     /// The VM the vCPUs belong to.
     vm: VmGic,
     /// Each vCPU's handle indexed by vCPU id, `None` until its thread has
-    /// created the vCPU.
+    /// created the vCPU and again once its registration is dropped.
     handles: Mutex<Vec<Option<VcpuHandle>>>,
     /// The `CPU_ON` mailboxes of the secondaries.
     secondaries: Vec<Secondary>,
@@ -154,11 +155,32 @@ impl Kicker {
     /// Registers `vcpu`, which the calling thread created, as vCPU `cpu`.
     ///
     /// It also records the vCPU as the calling thread's own, so a kick from
-    /// this thread leaves it out.
-    fn register(&self, cpu: u32, vcpu: &Vcpu) {
+    /// this thread leaves it out. The returned guard removes the entry when
+    /// dropped, and must drop before the vCPU does.
+    fn register(&self, cpu: u32, vcpu: &Vcpu) -> Registration<'_> {
         OWN_VCPU.with(|own| own.set(Some(vcpu.id())));
         if let Some(slot) = lock_or_recover(&self.handles).get_mut(cpu as usize) {
             *slot = Some(vcpu.get_handle());
+        }
+        Registration { kicker: self, cpu }
+    }
+}
+
+/// A vCPU's entry in a [`Kicker`], removed when dropped.
+///
+/// A kick sends `hv_vcpus_exit` one list of handles, so a handle to a destroyed
+/// vCPU in the table would fail the kick of every other vCPU in the list.
+struct Registration<'a> {
+    /// The table the entry is in.
+    kicker: &'a Kicker,
+    /// The vCPU id of the entry.
+    cpu: u32,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = lock_or_recover(&self.kicker.handles).get_mut(self.cpu as usize) {
+            *slot = None;
         }
     }
 }
@@ -176,9 +198,11 @@ impl Kick for Kicker {
     fn kick_all(&self) {
         // A cancel a vCPU sends itself stays pending and ends its next run
         // before the guest ran, so a plugin that kicked from `safepoint` would
-        // run again at once.
+        // run again at once. The table stays locked through the kick, so no
+        // vCPU in the list is destroyed before it.
         let own = OWN_VCPU.with(std::cell::Cell::get);
-        let others: Vec<VcpuHandle> = lock_or_recover(&self.handles)
+        let handles = lock_or_recover(&self.handles);
+        let others: Vec<VcpuHandle> = handles
             .iter()
             .flatten()
             .filter(|handle| Some(handle.id()) != own)
@@ -292,9 +316,10 @@ struct Shared {
 /// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
-/// returns an error naming the one that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
-/// plugin kept, in a field or on a thread it started from `attach`.
+/// returns an error naming the first that did not stop within
+/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread.
+/// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
+/// thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
@@ -555,7 +580,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             block: virtio,
             net,
             vsock,
-            vcpus: Arc::new(Vcpus::new(num_cpus, kicker)),
+            vcpus: Arc::new(Vcpus::new(num_cpus, kicker, Arc::new(Waker::new()?))),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         fs,
@@ -652,25 +677,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .guest
         .vcpus
         .spawn((0..num_cpus).map(|_| shared.clone()), run_cpu);
-    let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
-    threads.join();
-    let outcome = shared.guest.vcpus.outcome();
-    if let Outcome::Failed(text) = &outcome {
-        // A spawn failure above is the one returned, so the vCPU's failure is
-        // printed.
-        if failure.is_some() {
-            stderrln!("{LOG_PREFIX} {text}");
-        } else {
-            failure = Some(text.clone().into());
-        }
-    }
-
-    // The guest has stopped. End the I/O threads (see `teardown`) and write out
-    // the ledger tail, which the flush cadence alone would leave in the buffer.
-    if let Err(e) = io_threads.stop() {
-        failure.get_or_insert(e.into());
-    }
-    lock_or_recover(&shared.guest.ledger).flush();
+    let failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
+    let result = run_to_stop(&shared.guest, threads, failure, io_threads);
 
     // What the guest actually spent, reported once on the way out. #34 asks
     // for this number before any limit is tightened: a ceiling picked without
@@ -679,10 +687,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         report_fs_usage(index, &fs.dev);
     }
 
-    if let Some(e) = failure {
-        return Err(e);
-    }
-    outcome.into_result()
+    result
 }
 
 /// Prints the peak handle count, the operation counts and times, and the
@@ -696,13 +701,13 @@ fn report_fs_usage(index: usize, dev: &Mutex<VirtioFs>) {
         Ok(dev) => dev,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => {
-            eprintln!(
+            stderrln!(
                 "{LOG_PREFIX} virtio-fs[{index}]: statistics skipped, the device is still in use"
             );
             return;
         }
     };
-    eprintln!(
+    stderrln!(
         "{LOG_PREFIX} virtio-fs[{index}]: peak {} of {} guest handles",
         dev.peak_handles(),
         dev.handle_limit()
@@ -720,9 +725,9 @@ fn report_fs_usage(index: usize, dev: &Mutex<VirtioFs>) {
             )
         })
         .collect();
-    eprintln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
+    stderrln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
     let (hits, waits, misses) = dev.readahead_stats();
-    eprintln!(
+    stderrln!(
         "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
     );
 }
@@ -751,26 +756,18 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let vcpu = match sh.vm.vcpu_create() {
         Ok(v) => v,
         Err(e) => {
-            // The secondaries would otherwise wait for a CPU_ON that cannot
-            // arrive, and the join in `boot` with them.
             sh.guest.vcpus.report(Outcome::Failed(format!(
                 "vcpu{cpu_id}: vcpu_create failed: {e:?}"
             )));
-            sh.guest.vcpus.stop();
             return;
         }
     };
-    // Held for the rest of the run, so every way out ends the VM. A secondary
-    // that ended alone would otherwise leave the VM running with one vCPU fewer
-    // and the join in `boot` blocked. Declared after the vCPU so it drops
-    // first: the VM is stopped while this vCPU still exists, and its
-    // destruction is outside the stop.
-    let _stop = sh.guest.vcpus.stop_on_drop();
     let _ = vcpu.set_trap_debug_exceptions(false);
     let _ = vcpu.set_trap_debug_reg_accesses(false);
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
-    sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
+    // Declared after the vCPU, so it drops first.
+    let _registration = sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
 
     if cpu_id == 0 {
         let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
@@ -801,8 +798,8 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
 
     let is_boot = cpu_id == 0;
     // The loop runs inside `catch_unwind` only for the report. A panic is
-    // reported with where the guest was and what it last did, and the guard
-    // ends the VM on the way out.
+    // reported with where the guest was and what it last did, and the thread
+    // then reports its exit like any other.
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         while sh.guest.vcpus.is_running() {
             // Safe point for every vCPU: park here while vcpu0 lets a plugin
@@ -1156,18 +1153,18 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// take the device mutex, or seen by the next `park()`. The mutex is held only
 /// for the drain, never across `park()`.
 ///
-/// [`FsWake::stop`], which runs once the vCPUs have exited, ends the loop at
-/// the next `park`. The worker then drains the chains announced by a wake that
-/// arrived with the stop.
+/// [`FsWake::stop`], which runs once the vCPUs have exited or been left
+/// running, ends the loop at the next `park`. The worker then drains the chains
+/// announced by a wake that arrived with the stop.
 fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake) {
     while wake.park() {
         lock_or_recover(dev).drain_notified(mem);
     }
     // A wake that arrived with the stop was cleared by that last `park`, and
-    // the chains it announced are still in the ring. `stop` runs only after
-    // every vCPU has been joined, so no further wake can come and nothing else
-    // touches the device. One unbounded pass drains every remaining chain. No
-    // vCPU is left to take the interrupt, so the line kicks none.
+    // the chains it announced are still in the ring, so one unbounded pass
+    // drains them. A vCPU left running at its join deadline that is still in
+    // `service_fs` can leave chains past its inline budget after this pass,
+    // with no worker to serve them. Only a run that already fails does that.
     lock_or_recover(dev).drain_notified(mem);
 }
 

@@ -58,7 +58,7 @@ flowchart TB
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable"]
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugin::builtin · events ledger"]
-            vm["hypervisor: vcpus / guest / kvm / quiesce"]
+            vm["hypervisor: vcpus / guest / kvm / run / quiesce"]
             rt["io_threads · signal<br/>terminal: filter / raw / input"]
             conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
             gm["memory: GuestRam over vm-memory<br/>SharedRam: memfd / POSIX shm"]
@@ -368,15 +368,20 @@ not brought up waits inside `KVM_RUN`, where a kick reaches it. On macOS a
 secondary the guest has not brought up waits for `CPU_ON` outside the hypervisor
 and is not waited for.
 
-On every backend, every path that ends a vCPU's run loop ends the VM through
-`Vcpus::stop` in `hypervisor/vcpus.rs`, which clears the running flag, kicks the
-vCPUs out of the hypervisor, and then releases the quiesce so no vCPU stays
-parked. A guard held by the vCPU thread calls it when the thread exits, whatever
-ended the loop: a guest-requested stop, a failed entry, an unhandled exit, a
-failed run, or a panic. Each of these is reported to `Vcpus` as the run's
-outcome. `boot` returns the guest's `Stop`, or an error that names the vCPU and
-the failure. The first report is kept, except that a failure replaces an earlier
-stop. A failure that is not kept is printed. The kick is the backend's:
+On every backend, the thread that called `boot` owns the stop. Once the vCPU
+threads are spawned it waits in `hypervisor/run.rs` on a pipe. A guard held by
+each vCPU thread writes it when the thread exits, whatever ended the loop: a
+guest-requested stop, a failed entry, an unhandled exit, a failed run, or a
+panic. Each of these is reported to `Vcpus` as the run's outcome. `boot` returns
+the guest's `Stop`, or an error that names the vCPU and the failure. The first
+report is kept, except that a failure replaces an earlier stop. A failure that is
+not kept is printed.
+
+The loop then ends the VM through `Vcpus::stop` in `hypervisor/vcpus.rs`, which
+clears the running flag, kicks the vCPUs out of the hypervisor, and then
+releases the quiesce so no vCPU stays parked. It joins the vCPU threads and then
+the I/O threads, each within one second, and leaves a thread still running at
+its deadline and names it in the error. The kick is the backend's:
 `hypervisor/kvm.rs` holds the one the two KVM backends share, and the macOS
 backend kicks with `hv_vcpus_exit`. The vCPU threads are named `vcpu0`, `vcpu1`
 and so on, so the panic hook's report says which vCPU panicked. A panic that
@@ -430,7 +435,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `hypervisor/run.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

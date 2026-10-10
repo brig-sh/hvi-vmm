@@ -38,7 +38,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | The node table has no cap. | `FORGET` is what shrinks it between device resets. A guest that never sends one grows the table until it resets the device. Guest-driven, unbounded. See [#34](https://github.com/brig-sh/hvi-vmm/issues/34). | Defect |
-| `SETLKW` blocks under the device mutex. | A guest waiting on a lock stalls that whole device, and any vCPU that accesses the device while it waits. That includes the vCPU that issued the request when the queue was shallow enough to drain inline. `boot` waits for the vCPUs with no deadline, so it does not return until the lock is released. See [#32](https://github.com/brig-sh/hvi-vmm/issues/32). | Defect |
+| `SETLKW` blocks under the device mutex. | A guest waiting on a lock stalls that whole device, and any vCPU that accesses the device while it waits. That includes the vCPU that issued the request when the queue was shallow enough to drain inline. `boot` waits one second for the vCPUs once the run stops, then finishes the teardown and returns an error naming a stalled one, which keeps running. See [#32](https://github.com/brig-sh/hvi-vmm/issues/32). | Defect |
 | The handle budget is per export, the descriptor table is per process. | Each export refuses `OPEN`/`OPENDIR` past its own budget with `ENFILE`. `CREATE`, `TMPFILE` and cached directory descriptors are not counted, so several busy exports can still exhaust the table. | Defect |
 | The open file limit is raised when the first share is set up. | A boot with no share never raises it and never logs the line. macOS only. | Design |
 | A node keeps at most 16 alias paths. | A file with more than 16 hard links inside a share can lose a name from the table. | Design |
@@ -60,7 +60,7 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| The ledger is not lossless. | It drains when a new event arrives more than 100 ms after the last drain. Events before a quiet period stay buffered. A killed VMM loses the tail; a guest that stops on its own does not, because `boot` flushes before it returns. | Design |
+| The ledger is not lossless. | It drains when a new event arrives more than 100 ms after the last drain. Events before a quiet period stay buffered. A killed VMM loses the tail; a guest that stops on its own does not, because `boot` flushes before it returns, unless a thread left running at the stop holds the ledger. | Design |
 | The ledger is not tamper-proof. | An ordinary file written by the VMM. Nothing signs or chains it. | Design |
 | `net` records are per packet and egress only. | No flow aggregation. `direction` and `guest_initiated` are constants, not observations. Inbound frames produce no record. | Design |
 | `ts` is host wall-clock. | It is not monotonic and can move backwards. | Design |

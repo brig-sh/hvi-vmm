@@ -33,6 +33,7 @@ use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Cpu, Guest};
+use crate::hypervisor::run::run_to_stop;
 use crate::hypervisor::vcpus::{Kick, Outcome};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::plugin::{Plugin, VmHandle};
@@ -211,15 +212,15 @@ pub(crate) fn start_io_threads(
 ///
 /// Each vCPU thread runs `run` with its id, its vCPU, its kick handle and a
 /// clone of `shared`. Once they exist the calling thread installs its own
-/// filter, and once they have exited it stops `io_threads` and writes out the
-/// ledger tail. The terminal stays in raw mode until this returns.
+/// filter, and then waits for the stop in [`run_to_stop`], which also stops
+/// `io_threads`. The terminal stays in raw mode until this returns.
 ///
 /// # Errors
 ///
 /// Errors if a vCPU thread cannot be spawned, the calling thread cannot be
-/// filtered, a vCPU fails or an I/O thread does not stop. Each failure stops
-/// the guest, and the first one is returned once every thread has been joined
-/// or left running.
+/// filtered, a vCPU fails or a thread does not stop. Each failure stops the
+/// guest, and the error is chosen as [`run_to_stop`] describes, once every
+/// thread has been joined or left running.
 pub(crate) fn run_guest<S: Clone + Send + 'static>(
     guest: &Guest<Kicker>,
     shared: &S,
@@ -247,35 +248,9 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
         // one returned.
         eprintln!("{LOG_PREFIX} {e}");
         failure.get_or_insert(e.into());
-        guest.vcpus.stop();
     }
 
-    threads.join();
-    let outcome = guest.vcpus.outcome();
-    if let Outcome::Failed(text) = &outcome {
-        // A spawn or filter failure above is the one returned, so the vCPU's
-        // failure is printed.
-        if failure.is_some() {
-            stderrln!("{LOG_PREFIX} {text}");
-        } else {
-            failure = Some(text.clone().into());
-        }
-    }
-
-    // The guest has stopped. End the I/O threads (see `teardown`) and write out
-    // the ledger tail, which the flush cadence alone would leave in the buffer.
-    // A thread left running is named in the error, after any failure.
-    if let Err(e) = io_threads.stop() {
-        failure = Some(match failure {
-            Some(failure) => format!("{failure}, and {e}").into(),
-            None => e.into(),
-        });
-    }
-    lock_or_recover(&guest.ledger).flush();
-    if let Some(e) = failure {
-        return Err(e);
-    }
-    outcome.into_result()
+    run_to_stop(guest, threads, failure, io_threads)
 }
 
 /// Runs vCPU `cpu` on the calling thread until the VM stops.
@@ -287,8 +262,8 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 /// stop, and an entry failure, an internal error and a `KVM_RUN` error are
 /// failures. Every other exit goes to `handle_exit`, which services it and
 /// returns `ControlFlow::Break` with the run's outcome to end the loop. A run a
-/// kick cut short reaches it as [`VcpuExit::Intr`]. Every way out of the loop
-/// ends the VM, a panic included.
+/// kick cut short reaches it as [`VcpuExit::Intr`]. A break reports its outcome
+/// through [`Vcpus::report`](crate::hypervisor::vcpus::Vcpus::report).
 pub(crate) fn run_vcpu(
     cpu: u32,
     mut vcpu: VcpuFd,
@@ -301,12 +276,8 @@ pub(crate) fn run_vcpu(
     // controls. MMIO exits are serviced on this thread, so the virtio device
     // models, which parse guest descriptors, run under it.
     seccomp::install_thread(seccomp::Thread::Vcpu);
-    // The guard lives for the whole run, so every way out ends the VM. A
-    // secondary that ended alone would leave the VM running with one vCPU fewer
-    // and the join in `run_guest` blocked. It is declared before the
-    // registration, so the registration drops first and the entry is gone
-    // before the stop kicks.
-    let _stop = guest.vcpus.stop_on_drop();
+    // The registration drops when the loop ends, before the thread reports its
+    // exit, so the entry is gone before the stop kicks.
     let _registration = guest.vcpus.kicker().register(cpu, kick_handle);
     // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
     // yet waits inside the run, where a kick reaches it.
@@ -504,11 +475,12 @@ mod stop_tests {
 
     // The boot vCPU's plugin panics before the first guest entry, while the
     // secondary is in `KVM_RUN` or on its way there. `boot` returns only if the
-    // panicking thread ends the VM on its way out; a secondary left running
-    // keeps the join in `run_guest` blocked, so the bound is the assertion.
-    // `boot` returns the panic as the failure. Ignored by default: it needs a
-    // usable `/dev/kvm`, and `boot` takes the terminal into raw mode and reads
-    // stdin for the guest, so it runs on its own, by name, with `--ignored`.
+    // panicking thread's exit wakes the loop that ends the VM, and it returns
+    // the panic as the failure. A secondary the stop does not reach is left
+    // running and named in the error, so the exact error is the check that the
+    // stop reached it. Ignored by default: it needs a usable `/dev/kvm`, and
+    // `boot` takes the terminal into raw mode and reads stdin for the guest, so
+    // it runs on its own, by name, with `--ignored`.
     #[test]
     #[ignore]
     fn plugin_panic_on_the_boot_vcpu_ends_the_vm() {
@@ -534,11 +506,12 @@ mod stop_tests {
     }
 
     // A secondary's `KVM_RUN` fails while the boot vCPU is in a guest that
-    // never exits, so `boot` returns only if the secondary's exit ends the VM,
-    // and it returns the failed run as the failure. The test causes the failure
-    // from outside the VMM: it replaces the secondary's vCPU descriptor with
-    // `/dev/null`, which refuses the next `KVM_RUN`. Ignored by default, as the
-    // test above is.
+    // never exits, so `boot` returns only if the secondary's exit wakes the
+    // loop that ends the VM, and it returns the failed run as the failure, with
+    // no vCPU named as left running. The test causes the failure from outside
+    // the VMM: it replaces the secondary's vCPU descriptor with `/dev/null`,
+    // which refuses the next `KVM_RUN`. Ignored by default, as the test above
+    // is.
     #[test]
     #[ignore]
     fn failed_run_on_a_secondary_ends_the_vm() {
@@ -584,6 +557,7 @@ mod stop_tests {
         };
         let error = outcome.expect_err("boot reported a stop for a failed run");
         assert!(error.starts_with("vcpu1: KVM_RUN error"), "{error}");
+        assert!(!error.contains("did not stop"), "{error}");
     }
 
     // Ignored by default, as it needs a usable `/dev/kvm`.

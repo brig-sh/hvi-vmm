@@ -61,6 +61,7 @@ use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
+use crate::hypervisor::run::Waker;
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
@@ -121,9 +122,10 @@ struct Shared {
 /// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
-/// returns an error naming the one that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
-/// plugin kept, in a field or on a thread it started from `attach`.
+/// returns an error naming the first that did not stop within
+/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread.
+/// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
+/// thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if !cfg.fs_shares.is_empty() {
         return Err(
@@ -335,7 +337,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             block: virtio,
             net,
             vsock,
-            vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
+            vcpus: Arc::new(Vcpus::new(
+                num_cpus,
+                Kicker::new(num_cpus),
+                Arc::new(Waker::new()?),
+            )),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         plugin: cfg.plugin.clone(),

@@ -18,8 +18,8 @@
 //! host: the console reader, the agent bridge, and the relay from a gateway or
 //! a tap. Each polls a stop token beside its own descriptor. A backend starts
 //! the threads only it has with [`IoThreads::spawn`]. Once the vCPUs have
-//! exited, [`IoThreads::stop`] requests the stop and joins every thread, as
-//! `teardown` describes.
+//! exited or been left running, [`IoThreads::stop`] requests the stop and joins
+//! every thread, as `teardown` describes.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -165,11 +165,27 @@ impl IoThreads {
         let mut failure = None;
         for thread in std::iter::once(self.console).chain(self.threads) {
             if let Err(e) = join_by(thread, deadline) {
-                eprintln!("{LOG_PREFIX} {e}; left running");
+                stderrln!("{LOG_PREFIX} {e}; left running");
                 failure.get_or_insert(e);
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+impl IoThreads {
+    /// Returns the I/O threads of a run with no devices, whose console reader
+    /// returns at once.
+    pub(crate) fn idle() -> Self {
+        let source = StopSource::new().expect("stop pair");
+        let console = spawn_thread("console reader", source.token(), |_| {});
+        Self {
+            source,
+            console,
+            threads: Vec::new(),
+            stop_actions: Vec::new(),
+        }
     }
 }
 
