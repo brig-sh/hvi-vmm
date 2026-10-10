@@ -723,17 +723,12 @@ impl Readahead {
         }
     }
 
-    /// Starts the worker threads and returns their handles.
-    ///
-    /// A thread that fails to start is left out, and the rest serve alone.
-    fn start(&self) -> Vec<std::thread::JoinHandle<()>> {
+    /// Returns what each worker thread runs.
+    fn workers(&self) -> Vec<impl FnOnce() + Send + 'static> {
         (0..READAHEAD_WORKERS)
-            .filter_map(|_| {
+            .map(|_| {
                 let state = Arc::clone(&self.state);
-                std::thread::Builder::new()
-                    .name("virtio-fs-readahead".into())
-                    .spawn(move || Self::worker(&state))
-                    .ok()
+                move || Self::worker(&state)
             })
             .collect()
     }
@@ -1435,17 +1430,17 @@ impl VirtioFs {
         }
     }
 
-    /// Starts the readahead workers and returns their handles, none under
-    /// `cache=none`, which never serves a prepared listing, and the handle
-    /// that stops them.
+    /// Returns what each readahead worker thread runs and the handle that stops
+    /// them.
     ///
-    /// The workers read the shared tree, so the hypervisor backend starts them
-    /// after it confines the process and joins them with its other helper
-    /// threads. Until then a READDIRPLUS finds nothing prepared and reads the
-    /// host.
-    pub fn start_readahead(&self) -> (Vec<std::thread::JoinHandle<()>>, ReadaheadStop) {
+    /// There are no workers under `cache=none`, which never serves a prepared
+    /// listing. The workers read the shared tree, so the hypervisor backend
+    /// starts them after it confines the process and joins them with its other
+    /// helper threads. Until then a READDIRPLUS finds nothing prepared and
+    /// reads the host.
+    pub fn readahead_workers(&self) -> (Vec<impl FnOnce() + Send + 'static>, ReadaheadStop) {
         let workers = if self.readahead_enabled() {
-            self.readahead.start()
+            self.readahead.workers()
         } else {
             Vec::new()
         };
@@ -7948,7 +7943,8 @@ mod tests {
         let (dir, dev) = fixture_with_access(true);
         let root = fs::canonicalize(&dir).unwrap();
         fs::create_dir_all(root.join("sub/inner")).unwrap();
-        let (workers, stop) = dev.start_readahead();
+        let (workers, stop) = dev.readahead_workers();
+        let workers: Vec<_> = workers.into_iter().map(std::thread::spawn).collect();
         dev.readahead.request(
             root.join("sub"),
             Arc::new(dup_cloexec(dev.dirs.root_fd()).unwrap()),
@@ -8019,11 +8015,12 @@ mod tests {
     #[test]
     fn readahead_workers_exit_through_the_stop_handle() {
         let (dir, dev) = fixture_with_cache(true, CachePolicy::None);
-        assert!(dev.start_readahead().0.is_empty());
+        assert!(dev.readahead_workers().0.is_empty());
         let _ = fs::remove_dir_all(dir);
 
         let (dir, dev) = fixture_with_access(true);
-        let (workers, stop) = dev.start_readahead();
+        let (workers, stop) = dev.readahead_workers();
+        let workers: Vec<_> = workers.into_iter().map(std::thread::spawn).collect();
         assert_eq!(workers.len(), READAHEAD_WORKERS);
         stop.stop();
         for worker in workers {
@@ -12730,7 +12727,7 @@ mod tests {
 
     // A `QUEUE_NOTIFY` runs no request. It records the queue index for a drain,
     // which runs on a vCPU up to a budget and on the worker thread past it
-    // (`spawn_fs_worker` in `arch/aarch64/hvf.rs`). The tests below cover what
+    // (`run_fs_worker` in `arch/aarch64/hvf.rs`). The tests below cover what
     // this module can check without a live VM: `mmio` does no I/O, a bounded
     // drain strands nothing, and the notified bitmask is race-free under
     // concurrent access.

@@ -29,7 +29,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 
 use applevisor::prelude::{
     ExitReason, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
@@ -198,7 +197,7 @@ impl Kick for Kicker {
 }
 
 /// One tagged virtio-fs export, its dynamically assigned transport slot, and
-/// the wake signal its dedicated worker thread (`spawn_fs_worker`) parks on.
+/// the wake signal its dedicated worker thread (`run_fs_worker`) parks on.
 #[derive(Clone)]
 struct SharedFs {
     base: u64,
@@ -213,7 +212,7 @@ struct SharedFs {
 /// `service_fs` calls [`FsWake::wake`] when its inline drain leaves work. The
 /// worker's [`FsWake::park`] checks a predicate under a `Condvar`, so a wake
 /// that lands between the worker's last drain and its park is seen rather than
-/// lost. `spawn_fs_worker` has the full argument.
+/// lost. `run_fs_worker` has the full argument.
 struct FsWake {
     state: Mutex<FsWakeState>,
     ready: Condvar,
@@ -608,9 +607,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         );
     }
 
-    // I/O threads. Each polls its stop token beside its own descriptor, or
-    // takes the stop through its `FsWake` or `ReadaheadStop`, and is joined
-    // after the vCPUs.
+    // The I/O threads, which are joined after the vCPUs. `teardown` describes
+    // the stop.
     install_kick_handler();
     let mut io_threads = IoThreads::start(
         stop_source,
@@ -623,23 +621,24 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         bridge,
         net_reader.map(NetSource::Gateway),
     );
-    let mut readahead_stops = Vec::new();
     // Each virtio-fs device gets its own worker thread, which serves the
-    // requests a vCPU leaves past `FS_INLINE_BUDGET`. See `spawn_fs_worker`.
+    // requests a vCPU leaves past `FS_INLINE_BUDGET`. See `run_fs_worker`.
     for fs in &shared.fs {
-        io_threads.push(
-            "virtio-fs worker",
-            spawn_fs_worker(
-                Arc::clone(&fs.dev),
-                Arc::clone(&shared.guest.ram),
-                Arc::clone(&fs.wake),
-            ),
+        let (dev, ram, wake) = (
+            Arc::clone(&fs.dev),
+            Arc::clone(&shared.guest.ram),
+            Arc::clone(&fs.wake),
         );
-        let (workers, stop) = lock_or_recover(&fs.dev).start_readahead();
+        io_threads.spawn("virtio-fs worker", move |_| {
+            run_fs_worker(&dev, &ram, &wake);
+        });
+        let wake = Arc::clone(&fs.wake);
+        io_threads.on_stop(move || wake.stop());
+        let (workers, stop) = lock_or_recover(&fs.dev).readahead_workers();
         for worker in workers {
-            io_threads.push("virtio-fs readahead", worker);
+            io_threads.spawn("virtio-fs readahead", move |_| worker());
         }
-        readahead_stops.push(stop);
+        io_threads.on_stop(move || stop.stop());
     }
 
     // One thread per vCPU. From here on a failure stops the guest and is
@@ -654,14 +653,6 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // The guest has stopped. End the I/O threads (see `teardown`) and write out
     // the ledger tail, which the flush cadence alone would leave in the buffer.
-    // The virtio-fs threads wait on no descriptor, so each gets its own stop
-    // first.
-    for fs in &shared.fs {
-        fs.wake.stop();
-    }
-    for stop in &readahead_stops {
-        stop.stop();
-    }
     if let Err(e) = io_threads.stop() {
         failure.get_or_insert(e.into());
     }
@@ -1082,7 +1073,7 @@ fn service_vsock(
 /// Every register is served here under the device mutex, as for the other
 /// virtio devices. A `QUEUE_NOTIFY` write only records the queue index in
 /// `mmio`, so this then serves a shallow queue at once and wakes the device's
-/// worker thread, `spawn_fs_worker`, for the rest.
+/// worker thread, `run_fs_worker`, for the rest.
 ///
 /// The device sets its line in `mmio` and at the end of every drain. Both run
 /// under the device mutex, so the line follows the last change to the interrupt
@@ -1119,7 +1110,8 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
     }
 }
 
-/// Runs a virtio-fs device's FUSE servicing on a thread of its own.
+/// Runs a virtio-fs device's FUSE servicing on the calling thread, the device's
+/// worker thread.
 ///
 /// `service_fs` serves a shallow queue on the vCPU and wakes this thread for
 /// the rest, which makes every host syscall those requests need. A deep queue
@@ -1137,26 +1129,19 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// take the device mutex, or seen by the next `park()`. The mutex is held only
 /// for the drain, never across `park()`.
 ///
-/// `boot` calls [`FsWake::stop`] once the vCPUs have exited, and the worker
-/// leaves its loop at the next `park`. It then drains the chains announced by a
-/// wake that arrived with the stop.
-fn spawn_fs_worker(
-    dev: Arc<Mutex<VirtioFs>>,
-    mem: Arc<GuestRam>,
-    wake: Arc<FsWake>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        while wake.park() {
-            lock_or_recover(&dev).drain_notified(&mem);
-        }
-        // A wake that arrived with the stop was cleared by that last `park`,
-        // and the chains it announced are still in the ring. `stop` runs only
-        // after every vCPU has been joined, so no further wake can come and
-        // nothing else touches the device. One unbounded pass drains every
-        // remaining chain. No vCPU is left to take the interrupt, so the line
-        // kicks none.
-        lock_or_recover(&dev).drain_notified(&mem);
-    })
+/// [`FsWake::stop`], which runs once the vCPUs have exited, ends the loop at
+/// the next `park`. The worker then drains the chains announced by a wake that
+/// arrived with the stop.
+fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake) {
+    while wake.park() {
+        lock_or_recover(dev).drain_notified(mem);
+    }
+    // A wake that arrived with the stop was cleared by that last `park`, and
+    // the chains it announced are still in the ring. `stop` runs only after
+    // every vCPU has been joined, so no further wake can come and nothing else
+    // touches the device. One unbounded pass drains every remaining chain. No
+    // vCPU is left to take the interrupt, so the line kicks none.
+    lock_or_recover(dev).drain_notified(mem);
 }
 
 /// Zero-extension mask for a load of `width` bytes.
