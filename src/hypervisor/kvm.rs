@@ -21,11 +21,13 @@
 //! `kvm_run.immediate_exit` byte, which makes the next `KVM_RUN` return `EINTR`
 //! at once, and then sends the signal for a run already in progress.
 
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kvm_ioctls::{VcpuFd, VmFd};
+use kvm_bindings::{KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET};
+use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
@@ -75,6 +77,18 @@ impl Kicker {
             *slot = Some(thread);
         }
         Registration { kicker: self, cpu }
+    }
+
+    /// Runs `inspect` on the second handle to vCPU `cpu`, if its thread is
+    /// registered.
+    ///
+    /// The handle is a descriptor of the same vCPU, so a register read through
+    /// it needs no borrow of the handle the vCPU thread runs.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn with_vcpu(&self, cpu: u32, inspect: impl FnOnce(&VcpuFd)) {
+        if let Some(Some(thread)) = lock_or_recover(&self.threads).get(cpu as usize) {
+            inspect(&thread.vcpu);
+        }
     }
 }
 
@@ -254,16 +268,19 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 ///
 /// Each pass clears the vCPU's `immediate_exit` byte, checks the running flag,
 /// parks at the quiesce checkpoint, lets `plugin` look at the guest from the
-/// boot vCPU, and then calls `run`. `run` enters the guest once, services the
-/// exit, and returns `false` to end the loop. Every way out of the loop ends
-/// the VM, a panic included.
+/// boot vCPU, and then enters the guest once. The exits both KVM backends treat
+/// the same are serviced here: a PSCI system event is how the guest asked to
+/// stop, and an entry failure, an internal error and a `KVM_RUN` error end the
+/// run. Every other exit goes to `handle_exit`, which services it and returns
+/// `ControlFlow::Break` to end the loop. A run a kick cut short reaches it as
+/// [`VcpuExit::Intr`]. Every way out of the loop ends the VM, a panic included.
 pub(crate) fn run_vcpu(
     cpu: u32,
     mut vcpu: VcpuFd,
     kick_handle: VcpuFd,
     guest: &Guest<Kicker>,
     plugin: Option<&dyn Plugin>,
-    mut run: impl FnMut(&mut VcpuFd) -> bool,
+    mut handle_exit: impl FnMut(VcpuExit<'_>) -> ControlFlow<()>,
 ) {
     // The vCPU filter goes in before this thread touches anything the guest
     // controls. MMIO exits are serviced on this thread, so the virtio device
@@ -299,10 +316,54 @@ pub(crate) fn run_vcpu(
                 plugin.safepoint(&Cpu { vcpu: &vcpu, guest });
             }
         }
-        if !run(&mut vcpu) {
+        let flow = match vcpu.run() {
+            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                // A run that a kick cut short has completed the MMIO exit
+                // before it and left `exit_reason` as it was. Linux 5.0 to 5.2
+                // on arm64 complete the exit again on the next run, and so do
+                // the stable series that took the same change back to 4.14.
+                // That skips one more guest instruction, so the reason is
+                // cleared here. x86 does not read the field when it enters the
+                // guest.
+                vcpu.get_kvm_run().exit_reason = KVM_EXIT_INTR;
+                handle_exit(VcpuExit::Intr)
+            }
+            // PSCI `SYSTEM_RESET` or `SYSTEM_OFF`. An x86 guest raises none.
+            Ok(VcpuExit::SystemEvent(event, _)) => {
+                let stop = if event == KVM_SYSTEM_EVENT_RESET {
+                    Stop::SystemReset
+                } else {
+                    Stop::SystemOff
+                };
+                guest.vcpus.set_stop_reason(stop);
+                ControlFlow::Break(())
+            }
+            Ok(VcpuExit::FailEntry(reason, entry_cpu)) => {
+                eprintln!(
+                    "{LOG_PREFIX} cpu{cpu}: KVM entry failed reason={reason:#x} cpu={entry_cpu}"
+                );
+                ControlFlow::Break(())
+            }
+            Ok(VcpuExit::InternalError) => {
+                eprintln!("{LOG_PREFIX} cpu{cpu}: KVM internal error");
+                ControlFlow::Break(())
+            }
+            Err(e) => {
+                eprintln!("{LOG_PREFIX} cpu{cpu}: KVM_RUN error: {e}");
+                ControlFlow::Break(())
+            }
+            Ok(exit) => handle_exit(exit),
+        };
+        if flow.is_break() {
             break;
         }
     }
+}
+
+/// Ends the run of vCPU `cpu` on an exit its backend does not service.
+pub(crate) fn unhandled_exit(cpu: u32, exit: &VcpuExit<'_>) -> ControlFlow<()> {
+    eprintln!("{LOG_PREFIX} cpu{cpu}: unhandled exit {exit:?}");
+    ControlFlow::Break(())
 }
 
 /// Returns the `kvm_run.immediate_exit` byte of `vcpu`.

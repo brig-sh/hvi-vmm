@@ -41,6 +41,7 @@
 // VMM's own.
 #![allow(clippy::disallowed_methods)]
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
@@ -63,7 +64,7 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
 use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
-    kick_handle, run_guest, run_vcpu, start_io_threads, Kicker, KvmIrqLine,
+    kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::NetSource;
@@ -464,9 +465,15 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         kick_handle,
         &sh.guest,
         sh.plugin.as_deref(),
-        |vcpu| {
-            match vcpu.run() {
-                Ok(VcpuExit::IoIn(port, data)) => {
+        |exit| {
+            // The trace reads registers through the vCPU's second handle, since
+            // the exit borrows the one the run uses.
+            let dump = |tag: &str| {
+                let kicker = sh.guest.vcpus.kicker();
+                kicker.with_vcpu(cpu_id, |vcpu| dump_regs(vcpu, &sh.guest.ram, cpu_id, tag));
+            };
+            match exit {
+                VcpuExit::IoIn(port, data) => {
                     if dbg && n_exit < 80 {
                         eprintln!("[trace] cpu{cpu_id} IoIn {port:#x}");
                         n_exit += 1;
@@ -475,7 +482,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                         *b = pio_read(&sh, port);
                     }
                 }
-                Ok(VcpuExit::IoOut(port, data)) => {
+                VcpuExit::IoOut(port, data) => {
                     if dbg && n_exit < 80 {
                         eprintln!(
                             "[trace] cpu{cpu_id} IoOut {port:#x} = {:02x?}",
@@ -487,7 +494,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                         pio_write(&sh, port, b);
                     }
                 }
-                Ok(VcpuExit::MmioRead(addr, data)) => {
+                VcpuExit::MmioRead(addr, data) => {
                     if dbg && n_exit < 80 {
                         eprintln!("[trace] cpu{cpu_id} MmioRead {addr:#x}");
                         n_exit += 1;
@@ -496,7 +503,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     let n = data.len().min(8);
                     data[..n].copy_from_slice(&val.to_le_bytes()[..n]);
                 }
-                Ok(VcpuExit::MmioWrite(addr, data)) => {
+                VcpuExit::MmioWrite(addr, data) => {
                     if dbg && n_exit < 80 {
                         eprintln!("[trace] cpu{cpu_id} MmioWrite {addr:#x}");
                         n_exit += 1;
@@ -506,39 +513,27 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     b[..n].copy_from_slice(&data[..n]);
                     mmio_write(&sh, addr, u64::from_le_bytes(b));
                 }
-                Ok(VcpuExit::Hlt) => {
+                VcpuExit::Hlt => {
                     if dbg {
                         eprintln!("[trace] cpu{cpu_id} HLT");
                     }
-                    return false;
+                    return ControlFlow::Break(());
                 }
-                Ok(VcpuExit::Shutdown) => {
+                VcpuExit::Shutdown => {
                     if dbg {
-                        dump_regs(vcpu, &sh.guest.ram, cpu_id, "SHUTDOWN");
+                        dump("SHUTDOWN");
                     }
                     sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
-                    return false;
+                    return ControlFlow::Break(());
                 }
-                Ok(VcpuExit::Intr) => {
+                VcpuExit::Intr => {
                     if dbg && cpu_id == 0 {
-                        dump_regs(vcpu, &sh.guest.ram, cpu_id, "kick");
+                        dump("kick");
                     }
                 }
-                Ok(other) => {
-                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
-                    return false;
-                }
-                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
-                    if dbg && cpu_id == 0 {
-                        dump_regs(vcpu, &sh.guest.ram, cpu_id, "kick(EINTR)");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
-                    return false;
-                }
+                other => return unhandled_exit(cpu_id, &other),
             }
-            true
+            ControlFlow::Continue(())
         },
     );
 }
