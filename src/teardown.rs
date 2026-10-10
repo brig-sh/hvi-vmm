@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shutdown of the host-side helper threads when the guest stops.
+//! Shutdown of the host-side helper threads when the run stops.
 //!
 //! `IoThreads` starts threads that block on host descriptors: the console, the
 //! agent listener and its connections, the gateway socket, the tap. Each polls
 //! its own descriptor beside a [`StopToken`]. `IoThreads::stop` requests the
 //! stop through its [`StopSource`] once the vCPU threads have exited, every
-//! poll returns, and it joins the threads before `boot` returns. Two helpers
-//! need more than the poll. The macOS virtio-fs worker waits on no descriptor;
-//! it parks on a condition variable and is stopped through it. The console
-//! reader reads stdin, which the whole process shares, so a byte another reader
-//! took between the poll and the read would leave it blocked; `IoThreads::stop`
-//! sends it the kick signal until it has exited, with `kick_until_finished`.
+//! poll returns, and it joins the threads before `boot` returns. Some helpers
+//! need more than the poll. A macOS virtio-fs device's worker and readahead
+//! workers wait on no descriptor; each parks on a condition variable, and a
+//! stop action that `IoThreads::stop` runs wakes it. The console reader reads
+//! stdin, which the whole process shares, so a byte another reader took between
+//! the poll and the read would leave it blocked; `IoThreads::stop` sends it the
+//! kick signal until it has exited, with `kick_until_finished`.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
 //! the deadline is left running and `boot` returns an error naming it, since a
@@ -59,10 +60,11 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// # Errors
 ///
-/// Errors when the thread has not exited by the deadline.
-pub fn join_by(name: &str, thread: JoinHandle<()>, deadline: Instant) -> io::Result<()> {
+/// Errors with the thread's name when it has not exited by the deadline.
+pub fn join_by(thread: JoinHandle<()>, deadline: Instant) -> io::Result<()> {
     while !thread.is_finished() {
         if Instant::now() >= deadline {
+            let name = thread.thread().name().unwrap_or("an I/O thread");
             return Err(io::Error::other(format!(
                 "{name} did not stop within {}s",
                 STOP_TIMEOUT.as_secs()

@@ -69,7 +69,6 @@ use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView};
-use crate::sandbox::confine_io_thread;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
 use crate::LOG_PREFIX;
@@ -353,23 +352,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if std::env::var_os("HVI_X86_TRACE").is_some() {
         let guest = Arc::clone(&shared.guest);
-        let watch = io_threads.token();
-        io_threads.push(
-            "trace watchdog",
-            std::thread::spawn(move || {
-                confine_io_thread();
-                for _ in 0..4 {
-                    match watch.sleep(std::time::Duration::from_secs(2)) {
-                        Ok(true) => guest.vcpus.kicker().kick(0),
-                        Ok(false) => break,
-                        Err(e) => {
-                            eprintln!("{LOG_PREFIX} trace watchdog: {e}; trace watchdog stopped");
-                            break;
-                        }
+        io_threads.spawn("trace watchdog", move |watch| {
+            for _ in 0..4 {
+                match watch.sleep(std::time::Duration::from_secs(2)) {
+                    Ok(true) => guest.vcpus.kicker().kick(0),
+                    Ok(false) => break,
+                    Err(e) => {
+                        eprintln!("{LOG_PREFIX} trace watchdog: {e}; trace watchdog stopped");
+                        break;
                     }
                 }
-            }),
-        );
+            }
+        });
     }
 
     run_guest(

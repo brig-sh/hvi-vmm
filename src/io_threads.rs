@@ -16,10 +16,10 @@
 //!
 //! [`IoThreads`] starts the threads that serve the guest's devices from the
 //! host: the console reader, the agent bridge, and the relay from a gateway or
-//! a tap. Each polls a stop token beside its own descriptor. A backend adds the
-//! threads only it has with [`IoThreads::push`]. Once the vCPUs have exited,
-//! [`IoThreads::stop`] requests the stop and joins every thread, as `teardown`
-//! describes.
+//! a tap. Each polls a stop token beside its own descriptor. A backend starts
+//! the threads only it has with [`IoThreads::spawn`]. Once the vCPUs have
+//! exited, [`IoThreads::stop`] requests the stop and joins every thread, as
+//! `teardown` describes.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -49,15 +49,19 @@ pub(crate) enum NetSource {
 
 /// The I/O threads of one VM and the stop that ends them.
 ///
-/// They serve the guest's devices from the host. A backend can add a thread of
-/// its own to the same stop, such as the x86 trace watchdog.
+/// They serve the guest's devices from the host. A backend can start a thread
+/// of its own under the same stop, such as the x86 trace watchdog. It can also
+/// add a stop action for a thread that waits on something other than a stop
+/// token.
 pub(crate) struct IoThreads {
     /// The stop the threads poll.
     source: StopSource,
     /// The console reader, which the stop also has to signal.
     console: JoinHandle<()>,
-    /// Every other thread, with the name a report of it uses.
-    threads: Vec<(&'static str, JoinHandle<()>)>,
+    /// Every other thread.
+    threads: Vec<JoinHandle<()>>,
+    /// The actions the stop runs before it joins the threads.
+    stop_actions: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl IoThreads {
@@ -76,92 +80,115 @@ impl IoThreads {
         net: Option<NetSource>,
     ) -> Self {
         let vcpus = Arc::clone(&guest.vcpus);
-        let console = terminal::input::spawn(
-            plugin,
-            source.token(),
-            move || vcpus.kicker().kick(0),
-            deliver,
-        );
+        let console = spawn_thread("console reader", source.token(), move |stop| {
+            terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
+        });
         let mut io_threads = Self {
             source,
             console,
             threads: Vec::new(),
+            stop_actions: Vec::new(),
         };
         if let Some(bridge) = bridge {
-            let stop = io_threads.token();
-            io_threads.push(
-                "agent bridge",
-                std::thread::spawn(move || {
-                    confine_io_thread();
-                    bridge.run(&stop);
-                }),
-            );
+            io_threads.spawn("agent bridge", move |stop| bridge.run(&stop));
         }
         if let (Some(net), Some(dev)) = (net, &guest.net) {
-            let (dev, ram, stop) = (Arc::clone(dev), Arc::clone(&guest.ram), io_threads.token());
+            let (dev, ram) = (Arc::clone(dev), Arc::clone(&guest.ram));
             let deliver = move |frame: &[u8]| lock_or_recover(&dev).deliver(&ram, frame);
-            let (name, relay) = match net {
-                NetSource::Gateway(stream) => (
-                    "gateway relay",
-                    std::thread::spawn(move || {
-                        confine_io_thread();
-                        if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
-                            eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
-                        }
-                    }),
-                ),
+            match net {
+                NetSource::Gateway(stream) => io_threads.spawn("gateway relay", move |stop| {
+                    if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
+                        eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
+                    }
+                }),
                 #[cfg(target_os = "linux")]
-                NetSource::Tap(file) => (
-                    "tap relay",
-                    std::thread::spawn(move || {
-                        confine_io_thread();
-                        if let Err(e) = TapRelay::new(file).run(&stop, deliver) {
-                            eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
-                        }
-                    }),
-                ),
-            };
-            io_threads.push(name, relay);
+                NetSource::Tap(file) => io_threads.spawn("tap relay", move |stop| {
+                    if let Err(e) = TapRelay::new(file).run(&stop, deliver) {
+                        eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
+                    }
+                }),
+            }
         }
         io_threads
     }
 
-    /// Returns a stop token for a thread the backend starts itself.
-    pub(crate) fn token(&self) -> StopToken {
-        self.source.token()
+    /// Starts a thread named `name` that runs `body` with a stop token, to be
+    /// joined with the others.
+    ///
+    /// [`stop`](Self::stop) only joins the thread, so `body` has to return on
+    /// its own: it watches the token, or an action added with
+    /// [`on_stop`](Self::on_stop) ends it.
+    ///
+    /// It has to be called from a thread with no seccomp filter, since naming
+    /// the new thread calls `prctl`, which neither allowlist has.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thread cannot be created.
+    pub(crate) fn spawn(
+        &mut self,
+        name: &'static str,
+        body: impl FnOnce(StopToken) + Send + 'static,
+    ) {
+        let thread = spawn_thread(name, self.source.token(), body);
+        self.threads.push(thread);
     }
 
-    /// Adds a thread the backend started, to be joined with the others.
+    /// Adds an action that [`stop`](Self::stop) runs before it joins the
+    /// threads.
     ///
-    /// [`stop`](Self::stop) only joins it, so the thread has to end on its own:
-    /// it watches a stop [`token`](Self::token), or the backend stops it before
-    /// calling `stop`.
-    pub(crate) fn push(&mut self, name: &'static str, thread: JoinHandle<()>) {
-        self.threads.push((name, thread));
+    /// It is for a thread that waits on something a stop token cannot reach,
+    /// such as a condition variable. The action must return at once.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn on_stop(&mut self, action: impl FnOnce() + Send + 'static) {
+        self.stop_actions.push(Box::new(action));
     }
 
     /// Requests the stop and joins every thread.
     ///
+    /// The stop actions run after the request, in the order they were added.
     /// The console reader also gets the kick signal until it exits, since a
     /// read of stdin is where the stop token cannot reach it. Every join shares
-    /// one deadline, [`STOP_TIMEOUT`] from the request. A thread still running
-    /// at the deadline is left running and reported on stderr.
+    /// one deadline, [`STOP_TIMEOUT`] after the stop actions have run. A thread
+    /// still running at the deadline is left running and reported on stderr.
     ///
     /// # Errors
     ///
     /// Errors with the first thread that did not stop in time.
     pub(crate) fn stop(self) -> std::io::Result<()> {
         self.source.request_stop();
+        for action in self.stop_actions {
+            action();
+        }
         let deadline = Instant::now() + STOP_TIMEOUT;
         kick_until_finished(&self.console, deadline);
         let mut failure = None;
-        for (name, thread) in std::iter::once(("console reader", self.console)).chain(self.threads)
-        {
-            if let Err(e) = join_by(name, thread, deadline) {
+        for thread in std::iter::once(self.console).chain(self.threads) {
+            if let Err(e) = join_by(thread, deadline) {
                 eprintln!("{LOG_PREFIX} {e}; left running");
                 failure.get_or_insert(e);
             }
         }
         failure.map_or(Ok(()), Err)
     }
+}
+
+/// Starts a thread named `name` that confines itself and then runs `body` with
+/// `stop`.
+///
+/// # Panics
+///
+/// Panics if the thread cannot be created.
+fn spawn_thread(
+    name: &'static str,
+    stop: StopToken,
+    body: impl FnOnce(StopToken) + Send + 'static,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            confine_io_thread();
+            body(stop);
+        })
+        .unwrap_or_else(|e| panic!("spawning the {name} thread: {e}"))
 }
