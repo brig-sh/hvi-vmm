@@ -372,14 +372,19 @@ On every backend, every path that ends a vCPU's run loop ends the VM through
 vCPUs out of the hypervisor, and then releases the quiesce so no vCPU stays
 parked. A guard held by the vCPU thread calls it when the thread exits, whatever
 ended the loop: a guest-requested stop, a failed entry, an unhandled exit, a
-failed run, or a panic. The kick is the backend's: `hypervisor/kvm.rs` holds the
-one the two KVM backends share, and the macOS backend kicks with
-`hv_vcpus_exit`. The vCPU threads are named `cpu0`, `cpu1` and so on, so the
-panic hook's report says which vCPU panicked. The macOS backend catches the
-panic at the loop and adds a line with the vCPU's last exit reason and its
-program counter. Under the seccomp sandbox the report has to stay unsymbolized:
-with `RUST_BACKTRACE` set it opens the binary, which the vCPU allowlist refuses,
-and the process dies of `SIGSYS` after the message.
+failed run, or a panic. Each of these is reported to `Vcpus` as the run's
+outcome. `boot` returns the guest's `Stop`, or an error that names the vCPU and
+the failure. The first report is kept, except that a failure replaces an earlier
+stop. A failure that is not kept is printed. The kick is the backend's:
+`hypervisor/kvm.rs` holds the one the two KVM backends share, and the macOS
+backend kicks with `hv_vcpus_exit`. The vCPU threads are named `vcpu0`, `vcpu1`
+and so on, so the panic hook's report says which vCPU panicked. A panic that
+leaves the vCPU thread is caught where the thread starts, and its message goes
+in the error. The macOS backend catches it at the loop instead, to add the
+vCPU's last exit reason and its program counter. Under the seccomp sandbox the
+report has to stay unsymbolized: with `RUST_BACKTRACE` set it opens the binary,
+which the vCPU allowlist refuses, and the process dies of `SIGSYS` after the
+message.
 
 Device and ledger mutexes on the macOS backend and in the helper threads go
 through `sync::lock_or_recover`, which takes a poisoned lock so the panic that

@@ -115,7 +115,10 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
 }
 
-/// Boots `cfg` on KVM and runs until the guest powers off.
+/// Boots `cfg` on KVM and runs the guest until it powers off or resets.
+///
+/// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
+/// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the one that did not stop within
@@ -390,7 +393,6 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     buf[..n].copy_from_slice(&data[..n]);
                     on_mmio_write(&sh, addr, &buf[..n]);
                 }
-                VcpuExit::Hlt => return ControlFlow::Break(()),
                 // Kicked for a snapshot or a stop; the loop checks which.
                 VcpuExit::Intr => {}
                 other => return unhandled_exit(cpu_id, &other),

@@ -66,7 +66,7 @@ use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
-use crate::hypervisor::vcpus::{Kick, Vcpus};
+use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView};
@@ -130,7 +130,10 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
     }
 }
 
-/// Boots `cfg` on KVM (x86-64) and runs until the guest powers off.
+/// Boots `cfg` on KVM (x86-64) and runs the guest until it resets.
+///
+/// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
+/// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the one that did not stop within
@@ -475,7 +478,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             match exit {
                 VcpuExit::IoIn(port, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!("[trace] cpu{cpu_id} IoIn {port:#x}");
+                        eprintln!("[trace] vcpu{cpu_id} IoIn {port:#x}");
                         n_exit += 1;
                     }
                     for b in data.iter_mut() {
@@ -485,7 +488,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 VcpuExit::IoOut(port, data) => {
                     if dbg && n_exit < 80 {
                         eprintln!(
-                            "[trace] cpu{cpu_id} IoOut {port:#x} = {:02x?}",
+                            "[trace] vcpu{cpu_id} IoOut {port:#x} = {:02x?}",
                             &data[..data.len().min(4)]
                         );
                         n_exit += 1;
@@ -496,7 +499,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 }
                 VcpuExit::MmioRead(addr, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!("[trace] cpu{cpu_id} MmioRead {addr:#x}");
+                        eprintln!("[trace] vcpu{cpu_id} MmioRead {addr:#x}");
                         n_exit += 1;
                     }
                     let val = mmio_read(&sh, addr);
@@ -505,7 +508,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!("[trace] cpu{cpu_id} MmioWrite {addr:#x}");
+                        eprintln!("[trace] vcpu{cpu_id} MmioWrite {addr:#x}");
                         n_exit += 1;
                     }
                     let mut b = [0u8; 8];
@@ -513,18 +516,11 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     b[..n].copy_from_slice(&data[..n]);
                     mmio_write(&sh, addr, u64::from_le_bytes(b));
                 }
-                VcpuExit::Hlt => {
-                    if dbg {
-                        eprintln!("[trace] cpu{cpu_id} HLT");
-                    }
-                    return ControlFlow::Break(());
-                }
                 VcpuExit::Shutdown => {
                     if dbg {
                         dump("SHUTDOWN");
                     }
-                    sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
-                    return ControlFlow::Break(());
+                    return ControlFlow::Break(Outcome::Stopped(Stop::SystemReset));
                 }
                 VcpuExit::Intr => {
                     if dbg && cpu_id == 0 {
@@ -556,7 +552,7 @@ fn dump_regs(vcpu: &VcpuFd, mem: &GuestRam, cpu_id: u32, tag: &str) {
         let mut code = [0u8; 16];
         let _ = mem.read(r.rip, &mut code);
         eprintln!(
-            "[trace] cpu{cpu_id} {tag}: rip={:#x} rsp={:#x} rflags={:#x} cs.sel={:#x} cs.l={} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} code@rip={:02x?}",
+            "[trace] vcpu{cpu_id} {tag}: rip={:#x} rsp={:#x} rflags={:#x} cs.sel={:#x} cs.l={} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} code@rip={:02x?}",
             r.rip, r.rsp, r.rflags, s.cs.selector, s.cs.l, s.cr0, s.cr3, s.cr4, s.efer, code
         );
     }

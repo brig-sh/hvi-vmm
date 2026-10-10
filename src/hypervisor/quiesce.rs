@@ -27,7 +27,7 @@
 //! kicks the vCPUs out of the hypervisor so they reach that point promptly, and
 //! waits for the expected number of them to park.
 //!
-//! The requester is itself a vCPU thread in the in-VMM path, since cpu0 takes
+//! The requester is itself a vCPU thread in the in-VMM path, since vcpu0 takes
 //! the snapshot. It waits for the other vCPUs and never parks itself, so a wait
 //! takes the number of vCPUs to wait for. [`Quiesce::wait_for`] takes a fixed
 //! number, and `wait_for_with` one it reads again as each vCPU parks, for a

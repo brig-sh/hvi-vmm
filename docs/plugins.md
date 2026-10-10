@@ -145,12 +145,14 @@ The stream is buffered and drained on continued traffic, not on a timer. See
 
 A panic in `safepoint`, in the block sink, or in the egress net sink ends the VM
 on every backend: the other vCPUs are kicked, the quiesce is released so no vCPU
-stays parked, and `boot` returns. The vCPU thread is named after its vCPU, so
-the panic report says which one panicked. The macOS backend catches the panic at
-the loop and adds the vCPU's last exit reason and its program counter to the
-report. With `RUST_BACKTRACE` set, that report symbolizes the backtrace by
-opening the binary, which the vCPU seccomp allowlist refuses, so a sandboxed run
-dies of `SIGSYS` right after the panic message instead of stopping the VM.
+stays parked, and `boot` returns an error that names the vCPU. The vCPU thread
+is named after its vCPU, so the panic report says which one panicked. A panic
+that leaves the vCPU thread is caught where the thread starts, and its message
+goes in the error. The macOS backend catches it at the loop instead, to add the
+vCPU's last exit reason and its program counter. With `RUST_BACKTRACE` set, that
+report symbolizes the backtrace by opening the binary, which the vCPU seccomp
+allowlist refuses, so a sandboxed run dies of `SIGSYS` right after the panic
+message instead of stopping the VM.
 
 `attach` runs before any vCPU thread exists, so a panic there fails the boot on
 its own, not through this path.
