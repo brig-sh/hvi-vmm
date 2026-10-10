@@ -28,8 +28,8 @@
 use vm_fdt::{Error, FdtWriter};
 
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE,
-    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion,
+    GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE,
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 
@@ -49,7 +49,8 @@ pub const RNG_SEED_LEN: usize = 64;
 /// The virtio-mmio nodes backed by this boot.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VirtioDevices {
-    pub blk: bool,
+    /// Number of virtio-blk disks, at most [`crate::config::MAX_DISKS`].
+    pub blk_count: usize,
     pub net: bool,
     pub vsock: bool,
     pub fs_count: usize,
@@ -205,8 +206,8 @@ pub fn build(
     fdt.property_string_list("clock-names", vec!["uartclk".into(), "apb_pclk".into()])?;
     fdt.end_node(uart)?;
 
-    // /virtio_mmio slots the guest probes — one per backed device (blk, net).
-    // Omitted when absent so the guest never touches an unbacked MMIO region.
+    // /virtio_mmio slots the guest probes, one per backed device. Omitted
+    // when absent so the guest never touches an unbacked MMIO region.
     let mut virtio_node = |base: u64, spi: u32| -> Result<(), Error> {
         let node = fdt.begin_node(&format!("virtio_mmio@{base:x}"))?;
         fdt.property_string("compatible", "virtio,mmio")?;
@@ -214,8 +215,12 @@ pub fn build(
         fdt.property_array_u32("interrupts", &[IRQ_SPI, spi, IRQ_LEVEL_HIGH])?;
         fdt.end_node(node)
     };
-    if devices.blk {
-        virtio_node(VIRTIO_BASE, VIRTIO_SPI)?;
+    // The disks come first and in order, so Linux probes them in that order.
+    // The guest still has to tell them apart by serial.
+    for index in 0..devices.blk_count {
+        if let (Some(base), Some(spi)) = (virtio_blk_base(index), virtio_blk_spi(index)) {
+            virtio_node(base, spi)?;
+        }
     }
     if devices.net {
         virtio_node(VIRTIO_NET_BASE, VIRTIO_NET_SPI)?;
@@ -316,6 +321,50 @@ pub(crate) mod tests {
         assert!(!contains(&absent, &first));
         assert!(contains(&present, &first));
         assert!(contains(&present, &second));
+    }
+
+    #[test]
+    fn emits_one_node_per_disk_in_order() {
+        let l = sample_layout(0);
+        let blob = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices {
+                blk_count: 3,
+                net: true,
+                ..VirtioDevices::default()
+            },
+            &SEED,
+            KASLR_SEED,
+        )
+        .unwrap();
+        let at = |index: usize| {
+            let name = format!("virtio_mmio@{:x}\0", virtio_blk_base(index).unwrap());
+            blob.windows(name.len())
+                .position(|w| w == name.as_bytes())
+                .unwrap_or_else(|| panic!("no node for disk {index}"))
+        };
+        assert!(at(0) < at(1) && at(1) < at(2), "disks in argv order");
+        // Each node carries its own SPI as <SPI type, number, level-high>,
+        // written out as the spec's cell values.
+        for (index, spi) in [2u32, 21, 22].into_iter().enumerate() {
+            let node = format!("virtio_mmio@{:x}", virtio_blk_base(index).unwrap());
+            let cells: Vec<u8> = [0u32, spi, 4]
+                .iter()
+                .flat_map(|c| c.to_be_bytes())
+                .collect();
+            assert_eq!(
+                prop(&blob, &node, "interrupts"),
+                Some(cells),
+                "disk {index} interrupts"
+            );
+        }
+        let fourth = format!("virtio_mmio@{:x}", virtio_blk_base(3).unwrap());
+        assert!(!contains(&blob, &fourth), "only the disks that exist");
+        let net = format!("virtio_mmio@{VIRTIO_NET_BASE:x}");
+        assert!(contains(&blob, &net));
     }
 
     /// Returns true if `needle` appears in the blob's strings/structure, which

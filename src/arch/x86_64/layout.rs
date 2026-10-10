@@ -20,6 +20,8 @@
 //! "zero page" and cmdline in low RAM, a minimal MP table in the EBDA, and the
 //! virtio-mmio window up in the sub-4 GiB MMIO hole.
 
+use crate::config::MAX_DISKS;
+
 /// Guest RAM base (x86 RAM starts at physical 0).
 pub const RAM_BASE: u64 = 0x0;
 
@@ -49,9 +51,20 @@ pub const BOOT_STACK: u64 = 0x6ff0;
 pub const COM1_PORT: u16 = 0x3f8;
 pub const COM1_GSI: u32 = 4;
 
-/// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device
-/// (blk, net, vsock), with IOAPIC GSIs 5/6/7. The guest is told about these via
+/// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device,
+/// each on its own IOAPIC GSI. The guest is told about these via
 /// `virtio_mmio.device=` on the kernel command line (see `kvm::boot`).
+///
+/// | window from `VIRTIO_MMIO_BASE` | GSI        | device                   |
+/// |--------------------------------|------------|--------------------------|
+/// | `+0x000`                       | 5          | virtio-blk, disk 0       |
+/// | `+0x200`                       | 6          | virtio-net               |
+/// | `+0x400`                       | 7          | virtio-vsock             |
+/// | `+0x600` .. `+0xa00`           | 9, 10, 11  | virtio-blk, disks 1 .. 3 |
+///
+/// Every GSI is an ISA line the MP table maps one to one (`mptable.rs`), so the
+/// guest routes it without further description. COM1 holds 4, and the guest's
+/// rtc-cmos driver claims 8 for the CMOS RTC, so the extra disks start at 9.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
 pub const VIRTIO_SIZE: u64 = 0x200;
 pub const VIRTIO_BLK_BASE: u64 = VIRTIO_MMIO_BASE;
@@ -60,6 +73,31 @@ pub const VIRTIO_VSOCK_BASE: u64 = VIRTIO_MMIO_BASE + 0x400;
 pub const VIRTIO_BLK_GSI: u32 = 5;
 pub const VIRTIO_NET_GSI: u32 = 6;
 pub const VIRTIO_VSOCK_GSI: u32 = 7;
+/// Window of disk 1. Disks 2 and 3 follow, one slot each.
+pub const VIRTIO_BLK_EXTRA_BASE: u64 = VIRTIO_MMIO_BASE + 0x600;
+/// GSIs of disks 1 to 3.
+pub const VIRTIO_BLK_EXTRA_GSI: [u32; MAX_DISKS - 1] = [9, 10, 11];
+
+/// Placement of the virtio-blk device for disk `index`, or `None` past
+/// [`MAX_DISKS`].
+#[must_use]
+pub fn virtio_blk_base(index: usize) -> Option<u64> {
+    match index {
+        0 => Some(VIRTIO_BLK_BASE),
+        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_BASE + (i as u64 - 1) * VIRTIO_SIZE),
+        _ => None,
+    }
+}
+
+/// The GSI of the virtio-blk device for disk `index`, or `None` past
+/// [`MAX_DISKS`].
+#[must_use]
+pub fn virtio_blk_gsi(index: usize) -> Option<u32> {
+    match index {
+        0 => Some(VIRTIO_BLK_GSI),
+        i => VIRTIO_BLK_EXTRA_GSI.get(i - 1).copied(),
+    }
+}
 
 /// Base of the sub-4 GiB MMIO hole: guest RAM stops here and the remainder,
 /// if any, resumes at [`HIGH_RAM_BASE`].
@@ -82,3 +120,47 @@ pub const MMIO_GAP_START: u64 = VIRTIO_MMIO_BASE;
 
 /// Where guest RAM resumes above the MMIO hole.
 pub const HIGH_RAM_BASE: u64 = 0x1_0000_0000; // 4 GiB
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every disk adds a window and a GSI. Neither may land on another device,
+    // and every GSI has to be one the MP table maps.
+    #[test]
+    fn disk_windows_and_gsis_clash_with_no_other_device() {
+        let rtc_gsi = 8;
+        let mut devices = vec![
+            ("net", VIRTIO_NET_BASE, VIRTIO_NET_GSI),
+            ("vsock", VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI),
+        ];
+        for i in 0..MAX_DISKS {
+            devices.push((
+                "blk",
+                virtio_blk_base(i).expect("a disk slot"),
+                virtio_blk_gsi(i).expect("a disk GSI"),
+            ));
+        }
+        for (a, (na, base_a, gsi_a)) in devices.iter().enumerate() {
+            assert!(*gsi_a < 16, "{na} GSI {gsi_a} is not an ISA line");
+            assert!(
+                ![COM1_GSI, rtc_gsi].contains(gsi_a),
+                "{na} takes a legacy device's GSI {gsi_a}"
+            );
+            assert!(*base_a >= MMIO_GAP_START, "{na} is in RAM");
+            for (nb, base_b, gsi_b) in devices.iter().skip(a + 1) {
+                let overlap = base_a < &(base_b + VIRTIO_SIZE) && base_b < &(base_a + VIRTIO_SIZE);
+                assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
+                assert_ne!(gsi_a, gsi_b, "{na} and {nb} share GSI {gsi_a}");
+            }
+        }
+        assert_eq!(
+            virtio_blk_base(0),
+            Some(VIRTIO_BLK_BASE),
+            "disk 0 stays put"
+        );
+        assert_eq!(virtio_blk_gsi(0), Some(VIRTIO_BLK_GSI));
+        assert_eq!(virtio_blk_base(MAX_DISKS), None);
+        assert_eq!(virtio_blk_gsi(MAX_DISKS), None);
+    }
+}

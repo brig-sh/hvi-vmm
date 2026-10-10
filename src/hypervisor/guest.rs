@@ -34,6 +34,35 @@ use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, RamRegion, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 
+/// A virtio-blk disk and the guest-physical base of its virtio-mmio window.
+pub(crate) struct Disk {
+    /// The first byte of the device's window.
+    pub(crate) base: u64,
+    /// The device.
+    pub(crate) dev: Arc<Mutex<VirtioBlk>>,
+}
+
+impl Disk {
+    /// Returns `devs` as disks, the one at index `i` at the window `base(i)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `base` has no window for an index. `block::open_disks` rules
+    /// that out, since it refuses more disks than any backend has windows for.
+    pub(crate) fn place(
+        devs: Vec<Arc<Mutex<VirtioBlk>>>,
+        base: impl Fn(usize) -> Option<u64>,
+    ) -> Vec<Disk> {
+        devs.into_iter()
+            .enumerate()
+            .map(|(index, dev)| Disk {
+                base: base(index).expect("a window per disk"),
+                dev,
+            })
+            .collect()
+    }
+}
+
 /// The guest a backend runs, apart from the hypervisor's handle to it.
 pub(crate) struct Guest<K> {
     /// The guest architecture.
@@ -47,8 +76,8 @@ pub(crate) struct Guest<K> {
     pub(crate) shared_ram: SharedRam,
     /// The `RawEvent` ledger.
     pub(crate) ledger: Arc<Mutex<Emitter>>,
-    /// The virtio-blk device, when the VM has a disk.
-    pub(crate) block: Option<Arc<Mutex<VirtioBlk>>>,
+    /// The virtio-blk disks, in the order of `BootConfig::disks`.
+    pub(crate) disks: Vec<Disk>,
     /// The virtio-net device, when the VM has a network.
     pub(crate) net: Option<Arc<Mutex<VirtioNet>>>,
     /// The virtio-vsock device, when the VM has an agent socket.
@@ -62,15 +91,16 @@ impl<K> Guest<K> {
     ///
     /// It takes a line for each virtio device a guest can hold, whether or not
     /// this VM has it, so a backend that leaves one out does not build. The
-    /// line of a device the VM does not have is dropped.
+    /// line of a device the VM does not have is dropped. `block` returns the
+    /// line of the disk at the index it is given.
     pub(crate) fn connect_irqs(
         &self,
-        block: Arc<dyn IrqLine>,
+        block: impl Fn(usize) -> Arc<dyn IrqLine>,
         net: Arc<dyn IrqLine>,
         vsock: Arc<dyn IrqLine>,
     ) {
-        if let Some(dev) = &self.block {
-            lock_or_recover(dev).connect_irq(block);
+        for (index, disk) in self.disks.iter().enumerate() {
+            lock_or_recover(&disk.dev).connect_irq(block(index));
         }
         if let Some(dev) = &self.net {
             lock_or_recover(dev).connect_irq(net);
@@ -78,6 +108,15 @@ impl<K> Guest<K> {
         if let Some(dev) = &self.vsock {
             lock_or_recover(dev).connect_irq(vsock);
         }
+    }
+
+    /// Returns the disk whose `size`-byte window holds `addr`, and the offset
+    /// of `addr` in it, or `None` when no disk window holds it.
+    pub(crate) fn disk_at(&self, addr: u64, size: u64) -> Option<(&Arc<Mutex<VirtioBlk>>, u64)> {
+        self.disks
+            .iter()
+            .find(|disk| (disk.base..disk.base + size).contains(&addr))
+            .map(|disk| (&disk.dev, addr - disk.base))
     }
 }
 
@@ -111,7 +150,7 @@ impl<K: Kick> VmHandle for Guest<K> {
     }
 
     fn has_block(&self) -> bool {
-        self.block.is_some()
+        !self.disks.is_empty()
     }
 
     fn has_net(&self) -> bool {
@@ -119,8 +158,8 @@ impl<K: Kick> VmHandle for Guest<K> {
     }
 
     fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
-        if let Some(dev) = &self.block {
-            lock_or_recover(dev).set_io_sink(sink);
+        for disk in &self.disks {
+            lock_or_recover(&disk.dev).set_io_sink(Arc::clone(&sink));
         }
     }
 

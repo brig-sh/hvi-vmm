@@ -131,10 +131,11 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 | GIC CPU interface (v2) | `0x0801_0000` | `0x1_0000` shared | |
 | GIC redistributor (v3) | `0x080A_0000` | `0x2_0000` per vCPU | |
 | PL011 UART | `0x0c00_0000` | `0x1000` | SPI 1, INTID 33 |
-| virtio-blk | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
+| virtio-blk, disk 0 | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
 | virtio-net | `0x0d00_0200` | `0x200` | SPI 3, INTID 35 |
 | virtio-vsock | `0x0d00_0400` | `0x200` | SPI 4, INTID 36 |
-| virtio-fs share `i` | `0x0d00_0600 + i * 0x200` | `0x200` | SPI `5 + i`, INTID `37 + i` |
+| virtio-fs share `i`, up to 16 | `0x0d00_0600 + i * 0x200` | `0x200` | SPI `5 + i`, INTID `37 + i` |
+| virtio-blk, disk `i` from 1 to 3 | `0x0d00_2600 + (i - 1) * 0x200` | `0x200` | SPI `20 + i`, INTID `52 + i` |
 | RAM | `0x4000_0000` | `--mem-mib` | |
 
 INTID is `32 + SPI` on both backends. Every device window sits inside
@@ -169,7 +170,8 @@ logs a redistributor region that does not match the table:
 | MP table (EBDA) | `0x9_fc00` |
 | `bzImage` load / 64-bit entry | `0x10_0000` / `0x10_0200` (a `vmlinux` enters at its `e_entry`) |
 | RAM, low half | `0x0` to `0xd000_0000` |
-| virtio-blk / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
+| virtio-blk disk 0 / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
+| virtio-blk disks 1 / 2 / 3 | `0xd000_0600` / `0xd000_0800` / `0xd000_0a00`, GSIs 9 / 10 / 11 |
 | COM1 UART | PIO `0x3f8`, GSI 4 |
 | CMOS RTC | PIO `0x70` / `0x71` |
 | IOAPIC / LAPIC | `0xfec0_0000` / `0xfee0_0000` |
@@ -311,12 +313,16 @@ thing that differs by backend:
   never kicks.
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
   vGICv2 and vGICv3.
-- **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7.
+- **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7
+  and 9 to 11.
 
 ### Devices
 
-- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`. It advertises
-  `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync.
+- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk` and
+  `--disk-ro`, one device per disk. It advertises `VIRTIO_BLK_F_FLUSH` and
+  honours a flush with a real sync, adds `VIRTIO_BLK_F_RO` on a read-only disk,
+  and answers `GET_ID` with the serial `disk<N>`. Other request types get
+  `VIRTIO_BLK_S_UNSUPP`.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.

@@ -30,9 +30,11 @@
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::config;
 use crate::memory::GuestRam;
+use crate::LOG_PREFIX;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -50,15 +52,26 @@ const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSI
 /// requests. Advertising and honouring it gives correct durability semantics
 /// for `fsync`/`end_fsync` workloads instead of the guest guessing.
 const F_BLK_FLUSH_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
+/// `VIRTIO_BLK_F_RO` (low word): the disk is read-only, and Linux marks the
+/// guest's block device read-only to match.
+const F_BLK_RO_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
 
 /// virtio-blk request types.
 const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
 const VIRTIO_BLK_T_OUT: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT; // guest -> write disk
 const VIRTIO_BLK_T_FLUSH: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_FLUSH; // flush the cache
+const VIRTIO_BLK_T_GET_ID: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_GET_ID; // read the serial
+
+/// Length of the serial `GET_ID` returns, zero-padded.
+pub const SERIAL_LEN: usize = virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES as usize;
 
 /// virtio-blk status byte.
 const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
 const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8;
+/// The device does not implement this request type (virtio 1.2, 5.2.6).
+/// Answering `S_OK` instead tells the driver a request it depends on, such as
+/// a discard, did its work when it did nothing at all.
+const VIRTIO_BLK_S_UNSUPP: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_UNSUPP as u8;
 
 const SECTOR: u64 = 512;
 
@@ -81,6 +94,10 @@ pub struct VirtioBlk {
     sink: Option<Arc<dyn IoSink>>,
     /// Stable id for this backing file, so a reader can tell two disks apart.
     disk_id: u64,
+    /// The backing file is open read-only, and every write is refused.
+    read_only: bool,
+    /// What `GET_ID` returns, zero-padded.
+    serial: [u8; SERIAL_LEN],
     /// Per-request `[virtio-blk]` console tracing, off by default (it is a
     /// synchronous stderr write per request — ruinous under fio). Enable with
     /// `HVI_BLK_TRACE=1`; the structured ledger still records every request.
@@ -123,13 +140,35 @@ fn backing_len(file: &File) -> std::io::Result<u64> {
 }
 
 impl VirtioBlk {
-    /// Opens `path` read-write as the backing disk.
+    /// Opens `path` read-write as the backing disk, with an empty serial.
     ///
     /// # Errors
     ///
     /// Errors if the file cannot be opened or its length read.
     pub fn open(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_as(path, false, "")
+    }
+
+    /// Opens `path` as the backing disk, read-only when `read_only` is set,
+    /// and answers `GET_ID` with `serial`.
+    ///
+    /// A read-only disk is opened `O_RDONLY`, so an image the VMM cannot write
+    /// still attaches, and the guest is told it is read-only.
+    ///
+    /// # Errors
+    ///
+    /// Errors if `serial` is longer than [`SERIAL_LEN`] bytes, or the file
+    /// cannot be opened or its length read.
+    pub fn open_as(path: &str, read_only: bool, serial: &str) -> std::io::Result<Self> {
+        if serial.len() > SERIAL_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("virtio-blk serial {serial:?} is longer than {SERIAL_LEN} bytes"),
+            ));
+        }
+        let mut id = [0u8; SERIAL_LEN];
+        id[..serial.len()].copy_from_slice(serial.as_bytes());
+        let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let capacity_sectors = backing_len(&file)? / SECTOR;
         // The inode identifies the backing store across the two processes that
         // care about it, without agreeing on a path: hvi may have been given a
@@ -146,8 +185,16 @@ impl VirtioBlk {
             events: Vec::new(),
             sink: None,
             disk_id,
+            read_only,
+            serial: id,
             trace: std::env::var_os("HVI_BLK_TRACE").is_some(),
         })
+    }
+
+    /// Returns whether the disk is read-only.
+    #[must_use]
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Feeds each request to `sink` as well as the ledger.
@@ -214,8 +261,9 @@ impl VirtioBlk {
                 mmio::VERSION => 2,
                 mmio::DEVICE_ID => VIRTIO_BLK_ID,
                 mmio::VENDOR_ID => VENDOR,
-                // Low word: VIRTIO_BLK_F_FLUSH. High word: VIRTIO_F_VERSION_1.
-                mmio::DEVICE_FEATURES if self.dev_feat_sel == 0 => u64::from(F_BLK_FLUSH_LO),
+                // Low word: VIRTIO_BLK_F_FLUSH, and VIRTIO_BLK_F_RO on a
+                // read-only disk. High word: VIRTIO_F_VERSION_1.
+                mmio::DEVICE_FEATURES if self.dev_feat_sel == 0 => u64::from(self.features_lo()),
                 mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
                 mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
                 mmio::QUEUE_READY => u64::from(self.queue.is_ready()),
@@ -238,6 +286,15 @@ impl VirtioBlk {
                 }
                 _ => 0,
             }
+        }
+    }
+
+    /// Returns the low 32 feature bits the device offers.
+    fn features_lo(&self) -> u32 {
+        if self.read_only {
+            F_BLK_FLUSH_LO | F_BLK_RO_LO
+        } else {
+            F_BLK_FLUSH_LO
         }
     }
 
@@ -368,7 +425,7 @@ impl VirtioBlk {
         let mut device_written = 0u32;
         let mut data_bytes = 0u64;
 
-        match typ {
+        let status = match typ {
             VIRTIO_BLK_T_IN => {
                 // Coalesce the data segments into one positioned read, then
                 // scatter into guest memory: one syscall per request, not one
@@ -385,7 +442,16 @@ impl VirtioBlk {
                     device_written += l;
                 }
                 data_bytes = total as u64;
+                VIRTIO_BLK_S_OK
             }
+            // The guest was offered VIRTIO_BLK_F_RO. A write that arrives
+            // anyway fails, and so does a flush carrying data.
+            VIRTIO_BLK_T_OUT if self.read_only => VIRTIO_BLK_S_IOERR,
+            VIRTIO_BLK_T_FLUSH if self.read_only && (readable.len() > 1 || writable.len() > 1) => {
+                VIRTIO_BLK_S_IOERR
+            }
+            // Nothing was written, so there is nothing to make durable.
+            VIRTIO_BLK_T_FLUSH if self.read_only => VIRTIO_BLK_S_OK,
             VIRTIO_BLK_T_OUT => {
                 // Gather the data segments into one buffer, then one positioned
                 // write.
@@ -400,16 +466,33 @@ impl VirtioBlk {
                 }
                 self.file.write_all_at(&buf, base).map_err(other)?;
                 data_bytes = total as u64;
+                VIRTIO_BLK_S_OK
             }
             VIRTIO_BLK_T_FLUSH => {
                 // Honour the guest's cache flush (durability for fsync).
                 self.file.sync_data().map_err(other)?;
+                VIRTIO_BLK_S_OK
             }
-            _ => {} // get-id / etc.: acknowledge without data.
-        }
+            VIRTIO_BLK_T_GET_ID => {
+                // The serial goes into the data segments, up to their length.
+                // Linux offers exactly SERIAL_LEN bytes.
+                let mut src = &self.serial[..];
+                for &(a, l) in &writable[..writable.len() - 1] {
+                    let n = (l as usize).min(src.len());
+                    mem.write(a, &src[..n]).map_err(other)?;
+                    src = &src[n..];
+                    device_written += n as u32;
+                }
+                VIRTIO_BLK_S_OK
+            }
+            // Every request type this device does not implement, discard and
+            // write-zeroes among them. None of them were negotiated, but a
+            // driver that sends one anyway must learn that nothing happened.
+            _ => VIRTIO_BLK_S_UNSUPP,
+        };
 
         let (saddr, _) = *writable.last().unwrap();
-        mem.write_u8(saddr, VIRTIO_BLK_S_OK).map_err(other)?;
+        mem.write_u8(saddr, status).map_err(other)?;
         device_written += 1;
 
         // Boundary capture: the guest's disk I/O, observed at the device. The
@@ -421,12 +504,16 @@ impl VirtioBlk {
                 VIRTIO_BLK_T_IN => "read ",
                 VIRTIO_BLK_T_OUT => "write",
                 VIRTIO_BLK_T_FLUSH => "flush",
+                VIRTIO_BLK_T_GET_ID => "getid",
                 _ => "other",
             };
-            eprint!("\r\n[virtio-blk] {kind} sector={sector} bytes={data_bytes}\r\n");
+            eprint!(
+                "\r\n[virtio-blk] {kind} sector={sector} bytes={data_bytes} status={status}\r\n"
+            );
         }
-        // Flush requests carry no data range — don't log them as I/O events.
-        if typ == VIRTIO_BLK_T_IN || typ == VIRTIO_BLK_T_OUT {
+        // Only a read or write that went through is I/O on the disk. A flush
+        // carries no data range, and a refused write moved nothing.
+        if status == VIRTIO_BLK_S_OK && (typ == VIRTIO_BLK_T_IN || typ == VIRTIO_BLK_T_OUT) {
             let write = typ == VIRTIO_BLK_T_OUT;
             self.events.push(CapturedEvent::Block {
                 lba: sector,
@@ -442,6 +529,32 @@ impl VirtioBlk {
         }
         Ok(device_written)
     }
+}
+
+/// Opens every disk in `disks` in order, with the serial
+/// [`config::disk_serial`] of its position, and logs each one.
+///
+/// # Errors
+///
+/// Errors when there are more than [`config::MAX_DISKS`] disks, or one of them
+/// does not open. The message names the path.
+pub fn open_disks(disks: &[config::DiskSpec]) -> Result<Vec<Arc<Mutex<VirtioBlk>>>, String> {
+    config::check_disks(disks)?;
+    disks
+        .iter()
+        .enumerate()
+        .map(|(index, disk)| {
+            let serial = config::disk_serial(index);
+            let blk = VirtioBlk::open_as(&disk.path, disk.read_only, &serial)
+                .map_err(|e| format!("virtio-blk disk {index} ({}): {e}", disk.path))?;
+            let mode = if disk.read_only { "ro" } else { "rw" };
+            eprintln!(
+                "{LOG_PREFIX} virtio-blk[{index}]: {} ({mode}, serial {serial})",
+                disk.path
+            );
+            Ok(Arc::new(Mutex::new(blk)))
+        })
+        .collect()
 }
 
 fn other<E: std::fmt::Display>(e: E) -> std::io::Error {
@@ -854,7 +967,7 @@ mod capacity_tests {
         // poison, so "untouched" is visible
         mem.write_u8(status, 0xff).unwrap();
 
-        let write_flag = if typ == VIRTIO_BLK_T_IN {
+        let write_flag = if typ == VIRTIO_BLK_T_IN || typ == VIRTIO_BLK_T_GET_ID {
             VIRTQ_DESC_F_WRITE
         } else {
             0
@@ -935,6 +1048,167 @@ mod capacity_tests {
         let mut got = [0u8; 4];
         mem.read(BASE + 0x5000, &mut got).unwrap();
         assert_eq!(&got, &[0xab; 4], "the sector reached guest memory");
+    }
+
+    /// A request type the device does not implement is answered `S_UNSUPP`,
+    /// not `S_OK`: a driver told its discard succeeded would trust a range
+    /// that still holds the old data.
+    #[test]
+    fn an_unknown_request_type_is_unsupported() {
+        let (r, mut blk) = rig("unsupp");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let discard = virtio_bindings::virtio_blk::VIRTIO_BLK_T_DISCARD;
+        let write_zeroes = virtio_bindings::virtio_blk::VIRTIO_BLK_T_WRITE_ZEROES;
+        for typ in [discard, write_zeroes, 0xdead_beef] {
+            let st = submit(&mut blk, &mem, typ, 0, 16);
+            // The wire value from the spec, not the constant the device uses.
+            assert_eq!(st, 2, "type {typ:#x} is VIRTIO_BLK_S_UNSUPP");
+            // Only the status byte was written: used.len of the newest entry.
+            let used = BASE + 0x3000;
+            let slot = u64::from(mem.read_u16(used + 2).unwrap().wrapping_sub(1) % 256);
+            assert_eq!(mem.read_u32(used + 4 + slot * 8 + 4).unwrap(), 1);
+        }
+        assert_eq!(
+            std::fs::read(&r.path).unwrap(),
+            [0xabu8; 512],
+            "nothing reached the disk"
+        );
+        assert!(blk.take_events().is_empty(), "and no I/O was recorded");
+    }
+
+    /// A 1-sector read-only disk on a `0444` image, opened with `serial`.
+    fn ro_rig(tag: &str, serial: &str) -> (Rig, VirtioBlk) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("hvi-ro-{tag}-{}.img", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, [0xabu8; 512]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let blk = VirtioBlk::open_as(path.to_str().unwrap(), true, serial).unwrap();
+        (Rig { path }, blk)
+    }
+
+    // The ro lower image of an overlay root is 0444 in the store; opening it
+    // for writing failed the boot.
+    #[test]
+    fn a_read_only_disk_opens_an_image_nobody_may_write() {
+        let (r, blk) = ro_rig("open", "disk0");
+        assert!(blk.read_only());
+        let err = VirtioBlk::open_as(r.path.to_str().unwrap(), false, "disk0");
+        // Root writes a 0444 file anyway, so the refusal is only checked for
+        // everyone else.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(err.is_err(), "a writable open of a 0444 image fails");
+        }
+    }
+
+    #[test]
+    fn a_read_only_disk_advertises_f_ro() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let (_r, mut ro) = ro_rig("feat", "");
+        // The spec's bit numbers, not the constants the device uses:
+        // VIRTIO_BLK_F_FLUSH is bit 9, VIRTIO_BLK_F_RO bit 5.
+        let features = ro.mmio(&mem, mmio::DEVICE_FEATURES, false, 0) as u32;
+        assert_eq!(features, (1 << 9) | (1 << 5));
+
+        let (_w, mut rw) = rig("feat");
+        let features = rw.mmio(&mem, mmio::DEVICE_FEATURES, false, 0) as u32;
+        assert_eq!(features, 1 << 9, "a writable disk is not ro");
+    }
+
+    #[test]
+    fn a_write_to_a_read_only_disk_is_refused() {
+        let (r, mut blk) = ro_rig("out", "");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        mem.write(BASE + 0x5000, &[0x11; 512]).unwrap();
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 0, 512);
+        assert_eq!(st, VIRTIO_BLK_S_IOERR);
+        assert_eq!(std::fs::read(&r.path).unwrap(), [0xabu8; 512]);
+        assert!(blk.take_events().is_empty(), "a refused write is not I/O");
+
+        // Reads still work.
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512);
+        assert_eq!(st, VIRTIO_BLK_S_OK);
+        let mut got = [0u8; 4];
+        mem.read(BASE + 0x5000, &mut got).unwrap();
+        assert_eq!(got, [0xab; 4]);
+    }
+
+    // `submit` always chains a data segment, so this flush carries data.
+    #[test]
+    fn a_flush_with_data_on_a_read_only_disk_is_refused() {
+        let (_r, mut blk) = ro_rig("flush", "");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_FLUSH, 0, 16);
+        assert_eq!(st, VIRTIO_BLK_S_IOERR);
+    }
+
+    #[test]
+    fn get_id_returns_the_zero_padded_serial() {
+        let (_r, mut blk) = ro_rig("id", "disk1");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        mem.write(BASE + 0x5000, &[0xff; 32]).unwrap();
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_GET_ID, 0, SERIAL_LEN as u32);
+        assert_eq!(st, VIRTIO_BLK_S_OK);
+        let mut got = [0u8; 32];
+        mem.read(BASE + 0x5000, &mut got).unwrap();
+        let mut want = [0u8; SERIAL_LEN];
+        want[..5].copy_from_slice(b"disk1");
+        assert_eq!(&got[..SERIAL_LEN], &want);
+        assert_eq!(&got[SERIAL_LEN..], &[0xff; 12], "nothing past the buffer");
+        assert_eq!(
+            mem.read_u32(BASE + 0x3000 + 8).unwrap(),
+            SERIAL_LEN as u32 + 1,
+            "the used length counts the serial and the status byte"
+        );
+    }
+
+    #[test]
+    fn get_id_stops_at_a_short_buffer() {
+        let (r, _) = rig("idshort");
+        let mut blk = VirtioBlk::open_as(r.path.to_str().unwrap(), false, "disk3").unwrap();
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        mem.write(BASE + 0x5000, &[0xff; 8]).unwrap();
+        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_GET_ID, 0, 3);
+        assert_eq!(st, VIRTIO_BLK_S_OK);
+        let mut got = [0u8; 4];
+        mem.read(BASE + 0x5000, &mut got).unwrap();
+        assert_eq!(&got, b"dis\xff");
+    }
+
+    // The guest finds its disks by serial, so position N in the disk list
+    // has to answer GET_ID with disk<N> and keep its own access mode.
+    #[test]
+    fn open_disks_gives_each_position_its_serial_and_mode() {
+        let (a, _) = ro_rig("argv-a", "");
+        let (b, _) = rig("argv-b");
+        let disks = open_disks(&[
+            config::DiskSpec::ro(a.path.to_str().unwrap()),
+            config::DiskSpec::rw(b.path.to_str().unwrap()),
+        ])
+        .unwrap();
+        assert_eq!(disks.len(), 2);
+        for (index, (dev, read_only)) in disks.iter().zip([true, false]).enumerate() {
+            let mut blk = dev.lock().unwrap();
+            assert_eq!(blk.read_only(), read_only, "disk {index}");
+            let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+            let st = submit(&mut blk, &mem, VIRTIO_BLK_T_GET_ID, 0, 20);
+            assert_eq!(st, 0, "disk {index} answered GET_ID");
+            let mut got = [0u8; 20];
+            mem.read(BASE + 0x5000, &mut got).unwrap();
+            let mut want = [0u8; 20];
+            want[..5].copy_from_slice(format!("disk{index}").as_bytes());
+            assert_eq!(got, want, "disk {index}");
+        }
+    }
+
+    #[test]
+    fn a_serial_longer_than_the_id_field_is_refused() {
+        let (r, _blk) = rig("idlong");
+        let long = "x".repeat(SERIAL_LEN + 1);
+        assert!(VirtioBlk::open_as(r.path.to_str().unwrap(), false, &long).is_err());
+        let exact = "x".repeat(SERIAL_LEN);
+        VirtioBlk::open_as(r.path.to_str().unwrap(), false, &exact).expect("20 bytes fit");
     }
 
     /// The bound is on the bytes actually transferred, so it is exact at the

@@ -97,6 +97,7 @@ and exits.
 
 ```sh
 hvi boot --kernel <Image> --disk disk.img --net-stub      # block device and a NIC
+hvi boot --kernel <Image> --disk-ro lo.img --disk up.img  # two disks, serials disk0, disk1
 hvi boot --kernel <Image> --share-ro ./src code           # a read-only share (macOS)
 hvi boot --kernel <Image> --events ledger.ndjson          # record device I/O
 hvi dump-fdt --kernel <Image>                             # arm64 devicetree, no hypervisor
@@ -133,7 +134,7 @@ hvi is young. Read these before you build on it.
   queried name, then asks the host to resolve it. The default sandbox denies
   the socket that needs, so the guest gets a reply with no addresses in it.
   Only `--no-sandbox` resolves.
-- **One disk and one NIC.** No hotplug, and no PCI at all.
+- **Four disks and one NIC.** No hotplug, and no PCI at all.
 - **virtio-fs is macOS only**, one request queue per share, no DAX window.
 - **8 vCPUs on a GICv2 arm64 host.** The guest interrupt controller follows
   the host, and GICv2 caps there.

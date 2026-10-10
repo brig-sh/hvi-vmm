@@ -39,22 +39,22 @@ use applevisor::prelude::{
 use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion,
+    DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_FS_MAX, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
+use crate::hypervisor::guest::{Cpu, Disk, Guest, VcpuRegs};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -72,7 +72,6 @@ type VmGic = VirtualMachineInstance<GicEnabled>;
 
 /// GIC INTIDs: SPIs start at 32.
 const UART_INTID: u32 = 32 + UART_SPI;
-const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
 const VIRTIO_NET_INTID: u32 = 32 + VIRTIO_NET_SPI;
 const VIRTIO_VSOCK_INTID: u32 = 32 + VIRTIO_VSOCK_SPI;
 
@@ -322,12 +321,17 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // virtio-fs ones again below as each share is placed, because those climb
     // with the share count.
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
+    let disk_windows = (0..cfg.disks.len())
+        .filter_map(virtio_blk_base)
+        .map(|base| ("virtio-blk", base, VIRTIO_SIZE));
     for (name, base, size) in [
         ("UART", UART_BASE, UART_SIZE),
-        ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
         ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
         ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
-    ] {
+    ]
+    .into_iter()
+    .chain(disk_windows)
+    {
         let end = base.saturating_add(size);
         if base < gic_end || end > DEVICE_WINDOW_END {
             return Err(format!(
@@ -374,13 +378,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         }
     }
 
-    let virtio = match &cfg.disk {
-        Some(path) => {
-            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
-        }
-        None => None,
-    };
+    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
     // virtio-net: gateway relay (real egress) when a gateway socket is given,
     // else the built-in user-space stack. `net_reader` carries the gateway read
     // side to the RX reader thread, spawned once the shared state exists.
@@ -448,8 +446,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         if !fs_tags.insert(share.tag.as_str()) {
             return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
         }
-        let base = virtio_fs_base(index).ok_or("too many virtio-fs devices")?;
-        let spi = virtio_fs_spi(index).ok_or("too many virtio-fs devices")?;
+        let too_many = || format!("too many virtio-fs devices; at most {VIRTIO_FS_MAX} fit");
+        let base = virtio_fs_base(index).ok_or_else(too_many)?;
+        let spi = virtio_fs_spi(index).ok_or_else(too_many)?;
         let end = base
             .checked_add(VIRTIO_SIZE)
             .ok_or("virtio-fs MMIO address overflow")?;
@@ -508,11 +507,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             wake: Arc::new(FsWake::new()),
         });
     }
-    let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
     let fdt_devices = fdt::VirtioDevices {
-        blk: has_blk,
+        blk_count: disks.len(),
         net: has_net,
         vsock: has_vsock,
         fs_count: fs.len(),
@@ -549,7 +547,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             ram,
             shared_ram,
             ledger: Arc::new(Mutex::new(emitter)),
-            block: virtio,
+            disks,
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, kicker)),
@@ -572,7 +570,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     };
     lock_or_recover(&shared.pl011).connect_irq(line(UART_INTID, false));
     shared.guest.connect_irqs(
-        line(VIRTIO_INTID, true),
+        // `open_disks` refused more disks than there are SPIs.
+        |index| line(32 + virtio_blk_spi(index).expect("an SPI per disk"), true),
         line(VIRTIO_NET_INTID, true),
         line(VIRTIO_VSOCK_INTID, true),
     );
@@ -820,10 +819,8 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
                                 service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
                                 advance_pc(&vcpu);
-                            } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
-                                if let Some(dev) = &sh.guest.block {
-                                    service_dev(&vcpu, &sh, dev, ipa - VIRTIO_BASE, syn);
-                                }
+                            } else if let Some((dev, offset)) = sh.guest.disk_at(ipa, VIRTIO_SIZE) {
+                                service_dev(&vcpu, &sh, dev, offset, syn);
                                 advance_pc(&vcpu);
                             } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE)
                                 .contains(&ipa)

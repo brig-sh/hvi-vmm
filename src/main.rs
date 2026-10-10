@@ -252,7 +252,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut initramfs = None;
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
-    let mut disk = None;
+    let mut disks = Vec::new();
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
@@ -276,7 +276,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--initramfs" => initramfs = it.next().cloned(),
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
-            "--disk" => disk = it.next().cloned(),
+            "--disk" | "--disk-ro" => push_disk(&mut disks, a, it.next())?,
             // The uid and gid the host's files carry inside the guest. The
             // default is root, which suits a guest whose workload runs as root;
             // a guest running as another user needs its own uid here, or the
@@ -402,7 +402,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         initramfs: initramfs.map(std::fs::read).transpose()?,
         mem_bytes: mem_mib << 20,
         cmdline,
-        disk,
+        disks,
         fs_shares,
         net,
         net_gateway,
@@ -427,9 +427,93 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Appends the disk named by `--disk` or `--disk-ro` to `disks`.
+///
+/// Both flags share one list, so a disk's position, and with it its serial
+/// `disk<N>`, counts across the two.
+///
+/// # Errors
+///
+/// Errors when the path is missing or the list is already full.
+fn push_disk(
+    disks: &mut Vec<config::DiskSpec>,
+    flag: &str,
+    path: Option<&String>,
+) -> Result<(), String> {
+    let path = path.ok_or_else(|| format!("{flag} needs a path"))?;
+    if disks.len() == config::MAX_DISKS {
+        return Err(format!(
+            "{flag} {path}: at most {} disks (--disk and --disk-ro count together)",
+            config::MAX_DISKS
+        ));
+    }
+    disks.push(if flag == "--disk-ro" {
+        config::DiskSpec::ro(path.as_str())
+    } else {
+        config::DiskSpec::rw(path.as_str())
+    });
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("hvi: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_disk;
+    use hvi::config::{disk_serial, DiskSpec, MAX_DISKS};
+
+    fn parse(args: &[&str]) -> Result<Vec<DiskSpec>, String> {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        let mut disks = Vec::new();
+        let mut it = args.iter();
+        while let Some(flag) = it.next() {
+            push_disk(&mut disks, flag, it.next())?;
+        }
+        Ok(disks)
+    }
+
+    #[test]
+    fn disk_and_disk_ro_share_one_position_count() {
+        let disks = parse(&[
+            "--disk-ro",
+            "lower.img",
+            "--disk",
+            "upper.img",
+            "--disk-ro",
+            "c.img",
+        ])
+        .unwrap();
+        assert_eq!(
+            disks,
+            [
+                DiskSpec::ro("lower.img"),
+                DiskSpec::rw("upper.img"),
+                DiskSpec::ro("c.img"),
+            ]
+        );
+        assert_eq!(disk_serial(1), "disk1", "upper.img answers as disk1");
+    }
+
+    #[test]
+    fn a_fifth_disk_is_refused() {
+        let mut args = Vec::new();
+        for i in 0..MAX_DISKS {
+            args.push(if i % 2 == 0 { "--disk" } else { "--disk-ro" });
+            args.push("x.img");
+        }
+        assert_eq!(parse(&args).unwrap().len(), MAX_DISKS);
+        args.extend(["--disk-ro", "y.img"]);
+        let err = parse(&args).unwrap_err();
+        assert!(err.contains("at most 4 disks"), "{err}");
+    }
+
+    #[test]
+    fn a_disk_flag_needs_a_path() {
+        assert!(parse(&["--disk-ro"]).unwrap_err().contains("needs a path"));
     }
 }

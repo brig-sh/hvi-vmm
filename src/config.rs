@@ -144,6 +144,71 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
+/// Most virtio-blk disks one guest can have.
+///
+/// Each disk is its own virtio-mmio device with its own window and interrupt,
+/// and every backend reserves exactly this many slots for them (see
+/// `virtio_blk_base` in each architecture's layout module).
+pub const MAX_DISKS: usize = 4;
+
+/// One host file or block device backing a virtio-blk disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskSpec {
+    /// Host path of the image file or block device.
+    pub path: String,
+    /// Whether the disk is read-only.
+    ///
+    /// A read-only disk is opened `O_RDONLY` and advertised to the guest with
+    /// `VIRTIO_BLK_F_RO`. A write the guest sends anyway fails with an I/O
+    /// error.
+    pub read_only: bool,
+}
+
+impl DiskSpec {
+    /// Returns a writable disk backed by `path`.
+    #[must_use]
+    pub fn rw(path: impl Into<String>) -> Self {
+        DiskSpec {
+            path: path.into(),
+            read_only: false,
+        }
+    }
+
+    /// Returns a read-only disk backed by `path`.
+    #[must_use]
+    pub fn ro(path: impl Into<String>) -> Self {
+        DiskSpec {
+            path: path.into(),
+            read_only: true,
+        }
+    }
+}
+
+/// Returns the virtio-blk serial of the disk at `index` in
+/// [`BootConfig::disks`].
+///
+/// The guest reads it from `/sys/block/vdX/serial`. The `vdX` letter follows
+/// probe order, so the serial is the stable way to find a disk in the guest.
+#[must_use]
+pub fn disk_serial(index: usize) -> String {
+    format!("disk{index}")
+}
+
+/// Refuses a disk list no backend can attach.
+///
+/// # Errors
+///
+/// Returns a message naming the limit when there are more than [`MAX_DISKS`].
+pub fn check_disks(disks: &[DiskSpec]) -> Result<(), String> {
+    if disks.len() > MAX_DISKS {
+        return Err(format!(
+            "{} disks given; at most {MAX_DISKS} fit (--disk and --disk-ro count together)",
+            disks.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Inputs for a boot. Populated by `main::boot_guest` from the CLI and handed
 /// to the active backend's `boot()`.
 pub struct BootConfig {
@@ -151,7 +216,10 @@ pub struct BootConfig {
     pub initramfs: Option<Vec<u8>>,
     pub mem_bytes: u64,
     pub cmdline: String,
-    pub disk: Option<String>,
+    /// virtio-blk disks, at most [`MAX_DISKS`], in the order the guest sees
+    /// them. The disk at index `N` answers `GET_ID` with the serial
+    /// [`disk_serial`]`(N)`.
+    pub disks: Vec<DiskSpec>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -206,7 +274,10 @@ pub enum Stop {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, CachePolicy, FsShare, ShareMode};
+    use super::{
+        check_disks, check_export_overlap, disk_serial, CachePolicy, DiskSpec, FsShare, ShareMode,
+        MAX_DISKS,
+    };
     use std::path::{Path, PathBuf};
 
     fn shares(pairs: &[(&str, ShareMode)]) -> Vec<FsShare> {
@@ -326,6 +397,25 @@ mod tests {
         ]))
         .expect("/srv/ab is a sibling of /srv/a, not a child");
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    #[test]
+    fn up_to_four_disks_are_accepted_and_a_fifth_is_refused() {
+        let mut disks: Vec<DiskSpec> = (0..MAX_DISKS)
+            .map(|i| DiskSpec::rw(format!("d{i}.img")))
+            .collect();
+        check_disks(&disks).expect("four disks fit");
+        disks.push(DiskSpec::ro("e.img"));
+        let err = check_disks(&disks).unwrap_err();
+        assert!(err.contains("at most 4"), "{err}");
+    }
+
+    #[test]
+    fn a_disk_serial_fits_the_virtio_blk_id_field() {
+        assert_eq!(disk_serial(0), "disk0");
+        assert_eq!(disk_serial(3), "disk3");
+        // VIRTIO_BLK_ID_BYTES.
+        assert!(disk_serial(MAX_DISKS - 1).len() <= 20);
     }
 
     #[test]
