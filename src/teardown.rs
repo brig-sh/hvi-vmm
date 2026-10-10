@@ -17,14 +17,15 @@
 //! `IoThreads` starts threads that block on host descriptors: the console, the
 //! agent listener and its connections, the gateway socket, the tap. Each polls
 //! its own descriptor beside a [`StopToken`]. `IoThreads::stop` requests the
-//! stop through its [`StopSource`] once the vCPU threads have exited, every
-//! poll returns, and it joins the threads before `boot` returns. Some helpers
-//! need more than the poll. A macOS virtio-fs device's worker and readahead
-//! workers wait on no descriptor; each parks on a condition variable, and a
-//! stop action that `IoThreads::stop` runs wakes it. The console reader reads
-//! stdin, which the whole process shares, so a byte another reader took between
-//! the poll and the read would leave it blocked; `IoThreads::stop` sends it the
-//! kick signal until it has exited, with `kick_until_finished`.
+//! stop through its [`StopSource`] once the vCPU threads have exited or been
+//! left running, every poll returns, and it joins the threads before `boot`
+//! returns. Some helpers need more than the poll. A macOS virtio-fs device's
+//! worker and readahead workers wait on no descriptor; each parks on a
+//! condition variable, and a stop action that `IoThreads::stop` runs wakes it.
+//! The console reader reads stdin, which the whole process shares, so a byte
+//! another reader took between the poll and the read would leave it blocked;
+//! `IoThreads::stop` sends it the kick signal until it has exited, with
+//! `kick_until_finished`.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
 //! the deadline is left running and `boot` returns an error naming it, since a
@@ -48,10 +49,11 @@ use std::time::{Duration, Instant};
 
 use crate::signal::kick_signal;
 
-/// How long the stop waits for the helper threads after it is requested.
+/// How long the stop waits for the vCPU threads, then for the helper threads,
+/// and then for the ledger, after it is requested.
 ///
-/// The waits the stop cannot interrupt are a plugin blocking in `request` and a
-/// virtio-fs worker waiting on a host file lock.
+/// The waits the stop cannot interrupt are a plugin blocking in `request` or
+/// `safepoint` and a virtio-fs worker waiting on a host file lock.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Joins `thread` if it exits before `deadline`.
@@ -144,7 +146,7 @@ impl StopToken {
     /// descriptor reports an error or is not open.
     pub fn wait(&self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         let mut fds = [pollfd(fd.as_raw_fd()), pollfd(self.0.as_raw_fd())];
-        poll(&mut fds, -1)?;
+        poll(&mut fds, None)?;
         if fds[1].revents != 0 {
             return Ok(false);
         }
@@ -168,7 +170,7 @@ impl StopToken {
         let mut out = pollfd(fd.as_raw_fd());
         out.events = libc::POLLOUT;
         let mut fds = [out, pollfd(self.0.as_raw_fd())];
-        poll(&mut fds, -1)?;
+        poll(&mut fds, None)?;
         Ok(fds[1].revents == 0)
     }
 
@@ -181,7 +183,7 @@ impl StopToken {
     #[must_use]
     pub fn keep_waiting(&self, fd: BorrowedFd<'_>) -> bool {
         let mut fds = [pollfd(fd.as_raw_fd()), pollfd(self.0.as_raw_fd())];
-        if poll(&mut fds, 0).is_err() {
+        if poll(&mut fds, Some(Instant::now())).is_err() {
             return false;
         }
         let gone = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -197,15 +199,14 @@ impl StopToken {
     ///
     /// Errors if `poll` fails for a reason other than a signal.
     pub fn sleep(&self, duration: Duration) -> io::Result<bool> {
-        let millis = libc::c_int::try_from(duration.as_millis()).unwrap_or(libc::c_int::MAX);
         let mut fds = [pollfd(self.0.as_raw_fd())];
-        poll(&mut fds, millis)?;
+        poll(&mut fds, Instant::now().checked_add(duration))?;
         Ok(fds[0].revents == 0)
     }
 }
 
 /// Builds a `pollfd` that waits for `fd` to become readable.
-fn pollfd(fd: libc::c_int) -> libc::pollfd {
+pub(crate) fn pollfd(fd: libc::c_int) -> libc::pollfd {
     libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -213,18 +214,30 @@ fn pollfd(fd: libc::c_int) -> libc::pollfd {
     }
 }
 
-/// Polls `fds`, retrying when a signal interrupts the call.
-fn poll(fds: &mut [libc::pollfd], timeout_millis: libc::c_int) -> io::Result<()> {
+/// Polls `fds` until one of them is ready or `deadline` passes, with no limit
+/// when `deadline` is `None`.
+///
+/// Each call waits only for the time left, rounded up to whole milliseconds, so
+/// a signal that interrupts the call does not extend the wait, and a wait
+/// shorter than a millisecond still sleeps.
+pub(crate) fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
     loop {
+        let timeout_millis = deadline.map_or(-1, |deadline| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
+        });
         // SAFETY: `fds` is a live slice of `pollfd` and the length matches.
         let ret =
             unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_millis) };
-        if ret >= 0 {
+        // A timeout short of the deadline is waited out by the next call.
+        if ret > 0 || (ret == 0 && timeout_millis == 0) {
             return Ok(());
         }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
     }
 }
@@ -243,6 +256,19 @@ mod tests {
         let waiter = std::thread::spawn(move || token.wait(idle.as_fd()).expect("poll"));
         source.request_stop();
         assert!(!waiter.join().expect("thread"));
+    }
+
+    // `poll` takes whole milliseconds, so a shorter sleep is rounded up, not
+    // down to no wait at all.
+    #[test]
+    fn sleep_shorter_than_a_millisecond_still_sleeps() {
+        let source = StopSource::new().expect("pair");
+        let start = Instant::now();
+        assert!(source
+            .token()
+            .sleep(Duration::from_micros(500))
+            .expect("poll"));
+        assert!(start.elapsed() >= Duration::from_micros(500));
     }
 
     #[test]

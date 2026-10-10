@@ -46,22 +46,25 @@ and does not restore the one it replaced. It sends that signal to its own
 threads to interrupt them, so nothing else in the process should use it. Before
 it returns, the ledger is flushed, the agent listener and every accepted agent
 connection are closed, and every thread it started itself has exited, with one
-exception: a helper thread still running one second after the stop is left
-running and `boot` returns an error naming it. The waits it cannot interrupt are
-a plugin blocking in `request` and a virtio-fs worker waiting on a host file
-lock. On macOS such a lock wait can also stall a vCPU, and then `boot` does not
-return until the lock is released (see [Known
+exception: a thread still running at its deadline is left running and `boot`
+returns an error naming the first such thread, a vCPU thread before a helper
+thread. `boot` waits up to one second for the vCPU threads, then up to one
+second for the helper threads, and then up to one second for the ledger, which a
+thread left running can hold; it does not write the tail of a ledger still held.
+It returns at most three seconds after the stop. The waits it cannot interrupt
+are a plugin blocking in `request` or `safepoint` and a virtio-fs worker waiting
+on a host file lock. On macOS such a lock wait can also stall a vCPU (see [Known
 limits](limitations.md#virtio-fs-resource-limits)). A plugin that keeps the
 `Arc<dyn VmHandle>` it was given keeps guest RAM, the ledger file and the block,
 net and vsock devices until it drops the handle. It also keeps the VM, through
 the vCPU kicker on macOS and through the interrupt line of each block, net or
-vsock device on Linux. The vCPUs have exited, so a kick reaches none. The tap
-under `--net-tap` keeps its carrier up. The disk stays open. The gateway
-connection under `--net-gateway` stays on the handle, but the relay shut it down
-as it ended, so it carries nothing. A thread the plugin started from `attach` is
-not joined, and holds the handle for as long as it runs. On macOS a second
-`boot` fails while such a handle exists, because Hypervisor.framework allows one
-VM per process.
+vsock device on Linux. The vCPUs have exited or been left running, so a kick
+reaches only a vCPU left running. The tap under `--net-tap` keeps its carrier
+up. The disk stays open. The gateway connection under `--net-gateway` stays on
+the handle, but the relay shut it down as it ended, so it carries nothing. A
+thread the plugin started from `attach` is not joined, and holds the handle for
+as long as it runs. On macOS a second `boot` fails while such a handle exists,
+because Hypervisor.framework allows one VM per process.
 
 ## A minimal caller
 

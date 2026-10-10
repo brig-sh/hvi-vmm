@@ -69,7 +69,8 @@ pub struct RegsView {
 /// handle kept past the end of `boot` keeps guest RAM, the ledger, and the
 /// block, net and vsock devices. It also keeps the VM, through the vCPU kicker
 /// on macOS and through those devices' interrupt lines on Linux. The vCPUs have
-/// exited by then, so a kick reaches none.
+/// exited or been left running by then, so a kick reaches only a vCPU left
+/// running.
 pub trait VmHandle: Send + Sync {
     /// The guest architecture this VM is running.
     fn arch(&self) -> GuestArch;
