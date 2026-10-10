@@ -28,7 +28,7 @@
 // clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 
 use applevisor::prelude::{
     ExitReason, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
@@ -662,40 +662,55 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // for this number before any limit is tightened: a ceiling picked without
     // knowing what a real build needs is a ceiling that breaks one.
     for (index, fs) in shared.fs.iter().enumerate() {
-        let dev = fs.dev.lock();
-        let dev = match dev {
-            Ok(d) => d,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        eprintln!(
-            "{LOG_PREFIX} virtio-fs[{index}]: peak {} of {} guest handles",
-            dev.peak_handles(),
-            dev.handle_limit()
-        );
-        let hist: Vec<String> = dev
-            .op_stats()
-            .into_iter()
-            .map(|(o, c, n)| {
-                format!(
-                    "{}({})={}/{:.1}ms",
-                    server::opcode_name(o),
-                    o,
-                    c,
-                    n as f64 / 1e6
-                )
-            })
-            .collect();
-        eprintln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
-        let (hits, waits, misses) = dev.readahead_stats();
-        eprintln!(
-            "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
-        );
+        report_fs_usage(index, &fs.dev);
     }
 
     if let Some(e) = failure {
         return Err(e);
     }
     Ok(shared.guest.vcpus.stop_reason())
+}
+
+/// Prints the peak handle count, the operation counts and times, and the
+/// readahead counts of virtio-fs device `index`.
+///
+/// A worker left running at the stop deadline can still hold the device, stuck
+/// in a host call, so the lock is only tried. When the device is held, one line
+/// says so and the statistics are skipped.
+fn report_fs_usage(index: usize, dev: &Mutex<VirtioFs>) {
+    let dev = match dev.try_lock() {
+        Ok(dev) => dev,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            eprintln!(
+                "{LOG_PREFIX} virtio-fs[{index}]: statistics skipped, the device is still in use"
+            );
+            return;
+        }
+    };
+    eprintln!(
+        "{LOG_PREFIX} virtio-fs[{index}]: peak {} of {} guest handles",
+        dev.peak_handles(),
+        dev.handle_limit()
+    );
+    let hist: Vec<String> = dev
+        .op_stats()
+        .into_iter()
+        .map(|(o, c, n)| {
+            format!(
+                "{}({})={}/{:.1}ms",
+                server::opcode_name(o),
+                o,
+                c,
+                n as f64 / 1e6
+            )
+        })
+        .collect();
+    eprintln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
+    let (hits, waits, misses) = dev.readahead_stats();
+    eprintln!(
+        "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
+    );
 }
 
 thread_local! {
@@ -1213,4 +1228,50 @@ fn gpr(idx: u8) -> Option<Reg> {
         30 => Reg::X30,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CachePolicy;
+    use std::time::{Duration, Instant};
+
+    // A worker stuck in a host call holds the device past the stop deadline.
+    // The report must not wait for it, or `boot` never returns the error that
+    // names the worker.
+    #[test]
+    fn report_fs_usage_skips_a_device_another_thread_holds() {
+        let dir = std::env::temp_dir().join(format!("hvi-fs-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let dev = Arc::new(Mutex::new(
+            VirtioFs::new(root, "share", false, CachePolicy::Auto).unwrap(),
+        ));
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || {
+                let _device = dev.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = released.recv();
+            })
+        };
+        holding.recv().unwrap();
+        let report = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || report_fs_usage(0, &dev))
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !report.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let finished = report.is_finished();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        report.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(finished, "the report waited for the device");
+    }
 }
