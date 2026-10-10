@@ -31,7 +31,8 @@ host:
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
-`Stop` is `SystemOff` or `SystemReset`: how the guest asked to halt.
+`Stop` is `SystemOff` or `SystemReset`: how the guest asked to halt. When a vCPU
+fails, `boot` returns an error that names the vCPU and says how it failed.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,

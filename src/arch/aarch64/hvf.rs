@@ -14,12 +14,12 @@
 
 //! The arm64 guest on Hypervisor.framework, SMP-capable.
 //!
-//! One thread per vCPU (an `applevisor::Vcpu` is thread-bound). cpu0 boots at
+//! One thread per vCPU (an `applevisor::Vcpu` is thread-bound). vcpu0 boots at
 //! the kernel entry; secondaries park until the guest brings them up via PSCI
 //! `CPU_ON`. Guest RAM is a `GuestRam` shared by every vCPU thread; devices,
 //! the event emitter, and the vCPU-handle list are shared behind locks. A
-//! plugin, if the caller supplied one, is called on cpu0 between guest
-//! entries — see [`crate::plugin`].
+//! plugin, if the caller supplied one, is called on vcpu0 between guest
+//! entries. See [`crate::plugin`].
 //!
 //! The exit-loop's timer/WFI/PC handling and the SMP hand-off are the
 //! boot-debug frontier.
@@ -28,6 +28,7 @@
 // clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 
 use applevisor::prelude::{
@@ -54,7 +55,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
-use crate::hypervisor::vcpus::{Kick, Vcpus};
+use crate::hypervisor::vcpus::{panic_message, Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
@@ -285,7 +286,10 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
 }
 
-/// Boots `cfg` and runs until the guest powers off.
+/// Boots `cfg` and runs the guest until it powers off or resets.
+///
+/// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
+/// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the one that did not stop within
@@ -650,6 +654,16 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .spawn((0..num_cpus).map(|_| shared.clone()), run_cpu);
     let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
     threads.join();
+    let outcome = shared.guest.vcpus.outcome();
+    if let Outcome::Failed(text) = &outcome {
+        // A spawn failure above is the one returned, so the vCPU's failure is
+        // printed.
+        if failure.is_some() {
+            stderrln!("{LOG_PREFIX} {text}");
+        } else {
+            failure = Some(text.clone().into());
+        }
+    }
 
     // The guest has stopped. End the I/O threads (see `teardown`) and write out
     // the ledger tail, which the flush cadence alone would leave in the buffer.
@@ -668,7 +682,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if let Some(e) = failure {
         return Err(e);
     }
-    Ok(shared.guest.vcpus.stop_reason())
+    outcome.into_result()
 }
 
 /// Prints the peak handle count, the operation counts and times, and the
@@ -739,7 +753,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         Err(e) => {
             // The secondaries would otherwise wait for a CPU_ON that cannot
             // arrive, and the join in `boot` with them.
-            eprintln!("{LOG_PREFIX} cpu{cpu_id}: vcpu_create failed: {e:?}");
+            sh.guest.vcpus.report(Outcome::Failed(format!(
+                "vcpu{cpu_id}: vcpu_create failed: {e:?}"
+            )));
             sh.guest.vcpus.stop();
             return;
         }
@@ -773,7 +789,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         match mbox.take() {
             Some((entry, ctx)) => {
                 drop(mbox);
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
+                eprintln!("{LOG_PREFIX} vcpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
                 let _ = vcpu.set_reg(Reg::PC, entry);
                 let _ = vcpu.set_reg(Reg::X0, ctx);
                 let _ = vcpu.set_reg(Reg::CPSR, 0x3c5);
@@ -787,14 +803,14 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // The loop runs inside `catch_unwind` only for the report. A panic is
     // reported with where the guest was and what it last did, and the guard
     // ends the VM on the way out.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         while sh.guest.vcpus.is_running() {
-            // Safe point for every vCPU: park here while cpu0 lets a plugin
+            // Safe point for every vCPU: park here while vcpu0 lets a plugin
             // look at the guest.
             sh.guest.vcpus.checkpoint();
-            // The plugin runs on cpu0, between guest entries, because only this
-            // thread can read this vCPU's registers. It is on the hot path:
-            // with no plugin this is a null check.
+            // The plugin runs on vcpu0, between guest entries, because only
+            // this thread can read this vCPU's registers. It is on the hot
+            // path: with no plugin this is a null check.
             if is_boot {
                 if let Some(obs) = sh.plugin.as_deref() {
                     obs.safepoint(&Cpu {
@@ -804,112 +820,112 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 }
             }
 
-            if let Err(e) = vcpu.run() {
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: vcpu run failed: {e:?}");
+            let flow = match vcpu.run() {
+                Ok(()) => handle_exit(&vcpu, &sh, cpu_id),
+                Err(e) => ControlFlow::Break(Outcome::Failed(format!(
+                    "vcpu{cpu_id}: vcpu run failed: {e:?}"
+                ))),
+            };
+            if let ControlFlow::Break(outcome) = flow {
+                sh.guest.vcpus.report(outcome);
                 break;
-            }
-            let exit = vcpu.get_exit_info();
-            LAST_EXIT.with(|last| last.set(Some(exit.reason)));
-            match exit.reason {
-                ExitReason::EXCEPTION => {
-                    let syn = exit.exception.syndrome;
-                    match Ec::from_syndrome(syn) {
-                        Ec::Hvc | Ec::Smc => {
-                            if service_psci(&vcpu, &sh) {
-                                break; // SYSTEM_OFF/RESET
-                            }
-                            // Not restartable: the saved PC is already past
-                            // HVC/SMC.
-                        }
-                        Ec::DataAbort => {
-                            let ipa = exit.exception.physical_address;
-                            if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
-                                service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
-                                advance_pc(&vcpu);
-                            } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
-                                if let Some(dev) = &sh.guest.block {
-                                    service_dev(&vcpu, &sh, dev, ipa - VIRTIO_BASE, syn);
-                                }
-                                advance_pc(&vcpu);
-                            } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE)
-                                .contains(&ipa)
-                            {
-                                if let Some(dev) = &sh.guest.net {
-                                    service_net(&vcpu, &sh, dev, ipa - VIRTIO_NET_BASE, syn);
-                                }
-                                advance_pc(&vcpu);
-                            } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE)
-                                .contains(&ipa)
-                            {
-                                if let Some(dev) = &sh.guest.vsock {
-                                    service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
-                                }
-                                advance_pc(&vcpu);
-                            } else if let Some(fs) = sh
-                                .fs
-                                .iter()
-                                .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
-                            {
-                                service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
-                                advance_pc(&vcpu);
-                            } else {
-                                eprintln!(
-                                    "{LOG_PREFIX} cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
-                                    vcpu.get_reg(Reg::PC).unwrap_or(0)
-                                );
-                                break;
-                            }
-                        }
-                        Ec::SysReg => {
-                            // RAZ/WI: unmodeled system register.
-                            let iss = syn & 0x1ff_ffff;
-                            if iss & 1 == 1 {
-                                write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, 0);
-                            }
-                            advance_pc(&vcpu);
-                        }
-                        Ec::Other(0x01) => {} // WFx: hvf handled the wait.
-                        other => {
-                            eprintln!(
-                                "{LOG_PREFIX} cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
-                                vcpu.get_reg(Reg::PC).unwrap_or(0)
-                            );
-                            break;
-                        }
-                    }
-                }
-                ExitReason::VTIMER_ACTIVATED => {
-                    let _ = vcpu.set_vtimer_mask(true);
-                }
-                ExitReason::CANCELED => {} // kicked for a snapshot or a stop
-                ExitReason::UNKNOWN => {
-                    // hvf could not say why it exited, so there is nothing to
-                    // resume into.
-                    eprintln!(
-                        "{LOG_PREFIX} cpu{cpu_id}: unknown exit reason (pc {:#x})",
-                        vcpu.get_reg(Reg::PC).unwrap_or(0)
-                    );
-                    break;
-                }
             }
         }
     }));
 
-    if let Err(payload) = outcome {
+    if let Err(payload) = unwound {
         // The report names where the guest was and what it last did, so it is
-        // usable without a debugger. `payload` carries the panic message for
-        // the two types a `panic!` produces.
-        let what = payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown payload".to_string());
-        eprintln!(
-            "{LOG_PREFIX} cpu{cpu_id}: panicked ({what}); last exit {:?}, pc {:#x}",
+        // usable without a debugger.
+        sh.guest.vcpus.report(Outcome::Failed(format!(
+            "vcpu{cpu_id}: panicked ({}); last exit {:?}, pc {:#x}",
+            panic_message(&*payload),
             last_exit(),
             vcpu.get_reg(Reg::PC).unwrap_or(0)
-        );
+        )));
     }
+}
+
+/// Services one exit of vCPU `cpu_id`.
+///
+/// Returns `ControlFlow::Break` with the run's outcome when the exit ends the
+/// run, and `ControlFlow::Continue` otherwise. The outcome is a guest-requested
+/// stop or a failure.
+fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32) -> ControlFlow<Outcome> {
+    let exit = vcpu.get_exit_info();
+    LAST_EXIT.with(|last| last.set(Some(exit.reason)));
+    match exit.reason {
+        ExitReason::EXCEPTION => {
+            let syn = exit.exception.syndrome;
+            match Ec::from_syndrome(syn) {
+                Ec::Hvc | Ec::Smc => {
+                    service_psci(vcpu, sh)?;
+                    // Not restartable: the saved PC is already past HVC/SMC.
+                }
+                Ec::DataAbort => {
+                    let ipa = exit.exception.physical_address;
+                    if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
+                        service_uart(vcpu, sh, ipa - UART_BASE, syn);
+                        advance_pc(vcpu);
+                    } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
+                        if let Some(dev) = &sh.guest.block {
+                            service_dev(vcpu, sh, dev, ipa - VIRTIO_BASE, syn);
+                        }
+                        advance_pc(vcpu);
+                    } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
+                        if let Some(dev) = &sh.guest.net {
+                            service_net(vcpu, sh, dev, ipa - VIRTIO_NET_BASE, syn);
+                        }
+                        advance_pc(vcpu);
+                    } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&ipa) {
+                        if let Some(dev) = &sh.guest.vsock {
+                            service_vsock(vcpu, sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
+                        }
+                        advance_pc(vcpu);
+                    } else if let Some(fs) = sh
+                        .fs
+                        .iter()
+                        .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
+                    {
+                        service_fs(vcpu, sh, fs, ipa - fs.base, syn);
+                        advance_pc(vcpu);
+                    } else {
+                        return ControlFlow::Break(Outcome::Failed(format!(
+                            "vcpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
+                            vcpu.get_reg(Reg::PC).unwrap_or(0)
+                        )));
+                    }
+                }
+                Ec::SysReg => {
+                    // RAZ/WI: unmodeled system register.
+                    let iss = syn & 0x1ff_ffff;
+                    if iss & 1 == 1 {
+                        write_gpr(vcpu, ((iss >> 5) & 0x1f) as u8, 0);
+                    }
+                    advance_pc(vcpu);
+                }
+                Ec::Other(0x01) => {} // WFx: hvf handled the wait.
+                other => {
+                    return ControlFlow::Break(Outcome::Failed(format!(
+                        "vcpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
+                        vcpu.get_reg(Reg::PC).unwrap_or(0)
+                    )));
+                }
+            }
+        }
+        ExitReason::VTIMER_ACTIVATED => {
+            let _ = vcpu.set_vtimer_mask(true);
+        }
+        ExitReason::CANCELED => {} // kicked for a snapshot or a stop
+        ExitReason::UNKNOWN => {
+            // hvf could not say why it exited, so there is nothing to resume
+            // into.
+            return ControlFlow::Break(Outcome::Failed(format!(
+                "vcpu{cpu_id}: unknown exit reason (pc {:#x})",
+                vcpu.get_reg(Reg::PC).unwrap_or(0)
+            )));
+        }
+    }
+    ControlFlow::Continue(())
 }
 
 impl VcpuRegs for Vcpu {
@@ -930,23 +946,19 @@ impl VcpuRegs for Vcpu {
     }
 }
 
-/// Handles a PSCI call. Returns `true` if the VM should stop
-/// (SYSTEM_OFF/RESET).
-fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
+/// Handles a PSCI call.
+///
+/// Returns `ControlFlow::Break` with the stop for `SYSTEM_OFF` and
+/// `SYSTEM_RESET`, and `ControlFlow::Continue` otherwise.
+fn service_psci(vcpu: &Vcpu, sh: &Shared) -> ControlFlow<Outcome> {
     let fid = vcpu.get_reg(Reg::X0).unwrap_or(0);
     match fid {
         psci::VERSION => {
             let _ = vcpu.set_reg(Reg::X0, 0x0001_0000); // v1.0
-            false
+            ControlFlow::Continue(())
         }
-        psci::SYSTEM_OFF => {
-            sh.guest.vcpus.set_stop_reason(Stop::SystemOff);
-            true
-        }
-        psci::SYSTEM_RESET => {
-            sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
-            true
-        }
+        psci::SYSTEM_OFF => ControlFlow::Break(Outcome::Stopped(Stop::SystemOff)),
+        psci::SYSTEM_RESET => ControlFlow::Break(Outcome::Stopped(Stop::SystemReset)),
         psci::FEATURES => {
             let q = vcpu.get_reg(Reg::X1).unwrap_or(0);
             let known = matches!(
@@ -965,7 +977,7 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
                     psci::NOT_SUPPORTED
                 },
             );
-            false
+            ControlFlow::Continue(())
         }
         psci::CPU_ON_64 => {
             let target = vcpu.get_reg(Reg::X1).unwrap_or(0);
@@ -982,15 +994,15 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
                 psci::NOT_SUPPORTED
             };
             let _ = vcpu.set_reg(Reg::X0, ret);
-            false
+            ControlFlow::Continue(())
         }
         psci::CPU_OFF => {
             let _ = vcpu.set_reg(Reg::X0, psci::SUCCESS);
-            false
+            ControlFlow::Continue(())
         }
         _ => {
             let _ = vcpu.set_reg(Reg::X0, psci::NOT_SUPPORTED);
-            false
+            ControlFlow::Continue(())
         }
     }
 }

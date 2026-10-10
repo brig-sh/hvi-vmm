@@ -15,23 +15,24 @@
 //! The vCPU threads of a VM, from their spawn to their join.
 //!
 //! [`Vcpus`] holds what every backend keeps about its vCPU threads: whether the
-//! VM still runs, the quiesce that parks them for a plugin, the reason the
-//! guest stopped and how many there are. Each vCPU thread checks the first two
-//! at the top of its run loop, between guest entries. The stop clears the
-//! running flag, kicks every vCPU out of the hypervisor and then releases the
-//! quiesce, so each one sees the stop at its next check.
+//! VM still runs, the quiesce that parks them for a plugin, how the run ended
+//! and how many there are. Each vCPU thread checks the first two at the top of
+//! its run loop, between guest entries. The stop clears the running flag, kicks
+//! every vCPU out of the hypervisor and then releases the quiesce, so each one
+//! sees the stop at its next check.
 //!
 //! How a kick reaches a vCPU depends on the hypervisor, so [`Vcpus`] takes it
 //! from a [`Kick`] implementation that owns the table of vCPU threads.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::config::Stop;
 use crate::hypervisor::quiesce::Quiesce;
 use crate::sync::lock_or_recover;
+use crate::LOG_PREFIX;
 
 /// How the hypervisor ends a vCPU's run.
 ///
@@ -55,8 +56,8 @@ pub(crate) struct Vcpus<K> {
     running: AtomicBool,
     /// The barrier that parks the vCPUs for a pause.
     quiesce: Quiesce,
-    /// How the guest asked to stop, once it has.
-    stop: Mutex<Option<Stop>>,
+    /// How the run ended, from the first report or a failure after a stop.
+    outcome: Mutex<Option<Outcome>>,
     /// The number of vCPUs.
     count: u32,
     /// The number of vCPUs that have entered their run loop.
@@ -71,7 +72,7 @@ impl<K: Kick> Vcpus<K> {
         Self {
             running: AtomicBool::new(true),
             quiesce: Quiesce::new(),
-            stop: Mutex::new(None),
+            outcome: Mutex::new(None),
             count,
             started: AtomicU32::new(0),
             kicker,
@@ -161,27 +162,55 @@ impl<K: Kick> Vcpus<K> {
         StopOnDrop { vcpus: self }
     }
 
-    /// Records how the guest asked to stop.
-    pub(crate) fn set_stop_reason(&self, stop: Stop) {
-        *lock_or_recover(&self.stop) = Some(stop);
+    /// Records how the run ended.
+    ///
+    /// The first report is kept, except that a failure replaces an earlier
+    /// stop, so a vCPU that fails while the guest powers off ends the run with
+    /// its failure. A failure that is not kept is printed. The vCPUs a stop
+    /// kicks leave their loops without a report, so a later report comes from a
+    /// thread that stopped or failed on its own at the same time. A report can
+    /// come from a thread that unwinds from a panic, where a second panic
+    /// aborts the process.
+    pub(crate) fn report(&self, outcome: Outcome) {
+        let mut kept = lock_or_recover(&self.outcome);
+        let replaces = matches!(
+            (kept.as_ref(), &outcome),
+            (None, _) | (Some(Outcome::Stopped(_)), Outcome::Failed(_))
+        );
+        if replaces {
+            *kept = Some(outcome);
+        } else if let Outcome::Failed(text) = outcome {
+            drop(kept);
+            stderrln!("{LOG_PREFIX} {text}");
+        }
     }
 
-    /// Returns how the guest asked to stop, or [`Stop::SystemOff`] when it did
-    /// not say.
-    pub(crate) fn stop_reason(&self) -> Stop {
-        lock_or_recover(&self.stop).unwrap_or(Stop::SystemOff)
+    /// Returns how the run ended.
+    ///
+    /// Every failure is reported, so a run with no report is one in which the
+    /// guest stopped without saying how, and it reads as [`Stop::SystemOff`].
+    pub(crate) fn outcome(&self) -> Outcome {
+        lock_or_recover(&self.outcome)
+            .clone()
+            .unwrap_or(Outcome::Stopped(Stop::SystemOff))
     }
 
     /// Spawns one thread per vCPU, each running `run` with its id and the item
     /// of `per_vcpu` at that position.
     ///
     /// Each thread is named after its vCPU, so a panic report says which one
-    /// panicked. A failed spawn stops the VM and spawns no further thread. The
-    /// threads spawned before it are returned beside the error, so the caller
-    /// can join them. `per_vcpu` must yield one item per vCPU. When it does
-    /// not, the VM is stopped and no thread is spawned.
-    pub(crate) fn spawn<T, I>(&self, per_vcpu: I, run: fn(u32, T)) -> (VcpuThreads, io::Result<()>)
+    /// panicked, and a panic that leaves `run` is reported as that vCPU's
+    /// failure, with its message. A failed spawn stops the VM and spawns no
+    /// further thread. The threads spawned before it are returned beside the
+    /// error, so the caller can join them. `per_vcpu` must yield one item per
+    /// vCPU. When it does not, the VM is stopped and no thread is spawned.
+    pub(crate) fn spawn<T, I>(
+        self: &Arc<Self>,
+        per_vcpu: I,
+        run: fn(u32, T),
+    ) -> (VcpuThreads, io::Result<()>)
     where
+        K: 'static,
         T: Send + 'static,
         I: IntoIterator<Item = T>,
         I::IntoIter: ExactSizeIterator,
@@ -197,19 +226,48 @@ impl<K: Kick> Vcpus<K> {
         }
         let mut threads = Vec::new();
         for (id, item) in (0..self.count).zip(per_vcpu) {
+            let vcpus = Arc::clone(self);
             let spawned = std::thread::Builder::new()
-                .name(format!("cpu{id}"))
-                .spawn(move || run(id, item));
+                .name(format!("vcpu{id}"))
+                .spawn(move || {
+                    let unwound =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(id, item)));
+                    if let Err(payload) = unwound {
+                        vcpus.report(Outcome::Failed(format!(
+                            "vcpu{id}: panicked ({})",
+                            panic_message(&*payload)
+                        )));
+                    }
+                });
             match spawned {
                 Ok(thread) => threads.push(thread),
                 Err(e) => {
                     self.stop();
-                    let e = io::Error::new(e.kind(), format!("spawning the cpu{id} thread: {e}"));
+                    let e = io::Error::new(e.kind(), format!("spawning the vcpu{id} thread: {e}"));
                     return (VcpuThreads(threads), Err(e));
                 }
             }
         }
         (VcpuThreads(threads), Ok(()))
+    }
+}
+
+/// How a run ended.
+#[derive(Clone, Debug)]
+pub(crate) enum Outcome {
+    /// The guest asked to stop.
+    Stopped(Stop),
+    /// A vCPU failed, with the text that says how.
+    Failed(String),
+}
+
+impl Outcome {
+    /// Returns the stop, or the failure as an error.
+    pub(crate) fn into_result(self) -> Result<Stop, Box<dyn std::error::Error>> {
+        match self {
+            Outcome::Stopped(stop) => Ok(stop),
+            Outcome::Failed(text) => Err(text.into()),
+        }
     }
 }
 
@@ -223,6 +281,18 @@ impl<K: Kick> Drop for StopOnDrop<'_, K> {
     fn drop(&mut self) {
         self.vcpus.stop();
     }
+}
+
+/// Returns the message a panic carried, from its payload.
+///
+/// A `panic!` carries a `&str` or a `String`, and any other payload reads as
+/// `unknown payload`.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown payload".to_string())
 }
 
 /// The vCPU threads [`Vcpus::spawn`] started.
@@ -434,8 +504,28 @@ mod tests {
     }
 
     #[test]
+    fn spawn_reports_a_panic_with_its_message() {
+        let vcpus = Arc::new(Vcpus::new(1, CountingKicker::default()));
+        let (threads, spawned) = vcpus.spawn(0..1, |_, _: i32| panic!("the run loop panicked"));
+        spawned.unwrap();
+        threads.join();
+        assert!(matches!(
+            vcpus.outcome(),
+            Outcome::Failed(text) if text == "vcpu0: panicked (the run loop panicked)"
+        ));
+    }
+
+    #[test]
+    fn stop_on_drop_reports_nothing_on_a_return() {
+        let vcpus = Vcpus::new(1, CountingKicker::default());
+        drop(vcpus.stop_on_drop());
+        assert!(!vcpus.is_running());
+        assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::SystemOff)));
+    }
+
+    #[test]
     fn spawn_runs_each_vcpu_on_a_thread_named_after_it() {
-        let vcpus = Vcpus::new(3, CountingKicker::default());
+        let vcpus = Arc::new(Vcpus::new(3, CountingKicker::default()));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (threads, spawned) = vcpus.spawn(
             (0..3).map(|n| (Arc::clone(&seen), n * 10)),
@@ -451,16 +541,16 @@ mod tests {
         assert_eq!(
             seen,
             [
-                (0, 0, Some("cpu0".to_string())),
-                (1, 10, Some("cpu1".to_string())),
-                (2, 20, Some("cpu2".to_string())),
+                (0, 0, Some("vcpu0".to_string())),
+                (1, 10, Some("vcpu1".to_string())),
+                (2, 20, Some("vcpu2".to_string())),
             ]
         );
     }
 
     #[test]
     fn spawn_rejects_items_for_another_number_of_vcpus() {
-        let vcpus = Vcpus::new(3, CountingKicker::default());
+        let vcpus = Arc::new(Vcpus::new(3, CountingKicker::default()));
         let (threads, spawned) = vcpus.spawn(0..2, |_, _: i32| {});
         threads.join();
         assert_eq!(spawned.unwrap_err().kind(), io::ErrorKind::InvalidInput);
@@ -468,10 +558,35 @@ mod tests {
     }
 
     #[test]
-    fn stop_reason_is_system_off_until_the_guest_names_one() {
+    fn outcome_is_system_off_until_a_vcpu_reports_one() {
         let vcpus = Vcpus::new(1, CountingKicker::default());
-        assert!(matches!(vcpus.stop_reason(), Stop::SystemOff));
-        vcpus.set_stop_reason(Stop::SystemReset);
-        assert!(matches!(vcpus.stop_reason(), Stop::SystemReset));
+        assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::SystemOff)));
+        vcpus.report(Outcome::Stopped(Stop::SystemReset));
+        assert!(matches!(
+            vcpus.outcome(),
+            Outcome::Stopped(Stop::SystemReset)
+        ));
+    }
+
+    // A failure on one vCPU stops the VM, and a vCPU that then stops on its own
+    // must not replace the failure with a clean stop.
+    #[test]
+    fn first_report_is_the_outcome() {
+        let vcpus = Vcpus::new(2, CountingKicker::default());
+        vcpus.report(Outcome::Failed("vcpu1: KVM internal error".to_string()));
+        vcpus.report(Outcome::Stopped(Stop::SystemOff));
+        assert!(
+            matches!(vcpus.outcome(), Outcome::Failed(text) if text == "vcpu1: KVM internal error")
+        );
+    }
+
+    #[test]
+    fn failure_takes_the_place_of_an_earlier_stop() {
+        let vcpus = Vcpus::new(2, CountingKicker::default());
+        vcpus.report(Outcome::Stopped(Stop::SystemOff));
+        vcpus.report(Outcome::Failed("vcpu1: failed".into()));
+        vcpus.report(Outcome::Failed("vcpu0: failed".into()));
+        vcpus.report(Outcome::Stopped(Stop::SystemReset));
+        assert!(matches!(vcpus.outcome(), Outcome::Failed(text) if text == "vcpu1: failed"));
     }
 }

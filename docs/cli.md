@@ -171,7 +171,7 @@ a real boot would describe.
 | Variable | Read by | Effect |
 | --- | --- | --- |
 | `HVI_SECCOMP=log` | Linux | Install the same allowlists, but let an off-list syscall run and be recorded instead of killing the process. **This turns enforcement off.** |
-| `HVI_X86_TRACE` | x86-64 | Any value. Log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick cpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
+| `HVI_X86_TRACE` | x86-64 | Any value. Log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
 | `HVI_BLK_TRACE` | all | Any value. Log every virtio-blk request to stderr. Off by default: one synchronous write per request. |
 
 There are no others at run time. `HVI_BLOCK_DEV` appears only inside a test
@@ -186,7 +186,16 @@ An embedder inherits these from the process environment. They are not part of
 | --- | --- |
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
-| The guest halts on x86-64 | Reported as `SystemOff`, because a halt records no reason. |
+| A vCPU fails | `hvi: <what failed>`, exit 1. |
+| The guest halts or powers off on x86-64 | The run does not end. |
+
+A vCPU fails on an exit hvi does not service, on an error from the hypervisor,
+or on a panic in hvi. On macOS, an access to an address no device answers is
+such an exit. The line names the vCPU and the failure.
+
+An x86-64 guest has no power-off: hvi gives it no ACPI, so Linux halts it in
+place, and KVM handles the halt without leaving the vCPU. A guest booted with
+`reboot=t` ends the run with `reboot -f`, which hvi reports as `SystemReset`.
 
 **hvi never reboots a guest.** `SystemReset` ends the process exactly as
 `SystemOff` does. Nothing loops around `hvi::boot`. An integration that wants a
@@ -282,8 +291,8 @@ this host offers only vGICv2, which supports at most 8 vCPUs (asked for 16)
 ```
 
 macOS and x86-64 have no hvi-side cap. An over-large `--cpus` on macOS spawns
-that many threads and then fails per vCPU with `[hvi] cpuN: vcpu_create
-failed`. The absence of a cap is not unlimited capacity.
+that many threads, and the run then fails with `hvi: vcpuN: vcpu_create failed`
+and exit 1. The absence of a cap is not unlimited capacity.
 
 ## See also
 

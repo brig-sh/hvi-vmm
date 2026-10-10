@@ -131,7 +131,7 @@ impl<K: Kick> VmHandle for Guest<K> {
     }
 
     fn kick(&self) {
-        // cpu0 is the one that reaches the plugin hook.
+        // vcpu0 is the one that reaches the plugin hook.
         self.vcpus.kicker().kick(0);
     }
 }
