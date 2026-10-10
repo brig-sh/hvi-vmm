@@ -32,15 +32,15 @@
 // VMM's own.
 #![allow(clippy::disallowed_methods)]
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
     kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
     kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF,
     KVM_ARM_VCPU_PSCI_0_2, KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR,
-    KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET,
-    KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST,
-    KVM_VGIC_V3_ADDR_TYPE_REDIST,
+    KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_VGIC_V2_ADDR_TYPE_CPU,
+    KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
@@ -59,7 +59,7 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
-    kick_handle, run_guest, run_vcpu, start_io_threads, Kicker, KvmIrqLine,
+    kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::NetSource;
@@ -372,7 +372,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     )
 }
 
-/// Runs one vCPU until the VM stops, servicing its MMIO and PSCI exits.
+/// Runs one vCPU until the VM stops, servicing its MMIO exits.
 fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     run_vcpu(
         cpu_id,
@@ -380,55 +380,22 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         kick_handle,
         &sh.guest,
         sh.plugin.as_deref(),
-        |vcpu| {
-            match vcpu.run() {
-                Ok(VcpuExit::MmioRead(addr, data)) => on_mmio(&sh, addr, true, data),
-                Ok(VcpuExit::MmioWrite(addr, data)) => {
+        |exit| {
+            match exit {
+                VcpuExit::MmioRead(addr, data) => on_mmio(&sh, addr, true, data),
+                VcpuExit::MmioWrite(addr, data) => {
                     // Copy out first: `data` borrows the run struct.
                     let mut buf = [0u8; 8];
                     let n = data.len().min(8);
                     buf[..n].copy_from_slice(&data[..n]);
                     on_mmio_write(&sh, addr, &buf[..n]);
                 }
-                Ok(VcpuExit::SystemEvent(evtype, _)) => {
-                    // PSCI SYSTEM_RESET vs SYSTEM_OFF (and anything else ->
-                    // off).
-                    let s = if evtype == KVM_SYSTEM_EVENT_RESET {
-                        Stop::SystemReset
-                    } else {
-                        Stop::SystemOff
-                    };
-                    sh.guest.vcpus.set_stop_reason(s);
-                    return false;
-                }
-                Ok(VcpuExit::Hlt) => return false,
+                VcpuExit::Hlt => return ControlFlow::Break(()),
                 // Kicked for a snapshot or a stop; the loop checks which.
-                Ok(VcpuExit::Intr) => {}
-                Ok(VcpuExit::FailEntry(reason, cpu)) => {
-                    eprintln!(
-                        "{LOG_PREFIX} cpu{cpu_id}: KVM entry failed reason={reason:#x} cpu={cpu}"
-                    );
-                    return false;
-                }
-                Ok(other) => {
-                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: unhandled exit {other:?}");
-                    return false;
-                }
-                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
-                    // A run that a kick cut short has completed the MMIO exit
-                    // before it and left `exit_reason` as it was. Linux 5.0 to
-                    // 5.2, and the stable series that took that change back to
-                    // 4.14, complete the exit again on the next run, which
-                    // skips one more guest instruction, so the reason is
-                    // cleared here.
-                    vcpu.get_kvm_run().exit_reason = KVM_EXIT_INTR;
-                }
-                Err(e) => {
-                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: KVM_RUN error: {e}");
-                    return false;
-                }
+                VcpuExit::Intr => {}
+                other => return unhandled_exit(cpu_id, &other),
             }
-            true
+            ControlFlow::Continue(())
         },
     );
 }
