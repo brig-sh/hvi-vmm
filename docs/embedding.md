@@ -14,7 +14,7 @@ tool once you are here, read [plugins.md](plugins.md).
 hvi = { git = "https://github.com/brig-sh/hvi-vmm", rev = "<commit>" }
 ```
 
-There is no published crate, no release and no tag, so pin a commit. The API
+There is no published crate and no release cut yet, so pin a commit. The API
 is not stable, and there is no compatibility promise between commits.
 
 hull, the first consumer, does the same thing a level up: it vendors hvi as a

@@ -165,7 +165,7 @@ hook to every member in insertion order. `attach` stops at the first error.
 - **Not a dynamically loadable plugin system.** The crate builds as an rlib.
   There is no `cdylib`, no `dlopen`, no `libloading`. A tool is linked at
   compile time.
-- **Not a stable ABI.** There is no released version and no tag. Pin a commit.
+- **Not a stable ABI.** No release is cut yet. Pin a commit.
 - **Not separately confined.** A plugin runs inside the VMM process, with the
   same authority. `attach` runs before the confinement is installed. The other
   hooks run under the same Seatbelt profile or seccomp filters as the VMM. On
@@ -181,4 +181,4 @@ hvi = { git = "https://github.com/brig-sh/hvi-vmm", rev = "<commit>" }
 
 Pin a fixed point, not a branch. `hvi --version` reports the VMM core a binary
 was built against, and that is only worth printing if the core is a fixed
-thing. No tag is published yet, so pin a `rev`.
+thing. No release is cut yet, so pin a `rev`.
