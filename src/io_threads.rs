@@ -21,9 +21,10 @@
 //! exited or been left running, [`IoThreads::stop`] requests the stop and joins
 //! every thread, as `teardown` describes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::devices::virtio::net::GatewayRelay;
 #[cfg(target_os = "linux")]
@@ -33,8 +34,9 @@ use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::Kick;
 use crate::plugin::Plugin;
 use crate::sandbox::confine_io_thread;
+use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
-use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
+use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
 use crate::LOG_PREFIX;
 
@@ -57,9 +59,11 @@ pub(crate) struct IoThreads {
     /// The stop the threads poll.
     source: StopSource,
     /// The console reader, which the stop also has to signal.
-    console: JoinHandle<()>,
+    console: IoThread,
     /// Every other thread.
-    threads: Vec<JoinHandle<()>>,
+    threads: Vec<IoThread>,
+    /// The count each thread notes on as it ends.
+    finish_count: Arc<FinishCount>,
     /// The actions the stop runs before it joins the threads.
     stop_actions: Vec<Box<dyn FnOnce() + Send>>,
 }
@@ -80,13 +84,20 @@ impl IoThreads {
         net: Option<NetSource>,
     ) -> Self {
         let vcpus = Arc::clone(&guest.vcpus);
-        let console = spawn_thread("console reader", source.token(), move |stop| {
-            terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
-        });
+        let finish_count = Arc::new(FinishCount::default());
+        let console = IoThread::spawn(
+            "console reader",
+            source.token(),
+            &finish_count,
+            move |stop| {
+                terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
+            },
+        );
         let mut io_threads = Self {
             source,
             console,
             threads: Vec::new(),
+            finish_count,
             stop_actions: Vec::new(),
         };
         if let Some(bridge) = bridge {
@@ -130,7 +141,7 @@ impl IoThreads {
         name: &'static str,
         body: impl FnOnce(StopToken) + Send + 'static,
     ) {
-        let thread = spawn_thread(name, self.source.token(), body);
+        let thread = IoThread::spawn(name, self.source.token(), &self.finish_count, body);
         self.threads.push(thread);
     }
 
@@ -147,10 +158,11 @@ impl IoThreads {
     /// Requests the stop and joins every thread.
     ///
     /// The stop actions run after the request, in the order they were added.
-    /// The console reader also gets the kick signal until it exits, since a
-    /// read of stdin is where the stop token cannot reach it. Every join shares
-    /// one deadline, [`STOP_TIMEOUT`] after the stop actions have run. A thread
-    /// still running at the deadline is left running and reported on stderr.
+    /// The console reader also gets the kick signal until it has finished,
+    /// since a read of stdin is where the stop token cannot reach it. The wait
+    /// for the threads ends when the last one has finished, or [`STOP_TIMEOUT`]
+    /// after the stop actions have run. A thread still running then is left
+    /// running and reported on stderr.
     ///
     /// # Errors
     ///
@@ -161,10 +173,13 @@ impl IoThreads {
             action();
         }
         let deadline = Instant::now() + STOP_TIMEOUT;
-        kick_until_finished(&self.console, deadline);
+        self.console
+            .kick_until_finished(&self.finish_count, deadline);
+        let count = u32::try_from(self.threads.len() + 1).unwrap_or(u32::MAX);
+        let _ = self.finish_count.wait_for(count, deadline);
         let mut failure = None;
         for thread in std::iter::once(self.console).chain(self.threads) {
-            if let Err(e) = join_by(thread, deadline) {
+            if let Err(e) = thread.try_join() {
                 stderrln!("{LOG_PREFIX} {e}; left running");
                 failure.get_or_insert(e);
             }
@@ -179,32 +194,164 @@ impl IoThreads {
     /// returns at once.
     pub(crate) fn idle() -> Self {
         let source = StopSource::new().expect("stop pair");
-        let console = spawn_thread("console reader", source.token(), |_| {});
+        let finish_count = Arc::new(FinishCount::default());
+        let console = IoThread::spawn("console reader", source.token(), &finish_count, |_| {});
         Self {
             source,
             console,
             threads: Vec::new(),
+            finish_count,
             stop_actions: Vec::new(),
         }
     }
 }
 
-/// Starts a thread named `name` that confines itself and then runs `body` with
-/// `stop`.
-///
-/// # Panics
-///
-/// Panics if the thread cannot be created.
-fn spawn_thread(
-    name: &'static str,
-    stop: StopToken,
-    body: impl FnOnce(StopToken) + Send + 'static,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            confine_io_thread();
-            body(stop);
-        })
-        .unwrap_or_else(|e| panic!("spawning the {name} thread: {e}"))
+/// An I/O thread, with the flag it sets as it ends.
+struct IoThread {
+    /// The thread, which carries its name.
+    handle: JoinHandle<()>,
+    /// Whether the thread has finished, set by its [`FinishGuard`].
+    finished: Arc<AtomicBool>,
+}
+
+impl IoThread {
+    /// Starts a thread named `name` that confines itself and then runs `body`
+    /// with `stop`.
+    ///
+    /// The thread holds a [`FinishGuard`] that notes on `count`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thread cannot be created.
+    fn spawn(
+        name: &'static str,
+        stop: StopToken,
+        count: &Arc<FinishCount>,
+        body: impl FnOnce(StopToken) + Send + 'static,
+    ) -> Self {
+        let finished = Arc::new(AtomicBool::new(false));
+        // The guard is built on the thread, so a thread that is never created
+        // notes nothing.
+        let (flag, count) = (Arc::clone(&finished), Arc::clone(count));
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _finished = FinishGuard {
+                    finished: flag,
+                    count,
+                };
+                confine_io_thread();
+                body(stop);
+            })
+            .unwrap_or_else(|e| panic!("spawning the {name} thread: {e}"));
+        Self { handle, finished }
+    }
+
+    /// Sends the kick signal to the thread until its flag is set, or until
+    /// `deadline` passes.
+    ///
+    /// The signal ends a blocking read on the thread with `EINTR`. It is sent
+    /// again after each wait, since a signal sent before the read blocks is
+    /// lost. Between two kicks the loop waits on `count` for at most a
+    /// millisecond. A note from any thread, this one included, ends that wait
+    /// sooner. The loop stops at the deadline when the signal cannot end the
+    /// read.
+    fn kick_until_finished(&self, count: &FinishCount, deadline: Instant) {
+        use std::os::unix::thread::JoinHandleExt;
+        loop {
+            // The count is read before the flag, so a note that lands after the
+            // check ends the wait below at once.
+            let finished = count.finished();
+            if self.finished.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                return;
+            }
+            // SAFETY: the handle has not been joined, so its thread id is live;
+            // the handler is a no-op. The cast is for musl, where std and libc
+            // spell `pthread_t` differently.
+            unsafe {
+                libc::pthread_kill(self.handle.as_pthread_t() as libc::pthread_t, kick_signal())
+            };
+            let _ = count.wait_for(
+                finished + 1,
+                (Instant::now() + Duration::from_millis(1)).min(deadline),
+            );
+        }
+    }
+
+    /// Joins the thread if it has finished.
+    ///
+    /// A thread that has set its flag has left its body, so the join returns at
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// Errors with the thread's name when it has not finished.
+    fn try_join(self) -> std::io::Result<()> {
+        if self.finished.load(Ordering::SeqCst) {
+            let _ = self.handle.join();
+            return Ok(());
+        }
+        let name = self.handle.thread().name().unwrap_or("an I/O thread");
+        Err(std::io::Error::other(format!(
+            "{name} did not stop within {STOP_TIMEOUT:?}"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Starts a thread that runs `body` and notes on `count`.
+    fn spawn(count: &Arc<FinishCount>, body: impl FnOnce() + Send + 'static) -> IoThread {
+        let source = StopSource::new().unwrap();
+        IoThread::spawn("test", source.token(), count, move |_| body())
+    }
+
+    #[test]
+    fn thread_that_exits_is_noted_and_joined() {
+        let count = Arc::new(FinishCount::default());
+        let thread = spawn(&count, || {});
+        assert!(count.wait_for(1, Instant::now() + Duration::from_secs(5)));
+        thread.try_join().unwrap();
+    }
+
+    // A thread stuck in a call the stop cannot interrupt must be reported once
+    // the wait ends, or `boot` would not return. The thread beside it that
+    // finished is still joined.
+    #[test]
+    fn thread_that_does_not_exit_is_reported() {
+        let count = Arc::new(FinishCount::default());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stuck = spawn(&count, move || {
+            let _ = released.recv();
+        });
+        let quick = spawn(&count, || {});
+        assert!(count.wait_for(1, Instant::now() + Duration::from_secs(5)));
+        quick.try_join().unwrap();
+        assert!(!count.wait_for(2, Instant::now() + Duration::from_millis(50)));
+        let error = stuck.try_join().expect_err("a running thread was joined");
+        assert!(
+            error.to_string().starts_with("test did not stop"),
+            "{error}"
+        );
+        release.send(()).unwrap();
+    }
+
+    // The thread blocks in a read until a kick ends it with `EINTR`, so the
+    // loop ends early only if its kick reaches the read.
+    #[test]
+    fn kick_loop_ends_once_a_kick_ends_the_read() {
+        crate::signal::install_kick_handler();
+        let (mut read, _write) = std::io::pipe().unwrap();
+        let count = Arc::new(FinishCount::default());
+        let thread = spawn(&count, move || {
+            let mut byte = [0u8; 1];
+            let _ = std::io::Read::read(&mut read, &mut byte);
+        });
+        let start = Instant::now();
+        thread.kick_until_finished(&count, Instant::now() + Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        thread.try_join().unwrap();
+    }
 }

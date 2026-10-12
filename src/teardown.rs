@@ -24,12 +24,14 @@
 //! condition variable, and a stop action that `IoThreads::stop` runs wakes it.
 //! The console reader reads stdin, which the whole process shares, so a byte
 //! another reader took between the poll and the read would leave it blocked;
-//! `IoThreads::stop` sends it the kick signal until it has exited, with
-//! `kick_until_finished`.
+//! `IoThreads::stop` sends it the kick signal until it has finished, with
+//! `IoThread::kick_until_finished`.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
 //! the deadline is left running and `boot` returns an error naming it, since a
-//! wait `boot` cannot interrupt must not keep `boot` from returning.
+//! wait `boot` cannot interrupt must not keep `boot` from returning. Each I/O
+//! thread notes on a `FinishCount` as it ends, so `IoThreads::stop` waits until
+//! the last one has or the deadline passes.
 //!
 //! The request shuts down the write half of a socket pair, which leaves the
 //! read half readable for every token from then on. Dropping the `StopSource`
@@ -43,11 +45,11 @@
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::signal::kick_signal;
+use crate::sync::lock_or_recover;
 
 /// How long the stop waits for the vCPU threads, then for the helper threads,
 /// and then for the ledger, after it is requested.
@@ -56,41 +58,57 @@ use crate::signal::kick_signal;
 /// `safepoint` and a virtio-fs worker waiting on a host file lock.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Joins `thread` if it exits before `deadline`.
-///
-/// A thread that has not exited by the deadline is left running.
-///
-/// # Errors
-///
-/// Errors with the thread's name when it has not exited by the deadline.
-pub fn join_by(thread: JoinHandle<()>, deadline: Instant) -> io::Result<()> {
-    while !thread.is_finished() {
-        if Instant::now() >= deadline {
-            let name = thread.thread().name().unwrap_or("an I/O thread");
-            return Err(io::Error::other(format!(
-                "{name} did not stop within {}s",
-                STOP_TIMEOUT.as_secs()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let _ = thread.join();
-    Ok(())
+/// A count of the helper threads that have finished.
+#[derive(Default)]
+pub(crate) struct FinishCount {
+    /// The number of threads that have noted they finished.
+    count: Mutex<u32>,
+    /// The condition variable notified at each note.
+    changed: Condvar,
 }
 
-/// Sends the kick signal to `thread` until it has exited or `deadline` passes.
+impl FinishCount {
+    /// Records that one more thread has finished.
+    pub(crate) fn note(&self) {
+        *lock_or_recover(&self.count) += 1;
+        self.changed.notify_all();
+    }
+
+    /// Returns the number of threads that have finished.
+    pub(crate) fn finished(&self) -> u32 {
+        *lock_or_recover(&self.count)
+    }
+
+    /// Returns whether `count` threads have finished by `deadline`.
+    ///
+    /// It blocks until they have or until `deadline` passes.
+    pub(crate) fn wait_for(&self, count: u32, deadline: Instant) -> bool {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let noted = lock_or_recover(&self.count);
+        let (noted, _) = self
+            .changed
+            .wait_timeout_while(noted, timeout, |noted| *noted < count)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *noted >= count
+    }
+}
+
+/// A guard that marks its thread finished when it is dropped.
 ///
-/// The signal ends a blocking read on `thread` with `EINTR`. It is sent again
-/// every millisecond, since a signal that lands before the read blocks is lost.
-/// The loop stops at the deadline when the signal cannot end the wait.
-pub(crate) fn kick_until_finished(thread: &JoinHandle<()>, deadline: Instant) {
-    use std::os::unix::thread::JoinHandleExt;
-    while !thread.is_finished() && Instant::now() < deadline {
-        // SAFETY: the handle has not been joined, so its thread id is live; the
-        // handler is a no-op. The cast is for musl, where std and libc spell
-        // `pthread_t` differently.
-        unsafe { libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, kick_signal()) };
-        std::thread::sleep(Duration::from_millis(1));
+/// The drop sets the thread's own flag and then notes on the [`FinishCount`]
+/// the threads share. It runs on a panic as on a return, so a thread that
+/// panics is counted too.
+pub(crate) struct FinishGuard {
+    /// The flag of the thread that holds the guard.
+    pub(crate) finished: Arc<AtomicBool>,
+    /// The count the threads share.
+    pub(crate) count: Arc<FinishCount>,
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::SeqCst);
+        self.count.note();
     }
 }
 
