@@ -33,7 +33,7 @@
             {"syscall": "brk", "comment": "glibc malloc for small allocations"},
             {"syscall": "poll", "comment": "the plugin waker, the readers and the stop loop's wake"},
             {"syscall": "ppoll", "comment": "safety net: glibc may lower poll() to ppoll"},
-            {"syscall": "clock_nanosleep", "comment": "a plugin thread that wakes on a timer; the console-reader kick loop"},
+            {"syscall": "clock_nanosleep", "comment": "a plugin thread that wakes on a timer; the stop's wait for a ledger a thread left running holds"},
             {"syscall": "clock_gettime", "comment": "safety net: event timestamps if vDSO is bypassed"},
             {"syscall": "sched_yield", "comment": "safety net: Mutex contention path"},
             {"syscall": "sched_getaffinity", "comment": "std thread startup"},
