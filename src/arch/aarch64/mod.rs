@@ -19,12 +19,14 @@
 //! guest-physical address map both work from. `kvm` runs the guest on Linux and
 //! `hvf` on macOS. `esr` decodes the exception syndrome that
 //! Hypervisor.framework reports on a guest exit, and `smoke` checks
-//! Hypervisor.framework without a kernel.
+//! Hypervisor.framework without a kernel. `profile` fills the parts of the
+//! machine profile both backends share.
 
 pub mod esr;
 pub mod fdt;
 pub mod layout;
 pub mod loader;
+pub(crate) mod profile;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod hvf;
