@@ -325,7 +325,7 @@ impl<K: Kick> Vcpus<K> {
 pub(crate) enum Outcome {
     /// The run stopped, as the guest or the host asked.
     Stopped(Stop),
-    /// A vCPU or a plugin thread failed, with the text that says how.
+    /// A vCPU or an I/O thread failed, with the text that says how.
     Failed(String),
 }
 

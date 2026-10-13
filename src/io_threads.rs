@@ -50,8 +50,8 @@ pub(crate) enum NetSource {
     Tap(std::fs::File),
 }
 
-/// A guard that, when its thread panics, reports the run failed and asks it to
-/// stop.
+/// A guard that, when its I/O thread panics, reports the run failed and asks it
+/// to stop.
 struct StopOnPanic<K: Kick> {
     /// The vCPUs of the run.
     vcpus: Arc<Vcpus<K>>,
@@ -75,7 +75,9 @@ impl<K: Kick> Drop for StopOnPanic<K> {
 /// of its own under the same stop, such as the x86 trace watchdog. It can also
 /// add a stop action for a thread that waits on something other than a stop
 /// token.
-pub(crate) struct IoThreads {
+pub(crate) struct IoThreads<K: Kick> {
+    /// The vCPUs of the run, which a thread that panics stops.
+    vcpus: Arc<Vcpus<K>>,
     /// The stop the threads poll.
     source: StopSource,
     /// The console reader, which the stop also has to signal.
@@ -88,14 +90,14 @@ pub(crate) struct IoThreads {
     stop_actions: Vec<Box<dyn FnOnce() + Send>>,
 }
 
-impl IoThreads {
+impl<K: Kick> IoThreads<K> {
     /// Starts the console reader, then the agent bridge and the network relay
     /// when the guest has them, then `plugin_threads`.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
     /// which runs it.
-    pub(crate) fn start<K: Kick + 'static>(
+    pub(crate) fn start(
         source: StopSource,
         guest: &Arc<Guest<K>>,
         plugin: Option<Arc<dyn Plugin>>,
@@ -103,18 +105,23 @@ impl IoThreads {
         bridge: Option<VsockBridge>,
         net: Option<NetSource>,
         plugin_threads: Vec<PluginThread>,
-    ) -> Self {
+    ) -> Self
+    where
+        K: 'static,
+    {
         let vcpus = Arc::clone(&guest.vcpus);
         let finish_count = Arc::new(FinishCount::default());
         let console = IoThread::spawn(
             "console reader",
             source.token(),
             &finish_count,
+            Arc::clone(&guest.vcpus),
             move |stop| {
                 terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
             },
         );
         let mut io_threads = Self {
+            vcpus: Arc::clone(&guest.vcpus),
             source,
             console,
             threads: Vec::new(),
@@ -142,11 +149,7 @@ impl IoThreads {
             }
         }
         for PluginThread { name, run } in plugin_threads {
-            let vcpus = Arc::clone(&guest.vcpus);
-            io_threads.spawn(name, move |stop| {
-                let _panic = StopOnPanic { vcpus, name };
-                run(stop);
-            });
+            io_threads.spawn(name, run);
         }
         io_threads
     }
@@ -156,7 +159,8 @@ impl IoThreads {
     ///
     /// [`stop`](Self::stop) only joins the thread, so `body` has to return on
     /// its own: it watches the token, or an action added with
-    /// [`on_stop`](Self::on_stop) ends it.
+    /// [`on_stop`](Self::on_stop) ends it. A panic in `body` fails the run and
+    /// asks it to stop.
     ///
     /// It has to be called from a thread with no seccomp filter, since naming
     /// the new thread calls `prctl`, which neither allowlist has.
@@ -168,8 +172,16 @@ impl IoThreads {
         &mut self,
         name: &'static str,
         body: impl FnOnce(StopToken) + Send + 'static,
-    ) {
-        let thread = IoThread::spawn(name, self.source.token(), &self.finish_count, body);
+    ) where
+        K: 'static,
+    {
+        let thread = IoThread::spawn(
+            name,
+            self.source.token(),
+            &self.finish_count,
+            Arc::clone(&self.vcpus),
+            body,
+        );
         self.threads.push(thread);
     }
 
@@ -217,14 +229,21 @@ impl IoThreads {
 }
 
 #[cfg(test)]
-impl IoThreads {
-    /// Returns the I/O threads of a run with no devices, whose console reader
-    /// returns at once.
-    pub(crate) fn idle() -> Self {
+impl<K: Kick + 'static> IoThreads<K> {
+    /// Returns the I/O threads of a run of `vcpus` with no devices, whose
+    /// console reader returns at once.
+    pub(crate) fn idle(vcpus: Arc<Vcpus<K>>) -> Self {
         let source = StopSource::new().expect("stop pair");
         let finish_count = Arc::new(FinishCount::default());
-        let console = IoThread::spawn("console reader", source.token(), &finish_count, |_| {});
+        let console = IoThread::spawn(
+            "console reader",
+            source.token(),
+            &finish_count,
+            Arc::clone(&vcpus),
+            |_| {},
+        );
         Self {
+            vcpus,
             source,
             console,
             threads: Vec::new(),
@@ -246,15 +265,17 @@ impl IoThread {
     /// Starts a thread named `name` that confines itself and then runs `body`
     /// with `stop`.
     ///
-    /// The thread holds a [`FinishGuard`] that notes on `count`.
+    /// The thread holds a [`FinishGuard`] that notes on `count`, and a
+    /// [`StopOnPanic`] that fails and stops the run of `vcpus` if it panics.
     ///
     /// # Panics
     ///
     /// Panics if the thread cannot be created.
-    fn spawn(
+    fn spawn<K: Kick + 'static>(
         name: &'static str,
         stop: StopToken,
         count: &Arc<FinishCount>,
+        vcpus: Arc<Vcpus<K>>,
         body: impl FnOnce(StopToken) + Send + 'static,
     ) -> Self {
         let finished = Arc::new(AtomicBool::new(false));
@@ -268,6 +289,7 @@ impl IoThread {
                     finished: flag,
                     count,
                 };
+                let _panic = StopOnPanic { vcpus, name };
                 confine_io_thread();
                 body(stop);
             })
@@ -329,19 +351,59 @@ impl IoThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stop::StopHandle;
 
-    /// Starts a thread that runs `body` and notes on `count`.
-    fn spawn(count: &Arc<FinishCount>, body: impl FnOnce() + Send + 'static) -> IoThread {
+    /// A kicker that reaches no thread.
+    struct NoopKicker;
+
+    impl Kick for NoopKicker {
+        fn kick(&self, _cpu: u32) {}
+
+        fn kick_all(&self) {}
+    }
+
+    /// Returns the vCPUs of a run with one vCPU and no threads.
+    fn vcpus() -> Arc<Vcpus<NoopKicker>> {
+        Arc::new(Vcpus::new(1, NoopKicker, StopHandle::new_pair().unwrap().0))
+    }
+
+    /// Starts a thread that runs `body`, notes on `count` and stops the run of
+    /// `vcpus` if it panics.
+    fn spawn(
+        count: &Arc<FinishCount>,
+        vcpus: &Arc<Vcpus<NoopKicker>>,
+        body: impl FnOnce() + Send + 'static,
+    ) -> IoThread {
         let source = StopSource::new().unwrap();
-        IoThread::spawn("test", source.token(), count, move |_| body())
+        IoThread::spawn(
+            "test",
+            source.token(),
+            count,
+            Arc::clone(vcpus),
+            move |_| body(),
+        )
     }
 
     #[test]
     fn thread_that_exits_is_noted_and_joined() {
         let count = Arc::new(FinishCount::default());
-        let thread = spawn(&count, || {});
+        let thread = spawn(&count, &vcpus(), || {});
         assert!(count.wait_for(1, Instant::now() + Duration::from_secs(5)));
         thread.try_join().unwrap();
+    }
+
+    #[test]
+    fn thread_that_panics_fails_the_run_and_stops_it() {
+        let (count, vcpus) = (Arc::new(FinishCount::default()), vcpus());
+        let thread = spawn(&count, &vcpus, || panic!("a test panic"));
+        assert!(count.wait_for(1, Instant::now() + Duration::from_secs(5)));
+        thread.try_join().unwrap();
+        assert!(vcpus.stop_handle().is_stop_requested());
+        assert!(
+            matches!(vcpus.outcome(), Outcome::Failed(text) if text == "test: panicked"),
+            "{:?}",
+            vcpus.outcome()
+        );
     }
 
     // A thread stuck in a call the stop cannot interrupt must be reported once
@@ -351,10 +413,11 @@ mod tests {
     fn thread_that_does_not_exit_is_reported() {
         let count = Arc::new(FinishCount::default());
         let (release, released) = std::sync::mpsc::channel::<()>();
-        let stuck = spawn(&count, move || {
+        let vcpus = vcpus();
+        let stuck = spawn(&count, &vcpus, move || {
             let _ = released.recv();
         });
-        let quick = spawn(&count, || {});
+        let quick = spawn(&count, &vcpus, || {});
         assert!(count.wait_for(1, Instant::now() + Duration::from_secs(5)));
         quick.try_join().unwrap();
         assert!(!count.wait_for(2, Instant::now() + Duration::from_millis(50)));
@@ -373,7 +436,7 @@ mod tests {
         crate::signal::install_kick_handler();
         let (mut read, _write) = std::io::pipe().unwrap();
         let count = Arc::new(FinishCount::default());
-        let thread = spawn(&count, move || {
+        let thread = spawn(&count, &vcpus(), move || {
             let mut byte = [0u8; 1];
             let _ = std::io::Read::read(&mut read, &mut byte);
         });
