@@ -17,8 +17,10 @@
 //! `virtio` holds the virtio devices over MMIO and the split virtqueue they
 //! share. `legacy` holds the serial ports and the CMOS RTC. A backend attaches
 //! the devices its guest needs: the PL011 on arm64, the 16550 and the CMOS RTC
-//! on x86-64. `irq` holds the interrupt line each device sets itself.
+//! on x86-64. `irq` holds the interrupt line each device sets itself, and
+//! `state` the checks each device's checkpoint state passes on restore.
 
 pub(crate) mod irq;
 pub mod legacy;
+pub mod state;
 pub mod virtio;
