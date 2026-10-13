@@ -88,6 +88,16 @@ pub(crate) mod test_line {
         pub(crate) fn is_high(&self) -> bool {
             self.high.load(Ordering::SeqCst)
         }
+
+        /// Returns the number of times the line was set high.
+        pub(crate) fn raises(&self) -> u32 {
+            self.raised.load(Ordering::SeqCst)
+        }
+
+        /// Returns the number of times the line was set at all.
+        pub(crate) fn sets(&self) -> u32 {
+            self.raises() + self.lowered.load(Ordering::SeqCst)
+        }
     }
 
     impl IrqLine for LevelLine {
