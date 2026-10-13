@@ -438,6 +438,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             move |byte| lock_or_recover(&pl011).push_rx(byte)
         },
         net_source,
+        profile,
     )?;
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
