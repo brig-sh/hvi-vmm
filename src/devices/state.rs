@@ -127,9 +127,10 @@ impl DeviceStates {
     ///
     /// Two checks need the host resources a restore opens, and stay in the
     /// restore: the disk's size ([`VirtioBlk::restore`]) and the network
-    /// backend's mode ([`VirtioNet::restore`]). A restore opens both before it
-    /// builds any device. Which devices the guest must have is the machine
-    /// profile's to say, not this document's.
+    /// backend's mode ([`VirtioNet::restore`]). Neither restore writes guest
+    /// RAM, so a refusal there leaves RAM as the checkpoint has it, whatever
+    /// order the devices are built in. Which devices the guest must have is
+    /// the machine profile's to say, not this document's.
     ///
     /// [`VirtioBlk::restore`]: crate::devices::virtio::block::VirtioBlk::restore
     /// [`VirtioNet::restore`]: crate::devices::virtio::net::VirtioNet::restore
