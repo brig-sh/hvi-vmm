@@ -630,10 +630,6 @@ impl VirtioVsock {
                 state.conns.len()
             )));
         }
-        // `add_conn` takes the next port with `+= 1`.
-        if state.next_port == u32::MAX {
-            return Err(invalid("virtio-vsock has no port left to give"));
-        }
         let mut conns = HashMap::with_capacity(state.conns.len());
         for c in &state.conns {
             Self::check_conn(c, state.next_port)?;
@@ -774,12 +770,26 @@ impl VirtioVsock {
     ///
     /// # Errors
     ///
-    /// Errors if the stream refuses non-blocking mode. The connection is not
-    /// registered then.
+    /// Errors if the host ports have run out or the stream refuses
+    /// non-blocking mode. The connection is not registered then.
     pub fn add_conn(&mut self, stream: UnixStream) -> std::io::Result<u32> {
-        stream.set_nonblocking(true)?;
         let port = self.next_port;
-        self.next_port += 1;
+        // Ports are never reused, so the counter only climbs. One that wrapped
+        // would hand out a low port again, and `insert` would give a new host
+        // client the session of a connection still at that port.
+        let Some(next_port) = port.checked_add(1) else {
+            return Err(std::io::Error::other("virtio-vsock has no host port left"));
+        };
+        // Every live port is below `next_port`, as a restore checks too, so
+        // this does not happen. If it did, the new client would take over the
+        // guest's session at that port.
+        if self.conns.contains_key(&port) {
+            return Err(std::io::Error::other(format!(
+                "virtio-vsock host port {port} is still in use"
+            )));
+        }
+        stream.set_nonblocking(true)?;
+        self.next_port = next_port;
         self.conns.insert(
             port,
             Conn {
@@ -1562,6 +1572,9 @@ impl VsockBridge {
     pub(crate) fn run(self, stop: &StopToken) {
         let Self { listener, dev, mem } = self;
         let mut relays: Vec<JoinHandle<()>> = Vec::new();
+        // A client that retries a refused connect would otherwise fill the
+        // log with the same line.
+        let mut refusal_logged = false;
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1584,8 +1597,15 @@ impl VsockBridge {
             let (port, writer_gate) = {
                 let _in = stop.enter();
                 let mut d = lock_or_recover(&dev);
-                let Ok(port) = d.add_conn(stream) else {
-                    continue;
+                let port = match d.add_conn(stream) {
+                    Ok(port) => port,
+                    Err(e) => {
+                        if !refusal_logged {
+                            eprintln!("{LOG_PREFIX} vsock bridge: {e}; connection refused");
+                            refusal_logged = true;
+                        }
+                        continue;
+                    }
                 };
                 d.connect(&mem, port);
                 (port, d.writer_gate(port))
@@ -3130,13 +3150,42 @@ mod state_tests {
             with(vec![conn.clone(), conn.clone()]),
             with(vec![port(good.next_port)]),
             with(many),
-            VsockState {
-                next_port: u32::MAX,
-                ..with(Vec::new())
-            },
         ] {
             assert_eq!(refused(&bad), Some(std::io::ErrorKind::InvalidData));
         }
+    }
+
+    /// A restored counter near the end of the port space runs out the way a
+    /// device that climbed there would: the last port is handed out, and the
+    /// next client is refused rather than given a port that wrapped.
+    #[test]
+    fn a_device_out_of_host_ports_refuses_a_new_connection() {
+        let mut state = VirtioVsock::new().state();
+        state.next_port = u32::MAX - 1;
+        let mut dev = VirtioVsock::import(&mem(), &state).unwrap();
+        let (a, _a_peer) = UnixStream::pair().unwrap();
+        let (b, _b_peer) = UnixStream::pair().unwrap();
+        assert_eq!(dev.add_conn(a).unwrap(), u32::MAX - 1);
+        assert!(dev.add_conn(b).is_err(), "the port counter wrapped");
+        assert_eq!(dev.state().conns.len(), 1);
+
+        state.next_port = u32::MAX;
+        assert_eq!(refused(&state), None, "a device that ran out restores");
+    }
+
+    /// A new client never takes over a session at a port still in use.
+    #[test]
+    fn a_new_connection_never_replaces_a_live_one() {
+        let mem = mem();
+        let (mut dev, _peers) = busy(&mem);
+        let live = dev.state().conns[0].port;
+        dev.next_port = live;
+        let (c, _c_peer) = UnixStream::pair().unwrap();
+        assert!(dev.add_conn(c).is_err());
+        let after = dev.state();
+        assert_eq!(after.conns[0].port, live);
+        assert_eq!(after.conns[0].state, VsockConnPhase::Connected);
+        assert_eq!(after.next_port, live, "a refused client takes no port");
     }
 
     #[test]
