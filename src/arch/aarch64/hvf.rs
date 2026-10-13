@@ -63,7 +63,7 @@ use crate::run::{record_start, run_to_stop};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
-use crate::teardown::StopSource;
+use crate::teardown::{StopSource, StopToken};
 use crate::terminal;
 use crate::LOG_PREFIX;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
@@ -655,8 +655,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             Arc::clone(&shared.guest.ram),
             Arc::clone(&fs.wake),
         );
-        io_threads.spawn("virtio-fs worker", move |_| {
-            run_fs_worker(&dev, &ram, &wake);
+        io_threads.spawn("virtio-fs worker", move |stop| {
+            run_fs_worker(&dev, &ram, &wake, &stop);
         });
         let wake = Arc::clone(&fs.wake);
         io_threads.on_stop(move || wake.stop());
@@ -1147,8 +1147,12 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// [`FsWake::stop`], which runs once the vCPUs have exited or been left
 /// running, ends the loop at the next `park`. The worker then drains the chains
 /// announced by a wake that arrived with the stop.
-fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake) {
+///
+/// Each drain passes the pause gate of `stop` first, so a pause holds the
+/// worker back between drains. The worker parks outside the gate.
+fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake, stop: &StopToken) {
     while wake.park() {
+        let _in = stop.enter();
         lock_or_recover(dev).drain_notified(mem);
     }
     // A wake that arrived with the stop was cleared by that last `park`, and
