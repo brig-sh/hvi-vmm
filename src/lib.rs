@@ -89,6 +89,7 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 pub mod arch;
+pub mod checkpoint;
 pub mod config;
 pub mod devices;
 pub mod events;
