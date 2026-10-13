@@ -55,7 +55,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, PluginThreads, VcpuRegs};
-use crate::hypervisor::run::run_to_stop;
+use crate::hypervisor::run::{record_start, run_to_stop};
 use crate::hypervisor::vcpus::{panic_message, Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -679,6 +679,7 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         io_threads.on_stop(move || stop.stop());
     }
 
+    record_start(&shared.guest, cfg.sandbox);
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
@@ -803,7 +804,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             None => return, // stopped while waiting
         }
     }
-    sh.guest.vcpus.mark_started();
+    sh.guest.vcpus.mark_started(cpu_id);
 
     let is_boot = cpu_id == 0;
     // The loop runs inside `catch_unwind` only for the report. A panic is

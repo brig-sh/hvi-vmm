@@ -22,7 +22,8 @@
 //! around a payload. The VMM writes `block` (disk I/O) and `net` (flows) —
 //! what it sees at its own device models — and the shape of both is pinned by
 //! the tests below, because a ledger whose format drifts is a ledger nobody can
-//! read twice.
+//! read twice. The VMM also writes the run's lifecycle, as `vmm.start`,
+//! `vmm.vcpu_started` and `vmm.stop`.
 //!
 //! [`Emitter::emit_payload`] leaves the stream open to other sources: a plugin
 //! (see [`crate::plugin`]) names its own `source` and supplies its own payload,

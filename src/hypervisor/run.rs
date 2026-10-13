@@ -24,13 +24,42 @@
 
 use std::time::Instant;
 
+use serde::Serialize;
+
 use crate::config::Stop;
+use crate::events::Emitter;
 use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, Outcome, VcpuThreads};
 use crate::io_threads::IoThreads;
+use crate::plugin::GuestArch;
 use crate::sync::try_lock_until;
 use crate::teardown::STOP_TIMEOUT;
 use crate::LOG_PREFIX;
+
+/// Writes the run's `vmm.start` record to the ledger.
+///
+/// `confined` says whether the run's confinement is on. Call it before the vCPU
+/// threads are spawned, so the record comes before any record the VMM writes
+/// for the run. A plugin can write earlier, from `attach` or from a thread it
+/// started there. Such a thread can also hold the ledger, so the call waits for
+/// it for at most [`STOP_TIMEOUT`] and skips the record when it is still held.
+pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
+    let start = StartRecord {
+        arch: match guest.arch {
+            GuestArch::Aarch64 => "aarch64",
+            GuestArch::X86_64 => "x86_64",
+        },
+        vcpus: guest.vcpus.count(),
+        mem_bytes: guest.ram.regions().iter().map(|region| region.size).sum(),
+        confined,
+        core_version: crate::CORE_VERSION,
+    };
+    let Some(mut ledger) = try_lock_until(&guest.ledger, Instant::now() + STOP_TIMEOUT) else {
+        stderrln!("{LOG_PREFIX} the ledger is still locked; the start is not recorded");
+        return;
+    };
+    ledger.emit_payload("vmm", "vmm.start", &start);
+}
 
 /// Runs the guest from its spawned vCPU threads to its stop.
 ///
@@ -39,24 +68,43 @@ use crate::LOG_PREFIX;
 /// calling thread waits until a vCPU thread exits or a stop is requested. It
 /// then stops the VM, joins the vCPU threads and stops `io_threads`, each by
 /// [`STOP_TIMEOUT`], and writes out the ledger tail, which the flush cadence
-/// alone would leave in the buffer. A thread left running may hold the ledger,
-/// so the flush waits for it for at most [`STOP_TIMEOUT`] and is skipped when
-/// it is still held.
+/// alone would leave in the buffer.
+///
+/// The loop writes the rest of the run's lifecycle to the ledger, after the
+/// record of [`record_start`]: a `vmm.vcpu_started` record for each vCPU that
+/// enters its run loop, and, before the last flush, a `vmm.stop` record with
+/// how the run ended. A thread left running may hold the ledger, so after the
+/// joins the loop waits for it for at most [`STOP_TIMEOUT`], and writes neither
+/// the records nor the tail when it is still held.
 ///
 /// # Errors
 ///
-/// Errors with `failure`, else with the failure a thread reported, else with a
-/// thread that did not stop in time. A thread left running is named after the
-/// failure, or reported with how the run stopped, since the error takes the
-/// place of that stop.
+/// Errors with the first of these that applies: `failure`, the failure a thread
+/// reported, or a thread that did not stop in time. A thread left running is
+/// named after the failure. Alone, its error also names how the run stopped,
+/// since it takes the place of that stop.
 pub(crate) fn run_to_stop<K: Kick>(
     guest: &Guest<K>,
     threads: VcpuThreads,
     mut failure: Option<Box<dyn std::error::Error>>,
     io_threads: IoThreads<K>,
 ) -> Result<Stop, Box<dyn std::error::Error>> {
+    let mut announced = 0;
     if failure.is_none() {
-        if let Err(e) = guest.vcpus.wait_for_stop() {
+        let waited = guest.vcpus.wait_for_stop(|| {
+            // The ledger is only tried, so a thread that holds it does not keep
+            // the loop from a failure or a stop request. A record it cannot
+            // write now is written after the joins.
+            let started = guest.vcpus.started_after(announced);
+            if started.is_empty() {
+                return;
+            }
+            if let Some(mut ledger) = try_lock_until(&guest.ledger, Instant::now()) {
+                record_vcpus_started(&mut ledger, &started);
+                announced += started.len();
+            }
+        });
+        if let Err(e) = waited {
             failure = Some(format!("waiting for the vCPUs: {e}").into());
         }
     }
@@ -68,33 +116,101 @@ pub(crate) fn run_to_stop<K: Kick>(
     if let Err(e) = io_threads.stop() {
         left_running.get_or_insert(e);
     }
-    let ledger = try_lock_until(&guest.ledger, Instant::now() + STOP_TIMEOUT);
-    match ledger {
-        Some(mut ledger) => ledger.flush(),
-        None => {
-            stderrln!("{LOG_PREFIX} the ledger is still locked; its tail is not written");
-        }
-    }
 
-    let outcome = guest.vcpus.outcome();
-    if let Some(e) = failure {
-        // `failure` is the one returned, so a thread's failure behind it is
-        // printed.
-        if let Outcome::Failed(text) = outcome {
-            stderrln!("{LOG_PREFIX} {text}");
+    let ledger = try_lock_until(&guest.ledger, Instant::now() + STOP_TIMEOUT);
+    let result = match (failure, guest.vcpus.outcome(), left_running) {
+        (Some(e), outcome, left_running) => {
+            // `failure` is the one returned, so a thread's failure behind it is
+            // printed.
+            if let Outcome::Failed(text) = outcome {
+                stderrln!("{LOG_PREFIX} {text}");
+            }
+            match left_running {
+                Some(left) => Err(format!("{e}, and {left}").into()),
+                None => Err(e),
+            }
         }
-        return Err(match left_running {
-            Some(left) => format!("{e}, and {left}").into(),
-            None => e,
-        });
-    }
-    match (outcome, left_running) {
-        (outcome, None) => outcome.into_result(),
-        (Outcome::Failed(text), Some(e)) => Err(format!("{text}, and {e}").into()),
-        (Outcome::Stopped(stop), Some(e)) => {
+        (None, outcome, None) => outcome.into_result(),
+        (None, Outcome::Failed(text), Some(e)) => Err(format!("{text}, and {e}").into()),
+        (None, Outcome::Stopped(stop), Some(e)) => {
             Err(format!("{e}, after the run stopped with {stop:?}").into())
         }
+    };
+    let Some(mut ledger) = ledger else {
+        stderrln!(
+            "{LOG_PREFIX} the ledger is still locked; the stop record and the tail are not written"
+        );
+        return result;
+    };
+    // A vCPU that started after the last wake is recorded before the stop.
+    record_vcpus_started(&mut ledger, &guest.vcpus.started_after(announced));
+    let error = result.as_ref().err().map(ToString::to_string);
+    let stop = StopRecord {
+        reason: match &result {
+            Ok(Stop::SystemOff) => "system_off",
+            Ok(Stop::SystemReset) => "system_reset",
+            Ok(Stop::Requested) => "requested",
+            Err(_) => "failed",
+        },
+        // A signal is the cause only when it asked first and the run stopped on
+        // the request.
+        signal: match &result {
+            Ok(Stop::Requested) => guest
+                .vcpus
+                .stop_handle()
+                .first_signal()
+                .and_then(signal_hook::low_level::signal_name),
+            _ => None,
+        },
+        error: error.as_deref(),
+    };
+    ledger.emit_payload("vmm", "vmm.stop", &stop);
+    ledger.flush();
+    result
+}
+
+/// Writes a `vmm.vcpu_started` record for each of `cpus`.
+fn record_vcpus_started(ledger: &mut Emitter, cpus: &[u32]) {
+    for &cpu in cpus {
+        ledger.emit_payload("vmm", "vmm.vcpu_started", &VcpuStartedRecord { vcpu: cpu });
     }
+}
+
+/// The payload of the `vmm.start` record.
+#[derive(Serialize)]
+struct StartRecord {
+    /// The guest architecture, `aarch64` or `x86_64`.
+    arch: &'static str,
+    /// The number of vCPUs.
+    vcpus: u32,
+    /// The size of guest RAM in bytes.
+    mem_bytes: u64,
+    /// Whether the run's confinement is on.
+    confined: bool,
+    /// The version of this crate, the VMM core.
+    core_version: &'static str,
+}
+
+/// The payload of a `vmm.vcpu_started` record.
+#[derive(Serialize)]
+struct VcpuStartedRecord {
+    /// The id of the vCPU that entered its run loop.
+    vcpu: u32,
+}
+
+/// The payload of the `vmm.stop` record.
+#[derive(Serialize)]
+struct StopRecord<'a> {
+    /// How the run ended, one of `system_off`, `system_reset`, `requested` or
+    /// `failed`.
+    reason: &'static str,
+    /// The name of the signal that asked first, such as `SIGTERM`, when the run
+    /// stopped on its request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<&'static str>,
+    /// The error `boot` returns, when the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -104,7 +220,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::events::Emitter;
     use crate::hypervisor::guest::PluginThreads;
     use crate::hypervisor::vcpus::Vcpus;
     use crate::memory::{GuestRam, RamRegion, SharedRam};
@@ -242,6 +357,122 @@ mod tests {
                 "vcpu1 did not stop within {STOP_TIMEOUT:?}, after the run stopped with SystemOff"
             )
         );
+    }
+
+    // A thread holds the ledger while the vCPUs start and the guest stops, so
+    // the loop cannot record the starts as they come. The holder lets go once
+    // the second vCPU sees the stop, after the loop's last wake. The host-path
+    // ban in clippy.toml is aimed at the virtio-fs device, where every
+    // component of a path comes from the guest. This test reads the ledger file
+    // it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn vcpus_started_while_the_ledger_is_held_are_recorded_before_the_stop() {
+        let path = std::env::temp_dir().join(format!("hvi-run-{}.ndjson", std::process::id()));
+        let mut guest = guest(2);
+        guest.ledger = Arc::new(Mutex::new(
+            Emitter::new(Some(path.to_str().unwrap()), "test").unwrap(),
+        ));
+        let (held, is_held) = mpsc::channel::<()>();
+        let (stopped, has_stopped) = mpsc::channel::<()>();
+        let ledger = Arc::clone(&guest.ledger);
+        let holder = std::thread::spawn(move || {
+            let _held = ledger.lock().unwrap();
+            held.send(()).unwrap();
+            has_stopped.recv().unwrap();
+        });
+        is_held.recv().unwrap();
+
+        let vcpus = Arc::clone(&guest.vcpus);
+        let off: Body = Box::new(move || {
+            vcpus.mark_started(0);
+            vcpus.report(Outcome::Stopped(Stop::SystemOff));
+        });
+        // The VM stops only after the loop's last wake, so once this vCPU sees
+        // the stop, the loop records the starts after the joins or not at all.
+        let vcpus = Arc::clone(&guest.vcpus);
+        let running: Body = Box::new(move || {
+            vcpus.mark_started(1);
+            while vcpus.is_running() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stopped.send(()).unwrap();
+        });
+        let result = run(&guest, vec![off, running], None);
+        holder.join().unwrap();
+        assert!(matches!(result, Ok(Stop::SystemOff)), "{result:?}");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let records: Vec<(String, serde_json::Value)> = text
+            .lines()
+            .map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                (
+                    record["source"].as_str().unwrap().to_string(),
+                    record["payload"].clone(),
+                )
+            })
+            .collect();
+        let mut started: Vec<_> = records
+            .iter()
+            .filter(|(source, _)| source == "vmm.vcpu_started")
+            .map(|(_, payload)| payload["vcpu"].as_u64().unwrap())
+            .collect();
+        // The two vCPUs start in either order.
+        started.sort_unstable();
+        assert_eq!(started, [0, 1]);
+        assert_eq!(records.last().unwrap().0, "vmm.stop");
+    }
+
+    /// Runs a guest with one vCPU to the stop `request` asks for on its handle,
+    /// with its ledger in a file named after `name`, and returns the payload of
+    /// the `vmm.stop` record.
+    // This test helper reads the ledger file it made, which the host-path ban
+    // in clippy.toml does not aim at.
+    #[allow(clippy::disallowed_methods)]
+    fn stop_payload(name: &str, request: impl FnOnce(&StopHandle)) -> serde_json::Value {
+        let path =
+            std::env::temp_dir().join(format!("hvi-run-{name}-{}.ndjson", std::process::id()));
+        let mut guest = guest(1);
+        guest.ledger = Arc::new(Mutex::new(
+            Emitter::new(Some(path.to_str().unwrap()), "test").unwrap(),
+        ));
+        let vcpus = Arc::clone(&guest.vcpus);
+        let running: Body = Box::new(move || {
+            while vcpus.is_running() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        request(guest.vcpus.stop_handle());
+        let result = run(&guest, vec![running], None);
+        assert!(matches!(result, Ok(Stop::Requested)), "{result:?}");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["source"], "vmm.stop");
+        last["payload"].clone()
+    }
+
+    #[test]
+    fn stop_record_names_a_signal_that_asked_first() {
+        let payload = stop_payload("signal-first", |handle| {
+            handle.request_stop_by(libc::SIGTERM);
+            handle.request_stop();
+        });
+        assert_eq!(payload["reason"], "requested");
+        assert_eq!(payload["signal"], "SIGTERM");
+    }
+
+    #[test]
+    fn stop_record_names_no_signal_after_another_request() {
+        let payload = stop_payload("request-first", |handle| {
+            handle.request_stop();
+            handle.request_stop_by(libc::SIGTERM);
+        });
+        assert_eq!(payload["reason"], "requested");
+        assert_eq!(payload["signal"], serde_json::Value::Null);
     }
 
     #[test]

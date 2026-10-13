@@ -65,7 +65,13 @@ pub(crate) struct Vcpus<K> {
     /// The number of vCPUs.
     count: u32,
     /// The number of vCPUs that have entered their run loop.
+    ///
+    /// It counts the vCPUs `started_ids` lists, and is kept apart so a pause
+    /// can read it inside the quiesce wait without a second lock.
     started: AtomicU32,
+    /// The ids of the vCPUs that have entered their run loop, in the order they
+    /// did.
+    started_ids: Mutex<Vec<u32>>,
     /// The number of vCPU threads that have exited.
     exited: AtomicU32,
     /// The run's stop handle, which also wakes the loop.
@@ -84,10 +90,16 @@ impl<K: Kick> Vcpus<K> {
             outcome: Mutex::new(None),
             count,
             started: AtomicU32::new(0),
+            started_ids: Mutex::new(Vec::new()),
             exited: AtomicU32::new(0),
             stop_handle: stop,
             kicker,
         }
+    }
+
+    /// Returns the number of vCPUs.
+    pub(crate) fn count(&self) -> u32 {
+        self.count
     }
 
     /// Returns the [`Kick`] implementation that kicks the vCPUs.
@@ -100,11 +112,23 @@ impl<K: Kick> Vcpus<K> {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Records that the calling vCPU entered its run loop.
+    /// Records that vCPU `cpu`, the calling one, entered its run loop.
     ///
-    /// A vCPU calls it once, before its first checkpoint.
-    pub(crate) fn mark_started(&self) {
+    /// It wakes the caller of [`wait_for_stop`](Self::wait_for_stop). A vCPU
+    /// calls it once, before its first checkpoint.
+    pub(crate) fn mark_started(&self, cpu: u32) {
         self.started.fetch_add(1, Ordering::SeqCst);
+        lock_or_recover(&self.started_ids).push(cpu);
+        self.stop_handle.wake();
+    }
+
+    /// Returns the ids of the vCPUs that entered their run loop after the first
+    /// `seen`, in the order they did.
+    pub(crate) fn started_after(&self, seen: usize) -> Vec<u32> {
+        lock_or_recover(&self.started_ids)
+            .get(seen..)
+            .unwrap_or_default()
+            .to_vec()
     }
 
     /// Parks the calling vCPU thread while a quiesce is in effect.
@@ -177,16 +201,21 @@ impl<K: Kick> Vcpus<K> {
 
     /// Blocks until a vCPU thread has exited or a stop is requested.
     ///
+    /// It calls `on_wake` before the first wait and again after each wake.
+    ///
     /// # Errors
     ///
     /// Errors if the wake cannot be waited on.
-    pub(crate) fn wait_for_stop(&self) -> io::Result<()> {
+    pub(crate) fn wait_for_stop(&self, mut on_wake: impl FnMut()) -> io::Result<()> {
         // A request is stored, and an exit is counted, before its wake. So one
-        // that lands after the check leaves a wake pending.
-        while self.exited.load(Ordering::SeqCst) == 0 && !self.stop_handle.is_stop_requested() {
+        // that lands after the check leaves a wake pending and ends the wait.
+        loop {
+            on_wake();
+            if self.exited.load(Ordering::SeqCst) > 0 || self.stop_handle.is_stop_requested() {
+                return Ok(());
+            }
             self.stop_handle.wait(None)?;
         }
-        Ok(())
     }
 
     /// Returns whether `count` vCPU threads exit before `deadline`.
@@ -505,8 +534,8 @@ mod tests {
     #[test]
     fn stop_releases_a_vcpu_parked_for_a_pause() {
         let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
-        vcpus.mark_started();
-        vcpus.mark_started();
+        vcpus.mark_started(0);
+        vcpus.mark_started(1);
         let secondary = {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || {
@@ -531,8 +560,8 @@ mod tests {
             seen: Mutex::new(None),
         };
         let vcpus = Arc::new(test_vcpus(2, kicker));
-        vcpus.mark_started();
-        vcpus.mark_started();
+        vcpus.mark_started(0);
+        vcpus.mark_started(1);
         let secondary = {
             let (vcpus, resumed) = (Arc::clone(&vcpus), Arc::clone(&resumed));
             std::thread::spawn(move || {
@@ -559,12 +588,12 @@ mod tests {
     #[test]
     fn pause_waits_only_for_started_vcpus() {
         let vcpus = Arc::new(test_vcpus(3, CountingKicker::default()));
-        vcpus.mark_started();
+        vcpus.mark_started(0);
         let (parking, parked) = std::sync::mpsc::channel();
         let secondary = {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || {
-                vcpus.mark_started();
+                vcpus.mark_started(1);
                 parking.send(()).unwrap();
                 while vcpus.is_running() {
                     vcpus.checkpoint();
@@ -585,13 +614,13 @@ mod tests {
     #[test]
     fn pause_waits_for_a_vcpu_that_starts_while_it_waits() {
         let vcpus = Arc::new(test_vcpus(3, CountingKicker::default()));
-        vcpus.mark_started();
-        vcpus.mark_started();
+        vcpus.mark_started(0);
+        vcpus.mark_started(1);
         let late = {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
-                vcpus.mark_started();
+                vcpus.mark_started(2);
                 while vcpus.is_running() {
                     vcpus.checkpoint();
                     std::thread::yield_now();
@@ -607,8 +636,8 @@ mod tests {
     #[test]
     fn pause_ends_when_the_vm_stops_during_the_wait() {
         let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
-        vcpus.mark_started();
-        vcpus.mark_started();
+        vcpus.mark_started(0);
+        vcpus.mark_started(1);
         let stopper = {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || {
@@ -629,8 +658,8 @@ mod tests {
     #[test]
     fn pause_that_times_out_releases_the_quiesce() {
         let vcpus = test_vcpus(2, CountingKicker::default());
-        vcpus.mark_started();
-        vcpus.mark_started();
+        vcpus.mark_started(0);
+        vcpus.mark_started(1);
         assert!(!vcpus.pause(), "the second vCPU never reaches a checkpoint");
         let checkpoint = std::thread::spawn(move || vcpus.checkpoint());
         assert!(exits(&checkpoint), "the quiesce stayed requested");
@@ -643,7 +672,7 @@ mod tests {
             vcpus: Arc::clone(&vcpus),
             exited: Arc::default(),
         });
-        vcpus.wait_for_stop().unwrap();
+        vcpus.wait_for_stop(|| {}).unwrap();
         assert!(vcpus.is_running(), "the guard stopped the VM itself");
         assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::SystemOff)));
     }
@@ -655,7 +684,7 @@ mod tests {
         let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
         let waiter = {
             let vcpus = Arc::clone(&vcpus);
-            std::thread::spawn(move || vcpus.wait_for_stop().unwrap())
+            std::thread::spawn(move || vcpus.wait_for_stop(|| {}).unwrap())
         };
         std::thread::sleep(Duration::from_millis(20));
         assert!(!waiter.is_finished(), "the wait ended with no exit");
@@ -689,7 +718,7 @@ mod tests {
         let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
         let waiter = {
             let vcpus = Arc::clone(&vcpus);
-            std::thread::spawn(move || vcpus.wait_for_stop().unwrap())
+            std::thread::spawn(move || vcpus.wait_for_stop(|| {}).unwrap())
         };
         vcpus.stop_handle().request_stop();
         assert!(exits(&waiter), "the request did not end the wait");

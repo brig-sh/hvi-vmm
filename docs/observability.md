@@ -6,7 +6,7 @@ artefacts come out of that position, and they answer different questions.
 
 | Artefact | Flag | What it is |
 | --- | --- | --- |
-| Event ledger | `--events <path>` | Structured NDJSON records of device activity. |
+| Event ledger | `--events <path>` | Structured NDJSON records of device activity and the run's lifecycle. |
 | I/O trace | `--trace-io <path>` | One raw line per block request and per network frame. |
 | Memory dump | `--dump-memory <path>` | Guest RAM, written with the VM parked. |
 
@@ -31,6 +31,33 @@ One compact JSON object per line:
 The envelope is `sandbox_id`, `ts`, `provenance`, `source`, `payload`. Its
 wire shape is pinned by tests. `--sandbox-id` sets the first field.
 
+The VMM also records the run's lifecycle, with `provenance` `vmm`:
+
+| `source` | When | `payload` |
+| --- | --- | --- |
+| `vmm.start` | The vCPU threads are about to start. | `arch`, `vcpus`, `mem_bytes`, `confined`, `core_version` |
+| `vmm.vcpu_started` | A vCPU entered its run loop. | `vcpu` |
+| `vmm.stop` | The run has been torn down, before the last flush. | `reason`, `signal`, `error` |
+
+`confined` says whether the confinement is on, and `vcpu` is the vCPU id.
+`reason` is `system_off`, `system_reset`, `requested` or `failed`. `signal`
+names the stop signal, `SIGTERM`, `SIGINT` or `SIGHUP`, when it asked first and
+the run stopped on its request, and `error` is the error `boot` returns when the
+run failed. A boot that fails before it writes `vmm.start` writes no `vmm.stop`
+either. A record's `ts` is when the VMM wrote it, so a `vmm.vcpu_started` record
+can follow records the vCPU caused after it entered its run loop.
+
+On KVM every vCPU enters its run loop at the start, and one the guest has not
+brought up yet waits inside the hypervisor. On macOS a secondary vCPU enters its
+run loop when the guest brings it up.
+
+```json
+{"sandbox_id":"hvi","ts":1791672885321504305,"provenance":"vmm","source":"vmm.start","payload":{"arch":"x86_64","vcpus":2,"mem_bytes":268435456,"confined":true,"core_version":"0.1.0"}}
+{"sandbox_id":"hvi","ts":1791672885321619047,"provenance":"vmm","source":"vmm.vcpu_started","payload":{"vcpu":0}}
+{"sandbox_id":"hvi","ts":1791672885321654412,"provenance":"vmm","source":"vmm.vcpu_started","payload":{"vcpu":1}}
+{"sandbox_id":"hvi","ts":1791672887494077791,"provenance":"vmm","source":"vmm.stop","payload":{"reason":"system_reset"}}
+```
+
 What the ledger is not:
 
 - **Not lossless.** Records are buffered and drained when a new event arrives
@@ -40,9 +67,11 @@ What the ledger is not:
   by `SIGKILL` or a crash loses the tail. A run loses nothing when the guest
   stops it, a vCPU fails, or a stop is requested, by `SIGTERM` for example.
   `boot` flushes the ledger before it returns. A thread left running at the stop
-  can hold the ledger, and that run then ends without its tail. Another stop
-  signal, one second or more after the first, ends the process at once, also
-  without the tail.
+  can hold the ledger, and that run then ends without its `vmm.stop` record and
+  tail. A plugin thread that holds the ledger for one second or more as the run
+  starts leaves out the `vmm.start` record. A repeated stop signal that arrives
+  one second or more after the first ends the process at once, also without the
+  record and the tail. One that arrives sooner has no effect.
 - **Not tamper-proof.** It is an ordinary file written by the VMM process.
   Nothing signs, chains or seals it.
 - **Not monotonic.** `ts` is host wall-clock nanoseconds. It can move
@@ -50,8 +79,8 @@ What the ledger is not:
 - **Not aggregated.** `net` records are per packet, and egress only. See
   [networking.md](networking.md#what-the-ledger-records).
 
-A boot with no block device and no network traffic produces an empty file.
-That is the normal result, not a failure.
+A boot with no block device and no network traffic produces the lifecycle
+records alone.
 
 ## The I/O trace
 
