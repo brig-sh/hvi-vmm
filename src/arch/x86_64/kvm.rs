@@ -56,6 +56,9 @@ use crate::arch::x86_64::layout::{
 };
 use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::{mptable, MAX_VCPUS};
+use crate::checkpoint::profile::{
+    device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform,
+};
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
@@ -186,6 +189,128 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
         }
         None => format!("{base} {extra}"),
     }
+}
+
+/// The CPUID leaves the profile records, as `(leaf, subleaf)`: the vendor,
+/// the family and the basic features, the structured extended features, the
+/// XSAVE layout and the extended features. A guest kernel decides what to use
+/// from these once, at boot.
+const PROFILE_LEAVES: [(u32, u32); 6] = [
+    (0x0, 0),
+    (0x1, 0),
+    (0x7, 0),
+    (0xd, 0),
+    (0xd, 1),
+    (0x8000_0001, 0),
+];
+
+/// Returns the CPU's identity from `cpuid` as the guest reads it: the vendor
+/// string and the display family, model and stepping.
+fn cpu_ident(cpuid: &[kvm_bindings::kvm_cpuid_entry2]) -> Option<String> {
+    let leaf = |function| {
+        cpuid
+            .iter()
+            .find(|e| e.function == function && e.index == 0)
+    };
+    let vendor_leaf = leaf(0)?;
+    let vendor: Vec<u8> = [vendor_leaf.ebx, vendor_leaf.edx, vendor_leaf.ecx]
+        .iter()
+        .flat_map(|r| r.to_le_bytes())
+        .collect();
+    let eax = leaf(1)?.eax;
+    let base_family = (eax >> 8) & 0xf;
+    let family = if base_family == 0xf {
+        base_family + ((eax >> 20) & 0xff)
+    } else {
+        base_family
+    };
+    let model = if base_family == 0x6 || base_family == 0xf {
+        ((eax >> 4) & 0xf) | (((eax >> 16) & 0xf) << 4)
+    } else {
+        (eax >> 4) & 0xf
+    };
+    Some(format!(
+        "{} family {family:#x} model {model:#x} stepping {:#x}",
+        String::from_utf8_lossy(&vendor),
+        eax & 0xf
+    ))
+}
+
+/// Returns the machine profile of this boot.
+///
+/// `cpuid` is the table every vCPU was given, the guest's view rather than the
+/// host's. The counter is the TSC, at the rate KVM gives the boot vCPU.
+fn boot_profile(
+    cfg: &BootConfig,
+    ram: &GuestRam,
+    cpuid: &[kvm_bindings::kvm_cpuid_entry2],
+    boot: &VcpuFd,
+    zero_page: u64,
+    devices: (bool, Option<&str>, bool),
+) -> MachineProfile {
+    let mut p = MachineProfile::for_this_host("x86_64", "kvm");
+    p.cpu.ident = cpu_ident(cpuid);
+    for (function, index) in PROFILE_LEAVES {
+        if let Some(e) = cpuid
+            .iter()
+            .find(|e| e.function == function && e.index == index)
+        {
+            p.cpu.id_regs.insert(
+                format!("cpuid.{function:#010x}.{index}"),
+                format!(
+                    "eax={},ebx={},ecx={},edx={}",
+                    hex(u64::from(e.eax)),
+                    hex(u64::from(e.ebx)),
+                    hex(u64::from(e.ecx)),
+                    hex(u64::from(e.edx))
+                ),
+            );
+        }
+    }
+    p.counter_freq_hz = boot.get_tsc_khz().map_or(0, |khz| u64::from(khz) * 1000);
+    p.x86 = Some(X86Platform {
+        irqchip: "kvm".to_string(),
+        pit: true,
+    });
+    p.ram_regions = ram.regions().into_iter().map(Into::into).collect();
+    p.vcpus = cfg.vcpus.max(1);
+    let (blk, net_mode, vsock) = devices;
+    p.devices = vec![
+        device("uart16550", u64::from(COM1_PORT), Some(COM1_GSI), None),
+        device("rtc-cmos", u64::from(RTC_INDEX_PORT), None, None),
+    ];
+    if blk {
+        p.devices.push(device(
+            "virtio-blk",
+            VIRTIO_BLK_BASE,
+            Some(VIRTIO_BLK_GSI),
+            Some(VirtioBlk::FEATURES),
+        ));
+    }
+    if let Some(mode) = net_mode {
+        let mut net = device(
+            "virtio-net",
+            VIRTIO_NET_BASE,
+            Some(VIRTIO_NET_GSI),
+            Some(VirtioNet::FEATURES),
+        );
+        net.mode = Some(mode.to_string());
+        p.devices.push(net);
+    }
+    if vsock {
+        p.devices.push(device(
+            "virtio-vsock",
+            VIRTIO_VSOCK_BASE,
+            Some(VIRTIO_VSOCK_GSI),
+            Some(VirtioVsock::FEATURES),
+        ));
+    }
+    let mut page = vec![0u8; 4096];
+    if ram.read(zero_page, &mut page).is_ok() {
+        p.firmware.boot_params_sha256 = Some(sha256_hex(&page));
+    }
+    p.agent_sock = cfg.agent_sock.is_some();
+    p
 }
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
@@ -369,6 +494,27 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         kick_handles.push(kick_handle(&vm, &vcpu)?);
         vcpus.push(vcpu);
     }
+
+    // The profile is complete now, so its file is written before any filter
+    // goes in.
+    let net_mode = match (&net, &net_source) {
+        (Some(_), Some(NetSource::Tap(_))) => Some("tap"),
+        (Some(_), Some(NetSource::Gateway(_))) => Some("gateway"),
+        (Some(_), None) => Some("stub"),
+        (None, _) => None,
+    };
+    let profile = Arc::new(ProfileCell::new(
+        boot_profile(
+            &cfg,
+            &ram,
+            cpuid.as_slice(),
+            &vcpus[0],
+            kernel.zero_page_addr,
+            (virtio.is_some(), net_mode, vsock.is_some()),
+        ),
+        cfg.profile_out.as_deref(),
+    )?);
+    profile.complete(|_| {})?;
 
     let vm = Arc::new(vm);
     let shared = Shared {
@@ -914,6 +1060,7 @@ mod vcpu_cap_tests {
             sandbox_id: "cap-test".to_string(),
             vcpus: 255,
             agent_sock: None,
+            profile_out: None,
             plugin: None,
             sandbox: false,
             stop: None,
@@ -1085,5 +1232,48 @@ mod pio_tests {
             self.high.store(level, Ordering::SeqCst);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::cpu_ident;
+    use kvm_bindings::kvm_cpuid_entry2;
+
+    fn leaf(function: u32, eax: u32, ebx: u32, ecx: u32, edx: u32) -> kvm_cpuid_entry2 {
+        kvm_cpuid_entry2 {
+            function,
+            eax,
+            ebx,
+            ecx,
+            edx,
+            ..Default::default()
+        }
+    }
+
+    // The display model folds in the extended model for families 6 and 15,
+    // and the display family the extended family for 15 alone. A Skylake
+    // server reports 0x50657: family 6, model 0x55, stepping 7.
+    /// Returns leaf 0 for `vendor`, whose twelve bytes CPUID spreads over
+    /// EBX, EDX and ECX in that order.
+    fn vendor_leaf(vendor: &[u8; 12]) -> kvm_cpuid_entry2 {
+        let word =
+            |i: usize| u32::from_le_bytes([vendor[i], vendor[i + 1], vendor[i + 2], vendor[i + 3]]);
+        leaf(0, 0x10, word(0), word(8), word(4))
+    }
+
+    #[test]
+    fn the_identity_is_vendor_family_model_stepping() {
+        let table = [vendor_leaf(b"GenuineIntel"), leaf(1, 0x0005_0657, 0, 0, 0)];
+        assert_eq!(
+            cpu_ident(&table).as_deref(),
+            Some("GenuineIntel family 0x6 model 0x55 stepping 0x7")
+        );
+        let amd = [vendor_leaf(b"AuthenticAMD"), leaf(1, 0x00a0_0f11, 0, 0, 0)];
+        assert_eq!(
+            cpu_ident(&amd).as_deref(),
+            Some("AuthenticAMD family 0x19 model 0x1 stepping 0x1")
+        );
+        assert_eq!(cpu_ident(&table[..1]), None);
     }
 }
