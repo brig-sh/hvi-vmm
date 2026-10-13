@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Format, reflow, lint and doc-check the tree. Run it before you push; CI runs
-# the same steps with --check (validate-code.yml).
+# Check rust-version against the toolchain pin, then format, reflow, lint and
+# doc-check the tree. Run it before you push; CI runs the same steps with
+# --check (validate-code.yml).
 #
 # Default (fix) mode rewrites formatting and comment width in place. --check is
 # the read-only variant: it verifies and fails instead of writing.
@@ -56,6 +57,23 @@ run() {
 have_nightly() {
   rustup toolchain list 2>/dev/null | grep -q "^$RUSTFMT_NIGHTLY"
 }
+
+# Prints the value of key $2 in file $1, from a line of the form key = "value".
+pinned() {
+  sed -n "s/^$2 = \"\\([^\"]*\\)\".*/\\1/p" "$1"
+}
+
+# rust-version names the release rust-toolchain.toml pins; see Cargo.toml.
+RUST_VERSION=$(pinned Cargo.toml rust-version)
+CHANNEL=$(pinned rust-toolchain.toml channel)
+if [ -z "$RUST_VERSION" ] || [ -z "$CHANNEL" ]; then
+  echo "tidy: cannot read rust-version from Cargo.toml or channel from rust-toolchain.toml" >&2
+  exit 1
+fi
+if [ "$RUST_VERSION" != "$CHANNEL" ]; then
+  echo "tidy: Cargo.toml sets rust-version $RUST_VERSION but rust-toolchain.toml pins $CHANNEL; set both to the same release" >&2
+  exit 1
+fi
 
 TARGET_ARGS=""
 if [ -n "$TARGET" ]; then

@@ -2,7 +2,12 @@
 name = "hvi"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+# `rust-version` names the release rust-toolchain.toml pins. The seccomp
+# allowlists hold the syscalls the standard library of that release makes, and
+# an older toolchain fails the build instead of running into a filter. clippy
+# also judges the code by the toolchain that builds it. tools/tidy.sh fails when
+# the two differ.
+rust-version = "1.95.0"
 description = "The microVMM that runs brig's sandboxes -- Hypervisor.framework (macOS) and KVM (Linux) backends"
 license = "Apache-2.0"
 repository = "https://github.com/brig-sh/hvi-vmm"
