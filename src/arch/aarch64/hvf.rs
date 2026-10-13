@@ -62,7 +62,7 @@ use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
-use crate::teardown::StopSource;
+use crate::teardown::{StopSource, StopToken};
 use crate::terminal;
 use crate::LOG_PREFIX;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
@@ -633,6 +633,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Arc::clone(&fs.dev),
                 Arc::clone(&shared.guest.ram),
                 Arc::clone(&fs.wake),
+                io_threads.token(),
             ),
         );
         let (workers, stop) = lock_or_recover(&fs.dev).start_readahead();
@@ -1140,13 +1141,18 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// `boot` calls [`FsWake::stop`] once the vCPUs have exited, and the worker
 /// leaves its loop at the next `park`. It then drains the chains announced by a
 /// wake that arrived with the stop.
+///
+/// Each drain passes the pause gate of `stop` first, so a pause holds the
+/// worker back between drains. The worker parks outside the gate.
 fn spawn_fs_worker(
     dev: Arc<Mutex<VirtioFs>>,
     mem: Arc<GuestRam>,
     wake: Arc<FsWake>,
+    stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while wake.park() {
+            let _in = stop.enter();
             lock_or_recover(&dev).drain_notified(&mem);
         }
         // A wake that arrived with the stop was cleared by that last `park`,

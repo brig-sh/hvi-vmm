@@ -20,6 +20,10 @@
 //! threads only it has with [`IoThreads::push`]. Once the vCPUs have exited,
 //! [`IoThreads::stop`] requests the stop and joins every thread, as `teardown`
 //! describes.
+//!
+//! Each thread passes the token's pause gate around the work that touches a
+//! device or guest RAM, so a pause of the gate holds all of them back. The
+//! console's bytes and the relay's frames are delivered inside the gate.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -76,11 +80,16 @@ impl IoThreads {
         net: Option<NetSource>,
     ) -> Self {
         let vcpus = Arc::clone(&guest.vcpus);
+        let mut deliver = deliver;
+        let gate = source.token();
         let console = terminal::input::spawn(
             plugin,
             source.token(),
             move || vcpus.kicker().kick(0),
-            deliver,
+            move |byte| {
+                let _in = gate.enter();
+                deliver(byte);
+            },
         );
         let mut io_threads = Self {
             source,
@@ -99,7 +108,11 @@ impl IoThreads {
         }
         if let (Some(net), Some(dev)) = (net, &guest.net) {
             let (dev, ram, stop) = (Arc::clone(dev), Arc::clone(&guest.ram), io_threads.token());
-            let deliver = move |frame: &[u8]| lock_or_recover(&dev).deliver(&ram, frame);
+            let gate = stop.clone();
+            let deliver = move |frame: &[u8]| {
+                let _in = gate.enter();
+                lock_or_recover(&dev).deliver(&ram, frame);
+            };
             let (name, relay) = match net {
                 NetSource::Gateway(stream) => (
                     "gateway relay",
