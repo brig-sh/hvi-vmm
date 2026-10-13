@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Stop;
 use crate::hypervisor::quiesce::Quiesce;
-use crate::hypervisor::run::Waker;
+use crate::stop::StopHandle;
 use crate::sync::lock_or_recover;
 use crate::LOG_PREFIX;
 
@@ -68,16 +68,16 @@ pub(crate) struct Vcpus<K> {
     started: AtomicU32,
     /// The number of vCPU threads that have exited.
     exited: AtomicU32,
-    /// The wake the loop waits on for an exit.
-    wake: Arc<Waker>,
+    /// The run's stop handle, which also wakes the loop.
+    stop_handle: StopHandle,
     /// The [`Kick`] implementation that kicks the vCPUs.
     kicker: K,
 }
 
 impl<K: Kick> Vcpus<K> {
-    /// Returns the state of `count` vCPUs that `kicker` kicks, whose threads
-    /// report their exit through `wake`.
-    pub(crate) fn new(count: u32, kicker: K, wake: Arc<Waker>) -> Self {
+    /// Returns the state of `count` vCPUs that `kicker` kicks, whose run stops
+    /// on a request through `stop`.
+    pub(crate) fn new(count: u32, kicker: K, stop: StopHandle) -> Self {
         Self {
             running: AtomicBool::new(true),
             quiesce: Quiesce::new(),
@@ -85,7 +85,7 @@ impl<K: Kick> Vcpus<K> {
             count,
             started: AtomicU32::new(0),
             exited: AtomicU32::new(0),
-            wake,
+            stop_handle: stop,
             kicker,
         }
     }
@@ -175,31 +175,35 @@ impl<K: Kick> Vcpus<K> {
         self.quiesce.release();
     }
 
-    /// Blocks until a vCPU thread has exited.
+    /// Blocks until a vCPU thread has exited or a stop is requested.
     ///
     /// # Errors
     ///
     /// Errors if the wake cannot be waited on.
-    pub(crate) fn wait_for_exit(&self) -> io::Result<()> {
-        self.wait_for_exits(1, None).map(|_| ())
+    pub(crate) fn wait_for_stop(&self) -> io::Result<()> {
+        // A request is stored, and an exit is counted, before its wake. So one
+        // that lands after the check leaves a wake pending.
+        while self.exited.load(Ordering::SeqCst) == 0 && !self.stop_handle.is_stop_requested() {
+            self.stop_handle.wait(None)?;
+        }
+        Ok(())
     }
 
-    /// Returns whether `count` vCPU threads exit before `deadline`, with no
-    /// limit when `deadline` is `None`.
+    /// Returns whether `count` vCPU threads exit before `deadline`.
     ///
     /// It blocks until they have exited or the deadline passes.
     ///
     /// # Errors
     ///
     /// Errors if the wake cannot be waited on.
-    fn wait_for_exits(&self, count: u32, deadline: Option<Instant>) -> io::Result<bool> {
+    fn wait_for_exits(&self, count: u32, deadline: Instant) -> io::Result<bool> {
         // An exit is counted before its wake, so one that lands after the check
         // leaves a wake pending.
         while self.exited.load(Ordering::SeqCst) < count {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 return Ok(false);
             }
-            self.wake.wait(deadline)?;
+            self.stop_handle.wait(Some(deadline))?;
         }
         Ok(true)
     }
@@ -229,12 +233,23 @@ impl<K: Kick> Vcpus<K> {
 
     /// Returns how the run ended.
     ///
-    /// Every failure is reported, so a run with no report is one in which the
-    /// guest stopped without saying how, and it reads as [`Stop::SystemOff`].
+    /// A report wins over a stop request, so a failure or a guest stop a vCPU
+    /// reports before `boot` reads how the run ended is the outcome returned.
+    /// Every failure is reported. A run with neither a report nor a request is
+    /// one in which the guest stopped without saying how, and its outcome is
+    /// [`Stop::SystemOff`].
     pub(crate) fn outcome(&self) -> Outcome {
-        lock_or_recover(&self.outcome)
-            .clone()
-            .unwrap_or(Outcome::Stopped(Stop::SystemOff))
+        let reported = lock_or_recover(&self.outcome).clone();
+        reported.unwrap_or(Outcome::Stopped(if self.stop_handle.is_stop_requested() {
+            Stop::Requested
+        } else {
+            Stop::SystemOff
+        }))
+    }
+
+    /// Returns the handle that asks this run to stop.
+    pub(crate) fn stop_handle(&self) -> &StopHandle {
+        &self.stop_handle
     }
 
     /// Spawns one thread per vCPU, each running `run` with its id and the item
@@ -308,7 +323,7 @@ impl<K: Kick> Vcpus<K> {
 /// How a run ended.
 #[derive(Clone, Debug)]
 pub(crate) enum Outcome {
-    /// The guest asked to stop.
+    /// The run stopped, as the guest or the host asked.
     Stopped(Stop),
     /// A vCPU failed, with the text that says how.
     Failed(String),
@@ -343,7 +358,7 @@ impl<K: Kick> Drop for ExitGuard<K> {
         // reads as exited.
         self.exited.store(true, Ordering::SeqCst);
         self.vcpus.exited.fetch_add(1, Ordering::SeqCst);
-        self.vcpus.wake.wake();
+        self.vcpus.stop_handle.wake();
     }
 }
 
@@ -386,7 +401,7 @@ impl VcpuThreads {
         timeout: Duration,
     ) -> io::Result<()> {
         let count = u32::try_from(self.0.len()).unwrap_or(u32::MAX);
-        if let Err(e) = vcpus.wait_for_exits(count, Some(Instant::now() + timeout)) {
+        if let Err(e) = vcpus.wait_for_exits(count, Instant::now() + timeout) {
             stderrln!("{LOG_PREFIX} waiting for the vCPU threads: {e}");
         }
         let mut failure = None;
@@ -459,7 +474,7 @@ mod tests {
     /// Returns the state of `count` vCPUs that `kicker` kicks, with a wake of
     /// their own.
     fn test_vcpus<K: Kick>(count: u32, kicker: K) -> Vcpus<K> {
-        Vcpus::new(count, kicker, Arc::new(Waker::new().unwrap()))
+        Vcpus::new(count, kicker, StopHandle::new_pair().unwrap().0)
     }
 
     /// Waits up to five seconds for `thread` to exit.
@@ -628,7 +643,7 @@ mod tests {
             vcpus: Arc::clone(&vcpus),
             exited: Arc::default(),
         });
-        vcpus.wait_for_exit().unwrap();
+        vcpus.wait_for_stop().unwrap();
         assert!(vcpus.is_running(), "the guard stopped the VM itself");
         assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::SystemOff)));
     }
@@ -636,11 +651,11 @@ mod tests {
     // The loop waits for an exit on another thread than the vCPU's. An exit
     // after the wait began has to end it.
     #[test]
-    fn wait_for_exit_ends_when_a_vcpu_thread_exits() {
+    fn wait_for_stop_ends_when_a_vcpu_thread_exits() {
         let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
         let waiter = {
             let vcpus = Arc::clone(&vcpus);
-            std::thread::spawn(move || vcpus.wait_for_exit().unwrap())
+            std::thread::spawn(move || vcpus.wait_for_stop().unwrap())
         };
         std::thread::sleep(Duration::from_millis(20));
         assert!(!waiter.is_finished(), "the wait ended with no exit");
@@ -667,6 +682,29 @@ mod tests {
             vcpus.outcome(),
             Outcome::Failed(text) if text == "vcpu0: panicked (the vCPU loop panicked)"
         ));
+    }
+
+    #[test]
+    fn wait_for_stop_ends_on_a_request() {
+        let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
+        let waiter = {
+            let vcpus = Arc::clone(&vcpus);
+            std::thread::spawn(move || vcpus.wait_for_stop().unwrap())
+        };
+        vcpus.stop_handle().request_stop();
+        assert!(exits(&waiter), "the request did not end the wait");
+        waiter.join().unwrap();
+        assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::Requested)));
+    }
+
+    // A vCPU that fails before the loop acts on a request is the failure the
+    // run returns.
+    #[test]
+    fn report_wins_over_a_request() {
+        let vcpus = test_vcpus(1, CountingKicker::default());
+        vcpus.report(Outcome::Failed("vcpu0: KVM internal error".to_string()));
+        vcpus.stop_handle().request_stop();
+        assert!(matches!(vcpus.outcome(), Outcome::Failed(_)));
     }
 
     // The error names the thread still running, not the one beside it that
@@ -700,7 +738,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(500);
         let waiter = {
             let vcpus = Arc::clone(&vcpus);
-            std::thread::spawn(move || vcpus.wait_for_exits(1, Some(deadline)))
+            std::thread::spawn(move || vcpus.wait_for_exits(1, deadline))
         };
         while !waiter.is_finished() {
             // SAFETY: a signal to a thread of this process that is not joined

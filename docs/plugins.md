@@ -56,6 +56,15 @@ cpu.resume();               // before anything that can fail or return
 report(sample);
 ```
 
+A `safepoint` may hold the pause while it waits, for example for another process
+to finish reading. It checks `cpu.is_stopping()` as it waits. Once that returns
+`true`, it resumes and returns. The stop waits one second for the boot vCPU,
+then leaves its thread running and fails the run.
+
+A plugin that needs the run to end calls `VmHandle::request_stop()`, from any
+thread. `boot` then returns `Stop::Requested`, unless a vCPU reports a failure
+or a guest stop before `boot` reads how the run ended.
+
 **3. Set a flag, then kick.** If your own thread decides it is time to act,
 set your flag and then call `VmHandle::kick()`. An idle guest sits in WFI on
 arm64 or HLT on x86 and does not reach `safepoint` on its own, so without the

@@ -125,6 +125,13 @@ pub trait VmHandle: Send + Sync {
     /// an [`IoSink`] on its exit path, is dropped. Call it from a thread of the
     /// plugin's own.
     fn kick(&self);
+
+    /// Asks the run to stop, as a [`StopHandle`](crate::stop::StopHandle) does.
+    ///
+    /// `boot` returns [`Stop::Requested`](crate::config::Stop::Requested),
+    /// unless a vCPU reports a failure or a guest stop before `boot` reads how
+    /// the run ended. The call returns at once and is safe from any thread.
+    fn request_stop(&self);
 }
 
 /// What the VMM offers a plugin at a vCPU safe point.
@@ -158,6 +165,14 @@ pub trait CpuHandle {
 
     /// Releases the vCPUs parked by a successful [`CpuHandle::pause`].
     fn resume(&self);
+
+    /// Returns whether the run is stopping.
+    ///
+    /// A plugin that waits inside [`Plugin::safepoint`] checks it while it
+    /// waits and returns once it is `true`. The stop waits
+    /// [`STOP_TIMEOUT`](crate::teardown::STOP_TIMEOUT) for this vCPU, then
+    /// leaves its thread running and fails the run.
+    fn is_stopping(&self) -> bool;
 
     /// The `RawEvent` ledger.
     fn ledger(&self) -> &Arc<Mutex<Emitter>>;

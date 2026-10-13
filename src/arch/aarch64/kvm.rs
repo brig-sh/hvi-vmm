@@ -61,7 +61,6 @@ use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
-use crate::hypervisor::run::Waker;
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
@@ -116,17 +115,20 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
 }
 
-/// Boots `cfg` on KVM and runs the guest until it powers off or resets.
+/// Boots `cfg` on KVM and runs the guest until it powers off, resets, or the
+/// host requests a stop.
 ///
 /// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
 /// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the first that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread.
-/// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
-/// thread it started from `attach`.
-pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
+/// exception is the thread that receives the stop signals, which the first run
+/// after [`stop_on_signals`](crate::signal::stop_on_signals) starts for the
+/// life of the process. What remains of the VM is a `VmHandle` a plugin kept,
+/// in a field or on a thread it started from `attach`.
+pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if !cfg.fs_shares.is_empty() {
         return Err(
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
@@ -340,7 +342,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             vcpus: Arc::new(Vcpus::new(
                 num_cpus,
                 Kicker::new(num_cpus),
-                Arc::new(Waker::new()?),
+                cfg.take_stop_handle()?,
             )),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),

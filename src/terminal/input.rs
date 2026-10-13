@@ -46,7 +46,7 @@ pub(crate) fn run(
             Ok(true) => {}
             Ok(false) => break,
             Err(e) => {
-                eprintln!("{LOG_PREFIX} console: {e}; console input stopped");
+                stderrln!("{LOG_PREFIX} console: {e}; console input stopped");
                 break;
             }
         }

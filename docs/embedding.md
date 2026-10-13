@@ -31,29 +31,35 @@ host:
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
-`Stop` is `SystemOff` or `SystemReset`: how the guest asked to halt. When a vCPU
-fails, `boot` returns an error that names the vCPU and says how it failed.
+`Stop` says how the run ended. `SystemOff` and `SystemReset` mean the guest
+powered off or reset. `Requested` means the host asked the run to stop (see
+[Stopping a run from the host](#stopping-a-run-from-the-host)). It is
+`#[non_exhaustive]`, so a `match` on it needs a wildcard arm. When a vCPU fails,
+`boot` returns an error that names the vCPU and says how it failed.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,
 call `boot` again yourself.
 
-The call blocks until the guest stops. It reads the process's stdin for the
-whole run, one byte at a time, as the guest console; nothing else in the process
-should read stdin while `boot` runs. It also takes over the kick signal,
-`SIGRTMIN` on Linux and `SIGUSR1` on macOS: it installs a no-op handler for it
-and does not restore the one it replaced. It sends that signal to its own
-threads to interrupt them, so nothing else in the process should use it. Before
-it returns, the ledger is flushed, the agent listener and every accepted agent
-connection are closed, and every thread it started itself has exited, with one
-exception: a thread still running at its deadline is left running and `boot`
-returns an error naming the first such thread, a vCPU thread before a helper
-thread. `boot` waits up to one second for the vCPU threads, then up to one
-second for the helper threads, and then up to one second for the ledger, which a
-thread left running can hold; it does not write the tail of a ledger still held.
-It returns at most three seconds after the stop. The waits it cannot interrupt
-are a plugin blocking in `request` or `safepoint` and a virtio-fs worker waiting
-on a host file lock. On macOS such a lock wait can also stall a vCPU (see [Known
+The call blocks until the guest stops, a vCPU fails, or a stop is requested. It
+reads the process's stdin for the whole run, one byte at a time, as the guest
+console; nothing else in the process should read stdin while `boot` runs. It
+also takes over the kick signal, `SIGRTMIN` on Linux and `SIGUSR1` on macOS: it
+installs a no-op handler for it and does not restore the one it replaced. It
+sends that signal to its own threads to interrupt them, so nothing else in the
+process should use it. Before it returns, the ledger is flushed, the agent
+listener and every accepted agent connection are closed, and every thread it
+started itself has exited, with two exceptions. A thread still running at its
+deadline is left running and `boot` returns an error naming the first such
+thread, a vCPU thread before a helper thread. The thread that receives the stop
+signals runs for the life of the process (see [Stopping a run from the
+host](#stopping-a-run-from-the-host)). `boot` waits up to one second for the
+vCPU threads, then up to one second for the helper threads, and then up to one
+second for the ledger, which a thread left running can hold; it does not write
+the tail of a ledger still held. It returns at most three seconds after the
+stop. The waits it cannot interrupt are a plugin blocking in `request` or
+`safepoint` and a virtio-fs worker waiting on a host file lock. On macOS such a
+lock wait can also stall a vCPU (see [Known
 limits](limitations.md#virtio-fs-resource-limits)). A plugin that keeps the
 `Arc<dyn VmHandle>` it was given keeps guest RAM, the ledger file and the block,
 net and vsock devices until it drops the handle. It also keeps the VM, through
@@ -88,6 +94,7 @@ let cfg = BootConfig {
     agent_sock: None,
     plugin: None,
     sandbox: true,
+    stop: None,
 };
 
 let stop = hvi::boot(cfg)?;
@@ -125,9 +132,56 @@ cargo build --release --example watch_guest
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
+| `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
 
 `FsShare` carries a `path`, a `tag`, a `ShareMode` and a `CachePolicy`. See
 [storage-and-sharing.md](storage-and-sharing.md).
+
+## Stopping a run from the host
+
+Create a pair with `hvi::stop::StopHandle::new_pair()` before `boot`, keep the
+`StopHandle` and pass the `StopRegistration` in `BootConfig::stop`. `boot` takes
+the registration by value, so it serves one run. `StopHandle::request_stop` from
+any thread stops the run: the VM stops, the threads are joined and the ledger is
+flushed, and `boot` returns `Stop::Requested`. A failure or a guest stop a vCPU
+reports before `boot` reads how the run ended takes the place of
+`Stop::Requested`. A plugin asks for the same stop with
+`VmHandle::request_stop`.
+
+The library installs no handler for a stop signal. To stop the run on `SIGTERM`,
+`SIGINT` and `SIGHUP`, as the `hvi` binary does, call
+`hvi::signal::stop_on_signals(&handle)` before `boot`. The signals keep their
+actions until the next `boot` starts its run, on Linux once it arms its filters
+and on macOS before it enters the sandbox. Until then a stop signal ends the
+process, unless you changed its action. That `boot` installs handlers for the
+signals, which are not removed, and starts a thread that receives them for the
+life of the process, outside the threads `boot` joins.
+
+A signal the process ignores when the run starts stays ignored, as `SIGHUP` is
+under `nohup`. To stop on it anyway, set it to `SIG_DFL` first. Once a run has
+started, the next call registers it at once. Make no other change to these
+signals' actions once a run has started, since a registered signal is not
+installed again. A handler a signal already has still runs, before the stop
+request.
+
+Once a run has started, the process outlives a `SIGHUP`, and stderr can then be
+a terminal that hung up. `eprintln!` panics on a failed write, so a line your
+code or your plugin prints with it after a `SIGHUP` panics that thread. A panic
+in a plugin hook that a vCPU thread runs fails the run. The setup lines of a
+later `boot` in the same process are printed with `eprintln!` too, so a binary
+that stopped on `SIGHUP` should end rather than boot again.
+
+Another stop signal, one second or more after the first, ends the process at
+once by that signal, and the ledger loses its tail. One that arrives sooner,
+such as a copy a wrapper forwards, has no effect. A later call moves the signals
+to another handle.
+
+Once `boot` has returned, `handle.signal()` names the first stop signal that
+asked for the stop, if one did, even one that asked after another request, and
+`hvi::signal::exit_by_signal(signal)` ends the process by it, so a parent sees
+the same status it would have seen with no handler. A first stop signal that
+arrives after the run has ended asks a finished run to stop, so a binary that
+keeps running after `boot` returns checks `handle.signal()` once it is done.
 
 ## Configuration outside `BootConfig`
 

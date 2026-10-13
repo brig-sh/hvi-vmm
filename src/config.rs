@@ -194,13 +194,40 @@ pub struct BootConfig {
     /// backend logs which one it installed, so this is never a silent
     /// "sandboxed" claim on a host that is not.
     pub sandbox: bool,
+    /// The registration of the [`StopHandle`](crate::stop::StopHandle) that
+    /// asks this run to stop from outside the guest, or `None` when the caller
+    /// keeps no handle.
+    ///
+    /// See [`crate::stop`].
+    pub stop: Option<crate::stop::StopRegistration>,
+}
+
+impl BootConfig {
+    /// Takes the run's stop out of [`stop`](Self::stop) as a handle, or returns
+    /// a new handle when it is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Errors if a new handle cannot be created.
+    pub(crate) fn take_stop_handle(&mut self) -> std::io::Result<crate::stop::StopHandle> {
+        match self.stop.take() {
+            Some(registration) => Ok(registration.into_handle()),
+            None => Ok(crate::stop::StopHandle::new_pair()?.0),
+        }
+    }
 }
 
 /// Why the run stopped.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Stop {
+    /// A power-off by the guest.
     SystemOff,
+    /// A reset by the guest, which is not restarted.
     SystemReset,
+    /// The host asked the run to stop, through a
+    /// [`StopHandle`](crate::stop::StopHandle).
+    Requested,
 }
 
 #[cfg(test)]

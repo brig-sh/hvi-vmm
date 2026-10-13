@@ -62,8 +62,8 @@ happen says so:
 ### macOS: Seatbelt
 
 One process-wide profile, entered once every host resource is open and before
-the first helper thread or vCPU starts. It is deny-default, with one static
-allow rule for `file-ioctl` on `/dev/tty`, plus one rule per virtio-fs export by
+the first I/O thread or vCPU starts. It is deny-default, with one static allow
+rule for `file-ioctl` on `/dev/tty`, plus one rule per virtio-fs export by
 resolved root path: `file-read*` for a read-only share, `file-read* file-write*`
 for a writable one.
 
@@ -86,7 +86,14 @@ thread as that thread's first act:
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the main thread and the host-side I/O threads | 47 syscalls | 48 syscalls |
+| `vmm` | the main thread, the host-side I/O threads and the stop-signal thread | 47 syscalls | 48 syscalls |
+
+The stop-signal thread starts in the first run after a call to
+`hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
+the `vmm` filter as its first act. It outlives the run and stays filtered. When
+that first run has the sandbox off, the thread starts unfiltered, and installs
+the filter the first time a stop signal wakes it in a later run with the sandbox
+on.
 
 `vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
 action of `trap`, so an off-list syscall raises `SIGSYS` and kills the

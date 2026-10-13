@@ -59,7 +59,7 @@ flowchart TB
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos"]
             obs["plugin: the seam<br/>plugin::builtin · events ledger"]
             vm["hypervisor: vcpus / guest / kvm / run / quiesce"]
-            rt["io_threads · signal<br/>terminal: filter / raw / input"]
+            rt["io_threads · signal · stop<br/>terminal: filter / raw / input"]
             conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
             gm["memory: GuestRam over vm-memory<br/>SharedRam: memfd / POSIX shm"]
         end
@@ -82,7 +82,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
 The crate root re-exports the one for the host target as `hvi::boot`, so the CLI
-and a linking crate use the same call. `Stop` is `SystemOff` or `SystemReset`.
+and a linking crate use the same call. `Stop` is `SystemOff`, `SystemReset` or
+`Requested`.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
@@ -372,10 +373,12 @@ On every backend, the thread that called `boot` owns the stop. Once the vCPU
 threads are spawned it waits in `hypervisor/run.rs` on a pipe. A guard held by
 each vCPU thread writes it when the thread exits, whatever ended the loop: a
 guest-requested stop, a failed entry, an unhandled exit, a failed run, or a
-panic. Each of these is reported to `Vcpus` as the run's outcome. `boot` returns
-the guest's `Stop`, or an error that names the vCPU and the failure. The first
-report is kept, except that a failure replaces an earlier stop. A failure that is
-not kept is printed.
+panic. Each of these is reported to `Vcpus` as the run's outcome. A stop request
+through a `StopHandle` or `VmHandle::request_stop` writes the same pipe. `boot`
+returns the guest's `Stop`, or an error that names the vCPU and the failure. The
+first report is kept, except that a failure replaces an earlier stop. A failure
+that is not kept is printed. With no report, a request makes `boot` return
+`Stop::Requested`.
 
 The loop then ends the VM through `Vcpus::stop` in `hypervisor/vcpus.rs`, which
 clears the running flag, kicks the vCPUs out of the hypervisor, and then
@@ -435,7 +438,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `hypervisor/run.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `hypervisor/run.rs`, `stop.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

@@ -1202,7 +1202,7 @@ impl VsockBridge {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; no longer accepting");
+                    stderrln!("{LOG_PREFIX} vsock bridge: {e}; no longer accepting");
                     break;
                 }
             }
@@ -1264,7 +1264,7 @@ impl VsockBridge {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
+                    stderrln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
                     lock_or_recover(&dev).host_gone(&mem, port);
                     break;
                 }
@@ -1294,7 +1294,7 @@ impl VsockBridge {
                     // device releases it.
                     Ok(false) => break,
                     Err(e) => {
-                        eprintln!("{LOG_PREFIX} vsock bridge: {e}; connection closed");
+                        stderrln!("{LOG_PREFIX} vsock bridge: {e}; connection closed");
                         break;
                     }
                 }

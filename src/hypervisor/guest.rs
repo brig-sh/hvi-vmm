@@ -134,6 +134,10 @@ impl<K: Kick> VmHandle for Guest<K> {
         // vcpu0 is the one that reaches the plugin hook.
         self.vcpus.kicker().kick(0);
     }
+
+    fn request_stop(&self) {
+        self.vcpus.stop_handle().request_stop();
+    }
 }
 
 /// Access to a vCPU's registers for a plugin at a safe point.
@@ -172,6 +176,10 @@ impl<K: Kick, V: VcpuRegs> CpuHandle for Cpu<'_, K, V> {
 
     fn resume(&self) {
         self.guest.vcpus.resume();
+    }
+
+    fn is_stopping(&self) -> bool {
+        !self.guest.vcpus.is_running()
     }
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {

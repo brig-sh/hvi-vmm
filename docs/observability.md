@@ -36,10 +36,13 @@ What the ledger is not:
 - **Not lossless.** Records are buffered and drained when a new event arrives
   more than 100 ms after the last drain. That is a cadence of continued traffic,
   not of wall time. Events emitted just before a guest goes quiet stay in the
-  buffer until something else is emitted or the emitter is dropped. A killed VMM
-  loses the tail. A guest that stops on its own does not: `boot` flushes the
-  ledger before it returns. A thread left running at the stop can hold the
-  ledger, and that run then ends without its tail.
+  buffer until something else is emitted or the emitter is dropped. A VMM ended
+  by `SIGKILL` or a crash loses the tail. A run loses nothing when the guest
+  stops it, a vCPU fails, or a stop is requested, by `SIGTERM` for example.
+  `boot` flushes the ledger before it returns. A thread left running at the stop
+  can hold the ledger, and that run then ends without its tail. Another stop
+  signal, one second or more after the first, ends the process at once, also
+  without the tail.
 - **Not tamper-proof.** It is an ordinary file written by the VMM process.
   Nothing signs, chains or seals it.
 - **Not monotonic.** `ts` is host wall-clock nanoseconds. It can move
