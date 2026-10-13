@@ -31,14 +31,21 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use vm_superio::serial::NoEvents;
-use vm_superio::{Serial, Trigger};
+use vm_superio::{Serial, SerialState, Trigger};
 
 use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::state::{check_version, invalid};
 use crate::terminal::ConsoleFilter;
 
 /// The register bits the interrupt state is computed from. The crate keeps its
 /// own register bits private.
+/// The received bytes the 16550's FIFO keeps.
+///
+/// This is vm-superio's `FIFO_SIZE`, which the crate does not export, and
+/// `Serial::from_state` refuses a state holding more.
+const RX_FIFO: usize = 64;
 const IER_RECEIVED_DATA: u8 = 0x01;
 const IER_THR_EMPTY: u8 = 0x02;
 const LSR_DATA_READY: u8 = 0x01;
@@ -83,6 +90,15 @@ struct ConsoleOut {
     passed: Vec<u8>,
 }
 
+impl ConsoleOut {
+    fn new() -> Self {
+        ConsoleOut {
+            filter: ConsoleFilter::new(),
+            passed: Vec::new(),
+        }
+    }
+}
+
 impl Write for ConsoleOut {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.passed.clear();
@@ -100,6 +116,64 @@ impl Write for ConsoleOut {
     }
 }
 
+/// The [`UartState`] format this build writes and reads.
+pub const UART_STATE_VERSION: u32 = 1;
+
+/// What a checkpoint keeps of the 16550: the register file the crate holds,
+/// its receive buffer, and the THR-empty interrupt this module tracks.
+///
+/// The crate's `SerialState` has no serde, so this mirrors it field for
+/// field. Transmit drains synchronously, so no byte waits on the way out. The
+/// console filter's place in an escape sequence is the host terminal's, and a
+/// restore starts it afresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UartState {
+    /// [`UART_STATE_VERSION`] when written by this build.
+    pub version: u32,
+    /// The divisor latch, low byte.
+    pub baud_divisor_low: u8,
+    /// The divisor latch, high byte.
+    pub baud_divisor_high: u8,
+    /// IER.
+    pub interrupt_enable: u8,
+    /// The crate's IIR, which reads do not answer from but keep in step.
+    pub interrupt_identification: u8,
+    /// LCR.
+    pub line_control: u8,
+    /// LSR.
+    pub line_status: u8,
+    /// MCR.
+    pub modem_control: u8,
+    /// MSR.
+    pub modem_status: u8,
+    /// The scratch register.
+    pub scratch: u8,
+    /// Received bytes the guest has not read, oldest first.
+    pub rx: Vec<u8>,
+    /// Whether a THR-empty interrupt is pending.
+    pub thr_empty_pending: bool,
+}
+
+impl UartState {
+    /// Refuses a state this build could not restore.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version or holds more received
+    /// bytes than the crate's FIFO keeps.
+    pub fn check(&self) -> io::Result<()> {
+        check_version("16550", self.version, UART_STATE_VERSION)?;
+        if self.rx.len() > RX_FIFO {
+            return Err(invalid(format_args!(
+                "16550 holds {} received bytes, the FIFO keeps {RX_FIFO}",
+                self.rx.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A 16550 UART with a host-stdout TX and a host-fed RX queue.
 pub struct Uart16550 {
     inner: Serial<NoTrigger, NoEvents, ConsoleOut>,
@@ -113,23 +187,76 @@ impl Uart16550 {
     #[must_use]
     pub fn new() -> Self {
         Uart16550 {
-            inner: Serial::new(
-                NoTrigger,
-                ConsoleOut {
-                    filter: ConsoleFilter::new(),
-                    passed: Vec::new(),
-                },
-            ),
+            inner: Serial::new(NoTrigger, ConsoleOut::new()),
             thr_empty_pending: false,
             irq: Irq::default(),
         }
     }
 
-    /// Connects the UART to the interrupt line it raises.
+    /// Connects the UART to the interrupt line it raises, and sets the line
+    /// to the UART's level.
+    ///
+    /// A UART built at boot has nothing pending, so the line stays low. A
+    /// restored one may have an interrupt pending that an IIR read would
+    /// report. The guest programs the pin edge-triggered, so a line left low
+    /// over it never rises, and the guest waits for an interrupt that does not
+    /// come.
     // Only the x86-64 backend attaches a 16550.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
+        self.irq.set(self.irq_level());
+    }
+
+    /// Returns what a checkpoint keeps of the UART.
+    #[must_use]
+    pub fn state(&self) -> UartState {
+        let s = self.inner.state();
+        UartState {
+            version: UART_STATE_VERSION,
+            baud_divisor_low: s.baud_divisor_low,
+            baud_divisor_high: s.baud_divisor_high,
+            interrupt_enable: s.interrupt_enable,
+            interrupt_identification: s.interrupt_identification,
+            line_control: s.line_control,
+            line_status: s.line_status,
+            modem_control: s.modem_control,
+            modem_status: s.modem_status,
+            scratch: s.scratch,
+            rx: s.in_buffer,
+            thr_empty_pending: self.thr_empty_pending,
+        }
+    }
+
+    /// Rebuilds the UART a checkpoint describes. The interrupt line is
+    /// connected afterwards, as at boot, and connecting it asserts it when an
+    /// IIR read would report an interrupt.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version or holds more received
+    /// bytes than the crate's FIFO keeps.
+    pub fn restore(state: &UartState) -> io::Result<Self> {
+        state.check()?;
+        let serial = SerialState {
+            baud_divisor_low: state.baud_divisor_low,
+            baud_divisor_high: state.baud_divisor_high,
+            interrupt_enable: state.interrupt_enable,
+            interrupt_identification: state.interrupt_identification,
+            line_control: state.line_control,
+            line_status: state.line_status,
+            modem_control: state.modem_control,
+            modem_status: state.modem_status,
+            scratch: state.scratch,
+            in_buffer: state.rx.clone(),
+        };
+        let inner = Serial::from_state(&serial, NoTrigger, NoEvents, ConsoleOut::new())
+            .map_err(|e| invalid(format_args!("16550: {e}")))?;
+        Ok(Uart16550 {
+            inner,
+            thr_empty_pending: state.thr_empty_pending,
+            irq: Irq::default(),
+        })
     }
 
     /// Returns the interrupt ID an IIR read would report now, without the FIFO
@@ -235,6 +362,7 @@ impl Default for Uart16550 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::irq::test_line::LevelLine;
 
     // COM-base offsets, as the hypervisor backend passes them in.
     const RBR_THR: u16 = 0;
@@ -387,5 +515,96 @@ mod tests {
         assert!(u.irq_level());
         assert_eq!(u.pio_read(IER), IER_THRI, "IER kept its value");
         assert_eq!(u.pio_read(IIR), 0xc2);
+    }
+
+    /// A restored UART answers the guest as the one it was taken from: the
+    /// line settings, the unread byte and the pending THR-empty interrupt all
+    /// carry over, and the JSON is the same both ways.
+    #[test]
+    fn state_round_trips_through_json_and_a_restored_uart() {
+        let mut u = Uart16550::new();
+        u.pio_write(LCR, 0x80);
+        u.pio_write(RBR_THR, 0x0c); // divisor low, 9600 baud
+        u.pio_write(LCR, 0x03);
+        u.pio_write(IER, IER_RDA | IER_THRI);
+        u.pio_write(7, 0x5a); // scratch
+        u.push_rx(b'k');
+        let state = u.state();
+        assert!(state.thr_empty_pending);
+        assert_eq!(state.rx, b"k");
+        assert_eq!(state.baud_divisor_low, 0x0c);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let back: UartState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+        let mut restored = Uart16550::restore(&back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(restored.pio_read(LSR) & LSR_DR, LSR_DR);
+        assert_eq!(restored.pio_read(RBR_THR), b'k');
+        assert_eq!(restored.pio_read(IIR) & 0x0f, IIR_THR_EMPTY);
+    }
+
+    #[test]
+    fn connecting_a_restored_uart_drives_its_line_from_its_registers() {
+        let mut u = Uart16550::new();
+        u.pio_write(IER, IER_RDA);
+        u.push_rx(b'k');
+        let pending = u.state();
+        let mut restored = Uart16550::restore(&pending).unwrap();
+        let line = Arc::new(LevelLine::default());
+        restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert!(
+            line.is_high(),
+            "the unread byte with RDA enabled raises COM1"
+        );
+        assert_eq!(line.raises(), 1);
+
+        let mut restored = Uart16550::restore(&Uart16550::new().state()).unwrap();
+        let line = Arc::new(LevelLine::default());
+        restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert_eq!(line.sets(), 0);
+    }
+
+    #[test]
+    fn state_the_uart_could_not_hold_is_refused() {
+        let good = Uart16550::new().state();
+        for bad in [
+            UartState {
+                rx: vec![0; 65],
+                ..good.clone()
+            },
+            UartState {
+                version: 0,
+                ..good.clone()
+            },
+        ] {
+            let err = Uart16550::restore(&bad).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        }
+        let full = UartState {
+            rx: vec![0; 64],
+            ..good
+        };
+        assert!(Uart16550::restore(&full).is_ok(), "a full FIFO is fine");
+    }
+
+    /// `RX_FIFO` copies a constant the crate keeps private, so the copy is
+    /// held to what `Serial::from_state` accepts.
+    #[test]
+    fn the_fifo_check_matches_the_crate() {
+        let serial = |len: usize| SerialState {
+            in_buffer: vec![0; len],
+            ..Serial::new(NoTrigger, ConsoleOut::new()).state()
+        };
+        let from_state =
+            |len: usize| Serial::from_state(&serial(len), NoTrigger, NoEvents, ConsoleOut::new());
+        assert!(from_state(RX_FIFO).is_ok());
+        assert!(from_state(RX_FIFO + 1).is_err());
+        let state = |len: usize| UartState {
+            rx: vec![0; len],
+            ..Uart16550::new().state()
+        };
+        assert!(state(RX_FIFO).check().is_ok());
+        assert!(state(RX_FIFO + 1).check().is_err());
     }
 }
