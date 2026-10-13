@@ -126,6 +126,14 @@ const MAX_TX_PACKET: usize = HDR_LEN + 64 * 1024;
 /// the rest of its socket goes into the backlog, bounded by the socket's
 /// receive buffer.
 const HOST_BACKLOG_MAX: usize = 64 * 1024;
+/// Guest to device: the waiting packets past which a guest-started connect
+/// gets no `OP_RST`.
+///
+/// The reset needs no connection, so a guest that connects in a loop while it
+/// posts no RX buffer would otherwise grow `pending` without bound, and a
+/// restore would refuse its checkpoint, see [`RESTORE_MAX_PENDING`]. A connect
+/// that gets no answer times out in the guest instead of failing at once.
+const REFUSALS_PENDING_MAX: usize = 1024;
 /// How often [`HostGate::wait`] checks whether its reader should stop
 /// waiting, for a stop or a host hangup.
 const GATE_POLL: Duration = Duration::from_millis(100);
@@ -1325,6 +1333,8 @@ impl VirtioVsock {
                     self.settle(port);
                 }
             }
+            // Enough waits for the guest already, see `REFUSALS_PENDING_MAX`.
+            OP_REQUEST if self.pending.len() >= REFUSALS_PENDING_MAX => {}
             OP_REQUEST => {
                 // Guest-initiated connect: not supported here — reset it.
                 let hdr = Hdr {
@@ -1358,7 +1368,27 @@ impl VirtioVsock {
         self.fill_rx(mem);
     }
 
+    /// Queues an `OP_CREDIT_UPDATE` for `host_port` carrying `fwd_cnt`.
+    ///
+    /// A credit update still waiting as the last packet from `host_port` is
+    /// brought up to `fwd_cnt` instead of followed by another. The guest keeps
+    /// only the newest count, and no packet of that connection behind it
+    /// carries an older one, so it loses nothing. Without this, a guest that
+    /// posts no RX buffer grows `pending` by one packet per credit request,
+    /// and a restore refuses its checkpoint, see [`RESTORE_MAX_PENDING`].
     fn enqueue_credit(&mut self, host_port: u32, fwd_cnt: u32) {
+        let last = self
+            .pending
+            .iter_mut()
+            .rev()
+            .find(|p| Hdr::parse(p).is_some_and(|h| h.src_port == host_port));
+        if let Some(last) = last {
+            if let Some(mut h) = Hdr::parse(last).filter(|h| h.op == OP_CREDIT_UPDATE) {
+                h.fwd_cnt = fwd_cnt;
+                last[..HDR_LEN].copy_from_slice(&h.to_bytes());
+                return;
+            }
+        }
         let hdr = Hdr {
             src_cid: HOST_CID,
             dst_cid: GUEST_CID,
@@ -3186,6 +3216,65 @@ mod state_tests {
         assert_eq!(after.conns[0].port, live);
         assert_eq!(after.conns[0].state, VsockConnPhase::Connected);
         assert_eq!(after.next_port, live, "a refused client takes no port");
+    }
+
+    /// A guest that posts no RX buffer and floods credit requests gets one
+    /// credit update waiting, kept up to date, and its device can still be
+    /// checkpointed.
+    #[test]
+    fn a_credit_flood_leaves_one_update_waiting() {
+        let mem = mem();
+        let (mut dev, _peers) = busy(&mem);
+        let accepted = dev.state().conns[0].port;
+        for _ in 0..RESTORE_MAX_PENDING + 10 {
+            dev.handle_pkt(&mem, &from_guest(OP_CREDIT_REQUEST, accepted, &[]));
+        }
+        assert_eq!(dev.state().pending.len(), 3, "two requests, one update");
+
+        // A host that went away turns every guest send into credit.
+        dev.host_gone(&mem, accepted);
+        let rx_before = dev.state().conns[0].rx_cnt;
+        for _ in 0..1000 {
+            dev.handle_pkt(&mem, &from_guest(OP_RW, accepted, b"0123456789"));
+        }
+        let state = dev.state();
+        let ops: Vec<u16> = state
+            .pending
+            .iter()
+            .map(|p| Hdr::parse(p).unwrap().op)
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                OP_REQUEST,
+                OP_REQUEST,
+                OP_CREDIT_UPDATE,
+                OP_SHUTDOWN,
+                OP_CREDIT_UPDATE
+            ]
+        );
+        let last = Hdr::parse(state.pending.last().unwrap()).unwrap();
+        assert_eq!(
+            last.fwd_cnt,
+            rx_before + 10_000,
+            "the update carries the newest count"
+        );
+        assert_eq!(refused(&state), None, "the device can be checkpointed");
+    }
+
+    /// A guest that connects in a loop without posting an RX buffer stops
+    /// getting resets once enough packets wait, so its device can still be
+    /// checkpointed.
+    #[test]
+    fn a_connect_flood_is_answered_only_so_far() {
+        let mem = mem();
+        let (mut dev, _peers) = busy(&mem);
+        for port in 0..RESTORE_MAX_PENDING as u32 + 10 {
+            dev.handle_pkt(&mem, &from_guest(OP_REQUEST, port, &[]));
+        }
+        let state = dev.state();
+        assert_eq!(state.pending.len(), REFUSALS_PENDING_MAX);
+        assert_eq!(refused(&state), None, "the device can be checkpointed");
     }
 
     #[test]
