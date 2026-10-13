@@ -177,6 +177,15 @@ pub struct BootConfig {
     pub vcpus: u32,
     /// Host Unix-socket path bridged to the guest agent's vsock port (exec).
     pub agent_sock: Option<String>,
+    /// Path the machine profile is written to, as one line of canonical JSON
+    /// (see [`crate::checkpoint::profile`]).
+    ///
+    /// The file is created before confinement, which forbids creating one
+    /// later, and written once the profile is complete: before the guest starts
+    /// on KVM, and on hvf by the boot vCPU before the guest's first
+    /// instruction, since only a vCPU's own thread can read `MIDR_EL1` there.
+    /// A reader that finds the file empty waits, or asks the control socket.
+    pub profile_out: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.
     ///
     /// This is the whole of the VMM's observation surface: see

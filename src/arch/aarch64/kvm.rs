@@ -50,6 +50,8 @@ use crate::arch::aarch64::layout::{
     VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
+use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::checkpoint::profile::{hex, MachineProfile, ProfileCell};
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
@@ -103,6 +105,61 @@ fn get_u64(vcpu: &VcpuFd, id: u64) -> u64 {
     vcpu.get_one_reg(id, &mut b)
         .map(|_| u64::from_le_bytes(b))
         .unwrap_or(0)
+}
+
+/// Returns the `KVM_GET_ONE_REG` id of the 64-bit system register with
+/// encoding `op0, op1, CRn, CRm, op2`, as the kernel's `ARM64_SYS_REG` builds
+/// it. bindgen does not expand that macro, so it is spelled out here.
+const fn sys_reg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+    0x6030_0000_0013_0000 | (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+}
+
+/// `MIDR_EL1`, the CPU's identity.
+const REG_MIDR_EL1: u64 = sys_reg(3, 0, 0, 0, 0);
+
+/// The PSCI version firmware register, `KVM_REG_ARM_FW_REG(0)`.
+const REG_PSCI_VERSION: u64 = 0x6030_0000_0014_0000;
+
+/// The ID registers the profile records, by the name it records them under.
+/// The guest reads these values, and KVM serves the host's unless told
+/// otherwise, so two hosts must agree on each.
+const ID_REGS: [(&str, u64); 13] = [
+    ("ID_AA64DFR0_EL1", sys_reg(3, 0, 0, 5, 0)),
+    ("ID_AA64DFR1_EL1", sys_reg(3, 0, 0, 5, 1)),
+    ("ID_AA64ISAR0_EL1", sys_reg(3, 0, 0, 6, 0)),
+    ("ID_AA64ISAR1_EL1", sys_reg(3, 0, 0, 6, 1)),
+    ("ID_AA64ISAR2_EL1", sys_reg(3, 0, 0, 6, 2)),
+    ("ID_AA64MMFR0_EL1", sys_reg(3, 0, 0, 7, 0)),
+    ("ID_AA64MMFR1_EL1", sys_reg(3, 0, 0, 7, 1)),
+    ("ID_AA64MMFR2_EL1", sys_reg(3, 0, 0, 7, 2)),
+    ("ID_AA64PFR0_EL1", sys_reg(3, 0, 0, 4, 0)),
+    ("ID_AA64PFR1_EL1", sys_reg(3, 0, 0, 4, 1)),
+    ("CTR_EL0", sys_reg(3, 3, 0, 0, 1)),
+    ("CLIDR_EL1", sys_reg(3, 1, 0, 0, 1)),
+    ("DCZID_EL0", sys_reg(3, 3, 0, 0, 7)),
+];
+
+/// Returns the 64-bit register `id` of `vcpu`, or `None` when KVM does not
+/// serve it.
+fn read_u64(vcpu: &VcpuFd, id: u64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    vcpu.get_one_reg(id, &mut b).ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+/// Returns the machine profile of this boot, read from the boot vCPU.
+fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, boot: &VcpuFd) -> MachineProfile {
+    let mut p = arm64_profile::profile("kvm", machine);
+    p.cpu.ident = read_u64(boot, REG_MIDR_EL1).map(hex);
+    for (name, id) in ID_REGS {
+        if let Some(value) = read_u64(boot, id) {
+            p.cpu.id_regs.insert(name.to_string(), hex(value));
+        }
+    }
+    p.firmware.psci_version =
+        read_u64(boot, REG_PSCI_VERSION).map(|v| format!("{}.{}", v >> 16, v & 0xffff));
+    p.agent_sock = cfg.agent_sock.is_some();
+    p
 }
 
 /// State shared across the vCPU threads.
@@ -315,6 +372,28 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         addr: 0,
     };
     gicfd.set_device_attr(&init_attr)?;
+
+    // The profile is complete now, so its file is written before any filter
+    // goes in.
+    let machine = Arm64Machine {
+        gic: &gic,
+        layout: &layout,
+        vcpus: num_cpus,
+        cmdline: &cfg.cmdline,
+        devices: fdt_devices,
+        net_mode: match (&net, &net_source) {
+            (Some(_), Some(NetSource::Tap(_))) => Some("tap"),
+            (Some(_), Some(NetSource::Gateway(_))) => Some("gateway"),
+            (Some(_), None) => Some("stub"),
+            (None, _) => None,
+        },
+        ram_regions: ram.regions(),
+    };
+    let profile = Arc::new(ProfileCell::new(
+        boot_profile(&cfg, &machine, &vcpus[0]),
+        cfg.profile_out.as_deref(),
+    )?);
+    profile.complete(|_| {})?;
 
     // Primary vCPU boot state: PC = kernel entry, X0 = DTB, PSTATE = EL1h/DAIF.
     set_u64(&vcpus[0], REG_PC, layout.kernel_addr);

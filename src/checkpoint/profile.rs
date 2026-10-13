@@ -29,9 +29,13 @@
 //! equal profiles serialize to the same bytes.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::{Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::sync::lock_or_recover;
 
 /// The version of the profile format this hvi writes and reads.
 pub const PROFILE_VERSION: u32 = 1;
@@ -170,8 +174,9 @@ pub struct Device {
     pub kind: String,
     /// The MMIO base address, or the I/O port on x86-64.
     pub base: u64,
-    /// The GIC INTID on arm64, the GSI on x86-64.
-    pub irq: u32,
+    /// The GIC INTID on arm64, the GSI on x86-64, `None` for a device with
+    /// no interrupt line.
+    pub irq: Option<u32>,
     /// The virtio device features as hex, `None` for a device that is not
     /// virtio.
     pub features_hex: Option<String>,
@@ -194,6 +199,39 @@ pub struct Firmware {
 }
 
 impl MachineProfile {
+    /// Returns a profile of this hvi on this host for a guest of `arch` on
+    /// `backend`, with every guest-specific field still empty for the backend
+    /// to fill.
+    #[must_use]
+    pub fn for_this_host(arch: &str, backend: &str) -> Self {
+        Self {
+            profile_version: PROFILE_VERSION,
+            arch: arch.to_string(),
+            backend: backend.to_string(),
+            hvi_build: this_build(),
+            checkpoint_format: CHECKPOINT_FORMAT,
+            host: this_host(),
+            cpu: Cpu {
+                ident: None,
+                id_regs: BTreeMap::new(),
+            },
+            counter_freq_hz: 0,
+            gic: None,
+            x86: None,
+            page_size: host_page_size(),
+            ram_regions: Vec::new(),
+            vcpus: 0,
+            devices: Vec::new(),
+            firmware: Firmware {
+                psci_version: None,
+                dtb_sha256: None,
+                boot_params_sha256: None,
+            },
+            agent_sock: false,
+            fs_shares: 0,
+        }
+    }
+
     /// Returns the canonical JSON of the profile, on one line.
     #[must_use]
     pub fn to_json(&self) -> String {
@@ -366,6 +404,105 @@ impl MachineProfile {
     }
 }
 
+/// The profile of the running guest, shared by the thread that boots it, the
+/// boot vCPU and the control socket, with the file it is written to.
+///
+/// A backend creates it before confinement, since the profile file cannot be
+/// created after. The profile is complete once [`complete`](Self::complete)
+/// has run, which writes the file. On KVM that happens before the guest
+/// starts. Hypervisor.framework shows `MIDR_EL1` only to a vCPU's own thread,
+/// so on hvf the boot vCPU completes the profile before the guest's first
+/// instruction, and the file is written then, through the descriptor opened
+/// before confinement.
+pub(crate) struct ProfileCell {
+    /// The profile, whether it is complete, and the file still to write.
+    state: Mutex<CellState>,
+    /// Signals that the profile is complete.
+    ready: Condvar,
+}
+
+/// The state behind [`ProfileCell`].
+struct CellState {
+    /// The profile, complete or not.
+    profile: MachineProfile,
+    /// Whether [`ProfileCell::complete`] has run.
+    complete: bool,
+    /// The file the complete profile goes to, with its path for a report,
+    /// until it has been written.
+    out: Option<(String, std::fs::File)>,
+}
+
+impl ProfileCell {
+    /// Returns a cell holding `profile`, not yet complete, and creates the
+    /// file at `out`, empty, when there is one.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file cannot be created.
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device. This
+    // path is the operator's.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn new(profile: MachineProfile, out: Option<&str>) -> std::io::Result<Self> {
+        let out = match out {
+            Some(path) => {
+                let file = std::fs::File::create(path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("cannot create the profile file {path}: {e}"),
+                    )
+                })?;
+                Some((path.to_string(), file))
+            }
+            None => None,
+        };
+        Ok(Self {
+            state: Mutex::new(CellState {
+                profile,
+                complete: false,
+                out,
+            }),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Applies `finish` to the profile, marks it complete and writes the file.
+    ///
+    /// Only the first call does anything; a later one returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file cannot be written. The profile is complete
+    /// anyway, so the control socket still reports it.
+    pub(crate) fn complete(&self, finish: impl FnOnce(&mut MachineProfile)) -> std::io::Result<()> {
+        let mut state = lock_or_recover(&self.state);
+        if state.complete {
+            return Ok(());
+        }
+        finish(&mut state.profile);
+        state.complete = true;
+        self.ready.notify_all();
+        let Some((path, mut file)) = state.out.take() else {
+            return Ok(());
+        };
+        let line = state.profile.to_json() + "\n";
+        file.write_all(line.as_bytes()).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("writing the profile file {path}: {e}"))
+        })
+    }
+}
+
+/// Returns a device entry for the profile.
+#[must_use]
+pub fn device(kind: &str, base: u64, irq: Option<u32>, features: Option<u64>) -> Device {
+    Device {
+        kind: kind.to_string(),
+        base,
+        irq,
+        features_hex: features.map(hex),
+        mode: None,
+    }
+}
+
 /// Returns `value` as compact JSON, for a reason that quotes it.
 fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_default()
@@ -524,14 +661,14 @@ mod tests {
                 Device {
                     kind: "pl011".into(),
                     base: 0x0900_0000,
-                    irq: 33,
+                    irq: Some(33),
                     features_hex: None,
                     mode: None,
                 },
                 Device {
                     kind: "virtio-blk".into(),
                     base: 0x0a00_0000,
-                    irq: 48,
+                    irq: Some(48),
                     features_hex: Some("0x100000200".into()),
                     mode: None,
                 },
@@ -646,7 +783,8 @@ mod tests {
         refused_for("devices[1]", |p| {
             p.devices[1].features_hex = Some("0x100000000".into());
         });
-        refused_for("devices[0]", |p| p.devices[0].irq = 34);
+        refused_for("devices[0]", |p| p.devices[0].irq = Some(34));
+        refused_for("devices[0]", |p| p.devices[0].mode = Some("stub".into()));
         refused_for("devices", |p| {
             p.devices.pop();
         });
@@ -765,6 +903,45 @@ mod tests {
         let build = this_build();
         assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
         assert!(!build.git_sha.is_empty());
+    }
+
+    #[test]
+    fn a_profile_for_this_host_is_filled_where_the_host_decides() {
+        let p = MachineProfile::for_this_host("aarch64", "hvf");
+        assert_eq!(p.profile_version, PROFILE_VERSION);
+        assert_eq!(p.hvi_build, this_build());
+        assert_eq!(p.page_size, host_page_size());
+        assert_eq!(p.cpu.ident, None);
+    }
+
+    /// Returns a path for a profile file of this test process.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hvi-profile-{}-{name}.json", std::process::id()))
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn the_file_is_created_at_once_and_written_when_complete() {
+        let path = temp_path("write");
+        let cell = ProfileCell::new(sample(), path.to_str()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        cell.complete(|p| p.vcpus = 3).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut want = sample();
+        want.vcpus = 3;
+        assert_eq!(text, want.to_json() + "\n");
+        // A second completion changes nothing, on disk or in the cell.
+        cell.complete(|p| p.vcpus = 9).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_profile_file_that_cannot_be_created_is_an_error() {
+        let err = ProfileCell::new(sample(), Some("/nonexistent-dir/p.json"))
+            .err()
+            .expect("no such directory");
+        assert!(err.to_string().contains("/nonexistent-dir/p.json"), "{err}");
     }
 
     #[test]

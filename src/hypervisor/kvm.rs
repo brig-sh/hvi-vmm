@@ -403,6 +403,7 @@ mod stop_tests {
             sandbox_id: "stop-test".to_string(),
             vcpus: 2,
             agent_sock: None,
+            profile_out: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
         }

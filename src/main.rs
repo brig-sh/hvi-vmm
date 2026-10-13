@@ -264,6 +264,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut sandbox_id = String::from("hvi");
     let mut vcpus: u32 = 1;
     let mut agent_sock = None;
+    let mut profile_out = None;
     let mut dump_memory = None;
     let mut dump_after = None;
     let mut trace_io = None;
@@ -358,6 +359,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--cpus" => vcpus = it.next().ok_or("--cpus needs a value")?.parse()?,
             "--agent-sock" => agent_sock = it.next().cloned(),
+            "--profile-out" => {
+                profile_out = Some(it.next().ok_or("--profile-out needs a path")?.clone());
+            }
             "--dump-memory" => dump_memory = it.next().cloned(),
             "--dump-after" => {
                 dump_after = Some(it.next().ok_or("--dump-after needs seconds")?.parse()?);
@@ -412,6 +416,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         sandbox_id,
         vcpus,
         agent_sock,
+        profile_out,
         sandbox,
         // `None` rather than an empty chain, so without tools the hooks stay a
         // null check.
