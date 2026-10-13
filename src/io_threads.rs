@@ -23,12 +23,14 @@
 //!
 //! Each thread passes the token's pause gate around the work that touches a
 //! device or guest RAM, so a pause of the gate holds all of them back. The
-//! console's bytes and the relay's frames are delivered inside the gate.
+//! console's bytes and the relay's frames are delivered inside the gate. The
+//! control socket's thread, when there is one, is the one that closes it.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use crate::checkpoint::server::ControlSocket;
 use crate::devices::virtio::net::GatewayRelay;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::net::TapRelay;
@@ -65,8 +67,8 @@ pub(crate) struct IoThreads {
 }
 
 impl IoThreads {
-    /// Starts the console reader, then the agent bridge and the network relay
-    /// when the guest has them.
+    /// Starts the console reader, then the agent bridge, the network relay and
+    /// the control socket when the guest has them.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
@@ -78,6 +80,7 @@ impl IoThreads {
         deliver: impl FnMut(u8) + Send + 'static,
         bridge: Option<VsockBridge>,
         net: Option<NetSource>,
+        control: Option<ControlSocket>,
     ) -> Self {
         let vcpus = Arc::clone(&guest.vcpus);
         let mut deliver = deliver;
@@ -135,6 +138,17 @@ impl IoThreads {
                 ),
             };
             io_threads.push(name, relay);
+        }
+        if let Some(control) = control {
+            let (stop, gate) = (io_threads.token(), Arc::clone(io_threads.source.gate()));
+            let vcpus = Arc::clone(&guest.vcpus);
+            io_threads.push(
+                "control socket",
+                std::thread::spawn(move || {
+                    confine_io_thread();
+                    control.run(&stop, &gate, &vcpus);
+                }),
+            );
         }
         io_threads
     }

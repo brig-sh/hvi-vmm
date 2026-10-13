@@ -186,6 +186,11 @@ pub struct BootConfig {
     /// instruction, since only a vCPU's own thread can read `MIDR_EL1` there.
     /// A reader that finds the file empty waits, or asks the control socket.
     pub profile_out: Option<String>,
+    /// Host Unix-socket path of the control socket, which pauses, resumes,
+    /// reports and stops the VM (see [`crate::checkpoint::control`]).
+    ///
+    /// It is bound before confinement, as the agent socket is.
+    pub control_sock: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.
     ///
     /// This is the whole of the VMM's observation surface: see
@@ -210,6 +215,8 @@ pub struct BootConfig {
 pub enum Stop {
     SystemOff,
     SystemReset,
+    /// The control socket's `stop` op ended the run.
+    Requested,
 }
 
 #[cfg(test)]

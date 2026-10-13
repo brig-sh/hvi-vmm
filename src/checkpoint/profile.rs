@@ -31,6 +31,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -489,6 +490,17 @@ impl ProfileCell {
             std::io::Error::new(e.kind(), format!("writing the profile file {path}: {e}"))
         })
     }
+
+    /// Returns the profile once it is complete, waiting for at most
+    /// `timeout`, or `None` when it is not complete by then.
+    pub(crate) fn get(&self, timeout: Duration) -> Option<MachineProfile> {
+        let state = lock_or_recover(&self.state);
+        let (state, _) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| !state.complete)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.complete.then(|| state.profile.clone())
+    }
 }
 
 /// Returns a device entry for the profile.
@@ -933,7 +945,25 @@ mod tests {
         // A second completion changes nothing, on disk or in the cell.
         cell.complete(|p| p.vcpus = 9).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(cell.get(Duration::ZERO), Some(want));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_incomplete_profile_is_not_reported() {
+        let cell = std::sync::Arc::new(ProfileCell::new(sample(), None).unwrap());
+        assert_eq!(cell.get(Duration::from_millis(10)), None);
+        let waiter = {
+            let cell = std::sync::Arc::clone(&cell);
+            std::thread::spawn(move || cell.get(Duration::from_secs(5)))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        cell.complete(|p| p.cpu.ident = Some("0x1".into())).unwrap();
+        let got = waiter
+            .join()
+            .unwrap()
+            .expect("the waiter saw the completion");
+        assert_eq!(got.cpu.ident.as_deref(), Some("0x1"));
     }
 
     #[test]

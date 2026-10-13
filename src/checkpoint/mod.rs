@@ -17,8 +17,9 @@
 //!
 //! [`profile`] describes the machine in a form two hosts can compare before a
 //! guest moves between them. [`control`] is the line protocol of the
-//! `--control-sock` socket. The bundle that holds a captured guest comes later
-//! and builds on both.
+//! `--control-sock` socket, and `server` the I/O thread that serves it. The
+//! bundle that holds a captured guest comes later and builds on both.
 
 pub mod control;
 pub mod profile;
+pub(crate) mod server;

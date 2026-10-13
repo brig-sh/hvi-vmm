@@ -438,6 +438,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             move |byte| lock_or_recover(&pl011).push_rx(byte)
         },
         net_source,
+        profile,
     )?;
 
     run_guest(

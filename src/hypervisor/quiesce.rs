@@ -115,7 +115,11 @@ impl Quiesce {
 
     /// Waits until as many vCPUs have parked as `target` returns, for at most
     /// `timeout`.
-    fn wait_for_within(&self, target: impl Fn() -> u32, timeout: Duration) -> bool {
+    ///
+    /// The control socket's pause calls it with its own timeout, since the
+    /// default suits a plugin that proceeds degraded and not a checkpoint that
+    /// must abort instead.
+    pub(crate) fn wait_for_within(&self, target: impl Fn() -> u32, timeout: Duration) -> bool {
         let parked = self.parked.lock().unwrap();
         // One deadline covers the whole wait. Each vCPU that parks notifies,
         // and those wakeups must not extend it.
@@ -127,6 +131,11 @@ impl Quiesce {
         // again here could count a vCPU that started after it and turn a
         // completed wait into a timeout.
         !result.timed_out()
+    }
+
+    /// Returns the number of vCPUs parked right now.
+    pub(crate) fn parked(&self) -> u32 {
+        *self.parked.lock().unwrap()
     }
 
     /// Releases the quiesce and wakes every parked vCPU.

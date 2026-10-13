@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 
 use kvm_ioctls::{VcpuFd, VmFd};
 
+use crate::checkpoint::profile::ProfileCell;
+use crate::checkpoint::server::ControlSocket;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
@@ -161,20 +163,22 @@ impl Drop for Registration<'_> {
 /// confinement needs.
 ///
 /// The plugin attaches to the guest before anything runs. The filters are armed
-/// before the first I/O or vCPU thread exists. The agent socket and the stop
-/// source's socket pair are created before any filter goes in, since the
-/// allowlists allow accepting on a listener already held but not creating one.
-/// Then the I/O threads start, each filtering itself as it begins.
+/// before the first I/O or vCPU thread exists. The agent socket, the control
+/// socket and the stop source's socket pair are created before any filter goes
+/// in, since the allowlists allow accepting on a listener already held but not
+/// creating one. Then the I/O threads start, each filtering itself as it
+/// begins. The control socket reports `profile`.
 ///
 /// # Errors
 ///
-/// Errors if the plugin refuses the guest, a filter does not compile, the agent
-/// socket cannot be bound or the stop source cannot be created.
+/// Errors if the plugin refuses the guest, a filter does not compile, a socket
+/// cannot be bound or the stop source cannot be created.
 pub(crate) fn start_io_threads(
     cfg: &BootConfig,
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
+    profile: Arc<ProfileCell>,
 ) -> Result<(seccomp::Filters, IoThreads), Box<dyn std::error::Error>> {
     if let Some(plugin) = &cfg.plugin {
         plugin.attach(Arc::clone(guest) as Arc<dyn VmHandle>)?;
@@ -188,8 +192,21 @@ pub(crate) fn start_io_threads(
         )?),
         _ => None,
     };
+    let control = cfg
+        .control_sock
+        .as_deref()
+        .map(|path| ControlSocket::bind(path, profile))
+        .transpose()?;
     let source = StopSource::new()?;
-    let io_threads = IoThreads::start(source, guest, cfg.plugin.clone(), deliver, bridge, net);
+    let io_threads = IoThreads::start(
+        source,
+        guest,
+        cfg.plugin.clone(),
+        deliver,
+        bridge,
+        net,
+        control,
+    );
     Ok((filters, io_threads))
 }
 
@@ -404,6 +421,7 @@ mod stop_tests {
             vcpus: 2,
             agent_sock: None,
             profile_out: None,
+            control_sock: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
         }

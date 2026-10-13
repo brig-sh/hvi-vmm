@@ -495,6 +495,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             move |byte| lock_or_recover(&uart).push_rx(byte)
         },
         net_source,
+        profile,
     )?;
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if std::env::var_os("HVI_X86_TRACE").is_some() {

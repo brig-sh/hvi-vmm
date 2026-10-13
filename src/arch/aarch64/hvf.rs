@@ -46,6 +46,7 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell};
+use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
@@ -649,6 +650,13 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         lock_or_recover(&fs.dev).connect_irq(line(fs.intid, true));
     }
 
+    // Bound before Seatbelt for the same reason as the agent socket.
+    let control = cfg
+        .control_sock
+        .as_deref()
+        .map(|path| ControlSocket::bind(path, Arc::clone(&shared.profile)))
+        .transpose()?;
+
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
     if let Some(obs) = &shared.plugin {
@@ -691,6 +699,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         },
         bridge,
         net_reader.map(NetSource::Gateway),
+        control,
     );
     let mut readahead_stops = Vec::new();
     // Each virtio-fs device gets its own worker thread, which serves the
