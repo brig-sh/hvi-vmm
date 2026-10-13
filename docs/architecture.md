@@ -85,7 +85,8 @@ pub(crate) fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + 
 `hvi::boot` calls the one for the host target and returns its error as a
 `BootError`, so the CLI and a linking crate use the same call. `hvi::spawn`
 makes the same call on a thread of its own. `Stop` is `SystemOff`, `SystemReset`
-or `Requested`.
+or `Requested`, the last when the host asks the run to stop or the control socket
+ends it.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
@@ -415,6 +416,23 @@ Every KVM vCPU counts as started once its thread runs, since one the guest has
 not brought up waits inside `KVM_RUN`, where a kick reaches it. On macOS a
 secondary the guest has not brought up waits for `CPU_ON` outside the hypervisor
 and is not waited for.
+
+The control socket (`checkpoint/server.rs`) is the other requester, and it is
+not a vCPU. Its `pause` first closes the I/O threads' `PauseGate`
+(`teardown.rs`): each of the console reader, the network relay, the agent
+bridge and its connections, and the macOS virtio-fs workers passes the gate
+around every call that takes a device mutex or writes guest RAM, so the pause
+waits only for the work in progress, never for traffic. It then calls
+`Vcpus::pause_from_control`, which waits for every started vCPU, since its
+caller parks none. The two waits share one 2 s deadline, and a pause that misses
+it is undone and the VM runs on. The agent bridge and the network relays read
+their non-blocking sockets inside the gate, so what they have read is in a
+device by the time a pause completes. Two pieces of input can still be off the
+host and not yet in a device: the start of a gateway frame whose rest has not
+arrived, and one console byte, since the console reader reads stdin, a shared
+terminal, outside the gate. Pause and resume lose neither; a checkpoint taken
+then drops them. The plugin and the control socket share one quiesce, and whichever
+holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU
 threads are spawned it waits in `run/supervisor.rs` on a pipe. A guard held by

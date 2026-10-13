@@ -248,8 +248,9 @@ impl GatewayRelay {
     /// Relays frames to `deliver` until the gateway closes or the stop is
     /// requested.
     ///
-    /// After each wakeup it receives what the socket holds without blocking and
-    /// hands every complete frame to `deliver`. At most [`DRAIN_BURST`]
+    /// After each wakeup it passes the stop token's pause gate, receives what
+    /// the socket holds without blocking and hands every complete frame to
+    /// `deliver`, which must not pass the gate itself. At most [`DRAIN_BURST`]
     /// receives run per wakeup, so a stop request is seen between bursts
     /// however long the traffic lasts. The socket is shut down as the relay
     /// ends, whatever ended it, so the device's next write fails instead of
@@ -275,6 +276,13 @@ impl GatewayRelay {
                 Ok(false) => break Ok(()),
                 Err(e) => break Err(e),
             }
+            // The burst runs inside the pause gate, receives and deliveries
+            // alike, and every receive is non-blocking, so a pause finds the
+            // relay either waiting above with nothing but a partial frame in
+            // hand, or here and about to finish. Were the receive outside, a
+            // pause could catch whole frames off the socket and not yet in the
+            // device, which a checkpoint taken then would drop.
+            let _in = stop.enter();
             for _ in 0..DRAIN_BURST {
                 match try_recv(&self.reader, &mut self.buf) {
                     Ok(0) => break 'relay Ok(()),
@@ -322,9 +330,10 @@ impl TapRelay {
     /// Relays frames to `deliver` until the tap is gone or the stop is
     /// requested.
     ///
-    /// After each wakeup it reads until the queue is empty or until it has read
-    /// [`DRAIN_BURST`] frames, so a burst costs one `poll` and a stop request
-    /// is still seen while frames keep arriving.
+    /// After each wakeup it passes the stop token's pause gate and reads until
+    /// the queue is empty or until it has read [`DRAIN_BURST`] frames, so a
+    /// burst costs one `poll` and a stop request is still seen while frames
+    /// keep arriving.
     ///
     /// # Errors
     ///
@@ -341,6 +350,9 @@ impl TapRelay {
             if !stop.wait(self.reader.as_fd())? {
                 return Ok(());
             }
+            // Inside the pause gate for the same reason as the gateway relay:
+            // a frame read is a frame delivered before a pause completes.
+            let _in = stop.enter();
             for _ in 0..DRAIN_BURST {
                 let n = match self.reader.read(&mut self.buf) {
                     Ok(0) => return Ok(()),
@@ -495,6 +507,10 @@ impl VirtioNet {
         self.dev_feat_sel = 0;
         self.queue_sel = 0;
     }
+
+    /// The device features this device offers, both words: what the machine
+    /// profile records, since a restored driver has negotiated against them.
+    pub const FEATURES: u64 = ((F_VERSION_1_HI as u64) << 32) | F_MAC_LO as u64;
 
     /// Services one MMIO access. On a transmit-queue notify, drains the guest's
     /// TX frames (capturing them) and injects any replies into the RX queue.
@@ -1278,6 +1294,62 @@ mod tests {
             relay.join().expect("thread").expect("relay");
         }
 
+        /// Returns the bytes queued on `socket` that nobody has read.
+        fn unread(socket: &UnixStream) -> i32 {
+            use std::os::fd::AsRawFd;
+            let mut n: libc::c_int = 0;
+            // SAFETY: FIONREAD writes one int through the pointer, which lives
+            // for the call.
+            let rc = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut n) };
+            assert_eq!(rc, 0, "FIONREAD");
+            n
+        }
+
+        // A relay that took whole frames off the socket and then waited at a
+        // closed gate to deliver them would hold them where a checkpoint
+        // cannot see them. Under a pause they must stay in the socket.
+        #[test]
+        fn a_paused_relay_leaves_the_frames_in_the_socket() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+            let source = StopSource::new().expect("pair");
+            let (mut ours, theirs) = UnixStream::pair().expect("pair");
+            let probe = theirs.try_clone().expect("clone");
+            source
+                .gate()
+                .pause(Duration::from_secs(1))
+                .expect("no helper inside");
+            let wire = relayed(&[b"one", b"two"]);
+            ours.write_all(&wire).expect("write");
+            let (tx, rx) = mpsc::channel();
+            let token = source.token();
+            let relay = std::thread::spawn(move || {
+                GatewayRelay::new(theirs)
+                    .run(&token, |frame| tx.send(frame.to_vec()).expect("send"))
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                unread(&probe),
+                wire.len() as i32,
+                "the relay read under a pause"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a frame was delivered under a pause"
+            );
+            source.gate().unpause();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).expect("one"),
+                b"one"
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).expect("two"),
+                b"two"
+            );
+            source.request_stop();
+            relay.join().expect("thread").expect("relay");
+        }
+
         // A framing error ends the relay and shuts the socket down, so the
         // device's writes fail instead of queueing for a peer nobody reads.
         #[test]
@@ -1739,6 +1811,17 @@ mod tests {
             &mac,
             "the OFFER is addressed to the guest's actual MAC, not the default"
         );
+    }
+
+    #[test]
+    fn features_are_the_two_pages_the_window_offers() {
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        let mut net = VirtioNet::new();
+        let mut page = |sel| {
+            net.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, sel);
+            net.mmio(&mem, mmio::DEVICE_FEATURES, false, 0)
+        };
+        assert_eq!((page(1) << 32) | page(0), VirtioNet::FEATURES);
     }
 
     /// After `set_mac`, the guest must read the override from config space

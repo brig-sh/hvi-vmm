@@ -26,9 +26,15 @@
 //!
 //! How a kick reaches a vCPU depends on the hypervisor, so [`Vcpus`] takes it
 //! from a [`Kick`] implementation that owns the table of vCPU threads.
+//!
+//! Two requesters can pause the vCPUs: a plugin on cpu0, through
+//! [`Vcpus::pause`], and the control socket's thread, through
+//! [`Vcpus::pause_from_control`]. They share one quiesce, so whichever holds it
+//! keeps the other out until it releases. Without that, a plugin's `resume`
+//! would let the guest run under a control pause that still reports it paused.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -61,6 +67,8 @@ pub(crate) struct Vcpus<K> {
     running: AtomicBool,
     /// The barrier that parks the vCPUs for a pause.
     quiesce: Quiesce,
+    /// Which requester holds the quiesce: [`FREE`], [`PLUGIN`] or [`CONTROL`].
+    holder: AtomicU8,
     /// How the run ended, from the first report or a failure after a stop.
     outcome: Mutex<Option<Outcome>>,
     /// The number of vCPUs.
@@ -91,6 +99,7 @@ impl<K: Kick> Vcpus<K> {
         Self {
             running: AtomicBool::new(true),
             quiesce: Quiesce::new(),
+            holder: AtomicU8::new(FREE),
             outcome: Mutex::new(None),
             count,
             started: AtomicU32::new(0),
@@ -165,9 +174,13 @@ impl<K: Kick> Vcpus<K> {
     /// for the guest to start it, cannot touch guest state. One that starts
     /// during the wait is waited for too, and parks at its first checkpoint,
     /// before it enters the guest. Returns `false` when they did not all park
-    /// in time, or when the VM stopped during the wait. The quiesce is then
-    /// released already, and the caller must not call [`resume`](Self::resume).
+    /// in time, when the VM stopped during the wait, or when the control socket
+    /// holds the quiesce. The quiesce is then released already or not this
+    /// caller's, and the caller must not call [`resume`](Self::resume).
     pub(crate) fn pause(&self) -> bool {
+        if !self.claim(PLUGIN) {
+            return false;
+        }
         self.quiesce.request();
         self.kicker.kick_all();
         // Read as each vCPU parks, since one that started after a single read
@@ -184,14 +197,109 @@ impl<K: Kick> Vcpus<K> {
         if self.quiesce.wait_for_with(others) && self.is_running() {
             true
         } else {
-            self.quiesce.release();
+            self.release_held(PLUGIN);
             false
         }
     }
 
     /// Releases the vCPUs a successful [`pause`](Self::pause) parked.
+    ///
+    /// It does nothing while the control socket holds the quiesce, so a plugin
+    /// that calls it after a failed pause cannot end a control pause.
     pub(crate) fn resume(&self) {
+        self.release_held(PLUGIN);
+    }
+
+    /// Parks every started vCPU at its next checkpoint, for a requester that
+    /// is not a vCPU thread.
+    ///
+    /// The caller does not run a vCPU, so it waits for all of the started
+    /// vCPUs rather than all but one. The wait has one deadline, `timeout`
+    /// from the request. A pause that misses it is released before this
+    /// returns, so the guest runs again and no caller ever acts on a guest
+    /// that is only partly still. Returns the number of vCPUs parked.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the VM has stopped, when a plugin or an earlier control
+    /// pause holds the quiesce, or when the vCPUs did not all park in time.
+    pub(crate) fn pause_from_control(&self, timeout: Duration) -> Result<u32, PauseError> {
+        if !self.is_running() {
+            return Err(PauseError::Stopped);
+        }
+        if !self.claim(CONTROL) {
+            return Err(PauseError::Busy);
+        }
+        self.quiesce.request();
+        self.kicker.kick_all();
+        // Once the VM stops the target drops to zero, so the wait ends with
+        // the stop. Waiting out the deadline would keep the control thread
+        // past the shorter one the join of the I/O threads has.
+        let target = || {
+            if self.is_running() {
+                self.started.load(Ordering::SeqCst)
+            } else {
+                0
+            }
+        };
+        if !self.quiesce.wait_for_within(target, timeout) {
+            let parked = self.quiesce.parked();
+            let expected = self.started();
+            self.release_held(CONTROL);
+            return Err(PauseError::Timeout { parked, expected });
+        }
+        // A stop during the wait released the quiesce, and the vCPUs it
+        // parked are on their way out of the run loop.
+        if !self.is_running() {
+            self.release_held(CONTROL);
+            return Err(PauseError::Stopped);
+        }
+        Ok(self.quiesce.parked())
+    }
+
+    /// Releases the vCPUs a successful
+    /// [`pause_from_control`](Self::pause_from_control) parked.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the control socket does not hold the quiesce, which leaves
+    /// a plugin's pause in place.
+    pub(crate) fn resume_from_control(&self) -> Result<(), PauseError> {
+        if self.release_held(CONTROL) {
+            Ok(())
+        } else {
+            Err(PauseError::NotPaused)
+        }
+    }
+
+    /// Returns the number of vCPUs parked at a checkpoint right now.
+    pub(crate) fn parked(&self) -> u32 {
+        self.quiesce.parked()
+    }
+
+    /// Returns the number of vCPUs that have entered their run loop.
+    pub(crate) fn started(&self) -> u32 {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    /// Makes `who` the holder of the quiesce, if no one holds it.
+    fn claim(&self, who: u8) -> bool {
+        self.holder
+            .compare_exchange(FREE, who, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Releases the quiesce if `who` holds it, and returns whether it did.
+    ///
+    /// The quiesce is released before the holder is cleared, so a requester
+    /// that claims it next starts from a released barrier.
+    fn release_held(&self, who: u8) -> bool {
+        if self.holder.load(Ordering::SeqCst) != who {
+            return false;
+        }
         self.quiesce.release();
+        self.holder.store(FREE, Ordering::SeqCst);
+        true
     }
 
     /// Ends the VM.
@@ -369,6 +477,44 @@ impl<K: Kick> Vcpus<K> {
             }
         }
         (VcpuThreads(threads), Ok(()))
+    }
+}
+
+/// No requester holds the quiesce.
+const FREE: u8 = 0;
+/// A plugin on cpu0 holds the quiesce, through [`Vcpus::pause`].
+const PLUGIN: u8 = 1;
+/// The control socket holds the quiesce, through [`Vcpus::pause_from_control`].
+const CONTROL: u8 = 2;
+
+/// Why a pause or resume from the control socket did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PauseError {
+    /// The VM has stopped.
+    Stopped,
+    /// A plugin, or an earlier control pause, holds the quiesce.
+    Busy,
+    /// Only `parked` of the `expected` vCPUs parked before the deadline.
+    Timeout {
+        /// The vCPUs parked at the deadline.
+        parked: u32,
+        /// The vCPUs that had started.
+        expected: u32,
+    },
+    /// The control socket holds no pause to release.
+    NotPaused,
+}
+
+impl std::fmt::Display for PauseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("the VM has stopped"),
+            Self::Busy => f.write_str("another pause holds the vCPUs"),
+            Self::Timeout { parked, expected } => {
+                write!(f, "{parked} of {expected} vCPUs parked in time")
+            }
+            Self::NotPaused => f.write_str("the vCPUs are not paused from the control socket"),
+        }
     }
 }
 
@@ -694,6 +840,148 @@ mod tests {
         assert!(
             checkpoint.join().unwrap().is_zero(),
             "parked after the quiesce ended"
+        );
+    }
+
+    /// Spawns a fake vCPU that has started and parks at every checkpoint
+    /// until the VM stops.
+    fn parking_vcpu(vcpus: &Arc<Vcpus<CountingKicker>>) -> JoinHandle<()> {
+        vcpus.mark_started(vcpus.started());
+        let vcpus = Arc::clone(vcpus);
+        std::thread::spawn(move || {
+            while vcpus.is_running() {
+                let _ = vcpus.checkpoint();
+                std::thread::yield_now();
+            }
+        })
+    }
+
+    /// Waits up to five seconds for `n` vCPUs to be parked.
+    fn parked(vcpus: &Vcpus<CountingKicker>, n: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vcpus.parked() != n {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    // The control thread runs no vCPU. A wait for all but one, as a vCPU
+    // requester does, would return with one vCPU still in the guest.
+    #[test]
+    fn control_pause_waits_for_every_started_vcpu() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let first = parking_vcpu(&vcpus);
+        let second = parking_vcpu(&vcpus);
+        assert_eq!(vcpus.pause_from_control(Duration::from_secs(5)), Ok(2));
+        assert_eq!(vcpus.kicker().all.load(Ordering::SeqCst), 1);
+        assert_eq!(vcpus.parked(), 2, "a vCPU left while the pause held");
+        vcpus.resume_from_control().unwrap();
+        assert!(parked(&vcpus, 0), "the resume left a vCPU parked");
+        vcpus.stop();
+        assert!(exits(&first) && exits(&second));
+    }
+
+    // A checkpoint taken over a guest whose vCPUs did not all park would be
+    // torn, so a missed deadline is an error, and the vCPUs that did park run
+    // again rather than stay parked behind a pause nobody holds.
+    #[test]
+    fn control_pause_that_times_out_releases_and_fails() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let running = parking_vcpu(&vcpus);
+        // Started, and never reaches a checkpoint.
+        vcpus.mark_started(vcpus.started());
+        let started = Instant::now();
+        let paused = vcpus.pause_from_control(Duration::from_millis(100));
+        assert_eq!(
+            paused,
+            Err(PauseError::Timeout {
+                parked: 1,
+                expected: 2
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(parked(&vcpus, 0), "the failed pause left a vCPU parked");
+        assert_eq!(vcpus.resume_from_control(), Err(PauseError::NotPaused));
+        // The failed pause gave the quiesce back.
+        assert!(vcpus.pause());
+        vcpus.resume();
+        vcpus.stop();
+        assert!(exits(&running));
+    }
+
+    // cpu0 may be inside a plugin's safepoint when the control pause lands.
+    // The plugin's resume must not let the guest run under the control pause.
+    #[test]
+    fn plugin_cannot_pause_or_resume_under_a_control_pause() {
+        let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
+        let vcpu = parking_vcpu(&vcpus);
+        assert_eq!(vcpus.pause_from_control(Duration::from_secs(5)), Ok(1));
+        assert!(!vcpus.pause(), "the plugin paused under a control pause");
+        vcpus.resume();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(vcpus.parked(), 1, "the plugin's resume released the vCPU");
+        vcpus.resume_from_control().unwrap();
+        assert!(parked(&vcpus, 0));
+        vcpus.stop();
+        assert!(exits(&vcpu));
+    }
+
+    // The reverse: a control pause that released the quiesce on its way out
+    // would end a plugin's pause in the middle of its dump.
+    #[test]
+    fn control_pause_is_refused_while_a_plugin_holds_the_vcpus() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        // The calling thread is cpu0, inside its safepoint.
+        vcpus.mark_started(vcpus.started());
+        let secondary = parking_vcpu(&vcpus);
+        assert!(vcpus.pause(), "the secondary did not park");
+        assert_eq!(
+            vcpus.pause_from_control(Duration::from_secs(5)),
+            Err(PauseError::Busy)
+        );
+        assert_eq!(vcpus.resume_from_control(), Err(PauseError::NotPaused));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(vcpus.parked(), 1, "the refused pause released the vCPU");
+        vcpus.resume();
+        assert!(parked(&vcpus, 0));
+        vcpus.stop();
+        assert!(exits(&secondary));
+    }
+
+    // The stop releases the quiesce and notifies the wait, which must then
+    // end at once rather than at its deadline.
+    #[test]
+    fn control_pause_ends_with_a_stop_during_its_wait() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let running = parking_vcpu(&vcpus);
+        // Started, and never reaches a checkpoint.
+        vcpus.mark_started(vcpus.started());
+        let pause = {
+            let vcpus = Arc::clone(&vcpus);
+            std::thread::spawn(move || vcpus.pause_from_control(Duration::from_secs(30)))
+        };
+        assert!(parked(&vcpus, 1));
+        vcpus.stop();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !pause.is_finished() {
+            assert!(Instant::now() < deadline, "the pause outlived the stop");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(pause.join().unwrap(), Err(PauseError::Stopped));
+        assert!(exits(&running));
+    }
+
+    #[test]
+    fn control_pause_after_the_stop_is_refused() {
+        let vcpus = test_vcpus(1, CountingKicker::default());
+        vcpus.mark_started(vcpus.started());
+        vcpus.stop();
+        assert_eq!(
+            vcpus.pause_from_control(Duration::from_millis(10)),
+            Err(PauseError::Stopped)
         );
     }
 

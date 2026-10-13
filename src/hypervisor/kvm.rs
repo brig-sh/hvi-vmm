@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
+use crate::checkpoint::profile::ProfileCell;
+use crate::checkpoint::server::ControlSocket;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
@@ -177,22 +179,23 @@ impl Drop for Registration<'_> {
 ///
 /// The plugin attaches to the guest before anything runs. The filters are armed
 /// before the first I/O or vCPU thread exists, and a binary's stop-signal
-/// thread starts right after. The agent socket and the stop source's socket
-/// pair are created before any filter goes in, since the allowlists allow
-/// accepting on a listener already held but not creating one. Then the I/O
-/// threads start, with the threads the plugin asked for, each filtering itself
-/// as it begins.
+/// thread starts right after. The agent socket, the control socket and the stop
+/// source's socket pair are created before any filter goes in, since the
+/// allowlists allow accepting on a listener already held but not creating one.
+/// Then the I/O threads start, with the threads the plugin asked for, each
+/// filtering itself as it begins. The control socket reports `profile`.
 ///
 /// # Errors
 ///
 /// Errors if the plugin refuses the guest, a filter does not compile, the
-/// stop-signal thread cannot be started or its handlers installed, the agent
-/// socket cannot be bound or the stop source cannot be created.
+/// stop-signal thread cannot be started or its handlers installed, a socket
+/// cannot be bound or the stop source cannot be created.
 pub(crate) fn start_io_threads(
     cfg: &BootConfig,
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
+    profile: Arc<ProfileCell>,
 ) -> Result<(seccomp::Filters, IoThreads<Kicker>), Box<dyn std::error::Error + Send + Sync>> {
     let plugin_threads = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
@@ -210,6 +213,11 @@ pub(crate) fn start_io_threads(
         )?),
         _ => None,
     };
+    let control = cfg
+        .control_sock
+        .as_deref()
+        .map(|path| ControlSocket::bind(path, profile))
+        .transpose()?;
     let source = StopSource::new()?;
     let io_threads = IoThreads::start(
         source,
@@ -218,6 +226,7 @@ pub(crate) fn start_io_threads(
         deliver,
         bridge,
         net,
+        control,
         plugin_threads,
     );
     Ok((filters, io_threads))
@@ -514,6 +523,8 @@ mod stop_tests {
             sandbox_id: "stop-test".to_string(),
             vcpus: 2,
             agent_sock: None,
+            profile_out: None,
+            control_sock: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
             stop: None,

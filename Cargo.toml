@@ -45,6 +45,9 @@ signal-hook = "0.4.5"
 # so those stay ours. The legacy devices build for every backend, whichever
 # guest uses them, so this is a common dependency.
 vm-superio = "0.8.1"
+# SHA-256 for the machine profile's firmware digests, and later for the
+# checkpoint bundle's integrity. Pure Rust, from RustCrypto.
+sha2 = "0.10.9"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # Pure-Rust devicetree builder for the arm64 guest's devicetree

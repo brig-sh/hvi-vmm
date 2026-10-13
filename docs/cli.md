@@ -56,6 +56,8 @@ including a typo, silently runs the plain test.
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
+| `--control-sock <path>` | none | Host Unix socket that pauses, resumes, reports and stops the VM. See [The control socket](#the-control-socket). |
+| `--profile-out <path>` | none | Write the machine profile here, as one line of JSON. See [The control socket](#the-control-socket). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
@@ -90,8 +92,8 @@ hvi: boot needs --kernel <Image>
 ```
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
-`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`,
-`--cpus`, `--dump-after`.
+`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`, `--cpus`,
+`--dump-after`, `--control-sock`, `--profile-out`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -147,6 +149,48 @@ hvi: --dump-after needs --dump-memory <path>
 hvi: unknown boot arg "--nope"
 ```
 
+### The control socket
+
+`--control-sock` binds a Unix socket before confinement, as `--agent-sock` does,
+and serves one connection at a time. A socket left at the path by an earlier run
+is replaced. Anything else there is an error, and is left alone. Each request is one JSON object on a line,
+and each reply is one line:
+
+```text
+{"v":1,"op":"pause"}   ->  {"v":1,"ok":true,"state":"paused"}
+{"v":1,"op":"status"}  ->  {"v":1,"ok":true,"state":"paused","vcpus":2,"vcpus_parked":2}
+{"v":1,"op":"resume"}  ->  {"v":1,"ok":true,"state":"running"}
+```
+
+| `op` | Effect |
+| --- | --- |
+| `profile` | Replies with the machine profile under `profile`, waiting up to 2 s for it on macOS, where the boot vCPU completes it. |
+| `pause` | Holds the host I/O threads, then parks every started vCPU. If both have not happened within 2 s in all, the pause is undone and the reply is `timeout`. |
+| `resume` | Releases the vCPUs, then the I/O threads. |
+| `status` | Replies with `state` (`running`, `paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. |
+| `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
+| `checkpoint` | Reserved. Refused with `not_implemented`. |
+
+`pause` and `resume` are idempotent. A pause outlives the connection that asked
+for it. No reply takes longer than about 2 s, so give a client a reply timeout
+of at least 3 s. A client that gives up on a `pause` before its reply cannot
+tell whether the VM paused: it should reconnect and ask `status`, or send
+`resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
+`code`; `error` is for a person. The codes are listed in
+`src/checkpoint/control.rs`. The socket has no authentication: anyone who can
+connect to it can pause or stop the VM, so put it in a directory only its owner
+can reach.
+
+`--profile-out` writes the machine profile: what the guest was built against,
+such as the CPU's ID registers, the counter frequency, the interrupt
+controller, RAM, devices and the hvi commit. Two hosts compare profiles before
+a guest moves between them. A profile matches no other when a value in it could
+not be read, or when its hvi does not know its commit or was built with
+uncommitted changes. The file is created before confinement. On Linux it
+is written before the guest starts. On macOS the boot vCPU writes it just
+before the guest's first instruction, since only that thread can read
+`MIDR_EL1`, so a reader that finds it empty waits or asks the socket.
+
 ## `dump-fdt`
 
 Runs the whole arm64 pre-boot pipeline with no hypervisor, no entitlement and
@@ -192,6 +236,7 @@ An embedder inherits these from the process environment. They are not part of
 | Path | Result |
 | --- | --- |
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
+| The control socket's `stop` | `guest stopped: Requested`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
 | A vCPU fails | `hvi: <what failed>`, exit 1. |
 | `SIGTERM`, `SIGINT` or `SIGHUP` | `guest stopped: Requested`, or `hvi: <what failed>` if the run failed, and then the process ends by that signal. |
