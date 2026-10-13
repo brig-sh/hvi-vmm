@@ -24,13 +24,15 @@
 //!
 //! Each thread passes the token's pause gate around the work that touches a
 //! device or guest RAM, so a pause of the gate holds all of them back. The
-//! console's bytes and the relay's frames are delivered inside the gate.
+//! console's bytes and the relay's frames are delivered inside the gate. The
+//! control socket's thread, when there is one, is the one that closes it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::server::ControlSocket;
 use crate::devices::virtio::net::GatewayRelay;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::net::TapRelay;
@@ -121,8 +123,8 @@ impl Drop for StopPlan {
 }
 
 impl<K: Kick> IoThreads<K> {
-    /// Starts the console reader, then the agent bridge and the network relay
-    /// when the guest has them, then `plugin_threads`.
+    /// Starts the console reader, then the agent bridge, the network relay and
+    /// the control socket when the guest has them, then `plugin_threads`.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
@@ -134,6 +136,7 @@ impl<K: Kick> IoThreads<K> {
         deliver: impl FnMut(u8) + Send + 'static,
         bridge: Option<VsockBridge>,
         net: Option<NetSource>,
+        control: Option<ControlSocket>,
         plugin_threads: Vec<PluginThread>,
     ) -> Self
     where
@@ -196,6 +199,13 @@ impl<K: Kick> IoThreads<K> {
         }
         for PluginThread { name, run } in plugin_threads {
             io_threads.spawn(name, run);
+        }
+        if let Some(control) = control {
+            let gate = Arc::clone(io_threads.stop.source.gate());
+            let vcpus = Arc::clone(&guest.vcpus);
+            io_threads.spawn("control socket", move |stop| {
+                control.run(&stop, &gate, &vcpus);
+            });
         }
         io_threads
     }

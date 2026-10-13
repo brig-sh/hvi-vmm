@@ -564,6 +564,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             move |byte| lock_or_recover(&uart).push_rx(byte)
         },
         net_source,
+        profile,
     )?;
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
@@ -1061,6 +1062,7 @@ mod vcpu_cap_tests {
             vcpus: 255,
             agent_sock: None,
             profile_out: None,
+            control_sock: None,
             plugin: None,
             sandbox: false,
             stop: None,

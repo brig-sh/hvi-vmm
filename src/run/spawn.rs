@@ -134,6 +134,7 @@ mod tests {
             vcpus: 1,
             agent_sock: None,
             profile_out: None,
+            control_sock: None,
             plugin: None,
             sandbox: false,
             stop: Some(registration),
