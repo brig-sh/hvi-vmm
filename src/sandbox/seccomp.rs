@@ -300,6 +300,11 @@ impl Filters {
         })
     }
 
+    /// Returns whether the filters are armed.
+    pub(crate) fn is_armed(&self) -> bool {
+        self.counts.is_some()
+    }
+
     /// Filters the calling main thread and reports the confinement on stderr.
     ///
     /// It must run once every thread the main thread spawns exists. That order

@@ -163,10 +163,10 @@ ledger.
 
 One known gap: the arm64/KVM backend is unit-tested on its stop path only. Its
 only tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a run
-stops: a vCPU thread that ends, a stop request, plugin threads, and a kick
-before the run. The suite runs on arm64 Linux, on the self-hosted boot runners
-and on a hosted `ubuntu-24.04-arm` runner; the boot runners also run the stop
-tests.
+stops: a vCPU thread that ends, a stop request, plugin threads, the lifecycle
+records, and a kick before the run. The suite runs on arm64 Linux, on the
+self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the boot
+runners also run the stop tests.
 
 Three scheduled workflows run outside the two entry points, each reporting
 through a tracking issue so `main` stays green: the weekly dependency audit,

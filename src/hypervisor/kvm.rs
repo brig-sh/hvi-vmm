@@ -33,7 +33,7 @@ use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Cpu, Guest};
-use crate::hypervisor::run::run_to_stop;
+use crate::hypervisor::run::{record_start, run_to_stop};
 use crate::hypervisor::vcpus::{Kick, Outcome};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::plugin::Plugin;
@@ -247,6 +247,9 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 ) -> Result<Stop, Box<dyn std::error::Error>> {
     let _raw = terminal::RawTerm::enable();
 
+    // Log mode traps nothing, so the run is not confined under it.
+    let confined = filters.is_armed() && !seccomp::log_mode();
+    record_start(guest, confined);
     let (threads, spawned) = guest.vcpus.spawn(
         vcpus
             .into_iter()
@@ -296,7 +299,7 @@ pub(crate) fn run_vcpu(
     let _registration = guest.vcpus.kicker().register(cpu, kick_handle);
     // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
     // yet waits inside the run, where a kick reaches it.
-    guest.vcpus.mark_started();
+    guest.vcpus.mark_started(cpu);
     let is_boot = cpu == 0;
 
     loop {
@@ -764,6 +767,64 @@ mod stop_tests {
             .expect("boot returns once the plugin thread panicked");
         let error = outcome.expect_err("boot reported a stop for a panic");
         assert_eq!(error, "plugin-wait: panicked");
+    }
+
+    // Ignored by default, as the tests above are.
+    #[test]
+    #[ignore]
+    fn ledger_records_the_start_each_vcpu_and_the_stop() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let path =
+            std::env::temp_dir().join(format!("hvi-lifecycle-{}.ndjson", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (stop, registration) = StopHandle::new_pair().unwrap();
+        let mut cfg = config(spinning_kernel(), None);
+        cfg.events = Some(path.to_str().unwrap().to_string());
+        cfg.stop = Some(registration);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::boot(cfg).map_err(|e| e.to_string()));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        stop.request_stop();
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the stop is requested");
+        assert!(
+            matches!(outcome, Ok(Stop::Requested)),
+            "boot returned {outcome:?}"
+        );
+
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|record: &serde_json::Value| record["provenance"] == "vmm")
+            .collect();
+        std::fs::remove_file(&path).unwrap();
+        let sources: Vec<&str> = records
+            .iter()
+            .map(|r| r["source"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                "vmm.start",
+                "vmm.vcpu_started",
+                "vmm.vcpu_started",
+                "vmm.stop"
+            ],
+            "{records:?}"
+        );
+        assert_eq!(records[0]["payload"]["vcpus"], 2);
+        assert_eq!(records[0]["payload"]["mem_bytes"], 128 << 20);
+        let mut started: Vec<u64> = records[1..3]
+            .iter()
+            .map(|r| r["payload"]["vcpu"].as_u64().unwrap())
+            .collect();
+        started.sort_unstable();
+        assert_eq!(started, [0, 1]);
+        assert_eq!(records[3]["payload"]["reason"], "requested");
     }
 
     // Ignored by default, as it needs a usable `/dev/kvm`.

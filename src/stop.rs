@@ -132,6 +132,15 @@ impl StopHandle {
         }
     }
 
+    /// Returns the signal that asked for the stop first, or `None` when a
+    /// request without a signal came first or none came.
+    pub(crate) fn first_signal(&self) -> Option<libc::c_int> {
+        match self.0.first.load(Ordering::SeqCst) {
+            0 | NO_SIGNAL => None,
+            signal => Some(signal),
+        }
+    }
+
     /// Returns whether a stop has been requested.
     pub(crate) fn is_stop_requested(&self) -> bool {
         self.0.first.load(Ordering::SeqCst) != 0
@@ -267,12 +276,25 @@ mod tests {
     }
 
     #[test]
+    fn signal_after_a_request_does_not_ask_first() {
+        let (handle, _registration) = StopHandle::new_pair().unwrap();
+        handle.request_stop();
+        handle.request_stop_by(libc::SIGTERM);
+        assert_eq!(handle.first_signal(), None);
+        let (handle, _registration) = StopHandle::new_pair().unwrap();
+        handle.request_stop_by(libc::SIGTERM);
+        handle.request_stop();
+        assert_eq!(handle.first_signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
     fn first_of_two_signals_counts() {
         let (handle, _registration) = StopHandle::new_pair().unwrap();
         handle.request_stop_by(libc::SIGTERM);
         handle.request_stop_by(libc::SIGINT);
         handle.request_stop();
         assert_eq!(handle.signal(), Some(libc::SIGTERM));
+        assert_eq!(handle.first_signal(), Some(libc::SIGTERM));
     }
 
     #[test]
