@@ -62,7 +62,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
-use crate::hypervisor::guest::{Guest, VcpuRegs};
+use crate::hypervisor::guest::{Guest, PluginThreads, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
@@ -333,6 +333,7 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Kicker::new(num_cpus),
                 cfg.take_stop_handle()?,
             )),
+            plugin_threads: PluginThreads::new(),
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),

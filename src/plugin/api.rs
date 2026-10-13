@@ -15,12 +15,14 @@
 //! The traits and types a plugin is written against, re-exported from
 //! [`crate::plugin`].
 
+use std::io;
 use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Mutex};
 
 use crate::events::Emitter;
 use crate::memory::GuestRam;
 pub use crate::memory::RamRegion;
+use crate::teardown::StopToken;
 
 /// The guest architecture a backend is running, so a tool can interpret
 /// [`RegsView`] correctly without guessing it from the host.
@@ -129,9 +131,30 @@ pub trait VmHandle: Send + Sync {
     /// Asks the run to stop, as a [`StopHandle`](crate::stop::StopHandle) does.
     ///
     /// `boot` returns [`Stop::Requested`](crate::config::Stop::Requested),
-    /// unless a vCPU reports a failure or a guest stop before `boot` reads how
-    /// the run ended. The call returns at once and is safe from any thread.
+    /// unless a thread reports a failure, or a vCPU a guest stop, before `boot`
+    /// reads how the run ended. The call returns at once and is safe from any
+    /// thread.
     fn request_stop(&self);
+
+    /// Runs `run` on a thread of the VMM's own, named `name`.
+    ///
+    /// The VMM starts the thread once `attach` has returned `Ok` and the
+    /// sandbox is armed, and drops `run` when `attach` fails or `boot` fails
+    /// before it starts the threads. On Linux the thread installs the seccomp
+    /// filter of the VMM's I/O threads, so anything that filter refuses, such
+    /// as opening a file or binding a socket, belongs in `attach`.
+    ///
+    /// The thread gets a [`StopToken`] that reports the stop once the vCPUs
+    /// have exited or been left running, and it must return then. `boot` waits
+    /// [`STOP_TIMEOUT`](crate::teardown::STOP_TIMEOUT) for it, and after that
+    /// leaves the thread running and fails the run. A thread that panics fails
+    /// the run and stops it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when called after `attach` has returned, and for a `name` with a
+    /// NUL byte.
+    fn spawn(&self, name: &'static str, run: Box<dyn FnOnce(StopToken) + Send>) -> io::Result<()>;
 }
 
 /// What the VMM offers a plugin at a vCPU safe point.

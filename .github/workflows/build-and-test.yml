@@ -317,12 +317,12 @@ jobs:
           grep -q "test result: ok. 1 passed" blk.log \
             || { echo "::error::the block-device size test did not pass"; exit 1; }
       # The tests of how a run stops: a vCPU thread that ends, a stop request,
-      # and a kick before the run. They are ignored in the plain suite, since
-      # they need KVM (root's here) and most of them boot a guest on the
-      # terminal. They run in release, where they keep the seccomp filters on; a
-      # debug build turns the filters off, since std checks each descriptor it
-      # closes with `fcntl`, which the vCPU allowlist refuses. One at a time,
-      # since one of them finds the secondary's thread by name. 2>&1: the panic
+      # plugin threads, and a kick before the run. They are ignored in the plain
+      # suite, since they need KVM (root's here) and most of them boot a guest
+      # on the terminal. They run in release, where they keep the seccomp
+      # filters on; a debug build turns the filters off, since std checks each
+      # descriptor it closes with `fcntl`, which the vCPU allowlist refuses. One
+      # at a time, since some of them find a thread by name. 2>&1: the panic
       # report is on stderr.
       - name: run the vCPU stop tests
         if: steps.kvm.outputs.ok == 'yes'
@@ -332,7 +332,7 @@ jobs:
           echo "test binary: $BIN"
           sudo "$BIN" kvm::stop_tests:: --ignored --nocapture --test-threads=1 \
             </dev/null 2>&1 | tee stop.log || true
-          grep -q "test result: ok. 5 passed" stop.log \
+          grep -q "test result: ok. 7 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
       # The searches above keep only the lines they match. When the job
       # fails, the full log answers what those lines cannot.
@@ -697,7 +697,7 @@ jobs:
         run: |
           cargo test --release --lib kvm::stop_tests:: \
             -- --ignored --nocapture --test-threads=1 </dev/null 2>&1 | tee stop.log || true
-          grep -q "test result: ok. 5 passed" stop.log \
+          grep -q "test result: ok. 7 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
       # The aarch64 allowlist is a different file from the x86 one. The hosted
       # arm64 musl job runs it on the static musl binary. This is the only place

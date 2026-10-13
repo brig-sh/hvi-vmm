@@ -36,7 +36,7 @@ use crate::hypervisor::guest::{Cpu, Guest};
 use crate::hypervisor::run::run_to_stop;
 use crate::hypervisor::vcpus::{Kick, Outcome};
 use crate::io_threads::{IoThreads, NetSource};
-use crate::plugin::{Plugin, VmHandle};
+use crate::plugin::Plugin;
 use crate::sandbox::seccomp;
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
@@ -180,7 +180,8 @@ impl Drop for Registration<'_> {
 /// thread starts right after. The agent socket and the stop source's socket
 /// pair are created before any filter goes in, since the allowlists allow
 /// accepting on a listener already held but not creating one. Then the I/O
-/// threads start, each filtering itself as it begins.
+/// threads start, with the threads the plugin asked for, each filtering itself
+/// as it begins.
 ///
 /// # Errors
 ///
@@ -193,9 +194,7 @@ pub(crate) fn start_io_threads(
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
 ) -> Result<(seccomp::Filters, IoThreads), Box<dyn std::error::Error>> {
-    if let Some(plugin) = &cfg.plugin {
-        plugin.attach(Arc::clone(guest) as Arc<dyn VmHandle>)?;
-    }
+    let plugin_threads = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
     // A binary's stop signals get their handlers, and the thread that receives
     // them starts, once the filters are armed, so the thread installs the `vmm`
@@ -212,7 +211,15 @@ pub(crate) fn start_io_threads(
         _ => None,
     };
     let source = StopSource::new()?;
-    let io_threads = IoThreads::start(source, guest, cfg.plugin.clone(), deliver, bridge, net);
+    let io_threads = IoThreads::start(
+        source,
+        guest,
+        cfg.plugin.clone(),
+        deliver,
+        bridge,
+        net,
+        plugin_threads,
+    );
     Ok((filters, io_threads))
 }
 
@@ -226,9 +233,9 @@ pub(crate) fn start_io_threads(
 /// # Errors
 ///
 /// Errors if a vCPU thread cannot be spawned, the calling thread cannot be
-/// filtered, a vCPU fails or a thread does not stop. Each failure stops the
-/// guest, and the error is chosen as [`run_to_stop`] describes, once every
-/// thread has been joined or left running.
+/// filtered, a vCPU or a plugin thread fails, or a thread does not stop. Each
+/// failure stops the guest, and the error is chosen as [`run_to_stop`]
+/// describes, once every thread has been joined or left running.
 pub(crate) fn run_guest<S: Clone + Send + 'static>(
     guest: &Guest<Kicker>,
     shared: &S,
@@ -386,7 +393,7 @@ pub(crate) fn kick_handle(vm: &VmFd, vcpu: &VcpuFd) -> std::io::Result<VcpuFd> {
 mod stop_tests {
     use super::*;
     use crate::config::BootConfig;
-    use crate::plugin::CpuHandle;
+    use crate::plugin::{CpuHandle, VmHandle};
     use crate::signal::install_kick_handler;
     use crate::stop::StopHandle;
     use kvm_ioctls::Kvm;
@@ -448,6 +455,40 @@ mod stop_tests {
                 std::thread::yield_now();
             }
         }
+    }
+
+    /// A plugin that starts one thread in `attach`, which waits for the stop,
+    /// or panics at once when asked to.
+    struct SpawnsAThread {
+        /// Whether the thread panics rather than waiting.
+        panics: bool,
+        /// Whether the thread has seen the stop and returned.
+        ended: Arc<AtomicBool>,
+    }
+
+    impl Plugin for SpawnsAThread {
+        fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+            let (panics, ended) = (self.panics, Arc::clone(&self.ended));
+            vmm.spawn(
+                "plugin-wait",
+                Box::new(move |stop| {
+                    assert!(!panics, "plugin thread failure under test");
+                    let _ = stop.sleep(Duration::from_secs(30));
+                    ended.store(true, Ordering::SeqCst);
+                }),
+            )
+        }
+    }
+
+    /// Returns the `Seccomp:` value of this process's thread `id`.
+    fn seccomp_mode(id: libc::pid_t) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/self/task/{id}/status"))
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Seccomp:")
+                    .map(|mode| mode.trim().to_string())
+            })
     }
 
     /// Returns the configuration of a two-vCPU boot of `kernel`.
@@ -650,6 +691,79 @@ mod stop_tests {
             matches!(outcome, Ok(Stop::Requested)),
             "boot returned {outcome:?}"
         );
+    }
+
+    // The filter is checked only in a release build, where the filters are on.
+    // Ignored by default, as the tests above are.
+    #[test]
+    #[ignore]
+    fn plugin_thread_is_filtered_and_ends_with_the_run() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let plugin = Arc::new(SpawnsAThread {
+            panics: false,
+            ended: Arc::new(AtomicBool::new(false)),
+        });
+        let (stop, registration) = StopHandle::new_pair().unwrap();
+        let mut cfg = config(
+            spinning_kernel(),
+            Some(Arc::clone(&plugin) as Arc<dyn Plugin>),
+        );
+        cfg.stop = Some(registration);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::boot(cfg).map_err(|e| e.to_string()));
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let thread = loop {
+            if let Some(id) = thread_id("plugin-wait") {
+                break id;
+            }
+            assert!(Instant::now() < deadline, "the plugin thread never started");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        // The thread is named before its first instruction installs the filter,
+        // so the mode is read until it changes or a deadline passes.
+        if !cfg!(debug_assertions) {
+            let filtered = Instant::now() + Duration::from_secs(2);
+            while seccomp_mode(thread).as_deref() != Some("2") {
+                assert!(Instant::now() < filtered, "the plugin thread is unfiltered");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        stop.request_stop();
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the stop is requested");
+        assert!(
+            matches!(outcome, Ok(Stop::Requested)),
+            "boot returned {outcome:?}"
+        );
+        assert!(
+            plugin.ended.load(Ordering::SeqCst),
+            "boot returned before the plugin thread ended"
+        );
+    }
+
+    // The run fails as it does for a vCPU that panics. Ignored by default, as
+    // the tests above are.
+    #[test]
+    #[ignore]
+    fn plugin_thread_panic_fails_the_run() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let plugin = Arc::new(SpawnsAThread {
+            panics: true,
+            ended: Arc::new(AtomicBool::new(false)),
+        });
+        let cfg = config(spinning_kernel(), Some(plugin as Arc<dyn Plugin>));
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::boot(cfg).map_err(|e| e.to_string()));
+        });
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the plugin thread panicked");
+        let error = outcome.expect_err("boot reported a stop for a panic");
+        assert_eq!(error, "plugin-wait: panicked");
     }
 
     // Ignored by default, as it needs a usable `/dev/kvm`.

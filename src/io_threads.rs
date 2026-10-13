@@ -16,10 +16,11 @@
 //!
 //! [`IoThreads`] starts the threads that serve the guest's devices from the
 //! host: the console reader, the agent bridge, and the relay from a gateway or
-//! a tap. Each polls a stop token beside its own descriptor. A backend starts
-//! the threads only it has with [`IoThreads::spawn`]. Once the vCPUs have
-//! exited or been left running, [`IoThreads::stop`] requests the stop and joins
-//! every thread, as `teardown` describes.
+//! a tap. Each polls a stop token beside its own descriptor. [`IoThreads`] also
+//! starts the threads a plugin asked for in `attach`. A backend starts the
+//! threads only it has with [`IoThreads::spawn`]. Once the vCPUs have exited or
+//! been left running, [`IoThreads::stop`] requests the stop and joins every
+//! thread, as `teardown` describes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,8 +31,8 @@ use crate::devices::virtio::net::GatewayRelay;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::net::TapRelay;
 use crate::devices::virtio::vsock::VsockBridge;
-use crate::hypervisor::guest::Guest;
-use crate::hypervisor::vcpus::Kick;
+use crate::hypervisor::guest::{Guest, PluginThread};
+use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
 use crate::sandbox::confine_io_thread;
 use crate::signal::kick_signal;
@@ -47,6 +48,25 @@ pub(crate) enum NetSource {
     /// A tap device.
     #[cfg(target_os = "linux")]
     Tap(std::fs::File),
+}
+
+/// A guard that, when its thread panics, reports the run failed and asks it to
+/// stop.
+struct StopOnPanic<K: Kick> {
+    /// The vCPUs of the run.
+    vcpus: Arc<Vcpus<K>>,
+    /// The name of the thread that holds the guard.
+    name: &'static str,
+}
+
+impl<K: Kick> Drop for StopOnPanic<K> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.vcpus
+                .report(Outcome::Failed(format!("{}: panicked", self.name)));
+            self.vcpus.stop_handle().request_stop();
+        }
+    }
 }
 
 /// The I/O threads of one VM and the stop that ends them.
@@ -70,7 +90,7 @@ pub(crate) struct IoThreads {
 
 impl IoThreads {
     /// Starts the console reader, then the agent bridge and the network relay
-    /// when the guest has them.
+    /// when the guest has them, then `plugin_threads`.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
@@ -82,6 +102,7 @@ impl IoThreads {
         deliver: impl FnMut(u8) + Send + 'static,
         bridge: Option<VsockBridge>,
         net: Option<NetSource>,
+        plugin_threads: Vec<PluginThread>,
     ) -> Self {
         let vcpus = Arc::clone(&guest.vcpus);
         let finish_count = Arc::new(FinishCount::default());
@@ -119,6 +140,13 @@ impl IoThreads {
                     }
                 }),
             }
+        }
+        for PluginThread { name, run } in plugin_threads {
+            let vcpus = Arc::clone(&guest.vcpus);
+            io_threads.spawn(name, move |stop| {
+                let _panic = StopOnPanic { vcpus, name };
+                run(stop);
+            });
         }
         io_threads
     }

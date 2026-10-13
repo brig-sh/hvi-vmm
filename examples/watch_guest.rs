@@ -30,7 +30,7 @@
 //!
 //! On Linux the signing step does not apply; the binary needs `/dev/kvm`.
 //!
-//! It demonstrates the first four rules that fail quietly:
+//! It demonstrates the six rules that fail quietly:
 //!
 //! 1. `safepoint` runs between guest entries, so the nothing-to-do case is one
 //!    atomic load and a return.
@@ -42,6 +42,11 @@
 //! 4. An [`IoSink`] is called with the device lock held, so it must not block.
 //!    Which thread it runs on depends on the device and the networking mode, so
 //!    do not assume one. Count in the sink; do the writing at the safe point.
+//! 5. `request` runs on the console thread, which the stop waits for, so it
+//!    sets a flag and returns.
+//! 6. A thread of your own starts from `attach` with [`VmHandle::spawn`], so it
+//!    runs under the VMM's seccomp filter and is joined when the run stops. It
+//!    returns once its stop token fires.
 
 // This example reads the kernel and initramfs it is given, which are the
 // caller's own paths rather than a guest's.
@@ -121,15 +126,19 @@ impl Plugin for WatchGuest {
         }
 
         // Rule 3: flag, then kick. Reversing these two lines is the bug that
-        // only shows up against an idle guest.
+        // only shows up against an idle guest. Rule 6: the timer sleeps on its
+        // stop token, so it ends with the run.
         let pending = Arc::clone(&self.pending);
-        let vmm = Arc::clone(&vmm);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            pending.store(true, Ordering::SeqCst);
-            vmm.kick();
-        });
-        Ok(())
+        let timer = Arc::clone(&vmm);
+        vmm.spawn(
+            "watch timer",
+            Box::new(move |stop| {
+                while let Ok(true) = stop.sleep(std::time::Duration::from_secs(1)) {
+                    pending.store(true, Ordering::SeqCst);
+                    timer.kick();
+                }
+            }),
+        )
     }
 
     /// Called on the boot vCPU between guest entries.

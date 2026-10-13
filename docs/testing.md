@@ -72,9 +72,9 @@ and they need `/dev/kvm`.
 The used-ring litmus, the virtio-fs benchmarks and the KVM stop tests are
 `#[ignore]`d and do not run in a normal `cargo test`.
 
-The stop tests boot a guest on the terminal, and one of them finds the secondary
-vCPU's thread and descriptors by name. Run them one at a time, with stdin
-redirected, as a user who can open `/dev/kvm`:
+The stop tests boot a guest on the terminal, and two of them find a thread by
+name. Run them one at a time, with stdin redirected, as a user who can open
+`/dev/kvm`:
 
 ```sh
 cargo test --release kvm::stop_tests:: -- \

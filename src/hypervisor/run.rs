@@ -45,7 +45,7 @@ use crate::LOG_PREFIX;
 ///
 /// # Errors
 ///
-/// Errors with `failure`, else with the failure a vCPU reported, else with a
+/// Errors with `failure`, else with the failure a thread reported, else with a
 /// thread that did not stop in time. A thread left running is named after the
 /// failure, or reported with how the run stopped, since the error takes the
 /// place of that stop.
@@ -78,7 +78,7 @@ pub(crate) fn run_to_stop<K: Kick>(
 
     let outcome = guest.vcpus.outcome();
     if let Some(e) = failure {
-        // `failure` is the one returned, so a vCPU failure behind it is
+        // `failure` is the one returned, so a thread's failure behind it is
         // printed.
         if let Outcome::Failed(text) = outcome {
             stderrln!("{LOG_PREFIX} {text}");
@@ -105,6 +105,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::events::Emitter;
+    use crate::hypervisor::guest::PluginThreads;
     use crate::hypervisor::vcpus::Vcpus;
     use crate::memory::{GuestRam, RamRegion, SharedRam};
     use crate::plugin::GuestArch;
@@ -136,6 +137,7 @@ mod tests {
             block: None,
             net: None,
             vsock: None,
+            plugin_threads: PluginThreads::new(),
             vcpus: Arc::new(Vcpus::new(
                 count,
                 NoopKicker,

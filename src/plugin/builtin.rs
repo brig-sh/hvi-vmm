@@ -194,15 +194,25 @@ impl Plugin for MemoryDump {
 
         if let Some(secs) = self.after {
             let pending = Arc::clone(&self.pending);
-            let vmm = Arc::clone(&vmm);
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
-                pending.store(true, Ordering::SeqCst);
-                // Without this the flag is never seen: an idle guest sits in
-                // WFI/HLT and the safe point is only reached between guest
-                // entries.
-                vmm.kick();
-            });
+            let kicker = Arc::clone(&vmm);
+            vmm.spawn(
+                "memory dump timer",
+                Box::new(move |stop| {
+                    // A stop before the timer fires ends the wait, and there is
+                    // no dump to take.
+                    if !matches!(
+                        stop.sleep(std::time::Duration::from_secs(secs.max(1))),
+                        Ok(true)
+                    ) {
+                        return;
+                    }
+                    pending.store(true, Ordering::SeqCst);
+                    // Without this the flag is never seen: an idle guest sits
+                    // in WFI/HLT and the safe point is only reached between
+                    // guest entries.
+                    kicker.kick();
+                }),
+            )?;
         }
         Ok(())
     }

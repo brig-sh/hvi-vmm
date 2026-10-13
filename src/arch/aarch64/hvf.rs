@@ -54,12 +54,12 @@ use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
+use crate::hypervisor::guest::{Cpu, Guest, PluginThreads, VcpuRegs};
 use crate::hypervisor::run::run_to_stop;
 use crate::hypervisor::vcpus::{panic_message, Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
-use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
+use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
@@ -584,6 +584,7 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, kicker, cfg.take_stop_handle()?)),
+            plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         fs,
@@ -613,9 +614,7 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
-    if let Some(obs) = &shared.plugin {
-        obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
-    }
+    let plugin_threads = shared.guest.attach(shared.plugin.as_ref())?;
 
     // A binary's stop signals get their handlers, and the thread that receives
     // them starts, before the terminal goes into raw mode, so a first stop
@@ -658,6 +657,7 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         },
         bridge,
         net_reader.map(NetSource::Gateway),
+        plugin_threads,
     );
     // Each virtio-fs device gets its own worker thread, which serves the
     // requests a vCPU leaves past `FS_INLINE_BUDGET`. See `run_fs_worker`.
