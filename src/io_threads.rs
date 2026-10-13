@@ -21,12 +21,19 @@
 //! threads only it has with [`IoThreads::spawn`]. Once the vCPUs have exited or
 //! been left running, [`IoThreads::stop`] requests the stop and joins every
 //! thread, as `teardown` describes.
+//!
+//! Each thread passes the token's pause gate around the work that touches a
+//! device or guest RAM, so a pause of the gate holds all of them back. The
+//! console's bytes are delivered inside the gate, and the relays receive and
+//! deliver their frames inside it. The control socket's thread, when there is
+//! one, is the one that closes it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::server::ControlSocket;
 use crate::devices::virtio::net::GatewayRelay;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::net::TapRelay;
@@ -116,8 +123,8 @@ impl Drop for StopPlan {
 }
 
 impl<K: Kick> IoThreads<K> {
-    /// Starts the console reader, then the agent bridge and the network relay
-    /// when the guest has them, then `plugin_threads`.
+    /// Starts the console reader, then the agent bridge, the network relay and
+    /// the control socket when the guest has them, then `plugin_threads`.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
@@ -129,12 +136,14 @@ impl<K: Kick> IoThreads<K> {
         deliver: impl FnMut(u8) + Send + 'static,
         bridge: Option<VsockBridge>,
         net: Option<NetSource>,
+        control: Option<ControlSocket>,
         plugin_threads: Vec<PluginThread>,
     ) -> Self
     where
         K: 'static,
     {
         let vcpus = Arc::clone(&guest.vcpus);
+        let mut deliver = deliver;
         let finish_count = Arc::new(FinishCount::default());
         let console = IoThread::spawn(
             "console reader",
@@ -142,7 +151,16 @@ impl<K: Kick> IoThreads<K> {
             &finish_count,
             Arc::clone(&guest.vcpus),
             move |stop| {
-                terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
+                let gate = stop.clone();
+                terminal::input::run(
+                    plugin,
+                    &stop,
+                    move || vcpus.kicker().kick(0),
+                    move |byte| {
+                        let _in = gate.enter();
+                        deliver(byte);
+                    },
+                );
             },
         );
         let mut io_threads = Self {
@@ -160,7 +178,12 @@ impl<K: Kick> IoThreads<K> {
         }
         if let (Some(net), Some(dev)) = (net, &guest.net) {
             let (dev, ram) = (Arc::clone(dev), Arc::clone(&guest.ram));
-            let deliver = move |frame: &[u8]| dev.lock().unwrap().deliver(&ram, frame);
+            // The relay passes the pause gate around each burst it receives
+            // and delivers, so `deliver` does not: a second admission inside
+            // the first would wait on a pause that waits on the first.
+            let deliver = move |frame: &[u8]| {
+                dev.lock().unwrap().deliver(&ram, frame);
+            };
             match net {
                 NetSource::Gateway(stream) => io_threads.spawn("gateway relay", move |stop| {
                     if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
@@ -177,6 +200,13 @@ impl<K: Kick> IoThreads<K> {
         }
         for PluginThread { name, run } in plugin_threads {
             io_threads.spawn(name, run);
+        }
+        if let Some(control) = control {
+            let gate = Arc::clone(io_threads.stop.source.gate());
+            let vcpus = Arc::clone(&guest.vcpus);
+            io_threads.spawn("control socket", move |stop| {
+                control.run(&stop, &gate, &vcpus);
+            });
         }
         io_threads
     }

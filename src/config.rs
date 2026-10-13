@@ -619,6 +619,20 @@ pub struct BootConfig {
     pub vcpus: u32,
     /// Host Unix-socket path bridged to the guest agent's vsock port (exec).
     pub agent_sock: Option<String>,
+    /// Path the machine profile is written to, as one line of canonical JSON
+    /// (see [`crate::checkpoint::profile`]).
+    ///
+    /// The file is created before confinement, which forbids creating one
+    /// later, and written once the profile is complete: before the guest starts
+    /// on KVM, and on hvf by the boot vCPU before the guest's first
+    /// instruction, since only a vCPU's own thread can read `MIDR_EL1` there.
+    /// A reader that finds the file empty waits, or asks the control socket.
+    pub profile_out: Option<String>,
+    /// Host Unix-socket path of the control socket, which pauses, resumes,
+    /// reports and stops the VM (see [`crate::checkpoint::control`]).
+    ///
+    /// It is bound before confinement, as the agent socket is.
+    pub control_sock: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.
     ///
     /// This is the whole of the VMM's observation surface: see
@@ -671,7 +685,8 @@ pub enum Stop {
     /// A reset by the guest, which is not restarted.
     SystemReset,
     /// The host asked the run to stop, through a
-    /// [`StopHandle`](crate::run::StopHandle).
+    /// [`StopHandle`](crate::run::StopHandle), or the control socket's `stop`
+    /// op ended it.
     Requested,
 }
 

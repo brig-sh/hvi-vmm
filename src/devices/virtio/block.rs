@@ -334,6 +334,10 @@ impl VirtioBlk {
         std::mem::take(&mut self.events)
     }
 
+    /// The device features this device offers, both words: what the machine
+    /// profile records, since a restored driver has negotiated against them.
+    pub const FEATURES: u64 = ((F_VERSION_1_HI as u64) << 32) | F_BLK_FLUSH_LO as u64;
+
     /// Services one MMIO access. Returns the read value (0 for writes). When
     /// the driver notifies a queue, the virtqueue is processed inline.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
@@ -1061,6 +1065,17 @@ mod queue_tests {
             blk.mmio(&mem, mmio::DEVICE_FEATURES, false, 0),
             u64::from(F_BLK_FLUSH_LO)
         );
+    }
+
+    #[test]
+    fn features_are_the_two_pages_the_window_offers() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = dev();
+        let mut page = |sel| {
+            blk.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, sel);
+            blk.mmio(&mem, mmio::DEVICE_FEATURES, false, 0)
+        };
+        assert_eq!((page(1) << 32) | page(0), VirtioBlk::FEATURES);
     }
 
     #[test]

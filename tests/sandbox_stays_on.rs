@@ -36,6 +36,8 @@ fn config(sandbox: bool) -> BootConfig {
         sandbox_id: "sandbox-test".to_string(),
         vcpus: 1,
         agent_sock: None,
+        profile_out: None,
+        control_sock: None,
         plugin: None,
         sandbox,
         stop: None,

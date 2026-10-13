@@ -38,9 +38,10 @@ tell one failure from another, and `BootError::into_inner` hands it over.
 
 `Stop` says how the run ended. `SystemOff` and `SystemReset` mean the guest
 powered off or reset. `Requested` means the host asked the run to stop (see
-[Stopping a run from the host](#stopping-a-run-from-the-host)). It is
-`#[non_exhaustive]`, so a `match` on it needs a wildcard arm. When a vCPU fails,
-`boot` returns an error that names the vCPU and says how it failed.
+[Stopping a run from the host](#stopping-a-run-from-the-host)), or that the
+control socket's `stop` ended it. It is `#[non_exhaustive]`, so a `match` on it
+needs a wildcard arm. When a vCPU fails, `boot` returns an error that names the
+vCPU and says how it failed.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,
@@ -57,13 +58,14 @@ installs a no-op handler for it and does not restore the one it replaced. It
 sends that signal to its own threads to interrupt them, so nothing else in the
 process should use it.
 
-Before it returns, the ledger is closed, the agent listener and every accepted
-agent connection are closed, and every thread it started itself has exited, with
-three exceptions. A thread still running at its deadline is left running and
-`boot` returns an error naming the first such thread, a vCPU thread before a
-helper thread. The thread that receives the stop signals runs for the life of
-the process (see [Stopping a run from the host](#stopping-a-run-from-the-host)).
-The ledger's writer thread is not joined. `boot` waits up to one second for the
+Before it returns, the ledger is closed, the agent listener, the control socket
+and every accepted connection are closed, and every thread it started itself has
+exited, with three exceptions. A thread still running at its deadline is left
+running and `boot` returns an error naming the first such thread, a vCPU thread
+before a helper thread. The thread that receives the stop signals runs for the
+life of the process (see [Stopping a run from the
+host](#stopping-a-run-from-the-host)). The ledger's writer thread is not
+joined. `boot` waits up to one second for the
 vCPU threads, then up to one second for the helper threads, and then up to one
 second for the writer to write the `vmm.stop` record, so it returns at most
 three seconds after the stop, with no error for a writer still in a write. The
@@ -113,6 +115,8 @@ let cfg = BootConfig {
     sandbox_id: String::from("my-sandbox"),
     vcpus: 2,
     agent_sock: None,
+    profile_out: None,
+    control_sock: None,
     plugin: None,
     sandbox: true,
     stop: None,
@@ -152,6 +156,8 @@ cargo build --release --example watch_guest
 | `sandbox_id` | `String` | Written into every ledger record. |
 | `vcpus` | `u32` | 1 or more. Linux/arm64 refuses more than 8 on a GICv2 host and more than 507 on a GICv3 one, and x86-64 more than 254. |
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
+| `profile_out` | `Option<String>` | Where the machine profile is written. Created before confinement. See [cli.md](cli.md#the-control-socket). |
+| `control_sock` | `Option<String>` | The control socket's path. Bound before confinement. See [cli.md](cli.md#the-control-socket). |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
