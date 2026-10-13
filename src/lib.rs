@@ -42,6 +42,7 @@
 //! library as well as a binary. See `docs/plugins.md`.
 
 pub mod arch;
+pub mod checkpoint;
 pub mod config;
 pub mod devices;
 pub mod events;
