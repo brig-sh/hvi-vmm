@@ -41,6 +41,11 @@ use crate::terminal::ConsoleFilter;
 
 /// The register bits the interrupt state is computed from. The crate keeps its
 /// own register bits private.
+/// The received bytes the 16550's FIFO keeps.
+///
+/// This is vm-superio's `FIFO_SIZE`, which the crate does not export, and
+/// `Serial::from_state` refuses a state holding more.
+const RX_FIFO: usize = 64;
 const IER_RECEIVED_DATA: u8 = 0x01;
 const IER_THR_EMPTY: u8 = 0x02;
 const LSR_DATA_READY: u8 = 0x01;
@@ -150,6 +155,25 @@ pub struct UartState {
     pub thr_empty_pending: bool,
 }
 
+impl UartState {
+    /// Refuses a state this build could not restore.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version or holds more received
+    /// bytes than the crate's FIFO keeps.
+    pub fn check(&self) -> io::Result<()> {
+        check_version("16550", self.version, UART_STATE_VERSION)?;
+        if self.rx.len() > RX_FIFO {
+            return Err(invalid(format_args!(
+                "16550 holds {} received bytes, the FIFO keeps {RX_FIFO}",
+                self.rx.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A 16550 UART with a host-stdout TX and a host-fed RX queue.
 pub struct Uart16550 {
     inner: Serial<NoTrigger, NoEvents, ConsoleOut>,
@@ -213,7 +237,7 @@ impl Uart16550 {
     /// Errors when the state is of another version or holds more received
     /// bytes than the crate's FIFO keeps.
     pub fn restore(state: &UartState) -> io::Result<Self> {
-        check_version("16550", state.version, UART_STATE_VERSION)?;
+        state.check()?;
         let serial = SerialState {
             baud_divisor_low: state.baud_divisor_low,
             baud_divisor_high: state.baud_divisor_high,
@@ -562,5 +586,25 @@ mod tests {
             ..good
         };
         assert!(Uart16550::restore(&full).is_ok(), "a full FIFO is fine");
+    }
+
+    /// `RX_FIFO` copies a constant the crate keeps private, so the copy is
+    /// held to what `Serial::from_state` accepts.
+    #[test]
+    fn the_fifo_check_matches_the_crate() {
+        let serial = |len: usize| SerialState {
+            in_buffer: vec![0; len],
+            ..Serial::new(NoTrigger, ConsoleOut::new()).state()
+        };
+        let from_state =
+            |len: usize| Serial::from_state(&serial(len), NoTrigger, NoEvents, ConsoleOut::new());
+        assert!(from_state(RX_FIFO).is_ok());
+        assert!(from_state(RX_FIFO + 1).is_err());
+        let state = |len: usize| UartState {
+            rx: vec![0; len],
+            ..Uart16550::new().state()
+        };
+        assert!(state(RX_FIFO).check().is_ok());
+        assert!(state(RX_FIFO + 1).check().is_err());
     }
 }

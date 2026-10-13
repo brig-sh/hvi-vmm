@@ -91,6 +91,30 @@ pub struct BlkState {
     pub capacity_sectors: u64,
 }
 
+impl BlkState {
+    /// Refuses a state this build could not restore over `mem`, without
+    /// opening the disk or touching guest RAM.
+    ///
+    /// The disk's size is not checked here, since only the disk knows it;
+    /// [`VirtioBlk::restore`] checks it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, has a queue the transport
+    /// would not have accepted, or has registers this device never holds.
+    pub fn check(&self, mem: &GuestRam) -> std::io::Result<()> {
+        check_version("virtio-blk", self.version, BLK_STATE_VERSION)?;
+        self.common.check("virtio-blk")?;
+        if self.common.queue_sel != 0 {
+            return Err(invalid(format_args!(
+                "virtio-blk has one queue, state selects queue {}",
+                self.common.queue_sel
+            )));
+        }
+        self.queue.check(mem)
+    }
+}
+
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
     file: File,
@@ -242,14 +266,7 @@ impl VirtioBlk {
     /// queue the transport would not have accepted, or has registers this
     /// device never holds.
     pub fn restore(path: &str, mem: &GuestRam, state: &BlkState) -> std::io::Result<Self> {
-        check_version("virtio-blk", state.version, BLK_STATE_VERSION)?;
-        state.common.check("virtio-blk")?;
-        if state.common.queue_sel != 0 {
-            return Err(invalid(format_args!(
-                "virtio-blk has one queue, state selects queue {}",
-                state.common.queue_sel
-            )));
-        }
+        state.check(mem)?;
         let queue = Queue::from_state(mem, &state.queue)?;
         let mut dev = Self::open(path)?;
         if dev.capacity_sectors != state.capacity_sectors {

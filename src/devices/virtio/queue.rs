@@ -209,6 +209,18 @@ pub struct QueueState {
     pub last_avail: u16,
 }
 
+impl QueueState {
+    /// Refuses a queue the driver could not have programmed, as
+    /// [`Queue::from_state`] does, without keeping the queue.
+    ///
+    /// # Errors
+    ///
+    /// Errors as [`Queue::from_state`] does.
+    pub(crate) fn check(&self, mem: &GuestRam) -> std::io::Result<()> {
+        Queue::from_state(mem, self).map(drop)
+    }
+}
+
 impl Queue {
     /// Returns what a checkpoint keeps of the queue.
     pub(crate) fn state(&self) -> QueueState {
