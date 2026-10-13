@@ -43,7 +43,7 @@
 //! calls there), and the pair is created before any filter installs.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -54,8 +54,9 @@ use crate::sync::lock_or_recover;
 /// How long the stop waits for the vCPU threads, then for the helper threads,
 /// and then for the ledger, after it is requested.
 ///
-/// The waits the stop cannot interrupt are a plugin blocking in `request` or
-/// `safepoint` and a virtio-fs worker waiting on a host file lock.
+/// The waits the stop cannot interrupt are a plugin blocking in `request`, in
+/// `safepoint` or on a thread it started with `VmHandle::spawn`, and a
+/// virtio-fs worker waiting on a host file lock.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A count of the helper threads that have finished.
@@ -146,8 +147,19 @@ impl StopSource {
 }
 
 /// A helper thread's view of a [`StopSource`].
+///
+/// Its descriptor becomes readable when the stop is requested and stays
+/// readable, so a thread can add it to a `poll` set beside its own descriptors.
+/// Every token of a run shares the descriptor, so a thread polls it and neither
+/// reads it nor shuts it down.
 #[derive(Clone)]
 pub struct StopToken(Arc<UnixStream>);
+
+impl AsFd for StopToken {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
 
 impl StopToken {
     /// Blocks until `fd` is readable or the stop is requested.
@@ -264,7 +276,6 @@ pub(crate) fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::R
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::fd::AsFd;
 
     #[test]
     fn stop_wakes_waiter_on_idle_descriptor() {

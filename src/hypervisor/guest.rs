@@ -16,10 +16,10 @@
 //!
 //! [`Guest`] holds what each backend keeps about the VM it runs, apart from the
 //! hypervisor's own handle and the devices not every backend has: guest RAM and
-//! the object behind it, the event ledger, the virtio devices, the vCPUs and
-//! the identity of the run. It is the [`VmHandle`] a plugin gets at attach.
-//! [`Cpu`] is the [`CpuHandle`] it gets at a safe point, where only the
-//! registers depend on the backend.
+//! the object behind it, the event ledger, the virtio devices, the vCPUs, the
+//! threads a plugin asked for and the identity of the run. It is the
+//! [`VmHandle`] a plugin gets at attach. [`Cpu`] is the [`CpuHandle`] it gets
+//! at a safe point, where only the registers depend on the backend.
 
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
@@ -31,8 +31,9 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
-use crate::plugin::{CpuHandle, GuestArch, IoSink, RamRegion, RegsView, VmHandle};
+use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
+use crate::teardown::StopToken;
 
 /// The guest a backend runs, apart from the hypervisor's handle to it.
 pub(crate) struct Guest<K> {
@@ -55,6 +56,62 @@ pub(crate) struct Guest<K> {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
+    /// The threads a plugin asks for in `attach`, until the attach is over.
+    pub(crate) plugin_threads: PluginThreads,
+}
+
+/// A thread a plugin asked for with [`VmHandle::spawn`], not yet started.
+pub(crate) struct PluginThread {
+    /// The name of the thread, which its failure report also uses.
+    pub(crate) name: &'static str,
+    /// What the thread runs, given the token of the stop that ends it.
+    pub(crate) run: Box<dyn FnOnce(StopToken) + Send>,
+}
+
+/// The threads a plugin asks for while it attaches.
+///
+/// `attach` runs before the seccomp filters are armed, and a thread started
+/// then would run unfiltered. So the threads are queued, and the queue is taken
+/// once the attach is over. A request after that is refused.
+pub(crate) struct PluginThreads(Mutex<Option<Vec<PluginThread>>>);
+
+impl PluginThreads {
+    /// Returns an empty queue that takes requests.
+    pub(crate) fn new() -> Self {
+        Self(Mutex::new(Some(Vec::new())))
+    }
+
+    /// Queues `thread`.
+    ///
+    /// # Errors
+    ///
+    /// Errors once the queue has been taken, and for a name with a NUL byte,
+    /// which a thread cannot be given.
+    fn queue(&self, thread: PluginThread) -> std::io::Result<()> {
+        if thread.name.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("plugin thread {:?}: a name with a NUL byte", thread.name),
+            ));
+        }
+        match lock_or_recover(&self.0).as_mut() {
+            Some(queued) => {
+                queued.push(thread);
+                Ok(())
+            }
+            None => Err(std::io::Error::other(format!(
+                "plugin thread {}: a plugin starts its threads from attach",
+                thread.name
+            ))),
+        }
+    }
+
+    /// Returns the queued threads.
+    ///
+    /// A request after this call is refused.
+    pub(crate) fn take(&self) -> Vec<PluginThread> {
+        lock_or_recover(&self.0).take().unwrap_or_default()
+    }
 }
 
 impl<K> Guest<K> {
@@ -78,6 +135,28 @@ impl<K> Guest<K> {
         if let Some(dev) = &self.vsock {
             lock_or_recover(dev).connect_irq(vsock);
         }
+    }
+}
+
+impl<K: Kick + 'static> Guest<K> {
+    /// Hands `plugin` the guest, when there is one, and returns the threads it
+    /// asked for in `attach`.
+    ///
+    /// The queue is taken whether or not the attach succeeds, so a queued
+    /// thread, which can hold the guest, never outlives a failed boot.
+    ///
+    /// # Errors
+    ///
+    /// Errors with the plugin's error when it refuses the guest.
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        plugin: Option<&Arc<dyn Plugin>>,
+    ) -> std::io::Result<Vec<PluginThread>> {
+        let attached = plugin.map_or(Ok(()), |plugin| {
+            plugin.attach(Arc::clone(self) as Arc<dyn VmHandle>)
+        });
+        let threads = self.plugin_threads.take();
+        attached.map(|()| threads)
     }
 }
 
@@ -138,6 +217,14 @@ impl<K: Kick> VmHandle for Guest<K> {
     fn request_stop(&self) {
         self.vcpus.stop_handle().request_stop();
     }
+
+    fn spawn(
+        &self,
+        name: &'static str,
+        run: Box<dyn FnOnce(StopToken) + Send>,
+    ) -> std::io::Result<()> {
+        self.plugin_threads.queue(PluginThread { name, run })
+    }
 }
 
 /// Access to a vCPU's registers for a plugin at a safe point.
@@ -184,5 +271,51 @@ impl<K: Kick, V: VcpuRegs> CpuHandle for Cpu<'_, K, V> {
 
     fn ledger(&self) -> &Arc<Mutex<Emitter>> {
         &self.guest.ledger
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A thread asked for after `attach` would start under no filter and outside
+    // the join, so the request is refused.
+    #[test]
+    fn plugin_thread_is_refused_once_the_queue_is_taken() {
+        let threads = PluginThreads::new();
+        threads
+            .queue(PluginThread {
+                name: "early",
+                run: Box::new(|_| {}),
+            })
+            .unwrap();
+        let taken = threads.take();
+        assert_eq!(taken.len(), 1);
+        let error = threads
+            .queue(PluginThread {
+                name: "late",
+                run: Box::new(|_| {}),
+            })
+            .expect_err("a thread was queued after the attach");
+        assert!(
+            error.to_string().starts_with("plugin thread late"),
+            "{error}"
+        );
+        assert!(threads.take().is_empty());
+    }
+
+    // `std::thread::Builder` panics on such a name, in `boot`, after other
+    // threads have started.
+    #[test]
+    fn plugin_thread_with_a_nul_in_its_name_is_refused() {
+        let threads = PluginThreads::new();
+        let error = threads
+            .queue(PluginThread {
+                name: "bad\0name",
+                run: Box::new(|_| {}),
+            })
+            .expect_err("a name with a NUL byte was queued");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(threads.take().is_empty());
     }
 }

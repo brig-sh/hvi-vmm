@@ -86,7 +86,7 @@ thread as that thread's first act:
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the main thread, the host-side I/O threads and the stop-signal thread | 47 syscalls | 48 syscalls |
+| `vmm` | the main thread, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -153,10 +153,10 @@ sandbox is secure.
 - **It does not drop privilege.** There is no uid, gid or capability change
   anywhere in hvi. The process keeps the identity it was started with.
   Confinement narrows what it may ask the kernel for, nothing else.
-- **It does not cover every thread.** A thread a plugin starts in `attach`
-  starts before the Linux filters are armed and stays unfiltered. The
-  memory-dump plugin's `--dump-after` timer is one. It ends when it fires,
-  `--dump-after` seconds after the boot starts.
+- **It does not cover a thread a plugin starts outside `VmHandle::spawn`.** Such
+  a thread starts in `attach`, before the Linux filters are armed, and stays
+  unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
+  as it begins, as the memory-dump plugin's `--dump-after` timer does.
 - **It does not constrain syscall arguments.** No rule in either architecture
   file carries an argument condition, so `ioctl` and `sendmsg` are
   unconstrained over every descriptor the process already holds.

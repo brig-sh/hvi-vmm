@@ -57,20 +57,21 @@ host](#stopping-a-run-from-the-host)). `boot` waits up to one second for the
 vCPU threads, then up to one second for the helper threads, and then up to one
 second for the ledger, which a thread left running can hold; it does not write
 the tail of a ledger still held. It returns at most three seconds after the
-stop. The waits it cannot interrupt are a plugin blocking in `request` or
-`safepoint` and a virtio-fs worker waiting on a host file lock. On macOS such a
-lock wait can also stall a vCPU (see [Known
-limits](limitations.md#virtio-fs-resource-limits)). A plugin that keeps the
-`Arc<dyn VmHandle>` it was given keeps guest RAM, the ledger file and the block,
-net and vsock devices until it drops the handle. It also keeps the VM, through
-the vCPU kicker on macOS and through the interrupt line of each block, net or
-vsock device on Linux. The vCPUs have exited or been left running, so a kick
-reaches only a vCPU left running. The tap under `--net-tap` keeps its carrier
-up. The disk stays open. The gateway connection under `--net-gateway` stays on
-the handle, but the relay shut it down as it ended, so it carries nothing. A
-thread the plugin started from `attach` is not joined, and holds the handle for
-as long as it runs. On macOS a second `boot` fails while such a handle exists,
-because Hypervisor.framework allows one VM per process.
+stop. The waits it cannot interrupt are a plugin blocking in `request`, in
+`safepoint` or on a thread it started with `VmHandle::spawn`, and a virtio-fs
+worker waiting on a host file lock. On macOS such a lock wait can also stall a
+vCPU (see [Known limits](limitations.md#virtio-fs-resource-limits)). A plugin
+that keeps the `Arc<dyn VmHandle>` it was given keeps guest RAM, the ledger file
+and the block, net and vsock devices until it drops the handle. It also keeps
+the VM, through the vCPU kicker on macOS and through the interrupt line of each
+block, net or vsock device on Linux. The vCPUs have exited or been left running,
+so a kick reaches only a vCPU left running. The tap under `--net-tap` keeps its
+carrier up. The disk stays open. The gateway connection under `--net-gateway`
+stays on the handle, but the relay shut it down as it ended, so it carries
+nothing. A thread the plugin started with `VmHandle::spawn` is joined with the
+I/O threads. One it started any other way is not joined, and holds the handle
+for as long as it runs. On macOS a second `boot` fails while such a handle
+exists, because Hypervisor.framework allows one VM per process.
 
 ## A minimal caller
 
@@ -143,9 +144,9 @@ Create a pair with `hvi::stop::StopHandle::new_pair()` before `boot`, keep the
 `StopHandle` and pass the `StopRegistration` in `BootConfig::stop`. `boot` takes
 the registration by value, so it serves one run. `StopHandle::request_stop` from
 any thread stops the run: the VM stops, the threads are joined and the ledger is
-flushed, and `boot` returns `Stop::Requested`. A failure or a guest stop a vCPU
-reports before `boot` reads how the run ended takes the place of
-`Stop::Requested`. A plugin asks for the same stop with
+flushed, and `boot` returns `Stop::Requested`. A failure a thread reports, or a
+guest stop a vCPU reports, before `boot` reads how the run ended takes the place
+of `Stop::Requested`. A plugin asks for the same stop with
 `VmHandle::request_stop`.
 
 The library installs no handler for a stop signal. To stop the run on `SIGTERM`,
@@ -167,9 +168,10 @@ request.
 Once a run has started, the process outlives a `SIGHUP`, and stderr can then be
 a terminal that hung up. `eprintln!` panics on a failed write, so a line your
 code or your plugin prints with it after a `SIGHUP` panics that thread. A panic
-in a plugin hook that a vCPU thread runs fails the run. The setup lines of a
-later `boot` in the same process are printed with `eprintln!` too, so a binary
-that stopped on `SIGHUP` should end rather than boot again.
+in a plugin hook that a vCPU thread runs, or in a thread the plugin started with
+`VmHandle::spawn`, fails the run. The setup lines of a later `boot` in the same
+process are printed with `eprintln!` too, so a binary that stopped on `SIGHUP`
+should end rather than boot again.
 
 Another stop signal, one second or more after the first, restores the terminal
 and ends the process at once by that signal, and the ledger loses its tail. One

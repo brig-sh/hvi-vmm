@@ -60,8 +60,8 @@
 //! virtio device models -- the code that parses guest descriptors -- run there.
 //! `vmm` covers the main thread, the host-side I/O threads (the console reader,
 //! the agent bridge and its per-connection readers, the tap and gateway
-//! readers, and the debug watchdog when it is enabled) and the thread that
-//! receives the stop signals.
+//! readers, and the debug watchdog when it is enabled), the threads a plugin
+//! starts with `VmHandle::spawn` and the thread that receives the stop signals.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:

@@ -17,7 +17,7 @@ three things a reader should not have to guess between:
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | The KVM backends need kernel 4.11 or newer. | hvi stops a vCPU through `kvm_run.immediate_exit` and refuses to boot without `KVM_CAP_IMMEDIATE_EXIT`, which 4.11 added. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
-| The arm64/KVM backend is unit-tested on its stop path only. | Its only tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a run stops: a vCPU thread that ends, a stop request, and a kick. They need `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
+| The arm64/KVM backend is unit-tested on its stop path only. | Its only tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a run stops: a vCPU thread that ends, a stop request, plugin threads, and a kick. They need `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
 
 ## Devices
 
@@ -75,7 +75,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
-| A thread a plugin starts in `attach` is unfiltered on Linux. | It starts before the filters are armed and stays unfiltered. The `--dump-after` timer thread is one. It ends when it fires, `--dump-after` seconds after the boot starts. See [#92](https://github.com/brig-sh/hvi-vmm/issues/92). | Defect |
+| A thread a plugin starts outside `VmHandle::spawn` is unfiltered on Linux. | It starts in `attach`, before the filters are armed, and stays unfiltered. | Design |
 | No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |

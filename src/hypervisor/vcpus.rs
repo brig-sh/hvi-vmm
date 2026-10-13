@@ -233,11 +233,11 @@ impl<K: Kick> Vcpus<K> {
 
     /// Returns how the run ended.
     ///
-    /// A report wins over a stop request, so a failure or a guest stop a vCPU
-    /// reports before `boot` reads how the run ended is the outcome returned.
-    /// Every failure is reported. A run with neither a report nor a request is
-    /// one in which the guest stopped without saying how, and its outcome is
-    /// [`Stop::SystemOff`].
+    /// A report wins over a stop request, so a failure a thread reports, or a
+    /// guest stop a vCPU reports, before `boot` reads how the run ended is the
+    /// outcome returned. Every failure is reported. A run with neither a report
+    /// nor a request is one in which the guest stopped without saying how, and
+    /// its outcome is [`Stop::SystemOff`].
     pub(crate) fn outcome(&self) -> Outcome {
         let reported = lock_or_recover(&self.outcome).clone();
         reported.unwrap_or(Outcome::Stopped(if self.stop_handle.is_stop_requested() {
@@ -325,7 +325,7 @@ impl<K: Kick> Vcpus<K> {
 pub(crate) enum Outcome {
     /// The run stopped, as the guest or the host asked.
     Stopped(Stop),
-    /// A vCPU failed, with the text that says how.
+    /// A vCPU or a plugin thread failed, with the text that says how.
     Failed(String),
 }
 

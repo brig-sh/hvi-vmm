@@ -32,7 +32,7 @@ For constructing the `BootConfig` that carries a plugin, read
 All three methods on `Plugin` are defaulted, so an implementation takes only
 what it needs. All three backends call all three hooks.
 
-## The five rules that fail quietly
+## The six rules that fail quietly
 
 **1. `safepoint` is on the hot path.** It sits at the top of the vCPU run
 loop, so it runs once per guest entry. A tool with nothing to do this time
@@ -62,8 +62,8 @@ to finish reading. It checks `cpu.is_stopping()` as it waits. Once that returns
 then leaves its thread running and fails the run.
 
 A plugin that needs the run to end calls `VmHandle::request_stop()`, from any
-thread. `boot` then returns `Stop::Requested`, unless a vCPU reports a failure
-or a guest stop before `boot` reads how the run ended.
+thread. `boot` then returns `Stop::Requested`, unless a thread reports a
+failure, or a vCPU a guest stop, before `boot` reads how the run ended.
 
 **3. Set a flag, then kick.** If your own thread decides it is time to act,
 set your flag and then call `VmHandle::kick()`. An idle guest sits in WFI on
@@ -91,6 +91,19 @@ alive after `boot` returns. A sink that needs the handle keeps a `Weak` from
 the stop waits for that thread. A `request` still running a second after the
 stop leaves its thread running, and `boot` returns an error naming it. Set a
 flag and return, as `MemoryDump` does; the backend kicks once `request` returns.
+
+**6. Start your threads with `VmHandle::spawn`.** Call it from `attach`, with a
+name and a boxed closure that takes a `hvi::teardown::StopToken`. The VMM starts
+the thread once the attach has succeeded, under the same seccomp filter as its
+own I/O threads on Linux, and joins it with them when the run stops. The token
+reports the stop once the vCPUs have exited or been left running: wait on it
+with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own `poll`
+set, and return when it fires. A thread still running a second after the token
+reports the stop is left running and fails the run, and a thread that panics
+fails the run and stops it. Open files and bind sockets in `attach`, since the
+filter refuses them. A thread you start any other way is neither joined nor
+filtered, and it keeps the `VmHandle` and the VM it holds alive for as long as
+it runs.
 
 ## Reading guest memory
 
@@ -179,9 +192,10 @@ hook to every member in insertion order. `attach` stops at the first error.
 - **Not a stable ABI.** There is no released version and no tag. Pin a commit.
 - **Not separately confined.** A plugin runs inside the VMM process, with the
   same authority. `attach` runs before the confinement is installed. The other
-  hooks run under the same Seatbelt profile or seccomp filters as the VMM. On
-  Linux a thread started in `attach` stays unfiltered (see [Known
-  limits](limitations.md#confinement)). A plugin is part of the trusted VMM.
+  hooks, and the threads a plugin starts with `VmHandle::spawn`, run under the
+  same Seatbelt profile or seccomp filters as the VMM. On Linux a thread a
+  plugin starts any other way from `attach` stays unfiltered. A plugin is part
+  of the trusted VMM.
 
 ## Shipping one out of tree
 
