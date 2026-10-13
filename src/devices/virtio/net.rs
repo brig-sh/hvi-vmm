@@ -436,6 +436,27 @@ pub struct NetState {
     pub tap_write_reported: bool,
 }
 
+impl NetState {
+    /// Refuses a state this build could not restore over `mem`, without
+    /// building the device or touching guest RAM.
+    ///
+    /// The backend's mode is not checked here, since only the backend knows
+    /// it; [`VirtioNet::restore`] checks it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, has a queue the transport
+    /// would not have accepted, or has interrupt bits the device never sets.
+    pub fn check(&self, mem: &GuestRam) -> io::Result<()> {
+        check_version("virtio-net", self.version, NET_STATE_VERSION)?;
+        self.common.check("virtio-net")?;
+        for queue in &self.queues {
+            queue.check(mem)?;
+        }
+        Ok(())
+    }
+}
+
 /// A virtio-net device with a user-space capture backend.
 pub struct VirtioNet {
     status: u32,
@@ -587,8 +608,7 @@ impl VirtioNet {
     /// another version, has a queue the transport would not have accepted, or
     /// has interrupt bits the device never sets.
     pub fn restore(backend: NetBackend, mem: &GuestRam, state: &NetState) -> io::Result<Self> {
-        check_version("virtio-net", state.version, NET_STATE_VERSION)?;
-        state.common.check("virtio-net")?;
+        state.check(mem)?;
         if backend.mode() != state.mode {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
