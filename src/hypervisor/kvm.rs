@@ -176,14 +176,16 @@ impl Drop for Registration<'_> {
 /// confinement needs.
 ///
 /// The plugin attaches to the guest before anything runs. The filters are armed
-/// before the first I/O or vCPU thread exists. The agent socket and the stop
-/// source's socket pair are created before any filter goes in, since the
-/// allowlists allow accepting on a listener already held but not creating one.
-/// Then the I/O threads start, each filtering itself as it begins.
+/// before the first I/O or vCPU thread exists, and a binary's stop-signal
+/// thread starts right after. The agent socket and the stop source's socket
+/// pair are created before any filter goes in, since the allowlists allow
+/// accepting on a listener already held but not creating one. Then the I/O
+/// threads start, each filtering itself as it begins.
 ///
 /// # Errors
 ///
-/// Errors if the plugin refuses the guest, a filter does not compile, the agent
+/// Errors if the plugin refuses the guest, a filter does not compile, the
+/// stop-signal thread cannot be started or its handlers installed, the agent
 /// socket cannot be bound or the stop source cannot be created.
 pub(crate) fn start_io_threads(
     cfg: &BootConfig,
@@ -195,6 +197,12 @@ pub(crate) fn start_io_threads(
         plugin.attach(Arc::clone(guest) as Arc<dyn VmHandle>)?;
     }
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
+    // A binary's stop signals get their handlers, and the thread that receives
+    // them starts, once the filters are armed, so the thread installs the `vmm`
+    // filter as its first act. The terminal goes into raw mode after this, so a
+    // first stop signal stops the run rather than ending the process with the
+    // terminal raw.
+    crate::signal::start_stop_signal_thread()?;
     let bridge = match (&cfg.agent_sock, &guest.vsock) {
         (Some(path), Some(dev)) => Some(VsockBridge::bind(
             path,
@@ -246,7 +254,7 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
     if let Err(e) = filters.install() {
         // The error is printed here, since a spawn failure ahead of it is the
         // one returned.
-        eprintln!("{LOG_PREFIX} {e}");
+        stderrln!("{LOG_PREFIX} {e}");
         failure.get_or_insert(e.into());
     }
 
@@ -380,6 +388,7 @@ mod stop_tests {
     use crate::config::BootConfig;
     use crate::plugin::CpuHandle;
     use crate::signal::install_kick_handler;
+    use crate::stop::StopHandle;
     use kvm_ioctls::Kvm;
     use std::fs::File;
     use std::os::fd::RawFd;
@@ -422,6 +431,25 @@ mod stop_tests {
         }
     }
 
+    /// A plugin whose `safepoint` waits until the run is stopping, for at most
+    /// five seconds, as one that holds a pause for another process does.
+    struct WaitsInSafepoint {
+        /// Whether `safepoint` has run.
+        reached: AtomicBool,
+    }
+
+    impl Plugin for WaitsInSafepoint {
+        fn safepoint(&self, cpu: &dyn CpuHandle) {
+            self.reached.store(true, Ordering::SeqCst);
+            // `yield_now` rather than a sleep, since the vCPU allowlist has no
+            // `clock_nanosleep`.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cpu.is_stopping() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     /// Returns the configuration of a two-vCPU boot of `kernel`.
     ///
     /// The seccomp filters are on in a release build, so a vCPU thread exits
@@ -446,6 +474,7 @@ mod stop_tests {
             agent_sock: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
+            stop: None,
         }
     }
 
@@ -558,6 +587,69 @@ mod stop_tests {
         let error = outcome.expect_err("boot reported a stop for a failed run");
         assert!(error.starts_with("vcpu1: KVM_RUN error"), "{error}");
         assert!(!error.contains("did not stop"), "{error}");
+    }
+
+    // The guest never exits, so only the request can end the run. Ignored by
+    // default, as the tests above are.
+    #[test]
+    #[ignore]
+    fn request_stops_a_guest_that_never_exits() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let (stop, registration) = StopHandle::new_pair().unwrap();
+        let mut cfg = config(spinning_kernel(), None);
+        cfg.stop = Some(registration);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::boot(cfg).map_err(|e| e.to_string()));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        stop.request_stop();
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the stop is requested");
+        assert!(
+            matches!(outcome, Ok(Stop::Requested)),
+            "boot returned {outcome:?}"
+        );
+    }
+
+    // The boot vCPU waits in its plugin's `safepoint` when the stop is
+    // requested. The plugin has to see the stop and return, or the stop leaves
+    // the vCPU running and fails the run. Ignored by default, as the tests
+    // above are.
+    #[test]
+    #[ignore]
+    fn plugin_waiting_in_safepoint_sees_the_stop() {
+        assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
+        let plugin = Arc::new(WaitsInSafepoint {
+            reached: AtomicBool::new(false),
+        });
+        let (stop, registration) = StopHandle::new_pair().unwrap();
+        let mut cfg = config(
+            spinning_kernel(),
+            Some(Arc::clone(&plugin) as Arc<dyn Plugin>),
+        );
+        cfg.stop = Some(registration);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::boot(cfg).map_err(|e| e.to_string()));
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !plugin.reached.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the boot vCPU never reached the plugin"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stop.request_stop();
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("boot returns once the stop is requested");
+        assert!(
+            matches!(outcome, Ok(Stop::Requested)),
+            "boot returned {outcome:?}"
+        );
     }
 
     // Ignored by default, as it needs a usable `/dev/kvm`.

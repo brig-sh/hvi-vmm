@@ -109,13 +109,13 @@ impl IoThreads {
             match net {
                 NetSource::Gateway(stream) => io_threads.spawn("gateway relay", move |stop| {
                     if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
-                        eprintln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
+                        stderrln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
                     }
                 }),
                 #[cfg(target_os = "linux")]
                 NetSource::Tap(file) => io_threads.spawn("tap relay", move |stop| {
                     if let Err(e) = TapRelay::new(file).run(&stop, deliver) {
-                        eprintln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
+                        stderrln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
                     }
                 }),
             }

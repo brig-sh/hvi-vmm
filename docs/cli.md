@@ -187,6 +187,7 @@ An embedder inherits these from the process environment. They are not part of
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
 | A vCPU fails | `hvi: <what failed>`, exit 1. |
+| `SIGTERM`, `SIGINT` or `SIGHUP` | `guest stopped: Requested`, or `hvi: <what failed>` if the run failed, and then the process ends by that signal. |
 | The guest halts or powers off on x86-64 | The run does not end. |
 
 A vCPU fails on an exit hvi does not service, on an error from the hypervisor,
@@ -203,19 +204,30 @@ reboot calls it again.
 
 ### Signals and the terminal
 
-There is no `SIGINT`, `SIGTERM` or `SIGHUP` handler. hvi uses one signal
-internally, `SIGRTMIN` on Linux and `SIGUSR1` on macOS. It breaks a vCPU out of
-`KVM_RUN` on the Linux backends and ends the console reader's read of stdin when
-the guest stops. It is not a control interface.
+`SIGTERM`, `SIGINT` and `SIGHUP` stop the run. hvi stops the vCPUs, joins its
+threads, flushes the ledger and restores the terminal, and then ends by the
+signal it received, so a shell reports status 128 plus the signal number and a
+service manager sees the process end by that signal. The guest is not asked to
+shut down first. If the stop does not complete, another of these signals, one
+second or more after the first, ends hvi at once by that signal, and the ledger
+loses its tail. One that arrives sooner, such as a copy a wrapper script
+forwards, has no effect. A signal hvi starts with ignored, such as `SIGHUP`
+under `nohup`, stays ignored.
 
-hvi puts the terminal into raw mode when stdin is a TTY and restores it when
-the boot returns normally. The restore discards input the guest did not read.
-That restore is a destructor, and a destructor does not run when a signal kills
-the process.
+In raw mode the terminal sends Ctrl-C to the guest as a byte, so `SIGINT`
+reaches hvi only from `kill` or when stdin is not a TTY.
 
-CAUTION: If you kill hvi with Ctrl-C or `kill`, the terminal is left in raw
-mode. Run `stty sane` or `reset` to recover it. Stop a guest from inside it
-where you can.
+hvi uses one signal internally, `SIGRTMIN` on Linux and `SIGUSR1` on macOS. It
+breaks a vCPU out of `KVM_RUN` on the Linux backends and ends the console
+reader's read of stdin when the run stops. It is not a control interface.
+
+hvi puts the terminal into raw mode when stdin is a TTY and restores it when the
+boot returns. The restore discards input the guest did not read. That restore is
+a destructor, and a destructor does not run when `SIGKILL` or another signal hvi
+does not handle kills the process.
+
+CAUTION: If hvi is killed by a signal it does not handle, such as `SIGKILL`, the
+terminal is left in raw mode. Run `stty sane` or `reset` to recover it.
 
 ### Console output
 

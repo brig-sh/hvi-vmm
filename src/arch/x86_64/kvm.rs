@@ -66,7 +66,6 @@ use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
-use crate::hypervisor::run::Waker;
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
@@ -131,17 +130,20 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
     }
 }
 
-/// Boots `cfg` on KVM (x86-64) and runs the guest until it resets.
+/// Boots `cfg` on KVM (x86-64) and runs the guest until it resets or the host
+/// requests a stop.
 ///
 /// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
 /// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the first that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread.
-/// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
-/// thread it started from `attach`.
-pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
+/// exception is the thread that receives the stop signals, which the first run
+/// after [`stop_on_signals`](crate::signal::stop_on_signals) starts for the
+/// life of the process. What remains of the VM is a `VmHandle` a plugin kept,
+/// in a field or on a thread it started from `attach`.
+pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if !cfg.fs_shares.is_empty() {
         return Err(
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
@@ -329,7 +331,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             vcpus: Arc::new(Vcpus::new(
                 num_cpus,
                 Kicker::new(num_cpus),
-                Arc::new(Waker::new()?),
+                cfg.take_stop_handle()?,
             )),
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
@@ -368,7 +370,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                     Ok(true) => guest.vcpus.kicker().kick(0),
                     Ok(false) => break,
                     Err(e) => {
-                        eprintln!("{LOG_PREFIX} trace watchdog: {e}; trace watchdog stopped");
+                        stderrln!("{LOG_PREFIX} trace watchdog: {e}; trace watchdog stopped");
                         break;
                     }
                 }
@@ -484,7 +486,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             match exit {
                 VcpuExit::IoIn(port, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!("[trace] vcpu{cpu_id} IoIn {port:#x}");
+                        stderrln!("[trace] vcpu{cpu_id} IoIn {port:#x}");
                         n_exit += 1;
                     }
                     for b in data.iter_mut() {
@@ -493,7 +495,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 }
                 VcpuExit::IoOut(port, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!(
+                        stderrln!(
                             "[trace] vcpu{cpu_id} IoOut {port:#x} = {:02x?}",
                             &data[..data.len().min(4)]
                         );
@@ -505,7 +507,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 }
                 VcpuExit::MmioRead(addr, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!("[trace] vcpu{cpu_id} MmioRead {addr:#x}");
+                        stderrln!("[trace] vcpu{cpu_id} MmioRead {addr:#x}");
                         n_exit += 1;
                     }
                     let val = mmio_read(&sh, addr);
@@ -514,7 +516,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if dbg && n_exit < 80 {
-                        eprintln!("[trace] vcpu{cpu_id} MmioWrite {addr:#x}");
+                        stderrln!("[trace] vcpu{cpu_id} MmioWrite {addr:#x}");
                         n_exit += 1;
                     }
                     let mut b = [0u8; 8];
@@ -557,7 +559,7 @@ fn dump_regs(vcpu: &VcpuFd, mem: &GuestRam, cpu_id: u32, tag: &str) {
     if let (Ok(r), Ok(s)) = (vcpu.get_regs(), vcpu.get_sregs()) {
         let mut code = [0u8; 16];
         let _ = mem.read(r.rip, &mut code);
-        eprintln!(
+        stderrln!(
             "[trace] vcpu{cpu_id} {tag}: rip={:#x} rsp={:#x} rflags={:#x} cs.sel={:#x} cs.l={} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} code@rip={:02x?}",
             r.rip, r.rsp, r.rflags, s.cs.selector, s.cs.l, s.cr0, s.cr3, s.cr4, s.efer, code
         );

@@ -29,11 +29,14 @@
 // guest runs; see clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
+use std::io::Write;
 use std::sync::Arc;
 
 use hvi::config;
 use hvi::devices::virtio::tap;
 use hvi::plugin::builtin::{Chain, IoTrace, MemoryDump};
+use hvi::signal::{exit_by_signal, stop_on_signals};
+use hvi::stop::StopHandle;
 
 #[cfg(target_arch = "aarch64")]
 use hvi::arch::aarch64::{fdt, layout, loader};
@@ -397,6 +400,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "macos"))]
     let _ = (fs_uid, fs_gid);
 
+    // A stop signal asks the run to stop. Once `boot` has returned, the process
+    // ends by that signal.
+    let (stop_handle, stop_registration) = StopHandle::new_pair()?;
+    stop_on_signals(&stop_handle)?;
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
         initramfs: initramfs.map(std::fs::read).transpose()?,
@@ -420,16 +427,31 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Some(Arc::new(tools))
         },
+        stop: Some(stop_registration),
     };
     eprintln!("booting {kernel_path} with {mem_mib} MiB ...");
-    let stop = hvi::boot(cfg)?;
-    eprintln!("guest stopped: {stop:?}");
+    let result = hvi::boot(cfg);
+    // A run a signal asked to stop ends the process by that signal, whether the
+    // run then stopped cleanly or failed.
+    if let Some(signal) = stop_handle.signal() {
+        // stderr can be a closed pipe or, after `SIGHUP`, a terminal that hung
+        // up, where `eprintln!` would panic, so the last line ignores a failed
+        // write, here and below.
+        let mut stderr = std::io::stderr();
+        let _ = match &result {
+            Ok(stop) => writeln!(stderr, "guest stopped: {stop:?}"),
+            Err(e) => writeln!(stderr, "hvi: {e}"),
+        };
+        exit_by_signal(signal);
+    }
+    let stop = result?;
+    let _ = writeln!(std::io::stderr(), "guest stopped: {stop:?}");
     Ok(())
 }
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("hvi: {e}");
+        let _ = writeln!(std::io::stderr(), "hvi: {e}");
         std::process::exit(1);
     }
 }

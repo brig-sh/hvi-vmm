@@ -41,6 +41,23 @@
 //! can link this one and supply its own the same way, which is why the VMM is a
 //! library as well as a binary. See `docs/plugins.md`.
 
+/// Prints to stderr as `eprint!` does, without its panic on a failed write.
+///
+/// `eprint!` panics when the write fails, as it does on a terminal that hung up
+/// or a pipe whose reader has exited. A test build prints with `eprint!`, whose
+/// output the test harness captures.
+macro_rules! stderr {
+    ($($arg:tt)*) => {{
+        #[cfg(test)]
+        eprint!($($arg)*);
+        #[cfg(not(test))]
+        {
+            use std::io::Write as _;
+            let _ = write!(std::io::stderr(), $($arg)*);
+        }
+    }};
+}
+
 /// Prints a line to stderr as `eprintln!` does, without its panic on a failed
 /// write.
 ///
@@ -68,7 +85,8 @@ pub(crate) mod io_threads;
 pub mod memory;
 pub mod plugin;
 pub mod sandbox;
-pub(crate) mod signal;
+pub mod signal;
+pub mod stop;
 pub mod sync;
 pub mod teardown;
 pub mod terminal;

@@ -321,7 +321,7 @@ impl VirtioBlk {
                 // rejected or failed request could look like a success with
                 // stale data in the buffer.
                 if self.trace {
-                    eprint!("\r\n[virtio-blk] request failed: {e}\r\n");
+                    stderr!("\r\n[virtio-blk] request failed: {e}\r\n");
                 }
                 let _ = mem.write_u8(saddr, VIRTIO_BLK_S_IOERR);
                 1
@@ -423,7 +423,7 @@ impl VirtioBlk {
                 VIRTIO_BLK_T_FLUSH => "flush",
                 _ => "other",
             };
-            eprint!("\r\n[virtio-blk] {kind} sector={sector} bytes={data_bytes}\r\n");
+            stderr!("\r\n[virtio-blk] {kind} sector={sector} bytes={data_bytes}\r\n");
         }
         // Flush requests carry no data range — don't log them as I/O events.
         if typ == VIRTIO_BLK_T_IN || typ == VIRTIO_BLK_T_OUT {

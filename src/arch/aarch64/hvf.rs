@@ -55,7 +55,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
-use crate::hypervisor::run::{run_to_stop, Waker};
+use crate::hypervisor::run::run_to_stop;
 use crate::hypervisor::vcpus::{panic_message, Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -310,17 +310,20 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
 }
 
-/// Boots `cfg` and runs the guest until it powers off or resets.
+/// Boots `cfg` and runs the guest until it powers off, resets, or the host
+/// requests a stop.
 ///
 /// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
 /// the call returns an error that says how.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the first that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread.
-/// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
-/// thread it started from `attach`.
-pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
+/// exception is the thread that receives the stop signals, which the first run
+/// after [`stop_on_signals`](crate::signal::stop_on_signals) starts for the
+/// life of the process. What remains of the VM is a `VmHandle` a plugin kept,
+/// in a field or on a thread it started from `attach`.
+pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
     loader::LoadedKernel::from_header(&cfg.kernel)?;
@@ -580,7 +583,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             block: virtio,
             net,
             vsock,
-            vcpus: Arc::new(Vcpus::new(num_cpus, kicker, Arc::new(Waker::new()?))),
+            vcpus: Arc::new(Vcpus::new(num_cpus, kicker, cfg.take_stop_handle()?)),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         fs,
@@ -614,13 +617,19 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
     }
 
+    // A binary's stop signals get their handlers, and the thread that receives
+    // them starts, before the terminal goes into raw mode, so a first stop
+    // signal stops the run rather than ending the process with the terminal
+    // raw. The sandbox below confines the whole process, that thread included.
+    crate::signal::start_stop_signal_thread()?;
+
     let _raw = terminal::RawTerm::enable();
 
-    // Confine the process before the first helper thread exists. Everything
-    // above acquires host authority (the VM, the guest-RAM mapping, the block
-    // file, the ledger, the gateway connection, the listeners, the terminal),
-    // and everything below only services guest I/O with what is already open.
-    // An error here returns before there is a thread to stop. See
+    // Confine the process before the first I/O thread exists. Everything above
+    // acquires host authority (the VM, the guest-RAM mapping, the block file,
+    // the ledger, the gateway connection, the listeners, the terminal), and
+    // everything below only services guest I/O with what is already open. An
+    // error here returns before there is an I/O thread to stop. See
     // `sandbox::seatbelt`.
     //
     // Failing closed: a profile that will not install is a profile nobody has
@@ -629,9 +638,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if cfg.sandbox {
         seatbelt::enter_with_shares(&fs_access)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
-        eprintln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
+        stderrln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
     } else {
-        eprintln!(
+        stderrln!(
             "{LOG_PREFIX} seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority"
         );
     }
@@ -786,7 +795,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         match mbox.take() {
             Some((entry, ctx)) => {
                 drop(mbox);
-                eprintln!("{LOG_PREFIX} vcpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
+                stderrln!("{LOG_PREFIX} vcpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
                 let _ = vcpu.set_reg(Reg::PC, entry);
                 let _ = vcpu.set_reg(Reg::X0, ctx);
                 let _ = vcpu.set_reg(Reg::CPSR, 0x3c5);

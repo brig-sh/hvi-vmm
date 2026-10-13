@@ -218,7 +218,7 @@ impl Plugin for MemoryDump {
             return;
         }
         if !cpu.pause() {
-            eprintln!("{LOG_PREFIX} dump: vCPUs did not park; skipping (image would be torn)");
+            stderrln!("{LOG_PREFIX} dump: vCPUs did not park; skipping (image would be torn)");
             return;
         }
         // Every path from here owes exactly one resume().
@@ -226,11 +226,11 @@ impl Plugin for MemoryDump {
         cpu.resume();
 
         match result {
-            Ok(n) => eprintln!(
+            Ok(n) => stderrln!(
                 "{LOG_PREFIX} dumped {n} bytes of guest RAM to {}",
                 self.path
             ),
-            Err(e) => eprintln!("{LOG_PREFIX} dump to {} failed: {e}", self.path),
+            Err(e) => stderrln!("{LOG_PREFIX} dump to {} failed: {e}", self.path),
         }
     }
 

@@ -37,6 +37,9 @@ linux-loader = { version = "0.14.0", features = ["bzimage"] }
 # public in 0.2.172 and return `Ioctl` from 0.2.173; `Ioctl` and the TUN
 # request constants predate both.
 libc = "0.2.189"
+# Receives the stop signals on a thread of their own, so what a signal does runs
+# as ordinary code rather than inside a signal handler.
+signal-hook = "0.4.5"
 # The 16550 register file, maintained upstream. Only the x86 backend has a
 # COM1; pl011 (arm64) and the MC146818 CMOS have no equivalent in the crate,
 # so those stay ours. The legacy devices build for every backend, whichever

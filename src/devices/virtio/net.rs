@@ -758,7 +758,7 @@ impl VirtioNet {
                     // holding the device lock while the vCPU waits.
                     if !self.tap_write_reported {
                         self.tap_write_reported = true;
-                        eprintln!(
+                        stderrln!(
                             "{LOG_PREFIX} virtio-net: the tap's send buffer is full; frames are dropped \
                              while it stays full"
                         );
@@ -770,7 +770,7 @@ impl VirtioNet {
                     // rejected the frame's header. The frame is dropped.
                     if !self.tap_write_reported {
                         self.tap_write_reported = true;
-                        eprintln!(
+                        stderrln!(
                             "{LOG_PREFIX} virtio-net: writing to the tap failed ({e}); frames are dropped"
                         );
                     }
@@ -896,7 +896,7 @@ impl VirtioNet {
                 } else if dport == 53 && dst == DNS_IP {
                     self.handle_dns(sport, &payload[8..])
                 } else {
-                    eprint!("\r\n[virtio-net] udp {src}:{sport} -> {dst}:{dport}\r\n");
+                    stderr!("\r\n[virtio-net] udp {src}:{sport} -> {dst}:{dport}\r\n");
                     self.capture(IP_UDP, src, sport, dst, dport, payload.len() as u64, None);
                     None
                 }
@@ -906,7 +906,7 @@ impl VirtioNet {
                 let dport = u16::from_be_bytes([payload[2], payload[3]]);
                 let flags = payload.get(13).copied().unwrap_or(0);
                 let syn = flags & 0x02 != 0;
-                eprint!(
+                stderr!(
                     "\r\n[virtio-net] tcp {src}:{sport} -> {dst}:{dport}{}\r\n",
                     if syn { " SYN" } else { "" }
                 );
@@ -928,7 +928,7 @@ impl VirtioNet {
         msg[3] = 0;
         let ck = checksum16(&msg);
         msg[2..4].copy_from_slice(&ck.to_be_bytes());
-        eprint!("\r\n[virtio-net] icmp echo {src} -> {dst}\r\n");
+        stderr!("\r\n[virtio-net] icmp echo {src} -> {dst}\r\n");
         self.capture(IP_ICMP, src, 0, dst, 0, icmp.len() as u64, None);
         Some(self.ipv4_to_guest(dst, src, IP_ICMP, &msg))
     }
@@ -965,7 +965,7 @@ impl VirtioNet {
             3 => 5, // REQUEST  -> ACK
             _ => return None,
         };
-        eprint!(
+        stderr!(
             "\r\n[virtio-net] dhcp {} -> {GUEST_IP}\r\n",
             if msg_type == 1 { "discover" } else { "request" }
         );
@@ -1003,7 +1003,7 @@ impl VirtioNet {
             return None;
         }
         let (name, qend) = parse_dns_name(dns, 12)?;
-        eprint!("\r\n[virtio-net] dns query {name}\r\n");
+        stderr!("\r\n[virtio-net] dns query {name}\r\n");
         self.capture(
             IP_UDP,
             GUEST_IP,

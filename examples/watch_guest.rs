@@ -195,6 +195,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         agent_sock: None,
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,
+        stop: None,
     };
 
     let stop = hvi::boot(cfg)?;

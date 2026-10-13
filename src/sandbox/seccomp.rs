@@ -58,9 +58,10 @@
 //! Two filters, because the threads are not alike. `vcpu` is the tight one and
 //! it matters most: MMIO exits are serviced inline on the vCPU thread, so the
 //! virtio device models -- the code that parses guest descriptors -- run there.
-//! `vmm` covers the main thread and the host-side I/O threads (the console
-//! reader, the agent bridge and its per-connection readers, the tap and
-//! gateway readers, and the debug watchdog when it is enabled).
+//! `vmm` covers the main thread, the host-side I/O threads (the console reader,
+//! the agent bridge and its per-connection readers, the tap and gateway
+//! readers, and the debug watchdog when it is enabled) and the thread that
+//! receives the stop signals.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
@@ -196,10 +197,10 @@ pub fn install(thread: Thread) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("installing the {} filter: {e}", thread.key())))
 }
 
-/// Set once by [`arm`] before any thread is spawned, read by every thread that
-/// filters itself. A flag rather than a parameter threaded through seven spawn
-/// sites, and it is only ever written once, before the threads that read it
-/// exist.
+/// Set by [`arm`] before a run spawns its threads, read by every thread that
+/// filters itself. A flag rather than a parameter passed to each of those
+/// threads. The threads that read it start after it is set, apart from the
+/// stop-signal thread, which outlives the run that started it.
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
@@ -248,7 +249,7 @@ pub fn install_thread(thread: Thread) {
         return;
     }
     if let Err(e) = install(thread) {
-        eprintln!(
+        stderrln!(
             "{LOG_PREFIX} FATAL: cannot install the {} seccomp filter: {e}",
             thread.key()
         );
@@ -311,18 +312,18 @@ impl Filters {
     /// Errors if the filter cannot be installed.
     pub(crate) fn install(self) -> io::Result<()> {
         let Some((vmm, vcpu)) = self.counts else {
-            eprintln!(
+            stderrln!(
                 "{LOG_PREFIX} seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
             );
             return Ok(());
         };
         install(Thread::Vmm)?;
         if log_mode() {
-            eprintln!(
+            stderrln!(
                 "{LOG_PREFIX} seccomp: LOGGING ONLY ({LOG_ENV}=log) — denials are recorded, not enforced"
             );
         } else {
-            eprintln!(
+            stderrln!(
                 "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)"
             );
         }
