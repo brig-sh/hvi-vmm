@@ -36,6 +36,10 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
+use crate::devices::state::{check_version, invalid};
+
 /// Index register: selects the CMOS offset. Bit 7 is the NMI-disable line.
 pub const RTC_INDEX_PORT: u16 = 0x70;
 /// Data register: reads or writes the selected offset.
@@ -81,6 +85,26 @@ struct Wallclock {
     century: u8,
 }
 
+/// The [`RtcState`] format this build writes and reads.
+pub const RTC_STATE_VERSION: u32 = 1;
+
+/// What a checkpoint keeps of the CMOS RTC: the selected offset and the CMOS
+/// RAM.
+///
+/// The clock registers are not kept. They report the host wall clock, so
+/// after a restore the guest reads the restoring host's time, as it would
+/// after any pause. The RTC raises no interrupt, so none is pending.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RtcState {
+    /// [`RTC_STATE_VERSION`] when written by this build.
+    pub version: u32,
+    /// The offset the index port selected, without the NMI bit.
+    pub index: u8,
+    /// The 128 bytes of CMOS RAM.
+    pub ram: Vec<u8>,
+}
+
 /// An MC146818 RTC reporting the host wall clock.
 pub struct RtcCmos {
     index: u8,
@@ -98,6 +122,44 @@ impl RtcCmos {
             latched: now_utc(),
             latched_at: Instant::now(),
         }
+    }
+
+    /// Returns what a checkpoint keeps of the RTC.
+    #[must_use]
+    pub fn state(&self) -> RtcState {
+        RtcState {
+            version: RTC_STATE_VERSION,
+            index: self.index,
+            ram: self.ram.to_vec(),
+        }
+    }
+
+    /// Rebuilds the RTC a checkpoint describes, with the clock latched afresh
+    /// from this host.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, its RAM is not 128 bytes,
+    /// or its index has the NMI bit, which the index port never stores.
+    pub fn restore(state: &RtcState) -> std::io::Result<Self> {
+        check_version("cmos rtc", state.version, RTC_STATE_VERSION)?;
+        let ram: [u8; 128] = state.ram.as_slice().try_into().map_err(|_| {
+            invalid(format_args!(
+                "cmos rtc RAM of {} bytes, not 128",
+                state.ram.len()
+            ))
+        })?;
+        if state.index & 0x80 != 0 {
+            return Err(invalid(format_args!(
+                "cmos rtc index {:#x} has the NMI bit",
+                state.index
+            )));
+        }
+        Ok(Self {
+            index: state.index,
+            ram,
+            ..Self::new()
+        })
     }
 
     /// Refreshes the latch if it has aged out. Called before serving any field
@@ -260,5 +322,55 @@ mod tests {
         rtc.pio_write(RTC_DATA_PORT, 0x5a);
         rtc.pio_write(RTC_INDEX_PORT, 0x0f);
         assert_eq!(rtc.pio_read(RTC_DATA_PORT), 0x5a);
+    }
+
+    #[test]
+    fn state_round_trips_through_json_and_a_restored_rtc() {
+        let mut rtc = RtcCmos::new();
+        rtc.pio_write(RTC_INDEX_PORT, 0x0f);
+        rtc.pio_write(RTC_DATA_PORT, 0x5a);
+        rtc.pio_write(RTC_INDEX_PORT, 0x7f);
+        rtc.pio_write(RTC_DATA_PORT, 0xa5);
+        rtc.pio_write(RTC_INDEX_PORT, 0x8f); // index 0x0f, NMI masked
+        let state = rtc.state();
+        assert_eq!(state.index, 0x0f);
+        let json = serde_json::to_string(&state).unwrap();
+        let back: RtcState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+        let mut restored = RtcCmos::restore(&back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(restored.pio_read(RTC_DATA_PORT), 0x5a, "the index survives");
+        restored.pio_write(RTC_INDEX_PORT, 0x7f);
+        assert_eq!(restored.pio_read(RTC_DATA_PORT), 0xa5);
+    }
+
+    #[test]
+    fn state_the_rtc_could_not_hold_is_refused() {
+        let good = RtcCmos::new().state();
+        for bad in [
+            RtcState {
+                ram: vec![0; 127],
+                ..good.clone()
+            },
+            RtcState {
+                ram: vec![0; 129],
+                ..good.clone()
+            },
+            RtcState {
+                index: 0x80,
+                ..good.clone()
+            },
+            RtcState {
+                version: 2,
+                ..good.clone()
+            },
+        ] {
+            let err = RtcCmos::restore(&bad).err();
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::InvalidData),
+                "{bad:?}"
+            );
+        }
     }
 }
