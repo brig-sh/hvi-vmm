@@ -17,7 +17,8 @@
 //! The guest's console output goes to stdout through a [`ConsoleFilter`], which
 //! drops the escape sequences that would change host state. Its input is stdin,
 //! which `RawTerm` puts in raw mode for the run and `input` reads on a thread
-//! of its own.
+//! of its own. A binary can call [`restore_on_fatal_signals`] so the terminal
+//! is also restored when a fatal signal ends the process.
 
 mod filter;
 pub(crate) mod input;
@@ -25,3 +26,4 @@ mod raw;
 
 pub use filter::ConsoleFilter;
 pub(crate) use raw::RawTerm;
+pub use raw::{fatal_signals, restore_on_fatal_signals};

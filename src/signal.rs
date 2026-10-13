@@ -99,10 +99,11 @@ impl StopSignals {
 /// still runs, before the stop request.
 ///
 /// A second stop signal that arrives [`STOP_TIMEOUT`] or more after the first
-/// ends the process with the signal's default action, so a stop that does not
-/// complete can still be ended. One that arrives sooner has no effect, so a
-/// copy that a wrapper forwards does not cut the stop short. A later call moves
-/// the signals to another handle and releases the one before.
+/// restores the terminal and ends the process with the signal's default action,
+/// so a stop that does not complete can still be ended. One that arrives sooner
+/// has no effect, so a copy that a wrapper forwards does not cut the stop
+/// short. A later call moves the signals to another handle and releases the one
+/// before.
 ///
 /// A first stop signal that arrives once the run of `handle` has ended asks a
 /// finished run to stop and has no effect. Only another one, [`STOP_TIMEOUT`]
@@ -160,8 +161,9 @@ pub(crate) fn start_stop_signal_thread() -> io::Result<()> {
 
 /// Receives the stop signals and acts on each, for the life of the process.
 ///
-/// The first signal for a target requests its stop. A later one ends the
-/// process, unless it arrives within [`STOP_TIMEOUT`] of the first.
+/// The first signal for a target requests its stop. A later one restores the
+/// terminal and ends the process, unless it arrives within [`STOP_TIMEOUT`] of
+/// the first.
 fn receive_stop_signals(state: &Mutex<StopSignals>, mut signals: Signals) {
     crate::sandbox::confine_io_thread();
     // The thread inherits the mask of the one that started it, and a stop
@@ -183,6 +185,7 @@ fn receive_stop_signals(state: &Mutex<StopSignals>, mut signals: Signals) {
             }
         };
         if escalate {
+            crate::terminal::RawTerm::restore_saved();
             raise_with_default_action(signal);
         }
     }
