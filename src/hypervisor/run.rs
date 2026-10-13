@@ -53,7 +53,7 @@ pub(crate) fn run_to_stop<K: Kick>(
     guest: &Guest<K>,
     threads: VcpuThreads,
     mut failure: Option<Box<dyn std::error::Error>>,
-    io_threads: IoThreads,
+    io_threads: IoThreads<K>,
 ) -> Result<Stop, Box<dyn std::error::Error>> {
     if failure.is_none() {
         if let Err(e) = guest.vcpus.wait_for_stop() {
@@ -159,8 +159,13 @@ mod tests {
         crate::signal::install_kick_handler();
         let (threads, spawned) = guest.vcpus.spawn(bodies, |_, body| body());
         spawned.unwrap();
-        run_to_stop(guest, threads, failure.map(Into::into), IoThreads::idle())
-            .map_err(|e| e.to_string())
+        run_to_stop(
+            guest,
+            threads,
+            failure.map(Into::into),
+            IoThreads::idle(Arc::clone(&guest.vcpus)),
+        )
+        .map_err(|e| e.to_string())
     }
 
     #[test]

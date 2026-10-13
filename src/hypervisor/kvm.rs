@@ -193,7 +193,7 @@ pub(crate) fn start_io_threads(
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
-) -> Result<(seccomp::Filters, IoThreads), Box<dyn std::error::Error>> {
+) -> Result<(seccomp::Filters, IoThreads<Kicker>), Box<dyn std::error::Error>> {
     let plugin_threads = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
     // A binary's stop signals get their handlers, and the thread that receives
@@ -233,7 +233,7 @@ pub(crate) fn start_io_threads(
 /// # Errors
 ///
 /// Errors if a vCPU thread cannot be spawned, the calling thread cannot be
-/// filtered, a vCPU or a plugin thread fails, or a thread does not stop. Each
+/// filtered, a vCPU or an I/O thread fails, or a thread does not stop. Each
 /// failure stops the guest, and the error is chosen as [`run_to_stop`]
 /// describes, once every thread has been joined or left running.
 pub(crate) fn run_guest<S: Clone + Send + 'static>(
@@ -243,7 +243,7 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
     kick_handles: Vec<VcpuFd>,
     run: fn(u32, VcpuFd, VcpuFd, S),
     filters: seccomp::Filters,
-    io_threads: IoThreads,
+    io_threads: IoThreads<Kicker>,
 ) -> Result<Stop, Box<dyn std::error::Error>> {
     let _raw = terminal::RawTerm::enable();
 

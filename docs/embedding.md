@@ -168,10 +168,10 @@ request.
 Once a run has started, the process outlives a `SIGHUP`, and stderr can then be
 a terminal that hung up. `eprintln!` panics on a failed write, so a line your
 code or your plugin prints with it after a `SIGHUP` panics that thread. A panic
-in a plugin hook that a vCPU thread runs, or in a thread the plugin started with
-`VmHandle::spawn`, fails the run. The setup lines of a later `boot` in the same
-process are printed with `eprintln!` too, so a binary that stopped on `SIGHUP`
-should end rather than boot again.
+in a plugin hook, or in a thread the plugin started with `VmHandle::spawn`,
+fails the run. The setup lines of a later `boot` in the same process are printed
+with `eprintln!` too, so a binary that stopped on `SIGHUP` should end rather
+than boot again.
 
 Another stop signal, one second or more after the first, restores the terminal
 and ends the process at once by that signal, and the ledger loses its tail. One

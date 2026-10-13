@@ -373,13 +373,14 @@ On every backend, the thread that called `boot` owns the stop. Once the vCPU
 threads are spawned it waits in `hypervisor/run.rs` on a pipe. A guard held by
 each vCPU thread writes it when the thread exits, whatever ended the loop: a
 guest-requested stop, a failed entry, an unhandled exit, a failed run, or a
-panic. Each of these is reported to `Vcpus` as the run's outcome. A thread a
-plugin started reports its panic there too and requests the stop. A stop request
-through a `StopHandle` or `VmHandle::request_stop` writes the same pipe. `boot`
-returns the guest's `Stop`, or an error that names the vCPU or thread and the
-failure. The first report is kept, except that a failure replaces an earlier
-stop. A failure that is not kept is printed. With no report, a request makes
-`boot` return `Stop::Requested`.
+panic. Each of these is reported to `Vcpus` as the run's outcome. A thread
+`IoThreads` started, a plugin's among them, reports its panic there too and asks
+for the stop. The vsock bridge starts its per-connection threads itself, outside
+`IoThreads`. A stop request through a `StopHandle` or `VmHandle::request_stop`
+writes the same pipe. `boot` returns the guest's `Stop`, or an error that names
+the vCPU or thread and the failure. The first report is kept, except that a
+failure replaces an earlier stop. A failure that is not kept is printed. With no
+report, a request makes `boot` return `Stop::Requested`.
 
 The loop then ends the VM through `Vcpus::stop` in `hypervisor/vcpus.rs`, which
 clears the running flag, kicks the vCPUs out of the hypervisor, and then

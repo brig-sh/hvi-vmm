@@ -192,7 +192,9 @@ An embedder inherits these from the process environment. They are not part of
 
 A vCPU fails on an exit hvi does not service, on an error from the hypervisor,
 or on a panic in hvi. On macOS, an access to an address no device answers is
-such an exit. The line names the vCPU and the failure.
+such an exit. The line names the vCPU and the failure. A panic in one of hvi's
+I/O threads, such as the console reader or a network relay, fails the run the
+same way, and the line names the thread.
 
 An x86-64 guest has no power-off: hvi gives it no ACPI, so Linux halts it in
 place, and KVM handles the halt without leaving the vCPU. A guest booted with
