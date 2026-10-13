@@ -65,6 +65,51 @@ impl Irq {
     }
 }
 
+/// A line for tests that records what the device set it to.
+#[cfg(test)]
+pub(crate) mod test_line {
+    use super::IrqLine;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// A line that holds the level it was last set to, and counts the times
+    /// it was raised and lowered.
+    #[derive(Default)]
+    pub(crate) struct LevelLine {
+        /// The level the line was last set to.
+        high: AtomicBool,
+        /// The number of times the line was set high.
+        raised: AtomicU32,
+        /// The number of times the line was set low.
+        lowered: AtomicU32,
+    }
+
+    impl LevelLine {
+        /// Returns the level the line was last set to.
+        pub(crate) fn is_high(&self) -> bool {
+            self.high.load(Ordering::SeqCst)
+        }
+
+        /// Returns the number of times the line was set high.
+        pub(crate) fn raises(&self) -> u32 {
+            self.raised.load(Ordering::SeqCst)
+        }
+
+        /// Returns the number of times the line was set at all.
+        pub(crate) fn sets(&self) -> u32 {
+            self.raises() + self.lowered.load(Ordering::SeqCst)
+        }
+    }
+
+    impl IrqLine for LevelLine {
+        fn set_level(&self, level: bool) -> std::io::Result<()> {
+            self.high.store(level, Ordering::SeqCst);
+            let count = if level { &self.raised } else { &self.lowered };
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
