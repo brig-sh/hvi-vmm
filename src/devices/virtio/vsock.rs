@@ -727,6 +727,10 @@ impl VirtioVsock {
     }
 
     /// Services one MMIO access.
+    /// The device features this device offers, both words: what the machine
+    /// profile records, since a restored driver has negotiated against them.
+    pub const FEATURES: u64 = (F_VERSION_1_HI as u64) << 32;
+
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let read = self.serve_mmio(mem, offset, is_write, value);
         self.sync_irq();
@@ -1367,6 +1371,17 @@ mod tests {
         assert_eq!(p.op, OP_RW);
         assert_eq!(p.len, 7);
         assert_eq!(p.buf_alloc, OUR_BUF_ALLOC);
+    }
+
+    #[test]
+    fn features_are_the_two_pages_the_window_offers() {
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        let mut dev = VirtioVsock::new();
+        let mut page = |sel| {
+            dev.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, sel);
+            dev.mmio(&mem, mmio::DEVICE_FEATURES, false, 0)
+        };
+        assert_eq!((page(1) << 32) | page(0), VirtioVsock::FEATURES);
     }
 
     #[test]

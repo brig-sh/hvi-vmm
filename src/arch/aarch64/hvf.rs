@@ -32,8 +32,8 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 
 use applevisor::prelude::{
-    ExitReason, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
-    VirtualMachineConfig, VirtualMachineInstance,
+    ExitReason, FeatureReg, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuConfig, VcpuHandle,
+    VirtualMachine, VirtualMachineConfig, VirtualMachineInstance,
 };
 
 use crate::arch::aarch64::esr::{DataAbort, Ec};
@@ -44,6 +44,8 @@ use crate::arch::aarch64::layout::{
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
+use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell};
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
@@ -308,6 +310,52 @@ struct Shared {
     dtb_addr: u64,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
+    /// The machine profile, which the boot vCPU completes with `MIDR_EL1`.
+    profile: Arc<ProfileCell>,
+}
+
+/// The feature registers the profile records, by the name it records them
+/// under.
+///
+/// They are read from a default vCPU configuration, the one every vCPU here is
+/// created with, so no vCPU has to exist yet.
+const FEATURE_REGS: [(&str, FeatureReg); 14] = [
+    ("ID_AA64DFR0_EL1", FeatureReg::ID_AA64DFR0_EL1),
+    ("ID_AA64DFR1_EL1", FeatureReg::ID_AA64DFR1_EL1),
+    ("ID_AA64ISAR0_EL1", FeatureReg::ID_AA64ISAR0_EL1),
+    ("ID_AA64ISAR1_EL1", FeatureReg::ID_AA64ISAR1_EL1),
+    ("ID_AA64MMFR0_EL1", FeatureReg::ID_AA64MMFR0_EL1),
+    ("ID_AA64MMFR1_EL1", FeatureReg::ID_AA64MMFR1_EL1),
+    ("ID_AA64MMFR2_EL1", FeatureReg::ID_AA64MMFR2_EL1),
+    ("ID_AA64PFR0_EL1", FeatureReg::ID_AA64PFR0_EL1),
+    ("ID_AA64PFR1_EL1", FeatureReg::ID_AA64PFR1_EL1),
+    ("ID_AA64SMFR0_EL1", FeatureReg::ID_AA64SMFR0_EL1),
+    ("ID_AA64ZFR0_EL1", FeatureReg::ID_AA64ZFR0_EL1),
+    ("CTR_EL0", FeatureReg::CTR_EL0),
+    ("CLIDR_EL1", FeatureReg::CLIDR_EL1),
+    ("DCZID_EL0", FeatureReg::DCZID_EL0),
+];
+
+/// Returns the machine profile of this boot, complete but for `MIDR_EL1`,
+/// which only a vCPU's own thread can read.
+fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -> MachineProfile {
+    let mut p = arm64_profile::profile("hvf", machine);
+    let config = VcpuConfig::new();
+    for (name, reg) in FEATURE_REGS {
+        if let Ok(value) = config.get_feature_reg(reg) {
+            p.cpu.id_regs.insert(name.to_string(), hex(value));
+        }
+    }
+    // `service_psci` answers PSCI_VERSION with 1.0.
+    p.firmware.psci_version = Some("1.0".to_string());
+    for (fs, share) in fs.iter().zip(&cfg.fs_shares) {
+        let mut entry = device("virtio-fs", fs.base, Some(fs.intid), None);
+        entry.mode = Some(if share.mode.writable() { "rw" } else { "ro" }.to_string());
+        p.devices.push(entry);
+    }
+    p.agent_sock = cfg.agent_sock.is_some();
+    p.fs_shares = u32::try_from(cfg.fs_shares.len()).unwrap_or(u32::MAX);
+    p
 }
 
 /// Boots `cfg` on Hypervisor.framework, as [`crate::boot`] describes.
@@ -552,6 +600,26 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
     .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
 
+    // The profile file is created here, before Seatbelt, and written by the
+    // boot vCPU once it has read MIDR_EL1.
+    let machine = Arm64Machine {
+        gic: &gic,
+        layout: &layout,
+        vcpus: num_cpus,
+        cmdline: &cfg.cmdline,
+        devices: fdt_devices,
+        net_mode: match (&net, &net_reader) {
+            (Some(_), Some(_)) => Some("gateway"),
+            (Some(_), None) => Some("stub"),
+            (None, _) => None,
+        },
+        ram_regions: ram.regions(),
+    };
+    let profile = Arc::new(ProfileCell::new(
+        boot_profile(&cfg, &machine, &fs),
+        cfg.profile_out.as_deref(),
+    )?);
+
     let secondaries: Vec<Secondary> = (0..num_cpus)
         .map(|_| Secondary {
             mbox: Mutex::new(None),
@@ -579,6 +647,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         kernel_addr: layout.kernel_addr,
         dtb_addr: layout.dtb_addr,
         plugin: cfg.plugin.clone(),
+        profile,
     };
 
     // Each device sets its own interrupt line, from the methods that change its
@@ -770,6 +839,12 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let _registration = sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
 
     if cpu_id == 0 {
+        // Only this thread can read the register, and the guest has not run
+        // yet, so the profile is complete before its first instruction.
+        let midr = vcpu.get_sys_reg(SysReg::MIDR_EL1).ok();
+        if let Err(e) = sh.profile.complete(|p| p.cpu.ident = midr.map(hex)) {
+            eprintln!("{LOG_PREFIX} {e}");
+        }
         let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
         let _ = vcpu.set_reg(Reg::X0, sh.dtb_addr);
         let _ = vcpu.set_reg(Reg::X1, 0);
