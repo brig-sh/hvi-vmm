@@ -82,7 +82,8 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
 The crate root re-exports the one for the host target as `hvi::boot`, so the CLI
-and a linking crate use the same call. `Stop` is `SystemOff` or `SystemReset`.
+and a linking crate use the same call. `Stop` is `SystemOff`, `SystemReset` or
+`Requested`, the last when the control socket ends the run.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
@@ -366,6 +367,17 @@ calling vCPU never parks itself. Every KVM vCPU counts as started once its
 thread runs, since one the guest has not brought up waits inside `KVM_RUN`,
 where a kick reaches it. On macOS a secondary the guest has not brought up waits
 for `CPU_ON` outside the hypervisor and is not waited for.
+
+The control socket (`checkpoint/server.rs`) is the other requester, and it is
+not a vCPU. Its `pause` first closes the I/O threads' `PauseGate`
+(`teardown.rs`): each of the console reader, the network relay, the agent
+bridge and its connections, and the macOS virtio-fs workers passes the gate
+around every call that takes a device mutex or writes guest RAM, so the pause
+waits only for the work in progress, never for traffic. It then calls
+`Vcpus::pause_from_control`, which waits up to 2 s for every started vCPU,
+since its caller parks none. A step that misses its deadline is undone and the
+VM runs on. The plugin and the control socket share one quiesce, and whichever
+holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, every path that ends a vCPU's run loop ends the VM through
 `Vcpus::stop` in `hypervisor/vcpus.rs`, which clears the running flag, kicks the

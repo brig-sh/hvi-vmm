@@ -55,6 +55,8 @@ including a typo, silently runs the plain test.
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
+| `--control-sock <path>` | none | Host Unix socket that pauses, resumes, reports and stops the VM. See [The control socket](#the-control-socket). |
+| `--profile-out <path>` | none | Write the machine profile here, as one line of JSON. See [The control socket](#the-control-socket). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
@@ -87,7 +89,7 @@ hvi: boot needs --kernel <Image>
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
 `--fs-gid`, `--share-ro`, `--share-rw`, `--sandbox-id`, `--cpus`,
-`--dump-after`.
+`--dump-after`, `--control-sock`, `--profile-out`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -140,6 +142,42 @@ hvi: --dump-after needs --dump-memory <path>
 hvi: unknown boot arg "--nope"
 ```
 
+### The control socket
+
+`--control-sock` binds a Unix socket before confinement, as `--agent-sock` does,
+and serves one connection at a time. Each request is one JSON object on a line,
+and each reply is one line:
+
+```text
+{"v":1,"op":"pause"}   ->  {"v":1,"ok":true,"state":"paused"}
+{"v":1,"op":"status"}  ->  {"v":1,"ok":true,"state":"paused","vcpus":2,"vcpus_parked":2}
+{"v":1,"op":"resume"}  ->  {"v":1,"ok":true,"state":"running"}
+```
+
+| `op` | Effect |
+| --- | --- |
+| `profile` | Replies with the machine profile under `profile`. |
+| `pause` | Holds the host I/O threads, then parks every started vCPU. If either does not happen within 2 s, the pause is undone and the reply is `timeout`. |
+| `resume` | Releases the vCPUs, then the I/O threads. |
+| `status` | Replies with `state` (`running`, `paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. |
+| `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
+| `checkpoint` | Reserved. Refused with `not_implemented`. |
+
+`pause` and `resume` are idempotent. A pause outlives the connection that asked
+for it. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
+`code`; `error` is for a person. The codes are listed in
+`src/checkpoint/control.rs`. The socket has no authentication: anyone who can
+connect to it can pause or stop the VM, so put it in a directory only its owner
+can reach.
+
+`--profile-out` writes the machine profile: what the guest was built against,
+such as the CPU's ID registers, the counter frequency, the interrupt
+controller, RAM, devices and the hvi commit. Two hosts compare profiles before
+a guest moves between them. The file is created before confinement. On Linux it
+is written before the guest starts. On macOS the boot vCPU writes it just
+before the guest's first instruction, since only that thread can read
+`MIDR_EL1`, so a reader that finds it empty waits or asks the socket.
+
 ## `dump-fdt`
 
 Runs the whole arm64 pre-boot pipeline with no hypervisor, no entitlement and
@@ -185,6 +223,7 @@ An embedder inherits these from the process environment. They are not part of
 | Path | Result |
 | --- | --- |
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
+| The control socket's `stop` | `guest stopped: Requested`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
 | The guest halts on x86-64 | Reported as `SystemOff`, because a halt records no reason. |
 

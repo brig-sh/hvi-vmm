@@ -70,6 +70,17 @@ three things a reader should not have to guess between:
 | `--dump-after` needs the guest to still be running. | A guest that stops first produces no dump and no error. | Design |
 | A dump is not a checkpoint. | Raw RAM only. No register, device or virtqueue state. Nothing can restore a VM from it. | Design |
 
+## Control socket
+
+| Limit | Consequence | Kind |
+| --- | --- | --- |
+| The `checkpoint` op is refused. | `pause`, `resume`, `status`, `stop` and `profile` work. A capture is not implemented yet and replies `not_implemented`. | Defect |
+| A pause does not stop guest time. | The guest's counter keeps running while it is paused. On resume its clock has jumped by the pause, and timers that fell due fire at once. | Design |
+| One client at a time. | A connected client that sends nothing keeps the next one waiting in the backlog. | Design |
+| The socket has no authentication. | Anyone who can connect can pause or stop the VM. Its directory's permissions are the only control. | Design |
+| The virtio-fs readahead workers are not held by a pause. | They fill the share's read cache, not guest RAM. A guest with a share is never eligible to move anyway: its profile refuses every destination. | Design |
+| On macOS the profile file starts empty. | The boot vCPU writes it before the guest's first instruction, since only that thread can read `MIDR_EL1`. A reader that finds it empty waits, or asks the socket. | Platform |
+
 ## Confinement
 
 | Limit | Consequence | Kind |

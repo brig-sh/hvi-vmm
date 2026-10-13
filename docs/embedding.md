@@ -31,7 +31,8 @@ host:
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 ```
 
-`Stop` is `SystemOff` or `SystemReset`: how the guest asked to halt.
+`Stop` is `SystemOff` or `SystemReset`, how the guest asked to halt, or
+`Requested`, when the control socket's `stop` ended the run.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,
@@ -43,8 +44,8 @@ should read stdin while `boot` runs. It also takes over the kick signal,
 `SIGRTMIN` on Linux and `SIGUSR1` on macOS: it installs a no-op handler for it
 and does not restore the one it replaced. It sends that signal to its own
 threads to interrupt them, so nothing else in the process should use it. Before
-it returns, the ledger is flushed, the agent listener and every accepted agent
-connection are closed, and every thread it started itself has exited, with one
+it returns, the ledger is flushed, the agent listener, the control socket and every
+accepted connection are closed, and every thread it started itself has exited, with one
 exception: a helper thread still running one second after the stop is left
 running and `boot` returns an error naming it. The waits it cannot interrupt are
 a plugin blocking in `request` and a virtio-fs worker waiting on a host file
@@ -82,6 +83,8 @@ let cfg = BootConfig {
     sandbox_id: String::from("my-sandbox"),
     vcpus: 2,
     agent_sock: None,
+    profile_out: None,
+    control_sock: None,
     plugin: None,
     sandbox: true,
 };
@@ -119,6 +122,8 @@ cargo build --release --example watch_guest
 | `sandbox_id` | `String` | Written into every ledger record. |
 | `vcpus` | `u32` | 1 or more. A GICv2 arm64 host refuses more than 8. |
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
+| `profile_out` | `Option<String>` | Where the machine profile is written. Created before confinement. See [cli.md](cli.md#the-control-socket). |
+| `control_sock` | `Option<String>` | The control socket's path. Bound before confinement. See [cli.md](cli.md#the-control-socket). |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
 
