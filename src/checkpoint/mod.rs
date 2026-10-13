@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Checkpoint support, starting with the machine profile a guest was built
-//! against.
+//! Checkpoint support: the machine profile a guest was built against, and the
+//! control socket that pauses and resumes it.
 //!
 //! [`profile`] describes the machine in a form two hosts can compare before a
-//! guest moves between them.
+//! guest moves between them. [`control`] is the line protocol of the
+//! `--control-sock` socket. The bundle that holds a captured guest comes later
+//! and builds on both.
 
+pub mod control;
 pub mod profile;
