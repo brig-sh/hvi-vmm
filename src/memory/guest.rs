@@ -59,10 +59,10 @@ impl RamRegion {
             io::Error::new(io::ErrorKind::InvalidInput, "guest RAM region too large")
         })?;
         let object_len = file.metadata()?.len();
-        if !self
+        if self
             .file_offset
             .checked_add(self.size)
-            .is_some_and(|end| end <= object_len)
+            .is_none_or(|end| end > object_len)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

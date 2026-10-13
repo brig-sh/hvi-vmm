@@ -42,17 +42,19 @@ tools/tidy.sh --check --lint-only --target aarch64-unknown-linux-gnu
 ```
 
 `--lint-only` skips the fmt and reflow passes, which are target-independent
-anyway, and runs just clippy and rustdoc for that target.
+anyway. It still runs the rust-version check, then clippy and rustdoc for that
+target.
 
 The musl lints work the same way, with `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`. `tools/gates.sh` runs each cross-lint whose
 target is installed.
 
 The toolchain is pinned in `rust-toolchain.toml`, so everyone lints against the
-same compiler. `rust-version` in `Cargo.toml` (1.77) is a different thing: the
-MSRV floor, a compatibility claim rather than the build pin. No CI job builds
-at that floor, so nothing enforces it. Treat a change that raises it as
-something a reviewer has to notice.
+same compiler. `rust-version` in `Cargo.toml` names the same release, and
+`tools/tidy.sh` fails when the two differ, so a toolchain bump moves both. The
+seccomp allowlists hold the syscalls the standard library of the pinned release
+makes. A newer one can make a syscall they do not hold, so a bump is checked by
+the boot jobs, which run the guest under the filters.
 
 ## Branches
 
@@ -171,8 +173,9 @@ the weekly used-ring litmus on arm64, and a monthly check that the pinned
 reflow nightly still agrees with the latest one.
 
 External actions are pinned to commit SHAs, with the version in a comment.
-Renovate keeps those pins, the Cargo dependencies and the commitlint tooling
-updated (`.github/renovate.json`).
+Renovate keeps those pins, the Cargo dependencies, the Rust toolchain with
+`rust-version`, the cargo-deny pin and the commitlint tooling updated
+(`.github/renovate.json`).
 
 ## AI policy
 

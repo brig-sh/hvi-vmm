@@ -15,6 +15,14 @@
   "commitBodyTable": true,
   "customManagers": [
     {
+      "description": "Keep rust-version on the release rust-toolchain.toml pins; the cargo manager does not track it.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^Cargo\\.toml$/"],
+      "matchStrings": ["rust-version = \"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "rust-version"
+    },
+    {
       "description": "Bump the cargo-deny pin. It sits in an action input, which the github-actions manager does not read.",
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/actions/cargo-deny/action\\.yml$/"],
@@ -34,6 +42,12 @@
       "description": "Keep the Cargo dependencies bumped; the lockfile is committed.",
       "matchManagers": ["cargo"],
       "groupName": "cargo dependencies"
+    },
+    {
+      "description": "Keep the toolchain and rust-version bumped together in a pull request of their own.",
+      "matchDepNames": ["rust"],
+      "matchFileNames": ["rust-toolchain.toml", "Cargo.toml"],
+      "groupName": "Rust toolchain"
     },
     {
       "description": "Keep the commitlint tooling under .github/linters bumped.",

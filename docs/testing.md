@@ -128,11 +128,12 @@ also upload the event ledger. `boot-x86` and `boot-unikraft-hvf` do not pass
 
 ## Toolchain versions
 
-Four version declarations, and they mean different things:
+Four places declare a Rust version. The first two hold the build pin, and the
+other two step outside it:
 
 | Where | Value | Meaning |
 | --- | --- | --- |
-| `Cargo.toml` `rust-version` | 1.77 | The MSRV floor. A compatibility claim. **No CI job builds at it**, so it is not enforced. |
+| `Cargo.toml` `rust-version` | 1.95.0 | The oldest Rust that builds hvi, held to the build pin. `tools/tidy.sh` fails when the two differ. |
 | `rust-toolchain.toml` | 1.95.0 | The build pin. Every job that uses the shared setup gets this. |
 | `pins.env` `RUSTFMT_NIGHTLY` | nightly-2026-08-30 | The nightly whose rustfmt runs the comment reflow. `wrap_comments` is nightly-only. |
 | The cargo-deny lane | `stable` | Steps outside the pin deliberately. |
