@@ -19,9 +19,134 @@
 //! lists, enums by name. What only the host holds (files, sockets, the
 //! interrupt line, the event ledger) stays out, and a restore reattaches it.
 //! Every struct refuses fields it does not know, so a newer format fails to
-//! load instead of losing what it added.
+//! load instead of losing what it added. [`DeviceStates`] gathers them into
+//! the one document a checkpoint writes for the devices.
 
 use std::io;
+
+use serde::{Deserialize, Serialize};
+
+use crate::devices::legacy::pl011::{Pl011State, PL011_STATE_VERSION};
+use crate::devices::legacy::rtc_cmos::{RtcState, RTC_STATE_VERSION};
+use crate::devices::legacy::uart16550::{UartState, UART_STATE_VERSION};
+use crate::devices::virtio::block::{BlkState, BLK_STATE_VERSION};
+use crate::devices::virtio::net::{NetState, NET_STATE_VERSION};
+use crate::devices::virtio::vsock::{VsockState, VSOCK_STATE_VERSION};
+
+/// The [`DeviceStates`] format this build writes and reads.
+pub const DEVICE_STATES_VERSION: u32 = 1;
+
+/// The state of every device a guest has, as a checkpoint writes it.
+///
+/// A device the guest does not have is `null`, which keeps one shape for
+/// every guest and every backend: the arm64 backends attach a PL011, the
+/// x86-64 one a 16550 and the CMOS RTC. There is no slot for virtio-fs. Its
+/// FUSE session is a mirror of a host directory, held as host descriptors,
+/// locks and inode numbers that do not exist on another host, so a guest with
+/// a share is not checkpointed at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceStates {
+    /// [`DEVICE_STATES_VERSION`] when written by this build.
+    pub version: u32,
+    /// The virtio-blk device.
+    pub blk: Option<BlkState>,
+    /// The virtio-net device.
+    pub net: Option<NetState>,
+    /// The virtio-vsock device.
+    pub vsock: Option<VsockState>,
+    /// The arm64 console UART.
+    pub pl011: Option<Pl011State>,
+    /// The x86-64 COM1.
+    pub uart: Option<UartState>,
+    /// The x86-64 CMOS RTC.
+    pub rtc: Option<RtcState>,
+}
+
+impl Default for DeviceStates {
+    fn default() -> Self {
+        DeviceStates {
+            version: DEVICE_STATES_VERSION,
+            blk: None,
+            net: None,
+            vsock: None,
+            pl011: None,
+            uart: None,
+            rtc: None,
+        }
+    }
+}
+
+impl DeviceStates {
+    /// Encodes the states as the JSON a checkpoint stores.
+    ///
+    /// # Errors
+    ///
+    /// Errors as `serde_json` does, which for these types it does not.
+    pub fn to_json(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(io::Error::other)
+    }
+
+    /// Decodes the JSON [`DeviceStates::to_json`] writes, and refuses a
+    /// document or a device state of a version this build does not read.
+    ///
+    /// The versions are checked here as well as by each device's restore, so
+    /// a checkpoint this build cannot restore is refused before anything is
+    /// built from it. The caller bounds the document's size.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `json` is not a device-state document, has a field this
+    /// build does not know, or is of another version.
+    pub fn from_json(json: &[u8]) -> io::Result<Self> {
+        let states: DeviceStates = serde_json::from_slice(json).map_err(invalid)?;
+        states.check_versions()?;
+        Ok(states)
+    }
+
+    /// Refuses a document or a device state of another version.
+    fn check_versions(&self) -> io::Result<()> {
+        check_version("device", self.version, DEVICE_STATES_VERSION)?;
+        let versions = [
+            (
+                "virtio-blk",
+                self.blk.as_ref().map(|s| s.version),
+                BLK_STATE_VERSION,
+            ),
+            (
+                "virtio-net",
+                self.net.as_ref().map(|s| s.version),
+                NET_STATE_VERSION,
+            ),
+            (
+                "virtio-vsock",
+                self.vsock.as_ref().map(|s| s.version),
+                VSOCK_STATE_VERSION,
+            ),
+            (
+                "pl011",
+                self.pl011.as_ref().map(|s| s.version),
+                PL011_STATE_VERSION,
+            ),
+            (
+                "16550",
+                self.uart.as_ref().map(|s| s.version),
+                UART_STATE_VERSION,
+            ),
+            (
+                "cmos rtc",
+                self.rtc.as_ref().map(|s| s.version),
+                RTC_STATE_VERSION,
+            ),
+        ];
+        for (device, version, want) in versions {
+            if let Some(version) = version {
+                check_version(device, version, want)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Returns the error a restore refuses a corrupt or foreign state with.
 pub(crate) fn invalid(what: impl std::fmt::Display) -> io::Error {
@@ -40,5 +165,100 @@ pub(crate) fn check_version(device: &str, version: u32, want: u32) -> io::Result
         Err(invalid(format_args!(
             "{device} state version {version}, this build reads {want}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::legacy::pl011::Pl011;
+    use crate::devices::legacy::rtc_cmos::RtcCmos;
+    use crate::devices::legacy::uart16550::Uart16550;
+    use crate::devices::virtio::net::VirtioNet;
+    use crate::devices::virtio::vsock::VirtioVsock;
+    use crate::devices::virtio::{QueueState, VirtioCommonState};
+
+    /// The document for a guest with every device, each in its boot state.
+    fn every_device() -> DeviceStates {
+        let queue = QueueState {
+            num: 0,
+            ready: false,
+            desc: 0,
+            avail: 0,
+            used: 0,
+            last_avail: 0,
+        };
+        DeviceStates {
+            blk: Some(BlkState {
+                version: BLK_STATE_VERSION,
+                common: VirtioCommonState {
+                    status: 0xf,
+                    dev_feat_sel: 1,
+                    queue_sel: 0,
+                    interrupt_status: 1,
+                },
+                queue,
+                capacity_sectors: 2048,
+            }),
+            net: Some(VirtioNet::new().state()),
+            vsock: Some(VirtioVsock::new().state()),
+            pl011: Some(Pl011::new().state()),
+            uart: Some(Uart16550::new().state()),
+            rtc: Some(RtcCmos::new().state()),
+            ..DeviceStates::default()
+        }
+    }
+
+    #[test]
+    fn every_device_round_trips_through_json() {
+        let states = every_device();
+        let json = states.to_json().unwrap();
+        let back = DeviceStates::from_json(&json).unwrap();
+        assert_eq!(back, states);
+        assert_eq!(back.to_json().unwrap(), json, "one state, one encoding");
+    }
+
+    /// The document's top level is what a reader of another build sees first,
+    /// so its shape is pinned.
+    #[test]
+    fn a_guest_without_devices_has_a_fixed_shape() {
+        assert_eq!(
+            String::from_utf8(DeviceStates::default().to_json().unwrap()).unwrap(),
+            r#"{"version":1,"blk":null,"net":null,"vsock":null,"pl011":null,"uart":null,"rtc":null}"#
+        );
+    }
+
+    #[test]
+    fn a_document_or_device_of_another_version_is_refused() {
+        let mut other = every_device();
+        other.version = 2;
+        let mut device = every_device();
+        if let Some(rtc) = device.rtc.as_mut() {
+            rtc.version = 9;
+        }
+        for states in [other, device] {
+            let json = serde_json::to_vec(&states).unwrap();
+            let err = DeviceStates::from_json(&json).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        }
+    }
+
+    /// A field this build does not know is a format it does not read, at the
+    /// top level and inside a device alike.
+    #[test]
+    fn an_unknown_field_is_refused() {
+        let json = String::from_utf8(every_device().to_json().unwrap()).unwrap();
+        for edited in [
+            json.replacen(r#"{"version":1,"#, r#"{"version":1,"fs":null,"#, 1),
+            json.replacen(
+                r#""capacity_sectors":2048"#,
+                r#""capacity_sectors":2048,"ro":true"#,
+                1,
+            ),
+        ] {
+            assert_ne!(edited, json);
+            let err = DeviceStates::from_json(edited.as_bytes()).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        }
     }
 }
