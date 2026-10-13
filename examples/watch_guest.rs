@@ -203,6 +203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         vcpus: 1,
         agent_sock: None,
         profile_out: None,
+        control_sock: None,
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,
         stop: None,
