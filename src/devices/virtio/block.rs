@@ -35,12 +35,18 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config;
 use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
 
 use crate::devices::irq::{Irq, IrqLine};
-use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::devices::state::{check_version, invalid};
+use crate::devices::virtio::{
+    mmio, Queue, QueueState, VirtioCommonState, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
+};
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
 
@@ -77,6 +83,36 @@ const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR a
 const VIRTIO_BLK_S_UNSUPP: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_UNSUPP as u8;
 
 const SECTOR: u64 = 512;
+
+/// The [`BlkState`] format this build writes and reads. Version 2 added the
+/// disk's serial and its read-only flag.
+pub const BLK_STATE_VERSION: u32 = 2;
+
+/// What a checkpoint keeps of a virtio-blk device.
+///
+/// The disk's bytes are not here: the image travels on its own, and a restore
+/// reopens it. Nothing is in flight either, since a notify serves every chain
+/// before the MMIO exit returns. The ledger staging, the plugin feed, the
+/// inode and the trace switch belong to the host the device runs on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlkState {
+    /// [`BLK_STATE_VERSION`] when written by this build.
+    pub version: u32,
+    /// The transport registers. The device has one queue, so `queue_sel` is
+    /// always 0.
+    pub common: VirtioCommonState,
+    /// The one request queue.
+    pub queue: QueueState,
+    /// The disk size the guest was told, in 512-byte sectors.
+    pub capacity_sectors: u64,
+    /// The serial the disk answers `GET_ID` with, which the guest reads from
+    /// `/sys/block/vdX/serial`. The restored disk answers with it too.
+    pub serial: String,
+    /// Whether the guest was told the disk is read-only. A checkpoint is only
+    /// ever taken of a writable disk, so it is `false` in every bundle.
+    pub read_only: bool,
+}
 
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
@@ -319,9 +355,79 @@ impl VirtioBlk {
         self.interrupt_status != 0
     }
 
-    /// Connects the device to the interrupt line it raises.
+    /// Connects the device to the interrupt line it raises, and sets the line
+    /// to the device's level.
+    ///
+    /// A device built at boot has nothing pending, so the line stays low. One
+    /// restored from a checkpoint may hold a used-buffer interrupt the driver
+    /// has not acknowledged, and a line left low over it is an interrupt the
+    /// guest never takes: it waits for a completion it was already given.
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
+        self.sync_irq();
+    }
+
+    /// Returns what a checkpoint keeps of the device.
+    #[must_use]
+    pub fn state(&self) -> BlkState {
+        BlkState {
+            version: BLK_STATE_VERSION,
+            common: VirtioCommonState {
+                status: self.status,
+                dev_feat_sel: self.dev_feat_sel,
+                queue_sel: 0,
+                interrupt_status: self.interrupt_status,
+            },
+            queue: self.queue.state(),
+            capacity_sectors: self.capacity_sectors,
+            serial: self.serial_text.to_string(),
+            read_only: self.read_only,
+        }
+    }
+
+    /// Rebuilds the device a checkpoint describes over the disk at `path`,
+    /// opened as [`VirtioBlk::open_as`] opens it with the state's mode and
+    /// serial, and the restored
+    /// guest RAM `mem`.
+    ///
+    /// The disk must be the size the guest was told. A guest's filesystem
+    /// sized itself to that capacity at mount, so a smaller disk fails its
+    /// reads past the end and a larger one is space it never uses; either
+    /// means the image is not the one the checkpoint was taken over. The
+    /// interrupt line is connected afterwards, as at boot, and connecting it
+    /// asserts it when the state holds an unacknowledged interrupt.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the disk cannot be opened, when its size is not
+    /// `capacity_sectors`, or when the state is of another version, has a
+    /// queue the transport would not have accepted, or has registers this
+    /// device never holds.
+    pub fn restore(path: &str, mem: &GuestRam, state: &BlkState) -> std::io::Result<Self> {
+        check_version("virtio-blk", state.version, BLK_STATE_VERSION)?;
+        state.common.check("virtio-blk")?;
+        if state.common.queue_sel != 0 {
+            return Err(invalid(format_args!(
+                "virtio-blk has one queue, state selects queue {}",
+                state.common.queue_sel
+            )));
+        }
+        let queue = Queue::from_state(mem, &state.queue)?;
+        let mut dev = Self::open_as(path, state.read_only, &state.serial)?;
+        if dev.capacity_sectors != state.capacity_sectors {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "virtio-blk: {path} holds {} sectors, the guest was given {}",
+                    dev.capacity_sectors, state.capacity_sectors
+                ),
+            ));
+        }
+        dev.status = state.common.status;
+        dev.dev_feat_sel = state.common.dev_feat_sel;
+        dev.interrupt_status = state.common.interrupt_status;
+        dev.queue = queue;
+        Ok(dev)
     }
 
     /// Sets the interrupt line to the device's level.
@@ -1489,5 +1595,196 @@ mod capacity_tests {
         assert_eq!(blk.byte_range(1, 0).unwrap(), 512);
         assert!(blk.byte_range(u64::MAX, 1).is_err(), "overflow is refused");
         assert!(blk.byte_range(u64::MAX / 256, 16).is_err());
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::devices::irq::test_line::LevelLine;
+
+    const BASE: u64 = 0x4000_0000;
+    const DESC: u64 = BASE;
+    const AVAIL: u64 = BASE + 0x1000;
+    const USED: u64 = BASE + 0x2000;
+
+    /// A disk image of `sectors` sectors, removed on drop.
+    struct Disk {
+        path: std::path::PathBuf,
+    }
+
+    impl Disk {
+        fn new(tag: &str, sectors: usize) -> Disk {
+            let path = std::env::temp_dir()
+                .join(format!("hvi-blk-state-{tag}-{}.img", std::process::id()));
+            std::fs::write(&path, vec![0x5au8; sectors * 512]).unwrap();
+            Disk { path }
+        }
+
+        fn path(&self) -> &str {
+            self.path.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Programs the queue as a driver does and has it serve one read of
+    /// sector 0, so the state holds a consumed chain and a pending interrupt.
+    fn served_one_read(blk: &mut VirtioBlk, mem: &GuestRam) {
+        blk.mmio(mem, mmio::STATUS, true, 0xf);
+        blk.mmio(mem, mmio::DEVICE_FEATURES_SEL, true, 1);
+        blk.mmio(mem, mmio::QUEUE_NUM, true, 8);
+        blk.mmio(mem, mmio::QUEUE_DESC_LOW, true, DESC);
+        blk.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, AVAIL);
+        blk.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, USED);
+        blk.mmio(mem, mmio::QUEUE_READY, true, 1);
+        post_read(mem, 0);
+        blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
+    }
+
+    /// Posts a read of sector 0 as avail entry `idx`, on descriptors 0-2.
+    fn post_read(mem: &GuestRam, idx: u16) {
+        let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
+        mem.write_u32(hdr, VIRTIO_BLK_T_IN).unwrap();
+        mem.write_u64(hdr + 8, 0).unwrap();
+        mem.write_u8(status, 0xff).unwrap();
+        let d = |i: u64, addr: u64, len: u32, flags: u16| {
+            mem.write_u64(DESC + i * 16, addr).unwrap();
+            mem.write_u32(DESC + i * 16 + 8, len).unwrap();
+            mem.write_u16(DESC + i * 16 + 12, flags).unwrap();
+            mem.write_u16(DESC + i * 16 + 14, (i + 1) as u16).unwrap();
+        };
+        d(0, hdr, 16, VIRTQ_DESC_F_NEXT);
+        d(1, data, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
+        d(2, status, 1, VIRTQ_DESC_F_WRITE);
+        mem.write_u16(AVAIL + 4 + u64::from(idx % 8) * 2, 0)
+            .unwrap();
+        mem.write_u16(AVAIL + 2, idx.wrapping_add(1)).unwrap();
+    }
+
+    #[test]
+    fn state_round_trips_through_json_and_a_restored_device() {
+        let disk = Disk::new("rt", 2);
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        served_one_read(&mut blk, &mem);
+        let state = blk.state();
+        assert_eq!(state.common.interrupt_status, 1);
+        assert_eq!(state.queue.last_avail, 1);
+        assert_eq!(state.capacity_sectors, 2);
+
+        let json = serde_json::to_vec(&state).unwrap();
+        let back: BlkState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, state);
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &back).unwrap();
+        assert_eq!(restored.state(), state);
+
+        // The restored device carries on where the first left off: the next
+        // chain is the one after the consumed one, and its read succeeds.
+        restored.mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
+        post_read(&mem, 1);
+        restored.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        assert_eq!(mem.read_u16(USED + 2).unwrap(), 2, "two chains used");
+        assert_eq!(mem.read_u16(BASE + 0x6000).unwrap() as u8, VIRTIO_BLK_S_OK);
+        assert_eq!(restored.state().queue.last_avail, 2);
+    }
+
+    /// A restored device with an interrupt the driver had not acknowledged
+    /// asserts its line once the line is connected, and one with nothing
+    /// pending leaves the line alone.
+    #[test]
+    fn connecting_a_restored_device_drives_its_line_from_the_interrupt_status() {
+        let disk = Disk::new("irq", 2);
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        served_one_read(&mut blk, &mem);
+        let pending = blk.state();
+
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending).unwrap();
+        let line = Arc::new(LevelLine::default());
+        restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert!(line.is_high(), "the pending interrupt is asserted");
+        assert_eq!(line.raises(), 1);
+
+        let quiet = BlkState {
+            common: VirtioCommonState {
+                interrupt_status: 0,
+                ..pending.common.clone()
+            },
+            ..pending
+        };
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet).unwrap();
+        let line = Arc::new(LevelLine::default());
+        restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert_eq!(line.sets(), 0, "a line with nothing pending is not set");
+    }
+
+    #[test]
+    fn a_disk_of_another_size_is_refused() {
+        let disk = Disk::new("cap", 2);
+        let other = Disk::new("cap-other", 3);
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        served_one_read(&mut blk, &mem);
+        let err = VirtioBlk::restore(other.path(), &mem, &blk.state())
+            .err()
+            .expect("a 3-sector disk is not the 2-sector one the guest has");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("holds 3 sectors"), "{err}");
+    }
+
+    #[test]
+    fn a_queue_outside_the_restored_ram_is_refused() {
+        let disk = Disk::new("ram", 2);
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        served_one_read(&mut blk, &mem);
+        let smaller = GuestRam::from_ranges(&[(BASE, 0x2000)]);
+        let err = VirtioBlk::restore(disk.path(), &smaller, &blk.state()).err();
+        assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn state_this_device_never_holds_is_refused() {
+        let disk = Disk::new("bad", 2);
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let good = VirtioBlk::open(disk.path()).unwrap().state();
+        let bad = [
+            BlkState {
+                version: BLK_STATE_VERSION + 1,
+                ..good.clone()
+            },
+            // The format before the serial and the read-only flag.
+            BlkState {
+                version: 1,
+                ..good.clone()
+            },
+            BlkState {
+                common: VirtioCommonState {
+                    queue_sel: 1,
+                    ..good.common.clone()
+                },
+                ..good.clone()
+            },
+            BlkState {
+                common: VirtioCommonState {
+                    interrupt_status: 2,
+                    ..good.common.clone()
+                },
+                ..good.clone()
+            },
+        ];
+        for state in bad {
+            let err = VirtioBlk::restore(disk.path(), &mem, &state).err();
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::InvalidData),
+                "{state:?}"
+            );
+        }
     }
 }
