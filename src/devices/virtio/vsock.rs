@@ -1193,7 +1193,9 @@ impl VsockBridge {
     ///
     /// The per-connection threads poll the same token, and this thread joins
     /// the ones still running before it returns. On Linux they inherit the
-    /// seccomp filter of the thread that runs this.
+    /// seccomp filter of the thread that runs this. Every call into the device
+    /// passes the token's pause gate first, and no wait happens inside it, so a
+    /// pause holds all of these threads back without waiting for traffic.
     pub(crate) fn run(self, stop: &StopToken) {
         let Self { listener, dev, mem } = self;
         let mut relays: Vec<JoinHandle<()>> = Vec::new();
@@ -1217,6 +1219,7 @@ impl VsockBridge {
             };
             // Register the connection and send the guest agent a REQUEST.
             let (port, writer_gate) = {
+                let _in = stop.enter();
                 let mut d = lock_or_recover(&dev);
                 let Ok(port) = d.add_conn(stream) else {
                     continue;
@@ -1239,8 +1242,12 @@ impl VsockBridge {
             relays.push(Self::spawn_reader(&dev, &mem, stop, port, reader));
         }
         // Dropping the connections shuts their sockets down and opens their
-        // gates, so every reader and writer ends.
-        lock_or_recover(&dev).drop_conns();
+        // gates, so every reader and writer ends. The loop can end on an error
+        // as well as on the stop, so this passes the pause gate too.
+        {
+            let _in = stop.enter();
+            lock_or_recover(&dev).drop_conns();
+        }
         for relay in relays {
             let _ = relay.join();
         }
@@ -1265,10 +1272,12 @@ impl VsockBridge {
                 Ok(false) => break,
                 Err(e) => {
                     stderrln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
+                    let _in = stop.enter();
                     lock_or_recover(&dev).host_gone(&mem, port);
                     break;
                 }
             }
+            let _in = stop.enter();
             if !lock_or_recover(&dev).flush_to_host(&mem, port) {
                 break;
             }
@@ -1306,12 +1315,18 @@ impl VsockBridge {
                     Err(e) if retry_read(&e) => continue,
                     Err(_) => break,
                 };
-                let gate = lock_or_recover(&dev).host_data(&mem, port, &buf[..n]);
-                // `HostGate::wait` says why its result is not needed.
+                let gate = {
+                    let _in = stop.enter();
+                    lock_or_recover(&dev).host_data(&mem, port, &buf[..n])
+                };
+                // Outside the pause gate, since the guest's credit may come
+                // only after a resume. `HostGate::wait` says why its result is
+                // not needed.
                 if let Some(gate) = gate {
                     gate.wait(|| stop.keep_waiting(reader.as_fd()));
                 }
             }
+            let _in = stop.enter();
             lock_or_recover(&dev).host_closed(&mem, port);
         })
     }

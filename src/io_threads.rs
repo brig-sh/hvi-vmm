@@ -21,6 +21,10 @@
 //! threads only it has with [`IoThreads::spawn`]. Once the vCPUs have exited or
 //! been left running, [`IoThreads::stop`] requests the stop and joins every
 //! thread, as `teardown` describes.
+//!
+//! Each thread passes the token's pause gate around the work that touches a
+//! device or guest RAM, so a pause of the gate holds all of them back. The
+//! console's bytes and the relay's frames are delivered inside the gate.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -136,6 +140,7 @@ impl<K: Kick> IoThreads<K> {
         K: 'static,
     {
         let vcpus = Arc::clone(&guest.vcpus);
+        let mut deliver = deliver;
         let finish_count = Arc::new(FinishCount::default());
         let console = IoThread::spawn(
             "console reader",
@@ -143,7 +148,16 @@ impl<K: Kick> IoThreads<K> {
             &finish_count,
             Arc::clone(&guest.vcpus),
             move |stop| {
-                terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
+                let gate = stop.clone();
+                terminal::input::run(
+                    plugin,
+                    &stop,
+                    move || vcpus.kicker().kick(0),
+                    move |byte| {
+                        let _in = gate.enter();
+                        deliver(byte);
+                    },
+                );
             },
         );
         let mut io_threads = Self {
@@ -161,7 +175,11 @@ impl<K: Kick> IoThreads<K> {
         }
         if let (Some(net), Some(dev)) = (net, &guest.net) {
             let (dev, ram) = (Arc::clone(dev), Arc::clone(&guest.ram));
-            let deliver = move |frame: &[u8]| lock_or_recover(&dev).deliver(&ram, frame);
+            let gate = io_threads.stop.source.token();
+            let deliver = move |frame: &[u8]| {
+                let _in = gate.enter();
+                lock_or_recover(&dev).deliver(&ram, frame);
+            };
             match net {
                 NetSource::Gateway(stream) => io_threads.spawn("gateway relay", move |stop| {
                     if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
