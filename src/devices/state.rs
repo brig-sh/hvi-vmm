@@ -39,28 +39,37 @@ pub const DEVICE_STATES_VERSION: u32 = 1;
 
 /// The state of every device a guest has, as a checkpoint writes it.
 ///
-/// A device the guest does not have is `null`, which keeps one shape for
-/// every guest and every backend: the arm64 backends attach a PL011, the
-/// x86-64 one a 16550 and the CMOS RTC. There is no slot for virtio-fs. Its
-/// FUSE session is a mirror of a host directory, held as host descriptors,
-/// locks and inode numbers that do not exist on another host, so a guest with
-/// a share is not checkpointed at all.
+/// A device the guest does not have is `null`, and its key is still
+/// required, which keeps one shape for every guest and every backend: the
+/// arm64 backends attach a PL011, the x86-64 one a 16550 and the CMOS RTC.
+/// There is no slot for virtio-fs. Its FUSE session is a mirror of a host
+/// directory, held as host descriptors, locks and inode numbers that do not
+/// exist on another host, so a guest with a share is not checkpointed at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceStates {
     /// [`DEVICE_STATES_VERSION`] when written by this build.
     pub version: u32,
+    // Serde reads a missing `Option` field as `None`, so without
+    // `deserialize_with` a document that lost a key would restore a guest
+    // without that device, and raise no error.
     /// The virtio-blk device.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub blk: Option<BlkState>,
     /// The virtio-net device.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub net: Option<NetState>,
     /// The virtio-vsock device.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub vsock: Option<VsockState>,
     /// The arm64 console UART.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub pl011: Option<Pl011State>,
     /// The x86-64 COM1.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub uart: Option<UartState>,
     /// The x86-64 CMOS RTC.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub rtc: Option<RtcState>,
 }
 
@@ -97,8 +106,8 @@ impl DeviceStates {
     ///
     /// # Errors
     ///
-    /// Errors when `json` is not a device-state document, has a field this
-    /// build does not know, or is of another version.
+    /// Errors when `json` is not a device-state document, lacks a device key
+    /// or has a field this build does not know, or is of another version.
     pub fn from_json(json: &[u8]) -> io::Result<Self> {
         let states: DeviceStates = serde_json::from_slice(json).map_err(invalid)?;
         states.check_versions()?;
@@ -289,6 +298,25 @@ mod tests {
             let err = DeviceStates::from_json(&json).err();
             assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
         }
+    }
+
+    /// A document that lost a device's key is refused rather than read as a
+    /// guest without that device. A device written as `null` still reads.
+    #[test]
+    fn a_missing_device_key_is_refused() {
+        let json = String::from_utf8(every_device().to_json().unwrap()).unwrap();
+        let start = json.find(r#","vsock":"#).unwrap();
+        let end = json.find(r#","pl011":"#).unwrap();
+        let without_vsock = format!("{}{}", &json[..start], &json[end..]);
+        for edited in [r#"{"version":1}"#, without_vsock.as_str()] {
+            let err = DeviceStates::from_json(edited.as_bytes()).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        }
+        let none = DeviceStates::default().to_json().unwrap();
+        assert_eq!(
+            DeviceStates::from_json(&none).unwrap(),
+            DeviceStates::default()
+        );
     }
 
     /// `check` runs each device's restore checks over guest RAM, and refuses
