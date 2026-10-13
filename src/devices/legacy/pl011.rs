@@ -77,6 +77,25 @@ pub struct Pl011State {
     pub imsc: u32,
 }
 
+impl Pl011State {
+    /// Refuses a state this build could not restore.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version or holds more bytes than
+    /// the FIFO keeps.
+    pub fn check(&self) -> std::io::Result<()> {
+        check_version("pl011", self.version, PL011_STATE_VERSION)?;
+        if self.rx.len() > RX_CAP {
+            return Err(invalid(format_args!(
+                "pl011 holds {} received bytes, the FIFO keeps {RX_CAP}",
+                self.rx.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A PL011 modelling console TX plus an interrupt-driven RX FIFO.
 pub struct Pl011 {
     out: std::io::Stdout,
@@ -136,13 +155,7 @@ impl Pl011 {
     /// Errors when the state is of another version or holds more bytes than
     /// the FIFO keeps.
     pub fn restore(state: &Pl011State) -> std::io::Result<Self> {
-        check_version("pl011", state.version, PL011_STATE_VERSION)?;
-        if state.rx.len() > RX_CAP {
-            return Err(invalid(format_args!(
-                "pl011 holds {} received bytes, the FIFO keeps {RX_CAP}",
-                state.rx.len()
-            )));
-        }
+        state.check()?;
         Ok(Pl011 {
             rx: state.rx.iter().copied().collect(),
             imsc: state.imsc,

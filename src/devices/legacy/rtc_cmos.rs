@@ -105,6 +105,31 @@ pub struct RtcState {
     pub ram: Vec<u8>,
 }
 
+impl RtcState {
+    /// Refuses a state this build could not restore.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, its RAM is not 128 bytes,
+    /// or its index has the NMI bit, which the index port never stores.
+    pub fn check(&self) -> std::io::Result<()> {
+        check_version("cmos rtc", self.version, RTC_STATE_VERSION)?;
+        if self.ram.len() != 128 {
+            return Err(invalid(format_args!(
+                "cmos rtc RAM of {} bytes, not 128",
+                self.ram.len()
+            )));
+        }
+        if self.index & 0x80 != 0 {
+            return Err(invalid(format_args!(
+                "cmos rtc index {:#x} has the NMI bit",
+                self.index
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// An MC146818 RTC reporting the host wall clock.
 pub struct RtcCmos {
     index: u8,
@@ -142,19 +167,13 @@ impl RtcCmos {
     /// Errors when the state is of another version, its RAM is not 128 bytes,
     /// or its index has the NMI bit, which the index port never stores.
     pub fn restore(state: &RtcState) -> std::io::Result<Self> {
-        check_version("cmos rtc", state.version, RTC_STATE_VERSION)?;
+        state.check()?;
         let ram: [u8; 128] = state.ram.as_slice().try_into().map_err(|_| {
             invalid(format_args!(
                 "cmos rtc RAM of {} bytes, not 128",
                 state.ram.len()
             ))
         })?;
-        if state.index & 0x80 != 0 {
-            return Err(invalid(format_args!(
-                "cmos rtc index {:#x} has the NMI bit",
-                state.index
-            )));
-        }
         Ok(Self {
             index: state.index,
             ram,
