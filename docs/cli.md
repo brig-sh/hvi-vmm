@@ -209,10 +209,10 @@ threads, flushes the ledger and restores the terminal, and then ends by the
 signal it received, so a shell reports status 128 plus the signal number and a
 service manager sees the process end by that signal. The guest is not asked to
 shut down first. If the stop does not complete, another of these signals, one
-second or more after the first, ends hvi at once by that signal, and the ledger
-loses its tail. One that arrives sooner, such as a copy a wrapper script
-forwards, has no effect. A signal hvi starts with ignored, such as `SIGHUP`
-under `nohup`, stays ignored.
+second or more after the first, restores the terminal and ends hvi at once by
+that signal, and the ledger loses its tail. One that arrives sooner, such as a
+copy a wrapper script forwards, has no effect. A signal hvi starts with ignored,
+such as `SIGHUP` under `nohup`, stays ignored.
 
 In raw mode the terminal sends Ctrl-C to the guest as a byte, so `SIGINT`
 reaches hvi only from `kill` or when stdin is not a TTY.
@@ -222,12 +222,13 @@ breaks a vCPU out of `KVM_RUN` on the Linux backends and ends the console
 reader's read of stdin when the run stops. It is not a control interface.
 
 hvi puts the terminal into raw mode when stdin is a TTY and restores it when the
-boot returns. The restore discards input the guest did not read. That restore is
-a destructor, and a destructor does not run when `SIGKILL` or another signal hvi
-does not handle kills the process.
+boot returns. The restore discards input the guest did not read. hvi also
+restores the terminal when any other signal ends the process, such as a crash,
+an abort, a syscall the seccomp filter refuses or `SIGQUIT`. The process then
+ends by that signal, with a core dump where that signal's default makes one.
 
-CAUTION: If hvi is killed by a signal it does not handle, such as `SIGKILL`, the
-terminal is left in raw mode. Run `stty sane` or `reset` to recover it.
+CAUTION: `SIGKILL` cannot be handled. If hvi is killed with it, the terminal is
+left in raw mode. Run `stty sane` or `reset` to recover it.
 
 ### Console output
 

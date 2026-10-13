@@ -171,10 +171,10 @@ in a plugin hook that a vCPU thread runs fails the run. The setup lines of a
 later `boot` in the same process are printed with `eprintln!` too, so a binary
 that stopped on `SIGHUP` should end rather than boot again.
 
-Another stop signal, one second or more after the first, ends the process at
-once by that signal, and the ledger loses its tail. One that arrives sooner,
-such as a copy a wrapper forwards, has no effect. A later call moves the signals
-to another handle.
+Another stop signal, one second or more after the first, restores the terminal
+and ends the process at once by that signal, and the ledger loses its tail. One
+that arrives sooner, such as a copy a wrapper forwards, has no effect. A later
+call moves the signals to another handle.
 
 Once `boot` has returned, `handle.signal()` names the first stop signal that
 asked for the stop, if one did, even one that asked after another request, and
@@ -182,6 +182,16 @@ asked for the stop, if one did, even one that asked after another request, and
 the same status it would have seen with no handler. A first stop signal that
 arrives after the run has ended asks a finished run to stop, so a binary that
 keeps running after `boot` returns checks `handle.signal()` once it is done.
+
+`boot` restores the terminal it put in raw mode when it returns. A signal that
+ends the process skips that restore. `hvi::terminal::restore_on_fatal_signals()`
+installs a handler for each signal in `hvi::terminal::fatal_signals()` that has
+no handler and is not ignored. The handler restores the terminal, and the signal
+then ends the process with its default action. `SIGSEGV` and `SIGBUS` get the
+handler even when they have one. A fault goes to their earlier handler first,
+and the terminal is restored only when the fault still ends the process. It does
+not restore the handlers it replaces, so call it once, before `boot`, if you
+want it.
 
 ## Configuration outside `BootConfig`
 

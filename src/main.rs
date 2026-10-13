@@ -404,6 +404,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // ends by that signal.
     let (stop_handle, stop_registration) = StopHandle::new_pair()?;
     stop_on_signals(&stop_handle)?;
+    // A fatal signal restores the terminal before it ends the process.
+    hvi::terminal::restore_on_fatal_signals()?;
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
         initramfs: initramfs.map(std::fs::read).transpose()?,
