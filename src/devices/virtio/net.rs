@@ -1897,20 +1897,6 @@ mod tests {
         assert_ne!(checksum16(&h), 0);
     }
 
-    /// A line that holds the level it was last set to.
-    #[derive(Default)]
-    struct LevelLine {
-        /// The level the line was last set to.
-        high: std::sync::atomic::AtomicBool,
-    }
-
-    impl IrqLine for LevelLine {
-        fn set_level(&self, level: bool) -> std::io::Result<()> {
-            self.high.store(level, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     // A vCPU acknowledges the interrupt while a reader delivers the next frame,
     // each under the device lock. The vCPU reposts one RX buffer per
     // acknowledgment, as a guest driver refills its ring. A line that ended low
@@ -1924,7 +1910,7 @@ mod tests {
         const N: u64 = 256;
         let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x100000)]));
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
-        let line = Arc::new(LevelLine::default());
+        let line = Arc::new(crate::devices::irq::test_line::LevelLine::default());
         let mut net = VirtioNet::new();
         net.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         net.mmio(&mem, mmio::QUEUE_SEL, true, u64::from(RX_QUEUE));
@@ -1976,7 +1962,7 @@ mod tests {
             );
             std::thread::spawn(move || {
                 while !done.load(Ordering::SeqCst) {
-                    if line.high.load(Ordering::SeqCst) {
+                    if line.is_high() {
                         let mut d = dev.lock().unwrap();
                         d.mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
                         let idx = mem.read_u16(avail + 2).unwrap();
@@ -2004,7 +1990,7 @@ mod tests {
             quiet < 20,
             "progress stopped after {} acks: the line is {} over a device level of {}",
             acks.load(Ordering::SeqCst),
-            line.high.load(Ordering::SeqCst),
+            line.is_high(),
             dev.lock().unwrap().irq_level()
         );
     }
