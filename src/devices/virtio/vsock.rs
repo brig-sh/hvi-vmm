@@ -269,11 +269,12 @@ impl HostGate {
 
 /// One exec session: a host Unix stream mapped to a guest vsock stream.
 struct Conn {
-    /// The host stream, written with guest bytes.
+    /// The host stream, written with guest bytes, or `None` for a connection
+    /// restored from a checkpoint, whose host end stayed on the source host.
     ///
     /// A clone of it is read elsewhere, so `Drop` shuts the stream down. A
     /// drop alone would leave the clone and the peer open.
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     /// Where the session is in the handshake.
     state: ConnState,
     /// The guest bytes the host socket has taken, which is our `fwd_cnt`.
@@ -330,7 +331,9 @@ impl Drop for Conn {
     // The bridge threads still waiting on this connection go back to its
     // socket, which is shut down here, and end.
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        if let Some(stream) = &self.stream {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         self.reader_gate.open();
         self.writer_gate.open();
     }
@@ -430,7 +433,7 @@ impl VirtioVsock {
         self.conns.insert(
             port,
             Conn {
-                stream,
+                stream: Some(stream),
                 state: ConnState::New,
                 rx_cnt: 0,
                 to_host: VecDeque::new(),
@@ -641,7 +644,13 @@ impl VirtioVsock {
         let mut sent = 0usize;
         let mut gone = false;
         while !conn.to_host.is_empty() {
-            match (&conn.stream).write(conn.to_host.as_slices().0) {
+            // A connection with no host end has nowhere to send, which is a
+            // host that has gone.
+            let Some(mut stream) = conn.stream.as_ref() else {
+                gone = true;
+                break;
+            };
+            match stream.write(conn.to_host.as_slices().0) {
                 Ok(0) => break,
                 Ok(n) => {
                     conn.to_host.drain(..n);
