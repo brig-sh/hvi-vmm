@@ -32,6 +32,7 @@ use crate::devices::legacy::uart16550::{UartState, UART_STATE_VERSION};
 use crate::devices::virtio::block::{BlkState, BLK_STATE_VERSION};
 use crate::devices::virtio::net::{NetState, NET_STATE_VERSION};
 use crate::devices::virtio::vsock::{VsockState, VSOCK_STATE_VERSION};
+use crate::memory::GuestRam;
 
 /// The [`DeviceStates`] format this build writes and reads.
 pub const DEVICE_STATES_VERSION: u32 = 1;
@@ -90,9 +91,9 @@ impl DeviceStates {
     /// Decodes the JSON [`DeviceStates::to_json`] writes, and refuses a
     /// document or a device state of a version this build does not read.
     ///
-    /// The versions are checked here as well as by each device's restore, so
-    /// a checkpoint this build cannot restore is refused before anything is
-    /// built from it. The caller bounds the document's size.
+    /// Only the shape and the versions are checked here, since the rest needs
+    /// guest RAM, see [`DeviceStates::check`]. The caller bounds the
+    /// document's size.
     ///
     /// # Errors
     ///
@@ -102,6 +103,53 @@ impl DeviceStates {
         let states: DeviceStates = serde_json::from_slice(json).map_err(invalid)?;
         states.check_versions()?;
         Ok(states)
+    }
+
+    /// Refuses states this build could not restore over guest RAM `mem`,
+    /// without building a device or touching `mem`.
+    ///
+    /// It runs every check each device's restore runs on its state, so a
+    /// restore that calls it before building any device is not refused part
+    /// way through by a bad state. A capture calls it before it writes or
+    /// stops the source for good, so a state a restore would refuse fails the
+    /// checkpoint while the guest can still run on: the vsock device does not
+    /// keep within its restore limits by itself, see
+    /// [`VsockState::check`].
+    ///
+    /// Two checks need the host resources a restore opens, and stay in the
+    /// restore: the disk's size ([`VirtioBlk::restore`]) and the network
+    /// backend's mode ([`VirtioNet::restore`]). A restore opens both before it
+    /// builds any device. Which devices the guest must have is the machine
+    /// profile's to say, not this document's.
+    ///
+    /// [`VirtioBlk::restore`]: crate::devices::virtio::block::VirtioBlk::restore
+    /// [`VirtioNet::restore`]: crate::devices::virtio::net::VirtioNet::restore
+    ///
+    /// # Errors
+    ///
+    /// Errors when the document or a device state is of another version, or a
+    /// device state is one that device's restore refuses.
+    pub fn check(&self, mem: &GuestRam) -> io::Result<()> {
+        check_version("device", self.version, DEVICE_STATES_VERSION)?;
+        if let Some(blk) = &self.blk {
+            blk.check(mem)?;
+        }
+        if let Some(net) = &self.net {
+            net.check(mem)?;
+        }
+        if let Some(vsock) = &self.vsock {
+            vsock.check(mem)?;
+        }
+        if let Some(pl011) = &self.pl011 {
+            pl011.check()?;
+        }
+        if let Some(uart) = &self.uart {
+            uart.check()?;
+        }
+        if let Some(rtc) = &self.rtc {
+            rtc.check()?;
+        }
+        Ok(())
     }
 
     /// Refuses a document or a device state of another version.
@@ -240,6 +288,70 @@ mod tests {
             let json = serde_json::to_vec(&states).unwrap();
             let err = DeviceStates::from_json(&json).err();
             assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        }
+    }
+
+    /// `check` runs each device's restore checks over guest RAM, and refuses
+    /// what `from_json` lets through because it needs RAM or a limit to see.
+    #[test]
+    fn check_refuses_what_a_device_restore_would() {
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x10000)]);
+        every_device().check(&mem).unwrap();
+        DeviceStates::default().check(&mem).unwrap();
+
+        let mut outside = every_device();
+        if let Some(blk) = outside.blk.as_mut() {
+            blk.queue = QueueState {
+                num: 8,
+                ready: true,
+                desc: 0x1000,
+                avail: 0x2000,
+                used: 0x3000,
+                last_avail: 0,
+            };
+        }
+        let mut flooded = every_device();
+        if let Some(vsock) = flooded.vsock.as_mut() {
+            vsock.conns = (0..=crate::devices::virtio::vsock::RESTORE_MAX_CONNS as u32)
+                .map(|port| {
+                    let mut c = vsock_conn();
+                    c.port = port;
+                    c
+                })
+                .collect();
+            vsock.next_port = u32::MAX;
+        }
+        let mut uart = every_device();
+        if let Some(u) = uart.uart.as_mut() {
+            u.rx = vec![0; 65];
+        }
+        for bad in [outside, flooded, uart] {
+            let json = bad.to_json().unwrap();
+            let states = DeviceStates::from_json(&json).unwrap();
+            let err = states.check(&mem).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        }
+    }
+
+    /// A connection the guest accepted, with nothing in flight.
+    fn vsock_conn() -> crate::devices::virtio::vsock::VsockConnState {
+        use crate::devices::virtio::vsock::{VsockConnPhase, VsockConnState};
+        VsockConnState {
+            port: 0,
+            state: VsockConnPhase::Connected,
+            rx_cnt: 0,
+            to_host: Vec::new(),
+            backlog: Vec::new(),
+            host_closed: false,
+            host_gone: false,
+            guest_closed: false,
+            guest_reset: false,
+            guest_full_close: false,
+            guest_told: false,
+            reset_sent: false,
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: 0,
+            tx_cnt: 0,
         }
     }
 

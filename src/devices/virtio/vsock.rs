@@ -39,7 +39,7 @@
 //! that has gone gets `OP_SHUTDOWN` for its sends, and `OP_RST` after the last
 //! host byte.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsFd;
@@ -142,26 +142,33 @@ const GATE_POLL: Duration = Duration::from_millis(100);
 pub const VSOCK_STATE_VERSION: u32 = 1;
 /// The most connections a restore accepts.
 ///
-/// The device itself has no limit, one connection per host client, so this is
-/// a ceiling on what a checkpoint file may make the host allocate rather than
+/// The device has no limit of its own, one connection per host client, so
+/// this bounds what a checkpoint file may make the host allocate and is not
 /// a bound the device keeps. An agent serves a handful of sessions at a time.
+/// A device holding more is refused by [`VsockState::check`], which the
+/// capture runs before it writes anything, so the checkpoint fails and the
+/// guest runs on.
 pub const RESTORE_MAX_CONNS: usize = 1024;
 /// The most host-to-guest packets a restore accepts waiting for an RX buffer.
 ///
-/// A packet waits only while the guest posts no RX buffer, and the device
-/// frames backlog only while nothing waits, so the queue holds control
-/// packets and at most a split RW packet. Credit updates for a guest that
-/// keeps sending into a host that has gone can pile up behind a stalled RX
-/// queue, which is what the margin is for.
+/// Packets wait only while the guest posts no RX buffer. What the guest can
+/// add to them is bounded: backlog is framed only while nothing waits, so at
+/// most one RW packet, or its two halves, is among them; a connection's
+/// credit updates are merged rather than queued; and only so many guest
+/// connects are refused, see `REFUSALS_PENDING_MAX`. The host is not
+/// bounded: one that keeps opening and closing connections to a guest that
+/// reads none of them adds two packets each time. As with
+/// [`RESTORE_MAX_CONNS`], the capture refuses a device past this.
 pub const RESTORE_MAX_PENDING: usize = 16 * 1024;
 /// The most bytes the waiting packets may hold together on restore.
 pub const RESTORE_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// The most host bytes one connection's backlog may hold on restore.
 ///
-/// A live host's backlog stops near its 64 KiB gate plus one bridge
-/// read, but a host that hung up lifts that gate and the reader drains the
-/// rest of the socket into the backlog, bounded by the socket's buffer. This
-/// is well above both.
+/// A live host's backlog stops near its 64 KiB gate plus one bridge read.
+/// A host that hung up lifts that gate, and the reader drains the rest of the
+/// socket into the backlog, bounded by the socket's buffer, which a client
+/// can raise past this. As with [`RESTORE_MAX_CONNS`], the capture refuses a
+/// device past this.
 pub const RESTORE_MAX_BACKLOG: usize = 1024 * 1024;
 
 /// Where a connection is in the handshake, as a checkpoint names it.
@@ -233,6 +240,50 @@ pub struct VsockState {
     /// The connections, by ascending port, so one device state has one
     /// encoding.
     pub conns: Vec<VsockConnState>,
+}
+
+impl VsockState {
+    /// Refuses a state this build could not restore over `mem`, without
+    /// building the device or touching guest RAM.
+    ///
+    /// [`VirtioVsock::restore`] runs it first. The capture runs it too, before
+    /// it writes anything: the device itself does not keep within
+    /// [`RESTORE_MAX_CONNS`], [`RESTORE_MAX_PENDING`] or
+    /// [`RESTORE_MAX_BACKLOG`], and a checkpoint refused there fails while the
+    /// guest can still run on, rather than at a restore after the source has
+    /// stopped for good.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, has a queue the transport
+    /// would not have accepted or interrupt bits the device never sets, or
+    /// holds packets, connections or buffers this device would never have
+    /// held, see [`RESTORE_MAX_CONNS`] and the other limits.
+    pub fn check(&self, mem: &GuestRam) -> std::io::Result<()> {
+        check_version("virtio-vsock", self.version, VSOCK_STATE_VERSION)?;
+        self.common.check("virtio-vsock")?;
+        for queue in &self.queues {
+            queue.check(mem)?;
+        }
+        VirtioVsock::check_pending(&self.pending)?;
+        if self.conns.len() > RESTORE_MAX_CONNS {
+            return Err(invalid(format_args!(
+                "virtio-vsock holds {} connections, a restore takes at most {RESTORE_MAX_CONNS}",
+                self.conns.len()
+            )));
+        }
+        let mut ports = HashSet::with_capacity(self.conns.len());
+        for c in &self.conns {
+            VirtioVsock::check_conn(c, self.next_port)?;
+            if !ports.insert(c.port) {
+                return Err(invalid(format_args!(
+                    "virtio-vsock holds port {} twice",
+                    c.port
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl From<ConnState> for VsockConnPhase {
@@ -585,90 +636,53 @@ impl VirtioVsock {
     }
 
     /// Rebuilds the device a checkpoint describes over the restored guest RAM
-    /// `mem`, and ends every connection it held.
+    /// `mem`, connections and all.
     ///
-    /// The host end of each connection was a socket on the source host, and
-    /// nothing on this host is its peer. So each one ends the way a host that
-    /// went away ends it at runtime, through [`VirtioVsock::host_gone`] and
-    /// [`VirtioVsock::host_closed`]: the guest's sends fail, the host bytes
-    /// the device already held still reach the guest, and then the guest gets
-    /// `OP_RST` and the connection is dropped. A connection the guest was
-    /// never offered is dropped without a word, since the guest has nothing to
-    /// end. Those packets go into the guest's RX buffers now if it posted any,
-    /// so a guest blocked on a read is woken rather than left waiting for a
-    /// host that is not coming back. The interrupt line is connected
+    /// Nothing is written to guest RAM, so a restore that fails at a later
+    /// device leaves RAM as the checkpoint has it. The connections come back
+    /// with no host end, and [`VirtioVsock::end_restored_conns`] has to end
+    /// them once every device is built. The interrupt line is connected
     /// afterwards, as at boot, and connecting it asserts it when the guest has
     /// an unacknowledged interrupt.
     ///
     /// # Errors
     ///
-    /// Errors when the state is of another version, has a queue the transport
-    /// would not have accepted or interrupt bits the device never sets, or
-    /// holds packets, connections or buffers this device would never have
-    /// held, see [`RESTORE_MAX_CONNS`] and the other limits.
+    /// Errors when [`VsockState::check`] refuses the state.
     pub fn restore(mem: &GuestRam, state: &VsockState) -> std::io::Result<Self> {
-        let mut dev = Self::import(mem, state)?;
-        let mut ports: Vec<u32> = dev.conns.keys().copied().collect();
-        ports.sort_unstable();
-        for port in ports {
-            if dev.conns.get(&port).map(|c| c.state) == Some(ConnState::New) {
-                dev.conns.remove(&port);
-                continue;
-            }
-            dev.host_gone(mem, port);
-            dev.host_closed(mem, port);
-        }
-        Ok(dev)
-    }
-
-    /// Rebuilds the device `state` describes, connections and all, without
-    /// ending any.
-    fn import(mem: &GuestRam, state: &VsockState) -> std::io::Result<Self> {
-        check_version("virtio-vsock", state.version, VSOCK_STATE_VERSION)?;
-        state.common.check("virtio-vsock")?;
+        state.check(mem)?;
         let queues = [
             Queue::from_state(mem, &state.queues[0])?,
             Queue::from_state(mem, &state.queues[1])?,
             Queue::from_state(mem, &state.queues[2])?,
         ];
-        Self::check_pending(&state.pending)?;
-        if state.conns.len() > RESTORE_MAX_CONNS {
-            return Err(invalid(format_args!(
-                "virtio-vsock holds {} connections, a restore takes at most {RESTORE_MAX_CONNS}",
-                state.conns.len()
-            )));
-        }
-        let mut conns = HashMap::with_capacity(state.conns.len());
-        for c in &state.conns {
-            Self::check_conn(c, state.next_port)?;
-            let conn = Conn {
-                stream: None,
-                state: c.state.into(),
-                rx_cnt: c.rx_cnt,
-                to_host: c.to_host.iter().copied().collect(),
-                backlog: c.backlog.iter().copied().collect(),
-                host_closed: c.host_closed,
-                host_gone: c.host_gone,
-                guest_closed: c.guest_closed,
-                guest_reset: c.guest_reset,
-                guest_full_close: c.guest_full_close,
-                guest_told: c.guest_told,
-                reset_sent: c.reset_sent,
-                peer_buf_alloc: c.peer_buf_alloc,
-                peer_fwd_cnt: c.peer_fwd_cnt,
-                tx_cnt: c.tx_cnt,
-                // No bridge thread waits on a restored connection, so the
-                // gates start as `add_conn` leaves them.
-                reader_gate: Arc::default(),
-                writer_gate: Arc::new(HostGate::new_closed()),
-            };
-            if conns.insert(c.port, conn).is_some() {
-                return Err(invalid(format_args!(
-                    "virtio-vsock holds port {} twice",
-                    c.port
-                )));
-            }
-        }
+        let conns = state
+            .conns
+            .iter()
+            .map(|c| {
+                let conn = Conn {
+                    stream: None,
+                    state: c.state.into(),
+                    rx_cnt: c.rx_cnt,
+                    to_host: c.to_host.iter().copied().collect(),
+                    backlog: c.backlog.iter().copied().collect(),
+                    host_closed: c.host_closed,
+                    host_gone: c.host_gone,
+                    guest_closed: c.guest_closed,
+                    guest_reset: c.guest_reset,
+                    guest_full_close: c.guest_full_close,
+                    guest_told: c.guest_told,
+                    reset_sent: c.reset_sent,
+                    peer_buf_alloc: c.peer_buf_alloc,
+                    peer_fwd_cnt: c.peer_fwd_cnt,
+                    tx_cnt: c.tx_cnt,
+                    // No bridge thread waits on a restored connection, so the
+                    // gates start as `add_conn` leaves them.
+                    reader_gate: Arc::default(),
+                    writer_gate: Arc::new(HostGate::new_closed()),
+                };
+                (c.port, conn)
+            })
+            .collect();
         Ok(VirtioVsock {
             status: state.common.status,
             dev_feat_sel: state.common.dev_feat_sel,
@@ -681,6 +695,38 @@ impl VirtioVsock {
             next_port: state.next_port,
             next_turn: state.next_turn,
         })
+    }
+
+    /// Ends every connection a restore brought back.
+    ///
+    /// The host end of each connection was a socket on the source host, and
+    /// nothing on this host is its peer. So each one ends the way a host that
+    /// went away ends it at runtime, through [`VirtioVsock::host_gone`] and
+    /// [`VirtioVsock::host_closed`]: the guest's sends fail, the host bytes
+    /// the device already held still reach the guest, and then the guest gets
+    /// `OP_RST` and the connection is dropped. A connection the guest was
+    /// never offered is dropped without a word, since the guest has nothing to
+    /// end. Those packets go into the guest's RX buffers now if it posted any,
+    /// so a guest blocked on a read is woken rather than left waiting for a
+    /// host that is not coming back.
+    ///
+    /// It writes guest RAM, so the restore calls it only once every device is
+    /// built and nothing is left to refuse the checkpoint. It is not
+    /// optional: a connection left as restored has no host end, so a guest
+    /// send to it ends it, but a guest blocked on a read waits for good.
+    /// Called before the interrupt line is connected, it leaves the line to
+    /// `VirtioVsock::connect_irq`.
+    pub fn end_restored_conns(&mut self, mem: &GuestRam) {
+        let mut ports: Vec<u32> = self.conns.keys().copied().collect();
+        ports.sort_unstable();
+        for port in ports {
+            if self.conns.get(&port).map(|c| c.state) == Some(ConnState::New) {
+                self.conns.remove(&port);
+                continue;
+            }
+            self.host_gone(mem, port);
+            self.host_closed(mem, port);
+        }
     }
 
     /// Refuses waiting packets the device could not have framed.
@@ -2994,7 +3040,7 @@ mod state_tests {
     }
 
     #[test]
-    fn state_round_trips_through_json_and_an_imported_device() {
+    fn state_round_trips_through_json_and_a_restored_device() {
         let mem = mem();
         let (dev, _peers) = busy(&mem);
         let state = dev.state();
@@ -3008,17 +3054,18 @@ mod state_tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: VsockState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, state);
-        let imported = VirtioVsock::import(&mem, &back).unwrap();
-        assert_eq!(imported.state(), state);
-        assert_eq!(serde_json::to_string(&imported.state()).unwrap(), json);
+        let restored = VirtioVsock::restore(&mem, &back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(serde_json::to_string(&restored.state()).unwrap(), json);
     }
 
-    /// The host end of every connection stayed on the source host, so a
-    /// restore ends each one as a host that went away ends it: the guest gets
-    /// the host bytes the device held, then `OP_RST`, and the connection is
-    /// dropped. Guest bytes that had not reached the host come back as credit.
+    /// The host end of every connection stayed on the source host, so
+    /// `end_restored_conns` ends each one as a host that went away ends it:
+    /// the guest gets the host bytes the device held, then `OP_RST`, and the
+    /// connection is dropped. Guest bytes that had not reached the host come
+    /// back as credit. The restore itself writes nothing to guest RAM.
     #[test]
-    fn restore_ends_every_connection_through_the_host_gone_path() {
+    fn restored_connections_end_through_the_host_gone_path() {
         let mem = mem();
         let (dev, _peers) = busy(&mem);
         let mut state = dev.state();
@@ -3030,6 +3077,8 @@ mod state_tests {
         // restore sends for each connection.
         post_rx(&mem, 8);
         let mut restored = VirtioVsock::restore(&mem, &state).unwrap();
+        assert!(received(&mem).is_empty(), "the restore wrote guest RAM");
+        restored.end_restored_conns(&mem);
         let got = received(&mem);
         let ops: Vec<u16> = got.iter().map(|(op, _)| *op).collect();
         assert_eq!(
@@ -3074,7 +3123,7 @@ mod state_tests {
 
     /// The guest never heard of a connection still `New`, so it gets nothing.
     #[test]
-    fn restore_drops_a_connection_the_guest_was_never_offered() {
+    fn a_restored_connection_the_guest_was_never_offered_ends_silently() {
         let mem = mem();
         let mut dev = VirtioVsock::new();
         program(&mut dev, &mem, RX_QUEUE, RX_DESC);
@@ -3084,7 +3133,8 @@ mod state_tests {
         assert_eq!(state.conns[0].state, VsockConnPhase::New);
 
         post_rx(&mem, 2);
-        let restored = VirtioVsock::restore(&mem, &state).unwrap();
+        let mut restored = VirtioVsock::restore(&mem, &state).unwrap();
+        restored.end_restored_conns(&mem);
         assert!(received(&mem).is_empty());
         assert!(restored.state().conns.is_empty());
         assert_eq!(restored.state().common.interrupt_status, 0);
@@ -3099,9 +3149,13 @@ mod state_tests {
         assert_eq!(line.sets(), 0);
     }
 
-    /// Returns the error kind `import` refuses `state` with, or `None`.
+    /// Returns the error kind `restore` refuses `state` with, or `None`, and
+    /// checks that `VsockState::check` agrees.
     fn refused(state: &VsockState) -> Option<std::io::ErrorKind> {
-        VirtioVsock::import(&mem(), state).err().map(|e| e.kind())
+        let mem = mem();
+        let kind = VirtioVsock::restore(&mem, state).err().map(|e| e.kind());
+        assert_eq!(state.check(&mem).err().map(|e| e.kind()), kind);
+        kind
     }
 
     /// A waiting packet the device could not have framed is refused: one
@@ -3192,7 +3246,7 @@ mod state_tests {
     fn a_device_out_of_host_ports_refuses_a_new_connection() {
         let mut state = VirtioVsock::new().state();
         state.next_port = u32::MAX - 1;
-        let mut dev = VirtioVsock::import(&mem(), &state).unwrap();
+        let mut dev = VirtioVsock::restore(&mem(), &state).unwrap();
         let (a, _a_peer) = UnixStream::pair().unwrap();
         let (b, _b_peer) = UnixStream::pair().unwrap();
         assert_eq!(dev.add_conn(a).unwrap(), u32::MAX - 1);
@@ -3275,6 +3329,28 @@ mod state_tests {
         let state = dev.state();
         assert_eq!(state.pending.len(), REFUSALS_PENDING_MAX);
         assert_eq!(refused(&state), None, "the device can be checkpointed");
+    }
+
+    /// A host that keeps opening and closing connections to a guest that reads
+    /// none of them grows the waiting packets without bound. The capture's
+    /// check refuses that device, so the checkpoint fails while the guest can
+    /// still run on, and a restore would refuse it the same way.
+    #[test]
+    fn a_device_past_the_restore_limits_fails_the_capture_check() {
+        let mem = mem();
+        let (mut dev, _peers) = busy(&mem);
+        for _ in 0..RESTORE_MAX_PENDING / 2 + 1 {
+            let (a, _a_peer) = UnixStream::pair().unwrap();
+            let port = dev.add_conn(a).unwrap();
+            dev.connect(&mem, port);
+            dev.host_closed(&mem, port);
+        }
+        let state = dev.state();
+        assert!(state.pending.len() > RESTORE_MAX_PENDING);
+        assert_eq!(state.conns.len(), 2, "every churned connection was dropped");
+        let err = state.check(&mem).err();
+        assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+        assert_eq!(refused(&state), Some(std::io::ErrorKind::InvalidData));
     }
 
     #[test]
