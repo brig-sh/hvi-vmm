@@ -1,0 +1,146 @@
+From c61d393fb9962fc25ea11400a7941a904fdafe93 Mon Sep 17 00:00:00 2001
+From: Panagiotis Moustafellos <pmoust@nofire.ai>
+Date: Wed, 14 Oct 2026 22:53:38 +0300
+Subject: [PATCH 4/4] clocksource: hvi-time: Count host-sleep publishes apart
+ from restores
+
+The VMM publishes the page again after the host sleeps, and the
+migration work counted those publishes in migrations, so a guest on a
+Mac that slept reported moves it never made.
+
+The VMM now keeps a running count of its host-sleep publishes in the
+page, at 0x3c. The work keeps the count it last handled, as it keeps
+the generation, and splits the publishes since into host_sleeps and
+migrations. Both are taken from one read of the page at probe. The
+snapshot file shows host_sleeps before migrations, so a reader that
+takes everything after "migrations=" still reads one number.
+
+Signed-off-by: Panagiotis Moustafellos <pmoust@nofire.ai>
+---
+ drivers/clocksource/hvi-time.c | 29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/clocksource/hvi-time.c b/drivers/clocksource/hvi-time.c
+index e593f12c4..f0344e79b 100644
+--- a/drivers/clocksource/hvi-time.c
++++ b/drivers/clocksource/hvi-time.c
+@@ -47,6 +47,7 @@
+ #include <linux/irq.h>
+ #include <linux/kobject.h>
+ #include <linux/math64.h>
++#include <linux/minmax.h>
+ #include <linux/nmi.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -73,6 +74,7 @@
+ #define HVI_PAGE_SHIFT		0x24	/* u32 */
+ #define HVI_PAGE_WALL_NS	0x28	/* u64, host CLOCK_REALTIME */
+ #define HVI_PAGE_DOWNTIME_NS	0x30	/* u64 */
++#define HVI_PAGE_HOST_SLEEPS	0x3c	/* u32, publishes after a host sleep */
+ #define HVI_PAGE_SIZE		0x40
+ 
+ #define HVI_TIME_MAGIC		0x4d545648	/* "HVTM" */
+@@ -110,6 +112,7 @@ struct hvi_time_snap {
+ 	u64 base_ns;
+ 	u64 wall_ns;
+ 	u64 downtime_ns;
++	u32 host_sleeps;
+ 	u64 cntvct;
+ 	u64 now_ns;
+ };
+@@ -119,8 +122,10 @@ static void __iomem *hvi_timer_base __ro_after_init;
+ static int hvi_time_irq __ro_after_init;
+ static bool hvi_time_active __ro_after_init;
+ static atomic_t hvi_time_migrations = ATOMIC_INIT(0);
+-/* The page generation the migration work last handled */
++static atomic_t hvi_time_host_sleeps = ATOMIC_INIT(0);
++/* The page generation and host-sleep count the migration work last handled */
+ static u32 hvi_time_handled_gen;
++static u32 hvi_time_handled_sleeps;
+ static DEFINE_MUTEX(hvi_time_migrate_lock);
+ static DEFINE_PER_CPU(struct hvi_time_cpu, hvi_time_pcpu);
+ 
+@@ -172,6 +177,7 @@ static void hvi_time_snapshot(struct hvi_time_snap *s)
+ 		s->shift = hvi_page_read32(HVI_PAGE_SHIFT);
+ 		s->wall_ns = hvi_page_read64(HVI_PAGE_WALL_NS);
+ 		s->downtime_ns = hvi_page_read64(HVI_PAGE_DOWNTIME_NS);
++		s->host_sleeps = hvi_page_read32(HVI_PAGE_HOST_SLEEPS);
+ 		s->cntvct = __arch_counter_get_cntvct();
+ 		smp_rmb(); /* fields before the generation re-read */
+ 	} while ((gen & 1) || gen != hvi_page_read32(HVI_PAGE_GENERATION));
+@@ -243,14 +249,15 @@ static int hvi_time_disarm(struct clock_event_device *evt)
+  * Every CPU takes GEN_CHANGED and schedules this work, and it can run again
+  * after the first CPU's run. It handles each generation once: it counts the
+  * generations since the one it last handled, and does nothing when there
+- * are none.
++ * are none. The VMM counts the publishes it made after a host sleep in the
++ * page; those go to host_sleeps, the others (restores) to migrations.
+  */
+ static void hvi_time_migrate(struct work_struct *work)
+ {
+ 	struct hvi_time_snap s;
+ 	struct timespec64 ts;
+ 	u64 target_ns;
+-	u32 moves;
++	u32 publishes, sleeps;
+ 	s64 delta;
+ 
+ 	mutex_lock(&hvi_time_migrate_lock);
+@@ -260,8 +267,10 @@ static void hvi_time_migrate(struct work_struct *work)
+ 		return;
+ 	}
+ 	/* The generation goes up by 2 at every publish */
+-	moves = (s.generation - hvi_time_handled_gen) / 2;
++	publishes = (s.generation - hvi_time_handled_gen) / 2;
++	sleeps = min(s.host_sleeps - hvi_time_handled_sleeps, publishes);
+ 	hvi_time_handled_gen = s.generation;
++	hvi_time_handled_sleeps = s.host_sleeps;
+ 
+ 	/* Host wall clock now = published wall clock + guest ns since then */
+ 	target_ns = s.wall_ns + (s.now_ns - s.base_ns);
+@@ -279,7 +288,8 @@ static void hvi_time_migrate(struct work_struct *work)
+ 	touch_all_softlockup_watchdogs();
+ 	clocksource_touch_watchdog();
+ 	rcu_cpu_stall_reset();
+-	atomic_add(moves, &hvi_time_migrations);
++	atomic_add(publishes - sleeps, &hvi_time_migrations);
++	atomic_add(sleeps, &hvi_time_host_sleeps);
+ 	mutex_unlock(&hvi_time_migrate_lock);
+ 
+ 	pr_info("generation %u: counter %u Hz, lpj %lu, wall clock moved %lld ns, downtime total %llu ns\n",
+@@ -384,6 +394,7 @@ static int hvi_time_dying_cpu(unsigned int cpu)
+ static int __init hvi_time_of_init(struct device_node *np)
+ {
+ 	struct resource page_res, timer_res;
++	struct hvi_time_snap snap;
+ 	u32 magic, version, gen, freq, mult, shift;
+ 	unsigned int cpu, blocks = 0;
+ 	unsigned long hwirq = 0;
+@@ -459,7 +470,10 @@ static int __init hvi_time_of_init(struct device_node *np)
+ 		ret = -EINVAL;
+ 		goto out_page;
+ 	}
+-	hvi_time_handled_gen = gen;
++	/* One consistent read, in case the VMM published since */
++	hvi_time_snapshot(&snap);
++	hvi_time_handled_gen = snap.generation;
++	hvi_time_handled_sleeps = snap.host_sleeps;
+ 
+ 	hvi_timer_base = ioremap(timer_res.start, resource_size(&timer_res));
+ 	if (!hvi_timer_base) {
+@@ -570,10 +584,11 @@ static ssize_t snapshot_show(struct kobject *kobj, struct kobj_attribute *attr,
+ 	preempt_enable();
+ 
+ 	return sysfs_emit(buf,
+-			  "generation=%u counter_freq_hz=%u base_counter=%llu base_ns=%llu mult=%u shift=%u wall_ns=%llu downtime_total_ns=%llu cntvct=%llu now_ns=%llu mmio_now_ns=%llu lpj=%lu migrations=%d\n",
++			  "generation=%u counter_freq_hz=%u base_counter=%llu base_ns=%llu mult=%u shift=%u wall_ns=%llu downtime_total_ns=%llu cntvct=%llu now_ns=%llu mmio_now_ns=%llu lpj=%lu host_sleeps=%d migrations=%d\n",
+ 			  s.generation, s.freq, s.base_counter, s.base_ns,
+ 			  s.mult, s.shift, s.wall_ns, s.downtime_ns, s.cntvct,
+ 			  s.now_ns, mmio_now_ns, loops_per_jiffy,
++			  atomic_read(&hvi_time_host_sleeps),
+ 			  atomic_read(&hvi_time_migrations));
+ }
+ 
+-- 
+2.51.2
+
