@@ -45,9 +45,11 @@ signal-hook = "0.4.5"
 # so those stay ours. The legacy devices build for every backend, whichever
 # guest uses them, so this is a common dependency.
 vm-superio = "0.8.1"
-# SHA-256 for the machine profile's firmware digests, and later for the
-# checkpoint bundle's integrity. Pure Rust, from RustCrypto.
-sha2 = "0.10.9"
+# SHA-256 for the machine profile's firmware digests and the checkpoint
+# bundle's and stream's integrity. Pure Rust, from RustCrypto. From 0.11 it
+# uses the CPU's SHA-2 instructions on arm64 when it finds them at run
+# time, with no assembly to build.
+sha2 = "0.11.0"
 # LZ4 block compression for the pages a live move streams. Pure Rust, no C,
 # with the safe encoder and decoder only (no `unsafe` in either). The frame
 # format and its xxhash dependency are left out: hvi frames the stream
