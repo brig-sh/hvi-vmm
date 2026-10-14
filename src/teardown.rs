@@ -111,16 +111,16 @@ pub(crate) fn kick_until_finished(thread: &JoinHandle<()>, deadline: Instant) {
 /// The fast path of [`enter`](Self::enter) is two atomic operations and takes
 /// no lock, since the network relay passes it once per frame.
 ///
-/// A pause does not yet hold everything a checkpoint needs. The agent
-/// bridge's reader reads inside the gate, so its bytes are either still in
-/// the socket or already in the device. The console reader and the network
-/// relays read first and enter the gate to deliver, so a pause can find one
-/// console byte, one tap frame, or the gateway relay's buffered stream taken
-/// off the host and not yet in the device. Pause and resume on one host lose
-/// nothing, but a checkpoint taken then would drop it; capture has to take
-/// those buffers too, or move those reads inside the gate. The console cannot
-/// simply move: stdin is a shared terminal, which this does not make
-/// non-blocking.
+/// What a pause holds of the guest's input is exactly what a checkpoint can
+/// capture, with two exceptions. The agent bridge's reader and the network
+/// relays pass the gate before they read, on non-blocking descriptors, so
+/// their bytes are either still in the host socket or already in the device.
+/// The gateway relay can still hold the first part of a frame whose rest has
+/// not arrived; a checkpoint drops it, which the guest sees as one lost frame.
+/// The console reader reads stdin, a shared terminal this does not make
+/// non-blocking, outside the gate and delivers inside it, so a pause can find
+/// one byte read and not yet in the UART; a checkpoint taken then drops that
+/// keystroke. Pause and resume on one host lose neither.
 #[derive(Default)]
 pub struct PauseGate {
     /// Set while a pause holds the gate closed.

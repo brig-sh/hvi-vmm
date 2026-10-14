@@ -23,8 +23,9 @@
 //!
 //! Each thread passes the token's pause gate around the work that touches a
 //! device or guest RAM, so a pause of the gate holds all of them back. The
-//! console's bytes and the relay's frames are delivered inside the gate. The
-//! control socket's thread, when there is one, is the one that closes it.
+//! console's bytes are delivered inside the gate, and the relays receive and
+//! deliver their frames inside it. The control socket's thread, when there is
+//! one, is the one that closes it.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -111,9 +112,10 @@ impl IoThreads {
         }
         if let (Some(net), Some(dev)) = (net, &guest.net) {
             let (dev, ram, stop) = (Arc::clone(dev), Arc::clone(&guest.ram), io_threads.token());
-            let gate = stop.clone();
+            // The relay passes the pause gate around each burst it receives
+            // and delivers, so `deliver` does not: a second admission inside
+            // the first would wait on a pause that waits on the first.
             let deliver = move |frame: &[u8]| {
-                let _in = gate.enter();
                 lock_or_recover(&dev).deliver(&ram, frame);
             };
             let (name, relay) = match net {
