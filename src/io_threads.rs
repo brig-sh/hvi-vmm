@@ -41,7 +41,7 @@ use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Guest, PluginThread};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
-use crate::sandbox::confine_io_thread;
+use crate::sandbox::{confine_control_thread, confine_io_thread};
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
 use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
@@ -151,6 +151,7 @@ impl<K: Kick> IoThreads<K> {
             source.token(),
             &finish_count,
             Arc::clone(&guest.vcpus),
+            confine_io_thread,
             move |stop| {
                 let gate = stop.clone();
                 terminal::input::run(
@@ -205,7 +206,14 @@ impl<K: Kick> IoThreads<K> {
         if let Some(control) = control {
             let gate = Arc::clone(io_threads.stop.source.gate());
             let vcpus = Arc::clone(&guest.vcpus);
-            io_threads.spawn("control socket", move |stop| {
+            // Only a run that may write checkpoints gives the thread the file
+            // calls a bundle needs.
+            let confine: fn() = if control.checkpoint_root().is_some() {
+                confine_control_thread
+            } else {
+                confine_io_thread
+            };
+            io_threads.spawn_with("control socket", confine, move |stop| {
                 control.run(&stop, &gate, &vcpus);
             });
         }
@@ -233,11 +241,29 @@ impl<K: Kick> IoThreads<K> {
     ) where
         K: 'static,
     {
+        self.spawn_with(name, confine_io_thread, body);
+    }
+
+    /// [`spawn`](Self::spawn), for a thread that `confine` confines at its
+    /// start in place of the `vmm` filter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thread cannot be created.
+    pub(crate) fn spawn_with(
+        &mut self,
+        name: &'static str,
+        confine: fn(),
+        body: impl FnOnce(StopToken) + Send + 'static,
+    ) where
+        K: 'static,
+    {
         let thread = IoThread::spawn(
             name,
             self.stop.source.token(),
             &self.finish_count,
             Arc::clone(&self.vcpus),
+            confine,
             body,
         );
         self.threads.push(thread);
@@ -295,6 +321,7 @@ impl<K: Kick + 'static> IoThreads<K> {
             source.token(),
             &finish_count,
             Arc::clone(&vcpus),
+            confine_io_thread,
             |_| {},
         );
         Self {
@@ -333,6 +360,7 @@ impl IoThread {
         stop: StopToken,
         count: &Arc<FinishCount>,
         vcpus: Arc<Vcpus<K>>,
+        confine: fn(),
         body: impl FnOnce(StopToken) + Send + 'static,
     ) -> Self {
         let finished = Arc::new(AtomicBool::new(false));
@@ -347,7 +375,7 @@ impl IoThread {
                     count,
                 };
                 let _panic = StopOnPanic { vcpus, name };
-                confine_io_thread();
+                confine();
                 body(stop);
             })
             .unwrap_or_else(|e| panic!("spawning the {name} thread: {e}"));
@@ -437,6 +465,7 @@ mod tests {
             source.token(),
             count,
             Arc::clone(vcpus),
+            confine_io_thread,
             move |_| body(),
         )
     }

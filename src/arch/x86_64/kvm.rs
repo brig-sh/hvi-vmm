@@ -1092,6 +1092,7 @@ mod vcpu_cap_tests {
             agent_sock: None,
             profile_out: None,
             control_sock: None,
+            checkpoint_root: None,
             plugin: None,
             sandbox: false,
             stop: None,
