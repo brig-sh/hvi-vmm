@@ -156,15 +156,18 @@ and each reply is one line:
 
 | `op` | Effect |
 | --- | --- |
-| `profile` | Replies with the machine profile under `profile`. |
-| `pause` | Holds the host I/O threads, then parks every started vCPU. If either does not happen within 2 s, the pause is undone and the reply is `timeout`. |
+| `profile` | Replies with the machine profile under `profile`, waiting up to 2 s for it on macOS, where the boot vCPU completes it. |
+| `pause` | Holds the host I/O threads, then parks every started vCPU. If both have not happened within 2 s in all, the pause is undone and the reply is `timeout`. |
 | `resume` | Releases the vCPUs, then the I/O threads. |
 | `status` | Replies with `state` (`running`, `paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. |
 | `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
 | `checkpoint` | Reserved. Refused with `not_implemented`. |
 
 `pause` and `resume` are idempotent. A pause outlives the connection that asked
-for it. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
+for it. No reply takes longer than about 2 s, so give a client a reply timeout
+of at least 3 s. A client that gives up on a `pause` before its reply cannot
+tell whether the VM paused: it should reconnect and ask `status`, or send
+`resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
 `code`; `error` is for a person. The codes are listed in
 `src/checkpoint/control.rs`. The socket has no authentication: anyone who can
 connect to it can pause or stop the VM, so put it in a directory only its owner
