@@ -44,6 +44,7 @@ use crate::devices::virtio::{
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
+use crate::LOG_PREFIX;
 
 const MAGIC_VALUE: u64 = 0x7472_6976; // "virt" little-endian
 const VIRTIO_BLK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK as u64;
@@ -118,6 +119,9 @@ impl BlkState {
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
     file: File,
+    /// A second open of the disk, which holds an exclusive `flock` on it
+    /// while this guest may still write it. See [`DiskLock`].
+    lock: Option<DiskLock>,
     capacity_sectors: u64,
     status: u32,
     dev_feat_sel: u32,
@@ -183,15 +187,97 @@ fn backing_len(file: &File) -> std::io::Result<u64> {
     Ok(meta.len())
 }
 
-impl VirtioBlk {
-    /// Opens `path` read-write as the backing disk.
+/// An exclusive `flock` on a disk, so a second hvi cannot write it too.
+///
+/// Two guests writing one image corrupt its filesystem, and a checkpoint
+/// bundle can be restored any number of times, so hvi keeps a second
+/// process off a disk that one still has as its own. The lock is held on
+/// an open of its own, not on the device's file: it is released by closing
+/// that open, which needs no system call the sandbox would have to allow
+/// after confinement. A `flock` conflicts with every other open of the
+/// file, in this process or another, and goes with the process that holds
+/// it, however that ends.
+///
+/// It is advisory: it keeps out another hvi, not a program that writes the
+/// image without asking.
+#[derive(Debug)]
+struct DiskLock {
+    /// The open that holds the lock; closing it releases the lock.
+    _file: File,
+}
+
+impl DiskLock {
+    /// Takes the lock on the disk at `path`, whose device file is `disk`.
+    ///
+    /// A regular file or a block device is locked. Anything else, such as
+    /// a character device, is not a disk two guests could share, and a
+    /// filesystem that has no `flock` leaves the disk unlocked, as before.
     ///
     /// # Errors
     ///
-    /// Errors if the file cannot be opened or its length read.
+    /// Errors, as `WouldBlock`, when another open of the disk holds the
+    /// lock, or when the path cannot be opened again.
+    fn take(path: &str, disk: &File) -> std::io::Result<Option<Self>> {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::io::AsRawFd;
+
+        let kind = disk.metadata()?.file_type();
+        if !kind.is_file() && !kind.is_block_device() {
+            return Ok(None);
+        }
+        let file = File::open(path)?;
+        // SAFETY: flock on a descriptor `file` owns, with valid operations.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(DiskLock { _file: file }));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "virtio-blk: {path} is locked by another process, most likely an hvi \
+                     that has it as its disk; two guests writing one image corrupt it"
+                ),
+            )),
+            Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP || e == libc::ENOLCK => {
+                eprintln!(
+                    "{LOG_PREFIX} virtio-blk: {path} cannot be locked ({err}); left unlocked"
+                );
+                Ok(None)
+            }
+            _ => Err(std::io::Error::new(
+                err.kind(),
+                format!("virtio-blk: locking {path}: {err}"),
+            )),
+        }
+    }
+}
+
+impl VirtioBlk {
+    /// Opens `path` read-write as the backing disk, and takes the lock that
+    /// keeps another hvi from writing it as well (see `DiskLock`).
+    ///
+    /// # Errors
+    ///
+    /// Errors if the file cannot be opened or its length read, or, as
+    /// `WouldBlock`, when another process holds the disk's lock.
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        Self::from_file(file)
+        let lock = DiskLock::take(path, &file)?;
+        let mut dev = Self::from_file(file)?;
+        dev.lock = lock;
+        Ok(dev)
+    }
+
+    /// Releases the disk's lock, so another hvi may open the disk while
+    /// this one still has it open. Returns whether there was a lock.
+    ///
+    /// A source fenced after a checkpoint calls it: its guest never runs
+    /// again, so it never writes the disk again, and the restore that takes
+    /// the guest over may start before the source is stopped.
+    pub fn release_lock(&mut self) -> bool {
+        self.lock.take().is_some()
     }
 
     /// Builds a reset device over `file`, an open read-write disk.
@@ -203,6 +289,7 @@ impl VirtioBlk {
         let disk_id = file.metadata().map(|m| m.ino()).unwrap_or(0);
         Ok(VirtioBlk {
             file,
+            lock: None,
             capacity_sectors,
             status: 0,
             dev_feat_sel: 0,
@@ -1242,6 +1329,8 @@ mod state_tests {
         let json = serde_json::to_vec(&state).unwrap();
         let back: BlkState = serde_json::from_slice(&json).unwrap();
         assert_eq!(back, state);
+        // As a fenced source does, so the restore can take the disk.
+        assert!(blk.release_lock());
         let mut restored = VirtioBlk::restore(disk.path(), &mem, &back, 1046).unwrap();
         assert_eq!(restored.state(), state);
 
@@ -1274,6 +1363,7 @@ mod state_tests {
         let mut blk = VirtioBlk::open(disk.path()).unwrap();
         served_one_read(&mut blk, &mem);
         let pending = blk.state();
+        drop(blk);
 
         let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending, 0).unwrap();
         let line = Arc::new(LevelLine::default());
@@ -1288,10 +1378,43 @@ mod state_tests {
             },
             ..pending
         };
+        drop(restored);
         let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet, 0).unwrap();
         let line = Arc::new(LevelLine::default());
         restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         assert_eq!(line.sets(), 0, "a line with nothing pending is not set");
+    }
+
+    /// Two guests writing one image corrupt it, so a disk one device has
+    /// open is refused to a second until the first releases its lock or
+    /// goes, and a device that is not a disk is not locked at all.
+    #[test]
+    fn a_disk_is_the_disk_of_one_device_at_a_time() {
+        let disk = Disk::new("lock", 2);
+        let mut first = VirtioBlk::open(disk.path()).unwrap();
+        let err = VirtioBlk::open(disk.path())
+            .err()
+            .expect("a second device opened a locked disk");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            err.to_string().contains("is locked by another process"),
+            "{err}"
+        );
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let err = VirtioBlk::restore(disk.path(), &mem, &first.state(), 0)
+            .err()
+            .expect("a restore opened a locked disk");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        assert!(first.release_lock());
+        assert!(!first.release_lock(), "the lock was released twice");
+        let second = VirtioBlk::open(disk.path()).unwrap();
+        assert!(VirtioBlk::open(disk.path()).is_err());
+        drop(second);
+        let _third = VirtioBlk::open(disk.path()).unwrap();
+
+        let _a = VirtioBlk::open("/dev/null").unwrap();
+        let _b = VirtioBlk::open("/dev/null").unwrap();
     }
 
     #[test]
