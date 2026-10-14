@@ -305,9 +305,11 @@ if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
 The `seccomp` module exists on Linux only, hence the `cfg`. On musl the call
 does nothing. Without it, glibc's malloc can open a file from a filtered
 thread, and the seccomp filter kills the process with `SIGSYS`. A confined KVM
-boot sets the same thing before it starts a thread, but that is too late for
-an arena one of your threads already made: glibc keeps it and can hand it to a
-filtered thread. The setting is process-wide, so your own threads share the
+boot sets the same thing before it starts a thread, but by then it may do
+little. An arena one of your threads already made stays in use, and glibc can
+hand it to a filtered thread. If one of your threads has needed a new arena
+while more than eight existed, glibc has also fixed its arena limit, and
+ignores the setting. The setting is process-wide, so your own threads share the
 one arena too. The `hvi` binary and
 [`examples/watch_guest.rs`](../examples/watch_guest.rs) both make this call.
 See [the allowlists'
