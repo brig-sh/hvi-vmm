@@ -42,7 +42,10 @@
 //! manifest's before it returns. A mismatch is refused with the component's
 //! name, never repaired or skipped. Each accessor reads its component again
 //! and checks the hash again, so a file changed after the open is refused
-//! too.
+//! too. A restore opens the bundle with [`Bundle::open_for_restore`], which
+//! checks only the size of `ram.bin` and leaves its hash to
+//! [`Bundle::load_ram`], the one read of it a restore makes: the image is
+//! then read and hashed once, not twice.
 
 // The bundle directory is the operator's, named on the control socket or the
 // command line, not a guest's share, so it is resolved and opened by path.
@@ -795,6 +798,8 @@ pub struct Bundle {
     manifest_sha256: String,
     /// The source's profile.
     profile: MachineProfile,
+    /// Whether the open hashed `ram.bin`, or left it to `load_ram`.
+    ram_hashed: bool,
 }
 
 impl Bundle {
@@ -806,6 +811,22 @@ impl Bundle {
     ///
     /// Errors, naming the file, on the first thing that does not hold.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_hashing(dir, true)
+    }
+
+    /// Opens the bundle in `dir` as [`open`](Self::open) does, but checks
+    /// only the size of `ram.bin`: [`load_ram`](Self::load_ram) hashes it as
+    /// it copies it, and refuses it there. For a restore, which reads the
+    /// image once that way; until then the image is unchecked.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_for_restore(dir: &Path) -> io::Result<Self> {
+        Self::open_hashing(dir, false)
+    }
+
+    fn open_hashing(dir: &Path, hash_ram: bool) -> io::Result<Self> {
         let (mut file, len) = open_component(dir, MANIFEST, MAX_MANIFEST_BYTES)?;
         let mut bytes = Vec::with_capacity(len as usize);
         file.read_to_end(&mut bytes)?;
@@ -818,6 +839,9 @@ impl Bundle {
                     &entry.path,
                     format!("is {len} bytes, the manifest says {}", entry.size),
                 ));
+            }
+            if !hash_ram && entry.name == Component::RamBin.name() {
+                continue;
             }
             let mut hashing = Hashing::new(BufReader::with_capacity(1 << 20, file));
             io::copy(&mut hashing, &mut io::sink())?;
@@ -861,6 +885,7 @@ impl Bundle {
             manifest_sha256: hex(&Sha256::digest(&bytes)),
             manifest,
             profile,
+            ram_hashed: hash_ram,
         })
     }
 
@@ -972,7 +997,9 @@ impl Bundle {
     }
 
     /// Copies the RAM image into `ram`, which must be fresh RAM of the
-    /// bundle's regions, hashing `ram.bin` again as it goes.
+    /// bundle's regions, hashing `ram.bin` as it goes: again after
+    /// [`open`](Self::open), for the first time after
+    /// [`open_for_restore`](Self::open_for_restore).
     ///
     /// # Errors
     ///
@@ -989,7 +1016,14 @@ impl Bundle {
         ram::load_ram(&map, &self.manifest.ram.regions, &mut bin, ram)?;
         let (_, sha256, _) = bin.finish();
         if sha256 != entry.sha256 {
-            return Err(bad("ram.bin", "changed since the bundle was opened"));
+            return Err(bad(
+                "ram.bin",
+                if self.ram_hashed {
+                    "changed since the bundle was opened"
+                } else {
+                    "SHA-256 does not match the manifest"
+                },
+            ));
         }
         Ok(())
     }
@@ -1598,6 +1632,40 @@ mod tests {
             "ram.bin: SHA-256 does not match the manifest"
         );
         assert!(verify(&dir).is_err());
+    }
+
+    // A restore hashes ram.bin once, as it loads it: the open checks only
+    // its size, and the load refuses a changed byte. A full open that
+    // hashed it says the file changed after.
+    #[test]
+    fn a_restore_open_leaves_the_ram_hash_to_the_load() {
+        let scratch = Scratch::new("restore-open");
+        let dir = scratch.bundle();
+        write(&dir, false);
+        let fresh = || GuestRam::from_ranges(&[(GPA, MIB)]);
+        Bundle::open_for_restore(&dir)
+            .unwrap()
+            .load_ram(&fresh())
+            .unwrap();
+        let full = Bundle::open(&dir).unwrap();
+        let path = dir.join("ram.bin");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[100] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let bundle = Bundle::open_for_restore(&dir).unwrap();
+        assert_eq!(
+            bundle.load_ram(&fresh()).unwrap_err().to_string(),
+            "ram.bin: SHA-256 does not match the manifest"
+        );
+        assert_eq!(
+            full.load_ram(&fresh()).unwrap_err().to_string(),
+            "ram.bin: changed since the bundle was opened"
+        );
+        // The size is still checked at the open.
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = Bundle::open_for_restore(&dir).unwrap_err().to_string();
+        assert!(err.starts_with("ram.bin: is "), "{err}");
     }
 
     #[test]
