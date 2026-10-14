@@ -228,7 +228,12 @@ impl Plugin for MemoryDump {
             return;
         }
         if !cpu.pause() {
-            stderrln!("{LOG_PREFIX} dump: vCPUs did not park; skipping (image would be torn)");
+            // A retry at the next safe point would cost vcpu0 another wait at
+            // each one while a vCPU stays stuck, so the request is dropped.
+            stderrln!(
+                "{LOG_PREFIX} dump: vCPUs not paused (they did not park, or the control socket \
+                 holds them); skipping (image would be torn)"
+            );
             return;
         }
         // Every path from here owes exactly one resume().
