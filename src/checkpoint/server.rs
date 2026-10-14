@@ -50,31 +50,40 @@
 //! manifest is written to the connection, which is before the client has
 //! read it. A fenced VM is never streamed again: the fence released its
 //! disk, and the destination may already run it.
+//!
+//! `disk-dirty` and `disk-blocks` read the disk for a move, in any state but
+//! stopping, and need a disk and the checkpoint root. `disk-blocks` streams
+//! its batches on the connection before its reply, see
+//! [`disk`].
 
 use std::cell::Cell;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::checkpoint::bundle::{resolve_in_root, unix_ms, BundleWriter};
 use crate::checkpoint::capture::{self, Capture, Console};
 use crate::checkpoint::control::{
-    format_response, parse_request, CheckpointStats, Error, ErrorCode, Migrate, MigrateStats,
-    Request, Response, Then, VmState, MAX_LINE,
+    format_response, parse_request, BlockSelection, CheckpointStats, DiskBlocksReply,
+    DiskDirtyReply, Error, ErrorCode, Migrate, MigrateStats, Request, Response, Then, VmState,
+    MAX_LINE,
 };
 use crate::checkpoint::cpu::{CpuState, Output, VcpuState};
+use crate::checkpoint::disk;
 use crate::checkpoint::migrate::{self, Policy, Tracker};
-use crate::checkpoint::platform::PlatformState;
+use crate::checkpoint::platform::{base64_encode, PlatformState};
 use crate::checkpoint::profile::this_build;
 use crate::checkpoint::profile::{MachineProfile, ProfileCell};
 use crate::checkpoint::stream::StreamWriter;
 use crate::config::Stop;
+use crate::devices::virtio::block::{DirtySince, VirtioBlk, DIRTY_BLOCK_BYTES};
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus, WorkResult};
+use crate::sync::lock_or_recover;
 use crate::teardown::{PauseGate, StopToken, Writable};
 use crate::LOG_PREFIX;
 
@@ -439,6 +448,7 @@ fn answer<K: Kick>(
             let none = Cell::new(None);
             return SocketOut::new(conn, stop, machine.timeout, &none).send(&response);
         }
+        Ok(Request::DiskBlocks(selection)) => return machine.disk_blocks(conn, stop, selection),
         Ok(request) => machine.handle(request),
         Err(e) => (Response::Error(e), None),
     };
@@ -453,19 +463,25 @@ fn answer<K: Kick>(
 /// stop token.
 fn send(conn: &mut UnixStream, stop: &StopToken, response: &Response) -> std::io::Result<()> {
     let line = format_response(response) + "\n";
-    let mut rest = line.as_bytes();
+    write_all(conn, stop, line.as_bytes()).map(|_| ())
+}
+
+/// Writes `bytes` to `conn`, waiting for room beside the stop token.
+/// Returns false when the stop came first.
+fn write_all(conn: &mut UnixStream, stop: &StopToken, bytes: &[u8]) -> std::io::Result<bool> {
+    let mut rest = bytes;
     while !rest.is_empty() {
         match conn.write(rest) {
             Ok(n) => rest = &rest[n..],
             Err(e) if retry_read(&e) => {
                 if !stop.wait_writable(conn.as_fd())? {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The control connection as a writer for a stream: it waits for room
@@ -618,10 +634,146 @@ impl<K: Kick> Machine<'_, K> {
                 txid,
                 epoch,
             } => self.checkpoint(&dir, then, txid.as_deref(), epoch),
-            // `answer` serves it, on its connection.
+            Request::DiskDirty(since) => self.disk_dirty(since),
+            // `answer` serves these, since they stream on the connection.
             Request::Migrate(_) => refuse(ErrorCode::BadRequest, "migrate needs its connection"),
+            Request::DiskBlocks(_) => refuse(ErrorCode::BadRequest, "disk-blocks streams"),
         };
         (response, None)
+    }
+
+    /// Returns the guest's disk, or the refusal to send when there is none
+    /// to read.
+    fn disk(&self) -> Result<Arc<Mutex<VirtioBlk>>, Response> {
+        if self.state == VmState::Stopping {
+            return Err(refuse(ErrorCode::Stopped, "the run is ending"));
+        }
+        let (Some(capture), Some(_)) = (&self.capture, &self.root) else {
+            return Err(refuse(
+                ErrorCode::Refused,
+                "this run has no checkpoint root; boot it with --checkpoint-root",
+            ));
+        };
+        match &capture.block {
+            Some((dev, _)) => Ok(Arc::clone(dev)),
+            None => Err(refuse(ErrorCode::Refused, "the guest has no disk")),
+        }
+    }
+
+    /// Reads the disk blocks written since boot or since the last read, and
+    /// starts a round.
+    ///
+    /// With the guest still, the read is the last round of a move, so the
+    /// disk is synced first, as a checkpoint syncs it.
+    fn disk_dirty(&mut self, since: DirtySince) -> Response {
+        let dev = match self.disk() {
+            Ok(dev) => dev,
+            Err(refusal) => return refusal,
+        };
+        let mut dev = lock_or_recover(&dev);
+        if self.state != VmState::Running {
+            if let Err(e) = dev.sync_data() {
+                return refuse(ErrorCode::CaptureFailed, format!("syncing the disk: {e}"));
+            }
+        }
+        let read = dev.read_dirty(since);
+        drop(dev);
+        match read {
+            Ok(read) => Response::DiskDirty(DiskDirtyReply {
+                since: match since {
+                    DirtySince::Boot => "boot",
+                    DirtySince::Round => "round",
+                },
+                round: read.round,
+                block_size: DIRTY_BLOCK_BYTES,
+                blocks: read.dirty.blocks(),
+                dirty: read.dirty.count(),
+                generation: read.generation,
+                bitmap_b64: base64_encode(read.dirty.as_bytes()),
+            }),
+            Err(e) => refuse(ErrorCode::Refused, e.to_string()),
+        }
+    }
+
+    /// Streams the disk blocks `selection` names on `conn`, then the reply.
+    ///
+    /// Every block is checked before the first byte goes out. A block that
+    /// cannot be read ends the stream with a `capture_failed` reply; a
+    /// connection that fails ends it with nothing more.
+    fn disk_blocks(
+        &mut self,
+        conn: &mut UnixStream,
+        stop: &StopToken,
+        selection: BlockSelection,
+    ) -> std::io::Result<()> {
+        if !self.vcpus.is_running() {
+            self.state = VmState::Stopping;
+        }
+        let dev = match self.disk() {
+            Ok(dev) => dev,
+            Err(refusal) => return send(conn, stop, &refusal),
+        };
+        let blocks = {
+            let dev = lock_or_recover(&dev);
+            match selection {
+                BlockSelection::Round(round) => match dev.last_round() {
+                    Some((last, set)) if last == round => Ok(set.iter().collect()),
+                    Some((last, _)) => Err(Error::new(
+                        ErrorCode::Refused,
+                        format!("round {round} is not the last round read, round {last} is"),
+                    )),
+                    None => Err(Error::new(
+                        ErrorCode::Refused,
+                        "no round has been read; ask disk-dirty first",
+                    )),
+                },
+                BlockSelection::Blocks(blocks) => {
+                    disk::check_blocks(&blocks, dev.dirty_since_boot().blocks())
+                        .map(|()| blocks)
+                        .map_err(|e| Error::new(ErrorCode::BadRequest, e))
+                }
+            }
+        };
+        let blocks: Vec<u64> = match blocks {
+            Ok(blocks) => blocks,
+            Err(e) => return send(conn, stop, &Response::Error(e)),
+        };
+        let mut lost: Option<std::io::Error> = None;
+        let exported = disk::export(
+            &dev,
+            &blocks,
+            &mut |bytes| match write_all(conn, stop, bytes) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let e =
+                        std::io::Error::new(std::io::ErrorKind::Interrupted, "the run is ending");
+                    lost = Some(std::io::Error::new(e.kind(), e.to_string()));
+                    Err(e)
+                }
+                Err(e) => {
+                    lost = Some(std::io::Error::new(e.kind(), e.to_string()));
+                    Err(e)
+                }
+            },
+        );
+        if let Some(e) = lost {
+            return if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(e)
+            };
+        }
+        let response = match exported {
+            Ok(sent) => Response::DiskBlocks(DiskBlocksReply {
+                blocks: sent.blocks,
+                bytes: sent.bytes,
+                batches: sent.batches,
+                generation: lock_or_recover(&dev).generation(),
+                max_lock_us: sent.max_lock_us,
+            }),
+            Err(e) => refuse(ErrorCode::CaptureFailed, format!("reading the disk: {e}")),
+        };
+        send(conn, stop, &response)
     }
 
     /// Returns the profile once it is complete, or the refusal to send.
@@ -1219,6 +1371,9 @@ mod tests {
         /// How long a `migrate` waits on its reader; the real limits when
         /// not set.
         stream: StreamLimits,
+        /// A virtio-blk device the capture holds, and its path, in place of
+        /// `disk`, so the test can write it as the guest would.
+        blk: Option<(Arc<Mutex<VirtioBlk>>, String)>,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -1365,9 +1520,11 @@ mod tests {
                 backend: "hvf",
                 sandbox_id: "fixture".into(),
                 ram,
-                block: spec.disk.as_ref().map(|path| {
-                    let dev = crate::devices::virtio::block::VirtioBlk::open(path).unwrap();
-                    (Arc::new(std::sync::Mutex::new(dev)), path.clone())
+                block: spec.blk.clone().or_else(|| {
+                    spec.disk.as_ref().map(|path| {
+                        let dev = crate::devices::virtio::block::VirtioBlk::open(path).unwrap();
+                        (Arc::new(std::sync::Mutex::new(dev)), path.clone())
+                    })
                 }),
                 net: spec.net.clone(),
                 vsock: None,
@@ -2776,5 +2933,196 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         server.join().unwrap();
+    }
+
+    /// A disk of `blocks` 64 KiB blocks and one sector, every 8-byte word
+    /// its own offset, as a device the guest writes; removed on drop.
+    struct TestDisk {
+        path: std::path::PathBuf,
+        dev: Arc<Mutex<VirtioBlk>>,
+    }
+
+    impl TestDisk {
+        #[allow(clippy::disallowed_methods)]
+        fn new(name: &str, blocks: u64) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("hvi-ctl-{}-{name}.img", std::process::id()));
+            let size = blocks * DIRTY_BLOCK_BYTES + 512;
+            let bytes: Vec<u8> = (0..size / 8).flat_map(|w| (w * 8).to_le_bytes()).collect();
+            std::fs::write(&path, bytes).unwrap();
+            let dev = VirtioBlk::open(path.to_str().unwrap()).unwrap();
+            Self {
+                path,
+                dev: Arc::new(Mutex::new(dev)),
+            }
+        }
+
+        fn spec(&self) -> Option<(Arc<Mutex<VirtioBlk>>, String)> {
+            Some((Arc::clone(&self.dev), self.path.display().to_string()))
+        }
+
+        /// Writes 64 bytes into block `block` as the guest would.
+        fn write(&self, block: u64, byte: u8) {
+            lock_or_recover(&self.dev).write_for_test(block * DIRTY_BLOCK_BYTES + 128, &[byte; 64]);
+        }
+
+        #[allow(clippy::disallowed_methods)]
+        fn bytes(&self) -> Vec<u8> {
+            std::fs::read(&self.path).unwrap()
+        }
+    }
+
+    impl Drop for TestDisk {
+        fn drop(&mut self) {
+            #[allow(clippy::disallowed_methods)]
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl Fixture {
+        /// Asks for `line`, reads the batches it streams into `image` at
+        /// their offsets, checking each digest, and returns the reply after
+        /// them with the batch headers.
+        fn stream(
+            &mut self,
+            line: &str,
+            image: &mut [u8],
+        ) -> (serde_json::Value, Vec<disk::BatchHeader>) {
+            use crate::checkpoint::bundle::hex;
+            use sha2::{Digest, Sha256};
+            use std::io::Read;
+            self.client.write_all(line.as_bytes()).unwrap();
+            self.client.write_all(b"\n").unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut text = String::new();
+                self.replies.read_line(&mut text).unwrap();
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value.get("v").is_some() {
+                    return (value, headers);
+                }
+                let header: disk::BatchHeader = serde_json::from_value(value).unwrap();
+                let mut bytes = vec![0u8; header.size as usize];
+                self.replies.read_exact(&mut bytes).unwrap();
+                assert_eq!(hex(&Sha256::digest(&bytes)), header.sha256);
+                let at = header.offset as usize;
+                image[at..at + bytes.len()].copy_from_slice(&bytes);
+                headers.push(header);
+            }
+        }
+    }
+
+    fn bitmap(reply: &serde_json::Value) -> Vec<u64> {
+        let bits =
+            crate::checkpoint::platform::base64_decode(reply["bitmap_b64"].as_str().unwrap())
+                .unwrap();
+        (0..bits.len() as u64 * 8)
+            .filter(|i| bits[(*i / 8) as usize] & (1 << (i % 8)) != 0)
+            .collect()
+    }
+
+    #[test]
+    fn the_disk_ops_need_a_root_and_a_disk() {
+        let mut f = Fixture::new("disk-noroot", 1, 0);
+        let r = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"boot"}"#));
+        assert_eq!(r["code"], "refused", "{r}");
+        assert!(r["error"].as_str().unwrap().contains("no checkpoint root"));
+        let r = reply(&f.ask(r#"{"v":1,"op":"disk-blocks","round":0}"#));
+        assert_eq!(r["code"], "refused", "{r}");
+        drop(f);
+        let mut f = Fixture::with(
+            "disk-nodisk",
+            Spec {
+                parking: 1,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"boot"}"#));
+        assert_eq!(r["error"], "the guest has no disk", "{r}");
+        assert_eq!(
+            reply(&f.ask(r#"{"v":1,"op":"status"}"#))["state"],
+            "running"
+        );
+    }
+
+    // The rounds of a move as hull drives them: round 0 while the guest
+    // runs, a pause, the final round, then the fence. The blocks applied to
+    // a copy of the base image make the disk the guest left.
+    #[test]
+    fn a_move_streams_its_rounds_onto_the_base_and_ends_with_the_disk() {
+        let disk = TestDisk::new("disk-move", 40);
+        let mut image = disk.bytes();
+        let mut f = Fixture::with(
+            "disk-move",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
+        assert_eq!(r["code"], "refused", "{r}");
+        assert!(r["error"].as_str().unwrap().contains("no round 0"), "{r}");
+
+        for block in [1, 2, 3, 40] {
+            disk.write(block, 0xa1);
+        }
+        let r0 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"boot"}"#));
+        assert_eq!(
+            (
+                &r0["since"],
+                &r0["round"],
+                &r0["blocks"],
+                &r0["dirty"],
+                &r0["generation"]
+            ),
+            (&"boot".into(), &0.into(), &41.into(), &4.into(), &4.into()),
+            "{r0}"
+        );
+        assert_eq!(r0["block_size"], 65536);
+        assert_eq!(bitmap(&r0), [1, 2, 3, 40]);
+        // Written after the read: round 1.
+        disk.write(7, 0xb2);
+        let (done, headers) = f.stream(r#"{"v":1,"op":"disk-blocks","round":0}"#, &mut image);
+        assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(
+            headers
+                .iter()
+                .map(|h| (h.first, h.count))
+                .collect::<Vec<_>>(),
+            [(1, 3), (40, 1)]
+        );
+        assert_eq!((&done["blocks"], &done["batches"]), (&4.into(), &2.into()));
+        assert_eq!(done["bytes"], 3 * 65536 + 512);
+        assert_eq!(done["generation"], 5);
+
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"pause"}"#))["state"], "paused");
+        let r1 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
+        assert_eq!(
+            (&r1["round"], &r1["generation"]),
+            (&1.into(), &5.into()),
+            "{r1}"
+        );
+        assert_eq!(bitmap(&r1), [7]);
+        let r = reply(&f.ask(r#"{"v":1,"op":"disk-blocks","round":0}"#));
+        assert_eq!(r["code"], "refused", "{r}");
+        assert!(r["error"].as_str().unwrap().contains("round 1 is"), "{r}");
+        // Named by number: a block past the disk is refused before a byte
+        // goes out, so the next line is the refusal.
+        let (r, headers) = f.stream(r#"{"v":1,"op":"disk-blocks","blocks":[7,41]}"#, &mut image);
+        assert_eq!(r["code"], "bad_request", "{r}");
+        assert!(headers.is_empty());
+        let (done, _) = f.stream(r#"{"v":1,"op":"disk-blocks","blocks":[7]}"#, &mut image);
+        assert_eq!(done["blocks"], 1, "{done}");
+        assert!(
+            image == disk.bytes(),
+            "the base and the rounds are not the disk"
+        );
+
+        assert_eq!(reply(&f.checkpoint("ck", "fence"))["state"], "fenced");
+        let r2 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
+        assert_eq!((&r2["round"], &r2["dirty"]), (&2.into(), &0.into()), "{r2}");
     }
 }
