@@ -460,7 +460,7 @@ pub(crate) fn kick_handle(vm: &VmFd, vcpu: &VcpuFd) -> std::io::Result<VcpuFd> {
 #[allow(clippy::disallowed_methods)]
 mod stop_tests {
     use super::*;
-    use crate::config::BootConfig;
+    use crate::config::{BootConfig, MachineProfileKind};
     use crate::plugin::{CpuHandle, VmHandle};
     use crate::run::StopHandle;
     use crate::signal::install_kick_handler;
@@ -587,6 +587,8 @@ mod stop_tests {
             checkpoint_root: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
+            profile: MachineProfileKind::Native,
+            arch_timer_irq: true,
             stop: None,
         }
     }

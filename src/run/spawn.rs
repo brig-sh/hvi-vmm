@@ -142,6 +142,8 @@ mod tests {
             checkpoint_root: None,
             plugin: None,
             sandbox: false,
+            profile: crate::config::MachineProfileKind::Native,
+            arch_timer_irq: true,
             stop: Some(registration),
         };
         let run = spawn(cfg).unwrap();

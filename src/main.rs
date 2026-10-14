@@ -287,6 +287,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dump_after = None;
     let mut trace_io = None;
     let mut sandbox = true;
+    let mut profile = config::MachineProfileKind::Native;
+    let mut arch_timer_irq = true;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -447,6 +449,12 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--trace-io" => trace_io = it.next().cloned(),
             "--no-sandbox" => sandbox = false,
+            "--profile" => {
+                profile = config::MachineProfileKind::from_name(
+                    it.next().ok_or("--profile needs a name")?,
+                )?;
+            }
+            "--no-arch-timer-irq" => arch_timer_irq = false,
             other => return Err(format!("unknown boot arg {other:?}").into()),
         }
     }
@@ -502,6 +510,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         control_sock,
         checkpoint_root,
         sandbox,
+        profile,
+        arch_timer_irq,
         // `None` rather than an empty chain, so without tools the hooks stay a
         // null check.
         plugin: if tools.is_empty() {

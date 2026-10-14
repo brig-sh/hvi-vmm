@@ -55,7 +55,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use hvi::config::BootConfig;
+use hvi::config::{BootConfig, MachineProfileKind};
 use hvi::plugin::{CpuHandle, IoSink, Plugin, VmHandle};
 
 /// Counts what crosses the devices. Shared with the vCPU thread, so every field
@@ -211,6 +211,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_root: None,
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,
+        profile: MachineProfileKind::Native,
+        arch_timer_irq: true,
         stop: None,
     };
 

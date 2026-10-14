@@ -212,6 +212,8 @@ struct Shared {
 
 /// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    cfg.validate()?;
+    cfg.require_native_profile("KVM")?;
     // The Linux backends serve only exports a caller's vhost-user daemon
     // serves. Starting a daemon is the caller's job, as it is for every other
     // VMM.
@@ -357,6 +359,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         net: has_net,
         vsock: has_vsock,
         fs_count: fs.len(),
+        timer: fdt::ArchTimer::Interrupts,
     };
 
     let ledger = Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
