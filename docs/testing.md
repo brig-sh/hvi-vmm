@@ -149,11 +149,11 @@ The workload is a loop that keeps a count in a shell variable, prints it every
 200 ms with the guest's uptime and wall clock, and holds a file open on fd 3
 after unlinking it. It also writes and syncs a file on `/dev/vda`. Beside it,
 a CPU-bound `awk` at the lowest priority sums 0.25 into a double and prints
-the count and the sum every 500000 additions. It is on a vCPU most of the
-time, so a capture most likely finds its floating-point registers and its
-thread pointer live in the vCPU, and a wrong restore of them shows as a sum
-that is not exact or a count that does not go on. That is a likely catch,
-not a certain one. The script:
+the count and the sum every 500000 additions. Its sums show that the guest's
+floating-point work goes on after a move, but not that a restore loaded the
+registers: busybox `awk` keeps its sum in memory, and a task off the CPU
+keeps its registers in guest RAM, so a restore that lost every SIMD register
+still gave exact sums. Step 5 checks the registers instead. The script:
 
 1. boots the guest with a control socket, a checkpoint root, the disk, the
    stub network and an agent socket, and gives it the host's wall clock;
@@ -170,7 +170,11 @@ not a certain one. The script:
    host;
 5. moves the guest once more, into a third process, holds it
    `restored-paused` for a second and checks that it printed nothing and its
-   clock did not move, then resumes it and checks it counts on;
+   clock did not move. It checkpoints it there with `then: "continue"` and
+   checks that every vCPU register in `cpu.json` and the interrupt
+   controller and timer state in `platform.json` equal the bundle's, less
+   the host's monotonic clock at the capture, and that the guest is still
+   `restored-paused`. Then it resumes it and checks it counts on;
 6. stops every process, checks that the disk generation in `disk.json` grew
    from the first move to the second, and reads the post-restore file from
    the image on the host with `debugfs`.
