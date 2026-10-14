@@ -20,12 +20,14 @@
 //! `hvf` on macOS, which `hvf_state` reads into a checkpoint. `esr` decodes the
 //! exception syndrome that Hypervisor.framework reports on a guest exit, and
 //! `smoke` checks Hypervisor.framework without a kernel. `profile` fills the
-//! parts of the machine profile both backends share.
+//! parts of the machine profile both backends share, and `portable` the
+//! hypervisor-neutral contract of the portable machine profile.
 
 pub mod esr;
 pub mod fdt;
 pub mod layout;
 pub mod loader;
+pub mod portable;
 pub(crate) mod profile;
 
 #[cfg(target_os = "macos")]
