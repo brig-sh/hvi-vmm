@@ -544,22 +544,25 @@ is refused for its backend.
   [Clock policy](#clock-policy)). Steps A to C run as above, but vCPU 0
   loads the software GICv2 from the canonical state in step B, and step C
   has nothing to load.
-- **KVM.** The VM, the vGICv2, RAM and the devices as above; then every
-  vCPU is created and initialised in index order, one that was off powered
-  off; the host check, the baseline and firmware registers, the counter
-  offset and `hvi-time`'s read-only memory slot as at boot; the vGIC's
-  `NR_IRQS` and init. Before any vCPU thread starts, each vCPU loads its
-  state with `KVM_SET_ONE_REG` by name, its `mp_state` and any pending
-  SError, and the vGIC loads the canonical state, every register read back.
-  KVM has no rule that a vCPU's own thread load it, so the main thread does,
-  before the seccomp filters go on.
+- **KVM.** The VM and the vGICv2; every vCPU created and initialised in
+  index order, one that was off powered off; the host check and the
+  baseline and firmware registers, as at boot, before guest RAM is copied
+  and the disk opened; then RAM and the devices as above; the counter
+  offset and `hvi-time`'s read-only memory slot; the vGIC's `NR_IRQS` and
+  init. Before any vCPU thread starts, each vCPU loads its state with
+  `KVM_SET_ONE_REG` by name, its `mp_state` and any pending SError, and the
+  vGIC loads the canonical state, every register read back
+  (`kvm_state::load_portable`). KVM has no rule that a vCPU's own thread
+  load it, so the main thread does, before the seccomp filters go on.
 
 Then, on both, each device's line is driven to the device's level, and the
 device's record of its line with it: loading the interrupt controller sets
 every line behind the devices' backs. The vCPUs and the I/O threads are held
 before they start, and the control socket reports `restored-paused`. The
 first vCPU to enter the guest after `resume` publishes `hvi-time`'s page,
-and every other vCPU waits for it before its own first entry.
+and every other vCPU waits for it before its own first entry. A checkpoint
+of the guest before that writes the state waiting to be published, which is
+the guest's, since it has not run.
 
 ### Moving between hosts
 
