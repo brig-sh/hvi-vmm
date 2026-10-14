@@ -284,8 +284,16 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
 }
 
 /// Keeps glibc's malloc to its main arena, so no thread under a filter ever
-/// makes it open a file. `main` calls this before anything else, while the
-/// process has one thread.
+/// makes it open a file.
+///
+/// Call it before any thread starts. The `hvi` binary does, once its arguments
+/// say the run is confined (a boot or restore without `--no-sandbox`, or
+/// `seccomp-selftest`). An embedder that boots with `sandbox` set calls it
+/// first in its own `main`. A KVM boot or restore with `sandbox` set calls it
+/// again before it starts a thread, which covers threads from then on but not
+/// an arena an earlier thread made: glibc keeps that arena after its thread
+/// exits and hands it to a later one, which may be filtered. Calling it more
+/// than once is harmless.
 ///
 /// glibc's malloc opens two files on its own, both from a thread that is
 /// allocating or freeing, and either is a `SIGSYS` under the `vmm` filter,
@@ -668,7 +676,8 @@ fn probes() -> Vec<Probe> {
         // The two files glibc's malloc opens by itself, from whichever thread
         // allocates or frees (`one_malloc_arena` has the detail). A guest
         // with busy agent traffic reached both, and the VMM died of SIGSYS
-        // mid-run. Each probe fails unless `main` kept malloc to one arena.
+        // mid-run. Each probe fails unless malloc is kept to one arena, as
+        // `hvi seccomp-selftest` does before it forks them.
         //
         // More than eight threads holding arenas at once: glibc's next arena
         // decision reads /sys/devices/system/cpu/online.
