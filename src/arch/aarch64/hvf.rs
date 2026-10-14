@@ -45,7 +45,7 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
-use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell};
+use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::irq::IrqLine;
@@ -343,9 +343,12 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -
     let mut p = arm64_profile::profile("hvf", machine);
     let config = VcpuConfig::new();
     for (name, reg) in FEATURE_REGS {
-        if let Ok(value) = config.get_feature_reg(reg) {
-            p.cpu.id_regs.insert(name.to_string(), hex(value));
-        }
+        // A register this macOS does not serve is recorded as unread, which
+        // the compatibility check refuses on either side.
+        let value = config
+            .get_feature_reg(reg)
+            .map_or_else(|_| UNKNOWN.to_string(), hex);
+        p.cpu.id_regs.insert(name.to_string(), value);
     }
     // `service_psci` answers PSCI_VERSION with 1.0.
     p.firmware.psci_version = Some("1.0".to_string());
