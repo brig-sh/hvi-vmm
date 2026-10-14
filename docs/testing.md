@@ -126,6 +126,49 @@ The boot jobs upload their logs on failure. The two arm64 Linux-guest jobs
 also upload the event ledger. `boot-x86` and `boot-unikraft-hvf` do not pass
 `--events`, so they record none.
 
+## The checkpoint end-to-end test
+
+`tools/checkpoint-e2e.sh` moves a running guest from one hvi process to
+another on a Mac, and checks that it carried on rather than rebooting. No CI
+job runs it yet; run it by hand on Apple silicon, with a signed release
+build:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload \
+    --out target/initramfs-workload.cpio
+tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
+    --initramfs target/initramfs-workload.cpio --out /tmp/e2e --cpus 2 --mem 512
+```
+
+The build must be of a commit with no uncommitted changes, since a restore
+refuses a profile whose hvi was built with them. The disk is an ext4 image the
+script makes with `mke2fs` from e2fsprogs; `--no-disk` runs without one.
+
+The workload is a loop that keeps a count in a shell variable, prints it every
+200 ms with the guest's uptime and wall clock, and holds a file open on fd 3
+after unlinking it. It also writes and syncs a file on `/dev/vda`. The script:
+
+1. boots the guest with a control socket, a checkpoint root, the disk, the
+   stub network and an agent socket, and gives it the host's wall clock;
+2. checkpoints it with `then: "fence"` and starts `hvi restore` as a second
+   process with its own sockets, then sends `resume` once it reports
+   `restored-paused`;
+3. checks that the count goes on from the captured one, that no boot banner
+   appears, that the guest's monotonic and wall clocks go on from the
+   capture, and that the fenced source printed nothing more;
+4. asks the guest, over the console, to print its count, read fd 3 and the
+   disk file, write and sync another file and time a `sleep 5` against the
+   host;
+5. moves the guest once more, into a third process, and checks it counts on;
+6. stops every process, and reads the post-restore file from the image on
+   the host with `debugfs`.
+
+It prints each check and writes `summary.json` with `pause_ms`,
+`capture_ms`, the bundle size, the time from starting `hvi restore` to its
+`restored-paused` reply, and the downtime from the checkpoint request, and
+from its reply, to the `resume` reply. It exits 1 when a check failed.
+[checkpoint.md](checkpoint.md#timings) has the figures.
+
 ## Toolchain versions
 
 Four places declare a Rust version. The first two hold the build pin, and the
