@@ -305,10 +305,10 @@ little-endian:
 | 0x04 | `u32 version` | 1 |
 | 0x08 | `u32 generation` | Odd while hvi writes the page. |
 | 0x0c | `u32 counter_freq_hz` | The host counter's rate. |
-| 0x10 | `u64 base_counter` | The guest's `CNTVCT_EL0` at the publish. |
-| 0x18 | `u64 base_ns` | Guest nanoseconds at the publish. |
+| 0x10 | `u64 base_counter` | The guest's `CNTVCT_EL0` at the boot publish or the last restore. A host-sleep publish keeps it. |
+| 0x18 | `u64 base_ns` | Guest nanoseconds at `base_counter`. |
 | 0x20 | `u32 mult`, 0x24 `u32 shift` | `ns = base_ns + ((cnt - base_counter) * mult) >> shift`, 96-bit product. |
-| 0x28 | `u64 wall_ns` | The host's `CLOCK_REALTIME` at the publish. |
+| 0x28 | `u64 wall_ns` | The host's `CLOCK_REALTIME` at guest nanosecond `base_ns`. |
 | 0x30 | `u64 downtime_total_ns` | Time the guest spent stopped across restores and host sleeps. |
 | 0x38 | `u64 flags` | 0. |
 
@@ -469,10 +469,14 @@ the host's by the sleep. hvi publishes the page again after a sleep:
   The two clocks of a pair share their rate and their adjustments, so the
   difference moves with nothing else.
 - When it grew by 50 ms or more since the last publish, the page is
-  published again on the same counter and rate: `base_counter` and
-  `base_ns` are now, `wall_ns` is the host's clock, `downtime_total_ns`
-  grows by how far the guest's wall clock was behind, and the generation
-  goes up by 2. Every vCPU gets `GEN_CHANGED`; deadlines stay as they are,
+  published again on the same counter, rate and base: `base_counter` and
+  `base_ns` stay, and `wall_ns` becomes the host's clock less the guest
+  nanoseconds since `base_ns`, so the guest's wall clock reads the host's.
+  The vCPUs run while the page is written, and a base moved to the
+  current counter would round guest nanoseconds down by up to 1 ns
+  between a read of the old page and one of the new.
+  `downtime_total_ns` grows by how far the guest's wall clock was behind,
+  and the generation goes up by 2. Every vCPU gets `GEN_CHANGED`; deadlines stay as they are,
   since guest nanoseconds did not jump. The driver then moves REALTIME and
   BOOTTIME on as after a restore, and MONOTONIC carries on. hvi logs
   `hvi-time: the host slept 30.000 s; published generation 4, the guest's

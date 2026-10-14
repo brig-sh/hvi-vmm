@@ -69,9 +69,10 @@
 //! thread wakes at least once a second and compares a host clock that runs
 //! only while the host sleeps ([`HostClock::slept_ns`]) with its value at the
 //! last publish. When it grew by [`SLEEP_REPUBLISH_NS`] or more, the page is
-//! published again as a restore publishes it, on the same counter and rate:
-//! guest nanoseconds go on, the wall clock is the host's, and every vCPU gets
-//! `GEN_CHANGED`, so the guest driver steps its wall clock forward.
+//! published again with only its wall clock changed: the counter, the rate
+//! and the base stay, so guest nanoseconds read the same on the old page and
+//! the new, and the wall clock is the host's again. Every vCPU gets
+//! `GEN_CHANGED`, so the guest driver sets its wall clock to the host's.
 //!
 //! The device knows nothing of the hypervisor. The backend supplies the
 //! guest's counter ([`GuestCounter`]) and the interrupt line ([`TimerLine`]),
@@ -376,15 +377,18 @@ pub struct PageState {
     pub generation: u32,
     /// The rate of the counter `base_counter` counts, in Hz.
     pub counter_freq_hz: u32,
-    /// The guest's counter at the publish.
+    /// The guest's counter at the boot publish or the last restore. A
+    /// host-sleep publish keeps it.
     pub base_counter: u64,
-    /// Guest nanoseconds at the publish.
+    /// Guest nanoseconds at `base_counter`.
     pub base_ns: u64,
     /// Nanoseconds per counter tick, scaled by `2^shift`.
     pub mult: u32,
     /// See `mult`.
     pub shift: u32,
-    /// The host's `CLOCK_REALTIME` at the publish, in nanoseconds.
+    /// The host's `CLOCK_REALTIME`, in nanoseconds, at guest nanosecond
+    /// `base_ns`: the guest's wall clock is `wall_ns` plus the guest
+    /// nanoseconds since `base_ns`.
     pub wall_ns: u64,
     /// How long the guest has been stopped across restores, in total.
     pub downtime_total_ns: u64,
@@ -984,10 +988,16 @@ impl HviTime {
     /// counter stops while a Mac sleeps, so the wall clock the guest derives
     /// from the page is behind the host's by the sleep.
     ///
-    /// The new page is a restore's on the same counter: guest nanoseconds go
-    /// on from now, the wall clock is the host's, and the downtime grows by
-    /// how far the guest's wall clock was behind. Every vCPU's `STATUS`
-    /// gains `GEN_CHANGED`, and the deadlines stay as they are, since guest
+    /// The new page keeps the counter, the rate, `base_counter` and
+    /// `base_ns`: the vCPUs run while it is written, and a guest that reads
+    /// the old page and then the new one at the same counter value reads the
+    /// same nanoseconds, which a page based at the current counter would
+    /// round down by up to 1 ns. Only `wall_ns` moves, to the host's wall
+    /// clock less the guest nanoseconds since `base_ns`, so the guest's wall
+    /// clock is the host's again. The downtime grows by how far the guest's
+    /// wall clock was behind; a guest ahead of the host is stepped back by
+    /// its driver, and adds nothing. Every vCPU's `STATUS` gains
+    /// `GEN_CHANGED`, and the deadlines stay as they are, since guest
     /// nanoseconds did not jump. A host whose counter ran through the sleep
     /// gets the same publish, with the wall clock 0 behind.
     ///
@@ -1013,9 +1023,9 @@ impl HviTime {
         let behind = wall.saturating_sub(guest_wall);
         g.clock = PageState {
             generation: g.clock.generation.wrapping_add(2),
-            base_counter: counter,
-            base_ns: now,
-            wall_ns: wall,
+            // The guest's wall clock is wall_ns plus the guest nanoseconds
+            // since base_ns: the host's wall clock now.
+            wall_ns: wall.wrapping_sub(now.wrapping_sub(g.clock.base_ns)),
             downtime_total_ns: g.clock.downtime_total_ns.saturating_add(behind),
             ..g.clock
         };
@@ -2270,15 +2280,16 @@ mod tests {
         let page = dev.page().read();
         assert_eq!(page.generation, before.generation + 2);
         assert_eq!((page.counter_freq_hz, page.mult), (24_000_000, 699_050_667));
-        assert_eq!(page.base_counter, 1000 + ticks(2_000_000_000));
-        // Guest nanoseconds go on where they were; the wall clock is the
-        // host's again, and the sleep counts as downtime.
-        assert!(
-            page.base_ns.abs_diff(2_000_000_000) <= 1,
-            "{}",
-            page.base_ns
+        // Guest nanoseconds go on where they were, on the same base; the
+        // wall clock is the host's again, and the sleep counts as downtime.
+        assert_eq!(
+            (page.base_counter, page.base_ns),
+            (before.base_counter, before.base_ns)
         );
-        assert_eq!(page.wall_ns, host.realtime());
+        assert_eq!(
+            page.wall_ns,
+            host.realtime() - (dev.now_ns() - page.base_ns)
+        );
         assert_eq!(page.downtime_total_ns, 30_000_000_000);
         assert_eq!(guest_wall(&dev), host.realtime());
         // Both vCPUs are told; the enabled one's line goes high, and its
@@ -2291,6 +2302,41 @@ mod tests {
         assert!(dev
             .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
             .is_none());
+    }
+
+    // The vCPUs run while a host-sleep publish is written, so a guest can
+    // read the old page and then the new one at the same counter value. Both
+    // must give the same nanoseconds: a page based at the publish's counter
+    // would give floor(a) + floor(b) where the old one gave floor(a + b), up
+    // to 1 ns less. And the driver's wall clock, wall_ns plus the guest
+    // nanoseconds since base_ns, is the host's from the publish on.
+    #[test]
+    fn a_host_sleep_publish_keeps_guest_nanoseconds_continuous() {
+        let (counter, lines, host) = (Counter::default(), Lines::default(), Host::new());
+        let dev = device_on(&counter, &lines, &host);
+        dev.publish_boot();
+        // 2 s in: the exact nanoseconds there are 2e9 + 0.95, so a base at
+        // this counter rounds the next tick's 41.67 ns away from the old
+        // page's sum.
+        let at = 1000 + ticks(2_000_000_000);
+        counter.set(at);
+        host.run(2_000_000_000);
+        let before = dev.page().read();
+        host.sleep(30_000_000_000);
+        dev.republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .expect("a 30 s sleep publishes");
+        let after = dev.page().read();
+        assert_eq!(after.generation, before.generation + 2);
+        for c in at..at + 64 {
+            assert_eq!(after.guest_ns(c), before.guest_ns(c), "counter {c}");
+        }
+        assert_eq!(
+            after.wall_ns + (after.guest_ns(at) - after.base_ns),
+            host.realtime()
+        );
+        counter.set(at + ticks(1_000_000_000));
+        host.run(1_000_000_000);
+        assert!(guest_wall(&dev).abs_diff(host.realtime()) <= 1);
     }
 
     // What the timer thread does not take for a sleep: a short one, and a
