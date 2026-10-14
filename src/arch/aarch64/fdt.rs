@@ -16,7 +16,8 @@
 //!
 //! Describes the hardware an arm64 guest gets: RAM, the vCPUs (PSCI
 //! enable-method), a GIC (v3 or v2), the architected timer, a PL011 UART for
-//! `earlycon`, and one node per virtio-mmio device. The addresses come from
+//! `earlycon`, one node per virtio-mmio device and, on the portable profile,
+//! the `hvi-time` clock and timer device. The addresses come from
 //! [`crate::arch::aarch64::layout`] so the DTB and the actual device placement
 //! cannot drift. Interrupt encodings follow the GICv3 convention
 //! (`<type number flags>`, type 0=SPI/1=PPI, flag 4=level-high); the timer PPI
@@ -29,9 +30,10 @@ use vm_fdt::{Error, FdtWriter};
 
 use crate::arch::aarch64::layout::{
     mpidr_affinity, virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, GicLayout,
-    GicVersion, GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI,
-    VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GicVersion, GuestLayout, HVI_TIME_PAGE_BASE, HVI_TIME_TIMERS_BASE, UART_BASE, UART_SIZE,
+    UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
+use crate::devices::hvitime;
 
 const PHANDLE_GIC: u32 = 1;
 const PHANDLE_CLK: u32 = 2;
@@ -46,8 +48,9 @@ const IRQ_LEVEL_HIGH: u32 = 4;
 /// the kernel needs before it calls its CRNG initialised.
 pub const RNG_SEED_LEN: usize = 64;
 
-/// The devicetree parts a boot chooses: the virtio-mmio nodes it backs and
-/// the shape of the architected timer's node.
+/// The devicetree parts a boot chooses: the virtio-mmio nodes it backs, the
+/// shape of the architected timer's node and whether the guest has
+/// `hvi-time`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VirtioDevices {
     /// Number of virtio-blk disks, at most [`crate::config::MAX_DISKS`].
@@ -56,6 +59,8 @@ pub struct VirtioDevices {
     pub vsock: bool,
     pub fs_count: usize,
     pub timer: ArchTimer,
+    /// The `hvi-time` node: the portable profile's clock and timers.
+    pub hvi_time: bool,
 }
 
 /// How `/timer` describes the architected timer.
@@ -70,7 +75,7 @@ pub enum ArchTimer {
     /// gives up ("No interrupt available, giving up") before it registers a
     /// clocksource, a clock event or `sched_clock`. Without any timer node
     /// the kernel panics in `time_init`, so the portable profile keeps this
-    /// one and its clock comes from elsewhere.
+    /// one and its clock comes from `hvi-time`.
     NoInterrupts {
         /// The rate the guest calibrates its delay loop with, in Hz.
         clock_frequency: u32,
@@ -103,6 +108,34 @@ fn timer_interrupts(fdt: &mut FdtWriter) -> Result<(), Error> {
             IRQ_LEVEL_HIGH, // hypervisor physical
         ],
     )
+}
+
+/// Writes the `hvi-time` node: the pvclock page, the timer blocks and the
+/// timers' PPI on every vCPU.
+///
+/// The page is listed in `reg`, not under `/memory`: the guest maps it
+/// itself, read-only, and must never allocate from it.
+fn hvi_time_node(fdt: &mut FdtWriter, num_cpus: u32) -> Result<(), Error> {
+    let node = fdt.begin_node(&format!("hvi-time@{HVI_TIME_PAGE_BASE:x}"))?;
+    fdt.property_string("compatible", "hvi,time-v1")?;
+    fdt.property_array_u64(
+        "reg",
+        &[
+            HVI_TIME_PAGE_BASE,
+            hvitime::PAGE_SIZE,
+            HVI_TIME_TIMERS_BASE,
+            hvitime::TIMERS_SIZE,
+        ],
+    )?;
+    fdt.property_array_u32("interrupts", &[IRQ_PPI, hvitime::PPI, ppi_flags(num_cpus)])?;
+    fdt.end_node(node)
+}
+
+/// The flags cell of a level-high PPI that reaches `num_cpus` vCPUs: under
+/// the GICv2 binding bits 15:8 are the CPU mask.
+fn ppi_flags(num_cpus: u32) -> u32 {
+    let mask = (1u32 << num_cpus.clamp(1, 8)) - 1;
+    (mask << 8) | IRQ_LEVEL_HIGH
 }
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
@@ -205,6 +238,10 @@ pub fn build(
     // deep idle states.
     fdt.property_null("always-on")?;
     fdt.end_node(timer)?;
+
+    if devices.hvi_time {
+        hvi_time_node(&mut fdt, num_cpus)?;
+    }
 
     // /intc: GICv3 distributor + redistributor, or GICv2 distributor + CPU
     // interface. The `reg` shape is the same two regions either way; only the
@@ -574,6 +611,59 @@ pub(crate) mod tests {
             prop(&without, "timer", "clock-frequency"),
             Some(54_000_000u32.to_be_bytes().to_vec())
         );
+    }
+
+    /// The portable profile's `hvi-time` node: two windows, PPI 4 on every
+    /// vCPU, and nothing of it under `/memory`.
+    #[test]
+    fn hvi_time_node_follows_the_spec() {
+        let build_with = |hvi_time, cpus| {
+            build(
+                &sample_layout(0),
+                &GicLayout::QEMU_VIRT_V2,
+                cpus,
+                "",
+                VirtioDevices {
+                    hvi_time,
+                    timer: ArchTimer::NoInterrupts {
+                        clock_frequency: ArchTimer::PORTABLE_HZ,
+                    },
+                    ..VirtioDevices::default()
+                },
+                &SEED,
+                KASLR_SEED,
+            )
+            .unwrap()
+        };
+        assert!(!contains(&build_with(false, 1), "hvi,time-v1"));
+        let blob = build_with(true, 1);
+        assert_eq!(
+            prop(&blob, "hvi-time@d100000", "compatible").unwrap(),
+            b"hvi,time-v1\0"
+        );
+        let mut reg = Vec::new();
+        for v in [0x0d10_0000u64, 0x1_0000, 0x0d11_0000, 0x1_0000] {
+            reg.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(prop(&blob, "hvi-time@d100000", "reg").unwrap(), reg);
+        let cells = |blob: &[u8]| -> Vec<u32> {
+            prop(blob, "hvi-time@d100000", "interrupts")
+                .unwrap()
+                .chunks(4)
+                .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        // PPI 4 (INTID 20), level high, CPU mask (1 << N) - 1.
+        assert_eq!(cells(&blob), [1, 4, 0x104]);
+        assert_eq!(cells(&build_with(true, 2)), [1, 4, 0x304]);
+        assert_eq!(cells(&build_with(true, 4)), [1, 4, 0xf04]);
+        assert_eq!(cells(&build_with(true, 8)), [1, 4, 0xff04]);
+        // `/memory` is RAM alone.
+        let mut mem = Vec::new();
+        for v in [0x4000_0000u64, 512 << 20] {
+            mem.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(prop(&blob, "memory@", "reg").unwrap(), mem);
     }
 
     /// `/chosen` carries the seed it was given, all 64 bytes of it.

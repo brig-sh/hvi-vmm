@@ -86,6 +86,16 @@ pub const VIRTIO_BLK_EXTRA_SPI: u32 = 5;
 pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
 pub const VIRTIO_FS_SPI: u32 = VIRTIO_BLK_EXTRA_SPI + MAX_DISKS as u32 - 1;
 
+/// The pvclock page of the `hvi-time` device, on the portable profile only:
+/// [`crate::devices::hvitime::PAGE_SIZE`] bytes of memory hvi writes and the
+/// guest maps read-only. It is not guest RAM, so `/memory` does not list it.
+/// 1 MiB above the virtio windows, so that the virtio-fs windows, which
+/// climb from [`VIRTIO_FS_BASE`], would need over two thousand shares to
+/// reach it, and 64 KiB-aligned, which every host's page size divides.
+pub const HVI_TIME_PAGE_BASE: u64 = 0x0d10_0000;
+/// The per-vCPU timer blocks of the `hvi-time` device, right above its page.
+pub const HVI_TIME_TIMERS_BASE: u64 = 0x0d11_0000;
+
 /// Number of interrupts the guest's GIC is created with.
 ///
 /// A multiple of 32, and the ceiling every SPI in this layout is checked
@@ -411,6 +421,7 @@ impl GuestLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::hvitime;
 
     // KVM resets vCPU `index` to this numbering, and the devicetree has to name
     // each vCPU the same way for the guest's CPU_ON to reach it.
@@ -571,6 +582,50 @@ mod tests {
         place_virtio_fs(0, &gic, Some(GIC_NUM_IRQS)).expect("an export");
     }
 
+    // The page is a memory slot on KVM, which has to start and end on a
+    // host page, and the Pi runs 16 KiB pages; Apple silicon does too. Both
+    // windows must also stay off every other device a portable guest has.
+    #[test]
+    fn hvi_time_windows_are_page_aligned_and_clear_of_the_other_devices() {
+        for (base, size) in [
+            (HVI_TIME_PAGE_BASE, hvitime::PAGE_SIZE),
+            (HVI_TIME_TIMERS_BASE, hvitime::TIMERS_SIZE),
+        ] {
+            assert_eq!(base % 0x1_0000, 0, "{base:#x}");
+            assert_eq!(size % 0x4000, 0, "{size:#x}");
+        }
+        assert_eq!(
+            HVI_TIME_PAGE_BASE + hvitime::PAGE_SIZE,
+            HVI_TIME_TIMERS_BASE,
+            "the timers sit right above the page"
+        );
+        let hvi_time = HVI_TIME_PAGE_BASE..HVI_TIME_TIMERS_BASE + hvitime::TIMERS_SIZE;
+        let v2 = GicLayout::QEMU_VIRT_V2;
+        let others = [
+            (v2.gicd_base, v2.gicd_size),
+            (v2.gicr_base, v2.gicr_size),
+            (UART_BASE, UART_SIZE),
+            (VIRTIO_BASE, VIRTIO_SIZE),
+            (VIRTIO_NET_BASE, VIRTIO_SIZE),
+            (VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
+        ];
+        let disks = (1..MAX_DISKS).map(|i| (virtio_blk_base(i).unwrap(), VIRTIO_SIZE));
+        for (base, size) in others.into_iter().chain(disks) {
+            assert!(
+                base + size <= hvi_time.start || base >= hvi_time.end,
+                "{base:#x}+{size:#x} overlaps hvi-time"
+            );
+        }
+        // The eight vCPUs a GICv2 reaches have a timer block each.
+        assert!(u64::from(GicLayout::V2_MAX_CPUS) * hvitime::BLOCK_STRIDE <= hvitime::TIMERS_SIZE);
+        // A native guest's virtio-fs windows, which climb, stay clear of it
+        // for far more shares than anyone exports.
+        let fs_end = virtio_fs_base(255).unwrap() + VIRTIO_SIZE;
+        assert!(fs_end <= hvi_time.start, "{fs_end:#x}");
+        // Not RAM: below RAM_BASE, so `/memory` cannot cover it.
+        assert!(hvi_time.end <= RAM_BASE);
+    }
+
     // Every disk adds a window and an SPI. Neither may land on another device,
     // and the exports start right after the last disk slot.
     #[test]
@@ -648,6 +703,12 @@ mod tests {
             ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
             ("virtio-fs", VIRTIO_FS_BASE, VIRTIO_SIZE),
             ("last virtio-blk", last_disk, VIRTIO_SIZE),
+            ("hvi-time page", HVI_TIME_PAGE_BASE, hvitime::PAGE_SIZE),
+            (
+                "hvi-time timers",
+                HVI_TIME_TIMERS_BASE,
+                hvitime::TIMERS_SIZE,
+            ),
         ];
         for (name, base, size) in windows {
             assert!(
