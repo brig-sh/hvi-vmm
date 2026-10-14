@@ -16,10 +16,11 @@
 //!
 //! The machine profile carries it, and a checkpoint is refused on an hvi built
 //! from another commit, since the device state it holds is only defined by the
-//! code that wrote it. A tree with uncommitted changes gets a `-dirty` suffix.
+//! code that wrote it. A tree with uncommitted changes gets a `-dirty` suffix,
+//! which no profile check accepts either, since it does not say which changes.
 //! A build with no git, such as one from a source tarball, reads
 //! `HVI_GIT_SHA` from the environment or records `unknown`, which no profile
-//! check accepts.
+//! check accepts. Whoever sets `HVI_GIT_SHA` vouches that it names the code.
 
 use std::process::Command;
 
