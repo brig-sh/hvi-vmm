@@ -920,6 +920,26 @@ impl VirtioBlk {
         Ok(base)
     }
 
+    /// Writes `buf` at byte `base` of the disk, as a guest write does, once
+    /// [`byte_range`](Self::byte_range) has checked the range.
+    ///
+    /// The blocks are marked before the write, so a write that fails part
+    /// way is still in the next round: the blocks may hold some of it.
+    fn write_at(&mut self, base: u64, buf: &[u8]) -> std::io::Result<()> {
+        self.dirty.mark(base, buf.len() as u64);
+        self.file.write_all_at(buf, base)?;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Writes `buf` at byte `base` as a guest write would, for a test that
+    /// has no queue to post one on.
+    #[cfg(test)]
+    pub(crate) fn write_for_test(&mut self, base: u64, buf: &[u8]) {
+        self.byte_range(base / SECTOR, buf.len() as u64).unwrap();
+        self.write_at(base, buf).unwrap();
+    }
+
     /// Runs a single virtio-blk request. The first readable segment is the
     /// 16-byte header (type, _, sector); the last writable segment is the
     /// status byte; the segments between carry data.
@@ -967,12 +987,8 @@ impl VirtioBlk {
                     mem.read(a, &mut buf[o..o + l as usize]).map_err(other)?;
                     o += l as usize;
                 }
-                // Marked before the write, so a write that fails part way
-                // is still sent: the blocks may hold some of it.
-                self.dirty.mark(base, total as u64);
-                self.file.write_all_at(&buf, base).map_err(other)?;
+                self.write_at(base, &buf).map_err(other)?;
                 data_bytes = total as u64;
-                self.generation += 1;
             }
             VIRTIO_BLK_T_FLUSH => {
                 // Honour the guest's cache flush (durability for fsync).
