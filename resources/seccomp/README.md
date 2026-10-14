@@ -75,10 +75,12 @@ allocating or freeing at the time:
 Both reads were found on a Raspberry Pi 5 running Debian 12. A guest with heavy
 agent traffic kept enough vsock bridge threads allocating at once to reach
 them, and the VMM died of `SIGSYS`. Allowing `openat` would undo the point of
-the lists, so hvi keeps glibc's malloc to its main arena instead.
-`mallopt(M_ARENA_MAX, 1)` is the first thing `main` does, while the process has
-one thread. With the limit set, glibc never counts CPUs, and with no other
-arena there is no other heap to shrink. `MALLOC_ARENA_MAX=4` in the
+the lists, so a confined run keeps glibc's malloc to its main arena instead.
+`main` calls `mallopt(M_ARENA_MAX, 1)` once the arguments say the run is
+confined, while the process still has one thread, and a KVM boot or restore
+sets it again before its first thread. With the limit set, glibc never counts
+CPUs, and with no other arena there is no other heap to shrink. A
+`--no-sandbox` run installs no filter and keeps glibc's default arenas. `MALLOC_ARENA_MAX=4` in the
 environment avoids the first read and not the second, so it is not a
 workaround.
 

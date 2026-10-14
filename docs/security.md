@@ -116,8 +116,8 @@ default action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
 
 No list allows `openat` outside `control`, and glibc's malloc would otherwise
-open a sysfs or procfs file from a filtered thread, so on glibc `main` keeps
-malloc to one arena before any thread starts (see
+open a sysfs or procfs file from a filtered thread, so on glibc a confined run
+keeps malloc to one arena, set before any thread starts (see
 [the allowlists' README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself)).
 
 seccomp cannot filter the path a call names. The `control` filter therefore

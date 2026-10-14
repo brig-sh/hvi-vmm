@@ -166,8 +166,8 @@ Setting it after a share is already answering hands the guest a home it cannot
 write.
 
 **glibc's malloc on Linux.** The `hvi` binary calls
-`hvi::sandbox::seccomp::one_malloc_arena()` first in `main`, while it has one
-thread. An embedder that boots with `sandbox: true` on a glibc build must do the
+`hvi::sandbox::seccomp::one_malloc_arena()` before a confined run, while it
+has one thread. An embedder that boots with `sandbox: true` on a glibc build must do the
 same in its own `main`, before it starts any thread. Without it, glibc's malloc
 can open a file from a filtered thread, and the seccomp filter kills the process
 with `SIGSYS`. The setting is process-wide, so the embedder's own threads share
