@@ -72,6 +72,11 @@ A run started with `--checkpoint-root` adds one more subtree rule,
 thread can write checkpoint bundles there. The whole process gets it, as with an
 export. Nothing else outside the exports can be written.
 
+Because the rule is process-wide, a compromised hvi can read and write every
+bundle below its root from any thread, and a bundle holds the guest's RAM in
+clear. Give each hvi process a root of its own, mode 0700, and never share one
+between sandboxes.
+
 A writable export adds one more: `system-fsctl` for the single command
 `FSIOC_SYNC_VOLUME`, which is how SYNCFS writes out the export's volume
 (`sync_volume_np(3)`). It is a command filter, not a path filter, so the
@@ -108,6 +113,12 @@ test. That thread parses the control protocol, never guest data, and without a
 checkpoint root it installs `vmm` like the other I/O threads. All three use a
 default action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
+
+seccomp cannot filter the path a call names. The `control` filter therefore
+lets that one thread read, create, rename and remove files anywhere the user
+hvi runs as can, not only below the checkpoint root. On Linux the rule that a
+bundle goes below the root is hvi's own path check, not the kernel's. The
+advice for macOS above holds here as well: one private root per hvi process.
 
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
@@ -170,6 +181,9 @@ sandbox is secure.
 - **It does not constrain syscall arguments.** No rule in either architecture
   file carries an argument condition, so `ioctl` and `sendmsg` are
   unconstrained over every descriptor the process already holds.
+- **It does not hold the checkpoint writer to its root on Linux.** The
+  control socket's thread of a run with `--checkpoint-root` can open files by
+  any path. Only hvi's own path check keeps bundles below the root.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 
