@@ -367,6 +367,23 @@ pub fn smccc_arch_features(function: u32) -> u64 {
     }
 }
 
+/// Checks that the guest counter KVM reports (`KVM_REG_ARM_TIMER_CNT`),
+/// `guest`, lies within hvi's reads before and after it, `[before, after]`,
+/// widened by `slack` ticks on each side.
+///
+/// # Errors
+///
+/// Errors naming both values when it does not.
+pub fn check_guest_counter(guest: u64, before: u64, after: u64, slack: u64) -> Result<(), String> {
+    if (before.saturating_sub(slack)..=after.saturating_add(slack)).contains(&guest) {
+        Ok(())
+    } else {
+        Err(format!(
+            "KVM_REG_ARM_TIMER_CNT reads {guest}, and hvi's view of the guest counter \
+             around that read is [{before}, {after}] (slack {slack} ticks)"
+        ))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +647,20 @@ mod tests {
             .map(|(_, v)| *v)
             .unwrap();
         assert_eq!((pfr0 >> 24) & 0xf, 0);
+    }
+
+    #[test]
+    fn a_guest_counter_outside_hvis_view_is_refused() {
+        assert!(check_guest_counter(92, 52, 99, 54).is_ok());
+        // The slack covers an ioctl's worth of skew either side.
+        assert!(check_guest_counter(0, 52, 99, 54).is_ok());
+        assert!(check_guest_counter(153, 52, 99, 54).is_ok());
+        let e = check_guest_counter(154, 52, 99, 54).unwrap_err();
+        assert!(e.contains("154") && e.contains("[52, 99]"), "{e}");
+        // A counter in another domain, as on a host where the offset did
+        // not take.
+        let e = check_guest_counter(3_000_000_000, 52, 99, 54).unwrap_err();
+        assert!(e.contains("3000000000"), "{e}");
+        assert!(check_guest_counter(5, 100, 200, 54).is_err());
     }
 }
