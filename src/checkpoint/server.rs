@@ -54,7 +54,7 @@ use crate::checkpoint::control::{
 use crate::checkpoint::cpu::{Output, VcpuState};
 use crate::checkpoint::platform::PlatformState;
 use crate::checkpoint::profile::{MachineProfile, ProfileCell};
-use crate::config::{MachineProfileKind, Stop};
+use crate::config::Stop;
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus, WorkResult};
@@ -495,15 +495,6 @@ impl<K: Kick> Machine<'_, K> {
                     "the guest has {} virtio-fs share(s), whose state is host files that do \
                      not move",
                     profile.fs_shares
-                ),
-            );
-        }
-        if profile.profile != MachineProfileKind::Native.name() {
-            return refuse(
-                ErrorCode::Refused,
-                format!(
-                    "the guest has the {} machine profile, which no backend checkpoints yet",
-                    profile.profile
                 ),
             );
         }
@@ -1737,7 +1728,12 @@ mod tests {
             std::fs::symlink_metadata(&dir).is_err(),
             "a refusal left a directory"
         );
+    }
 
+    // The portable machine is captured as the native one is: its profile is
+    // no reason to refuse.
+    #[test]
+    fn a_portable_guest_is_captured() {
         let mut portable = Fixture::with(
             "ck-portable",
             Spec {
@@ -1747,16 +1743,11 @@ mod tests {
                 ..Spec::default()
             },
         );
-        let dir = portable.root.join("ck");
-        refused(
-            &mut portable,
-            &format!(r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#, dir.display()),
-            "the portable-arm64-v1 machine profile, which no backend checkpoints yet",
-        );
-        assert!(
-            std::fs::symlink_metadata(&dir).is_err(),
-            "a refusal left a directory"
-        );
+        let r = reply(&portable.checkpoint("ck", "continue"));
+        assert_eq!(r["ok"], true, "{r}");
+        portable.assert_running();
+        let bundle = crate::checkpoint::bundle::Bundle::open(&portable.root.join("ck")).unwrap();
+        assert_eq!(bundle.profile().profile, "portable-arm64-v1");
     }
 
     // A vCPU that never parks fails the capture in time, and the VM runs on.
