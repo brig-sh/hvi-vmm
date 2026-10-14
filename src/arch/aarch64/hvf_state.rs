@@ -327,6 +327,9 @@ fn export_vcpu(cpu: u32, vcpu: &Vcpu) -> io::Result<Output> {
         timer: Some(VcpuTimer { vtimer_masked }),
         backend: "hvf".to_string(),
         kvm_extra: std::collections::BTreeMap::new(),
+        firmware: std::collections::BTreeMap::new(),
+        fixed: std::collections::BTreeMap::new(),
+        events: None,
         unavailable,
         partial: false,
     });
