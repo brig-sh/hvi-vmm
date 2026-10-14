@@ -209,7 +209,7 @@ assume a count. It returns one region on arm64, and on x86-64 one region up to
 flowchart TB
     A["Payload::load: linux-loader PE::load(kernel)<br/>magic check, kernel@RAM_BASE+text_offset<br/>image_size read from the header"] --> B
     B["LoadedKernel::plan: GuestLayout::new<br/>dtb@align2M(kernel+image_size)<br/>initrd@align4K(dtb_end)"] --> C
-    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011<br/>virtio_mmio@… per device"] --> D
+    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011<br/>virtio_mmio@… per device<br/>hvi-time@d100000 (portable profile)"] --> D
     D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
 ```
 
@@ -219,7 +219,11 @@ PSCI with `method = "hvc"`, the interrupt controller the backend chose
 for its vGICv2), the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock,
 the PL011 console as `stdout-path`, and one `virtio_mmio@…` node per backed
 device. The timer node is marked `always-on`, because the hypervisor keeps each
-vCPU's timer while the vCPU is out of the guest.
+vCPU's timer while the vCPU is out of the guest. Under `--profile
+portable-arm64-v1` both backends take the tree's inputs from
+`portable::devicetree`: `/timer` has a fixed `clock-frequency` and no
+interrupts, and an `hvi-time` node describes the clock device, so one
+configuration gives the same tree on both hosts.
 
 `/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
 every boot. Under HVF it is the guest's only entropy source at boot, since the
@@ -249,13 +253,16 @@ On KVM each vCPU starts with PSCI 0.2, and with address and generic pointer
 authentication when KVM supports both. KVM hides pointer authentication from a
 guest whose vCPUs do not ask for it. Under HVF the guest gets the CPU features
 Hypervisor.framework passes through, which on Apple silicon include pointer
-authentication.
+authentication. A `--profile portable-arm64-v1` guest gets it on neither: the
+profile's baseline ID registers show no pointer authentication, and its KVM
+vCPUs do not ask for it.
 
 The GIC version is not a choice. KVM offers the vGIC that matches the host, so
 a GIC-400 host gets v2 and refuses more than 8 vCPUs, and a GICv3 host gets
 v3. The macOS backend is v3, because Apple's `hv_gic` is one, unless the boot
 asks for `--profile portable-arm64-v1`. That profile creates no `hv_gic` and
-gives the guest hvi's software GICv2 at the v2 addresses (see
+gives the guest hvi's software GICv2 at the v2 addresses. On KVM the same
+profile asks for a vGICv2 alone and refuses a host without one (see
 [portable-profile.md](portable-profile.md)).
 
 A v3 guest on KVM takes at most 507 vCPUs, since each vCPU adds a redistributor
@@ -348,7 +355,8 @@ thing that differs by backend:
   (`devices/gicv2.rs`), and every vCPU the GIC routes it to, other than the
   calling thread's own, is woken. See [The software GICv2](#the-software-gicv2).
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
-  vGICv2 and vGICv3.
+  vGICv2 and vGICv3. The `hvi-time` timers raise a PPI instead, with the
+  vCPU index in the line number.
 - **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7.
 
 ### Devices
@@ -363,6 +371,10 @@ thing that differs by backend:
 - **virtio-fs** (`devices/virtio/fs/`, id 26, macOS only) serves the guest's
   FUSE messages itself over a hiprio and a request queue. See
   [storage-and-sharing.md](storage-and-sharing.md).
+- **hvi-time** (`devices/hvitime.rs`, portable profile only) is the guest's
+  clock and timers: a read-only pvclock page at `0x0d100000` and one timer
+  block per vCPU at `0x0d110000`, raising PPI 20. See
+  [hvi-time](#hvi-time) below.
 
 A write of 0 to a device's STATUS register resets it: every queue returns to
 its unprogrammed state, the interrupt is withdrawn, and state the driver
@@ -420,6 +432,26 @@ run weekly.
 Every descriptor-chain walker refuses an index outside the ring and caps the
 walk at the ring size, so a cycle runs out of budget. Re-programming any queue
 register clears `ready`.
+
+### hvi-time
+
+`devices/hvitime.rs` gives a portable guest a clock in nanoseconds, so that
+it keeps time at one rate on hosts whose counters do not (24 MHz on Apple
+silicon, 54 MHz on the Pi). It knows nothing of the hypervisor:
+
+- The backend supplies the guest's counter (`GuestCounter`) and the timers'
+  lines (`TimerLine`), maps the page read-only into the guest and routes the
+  timer window to `HviTime::mmio_read` and `mmio_write`.
+- hvi writes the page under a sequence count at boot and at every restore.
+  The guest reads it without an exit.
+- One thread per VM, started with the I/O threads and ended before them,
+  sleeps until the earliest armed deadline and raises the vCPU's line. On
+  macOS it runs under `THREAD_TIME_CONSTRAINT_POLICY`, on Linux with a 1 ns
+  timer slack and the `vmm` seccomp filter.
+- Lock order: the device's lock, then the GIC's. Wakes of vCPUs happen after
+  the device's lock is released.
+- `HviTime::state` and `HviTime::restore` carry its canonical checkpoint
+  state.
 
 ## 5. Concurrency and failure
 
@@ -536,10 +568,10 @@ how it works.
 | Crate root and backend selection | `lib.rs`, `arch/<arch>/mod.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
 | Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
-| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
+| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `portable.rs`, `profile.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `acpi_pm.rs`; `devices/irq.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `acpi_pm.rs`; `devices/irq.rs`; `devices/gicv2.rs`, `devices/hvitime.rs` (portable profile) |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Control socket, checkpoints and restore | `checkpoint/`: `control.rs`, `server.rs`, `profile.rs`, `capture.rs`, `bundle.rs`, `ram.rs`, `cpu.rs`, `platform.rs`, `restore.rs`; `arch/aarch64/hvf_state.rs` for HVF |
