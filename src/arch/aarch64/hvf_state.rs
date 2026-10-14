@@ -50,7 +50,7 @@ use crate::checkpoint::platform::{
 };
 use crate::checkpoint::profile::counter_freq_hz;
 use crate::devices::gicv2::Gicv2;
-use crate::devices::hvitime::HviTime;
+use crate::devices::hvitime::{HviTime, PendingPublish};
 use crate::sync::lock_or_recover;
 
 /// The VM handle once the GICv3 is configured.
@@ -254,7 +254,8 @@ fn check_kvm_parts(state: &Aarch64Vcpu) -> io::Result<()> {
 /// The platform is read with the device frozen, so no timer fires between
 /// its state and the GIC's; the caller thaws it if the guest goes on. A
 /// restore loads the GIC in the platform step and leaves `hvi-time` to the
-/// guest's resume, when its page is published.
+/// guest's resume, when its page is published; until then `pending` holds
+/// the state, and a capture writes that.
 ///
 /// # Errors
 ///
@@ -264,6 +265,7 @@ pub(crate) fn serve_portable(
     vcpu: &Vcpu,
     gic: &std::sync::Mutex<Gicv2>,
     hvitime: &HviTime,
+    pending: Option<&PendingPublish>,
     work: Work<'_>,
 ) -> io::Result<Option<Output>> {
     match work {
@@ -272,8 +274,15 @@ pub(crate) fn serve_portable(
             irq: None,
         })),
         Work::ExportPlatform if cpu == 0 => {
-            hvitime.freeze();
-            let timer = hvitime.state();
+            // A restored guest that has not run since holds the restored
+            // state, which the device gets only at the resume.
+            let timer = match pending.and_then(PendingPublish::unpublished) {
+                Some(state) => state.clone(),
+                None => {
+                    hvitime.freeze();
+                    hvitime.state()
+                }
+            };
             let irq = lock_or_recover(gic).state();
             Ok(Some(Output::Platform {
                 platform: PlatformState {
