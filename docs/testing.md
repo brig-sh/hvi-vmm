@@ -129,9 +129,9 @@ also upload the event ledger. `boot-x86` and `boot-unikraft-hvf` do not pass
 ## The checkpoint end-to-end test
 
 `tools/checkpoint-e2e.sh` moves a running guest from one hvi process to
-another on a Mac, and checks that it carried on rather than rebooting. No CI
-job runs it yet; run it by hand on Apple silicon, with a signed release
-build:
+another on the same host, and checks that it carried on rather than
+rebooting. No CI job runs it yet; run it by hand on Apple silicon, with a
+signed release build, or with `--portable` on an arm64 KVM host too:
 
 ```sh
 python3 tools/mk-initramfs.py --checkpoint-workload \
@@ -180,6 +180,28 @@ It prints each check and writes `summary.json` with `pause_ms`,
 `restored-paused` reply, and the downtime from the checkpoint request, and
 from its reply, to the `resume` reply. It exits 1 when a check failed.
 [checkpoint.md](checkpoint.md#timings) has the figures.
+
+`--portable` boots the portable profile instead, on the Mac or on a Pi 5,
+with the portable kernel and an initramfs that also holds `el0check` (the
+portable kernel's `test/el0check.c`) and `tfd` (`tools/guest/tfd.c`), both
+static arm64 binaries:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --out target/initramfs-portable.cpio
+tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-portable.cpio --out /tmp/e2e-p --cpus 1 \
+    --mem 512 --portable
+```
+
+Just before the capture it starts a 6 s `timerfd` and a 6 s `sleep`. Beside
+the checks above, it checks that the clocksource is `hvi-time` and
+`el0check` passes before and after the move, that both timers fire after
+the resume 6 s of guest time after they were armed, that the guest driver
+logged the move and reads `migrations=1`, and that the guest's wall clock
+is the host's again. The uptime the ticks carry is `CLOCK_BOOTTIME`, which
+`hvi-time` moves on by the downtime, so the continuity checks take the
+downtime the restore logged off.
 
 ## Toolchain versions
 

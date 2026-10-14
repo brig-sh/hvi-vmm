@@ -90,8 +90,8 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>>;
 `RestoreConfig` names the bundle, the control socket the guest waits on for
 `resume`, and the host resources the guest's devices need. It returns as
 `boot` does, and the same rules apply to stdin, the kick signal and the
-threads. See [checkpoint.md](checkpoint.md#restoring-a-bundle). There is no
-KVM restore yet.
+threads. See [checkpoint.md](checkpoint.md#restoring-a-bundle). On arm64
+KVM it restores the portable profile only; there is no x86-64 restore yet.
 
 ## A minimal caller
 
