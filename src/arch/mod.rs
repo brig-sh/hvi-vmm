@@ -18,8 +18,8 @@
 //! boot-time description of the machine: a devicetree on arm64, and an e820
 //! map, an MP table and ACPI tables on x86-64. Each backend runs one guest
 //! architecture on one hypervisor, so it sits under its architecture and is
-//! named for its hypervisor. The crate root re-exports the host target's
-//! backend as `hvi::boot`.
+//! named for its hypervisor. [`crate::boot`] calls the backend for the host
+//! target.
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;

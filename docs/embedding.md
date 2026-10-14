@@ -23,13 +23,18 @@ before signing it. Pinning a commit is the supported way to depend on hvi.
 
 ## The entry point
 
-Every backend exposes the same function, and the crate root re-exports the one
-for the host target as `hvi::boot`, so a caller writes one line whatever the
-host:
+`hvi::boot` boots on the backend for the host target, so a caller writes one
+line whatever the host:
 
 ```rust
-pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
+pub fn boot(cfg: BootConfig) -> Result<Stop, BootError>;
 ```
+
+`BootError` implements `Error`, `Send` and `Sync`, so `?` turns it into a
+`Box<dyn Error>`, and it can be returned from another thread. Its message is
+that of the error that failed the run, and it names any thread the run left
+running. `BootError::get_ref` returns that error, which a caller can downcast to
+tell one failure from another, and `BootError::into_inner` hands it over.
 
 `Stop` says how the run ended. `SystemOff` and `SystemReset` mean the guest
 powered off or reset. `Requested` means the host asked the run to stop (see

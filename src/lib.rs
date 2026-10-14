@@ -94,19 +94,41 @@ pub mod terminal;
 /// The prefix of the library's log lines on stderr.
 pub(crate) const LOG_PREFIX: &str = "[hvi]";
 
-// The backend for the host's target. Each one exposes the same
-// `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.
+// The backend for the host's target. Each one has the same `boot`, and only one
+// compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use arch::aarch64::hvf::boot;
+use arch::aarch64::hvf as backend;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-pub use arch::aarch64::kvm::boot;
+use arch::aarch64::kvm as backend;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use arch::x86_64::kvm::boot;
+use arch::x86_64::kvm as backend;
 #[cfg(not(any(
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
     all(target_arch = "x86_64", target_os = "linux")
 )))]
 compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux only");
+
+/// Boots `cfg` and runs the guest until it powers off, resets, or the host
+/// requests a stop.
+///
+/// Returns the [`Stop`](config::Stop) that ended the run. When a vCPU fails,
+/// the run ends and the call returns an error that says how.
+///
+/// Every thread this call itself starts has exited when it returns, or the call
+/// returns an error naming the first that did not stop within
+/// [`teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
+/// exception is the thread that receives the stop signals, which the first run
+/// after [`stop_on_signals`](signal::stop_on_signals) starts for the life of
+/// the process. What remains of the VM is a `VmHandle` a plugin kept, in a
+/// field or on a thread it started from `attach`.
+///
+/// # Errors
+///
+/// Errors if the guest cannot be set up, if a vCPU or a thread fails, or if a
+/// thread does not stop in time.
+pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> {
+    backend::boot(cfg).map_err(config::BootError::new)
+}
 
 /// This crate's version, so a binary built against it can report which VMM core
 /// it carries. Two binaries reporting the same core ran the same VMM.

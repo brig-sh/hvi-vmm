@@ -360,7 +360,7 @@ pub(crate) enum Outcome {
 
 impl Outcome {
     /// Returns the stop, or the failure as an error.
-    pub(crate) fn into_result(self) -> Result<Stop, Box<dyn std::error::Error>> {
+    pub(crate) fn into_result(self) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Outcome::Stopped(stop) => Ok(stop),
             Outcome::Failed(text) => Err(text.into()),

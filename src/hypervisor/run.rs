@@ -22,6 +22,8 @@
 //!
 //! [`StopHandle`]: crate::stop::StopHandle
 
+use std::fmt;
+use std::io;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -35,6 +37,34 @@ use crate::plugin::GuestArch;
 use crate::sync::try_lock_until;
 use crate::teardown::STOP_TIMEOUT;
 use crate::LOG_PREFIX;
+
+/// The error of a run that left a thread running.
+///
+/// It keeps the error that failed the run as it was, beside the thread left
+/// running, so [`BootError::get_ref`](crate::config::BootError::get_ref)
+/// returns the former. It reads as the error, then the thread.
+#[derive(Debug)]
+pub(crate) struct LeftRunning {
+    /// The error that failed the run.
+    pub(crate) error: Box<dyn std::error::Error + Send + Sync>,
+    /// The thread left running, when `error` does not already name it.
+    pub(crate) left: Option<io::Error>,
+}
+
+impl fmt::Display for LeftRunning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.left {
+            Some(left) => write!(f, "{}, and {left}", self.error),
+            None => fmt::Display::fmt(&self.error, f),
+        }
+    }
+}
+
+impl std::error::Error for LeftRunning {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
 
 /// Writes the run's `vmm.start` record to the ledger.
 ///
@@ -86,9 +116,9 @@ pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
 pub(crate) fn run_to_stop<K: Kick>(
     guest: &Guest<K>,
     threads: VcpuThreads,
-    mut failure: Option<Box<dyn std::error::Error>>,
+    mut failure: Option<Box<dyn std::error::Error + Send + Sync>>,
     io_threads: IoThreads<K>,
-) -> Result<Stop, Box<dyn std::error::Error>> {
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let mut announced = 0;
     if failure.is_none() {
         let waited = guest.vcpus.wait_for_stop(|| {
@@ -118,24 +148,32 @@ pub(crate) fn run_to_stop<K: Kick>(
     }
 
     let ledger = try_lock_until(&guest.ledger, Instant::now() + STOP_TIMEOUT);
-    let result = match (failure, guest.vcpus.outcome(), left_running) {
-        (Some(e), outcome, left_running) => {
-            // `failure` is the one returned, so a thread's failure behind it is
-            // printed.
-            if let Outcome::Failed(text) = outcome {
-                stderrln!("{LOG_PREFIX} {text}");
+    let result: Result<Stop, Box<dyn std::error::Error + Send + Sync>> =
+        match (failure, guest.vcpus.outcome(), left_running) {
+            (Some(e), outcome, left_running) => {
+                // `failure` is the one returned, so a thread's failure behind
+                // it is printed.
+                if let Outcome::Failed(text) = outcome {
+                    stderrln!("{LOG_PREFIX} {text}");
+                }
+                match left_running {
+                    Some(left) => Err(Box::new(LeftRunning {
+                        error: e,
+                        left: Some(left),
+                    })),
+                    None => Err(e),
+                }
             }
-            match left_running {
-                Some(left) => Err(format!("{e}, and {left}").into()),
-                None => Err(e),
-            }
-        }
-        (None, outcome, None) => outcome.into_result(),
-        (None, Outcome::Failed(text), Some(e)) => Err(format!("{text}, and {e}").into()),
-        (None, Outcome::Stopped(stop), Some(e)) => {
-            Err(format!("{e}, after the run stopped with {stop:?}").into())
-        }
-    };
+            (None, outcome, None) => outcome.into_result(),
+            (None, Outcome::Failed(text), Some(e)) => Err(Box::new(LeftRunning {
+                error: text.into(),
+                left: Some(e),
+            })),
+            (None, Outcome::Stopped(stop), Some(e)) => Err(Box::new(LeftRunning {
+                error: format!("{e}, after the run stopped with {stop:?}").into(),
+                left: None,
+            })),
+        };
     let Some(mut ledger) = ledger else {
         stderrln!(
             "{LOG_PREFIX} the ledger is still locked; the stop record and the tail are not written"
