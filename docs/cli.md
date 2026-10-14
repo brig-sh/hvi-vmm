@@ -145,7 +145,8 @@ hvi: unknown boot arg "--nope"
 ### The control socket
 
 `--control-sock` binds a Unix socket before confinement, as `--agent-sock` does,
-and serves one connection at a time. Each request is one JSON object on a line,
+and serves one connection at a time. A socket left at the path by an earlier run
+is replaced. Anything else there is an error, and is left alone. Each request is one JSON object on a line,
 and each reply is one line:
 
 ```text
