@@ -110,12 +110,23 @@ guest on the Pi read with the KVM firmware bitmaps `STD`, `STD_HYP` and
 | `PSCI_FEATURES` of `PSCI_VERSION`, `CPU_SUSPEND` (32 and 64), `CPU_OFF`, `CPU_ON` (32 and 64), `AFFINITY_INFO` (32 and 64), `MIGRATE_INFO_TYPE`, `SYSTEM_OFF`, `SYSTEM_RESET`, `PSCI_FEATURES`, `SYSTEM_RESET2` (32 and 64), `SMCCC_VERSION` | `0` |
 | `PSCI_FEATURES` of anything else, `SYSTEM_SUSPEND` included | `NOT_SUPPORTED` (-1) |
 | `SMCCC_ARCH_FEATURES(ARCH_WORKAROUND_1)` | `1`: not required on this CPU |
-| `SMCCC_ARCH_FEATURES(ARCH_WORKAROUND_2)` | `NOT_SUPPORTED` |
+| `SMCCC_ARCH_FEATURES(ARCH_WORKAROUND_2)` | `NOT_REQUIRED` (-2), measured with `ID_AA64PFR1_EL1` at the baseline's 0 |
 | `SMCCC_ARCH_FEATURES(ARCH_WORKAROUND_3)` | `0`: available |
 | `SMCCC_ARCH_FEATURES` of anything else, `SMCCC_ARCH_SOC_ID` included | `NOT_SUPPORTED` |
 | `ARCH_WORKAROUND_1`, `ARCH_WORKAROUND_3` | `0`, and nothing else happens |
 | `MIGRATE_INFO_TYPE` | `2`: no Trusted OS to migrate |
 | `TRNG_VERSION`, the vendor hypervisor UID, `PV_TIME_FEATURES` | `NOT_SUPPORTED` |
+
+Workaround 2's answer follows SSBS. While a vCPU on the Pi sees SSBS, KVM
+answers `NOT_SUPPORTED`. The baseline hides SSBS, and KVM then answers
+`NOT_REQUIRED` and keeps the guest mitigated itself. A Linux guest takes
+that answer to mean it is not affected by Spectre v4: it logs no
+"Spectre-v4" CPU feature line, and
+`/sys/devices/system/cpu/vulnerabilities/spec_store_bypass` reads "Not
+affected". hvi answers the same on the Mac, so a guest reads the same
+mitigation state wherever it boots. On the Mac nothing backs that answer.
+The guest is unmitigated there either way: before, it read
+`NOT_SUPPORTED` and reported itself "Vulnerable".
 
 The rest of what the calls do follows KVM's source
 (`arch/arm64/kvm/psci.c` in Linux 6.12) rather than a measurement:
