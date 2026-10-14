@@ -421,8 +421,12 @@ the portable profile on Hypervisor.framework, which has no GIC without
 the identification registers, five priority bits, fixed SGI and PPI
 configuration, and banked read-only targets for interrupts 0-31. It keeps each
 interrupt's enable, line level, software latch and active state apart, so a
-checkpoint can carry all four (`Gicv2::state`, `Gicv2::restore`). It knows
-nothing of the hypervisor:
+checkpoint can carry all four (`Gicv2::state`, `Gicv2::restore`). On KVM,
+`arch/aarch64/vgicv2.rs` reads and writes the in-kernel vGICv2 in the same
+form, through the vGIC device's register attributes, with the line levels
+from hvi's own devices (see
+[portable-profile.md](portable-profile.md#capture-and-restore-on-kvm)). The
+model knows nothing of the hypervisor:
 
 - The backend routes guest accesses to `GICD` and the first 4 KiB of `GICC` to
   it. The rest of the `GICC` window reads as zero.

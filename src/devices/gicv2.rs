@@ -80,22 +80,22 @@ pub const GICC_IIDR: u32 = 0x0202_143b;
 pub const GICC_DECODED: u64 = 0x2000;
 
 /// Number of 32-interrupt words in a bit-per-interrupt register.
-const WORDS: usize = NR_IRQS / 32;
+pub const WORDS: usize = NR_IRQS / 32;
 /// The priority bits the model implements.
-const PRIO_MASK: u8 = 0xf8;
+pub const PRIO_MASK: u8 = 0xf8;
 /// The configuration bits a guest can set: one edge bit per interrupt, the
 /// odd bit of each pair.
-const CFG_EDGE_BITS: u32 = 0xaaaa_aaaa;
+pub const CFG_EDGE_BITS: u32 = 0xaaaa_aaaa;
 /// The reset value of `GICC_BPR`, also its minimum.
-const BPR_MIN: u32 = 2;
+pub const BPR_MIN: u32 = 2;
 /// The reset value of `GICC_ABPR`, also its minimum.
-const ABPR_MIN: u32 = 3;
+pub const ABPR_MIN: u32 = 3;
 /// The `GICC_CTLR` bits that hold what is written: EnableGrp0 (0),
 /// EnableGrp1 (1), AckCtl (2), FIQEn (3), CBPR (4) and EOImode (9). A guest
 /// on the Pi that writes 0xffffffff reads 0x21f back, and so does KVM's
 /// userspace view (`scratchpad/portable/p1/review/gicc_probe.out`). The
 /// bypass bits 5-8 read as zero.
-const GICC_CTLR_MASK: u32 = 0x21f;
+pub const GICC_CTLR_MASK: u32 = 0x21f;
 /// `GICC_CTLR.CBPR`: `GICC_BPR` sets the group priority of both groups.
 const CTLR_CBPR: u32 = 1 << 4;
 /// `GICC_CTLR.EOImode`: `GICC_EOIR` only drops the priority, and
@@ -105,7 +105,7 @@ const CTLR_EOIMODE: u32 = 1 << 9;
 const IDLE_PRIORITY: u32 = 0xff;
 
 /// Distributor register offsets.
-mod gicd {
+pub mod gicd {
     pub const CTLR: u64 = 0x000;
     pub const TYPER: u64 = 0x004;
     pub const IIDR: u64 = 0x008;
@@ -125,7 +125,7 @@ mod gicd {
 }
 
 /// CPU interface register offsets.
-mod gicc {
+pub mod gicc {
     pub const CTLR: u64 = 0x00;
     pub const PMR: u64 = 0x04;
     pub const BPR: u64 = 0x08;
@@ -949,40 +949,8 @@ impl Gicv2 {
     /// Errors when `state` has another number of CPUs, or an array of the
     /// wrong length. The model is unchanged then.
     pub fn restore(&mut self, state: &Gicv2State) -> Result<(), String> {
-        if state.cpus.len() != self.cpus.len() {
-            return Err(format!(
-                "GICv2 state has {} CPUs, this machine {}",
-                state.cpus.len(),
-                self.cpus.len()
-            ));
-        }
+        state.check_shape(self.cpus.len())?;
         let s = &state.dist;
-        let words = |name: &str, v: &[u32], n: usize| -> Result<(), String> {
-            if v.len() == n {
-                Ok(())
-            } else {
-                Err(format!(
-                    "GICv2 state: {name} has {} entries, not {n}",
-                    v.len()
-                ))
-            }
-        };
-        words("igroupr", &s.igroupr, WORDS)?;
-        words("isenabler", &s.isenabler, WORDS)?;
-        words("latch", &s.latch, WORDS)?;
-        words("line_level", &s.line_level, WORDS)?;
-        words("isactiver", &s.isactiver, WORDS)?;
-        words("icfgr", &s.icfgr, NR_IRQS / 16)?;
-        if s.ipriorityr.len() != NR_IRQS || s.itargetsr.len() != NR_IRQS {
-            return Err("GICv2 state: ipriorityr and itargetsr need 256 entries".into());
-        }
-        for (i, c) in state.cpus.iter().enumerate() {
-            if c.apr.len() != 4 || c.ipriorityr0.len() != 32 || c.sgi_sources.len() != 16 {
-                return Err(format!(
-                    "GICv2 state: cpu {i} has an array of the wrong length"
-                ));
-            }
-        }
 
         let cpu_mask = self.cpu_mask();
         let mut fresh = Gicv2::new(self.cpus.len() as u32);
@@ -1054,6 +1022,51 @@ fn sub_word(word: u32, offset: u64, width: u8) -> u32 {
 pub struct Gicv2State {
     pub dist: DistState,
     pub cpus: Vec<CpuState>,
+}
+
+impl Gicv2State {
+    /// Checks that the state is for `ncpu` CPUs and that every array has
+    /// the length the canonical form gives it.
+    ///
+    /// # Errors
+    ///
+    /// Errors naming the first array that does not.
+    pub fn check_shape(&self, ncpu: usize) -> Result<(), String> {
+        if self.cpus.len() != ncpu {
+            return Err(format!(
+                "GICv2 state has {} CPUs, this machine {ncpu}",
+                self.cpus.len()
+            ));
+        }
+        let s = &self.dist;
+        let words = |name: &str, v: &[u32], n: usize| -> Result<(), String> {
+            if v.len() == n {
+                Ok(())
+            } else {
+                Err(format!(
+                    "GICv2 state: {name} has {} entries, not {n}",
+                    v.len()
+                ))
+            }
+        };
+        words("igroupr", &s.igroupr, WORDS)?;
+        words("isenabler", &s.isenabler, WORDS)?;
+        words("latch", &s.latch, WORDS)?;
+        words("line_level", &s.line_level, WORDS)?;
+        words("isactiver", &s.isactiver, WORDS)?;
+        words("icfgr", &s.icfgr, NR_IRQS / 16)?;
+        if s.ipriorityr.len() != NR_IRQS || s.itargetsr.len() != NR_IRQS {
+            return Err("GICv2 state: ipriorityr and itargetsr need 256 entries".into());
+        }
+        for (i, c) in self.cpus.iter().enumerate() {
+            if c.apr.len() != 4 || c.ipriorityr0.len() != 32 || c.sgi_sources.len() != 16 {
+                return Err(format!(
+                    "GICv2 state: cpu {i} has an array of the wrong length"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The distributor part of [`Gicv2State`].
