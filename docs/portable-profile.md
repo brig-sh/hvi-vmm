@@ -10,17 +10,15 @@ baseline, the GICv2, the firmware and the `hvi-time` clock below, and give a
 guest of the same configuration the same devicetree, byte for byte. A guest
 kernel with the `hvi,time-v1` driver keeps time in nanoseconds on both hosts,
 although the counter under it runs at 24 MHz on Apple silicon and at 54 MHz
-on the Pi. Checkpoint and restore are not implemented yet, so a guest cannot
-move between hosts in this increment. The pieces a checkpoint needs exist
-and are tested: the `hvi-time` state and its restore, the software GICv2's
-state, and the import and export of KVM's vGICv2 in that same form (see
-[Capture and restore on KVM](#capture-and-restore-on-kvm)). A test hook
-exercises the restore in one process (see [Restore](#restore)); nothing
-writes a checkpoint yet. The control socket refuses a `checkpoint` of a
-portable guest before it pauses anything, and `hvi restore` refuses a
-portable bundle (see
-[checkpoint.md](checkpoint.md#the-platform-state)). The x86-64 KVM backend
-refuses the profile.
+on the Pi. A portable guest is checkpointed and restored on both backends,
+and its bundle is the same on both: the vCPUs by register name, the GICv2 in
+its canonical form (the software model on the Mac, the vGICv2 on the Pi, see
+[Capture and restore on KVM](#capture-and-restore-on-kvm)) and `hvi-time`'s
+state ([Restore](#restore)). `hvi restore` takes a portable bundle of either
+backend on either (see [checkpoint.md](checkpoint.md#the-portable-restore)).
+A restore on the host that took the bundle has been run on both; a move
+between the two has not been run yet. The x86-64 KVM backend refuses the
+profile.
 
 The default, `--profile native`, is unchanged: the host's own CPU features and,
 on macOS, Apple's in-kernel GICv3.
@@ -209,6 +207,15 @@ active interrupt and its `GICC_APR0` bit, and one CPU's `hvi-time` line.
 KVM, `HVI_TIME_TEST_RESTORE` also exports the live guest's vGIC while the
 vCPUs are held, imports it back and exports it again.
 
+A checkpoint runs the export on vCPU 0's thread, once every vCPU has
+exported its registers and the I/O threads are held, with `hvi-time`
+frozen so the line levels it gives do not change. A restore runs the import
+before any vCPU has run, then drives each device's line to the device's
+level through the device, so the device's record of its line agrees with
+the vGIC. On HVF the capture reads the software model under its lock, and
+the restore replaces the model with the captured state in the platform step
+of the import.
+
 ### Delivery on Hypervisor.framework
 
 Measured without `hv_gic`:
@@ -390,8 +397,15 @@ The canonical checkpoint form (`HviTimeState`, `platform.json` `timer`, kind
 {"page":{"generation","counter_freq_hz","base_counter","base_ns","mult","shift",
          "wall_ns","downtime_total_ns"},
  "guest_ns_at_capture",
+ "counter_at_capture",
  "cpus":[{"deadline_ns" (null when disarmed),"status","ctrl"}]}
 ```
+
+`counter_at_capture` is the guest's raw counter at the same moment as
+`guest_ns_at_capture`, at `page.counter_freq_hz`. A restore sets the
+destination's counter offset so the guest's counter starts no lower than
+that value scaled to the destination's rate, rounded up
+(`HviTimeState::counter_target`). An older state without it reads as 0.
 
 `HviTime::restore` publishes the page again from the destination's counter:
 `base_ns` is `guest_ns_at_capture`, `base_counter` the destination's counter
@@ -403,7 +417,14 @@ state. The guest's driver then sets its delay loop for the new rate in the
 interrupt handler, and its work item moves REALTIME and BOOTTIME on by the
 downtime while MONOTONIC carries on from the capture.
 
-Checkpoints do not exist yet. `HVI_TIME_TEST_RESTORE=<at>,<downtime>` runs
+A checkpoint reads the state with the device frozen, so no deadline fires
+under it; a guest that goes on after the capture thaws it, and what came due
+meanwhile fires then. `hvi restore` publishes the state once, when the first
+vCPU enters the guest after `resume`, and every vCPU waits for that before
+its first entry (`PendingPublish`), so the guest never reads an empty page
+and the time it waited restored-paused does not show on MONOTONIC.
+
+`HVI_TIME_TEST_RESTORE=<at>,<downtime>` runs
 the restore in one process: at `<at>` seconds it pauses the vCPUs, freezes
 and captures the device, holds the guest for `<downtime>` seconds, restores
 and resumes. It shows everything a same-host restore shows. A change of
@@ -546,9 +567,14 @@ console path's latency makes the guest look further behind than it is.
   can be lowered to the baseline, a 40-bit guest address space,
   `KVM_CAP_READONLY_MEM`, and 4 KiB or 16 KiB pages. hvi refuses the boot and
   names each problem.
-- Checkpoint and restore are not implemented; `hvi-time`'s state and restore
-  are, and are tested in one process only. A checkpoint of a portable guest
-  is refused, and so is a restore of a portable bundle.
+- A restore has been run on the host that took the bundle, on the Mac and on
+  a Pi 5. A move between the two has not been run yet, so a change of
+  counter rate across a restore is tested only in unit tests.
+- A guest booted with `--arch-timer-irq` is checkpointed like any other,
+  but its architected timer's line is not carried by the restore; that
+  debugging flag is not tested with checkpoints.
+- A `CPU_ON` that KVM had not served at a capture is not seen: the vCPU is
+  written as it was (v1 portable guests have 1 vCPU).
 - At most 8 vCPUs, the GICv2 limit.
 - No virtio-fs: `--share-ro` and `--share-rw` are refused, because a guest
   meant to move keeps its storage on virtio-blk, which every host offers.
