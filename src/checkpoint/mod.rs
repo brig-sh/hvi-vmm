@@ -23,6 +23,7 @@
 //! counter in [`platform`].
 
 pub mod bundle;
+pub(crate) mod capture;
 pub mod control;
 pub mod cpu;
 pub mod platform;

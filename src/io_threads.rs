@@ -206,6 +206,7 @@ impl<K: Kick> IoThreads<K> {
         if let Some(control) = control {
             let (stop, gate) = (io_threads.token(), Arc::clone(io_threads.source.gate()));
             let vcpus = Arc::clone(&guest.vcpus);
+            let capture = control.capture_of(guest);
             io_threads.push(
                 "control socket",
                 std::thread::spawn(move || {
@@ -216,7 +217,7 @@ impl<K: Kick> IoThreads<K> {
                     } else {
                         confine_io_thread();
                     }
-                    control.run(&stop, &gate, &vcpus);
+                    control.run(&stop, &gate, &vcpus, capture);
                 }),
             );
         }
