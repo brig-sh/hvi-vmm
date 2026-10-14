@@ -252,6 +252,19 @@ pub(crate) fn export(cpu: u32, vcpu: &impl OneReg) -> io::Result<Aarch64Vcpu> {
     {
         return Err(fail(format!("KVM does not list {name}")));
     }
+    // KVM serves PSCI `CPU_ON` in the kernel: it marks the target runnable
+    // and leaves the reset to the target's next `KVM_RUN`. A vCPU parked
+    // before that run is runnable with the registers of its initialisation,
+    // pc 0 at EL1h with DAIF masked, which no guest runs at. Written as on,
+    // it would start at pc 0. The VM stays paused, and once it has run on
+    // KVM has served the call.
+    if state.regs["pc"].0 == 0 && state.regs["pstate"].0 == CPU_ON_PSTATE {
+        return Err(fail(
+            "KVM has not yet served the CPU_ON that turned it on, so it holds no \
+             registers to capture; resume the guest and checkpoint again"
+                .to_string(),
+        ));
+    }
     for (name, need) in AARCH64_SYSREGS {
         if !state.sysregs.contains_key(name) {
             match need {
@@ -517,8 +530,14 @@ pub(crate) mod tests {
         pub(crate) set_state: RefCell<(Option<u32>, Option<Arm64Events>)>,
     }
 
+    /// The ids of the core registers `pc` and `pstate`.
+    const PC: u64 = 0x6030_0000_0010_0040;
+    const PSTATE: u64 = 0x6030_0000_0010_0042;
+
     impl FakeVcpu {
-        /// The portable vCPU of the fixture, with its measured values.
+        /// The portable vCPU of the fixture, with its measured values, but
+        /// at a kernel address: the fixture's vCPU never ran, so its pc is
+        /// 0.
         pub(crate) fn rp2() -> Self {
             let mut values = HashMap::new();
             let mut ids = Vec::new();
@@ -526,6 +545,7 @@ pub(crate) mod tests {
                 ids.push(id);
                 values.insert(id, u128::from_str_radix(value, 16).unwrap());
             }
+            values.insert(PC, 0xffff_8000_0801_0000);
             Self {
                 ids,
                 values: RefCell::new(values),
@@ -604,6 +624,22 @@ pub(crate) mod tests {
         assert!(state.unavailable.contains(&"APIAKEYLO_EL1".to_string()));
         assert!(state.events.is_none());
         assert!(state.kvm_extra.is_empty());
+    }
+
+    // A runnable vCPU still at its initialisation registers waits for KVM to
+    // serve its CPU_ON, and fails the capture rather than start at pc 0.
+    #[test]
+    fn a_vcpu_whose_cpu_on_kvm_has_not_served_fails_the_export() {
+        let vcpu = FakeVcpu::rp2();
+        vcpu.values.borrow_mut().insert(PC, 0);
+        let err = export(1, &vcpu).unwrap_err().to_string();
+        assert!(
+            err.starts_with("vCPU 1: KVM has not yet served the CPU_ON"),
+            "{err}"
+        );
+        // At pc 0 in another mode, it is a guest's.
+        vcpu.values.borrow_mut().insert(PSTATE, 0x5);
+        assert_eq!(export(1, &vcpu).unwrap().regs["pc"], Hex64(0));
     }
 
     #[test]
