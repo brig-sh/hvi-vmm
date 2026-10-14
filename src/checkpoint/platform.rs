@@ -38,7 +38,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint::cpu::arch_name;
+use crate::checkpoint::cpu::{arch_name, MAX_VCPUS};
 use crate::checkpoint::profile::sha256_hex;
 use crate::plugin::GuestArch;
 
@@ -396,6 +396,12 @@ impl PlatformState {
 impl GicV3State {
     /// See [`PlatformState::check`].
     fn check(&self, vcpus: u32) -> Result<(), String> {
+        // Bounded before the per-vCPU tables below are allocated by it.
+        if vcpus == 0 || vcpus as usize > MAX_VCPUS {
+            return Err(format!(
+                "irq: a machine of {vcpus} vCPUs, and a GIC state covers 1 to {MAX_VCPUS}"
+            ));
+        }
         if self.version != 3 {
             return Err(format!("irq: GIC version {}, not 3", self.version));
         }
@@ -685,6 +691,10 @@ pub(crate) mod tests {
         refused(&|g| g.redist[1].vcpu = 0, "redist lists vCPU 0 twice");
         refused_on(&|_| {}, 1, "redist lists vCPU 1, and the machine has 1");
         refused(&|g| g.icc[0].vcpu = 9, "icc lists vCPU 9");
+        // A count from a document is bounded before anything is allocated
+        // by it.
+        refused_on(&|_| {}, u32::MAX, "a machine of 4294967295 vCPUs");
+        refused_on(&|_| {}, 0, "a machine of 0 vCPUs");
         refused(
             &|g| {
                 g.redist[0].ipriorityr.pop();
