@@ -885,6 +885,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
 
 /// Boots `cfg` on Hypervisor.framework, as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    cfg.validate()?;
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
     loader::LoadedKernel::from_header(&cfg.kernel)?;

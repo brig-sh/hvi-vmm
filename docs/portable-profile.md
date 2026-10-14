@@ -195,6 +195,8 @@ rate from the property and has no clock event. A stock kernel reaches
 
 - macOS only for now. The KVM backends refuse the profile.
 - At most 8 vCPUs, the GICv2 limit.
+- No virtio-fs: `--share-ro` and `--share-rw` are refused, because a guest
+  meant to move keeps its storage on virtio-blk, which every host offers.
 - The guest's counter runs at the host's rate, so the profile does not yet
   make a guest movable between a Mac and a Pi.
 - `CPU_OFF` returns success and the vCPU goes on running, as on the native
