@@ -764,7 +764,7 @@ pub(crate) fn serve_from_regs_view<V: SafepointVcpu>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn view() -> RegsView {
