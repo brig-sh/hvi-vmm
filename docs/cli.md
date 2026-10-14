@@ -58,7 +58,7 @@ including a typo, silently runs the plain test.
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
 | `--control-sock <path>` | none | Host Unix socket that pauses, resumes, reports and stops the VM. See [The control socket](#the-control-socket). |
 | `--profile-out <path>` | none | Write the machine profile here, as one line of JSON. See [The control socket](#the-control-socket). |
-| `--checkpoint-root <dir>` | none | The directory a `checkpoint` may write bundles below. It must exist. Needs `--control-sock`. Without it every `checkpoint` is refused. See [checkpoint.md](checkpoint.md). |
+| `--checkpoint-root <dir>` | none | The directory a `checkpoint` may write bundles below. It must exist, and should be private to this sandbox (mode 0700): bundles hold guest RAM in clear. Needs `--control-sock`. Without it every `checkpoint` is refused. See [checkpoint.md](checkpoint.md). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |

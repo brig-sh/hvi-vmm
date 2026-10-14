@@ -26,8 +26,16 @@ hvi boot --kernel Image --initramfs initramfs.cpio --disk root.img \
 
 `--checkpoint-root` names the only directory a checkpoint may write below.
 The directory must exist. hvi resolves its path at boot, before the process
-is confined, and the confinement then grants writes below it and nowhere
-else. Without `--checkpoint-root`, every `checkpoint` is refused.
+is confined, and refuses a bundle directory that is not below it. On macOS
+the kernel enforces that too. On Linux only hvi's own check does: see
+[Confinement](#confinement). Without `--checkpoint-root`, every `checkpoint`
+is refused.
+
+Give each sandbox a root of its own, owned by the user hvi runs as, with mode
+0700, and never share one root between sandboxes. A bundle holds the guest's
+RAM in clear, with any keys and credentials the guest had in memory. The hvi
+process can read and write everything below its root, so a VMM that a guest
+took over could read or change another sandbox's bundles in a shared root.
 
 Then ask the socket:
 
@@ -229,13 +237,22 @@ ends it between components and between reads of RAM.
 The control thread writes the bundle after the process is confined:
 
 - **macOS.** The Seatbelt profile gets one more subtree rule, `file-read*
-  file-write*` below the resolved checkpoint root.
+  file-write*` below the resolved checkpoint root. The kernel enforces it: no
+  thread can write outside the root and the writable shares. The rule covers
+  the whole process, so every thread, the vCPU threads included, can read and
+  write every bundle below the root.
 - **Linux.** The control thread installs its own seccomp filter, `control`.
   It is `vmm` plus the file calls a bundle needs: `openat`, `mkdirat`,
   `renameat`, `unlinkat`, the `stat` family, `getdents64` and `readlinkat`
   (x86-64 also has the older names). Only a run with `--checkpoint-root` gives
   the thread that filter. Every thread that parses guest data still cannot
-  open a file.
+  open a file. seccomp cannot filter the path a call names, so the filter
+  does not hold the control thread to the root. That thread can read, create,
+  rename and remove files anywhere the user hvi runs as can. The rule that a
+  bundle goes below the root is hvi's own path check, which a compromised
+  control thread would skip. Holding the thread to the root in the kernel
+  needs Landlock, which hvi does not use yet; the Raspberry Pi 5 kernel it was
+  tested on does not enable it.
 
 Both selftests write and verify a real bundle under the production
 confinement. They also check that a bundle outside the root (macOS), or one
