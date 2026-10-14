@@ -30,7 +30,7 @@ use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, RamRegion, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 
@@ -55,6 +55,9 @@ pub(crate) struct Guest<K> {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
+    /// The hypervisor's record of the guest's own writes to RAM, which a
+    /// live move reads beside guest RAM's log of hvi's.
+    pub(crate) write_log: Option<Arc<dyn GuestWriteLog>>,
 }
 
 impl<K> Guest<K> {

@@ -37,6 +37,19 @@
 //! paused if a client had paused it. After the seal, `then: "continue"`
 //! does the same, and `then: "fence"` leaves the VM paused for good: `status`
 //! says `fenced`, `resume` is refused, and only `stop` ends it.
+//!
+//! `migrate` writes the same capture as a stream on the connection that
+//! asked for it, with no file: the RAM rounds of [`migrate`] while the
+//! guest runs, then the pause as for `checkpoint`, the final RAM round and
+//! the documents with the guest still, and the manifest. Only this thread
+//! writes, so a slow reader holds it up and never the guest; the pause
+//! starts once the last round with the guest running has been written. A
+//! failure before the manifest leaves the VM as the request found it, as a
+//! `checkpoint`'s does, and the client reads the failure as a reply line
+//! where a frame header was due. `then: "fence"` fences the VM once the
+//! manifest is written to the connection, which is before the client has
+//! read it; a fenced VM can therefore be streamed again, unchanged, by a
+//! client whose stream did not arrive.
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -45,15 +58,18 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::checkpoint::bundle::{resolve_in_root, BundleWriter};
+use crate::checkpoint::bundle::{resolve_in_root, unix_ms, BundleWriter};
 use crate::checkpoint::capture::{self, Capture, Console};
 use crate::checkpoint::control::{
-    format_response, parse_request, CheckpointStats, Error, ErrorCode, Request, Response, Then,
-    VmState, MAX_LINE,
+    format_response, parse_request, CheckpointStats, Error, ErrorCode, Migrate, MigrateStats,
+    Request, Response, Then, VmState, MAX_LINE,
 };
-use crate::checkpoint::cpu::{Output, VcpuState};
+use crate::checkpoint::cpu::{CpuState, Output, VcpuState};
+use crate::checkpoint::migrate::{self, Policy, Tracker};
 use crate::checkpoint::platform::PlatformState;
+use crate::checkpoint::profile::this_build;
 use crate::checkpoint::profile::{MachineProfile, ProfileCell};
+use crate::checkpoint::stream::StreamWriter;
 use crate::config::Stop;
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
@@ -217,10 +233,10 @@ impl ControlSocket {
         self
     }
 
-    /// Returns what a `checkpoint` captures of `guest`, when the run has a
-    /// checkpoint root and the backend said how.
+    /// Returns what a `checkpoint` or a `migrate` captures of `guest`, when
+    /// the backend said how. A `checkpoint` needs a checkpoint root as well;
+    /// a `migrate` writes no file.
     pub(crate) fn capture_of<K>(&self, guest: &Guest<K>) -> Option<Capture> {
-        self.checkpoint_root.as_ref()?;
         let parts = self.parts.as_ref()?;
         Some(Capture {
             arch: guest.arch,
@@ -234,6 +250,7 @@ impl ControlSocket {
             net: guest.net.clone(),
             vsock: guest.vsock.clone(),
             console: parts.console.clone(),
+            write_log: guest.write_log.clone(),
             #[cfg(test)]
             after_component: None,
         })
@@ -276,7 +293,8 @@ impl ControlSocket {
             gate,
             vcpus,
             profile: &self.profile,
-            capture: capture.zip(self.checkpoint_root.clone()),
+            capture,
+            root: self.checkpoint_root.clone(),
             timeout,
         };
         loop {
@@ -357,6 +375,8 @@ fn answer<K: Kick>(
         return Ok(());
     }
     let (response, then) = match parse_request(&line) {
+        // The stream goes on this connection, ahead of the reply.
+        Ok(Request::Migrate(request)) => (machine.migrate(conn, stop, &request), None),
         Ok(request) => machine.handle(request),
         Err(e) => (Response::Error(e), None),
     };
@@ -386,6 +406,38 @@ fn send(conn: &mut UnixStream, stop: &StopToken, response: &Response) -> std::io
     Ok(())
 }
 
+/// The control connection as a writer that waits for room beside the
+/// stop token, for a stream.
+struct SocketOut<'a> {
+    /// The connection, non-blocking.
+    conn: &'a mut UnixStream,
+    /// The stop, which ends a wait for room.
+    stop: &'a StopToken,
+}
+
+impl Write for SocketOut<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            match self.conn.write(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if retry_read(&e) => {
+                    if !self.stop.wait_writable(self.conn.as_fd())? {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "the run is stopping",
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// What a request does once its reply is on its way.
 enum After {
     /// End the run.
@@ -413,8 +465,10 @@ struct Machine<'a, K> {
     vcpus: &'a Vcpus<K>,
     /// The profile `profile` reports.
     profile: &'a ProfileCell,
-    /// What a `checkpoint` captures, and the root it writes under.
-    capture: Option<(Capture, CheckpointRoot)>,
+    /// What a `checkpoint` or a `migrate` captures.
+    capture: Option<Capture>,
+    /// The root a `checkpoint` writes under.
+    root: Option<CheckpointRoot>,
     /// The deadline of each wait, [`CONTROL_TIMEOUT`] outside the tests.
     timeout: Duration,
 }
@@ -447,6 +501,8 @@ impl<K: Kick> Machine<'_, K> {
                 txid,
                 epoch,
             } => self.checkpoint(&dir, then, txid.as_deref(), epoch),
+            // `answer` serves it, on its connection.
+            Request::Migrate(_) => refuse(ErrorCode::BadRequest, "migrate needs its connection"),
         };
         (response, None)
     }
@@ -474,7 +530,7 @@ impl<K: Kick> Machine<'_, K> {
             VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
             VmState::Running | VmState::Paused | VmState::RestoredPaused => {}
         }
-        let Some((_, root)) = &self.capture else {
+        let (Some(_), Some(root)) = (&self.capture, &self.root) else {
             return refuse(
                 ErrorCode::Refused,
                 "this run has no checkpoint root; boot it with --checkpoint-root",
@@ -522,7 +578,7 @@ impl<K: Kick> Machine<'_, K> {
         let captured_at = Instant::now();
         let request = capture::Request { then, txid, epoch };
         let sealed = match &self.capture {
-            Some((capture, _)) => {
+            Some(capture) => {
                 let vcpus_of = self.vcpus;
                 capture.write(writer, &profile, exported, &request, &|| {
                     !vcpus_of.is_running()
@@ -549,7 +605,7 @@ impl<K: Kick> Machine<'_, K> {
             Then::Continue => self.back_to(found),
             Then::Fence => {
                 self.state = VmState::Fenced;
-                if let Some((capture, _)) = &self.capture {
+                if let Some(capture) = &self.capture {
                     capture.release_disk();
                 }
             }
@@ -568,6 +624,184 @@ impl<K: Kick> Machine<'_, K> {
         }
     }
 
+    /// Streams the VM on `conn`: the RAM rounds with the guest running, then
+    /// the pause, the final round and the documents, then the manifest. It
+    /// returns the reply that follows the manifest, or the refusal that
+    /// takes the place of the next frame.
+    ///
+    /// Everything that can be refused without writing is checked first. A
+    /// failure from the first frame to the manifest returns the VM to where
+    /// the request found it, and stops the tracking of its writes.
+    #[allow(clippy::too_many_lines)]
+    fn migrate(&mut self, conn: &mut UnixStream, stop: &StopToken, request: &Migrate) -> Response {
+        if !self.vcpus.is_running() {
+            self.state = VmState::Stopping;
+        }
+        // A fenced VM streams again: it has not run since the stream that
+        // fenced it, so the new stream is the same machine, and a caller
+        // whose first stream never arrived can send it once more. It stays
+        // fenced.
+        if self.state == VmState::Stopping {
+            return refuse(ErrorCode::Stopped, "the run is ending");
+        }
+        let Some(capture) = self.capture.clone() else {
+            return refuse(ErrorCode::Refused, "this run cannot be captured");
+        };
+        let Some(write_log) = capture.write_log.clone() else {
+            return refuse(
+                ErrorCode::Refused,
+                "this backend does not record the guest's writes to RAM",
+            );
+        };
+        let profile = match self.complete_profile() {
+            Ok(profile) => profile,
+            Err(refusal) => return refusal,
+        };
+        if profile.fs_shares > 0 {
+            return refuse(
+                ErrorCode::Refused,
+                format!(
+                    "the guest has {} virtio-fs share(s), whose state is host files that do \
+                     not move",
+                    profile.fs_shares
+                ),
+            );
+        }
+        let policy = Policy {
+            max_rounds: request.max_rounds.unwrap_or(Policy::default().max_rounds),
+            max_time: request
+                .max_secs
+                .map_or(Policy::default().max_time, Duration::from_secs),
+            ..Policy::default()
+        };
+        let ram = Arc::clone(&capture.ram);
+        let found = self.state;
+        let mut out = SocketOut { conn, stop };
+        let mut stream = StreamWriter::new(&mut out);
+        if let Err(e) = stream.write_doc("profile.json", profile.to_json().as_bytes()) {
+            return refuse(
+                ErrorCode::CaptureFailed,
+                format!("{e}; the VM is as it was"),
+            );
+        }
+        let tracker = Tracker::new(&ram, &*write_log);
+        let vcpus = self.vcpus;
+        let stopping = || !vcpus.is_running();
+        let started = Instant::now();
+        let mut precopy = match migrate::precopy(&mut stream, &ram, &tracker, &policy, &stopping) {
+            Ok(precopy) => precopy,
+            Err(e) => {
+                tracker.stop();
+                if !self.vcpus.is_running() {
+                    self.state = VmState::Stopping;
+                    return refuse(ErrorCode::Stopped, format!("the run is ending: {e}"));
+                }
+                return refuse(
+                    ErrorCode::CaptureFailed,
+                    format!("{e}; the VM ran on and is as it was"),
+                );
+            }
+        };
+        let precopy_ms = started.elapsed().as_millis() as u64;
+        let precopy_end_unix_ms = unix_ms();
+
+        let paused_at = Instant::now();
+        if found == VmState::Running {
+            if let Response::Error(e) = self.pause() {
+                tracker.stop();
+                return Response::Error(e);
+            }
+        }
+        let exported = match self.export(paused_at + self.timeout) {
+            Ok(exported) => exported,
+            Err(e) => {
+                tracker.stop();
+                self.back_to(found);
+                return Response::Error(e);
+            }
+        };
+        let pause_ms = paused_at.elapsed().as_millis() as u64;
+        let request_doc = capture::Request {
+            then: request.then,
+            txid: request.txid.as_deref(),
+            epoch: request.epoch,
+        };
+        let sealed = (|| -> std::io::Result<_> {
+            let devices = capture.device_states()?;
+            let disk = capture.disk_state()?;
+            let last = migrate::final_round(&mut stream, &ram, &tracker, &mut precopy, &stopping)?;
+            stream.write_doc(
+                "cpu.json",
+                &json(&CpuState::new(capture.arch, exported.vcpus))?,
+            )?;
+            stream.write_doc("platform.json", &json(&exported.platform)?)?;
+            stream.write_doc("devices.json", &devices.to_json()?)?;
+            if let Some(disk) = &disk {
+                stream.write_doc("disk.json", &json(disk)?)?;
+            }
+            stream.write_doc("session.json", &json(&capture.session(&request_doc))?)?;
+            let sealed_at = unix_ms();
+            let (_, manifest_sha256) = stream.seal(
+                this_build(),
+                migrate::regions_of(&ram),
+                exported.capabilities,
+                sealed_at,
+            )?;
+            Ok((last, manifest_sha256, sealed_at))
+        })();
+        let faults = write_log.fault_stats();
+        tracker.stop();
+        let (last, manifest_sha256, sealed_at_unix_ms) = match sealed {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                if !self.vcpus.is_running() {
+                    self.state = VmState::Stopping;
+                    return refuse(ErrorCode::Stopped, format!("the run is ending: {e}"));
+                }
+                self.back_to(found);
+                return refuse(
+                    ErrorCode::CaptureFailed,
+                    format!("{e}; the stream is not sealed, and the VM is as it was"),
+                );
+            }
+        };
+        let paused_ms = paused_at.elapsed().as_millis() as u64;
+        match request.then {
+            Then::Continue => self.back_to(found),
+            Then::Fence => {
+                self.state = VmState::Fenced;
+                capture.release_disk();
+            }
+        }
+        let mut rounds = precopy.rounds;
+        rounds.push(last);
+        let ram_raw_bytes = rounds.iter().map(migrate::RoundStats::raw_bytes).sum();
+        let ram_stream_bytes = rounds.iter().map(|r| r.bytes).sum();
+        Response::Migrate {
+            state: self.state,
+            manifest_sha256,
+            stats: Box::new(MigrateStats {
+                final_round_bytes: rounds.last().map_or(0, |r| r.bytes),
+                rounds,
+                stop_reason: precopy.reason,
+                threshold_bytes: precopy.threshold_bytes,
+                precopy_ms,
+                pause_ms,
+                paused_ms,
+                ram_total_bytes: ram.regions().iter().map(|r| r.size).sum(),
+                ram_present_bytes: precopy.present_bytes,
+                ram_raw_bytes,
+                ram_stream_bytes,
+                stream_bytes: stream.written(),
+                write_granule: write_log.granule(),
+                write_faults: faults.map(|(n, _)| n),
+                write_fault_ns: faults.map(|(n, ns)| ns / n.max(1)),
+                precopy_end_unix_ms,
+                sealed_at_unix_ms,
+            }),
+        }
+    }
+
     /// Asks every parked vCPU for its state, then vCPU 0 for the platform,
     /// and returns the states by index with the platform they make up.
     ///
@@ -578,7 +812,7 @@ impl<K: Kick> Machine<'_, K> {
     /// is the barrier. A backend that does not read the platform leaves it
     /// marked as not captured.
     fn export(&mut self, deadline: Instant) -> Result<capture::Exported, Error> {
-        let Some((capture, _)) = &self.capture else {
+        let Some(capture) = &self.capture else {
             return Err(Error::new(ErrorCode::Refused, "no capture"));
         };
         let (arch, backend) = (capture.arch, capture.backend);
@@ -777,6 +1011,11 @@ impl<K: Kick> Machine<'_, K> {
     }
 }
 
+/// Returns `doc` as JSON.
+fn json<T: serde::Serialize>(doc: &T) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(doc).map_err(std::io::Error::other)
+}
+
 /// Returns a refusal with `code` and `message`.
 fn refuse(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::Error(Error::new(code, message))
@@ -843,6 +1082,8 @@ mod tests {
         stop_after: Option<Component>,
         /// The disk image of a virtio-blk device the capture holds.
         disk: Option<String>,
+        /// The record of the guest's writes a `migrate` reads.
+        write_log: Option<Arc<dyn crate::memory::GuestWriteLog>>,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -984,6 +1225,7 @@ mod tests {
                 net: spec.net.clone(),
                 vsock: None,
                 console: Console::None,
+                write_log: spec.write_log.clone(),
                 after_component: Some({
                     let (fail, stop, vcpus) =
                         (spec.fail_after, spec.stop_after, Arc::clone(&vcpus));
@@ -1928,6 +2170,252 @@ mod tests {
         );
         assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
         assert_stops(&f.vcpus, "the run did not stop");
+    }
+
+    /// A record of the guest's writes that holds none, and counts its
+    /// starts and stops.
+    #[derive(Default)]
+    struct QuietLog {
+        starts: std::sync::atomic::AtomicU32,
+        stops: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::memory::GuestWriteLog for QuietLog {
+        fn start(&self) -> std::io::Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn collect(&self, _into: &mut crate::memory::DirtyPages) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn stop(&self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+        fn granule(&self) -> u64 {
+            4096
+        }
+    }
+
+    impl Fixture {
+        /// Asks for a migrate and reads the stream into fresh guest RAM,
+        /// then the reply line after it. Returns what was read, or the
+        /// reader's error, and the reply.
+        fn migrate(
+            &mut self,
+            line: &str,
+        ) -> (
+            std::io::Result<(crate::checkpoint::stream::Received, Arc<GuestRam>)>,
+            serde_json::Value,
+        ) {
+            use crate::checkpoint::stream::{receive, PageSpace, StreamReader};
+            self.client.write_all(line.as_bytes()).unwrap();
+            self.client.write_all(b"\n").unwrap();
+            let ram = Arc::new(GuestRam::from_ranges(&[(GPA, 1 << 20)]));
+            let target = Arc::clone(&ram);
+            let mut reader = StreamReader::new(&mut self.replies);
+            let got = receive(&mut reader, |_| {
+                Ok((PageSpace::new(&migrate::regions_of(&target))?, target))
+            });
+            let reply_line = match &got {
+                // A refusal is the line where the next frame header was due,
+                // and the reader read it.
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
+                    return (
+                        Err(std::io::Error::other(e.to_string())),
+                        serde_json::Value::Null,
+                    )
+                }
+                _ => {
+                    let mut line = String::new();
+                    self.replies.read_line(&mut line).unwrap();
+                    line
+                }
+            };
+            (got.map(|r| (r, ram)), reply(reply_line.trim_end()))
+        }
+    }
+
+    #[test]
+    fn a_migrate_streams_the_vm_then_fences_it() {
+        let log = Arc::new(QuietLog::default());
+        let mut f = Fixture::with(
+            "mig-fence",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                ..Spec::default()
+            },
+        );
+        let (got, r) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"m1","epoch":4}"#);
+        let (received, ram) = got.expect("the stream reads whole");
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["state"], "fenced", "{r}");
+        assert_eq!(r["manifest_sha256"], received.manifest_sha256.as_str());
+        let mut data = [0u8; 10];
+        ram.read(GPA + 0x3000, &mut data).unwrap();
+        assert_eq!(&data, b"guest data", "the page came over");
+        let stats = &r["stats"];
+        assert_eq!(stats["stop_reason"], "converged", "{r}");
+        assert_eq!(stats["rounds"].as_array().unwrap().len(), 2, "{r}");
+        assert_eq!(stats["rounds"][1]["in_pause"], true, "{r}");
+        assert_eq!(stats["ram_present_bytes"], 4096, "{r}");
+        assert_eq!(stats["stream_bytes"], received.stream_bytes, "{r}");
+        let session: serde_json::Value =
+            serde_json::from_slice(received.doc("session.json").unwrap()).unwrap();
+        assert_eq!(session["txid"], "m1");
+        assert_eq!(session["then"], "fence");
+        assert_eq!(log.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(log.stops.load(Ordering::SeqCst), 1, "the tracking stopped");
+        let status = reply(&f.ask(r#"{"v":1,"op":"status"}"#));
+        assert_eq!(status["state"], "fenced");
+        assert_eq!(status["vcpus_parked"], 2);
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"resume"}"#))["code"], "fenced");
+    }
+
+    #[test]
+    fn a_migrate_then_continue_leaves_the_vm_running() {
+        let mut f = Fixture::with(
+            "mig-cont",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        let (got, r) = f.migrate(r#"{"v":1,"op":"migrate","then":"continue","max_rounds":1}"#);
+        got.expect("the stream reads whole");
+        assert_eq!(r["state"], "running", "{r}");
+        f.assert_running();
+    }
+
+    // Refused before the first frame: the reply is the only line, and the VM
+    // was never paused.
+    #[test]
+    fn a_migrate_without_a_record_of_writes_is_refused_before_it_starts() {
+        let mut f = Fixture::with(
+            "mig-nolog",
+            Spec {
+                parking: 2,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.ask(r#"{"v":1,"op":"migrate","then":"fence"}"#));
+        assert_eq!(r["code"], "refused", "{r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("does not record"),
+            "{r}"
+        );
+        f.assert_running();
+    }
+
+    // A failure after the pause takes the place of the next frame, the VM
+    // runs on, and the tracking of its writes is stopped.
+    #[test]
+    fn a_migrate_that_fails_in_the_pause_leaves_the_vm_running() {
+        use crate::devices::virtio::mmio;
+        use crate::devices::virtio::net::VirtioNet;
+        let elsewhere = GuestRam::from_ranges(&[(0x8000_0000, 1 << 20)]);
+        let mut net = VirtioNet::new();
+        let base = 0x8000_0000u64;
+        net.mmio(&elsewhere, mmio::QUEUE_SEL, true, 0);
+        net.mmio(&elsewhere, mmio::QUEUE_NUM, true, 16);
+        net.mmio(&elsewhere, mmio::QUEUE_DESC_LOW, true, base);
+        net.mmio(&elsewhere, mmio::QUEUE_DRIVER_LOW, true, base + 0x1000);
+        net.mmio(&elsewhere, mmio::QUEUE_DEVICE_LOW, true, base + 0x2000);
+        net.mmio(&elsewhere, mmio::QUEUE_READY, true, 1);
+        let log = Arc::new(QuietLog::default());
+        let mut f = Fixture::with(
+            "mig-fail",
+            Spec {
+                parking: 2,
+                capture: true,
+                net: Some(Arc::new(std::sync::Mutex::new(net))),
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                ..Spec::default()
+            },
+        );
+        let (got, _) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence"}"#);
+        let err = got.err().expect("the stream ended early").to_string();
+        assert!(
+            err.contains("capture_failed") && err.contains("a restore would refuse"),
+            "{err}"
+        );
+        f.assert_running();
+        assert_eq!(log.stops.load(Ordering::SeqCst), 1);
+        assert!(f
+            .ask(r#"{"v":1,"op":"status"}"#)
+            .contains(r#""state":"running""#));
+    }
+
+    // A client that goes away part way through leaves the VM running: the
+    // stream fails on the write, before the pause or inside it.
+    #[test]
+    fn a_migrate_whose_reader_hangs_up_leaves_the_vm_running() {
+        let log = Arc::new(QuietLog::default());
+        let mut f = Fixture::with(
+            "mig-hangup",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                ..Spec::default()
+            },
+        );
+        f.client
+            .write_all(b"{\"v\":1,\"op\":\"migrate\",\"then\":\"fence\"}\n")
+            .unwrap();
+        let mut first = String::new();
+        f.replies.read_line(&mut first).unwrap();
+        assert!(first.contains("profile.json"), "{first}");
+        f.client.shutdown(std::net::Shutdown::Both).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while log.stops.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the migrate did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The fixture's stream is small enough to fit the socket's buffer
+        // whole, in which case it was sealed and the VM fenced before the
+        // hang-up; otherwise the write failed and the VM runs on. Either
+        // way the server serves the next client.
+        let mut next = UnixStream::connect(&f.path).unwrap();
+        next.write_all(b"{\"v\":1,\"op\":\"status\"}\n").unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(next).read_line(&mut line).unwrap();
+        let state = reply(line.trim_end())["state"].clone();
+        assert!(state == "running" || state == "fenced", "{line}");
+        if state == "running" {
+            f.assert_running();
+        }
+    }
+
+    // A fenced VM streams again, the same machine, and stays fenced.
+    #[test]
+    fn a_fenced_vm_streams_again_unchanged() {
+        let mut f = Fixture::with(
+            "mig-again",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        let (first, r) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence"}"#);
+        assert_eq!(r["state"], "fenced", "{r}");
+        let (again, r2) = f.migrate(r#"{"v":1,"op":"migrate","then":"continue"}"#);
+        assert_eq!(r2["state"], "fenced", "{r2}");
+        let ((a, ram_a), (b, ram_b)) = (first.unwrap(), again.unwrap());
+        for name in ["cpu.json", "platform.json", "devices.json"] {
+            assert_eq!(a.doc(name), b.doc(name), "{name}");
+        }
+        let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+        ram_a.read(GPA, &mut x).unwrap();
+        ram_b.read(GPA, &mut y).unwrap();
+        assert!(x == y, "the same RAM");
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"resume"}"#))["code"], "fenced");
     }
 
     #[test]
