@@ -1071,21 +1071,6 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, source.profile
     );
 
-    let shared_ram = SharedRam::new(usize::try_from(ram_size)?)?;
-    let ram = Arc::new(GuestRam::new(
-        &shared_ram,
-        &[shared_ram.region_at(RAM_BASE)],
-    )?);
-    ram.register_kvm_slots(&vm)?;
-    opened.bundle.load_ram(&ram)?;
-    let rebuild::Devices {
-        block,
-        net,
-        net_reader,
-        vsock,
-        pl011,
-    } = rebuild::devices(&opened, &cfg, &ram)?;
-
     set_gic_addr(&gicfd, KVM_VGIC_V2_ADDR_TYPE_DIST, gic.gicd_base)?;
     set_gic_addr(&gicfd, KVM_VGIC_V2_ADDR_TYPE_CPU, gic.gicr_base)?;
 
@@ -1107,7 +1092,8 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vcpus.push(vcpu);
     }
 
-    // The machine, before any vCPU runs, as a portable boot sets it up.
+    // The host check of a portable boot, before guest RAM is copied and the
+    // disk is opened, and the baseline and firmware, before any vCPU runs.
     let host = kvm_host(&kvm, &vm, &vcpus[0]);
     let problems = portable::kvm_host_problems(&host);
     if !problems.is_empty() {
@@ -1116,6 +1102,23 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         )));
     }
     set_baseline(&vcpus)?;
+
+    let shared_ram = SharedRam::new(usize::try_from(ram_size)?)?;
+    let ram = Arc::new(GuestRam::new(
+        &shared_ram,
+        &[shared_ram.region_at(RAM_BASE)],
+    )?);
+    ram.register_kvm_slots(&vm)?;
+    opened.bundle.load_ram(&ram)?;
+    let rebuild::Devices {
+        block,
+        net,
+        net_reader,
+        vsock,
+        pl011,
+    } = rebuild::devices(&opened, &cfg, &ram)?;
+
+    // The counter, which KVM takes only before a vCPU has run.
     let start = clock.counter_target(crate::checkpoint::profile::counter_freq_hz());
     let offset = set_counter_offset(&kvm, &vm, &vcpus[0], start)?;
     let device = Arc::new(HviTime::new(
@@ -1154,23 +1157,43 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     })?;
     let gicfd = Arc::new(gicfd);
 
-    // The state, before any vCPU has run: the registers by name, then the
-    // vGIC, which holds every vCPU's CPU interface.
-    for (id, (vcpu, state)) in (0u32..).zip(vcpus.iter().zip(&opened.plan.vcpus)) {
-        let VcpuState::Aarch64(state) = state else {
-            return Err(format!("cpu.json: vCPU {id} is not an arm64 state").into());
-        };
-        kvm_state::import(id, vcpu, state, true)?;
-    }
-    let checked = vgicv2::import(
+    // The state, before any vCPU has run, then the lines: loading the vGIC
+    // set every line to its captured level behind the devices' backs, so
+    // each device's line goes to the device's level once it is connected,
+    // and the device's record of it with it.
+    let pl011 = Arc::new(Mutex::new(pl011));
+    let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
+    let checked = kvm_state::load_portable(
+        &vcpus,
+        &opened.plan.vcpus,
         &KvmVgic {
             gic: &gicfd,
             vm: &vm,
             ncpu: num_cpus as usize,
         },
         gic_state,
-    )
-    .map_err(|e| format!("the vGICv2: {e}"))?;
+        || {
+            let mut uart = lock_or_recover(&pl011);
+            uart.connect_irq(line(UART_SPI));
+            uart.redrive_irq();
+            drop(uart);
+            if let Some(dev) = &block {
+                let mut dev = lock_or_recover(dev);
+                dev.connect_irq(line(VIRTIO_SPI));
+                dev.redrive_irq();
+            }
+            if let Some(dev) = &net {
+                let mut dev = lock_or_recover(dev);
+                dev.connect_irq(line(VIRTIO_NET_SPI));
+                dev.redrive_irq();
+            }
+            if let Some(dev) = &vsock {
+                let mut dev = lock_or_recover(dev);
+                dev.connect_irq(line(VIRTIO_VSOCK_SPI));
+                dev.redrive_irq();
+            }
+        },
+    )?;
     eprintln!("{LOG_PREFIX} vGICv2: {checked} registers loaded and read back");
     let midr = read_u64(&vcpus[0], REG_MIDR_EL1);
 
@@ -1193,28 +1216,13 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
         }),
-        pl011: Arc::new(Mutex::new(pl011)),
+        pl011,
         plugin: None,
         hvitime: Some(Arc::clone(&device)),
         vm: Arc::clone(&vm),
         gic: Arc::clone(&gicfd),
         restoring: Some(Arc::new(PendingPublish::new((**clock).clone()))),
     };
-    // Loading the vGIC set every line to its captured level behind the
-    // devices' backs, so each device's line goes to the device's level
-    // after it is connected, and the device's record of it with it.
-    let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
-    {
-        let mut pl011 = lock_or_recover(&shared.pl011);
-        pl011.connect_irq(line(UART_SPI));
-        pl011.redrive_irq();
-    }
-    shared.guest.connect_irqs(
-        line(VIRTIO_SPI),
-        line(VIRTIO_NET_SPI),
-        line(VIRTIO_VSOCK_SPI),
-    );
-    shared.guest.redrive_irqs();
 
     // Held from the control socket before any vCPU thread exists, so each
     // parks before its first entry until a client resumes the guest.

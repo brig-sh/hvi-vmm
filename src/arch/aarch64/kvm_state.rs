@@ -458,6 +458,48 @@ pub(crate) fn import(
     Ok(())
 }
 
+/// Loads a portable guest's state into a KVM VM before any of its vCPUs
+/// has run: each vCPU's registers by name, in index order, then the vGIC
+/// from the canonical state, which holds every vCPU's CPU interface, then
+/// `redrive`, which connects the devices' lines and drives each to its
+/// device's level, since loading the vGIC set every line behind the
+/// devices' backs. Returns how many vGIC registers were read back.
+///
+/// The vCPUs must be created and initialised, the VM's baseline, firmware
+/// registers and counter offset set, and the vGIC initialised.
+///
+/// # Errors
+///
+/// Errors, before `redrive`, when a state is not an arm64 one for its
+/// vCPU, a vCPU refuses its state, or the vGIC refuses the canonical one.
+pub(crate) fn load_portable(
+    vcpus: &[impl OneReg],
+    states: &[crate::checkpoint::cpu::VcpuState],
+    vgic: &impl crate::arch::aarch64::vgicv2::VgicV2,
+    gic: &crate::devices::gicv2::Gicv2State,
+    redrive: impl FnOnce(),
+) -> io::Result<usize> {
+    if vcpus.len() != states.len() {
+        return Err(io::Error::other(format!(
+            "{} vCPUs for {} states",
+            vcpus.len(),
+            states.len()
+        )));
+    }
+    for (id, (vcpu, state)) in (0u32..).zip(vcpus.iter().zip(states)) {
+        let crate::checkpoint::cpu::VcpuState::Aarch64(state) = state else {
+            return Err(io::Error::other(format!(
+                "cpu.json: vCPU {id} is not an arm64 state"
+            )));
+        };
+        import(id, vcpu, state, true)?;
+    }
+    let checked = crate::arch::aarch64::vgicv2::import(vgic, gic)
+        .map_err(|e| io::Error::other(format!("the vGICv2: {e}")))?;
+    redrive();
+    Ok(checked)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -733,5 +775,123 @@ pub(crate) mod tests {
         assert_eq!(dest.set_state.borrow().0, Some(MP_RUNNABLE));
         let pc = crate::checkpoint::kvm_regs::id_of(Slot::Reg("pc")).unwrap();
         assert_eq!(dest.values.borrow()[&pc], 0x4008_0000);
+    }
+
+    /// The order of what a restore did, by kind.
+    type Order = RefCell<Vec<&'static str>>;
+
+    /// A vCPU that logs each write.
+    struct LoggedVcpu<'a>(FakeVcpu, &'a Order);
+
+    impl OneReg for LoggedVcpu<'_> {
+        fn reg_list(&self) -> io::Result<Vec<u64>> {
+            self.0.reg_list()
+        }
+        fn get(&self, id: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.0.get(id, buf)
+        }
+        fn set(&self, id: u64, buf: &[u8]) -> io::Result<()> {
+            self.1.borrow_mut().push("vcpu");
+            self.0.set(id, buf)
+        }
+        fn mp_state(&self) -> io::Result<u32> {
+            self.0.mp_state()
+        }
+        fn events(&self) -> io::Result<Arm64Events> {
+            self.0.events()
+        }
+        fn set_mp_state(&self, mp_state: u32) -> io::Result<()> {
+            self.1.borrow_mut().push("vcpu");
+            self.0.set_mp_state(mp_state)
+        }
+        fn set_events(&self, events: &Arm64Events) -> io::Result<()> {
+            self.0.set_events(events)
+        }
+    }
+
+    /// A vGIC that logs each write.
+    struct LoggedVgic<'a>(crate::arch::aarch64::vgicv2::tests::Fake, &'a Order);
+
+    impl crate::arch::aarch64::vgicv2::VgicV2 for LoggedVgic<'_> {
+        fn ncpu(&self) -> usize {
+            self.0.ncpu()
+        }
+        fn read(
+            &self,
+            bank: crate::arch::aarch64::vgicv2::Bank,
+            cpu: usize,
+            offset: u64,
+        ) -> Result<u32, String> {
+            self.0.read(bank, cpu, offset)
+        }
+        fn write(
+            &self,
+            bank: crate::arch::aarch64::vgicv2::Bank,
+            cpu: usize,
+            offset: u64,
+            value: u32,
+        ) -> Result<(), String> {
+            self.1.borrow_mut().push("vgic");
+            self.0.write(bank, cpu, offset, value)
+        }
+        fn set_line(&self, cpu: usize, intid: u32, level: bool) -> Result<(), String> {
+            self.1.borrow_mut().push("vgic");
+            self.0.set_line(cpu, intid, level)
+        }
+    }
+
+    // The restore's order before any vCPU runs: every vCPU's registers,
+    // then the vGIC, then the lines, which the vGIC load set behind the
+    // devices' backs. A vGIC that refuses the state stops it before the
+    // lines.
+    #[test]
+    fn a_kvm_restore_loads_the_vcpus_then_the_vgic_then_the_lines() {
+        use crate::arch::aarch64::vgicv2::tests::{busy_state, Fake};
+        let source = FakeVcpu::rp2();
+        let state = crate::checkpoint::cpu::VcpuState::Aarch64(export(0, &source).unwrap());
+        let mut gic = busy_state();
+        gic.cpus.truncate(1);
+        // busy_state has two CPUs; keep cpu0's SGIs to itself.
+        for s in &mut gic.cpus[0].sgi_sources {
+            *s &= 1;
+        }
+        for t in &mut gic.dist.itargetsr {
+            *t &= 1;
+        }
+        let order = Order::default();
+        let vcpus = [LoggedVcpu(FakeVcpu::rp2(), &order)];
+        let vgic = LoggedVgic(Fake::new(1), &order);
+        let checked = load_portable(&vcpus, std::slice::from_ref(&state), &vgic, &gic, || {
+            order.borrow_mut().push("redrive");
+        })
+        .unwrap();
+        assert!(checked > 0);
+        let mut runs: Vec<&str> = order.borrow().clone();
+        runs.dedup();
+        assert_eq!(runs, ["vcpu", "vgic", "redrive"]);
+
+        let order = Order::default();
+        let vcpus = [LoggedVcpu(FakeVcpu::rp2(), &order)];
+        let vgic = LoggedVgic(Fake::new(1), &order);
+        let mut refused = gic.clone();
+        refused.cpus[0].apr[2] = 1;
+        let err = load_portable(
+            &vcpus,
+            std::slice::from_ref(&state),
+            &vgic,
+            &refused,
+            || {
+                order.borrow_mut().push("redrive");
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("the vGICv2"), "{err}");
+        assert!(!order.borrow().contains(&"redrive"));
+        // A state for another number of vCPUs is refused before anything
+        // is written.
+        let order = Order::default();
+        let vcpus = [LoggedVcpu(FakeVcpu::rp2(), &order)];
+        assert!(load_portable(&vcpus, &[state.clone(), state], &vgic, &gic, || {}).is_err());
+        assert!(order.borrow().is_empty());
     }
 }
