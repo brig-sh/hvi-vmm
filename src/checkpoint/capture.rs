@@ -45,6 +45,7 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::memory::GuestRam;
 use crate::plugin::GuestArch;
 use crate::sync::lock_or_recover;
+use crate::LOG_PREFIX;
 
 /// The console devices a backend attaches.
 #[derive(Clone)]
@@ -127,6 +128,18 @@ impl Capture {
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn after(&self, _component: Component) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Releases the disk's lock once a checkpoint has fenced the VM, so the
+    /// restore that takes the guest over can open the disk before this
+    /// process is stopped. The fenced guest never runs again, so nothing
+    /// here writes the disk again. See `VirtioBlk::release_lock`.
+    pub(crate) fn release_disk(&self) {
+        if let Some((dev, path)) = &self.block {
+            if lock_or_recover(dev).release_lock() {
+                eprintln!("{LOG_PREFIX} virtio-blk: fenced; released the lock on {path}");
+            }
+        }
     }
 
     /// Gathers every device's state and line level, with every device mutex

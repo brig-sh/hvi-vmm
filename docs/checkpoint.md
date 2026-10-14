@@ -127,6 +127,11 @@ The fence holds only while this hvi process lives. It is not written
 anywhere. A caller that must survive a crash of the source records the fence
 itself.
 
+A fenced source also releases the lock it holds on its disk (see
+[The disk lock](#the-disk-lock)). Its guest never runs again, so it never
+writes the disk again, and the restore can open the disk before the source
+is stopped.
+
 ## Checking a bundle
 
 ```sh
@@ -371,6 +376,31 @@ had: `--disk` when it had a disk, the network mode it ran on, and
 paused. `status` reports `restored-paused`, and the guest runs once a client
 sends `resume`. `stop` ends it without it ever running. A checkpoint of a
 restored guest works as of any other, so a guest can move again.
+
+hvi does not consume a bundle. It restores a sealed bundle as often as it
+is asked to, a `then: "continue"` snapshot as well as a fenced one, and it
+records nothing in the bundle. The caller makes sure a guest runs in one
+place only: it restores a bundle once, and only once the source is fenced or
+stopped.
+
+### The disk lock
+
+Two guests that write one disk image corrupt its filesystem. Each hvi holds
+an exclusive `flock` on its `--disk` while its guest may write it, from the
+open at boot or restore until the process exits, or until a fenced
+checkpoint releases it. A boot or restore whose disk another process holds
+locked fails with `virtio-blk: PATH is locked by another process`. So a
+second restore of one bundle onto the disk a restored guest runs on fails,
+and so does a restore of a `then: "continue"` snapshot while its source
+still runs.
+
+The lock is advisory. It keeps out another hvi, not a program that writes
+the image without taking it. A regular file or a block device is locked; a
+filesystem that has no `flock` leaves the disk unlocked, and hvi says so on
+stderr. The lock is held on a second open of the disk, so the fence releases
+it by closing that open, which needs no call the sandbox would have to allow.
+
+### The steps
 
 A restore runs these steps, in this order:
 
