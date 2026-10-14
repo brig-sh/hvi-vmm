@@ -902,6 +902,8 @@ pub(crate) mod tests {
                 round,
                 generation,
                 blocks: 1,
+                bitmap_sha256: None,
+                sent_sha256: None,
             })
             .collect();
     }

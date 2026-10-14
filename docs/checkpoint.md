@@ -703,7 +703,9 @@ short when the disk is not a whole number of blocks.
    small; reading since boot again starts over.
 
 Each read records the device's generation, under the lock the guest's
-writes take, so a write after a read is in the next round. Read with the
+writes take, so a write after a read is in the next round, and the
+SHA-256 of the bitmap it returns, which the reply gives as
+`bitmap_sha256`. Read with the
 guest paused (`paused`, `restored-paused` or `fenced`), it first syncs the
 disk with `fdatasync`, as a capture does.
 
@@ -748,7 +750,7 @@ come on the connection in batches, then the op's reply:
 <131072 bytes: blocks 3 and 4>
 {"component":"disk-blocks","batch":1,"first":9,"count":1,"offset":589824,"size":65536,"sha256":"<hex>"}
 <65536 bytes: block 9>
-{"v":1,"ok":true,"blocks":3,"bytes":196608,"batches":2,"generation":41,"max_lock_us":38}
+{"v":1,"ok":true,"blocks":3,"bytes":196608,"batches":2,"generation":41,"max_lock_us":38,"sent_sha256":"<hex>"}
 ```
 
 | Header field | Meaning |
@@ -767,6 +769,14 @@ guest's I/O waits for one 64 KiB read at most; `max_lock_us` is the
 longest hold. A block the guest writes while it is exported may go out
 with or without the write, and is in the next round either way.
 
+The reply's `sent_sha256` is the SHA-256 of the batches' `sha256` texts,
+in order, with nothing between them. A reader that hashes the digests of
+the batches it applied the same way, and compares `blocks`, `bytes` and
+`batches` with what it applied, knows it applied the whole stream. For
+`{"round":k}` the reply also carries `round`, and the device records the
+digest against the round, so a `disk.json` captured later lists it as
+the round's `sent_sha256`.
+
 `tools/apply-blocks.py --image <copy> --sock <control socket> --round <k>`
 applies a round as a destination would: it checks each header, that the
 blocks are inside the image and at their own offset, and each digest, and
@@ -776,11 +786,23 @@ never grows the image. `--stream FILE` reads a saved stream instead.
 
 `disk.json` records `base_sha256` (the profile's `disk_base_sha256`),
 `block_size` (65536), `dirty_since_boot_b64` (the first bitmap as base64)
-and `rounds`, each `{"round","generation","blocks"}`. A `disk.json` written
-before these fields existed still reads. The reader refuses one whose base
-is not the profile's, whose rounds are out of order or of a generation past
-the disk's, or whose bitmap is not the bitmap of a disk this size; it
-checks the bitmap's length before it decodes it.
+and `rounds`, each `{"round","generation","blocks","bitmap_sha256",
+"sent_sha256"}`. `bitmap_sha256` is the digest the round's `disk-dirty`
+reply gave; `sent_sha256` is the one its `{"round":k}` reply gave, or
+`null` for a round not streamed that way before the capture. With them a
+destination can show it applied each listed round's blocks, and that no
+round was read before the one before it went out: such a round has no
+`sent_sha256`. hvi records them and checks only their form; comparing
+them with what was applied is the mover's work. A final round read after
+a fence is not in `disk.json`, so its digests are only in its replies.
+The manifest covers `disk.json`, and so the digests it lists, but not
+the block bytes themselves.
+
+A `disk.json` written before these fields existed still reads. The reader
+refuses one whose base is not the profile's, whose rounds are out of order
+or of a generation past the disk's, whose digests are not 64 lowercase hex
+digits, or whose bitmap is not the bitmap of a disk this size; it checks
+the bitmap's length before it decodes it.
 
 Only the mover knows how it made the destination's disk, so it says so:
 `hvi restore --disk-generation G` means `--disk` is the base with every

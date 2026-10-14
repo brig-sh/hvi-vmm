@@ -26,8 +26,8 @@
 //! | `status` | none | `state`, `vcpus`, `vcpus_parked` |
 //! | `stop` | ends the run, as a guest power-off would | `state` |
 //! | `checkpoint` | captures the VM into a bundle directory | `state`, `dir`, `manifest_sha256`, `stats` |
-//! | `disk-dirty` | reads the disk blocks written since boot or since the last read | `since`, `round`, `block_size`, `blocks`, `dirty`, `generation`, `bitmap_b64` |
-//! | `disk-blocks` | streams disk blocks, see [`disk`](super::disk) | `blocks`, `bytes`, `batches`, `generation`, `max_lock_us` |
+//! | `disk-dirty` | reads the disk blocks written since boot or since the last read | `since`, `round`, `block_size`, `blocks`, `dirty`, `generation`, `bitmap_sha256`, `bitmap_b64` |
+//! | `disk-blocks` | streams disk blocks, see [`disk`](super::disk) | `round` (for a round), `blocks`, `bytes`, `batches`, `generation`, `max_lock_us`, `sent_sha256` |
 //!
 //! A refusal is `{"v":1,"ok":false,"code":...,"error":...}`, where `code` is
 //! one of the [`ErrorCode`] spellings and `error` is prose for a person.
@@ -242,25 +242,34 @@ pub struct DiskDirtyReply {
     pub dirty: u64,
     /// The disk's generation at the read.
     pub generation: u64,
+    /// The SHA-256 of the bitmap's bytes, as lowercase hex.
+    pub bitmap_sha256: String,
     /// The bitmap, bit `i` of byte `i / 8` (low bit first) for block `i`,
     /// as standard base64.
     pub bitmap_b64: String,
 }
 
 /// What `disk-blocks` reports once it has sent every batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiskBlocksReply {
+    /// The round sent, for `{"round":k}`; absent for a list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
     /// The blocks sent.
     pub blocks: u64,
     /// Their bytes, without the header lines.
     pub bytes: u64,
     /// The batches.
     pub batches: u64,
-    /// The disk's generation after the last block was read.
+    /// The disk's generation after the last block was read. Not the
+    /// generation a restore checks: that is the `disk-dirty` reply's.
     pub generation: u64,
     /// The longest the disk was held from the guest for one block, in
     /// microseconds.
     pub max_lock_us: u64,
+    /// The SHA-256 of the batches' `sha256` texts in order, as lowercase
+    /// hex; for a round, `disk.json` records it too.
+    pub sent_sha256: String,
 }
 
 /// What a checkpoint took, as its reply reports it.
@@ -720,25 +729,48 @@ mod tests {
                 blocks: 10,
                 dirty: 2,
                 generation: 41,
+                bitmap_sha256: "ab".repeat(32),
                 bitmap_b64: "AQI=".into(),
             })),
-            concat!(
-                r#"{"v":1,"ok":true,"since":"round","round":2,"block_size":65536,"#,
-                r#""blocks":10,"dirty":2,"generation":41,"bitmap_b64":"AQI="}"#
+            format!(
+                concat!(
+                    r#"{{"v":1,"ok":true,"since":"round","round":2,"block_size":65536,"#,
+                    r#""blocks":10,"dirty":2,"generation":41,"bitmap_sha256":"{}","#,
+                    r#""bitmap_b64":"AQI="}}"#
+                ),
+                "ab".repeat(32)
             )
         );
         assert_eq!(
             format_response(&Response::DiskBlocks(DiskBlocksReply {
+                round: None,
                 blocks: 2,
                 bytes: 131_072,
                 batches: 1,
                 generation: 41,
                 max_lock_us: 90,
+                sent_sha256: "cd".repeat(32),
             })),
-            concat!(
-                r#"{"v":1,"ok":true,"blocks":2,"bytes":131072,"batches":1,"#,
-                r#""generation":41,"max_lock_us":90}"#
+            format!(
+                concat!(
+                    r#"{{"v":1,"ok":true,"blocks":2,"bytes":131072,"batches":1,"#,
+                    r#""generation":41,"max_lock_us":90,"sent_sha256":"{}"}}"#
+                ),
+                "cd".repeat(32)
             )
+        );
+        let line = format_response(&Response::DiskBlocks(DiskBlocksReply {
+            round: Some(3),
+            blocks: 0,
+            bytes: 0,
+            batches: 0,
+            generation: 41,
+            max_lock_us: 0,
+            sent_sha256: "cd".repeat(32),
+        }));
+        assert!(
+            line.starts_with(r#"{"v":1,"ok":true,"round":3,"blocks":0,"#),
+            "{line}"
         );
     }
 
