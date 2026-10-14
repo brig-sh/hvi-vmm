@@ -317,6 +317,9 @@ pub mod fw {
     pub const AFFINITY_OFF: u64 = 1;
     /// `SMCCC_ARCH_FEATURES` for a workaround the CPU does not need.
     pub const WORKAROUND_NOT_REQUIRED: u64 = 1;
+    /// `SMCCC_RET_NOT_REQUIRED`: what KVM answers `SMCCC_ARCH_FEATURES`
+    /// of workaround 2 with when the guest needs no firmware mitigation.
+    pub const NOT_REQUIRED: u64 = (-2i64) as u64;
 }
 
 /// The functions `PSCI_FEATURES` reports as implemented.
@@ -355,13 +358,23 @@ pub fn psci_features(function: u32) -> u64 {
 /// Returns what `SMCCC_ARCH_FEATURES(function)` answers.
 ///
 /// On the Pi, KVM answers that the Cortex-A76 does not need workaround 1
-/// (Spectre v2), that workaround 2 (SSB) is not available and that
-/// workaround 3 (Spectre-BHB) is. Every other function is not supported,
-/// `SMCCC_ARCH_SOC_ID` included.
+/// (Spectre v2), that workaround 2 (SSB) is not required and that
+/// workaround 3 (Spectre-BHB) is available. Every other function is not
+/// supported, `SMCCC_ARCH_SOC_ID` included.
+///
+/// Workaround 2's answer depends on the guest's `ID_AA64PFR1_EL1`: KVM
+/// answers `NOT_SUPPORTED` while SSBS is visible, and `NOT_REQUIRED` (-2)
+/// once the baseline hides it, because it then keeps the guest mitigated
+/// itself. A Linux guest reads `NOT_REQUIRED` as not affected by Spectre v4.
+/// hvi gives that answer on the Mac too, so that a guest reads the same
+/// mitigation state wherever it boots. On the Mac nothing backs the answer:
+/// a guest there was unmitigated before, when it read `NOT_SUPPORTED` and
+/// called itself vulnerable, and is now.
 #[must_use]
 pub fn smccc_arch_features(function: u32) -> u64 {
     match function {
         fw::SMCCC_ARCH_WORKAROUND_1 => fw::WORKAROUND_NOT_REQUIRED,
+        fw::SMCCC_ARCH_WORKAROUND_2 => fw::NOT_REQUIRED,
         fw::SMCCC_ARCH_WORKAROUND_3 => fw::SUCCESS,
         _ => fw::NOT_SUPPORTED,
     }
@@ -388,12 +401,13 @@ pub fn check_guest_counter(guest: u64, before: u64, after: u64, slack: u64) -> R
 mod tests {
     use super::*;
 
-    /// The answers a KVM guest on rp2 read, from `smccc_probe.out`
-    /// ("LOWERED" section).
+    /// The answers a KVM guest on rp2 read, from `smccc_probe.out`: the
+    /// "LOWERED" section, and for workaround 2 the section that also sets
+    /// `ID_AA64PFR1_EL1` to the baseline's 0.
     #[test]
     fn firmware_answers_match_the_pi() {
         assert_eq!(smccc_arch_features(0x8000_8000), 1);
-        assert_eq!(smccc_arch_features(0x8000_7fff), u64::MAX);
+        assert_eq!(smccc_arch_features(0x8000_7fff), 0xffff_ffff_ffff_fffe);
         assert_eq!(smccc_arch_features(0x8000_3fff), 0);
         for f in [0x8000_0000, 0x8000_0001, 0x8000_0002] {
             assert_eq!(smccc_arch_features(f), u64::MAX, "{f:#x}");

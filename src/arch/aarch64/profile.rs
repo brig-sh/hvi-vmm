@@ -72,27 +72,34 @@ pub(crate) fn profile(backend: &str, machine: &Arm64Machine<'_>) -> MachineProfi
         ram_regions,
     );
     p.firmware.dtb_sha256 = dtb_sha256(machine);
-    if machine.profile == MachineProfileKind::PortableArm64V1 {
-        p.profile = machine.profile.name().to_string();
-        p.baseline = Some(
-            portable::BASELINE
-                .iter()
-                .map(|(name, value)| ((*name).to_string(), hex(*value)))
-                .collect(),
-        );
-        p.irq = p.gic.clone().map(|layout| Irq {
-            kind: "gicv2".into(),
-            layout,
-        });
-        p.time = Some(Time {
-            kind: "hvi-time".into(),
-            counter_freq_hz: p.counter_freq_hz,
-            page_base: HVI_TIME_PAGE_BASE,
-            timers_base: HVI_TIME_TIMERS_BASE,
-            intid: hvitime::INTID,
-        });
-    }
+    fill_profile_kind(&mut p, machine.profile);
     p
+}
+
+/// Fills the fields of the machine profile `kind` into `p`: under the
+/// portable profile its name, its CPU baseline, its GICv2 and `hvi-time`.
+fn fill_profile_kind(p: &mut MachineProfile, kind: MachineProfileKind) {
+    if kind != MachineProfileKind::PortableArm64V1 {
+        return;
+    }
+    p.profile = kind.name().to_string();
+    p.baseline = Some(
+        portable::BASELINE
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), hex(*value)))
+            .collect(),
+    );
+    p.irq = p.gic.clone().map(|layout| Irq {
+        kind: "gicv2".into(),
+        layout,
+    });
+    p.time = Some(Time {
+        kind: "hvi-time".into(),
+        counter_freq_hz: p.counter_freq_hz,
+        page_base: HVI_TIME_PAGE_BASE,
+        timers_base: HVI_TIME_TIMERS_BASE,
+        intid: hvitime::INTID,
+    });
 }
 
 /// Returns the profile of an arm64 guest a restore builds on `backend`, as
@@ -105,14 +112,13 @@ pub(crate) fn profile(backend: &str, machine: &Arm64Machine<'_>) -> MachineProfi
 /// kernel and builds no devicetree, since guest RAM already holds both, so
 /// there is no layout here to hash; the restore makes the RAM and the vCPUs
 /// exactly as the bundle has them.
-// Only the HVF restore calls it so far.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn restored(
     backend: &str,
     gic: &GicLayout,
     devices: VirtioDevices,
     net_mode: Option<&str>,
     source: &MachineProfile,
+    kind: MachineProfileKind,
 ) -> MachineProfile {
     let mut p = base(
         backend,
@@ -125,6 +131,7 @@ pub(crate) fn restored(
     p.firmware
         .dtb_sha256
         .clone_from(&source.firmware.dtb_sha256);
+    fill_profile_kind(&mut p, kind);
     p
 }
 

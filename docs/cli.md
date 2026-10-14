@@ -17,7 +17,7 @@ not apply returns a named error rather than "unknown subcommand".
 | Subcommand | Where it works | What it does |
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
-| `restore` | macOS, Apple silicon | Resume a checkpoint bundle in this process. See [`restore`](#restore). On Linux it returns an error: the KVM restore is not built yet. |
+| `restore` | macOS, Apple silicon; arm64 Linux with KVM | Resume a checkpoint bundle in this process. See [`restore`](#restore). On KVM it restores the portable profile only. On x86-64 Linux it returns an error: that restore is not built yet. |
 | `checkpoint-verify <dir>` | everywhere | Check a checkpoint bundle whole and print what it holds. Exits 1, naming the file, on the first mismatch. See [checkpoint.md](checkpoint.md#checking-a-bundle). |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
 | `smoke` | macOS, Apple silicon | The Hypervisor.framework smoke test. `--shm` runs it over shared guest RAM. |
@@ -243,8 +243,11 @@ before it creates anything, and otherwise brings the guest up
 Each flag needs exactly what the guest had: the network mode and the
 devices are part of the machine it was built against. `--net-tap` is not
 taken. The kernel, initramfs, command line, vCPU count and RAM size come
-from the bundle. A bundle of a `--profile portable-arm64-v1` guest is
-refused: no backend restores the portable profile yet.
+from the bundle, and so does the machine profile: a bundle of a
+`--profile portable-arm64-v1` guest restores as one, on HVF or on arm64
+KVM, from either backend. On KVM only the portable profile restores; a
+native KVM bundle is refused, since its vGICv3 is not captured. See
+[checkpoint.md](checkpoint.md#the-portable-restore).
 
 ## `dump-fdt`
 
