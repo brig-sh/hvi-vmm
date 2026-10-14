@@ -45,7 +45,11 @@
 //!   | 0x18 | `CTRL` | read/write: bit 0 `ENABLE` |
 //!
 //!   Each register is 64 bits wide and also takes 32-bit accesses to either
-//!   half. Other offsets read as zero and ignore writes.
+//!   half. Other offsets read as zero and ignore writes. A 32-bit
+//!   `DEADLINE_NS` is written low half first: the low half is held, and the
+//!   timer disarmed, until the high half arrives and arms the whole value,
+//!   so no half-written deadline can fire early. A high half written alone
+//!   keeps the low half the deadline had.
 //!
 //! A vCPU's interrupt line, PPI 4 (INTID 20), is high while its timer is
 //! enabled and its `STATUS` is not zero. With `ENABLE` clear an armed
@@ -418,6 +422,9 @@ struct Timer {
     ctrl: u64,
     /// The level hvi last gave the line.
     line: bool,
+    /// A 32-bit write to the low half of `DEADLINE_NS`, held until the
+    /// high half arrives.
+    low: Option<u32>,
 }
 
 impl Timer {
@@ -426,6 +433,7 @@ impl Timer {
         status: 0,
         ctrl: 0,
         line: false,
+        low: None,
     };
 
     fn enabled(&self) -> bool {
@@ -615,7 +623,27 @@ impl HviTime {
         match reg {
             reg::DEADLINE_NS => {
                 let t = &mut g.timers[cpu];
-                t.deadline = (t.deadline & !mask) | bits;
+                match half {
+                    // The low half alone: merged into the armed deadline
+                    // it could make one in the past, so it waits for the
+                    // high half, and the old deadline is off meanwhile.
+                    Some(0) => {
+                        t.low = Some(value as u32);
+                        t.deadline = DISARMED;
+                    }
+                    // The high half: arms the whole value. Without a held
+                    // low half it keeps the deadline's; after a capture
+                    // that fell between the halves that is the disarmed
+                    // value's, so the deadline is late, never early.
+                    Some(_) => {
+                        let low = t.low.take().unwrap_or(t.deadline as u32);
+                        t.deadline = bits | u64::from(low);
+                    }
+                    None => {
+                        t.low = None;
+                        t.deadline = value;
+                    }
+                }
                 // A deadline already due fires here, on the writer; a later
                 // one is the timer thread's.
                 let now = g.clock.guest_ns(self.counter.now());
@@ -807,6 +835,7 @@ impl HviTime {
         g.frozen = false;
         for (t, s) in g.timers.iter_mut().zip(&state.cpus) {
             t.deadline = s.deadline_ns.unwrap_or(DISARMED);
+            t.low = None;
             t.status = s.status | STATUS_GEN_CHANGED;
             t.ctrl = s.ctrl & CTRL_ENABLE;
         }
@@ -1280,6 +1309,47 @@ mod tests {
         dev.mmio_write(0x18, 8, 0xff);
         assert_eq!(dev.mmio_read(0x18, 8), CTRL_ENABLE);
         assert!(lines.take().is_empty(), "nothing fired");
+    }
+
+    /// A deadline rewritten in 32-bit halves, low half first, fires at the
+    /// value both halves make and never at the mix of old and new.
+    #[test]
+    fn a_deadline_written_in_halves_never_fires_early() {
+        let (counter, lines) = (Counter::default(), Lines::default());
+        let dev = device(&counter, &lines);
+        dev.mmio_write(0x18, 8, CTRL_ENABLE);
+        // Armed at 2^32 + 0xffff_0000 ns, now 2^32 + 0x1000 ns.
+        dev.mmio_write(0x00, 8, 0x1_ffff_0000);
+        counter.set(1000 + ticks(0x1_0000_1000));
+        // The guest moves it to 2^33 + 0x10 ns. Merged into the armed value
+        // the low half would make 2^32 + 0x10, in the past.
+        dev.mmio_write(0x00, 4, 0x10);
+        assert!(lines.take().is_empty(), "the low half fired the timer");
+        assert_eq!(dev.mmio_read(0x10, 8), 0);
+        assert_eq!(dev.mmio_read(0x00, 8), DISARMED);
+        dev.mmio_write(0x04, 4, 0x2);
+        assert!(lines.take().is_empty(), "fired before its deadline");
+        assert_eq!(dev.mmio_read(0x00, 8), 0x2_0000_0010);
+        // It fires at that value, not before.
+        counter.set(1000 + ticks(0x2_0000_0000));
+        dev.mmio_write(0x18, 8, CTRL_ENABLE);
+        assert!(lines.take().is_empty());
+        counter.set(1000 + ticks(0x2_0000_0010) + 1);
+        dev.mmio_write(0x18, 8, CTRL_ENABLE);
+        assert_eq!(lines.take(), vec![(0, true)]);
+        assert_eq!(dev.mmio_read(0x10, 8), STATUS_EXPIRED);
+        // Both halves of a deadline already due fire it at the high half.
+        dev.mmio_write(0x10, 8, STATUS_EXPIRED);
+        assert_eq!(lines.take(), vec![(0, false)]);
+        dev.mmio_write(0x00, 4, 0x5);
+        assert!(lines.take().is_empty());
+        dev.mmio_write(0x04, 4, 0x2);
+        assert_eq!(lines.take(), vec![(0, true)]);
+        // A 64-bit write drops a held low half.
+        dev.mmio_write(0x100, 4, 0x7);
+        dev.mmio_write(0x100, 8, 0x9_0000_0000);
+        dev.mmio_write(0x104, 4, 0xa);
+        assert_eq!(dev.mmio_read(0x100, 8), 0xa_0000_0000);
     }
 
     #[test]
