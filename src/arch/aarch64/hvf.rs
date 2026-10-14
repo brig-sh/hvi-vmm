@@ -1200,7 +1200,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         Some(p) => {
             let device = Arc::new(HviTime::new(
                 num_cpus as usize,
-                u32::try_from(crate::checkpoint::profile::counter_freq_hz()).unwrap_or(0),
+                crate::checkpoint::profile::counter_freq_hz(),
                 Box::new(HvfCounter {
                     offset: vtimer_offset,
                 }),

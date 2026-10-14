@@ -96,8 +96,11 @@ pub const MAGIC: u32 = 0x4d54_5648;
 /// The page layout this device writes.
 pub const VERSION: u32 = 1;
 /// The shift the page carries at every counter rate. With 24, `mult` stays
-/// below 2^32 for any counter of at least 4 MHz.
+/// below 2^32 for any counter faster than [`MIN_COUNTER_HZ`].
 pub const SHIFT: u32 = 24;
+/// The slowest counter `hvi-time` serves, in Hz. At 3,906,250 Hz exactly,
+/// `(10^9 << SHIFT) / freq` is 2^32, one more than `mult` holds.
+pub const MIN_COUNTER_HZ: u32 = 3_906_251;
 
 /// `DEADLINE_NS` of a disarmed timer.
 pub const DISARMED: u64 = u64::MAX;
@@ -134,15 +137,41 @@ mod reg {
 }
 
 /// Returns the `mult` of the page for a counter of `freq` Hz: the nearest
-/// integer to `(10^9 << SHIFT) / freq`.
+/// integer to `(10^9 << SHIFT) / freq`, or `None` when `freq` is 0 or so
+/// slow that `mult` does not fit in 32 bits.
 ///
 /// The guest kernel's pvclock test pins 699050667 at 24 MHz and 310689185 at
 /// 54 MHz, so hvi and the guest round the same way.
 #[must_use]
-pub fn mult_for(freq: u32) -> u32 {
-    let freq = u128::from(freq.max(1));
+pub fn mult_for(freq: u32) -> Option<u32> {
+    if freq == 0 {
+        return None;
+    }
+    let freq = u128::from(freq);
     let num = 1_000_000_000u128 << SHIFT;
-    u32::try_from((num + freq / 2) / freq).unwrap_or(u32::MAX)
+    u32::try_from((num + freq / 2) / freq).ok()
+}
+
+/// Returns the counter rate `freq_hz` as the page carries it, with its
+/// `mult`.
+///
+/// # Errors
+///
+/// Errors when the rate is 0, does not fit the page's 32-bit field, or is
+/// below [`MIN_COUNTER_HZ`]. The guest would refuse a page with rate 0
+/// and never tick, and a slower counter would make `mult` overflow and
+/// guest time run at the wrong rate.
+pub fn counter_rate(freq_hz: u64) -> Result<(u32, u32), String> {
+    let refuse = || {
+        format!(
+            "the host counter runs at {freq_hz} Hz (CNTFRQ_EL0), and hvi-time needs \
+             {MIN_COUNTER_HZ} to {} Hz",
+            u32::MAX
+        )
+    };
+    let freq = u32::try_from(freq_hz).map_err(|_| refuse())?;
+    let mult = mult_for(freq).ok_or_else(refuse)?;
+    Ok((freq, mult))
 }
 
 /// `mul_u64_u32_shr`, as the guest computes it: the 96-bit product of `a`
@@ -432,6 +461,8 @@ pub struct HviTime {
     line: Box<dyn TimerLine>,
     /// The host counter's rate, which every publish on this host carries.
     freq: u32,
+    /// [`mult_for`] of `freq`.
+    mult: u32,
     /// The number of vCPUs, one timer block each.
     vcpus: usize,
     inner: Mutex<Inner>,
@@ -442,25 +473,29 @@ pub struct HviTime {
 
 impl HviTime {
     /// Returns the device for `vcpus` vCPUs on a host whose guest counter
-    /// runs at `freq` Hz, with every timer disarmed and disabled.
+    /// runs at `freq_hz`, with every timer disarmed and disabled.
     ///
     /// The page carries its magic and version and generation 0, which the
     /// guest driver refuses, until [`publish_boot`](Self::publish_boot).
     ///
     /// # Errors
     ///
-    /// Errors when the page cannot be allocated.
+    /// Errors when [`counter_rate`] refuses `freq_hz`, and when the page
+    /// cannot be allocated.
     pub fn new(
         vcpus: usize,
-        freq: u32,
+        freq_hz: u64,
         counter: Box<dyn GuestCounter>,
         line: Box<dyn TimerLine>,
     ) -> io::Result<Self> {
+        let (freq, mult) =
+            counter_rate(freq_hz).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Ok(Self {
             page: PvclockPage::new()?,
             counter,
             line,
             freq,
+            mult,
             vcpus,
             inner: Mutex::new(Inner {
                 clock: PageState {
@@ -468,7 +503,7 @@ impl HviTime {
                     counter_freq_hz: freq,
                     base_counter: 0,
                     base_ns: 0,
-                    mult: mult_for(freq),
+                    mult,
                     shift: SHIFT,
                     wall_ns: 0,
                     downtime_total_ns: 0,
@@ -502,7 +537,7 @@ impl HviTime {
             counter_freq_hz: self.freq,
             base_counter: self.counter.now(),
             base_ns: 0,
-            mult: mult_for(self.freq),
+            mult: self.mult,
             shift: SHIFT,
             wall_ns: realtime_ns(),
             downtime_total_ns: 0,
@@ -763,7 +798,7 @@ impl HviTime {
             counter_freq_hz: self.freq,
             base_counter: self.counter.now(),
             base_ns: state.guest_ns_at_capture,
-            mult: mult_for(self.freq),
+            mult: self.mult,
             shift: SHIFT,
             wall_ns: wall,
             downtime_total_ns: state.page.downtime_total_ns.saturating_add(downtime),
@@ -1148,21 +1183,53 @@ mod tests {
         ns * 24 / 1000
     }
 
+    /// [`mult_for`] of a rate it serves.
+    fn mult(freq: u32) -> u32 {
+        mult_for(freq).expect("a rate hvi-time serves")
+    }
+
+    #[test]
+    fn a_counter_rate_the_page_cannot_carry_is_refused() {
+        assert_eq!(mult_for(0), None);
+        assert!(counter_rate(0).is_err());
+        // The boundary, from the arithmetic itself: the slowest rate whose
+        // mult fits, and the one below it.
+        assert_eq!(mult_for(MIN_COUNTER_HZ - 1), None);
+        assert!(mult_for(MIN_COUNTER_HZ).is_some());
+        assert!(counter_rate(u64::from(MIN_COUNTER_HZ) - 1).is_err());
+        assert_eq!(
+            counter_rate(u64::from(MIN_COUNTER_HZ)).map(|(f, _)| f),
+            Ok(MIN_COUNTER_HZ)
+        );
+        assert!(counter_rate(u64::from(u32::MAX)).is_ok());
+        let e = counter_rate(u64::from(u32::MAX) + 1).unwrap_err();
+        assert!(e.contains("4294967296 Hz"), "{e}");
+        assert_eq!(counter_rate(24_000_000), Ok((24_000_000, 699_050_667)));
+        // The device refuses the rate, so no backend boots a guest that
+        // never ticks.
+        let counter = Counter::default();
+        let lines = Lines::default();
+        let e = HviTime::new(1, 0, Box::new(counter), Box::new(lines))
+            .err()
+            .expect("rate 0 refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
     #[test]
     fn mult_matches_the_guest_kernel_test() {
-        assert_eq!(mult_for(24_000_000), 699_050_667);
-        assert_eq!(mult_for(54_000_000), 310_689_185);
+        assert_eq!(mult_for(24_000_000), Some(699_050_667));
+        assert_eq!(mult_for(54_000_000), Some(310_689_185));
         // One second of ticks is one second, to the rounding.
-        let one = mul_shr(24_000_000, mult_for(24_000_000), SHIFT);
+        let one = mul_shr(24_000_000, mult(24_000_000), SHIFT);
         assert!(one.abs_diff(1_000_000_000) <= 1, "{one}");
-        let one = mul_shr(54_000_000, mult_for(54_000_000), SHIFT);
+        let one = mul_shr(54_000_000, mult(54_000_000), SHIFT);
         assert!(one.abs_diff(1_000_000_000) <= 1, "{one}");
     }
 
     #[test]
     fn an_hour_of_ticks_does_not_overflow() {
         // 3600 s at 54 MHz times mult is above 2^64; the product is 96-bit.
-        let ns = mul_shr(54_000_000 * 3600, mult_for(54_000_000), SHIFT);
+        let ns = mul_shr(54_000_000 * 3600, mult(54_000_000), SHIFT);
         assert!(ns.abs_diff(3_600_000_000_000) < 3000, "{ns}");
     }
 
