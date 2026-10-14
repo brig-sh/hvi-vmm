@@ -18,9 +18,10 @@
 //! share. `legacy` holds the serial ports and the RTCs. A backend attaches the
 //! devices its guest needs: the PL011 and the PL031 RTC on arm64, the 16550 and
 //! the CMOS RTC on x86-64. `irq` holds the interrupt line each device sets
-//! itself, and `state` the checks each device's checkpoint state passes on
-//! restore.
+//! itself, `state` the checks each device's checkpoint state passes on restore,
+//! and `gicv2` the software interrupt controller of the portable profile.
 
+pub mod gicv2;
 pub(crate) mod irq;
 pub mod legacy;
 pub mod state;
