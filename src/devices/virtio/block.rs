@@ -141,6 +141,9 @@ impl BlkState {
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
     file: File,
+    /// A second open of the disk, which holds an exclusive `flock` on it
+    /// while this guest may still write it. See [`DiskLock`].
+    lock: Option<DiskLock>,
     capacity_sectors: u64,
     status: u32,
     dev_feat_sel: u32,
@@ -246,6 +249,56 @@ fn lock(file: &File, read_only: bool) -> std::io::Result<()> {
 const BLOCK_DEVICE_LOCK_TRIES: u32 = 20;
 const BLOCK_DEVICE_LOCK_PAUSE: Duration = Duration::from_millis(50);
 
+/// Takes [`lock`] on `file`, retried for a second when it is a block device.
+///
+/// # Errors
+///
+/// Errors as [`lock`] does, once the tries are spent.
+fn lock_retrying(file: &File, read_only: bool, block_device: bool) -> std::io::Result<()> {
+    let mut tries = if block_device {
+        BLOCK_DEVICE_LOCK_TRIES
+    } else {
+        1
+    };
+    loop {
+        tries -= 1;
+        match lock(file, read_only) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries > 0 => {
+                std::thread::sleep(BLOCK_DEVICE_LOCK_PAUSE);
+            }
+            taken => break taken,
+        }
+    }
+}
+
+/// A writable disk's exclusive lock, held on an open of the image of its own
+/// rather than on the device's file.
+///
+/// The lock is [`lock`]'s, as [`VirtioBlk::open_as`] takes it for a writable
+/// disk. Holding it apart lets a fenced source release it while the device
+/// keeps the image open (see [`VirtioBlk::release_lock`]): closing that open
+/// releases it, which needs no system call the sandbox would have to allow
+/// after confinement.
+#[derive(Debug)]
+pub(crate) struct DiskLock {
+    /// The open that holds the lock; closing it releases the lock.
+    _file: File,
+}
+
+impl DiskLock {
+    /// Takes a writer's lock on the image at `path`, retried as
+    /// [`lock_retrying`] does when it is a block device.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the path cannot be opened again, and as [`lock`] does.
+    pub(crate) fn take(path: &str, block_device: bool) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        lock_retrying(&file, false, block_device)?;
+        Ok(DiskLock { _file: file })
+    }
+}
+
 /// Returns the id `IoSink::block` reports for the backing store `meta`
 /// describes, which a reader derives from its own path to the same store.
 ///
@@ -293,11 +346,13 @@ impl VirtioBlk {
     /// The file is locked for as long as it is open, shared for a read-only
     /// disk and exclusive for a writable one, so two hvi processes never write
     /// one image at once and no hvi writes an image another one reads. One
-    /// read-only image can back any number of guests. A writable block device
-    /// is opened `O_EXCL` on Linux as well, which claims the device itself and
-    /// so holds against another device node for it and against a mount. A
-    /// read-only open claims nothing, so a reader through another node is not
-    /// held against a writer.
+    /// read-only image can back any number of guests. A writable disk's lock
+    /// is held on an open of its own, so a fenced source can release it and
+    /// keep the disk (see [`release_lock`](Self::release_lock)). A writable
+    /// block device is opened `O_EXCL` on Linux as well, which claims the
+    /// device itself and so holds against another device node for it and
+    /// against a mount. A read-only open claims nothing, so a reader through
+    /// another node is not held against a writer.
     ///
     /// # Errors
     ///
@@ -332,20 +387,12 @@ impl VirtioBlk {
                 e
             }
         })?;
-        let mut tries = if block_device {
-            BLOCK_DEVICE_LOCK_TRIES
+        let lock = if read_only {
+            lock_retrying(&file, true, block_device)?;
+            None
         } else {
-            1
+            Some(DiskLock::take(path, block_device)?)
         };
-        loop {
-            tries -= 1;
-            match lock(&file, read_only) {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries > 0 => {
-                    std::thread::sleep(BLOCK_DEVICE_LOCK_PAUSE);
-                }
-                taken => break taken?,
-            }
-        }
         let capacity_sectors = backing_len(&file)? / SECTOR;
         // The backing store is identified across the two processes that care
         // about it without agreeing on a path: hvi may have been given a
@@ -353,6 +400,7 @@ impl VirtioBlk {
         let disk_id = disk_id(&file.metadata()?);
         Ok(VirtioBlk {
             file,
+            lock,
             capacity_sectors,
             status: 0,
             dev_feat_sel: 0,
@@ -368,6 +416,19 @@ impl VirtioBlk {
             trace: std::env::var_os("HVI_BLK_TRACE").is_some(),
             generation: 0,
         })
+    }
+
+    /// Releases the disk's lock, so another hvi may open the disk while
+    /// this one still has it open. Returns whether there was a lock, which
+    /// only a writable disk holds.
+    ///
+    /// A source fenced after a checkpoint calls it: its guest never runs
+    /// again, so it never writes the disk again, and the restore that takes
+    /// the guest over may start before the source is stopped. A writable
+    /// block device stays claimed by its `O_EXCL` open until the source
+    /// stops, so a restore on the same host waits for that.
+    pub fn release_lock(&mut self) -> bool {
+        self.lock.take().is_some()
     }
 
     /// Returns whether the disk is read-only.
@@ -1769,6 +1830,8 @@ mod state_tests {
         let json = serde_json::to_vec(&state).unwrap();
         let back: BlkState = serde_json::from_slice(&json).unwrap();
         assert_eq!(back, state);
+        // As a fenced source does, so the restore can take the disk.
+        assert!(blk.release_lock());
         let mut restored = VirtioBlk::restore(disk.path(), &mem, &back, 1046).unwrap();
         assert_eq!(restored.state(), state);
 
@@ -1801,6 +1864,7 @@ mod state_tests {
         let mut blk = VirtioBlk::open(disk.path()).unwrap();
         served_one_read(&mut blk, &mem);
         let pending = blk.state();
+        drop(blk);
 
         let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending, 0).unwrap();
         let line = Arc::new(LevelLine::default());
@@ -1815,10 +1879,41 @@ mod state_tests {
             },
             ..pending
         };
+        drop(restored);
         let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet, 0).unwrap();
         let line = Arc::new(LevelLine::default());
         restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         assert_eq!(line.sets(), 0, "a line with nothing pending is not set");
+    }
+
+    /// Two guests writing one image corrupt it, so a disk one device has
+    /// open is refused to a second until the first releases its lock or
+    /// goes. The lock is the one `open_as` takes; what the release adds is
+    /// that a fenced device lets it go and keeps the disk open.
+    #[test]
+    fn a_disk_is_the_disk_of_one_device_at_a_time() {
+        let disk = Disk::new("lock", 2);
+        let mut first = VirtioBlk::open(disk.path()).unwrap();
+        let err = VirtioBlk::open(disk.path())
+            .err()
+            .expect("a second device opened a locked disk");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            err.to_string().contains("the image is open elsewhere"),
+            "{err}"
+        );
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let err = VirtioBlk::restore(disk.path(), &mem, &first.state(), 0)
+            .err()
+            .expect("a restore opened a locked disk");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        assert!(first.release_lock());
+        assert!(!first.release_lock(), "the lock was released twice");
+        let second = VirtioBlk::open(disk.path()).unwrap();
+        assert!(VirtioBlk::open(disk.path()).is_err());
+        drop(second);
+        let _third = VirtioBlk::open(disk.path()).unwrap();
     }
 
     #[test]

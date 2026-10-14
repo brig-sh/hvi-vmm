@@ -556,7 +556,12 @@ impl<K: Kick> Machine<'_, K> {
         };
         match then {
             Then::Continue => self.back_to(found),
-            Then::Fence => self.state = VmState::Fenced,
+            Then::Fence => {
+                self.state = VmState::Fenced;
+                if let Some((capture, _)) = &self.capture {
+                    capture.release_disk();
+                }
+            }
         }
         Response::Checkpoint {
             state: self.state,
@@ -849,6 +854,8 @@ mod tests {
         fail_after: Option<Component>,
         /// The component after which the run is stopped.
         stop_after: Option<Component>,
+        /// The disk image of a virtio-blk device the capture holds.
+        disk: Option<String>,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -981,7 +988,10 @@ mod tests {
                 backend: "hvf",
                 sandbox_id: "fixture".into(),
                 ram,
-                block: None,
+                block: spec.disk.as_ref().map(|path| {
+                    let dev = crate::devices::virtio::block::VirtioBlk::open(path).unwrap();
+                    (Arc::new(std::sync::Mutex::new(dev)), path.clone())
+                }),
                 net: spec.net.clone(),
                 vsock: None,
                 console: Console::None,
@@ -1571,6 +1581,58 @@ mod tests {
         );
         assert_stops(&f.vcpus, "the fenced VM did not stop");
         crate::checkpoint::bundle::verify(&f.root.join("ck")).unwrap();
+    }
+
+    // A move's restore opens the disk while the fenced source still runs,
+    // and nothing else may open a disk whose guest can still write it.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn only_a_sealed_fence_releases_the_disk() {
+        let disk =
+            std::env::temp_dir().join(format!("hvi-ctl-{}-fenced-disk.img", std::process::id()));
+        std::fs::write(&disk, [0u8; 4096]).unwrap();
+        let path = disk.to_str().unwrap().to_string();
+        let locked = || {
+            crate::devices::virtio::block::VirtioBlk::open(&path)
+                .map(drop)
+                .err()
+                .map(|e| e.kind())
+                == Some(std::io::ErrorKind::WouldBlock)
+        };
+        {
+            let mut f = Fixture::with(
+                "ck-disk-fail",
+                Spec {
+                    parking: 2,
+                    capture: true,
+                    disk: Some(path.clone()),
+                    fail_after: Some(Component::Cpu),
+                    ..Spec::default()
+                },
+            );
+            assert!(locked(), "a running guest's disk was not locked");
+            assert_eq!(
+                reply(&f.checkpoint("ck", "fence"))["code"],
+                "capture_failed"
+            );
+            assert!(locked(), "a fence that failed released the disk");
+        }
+        assert!(!locked(), "the stopped source kept the disk");
+        let mut f = Fixture::with(
+            "ck-disk",
+            Spec {
+                parking: 2,
+                capture: true,
+                disk: Some(path.clone()),
+                ..Spec::default()
+            },
+        );
+        assert_eq!(reply(&f.checkpoint("ck", "continue"))["ok"], true);
+        assert!(locked(), "a checkpoint that continues released the disk");
+        assert_eq!(reply(&f.checkpoint("ck2", "fence"))["state"], "fenced");
+        assert!(!locked(), "the fenced source kept the disk");
+        drop(f);
+        let _ = std::fs::remove_file(&disk);
     }
 
     // The temp dir is behind a link on macOS (/var is /private/var). A caller
