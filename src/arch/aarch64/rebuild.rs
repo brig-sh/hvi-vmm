@@ -42,6 +42,10 @@ pub(crate) struct Devices {
     pub(crate) pl011: Pl011,
 }
 
+/// How long a restore from a stream waits for the source to release the
+/// disk's lock.
+const DISK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Rebuilds the devices of `opened` over the host resources `cfg` names,
 /// with their queues in `ram`, which already holds the bundle's RAM.
 ///
@@ -67,9 +71,24 @@ pub(crate) fn devices(
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
             // The refusals made sure disk.json is there.
             let generation = opened.disk.as_ref().map_or(0, |d| d.generation);
-            Some(Arc::new(Mutex::new(VirtioBlk::restore(
-                path, ram, state, generation,
-            )?)))
+            // A streaming source releases the disk's lock as it fences,
+            // just after it sends the manifest, so a restore that read the
+            // stream quickly can find it still held. It waits a little for
+            // that; a disk another guest holds stays refused.
+            let deadline = std::time::Instant::now() + DISK_LOCK_WAIT;
+            let dev = loop {
+                match VirtioBlk::restore(path, ram, state, generation) {
+                    Err(e)
+                        if opened.streamed()
+                            && e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    other => break other?,
+                }
+            };
+            Some(Arc::new(Mutex::new(dev)))
         }
         _ => None,
     };
