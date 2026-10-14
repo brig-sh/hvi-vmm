@@ -23,6 +23,7 @@ Four journeys. Start at the one that matches what you are doing.
 | Page | What it covers |
 | --- | --- |
 | [architecture.md](architecture.md) | Backends, boot protocols, the device model, guest memory, and concurrency. |
+| [portable-profile.md](portable-profile.md) | The `portable-arm64-v1` machine: one guest-visible machine on a Mac and a Raspberry Pi 5, and the measurements behind each value. |
 | [embedding.md](embedding.md) | Linking hvi as a library: `BootConfig`, `hvi::boot`, `hvi::spawn`, and the process-global configuration outside it. |
 | [checkpoint.md](checkpoint.md) | Capturing a guest into a bundle on the control socket and resuming it with `hvi restore`: the bundle format, the capture, the fence, the restore and its barriers, what is captured on each backend, and the clock policy. |
 | [plugins.md](plugins.md) | The `Plugin` / `VmHandle` / `CpuHandle` / `IoSink` contract, hook ordering, and the six rules that fail quietly. |
