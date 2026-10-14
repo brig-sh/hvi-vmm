@@ -26,12 +26,14 @@
 //! | `session.json` | who captured it and when, see [`Session`] |
 //! | `manifest.json` | every other file's size and SHA-256, written last |
 //!
-//! The writer, [`BundleWriter`], writes each component to a new file and
-//! syncs it, then writes the manifest to a temporary name, syncs it, renames
-//! it into place and syncs the directory. A directory without
-//! `manifest.json` is therefore not a bundle, whatever else is in it, and a
-//! writer that fails or is dropped before [`BundleWriter::seal`] removes what
-//! it wrote.
+//! The writer, [`BundleWriter`], syncs the parent of a directory it creates,
+//! writes each component to a new file and syncs it, then writes the
+//! manifest to a temporary name, syncs it, renames it into place and syncs
+//! the directory. The bundle is sealed once that last sync returns. A
+//! directory without `manifest.json` is therefore not a bundle, whatever
+//! else is in it, and a writer that fails or is dropped before
+//! [`BundleWriter::seal`] succeeds removes what it wrote, the manifest
+//! included.
 //!
 //! The reader, [`Bundle::open`], trusts nothing in the directory. It reads the
 //! manifest within a size limit, checks every count, name and size in it
@@ -397,8 +399,8 @@ pub struct Sealed {
 
 /// Writes a bundle, component by component, and seals it.
 ///
-/// Dropping it before [`seal`](Self::seal) removes every file it wrote, and
-/// the directory when it created it.
+/// Dropping it before [`seal`](Self::seal) succeeds removes every file it
+/// wrote, the manifest included, and the directory when it created it.
 pub struct BundleWriter {
     /// The bundle directory.
     dir: PathBuf,
@@ -457,13 +459,27 @@ impl BundleWriter {
                 false
             }
         };
-        Ok(Self {
+        let writer = Self {
             dir: dir.to_path_buf(),
             created_dir,
             written: Vec::new(),
             ram: None,
             sealed: false,
-        })
+        };
+        // The new directory's entry is in its parent. Without this sync a
+        // host crash can lose a bundle that was reported sealed, and with it
+        // the only copy of a fenced guest. A failure drops the writer, which
+        // removes the directory.
+        if created_dir {
+            if let Some(parent) = dir.parent() {
+                File::open(parent)
+                    .and_then(|parent| parent.sync_all())
+                    .map_err(|e| {
+                        io::Error::new(e.kind(), format!("{}: cannot sync: {e}", parent.display()))
+                    })?;
+            }
+        }
+        Ok(writer)
     }
 
     /// Returns the bundle directory.
@@ -626,11 +642,13 @@ impl BundleWriter {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, self.dir.join(MANIFEST))?;
-        self.sealed = true;
-        // The rename is durable once the directory is. A failure here leaves
-        // a sealed bundle whose seal may not survive a crash, which is
-        // reported rather than undone.
+        // The rename is durable once the directory is. Until then the bundle
+        // is not sealed: a failure drops the writer, which removes the
+        // manifest with the rest, so a capture that replies capture_failed
+        // and resumes the source leaves no bundle a later restore could run
+        // beside it.
         File::open(&self.dir)?.sync_all()?;
+        self.sealed = true;
         let bundle_bytes =
             self.written.iter().map(|(_, e)| e.size).sum::<u64>() + bytes.len() as u64;
         Ok(Sealed {
@@ -651,6 +669,9 @@ impl Drop for BundleWriter {
             let _ = std::fs::remove_file(self.dir.join(component.file()));
         }
         let _ = std::fs::remove_file(self.dir.join(MANIFEST_TMP));
+        // Only this writer can have put a manifest here: create refuses a
+        // directory that is not empty.
+        let _ = std::fs::remove_file(self.dir.join(MANIFEST));
         if self.created_dir {
             let _ = std::fs::remove_dir(&self.dir);
         }
@@ -1768,6 +1789,8 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let mut w = BundleWriter::create(&dir).unwrap();
         w.write_bytes(Component::Profile, b"{}").unwrap();
+        // As a seal whose directory sync failed after the rename leaves it.
+        std::fs::write(dir.join(MANIFEST), b"{}").unwrap();
         drop(w);
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
