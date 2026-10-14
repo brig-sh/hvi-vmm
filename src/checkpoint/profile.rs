@@ -114,6 +114,13 @@ pub struct MachineProfile {
     /// native profile, whose guest uses the architected timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<Time>,
+    /// The SHA-256 of the disk image the guest booted from, as lowercase
+    /// hex, when whoever started it computed it (`--disk-base-sha256`). A
+    /// mover that holds that image sends only the blocks the guest wrote,
+    /// see `disk-dirty`. It describes the disk's history, not the machine,
+    /// so no compatibility check reads it. Not written when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_base_sha256: Option<String>,
 }
 
 /// The name of the native machine profile.
@@ -297,6 +304,7 @@ impl MachineProfile {
             baseline: None,
             irq: None,
             time: None,
+            disk_base_sha256: None,
         }
     }
 
@@ -960,6 +968,7 @@ mod tests {
             baseline: None,
             irq: None,
             time: None,
+            disk_base_sha256: None,
         }
     }
 
@@ -1010,6 +1019,23 @@ mod tests {
                 r#""agent_sock":true,"fs_shares":0}"#,
             )
         );
+    }
+
+    // The disk's base digest is history, not machine: two profiles that
+    // differ only in it are compatible, and it is written only when known.
+    #[test]
+    fn the_disk_base_is_recorded_and_never_compared() {
+        let (a, mut b) = (sample(), sample());
+        b.disk_base_sha256 = Some("ab".repeat(32));
+        assert_eq!(a.compatible_with(&b), Ok(()));
+        assert_eq!(b.compatible_with(&a), Ok(()));
+        assert!(!a.to_json().contains("disk_base_sha256"));
+        let json = b.to_json();
+        assert!(
+            json.ends_with(&format!(r#","disk_base_sha256":"{}"}}"#, "ab".repeat(32))),
+            "{json}"
+        );
+        assert_eq!(MachineProfile::from_json(&json).unwrap(), b);
     }
 
     /// The profile a portable guest writes on a Mac: `sample` with the

@@ -424,6 +424,9 @@ pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Ope
     let devices =
         DevicesDoc::from_json(doc("devices.json")?).map_err(|e| stream_bad("devices.json", e))?;
     let disk = received.doc("disk.json").map(parse_disk).transpose()?;
+    if let Some(disk) = &disk {
+        disk.check(&profile).map_err(|e| stream_bad("disk.json", e))?;
+    }
     let session = parse_session(doc("session.json")?)?;
     if let Some(dir) = keep {
         keep_documents(Path::new(dir), &received)?;
@@ -602,6 +605,38 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
     why
 }
 
+/// Returns why a disk made from the guest's base image and `applied` rounds
+/// of its blocks is not the disk `disk` describes, or `None` when it is.
+///
+/// The rounds must be the ones the source read, all of them, and the last
+/// must have been read at the disk's final generation: inside the pause the
+/// capture was taken in, after the guest's last write.
+fn rounds_refusal(disk: &DiskState, applied: u32) -> Option<String> {
+    if applied == 0 {
+        return Some("--disk-rounds 0: a move applies at least round 0".to_string());
+    }
+    if disk.base_sha256.is_none() {
+        return Some(
+            "--disk-rounds: disk.json names no base image the rounds apply to".to_string(),
+        );
+    }
+    let read = disk.rounds.len();
+    if read != applied as usize {
+        return Some(format!(
+            "--disk-rounds {applied}: the source read {read} round(s) of disk blocks"
+        ));
+    }
+    match disk.rounds.last() {
+        None => None,
+        Some(last) if last.generation == disk.generation => None,
+        Some(last) => Some(format!(
+            "--disk-rounds {applied}: the last round, {}, was read at disk generation {}, \
+             and the guest wrote on to generation {}; the disk lacks those writes",
+            last.round, last.generation, disk.generation
+        )),
+    }
+}
+
 /// Returns every reason the host resources `cfg` names do not match the
 /// devices the guest had.
 fn device_refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> Vec<String> {
@@ -628,12 +663,18 @@ fn device_refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> Vec<
                     disk.size_bytes
                 ));
             }
+            if let Some(applied) = cfg.disk_rounds {
+                why.extend(rounds_refusal(disk, applied));
+            }
         }
         (Some(_), None, _) => {
             why.push("the guest had a disk; give it with --disk".to_string());
         }
         (None, Some(path), _) => {
             why.push(format!("--disk {path}: the guest had no disk"));
+        }
+        (_, None, _) if cfg.disk_rounds.is_some() => {
+            why.push("--disk-rounds describes --disk; give both".to_string());
         }
         (Some(_), Some(_), None) => why.push("disk.json is missing".to_string()),
         (None, None, _) => {}
@@ -944,6 +985,10 @@ pub(crate) mod tests {
                 sha256_sparse: None,
                 generation: 0,
                 synced: true,
+                base_sha256: None,
+                block_size: None,
+                dirty_since_boot_b64: None,
+                rounds: Vec::new(),
             }),
             states: DeviceStates {
                 blk: Some(blk),
@@ -1012,6 +1057,7 @@ pub(crate) mod tests {
             control_sock: "/unused".into(),
             checkpoint_root: None,
             disk: Some(scratch.disk()),
+            disk_rounds: None,
             net: true,
             net_gateway: None,
             net_mac: None,
@@ -1105,6 +1151,83 @@ pub(crate) mod tests {
             &reasons,
             &["the guest had a stub network; give it with --net-stub"],
         );
+    }
+
+    /// Makes `parts` a guest booted from a base image, whose source read
+    /// rounds at the generations `rounds` and was captured at `generation`.
+    fn moved(parts: &mut Parts, rounds: &[u64], generation: u64) {
+        use crate::devices::virtio::block::DiskRound;
+        let base = "ab".repeat(32);
+        parts.profile.disk_base_sha256 = Some(base.clone());
+        let disk = parts.disk.as_mut().unwrap();
+        disk.base_sha256 = Some(base);
+        disk.generation = generation;
+        disk.rounds = (0u32..)
+            .zip(rounds)
+            .map(|(round, &generation)| DiskRound {
+                round,
+                generation,
+                blocks: 1,
+            })
+            .collect();
+    }
+
+    // Only the mover knows whether it made the disk from rounds, so only
+    // its --disk-rounds asks for the check: rounds left from a move that
+    // was given up do not refuse a bundle whose disk was copied whole.
+    #[test]
+    fn a_disk_made_from_rounds_must_hold_the_guest_s_last_write() {
+        let none = refused("rounds-stale", |p| moved(p, &[3], 5), |_| {});
+        assert_eq!(none, Vec::<String>::new());
+        let reasons = refused(
+            "rounds-short",
+            |p| moved(p, &[3], 5),
+            |cfg| cfg.disk_rounds = Some(1),
+        );
+        has(
+            &reasons,
+            &[
+                "the last round, 0, was read at disk generation 3, and the guest wrote on to \
+               generation 5",
+            ],
+        );
+        let ok = refused(
+            "rounds-final",
+            |p| moved(p, &[3, 5], 5),
+            |cfg| cfg.disk_rounds = Some(2),
+        );
+        assert_eq!(ok, Vec::<String>::new());
+        let reasons = refused(
+            "rounds-count",
+            |p| moved(p, &[3, 5], 5),
+            |cfg| cfg.disk_rounds = Some(3),
+        );
+        has(&reasons, &["--disk-rounds 3: the source read 2 round(s)"]);
+        let reasons = refused(
+            "rounds-zero",
+            |p| moved(p, &[3, 5], 5),
+            |cfg| {
+                cfg.disk_rounds = Some(0);
+            },
+        );
+        has(
+            &reasons,
+            &["--disk-rounds 0: a move applies at least round 0"],
+        );
+        let reasons = refused("rounds-nobase", |_| {}, |cfg| cfg.disk_rounds = Some(1));
+        has(&reasons, &["disk.json names no base image"]);
+        let reasons = refused(
+            "rounds-nodisk",
+            |p| {
+                p.states.blk = None;
+                p.disk = None;
+            },
+            |cfg| {
+                cfg.disk = None;
+                cfg.disk_rounds = Some(1);
+            },
+        );
+        has(&reasons, &["--disk-rounds describes --disk; give both"]);
     }
 
     #[test]

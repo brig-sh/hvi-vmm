@@ -65,10 +65,17 @@ pub(crate) fn devices(
     let block = match (&cfg.disk, &states.blk) {
         (Some(path), Some(state)) => {
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            // The refusals made sure disk.json is there.
+            // The refusals made sure disk.json is there, and the bundle's
+            // reader checked its bitmap.
             let generation = opened.disk.as_ref().map_or(0, |d| d.generation);
+            let since_boot = match &opened.disk {
+                Some(disk) => disk
+                    .dirty_since_boot()
+                    .map_err(|e| format!("disk.json: {e}"))?,
+                None => None,
+            };
             Some(Arc::new(Mutex::new(VirtioBlk::restore(
-                path, ram, state, generation,
+                path, ram, state, generation, since_boot,
             )?)))
         }
         _ => None,

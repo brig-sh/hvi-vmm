@@ -30,7 +30,7 @@ use crate::checkpoint::bundle::{
 };
 use crate::checkpoint::control::Then;
 use crate::checkpoint::cpu::{CpuState, VcpuState};
-use crate::checkpoint::platform::PlatformState;
+use crate::checkpoint::platform::{base64_encode, PlatformState};
 use crate::checkpoint::profile::MachineProfile;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::pl011::Pl011;
@@ -39,7 +39,7 @@ use crate::devices::legacy::rtc_cmos::RtcCmos;
 #[cfg(target_arch = "x86_64")]
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::state::{DeviceStates, DEVICE_STATES_VERSION};
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{VirtioBlk, DIRTY_BLOCK_BYTES};
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::memory::{GuestRam, GuestWriteLog};
@@ -204,7 +204,7 @@ impl Capture {
     /// # Errors
     ///
     /// Errors when the sync fails.
-    pub(crate) fn disk_state(&self) -> io::Result<Option<DiskState>> {
+    pub(crate) fn disk_state(&self, profile: &MachineProfile) -> io::Result<Option<DiskState>> {
         let Some((dev, path)) = &self.block else {
             return Ok(None);
         };
@@ -218,6 +218,10 @@ impl Capture {
             sha256_sparse: None,
             generation: dev.generation(),
             synced: true,
+            base_sha256: profile.disk_base_sha256.clone(),
+            block_size: Some(DIRTY_BLOCK_BYTES),
+            dirty_since_boot_b64: Some(base64_encode(dev.dirty_since_boot().as_bytes())),
+            rounds: dev.rounds().to_vec(),
         }))
     }
 
@@ -258,7 +262,7 @@ impl Capture {
         stopping: &dyn Fn() -> bool,
     ) -> io::Result<Sealed> {
         let devices = self.device_states()?;
-        let disk = self.disk_state()?;
+        let disk = self.disk_state(profile)?;
         let check = || {
             if stopping() {
                 Err(io::Error::new(

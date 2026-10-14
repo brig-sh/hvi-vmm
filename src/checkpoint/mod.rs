@@ -23,11 +23,13 @@
 //! counter in [`platform`]. `restore` holds what every backend's `hvi restore`
 //! shares. [`stream`] is the same capture as one byte stream, the form a live
 //! move sends, and [`migrate`] the RAM rounds it sends while the guest runs.
+//! [`disk`] is how the disk's written blocks leave on the control socket.
 
 pub mod bundle;
 pub(crate) mod capture;
 pub mod control;
 pub mod cpu;
+pub mod disk;
 pub mod kvm_regs;
 pub mod migrate;
 pub mod platform;
