@@ -206,6 +206,7 @@ impl<K: Kick> IoThreads<K> {
         if let Some(control) = control {
             let gate = Arc::clone(io_threads.stop.source.gate());
             let vcpus = Arc::clone(&guest.vcpus);
+            let capture = control.capture_of(guest);
             // Only a run that may write checkpoints gives the thread the file
             // calls a bundle needs.
             let confine: fn() = if control.checkpoint_root().is_some() {
@@ -214,7 +215,7 @@ impl<K: Kick> IoThreads<K> {
                 confine_io_thread
             };
             io_threads.spawn_with("control socket", confine, move |stop| {
-                control.run(&stop, &gate, &vcpus);
+                control.run(&stop, &gate, &vcpus, capture);
             });
         }
         io_threads

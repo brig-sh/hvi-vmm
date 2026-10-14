@@ -163,7 +163,7 @@ impl DeviceStates {
     }
 
     /// Refuses a document or a device state of another version.
-    fn check_versions(&self) -> io::Result<()> {
+    pub(crate) fn check_versions(&self) -> io::Result<()> {
         check_version("device", self.version, DEVICE_STATES_VERSION)?;
         let versions = [
             (
@@ -257,6 +257,8 @@ mod tests {
                 },
                 queue,
                 capacity_sectors: 2048,
+                serial: "disk0".to_string(),
+                read_only: false,
             }),
             net: Some(VirtioNet::new().state()),
             vsock: Some(VirtioVsock::new().state()),

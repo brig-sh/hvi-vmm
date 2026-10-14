@@ -17,6 +17,7 @@ not apply returns a named error rather than "unknown subcommand".
 | Subcommand | Where it works | What it does |
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
+| `checkpoint-verify <dir>` | everywhere | Check a checkpoint bundle whole and print what it holds. Exits 1, naming the file, on the first mismatch. See [checkpoint.md](checkpoint.md#checking-a-bundle). |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
 | `smoke` | macOS, Apple silicon | The Hypervisor.framework smoke test. `--shm` runs it over shared guest RAM. |
 | `smoke-shm-verify <name> <hex>` | macOS, Apple silicon | The child half of `smoke --shm`. Not for direct use. |
@@ -58,6 +59,7 @@ including a typo, silently runs the plain test.
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
 | `--control-sock <path>` | none | Host Unix socket that pauses, resumes, reports and stops the VM. See [The control socket](#the-control-socket). |
 | `--profile-out <path>` | none | Write the machine profile here, as one line of JSON. See [The control socket](#the-control-socket). |
+| `--checkpoint-root <dir>` | none | The directory a `checkpoint` may write bundles below. It must exist, and should be private to this sandbox (mode 0700): bundles hold guest RAM in clear. Needs `--control-sock`. Without it every `checkpoint` is refused. See [checkpoint.md](checkpoint.md). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
@@ -93,7 +95,7 @@ hvi: boot needs --kernel <Image>
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
 `--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`, `--cpus`,
-`--dump-after`, `--control-sock`, `--profile-out`.
+`--dump-after`, `--control-sock`, `--profile-out`, `--checkpoint-root`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -169,11 +171,12 @@ and each reply is one line:
 | `resume` | Releases the vCPUs, then the I/O threads. |
 | `status` | Replies with `state` (`running`, `paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. |
 | `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
-| `checkpoint` | Reserved. Refused with `not_implemented`. |
+| `checkpoint` | Captures the VM into a new bundle directory below `--checkpoint-root`, then resumes it or fences it. See [checkpoint.md](checkpoint.md#taking-a-checkpoint). |
 
 `pause` and `resume` are idempotent. A pause outlives the connection that asked
-for it. No reply takes longer than about 2 s, so give a client a reply timeout
-of at least 3 s. A client that gives up on a `pause` before its reply cannot
+for it. Apart from `checkpoint`, no reply takes longer than about 2 s, so give a
+client a reply timeout of at least 3 s. A `checkpoint` replies once its bundle
+is written, which takes longer the more guest RAM is in use. A client that gives up on a `pause` before its reply cannot
 tell whether the VM paused: it should reconnect and ask `status`, or send
 `resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
 `code`; `error` is for a person. The codes are listed in

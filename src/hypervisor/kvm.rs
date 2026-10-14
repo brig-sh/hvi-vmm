@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
+use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::ProfileCell;
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{BootConfig, Stop};
@@ -183,7 +184,8 @@ impl Drop for Registration<'_> {
 /// source's socket pair are created before any filter goes in, since the
 /// allowlists allow accepting on a listener already held but not creating one.
 /// Then the I/O threads start, with the threads the plugin asked for, each
-/// filtering itself as it begins. The control socket reports `profile`.
+/// filtering itself as it begins. The control socket reports `profile`, and a
+/// checkpoint captures `console` beside the guest's virtio devices.
 ///
 /// # Errors
 ///
@@ -196,6 +198,7 @@ pub(crate) fn start_io_threads(
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
     profile: Arc<ProfileCell>,
+    console: Console,
 ) -> Result<(seccomp::Filters, IoThreads<Kicker>), Box<dyn std::error::Error + Send + Sync>> {
     let plugin_threads = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
@@ -216,7 +219,12 @@ pub(crate) fn start_io_threads(
     let control = cfg
         .control_sock
         .as_deref()
-        .map(|path| ControlSocket::bind(path, profile, cfg.checkpoint_root.as_deref()))
+        .map(|path| {
+            ControlSocket::bind(path, profile, cfg.checkpoint_root.as_deref()).map(|control| {
+                let disk = cfg.disks.first().map(|disk| disk.path.clone());
+                control.capturing("kvm", disk, console)
+            })
+        })
         .transpose()?;
     let source = StopSource::new()?;
     let io_threads = IoThreads::start(
@@ -324,8 +332,11 @@ pub(crate) fn run_vcpu(
             break;
         }
         // Safe point for every vCPU: park here while vcpu0 lets a plugin look
-        // at the guest.
-        guest.pass_safepoint(&vcpu, plugin);
+        // at the guest, or the control socket captures it, doing on this
+        // thread the work only it can.
+        guest.pass_safepoint(&vcpu, cpu, plugin, |work| {
+            crate::checkpoint::cpu::serve_from_regs_view(guest.arch, "kvm", cpu, &vcpu, work)
+        });
         let flow = match vcpu.run() {
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
                 // A run that a kick cut short has completed the MMIO exit
