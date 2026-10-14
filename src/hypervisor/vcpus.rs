@@ -222,20 +222,21 @@ impl<K: Kick> Vcpus<K> {
     /// runs on this thread, so it may read and write this vCPU's registers.
     /// Work posted before the vCPU parks is done before it waits, and work
     /// posted while it waits wakes it, so the requester finds every parked
-    /// vCPU done whichever came first.
+    /// vCPU done whichever came first. Returns how long the vCPU stayed
+    /// parked, the work included, zero when it did not park.
+    #[must_use]
     pub(crate) fn checkpoint_with(
         &self,
         cpu: u32,
         mut serve: impl FnMut(Work<'_>) -> io::Result<Option<Output>>,
-    ) {
+    ) -> Duration {
         let Some(due) = self.work_due.get(cpu as usize) else {
-            self.quiesce.checkpoint();
-            return;
+            return self.quiesce.checkpoint();
         };
         self.quiesce.checkpoint_serving(
             || due.load(Ordering::SeqCst),
             || self.serve(cpu, due, &mut serve),
-        );
+        )
     }
 
     /// Carries out the work due on vCPU `cpu` and records its result.
@@ -375,6 +376,16 @@ impl<K: Kick> Vcpus<K> {
             .into_iter()
             .map(|r| r.unwrap_or(WorkResult::NotStarted))
             .collect()
+    }
+
+    /// Returns whether a pause asks the vCPUs to park at their checkpoint.
+    ///
+    /// The request is raised before the vCPUs are kicked, so a vCPU that
+    /// waits outside the hypervisor and checks it under the lock its kick
+    /// takes cannot miss it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn quiesce_requested(&self) -> bool {
+        self.quiesce.is_requested()
     }
 
     /// Parks every started vCPU but the calling one at its next checkpoint.
@@ -1037,11 +1048,11 @@ mod tests {
     /// Spawns a fake vCPU that has started and parks at every checkpoint
     /// until the VM stops.
     fn parking_vcpu(vcpus: &Arc<Vcpus<CountingKicker>>) -> JoinHandle<()> {
-        vcpus.mark_started();
+        vcpus.mark_started(vcpus.started());
         let vcpus = Arc::clone(vcpus);
         std::thread::spawn(move || {
             while vcpus.is_running() {
-                vcpus.checkpoint();
+                let _ = vcpus.checkpoint();
                 std::thread::yield_now();
             }
         })
@@ -1063,7 +1074,7 @@ mod tests {
     // requester does, would return with one vCPU still in the guest.
     #[test]
     fn control_pause_waits_for_every_started_vcpu() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let first = parking_vcpu(&vcpus);
         let second = parking_vcpu(&vcpus);
         assert_eq!(vcpus.pause_from_control(Duration::from_secs(5)), Ok(2));
@@ -1080,10 +1091,10 @@ mod tests {
     // again rather than stay parked behind a pause nobody holds.
     #[test]
     fn control_pause_that_times_out_releases_and_fails() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let running = parking_vcpu(&vcpus);
         // Started, and never reaches a checkpoint.
-        vcpus.mark_started();
+        vcpus.mark_started(vcpus.started());
         let started = Instant::now();
         let paused = vcpus.pause_from_control(Duration::from_millis(100));
         assert_eq!(
@@ -1107,7 +1118,7 @@ mod tests {
     // The plugin's resume must not let the guest run under the control pause.
     #[test]
     fn plugin_cannot_pause_or_resume_under_a_control_pause() {
-        let vcpus = Arc::new(Vcpus::new(1, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
         let vcpu = parking_vcpu(&vcpus);
         assert_eq!(vcpus.pause_from_control(Duration::from_secs(5)), Ok(1));
         assert!(!vcpus.pause(), "the plugin paused under a control pause");
@@ -1124,9 +1135,9 @@ mod tests {
     // would end a plugin's pause in the middle of its dump.
     #[test]
     fn control_pause_is_refused_while_a_plugin_holds_the_vcpus() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         // The calling thread is cpu0, inside its safepoint.
-        vcpus.mark_started();
+        vcpus.mark_started(vcpus.started());
         let secondary = parking_vcpu(&vcpus);
         assert!(vcpus.pause(), "the secondary did not park");
         assert_eq!(
@@ -1146,10 +1157,10 @@ mod tests {
     // end at once rather than at its deadline.
     #[test]
     fn control_pause_ends_with_a_stop_during_its_wait() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let running = parking_vcpu(&vcpus);
         // Started, and never reaches a checkpoint.
-        vcpus.mark_started();
+        vcpus.mark_started(vcpus.started());
         let pause = {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || vcpus.pause_from_control(Duration::from_secs(30)))
@@ -1167,8 +1178,8 @@ mod tests {
 
     #[test]
     fn control_pause_after_the_stop_is_refused() {
-        let vcpus = Vcpus::new(1, CountingKicker::default());
-        vcpus.mark_started();
+        let vcpus = test_vcpus(1, CountingKicker::default());
+        vcpus.mark_started(vcpus.started());
         vcpus.stop();
         assert_eq!(
             vcpus.pause_from_control(Duration::from_millis(10)),
@@ -1183,11 +1194,11 @@ mod tests {
         cpu: u32,
         serve: fn(u32, Work<'_>) -> io::Result<Option<Output>>,
     ) -> JoinHandle<()> {
-        vcpus.mark_started();
+        vcpus.mark_started(vcpus.started());
         let vcpus = Arc::clone(vcpus);
         std::thread::spawn(move || {
             while vcpus.is_running() {
-                vcpus.checkpoint_with(cpu, |work| serve(cpu, work));
+                let _ = vcpus.checkpoint_with(cpu, |work| serve(cpu, work));
                 std::thread::yield_now();
             }
         })
@@ -1234,7 +1245,7 @@ mod tests {
     // vCPUs' exports are all done by then.
     #[test]
     fn only_vcpu_0_reads_the_platform() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let threads = [
             serving_vcpu(&vcpus, 0, export),
             serving_vcpu(&vcpus, 1, export),
@@ -1262,7 +1273,7 @@ mod tests {
     // would never reach them.
     #[test]
     fn parked_vcpus_export_when_asked() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let threads = [
             serving_vcpu(&vcpus, 0, export),
             serving_vcpu(&vcpus, 1, export),
@@ -1283,7 +1294,7 @@ mod tests {
     // exporting on its way in.
     #[test]
     fn vcpus_export_as_they_park() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let threads = [
             serving_vcpu(&vcpus, 0, export),
             serving_vcpu(&vcpus, 1, export),
@@ -1303,7 +1314,7 @@ mod tests {
     // so the wait must not wait for it, and it is reported as such.
     #[test]
     fn a_vcpu_that_never_started_is_reported_not_started() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let first = serving_vcpu(&vcpus, 0, export);
         vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
         vcpus.request_export();
@@ -1317,7 +1328,7 @@ mod tests {
 
     #[test]
     fn each_vcpu_imports_its_own_state() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let threads = [
             serving_vcpu(&vcpus, 0, export),
             serving_vcpu(&vcpus, 1, export),
@@ -1347,7 +1358,7 @@ mod tests {
         fn refuse(_: u32, _: Work<'_>) -> io::Result<Option<Output>> {
             Err(io::Error::other("register read failed"))
         }
-        let vcpus = Arc::new(Vcpus::new(1, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
         let vcpu = serving_vcpu(&vcpus, 0, refuse);
         vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
         vcpus.request_export();
@@ -1364,9 +1375,9 @@ mod tests {
     // wait must say so in time rather than hang the control thread.
     #[test]
     fn the_wait_for_work_times_out() {
-        let vcpus = Arc::new(Vcpus::new(2, CountingKicker::default()));
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
         let first = serving_vcpu(&vcpus, 0, export);
-        vcpus.mark_started();
+        vcpus.mark_started(vcpus.started());
         vcpus.request_export();
         let started = Instant::now();
         assert_eq!(

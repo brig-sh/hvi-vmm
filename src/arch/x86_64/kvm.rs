@@ -340,6 +340,7 @@ fn boot_profile(
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    cfg.require_native_profile("KVM")?;
     if !cfg.fs_shares.is_empty() {
         return Err(
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
