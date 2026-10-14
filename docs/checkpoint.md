@@ -589,16 +589,38 @@ from one commit, with no uncommitted changes: a build with them is refused
 on either side, as for the native machine.
 
 Run so far: a portable bundle restored on the host that took it, on the
-Mac and on a Pi 5 (`tools/checkpoint-e2e.sh --portable`), and one move each
+Mac and on a Pi 5 (`tools/checkpoint-e2e.sh --portable`), and moves each
 way between an Apple M5 Pro and a Pi 5 by hand: a 1-vCPU, 512 MiB guest
 with an ext4 disk and the stub network, fenced, copied with `rsync --sparse`
 (the bundle is 95 MB) and restored with the same flags, under Seatbelt and
-seccomp. In both, the guest's count went on by one, the `awk` sum went on
-exact, no boot banner appeared, `hvi-time` was published at the
-destination's rate (24 MHz to 54 MHz and back) and the guest's wall clock
-read the host's second. The downtime was the copy: 204 s from the Mac to
-the Pi over the tailnet, 33 s back. The end-to-end script's checks have
-not been run across hosts.
+seccomp.
+
+The first pair of moves ran before a fix to the restore on the Mac, which
+loaded every SIMD register with whatever the host's `v0` held (fixed in
+`0c178e0`). The Pi to Mac move of that pair lost the guest's live SIMD
+registers. Its checks did not show it: the `awk` sum stayed exact, because
+the guest kept the sum in memory.
+
+Each move was run again on `9880f4d`. Before the resume, the restored guest
+was checkpointed again while restored-paused, and that state was compared
+with the bundle's. The general, SIMD and system registers were equal,
+including the non-zero `q` registers (`q0`-`q3` and `q9` from the Mac,
+`q1`-`q3` from the Pi). The 15 registers only HVF has read 0 on the Mac in
+both directions, and are not carried. The GICv2 and `hvi-time` state was equal too. After the
+resume, in both directions:
+
+- the guest's count went on by one, and no boot banner appeared;
+- a 6 s timerfd armed before the capture fired 6.00009 s (to the Pi) and
+  6.00007 s (to the Mac) of guest time after it was armed;
+- `el0check` passed, the clocksource stayed `hvi-time`, and the driver
+  logged generation 4 at the destination's rate (24 MHz to 54 MHz and back)
+  with `migrations=1`;
+- the file held open after its unlink stayed readable, the file written
+  before the move was on the disk, and a write after it worked.
+
+The downtime was mostly the copy: 174 s from the Mac to the Pi over the
+tailnet, and 19 s back. `tools/checkpoint-e2e.sh` runs on one host, so its
+own checks have not been run across hosts.
 
 ### Timings
 
