@@ -243,6 +243,45 @@ impl BootConfig {
     }
 }
 
+/// Inputs for a restore: `hvi restore`, which resumes a checkpoint bundle in
+/// this process instead of booting a kernel. Populated by
+/// `main::restore_guest` and handed to the active backend's `restore()`.
+///
+/// The machine comes from the bundle: its RAM, vCPUs, devices and their
+/// state. What it needs from this host comes from here, and must agree with
+/// the bundle: a disk of the size the guest was given when it had one, a
+/// network of the mode it ran on when it had one, and an agent socket when it
+/// had a vsock device.
+pub struct RestoreConfig {
+    /// The bundle directory.
+    pub from: String,
+    /// The control socket, bound before confinement. The guest waits
+    /// restored-paused until a client sends `resume` on it.
+    pub control_sock: String,
+    /// The directory a later `checkpoint` may write under; see
+    /// [`BootConfig::checkpoint_root`].
+    pub checkpoint_root: Option<String>,
+    /// The disk image to reopen for the guest's virtio-blk device.
+    pub disk: Option<String>,
+    /// The built-in network stack, for a guest that ran on it.
+    pub net: bool,
+    /// The gateway stream socket, for a guest that ran on a gateway.
+    pub net_gateway: Option<String>,
+    /// The MAC the guest was given. Optional, since the bundle holds it; a
+    /// MAC given here must be that one.
+    pub net_mac: Option<[u8; 6]>,
+    /// The agent socket, for a guest that had a vsock device.
+    pub agent_sock: Option<String>,
+    /// The sandbox id, or `None` for the one the bundle was captured under.
+    pub sandbox_id: Option<String>,
+    /// The event ledger path.
+    pub events: Option<String>,
+    /// Where to write this machine's profile; see [`BootConfig::profile_out`].
+    pub profile_out: Option<String>,
+    /// Confine the process, as [`BootConfig::sandbox`].
+    pub sandbox: bool,
+}
+
 /// Why the run stopped.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
