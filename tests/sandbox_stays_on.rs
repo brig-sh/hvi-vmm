@@ -38,6 +38,7 @@ fn config(sandbox: bool) -> BootConfig {
         agent_sock: None,
         profile_out: None,
         control_sock: None,
+        checkpoint_root: None,
         plugin: None,
         sandbox,
         stop: None,

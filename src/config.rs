@@ -633,6 +633,14 @@ pub struct BootConfig {
     ///
     /// It is bound before confinement, as the agent socket is.
     pub control_sock: Option<String>,
+    /// The directory a `checkpoint` on the control socket may write its
+    /// bundle under, or `None` to refuse every `checkpoint`.
+    ///
+    /// It must exist. It is resolved before confinement, and the confinement
+    /// grants writes below it and nowhere else: Seatbelt with a subtree rule,
+    /// seccomp with a filter of its own for the control socket's thread. It
+    /// needs `control_sock`.
+    pub checkpoint_root: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.
     ///
     /// This is the whole of the VMM's observation surface: see

@@ -717,7 +717,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let control = cfg
         .control_sock
         .as_deref()
-        .map(|path| ControlSocket::bind(path, Arc::clone(&shared.profile)))
+        .map(|path| {
+            ControlSocket::bind(
+                path,
+                Arc::clone(&shared.profile),
+                cfg.checkpoint_root.as_deref(),
+            )
+        })
         .transpose()?;
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
@@ -743,7 +749,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
     if cfg.sandbox {
-        seatbelt::enter_with_shares(&fs_access)
+        let checkpoint_root = control.as_ref().and_then(ControlSocket::checkpoint_root);
+        seatbelt::enter_for(&fs_access, checkpoint_root)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         stderrln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
     } else {

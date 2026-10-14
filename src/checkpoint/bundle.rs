@@ -667,6 +667,18 @@ fn open_component(dir: &Path, name: &str, limit: u64) -> io::Result<(File, u64)>
     Ok((file, meta.len()))
 }
 
+/// Reads the component `entry` lists whole, checking its size and hash
+/// again.
+fn read_component(dir: &Path, entry: &ComponentEntry) -> io::Result<Vec<u8>> {
+    let (mut file, len) = open_component(dir, &entry.path, entry.size.max(1))?;
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != entry.size || hex(&Sha256::digest(&bytes)) != entry.sha256 {
+        return Err(bad(&entry.path, "changed since the bundle was opened"));
+    }
+    Ok(bytes)
+}
+
 /// Returns whether `name` is a plain file name: no directory part, not `.`
 /// or `..`, not empty, no NUL.
 fn is_bare(name: &str) -> bool {
@@ -718,28 +730,26 @@ impl Bundle {
                 return Err(bad(&entry.path, "SHA-256 does not match the manifest"));
             }
         }
-        let mut bundle = Self {
-            dir: dir.to_path_buf(),
-            manifest_sha256: hex(&Sha256::digest(&bytes)),
-            manifest,
-            profile: MachineProfile::for_this_host("", ""),
-        };
-        let profile = bundle.read(Component::Profile)?;
+        let profile = manifest
+            .components
+            .iter()
+            .find(|e| e.name == Component::Profile.name())
+            .ok_or_else(|| bad("profile.json", "is not in this bundle"))?;
+        let profile = read_component(dir, profile)?;
         let profile = std::str::from_utf8(&profile).map_err(|e| bad("profile.json", e))?;
-        bundle.profile = MachineProfile::from_json(profile).map_err(|e| bad("profile.json", e))?;
-        if bundle.profile.checkpoint_format != CHECKPOINT_FORMAT {
+        let profile = MachineProfile::from_json(profile).map_err(|e| bad("profile.json", e))?;
+        if profile.checkpoint_format != CHECKPOINT_FORMAT {
             return Err(bad(
                 "profile.json",
                 format!(
                     "checkpoint_format {}, this build reads {CHECKPOINT_FORMAT}",
-                    bundle.profile.checkpoint_format
+                    profile.checkpoint_format
                 ),
             ));
         }
-        let regions = &bundle.manifest.ram.regions;
-        let same = bundle.profile.ram_regions.len() == regions.len()
-            && bundle
-                .profile
+        let regions = &manifest.ram.regions;
+        let same = profile.ram_regions.len() == regions.len()
+            && profile
                 .ram_regions
                 .iter()
                 .zip(regions)
@@ -747,7 +757,12 @@ impl Bundle {
         if !same {
             return Err(bad(MANIFEST, "the RAM regions are not the profile's"));
         }
-        Ok(bundle)
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            manifest_sha256: hex(&Sha256::digest(&bytes)),
+            manifest,
+            profile,
+        })
     }
 
     /// Returns the manifest.
@@ -792,13 +807,7 @@ impl Bundle {
         let entry = self
             .entry(component)
             .ok_or_else(|| bad(component.file(), "is not in this bundle"))?;
-        let (mut file, len) = open_component(&self.dir, &entry.path, entry.size.max(1))?;
-        let mut bytes = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != entry.size || hex(&Sha256::digest(&bytes)) != entry.sha256 {
-            return Err(bad(&entry.path, "changed since the bundle was opened"));
-        }
-        Ok(bytes)
+        read_component(&self.dir, entry)
     }
 
     /// Returns `cpu.json`.
@@ -1169,6 +1178,126 @@ pub fn verify(dir: &Path) -> io::Result<Verified> {
         vcpus: cpu.vcpus.len(),
         partial,
     })
+}
+
+/// Returns the bundle directory `dir` names, which must be below `root`, the
+/// resolved checkpoint root.
+///
+/// `dir` must be absolute, name a directory strictly below `root`, and have
+/// no `..` in it. Every directory between the root and the bundle must
+/// exist and be a directory, not a link, so no link on the way can take the
+/// bundle outside the root; the writer opens the last component without
+/// following a link.
+///
+/// # Errors
+///
+/// Errors, as `InvalidInput`, on any of those, or as looking at a directory
+/// on the way does.
+pub fn resolve_in_root(root: &Path, dir: &str) -> io::Result<PathBuf> {
+    use std::path::Component as Part;
+    let refuse = |why: String| io::Error::new(io::ErrorKind::InvalidInput, why);
+    let path = Path::new(dir);
+    if !path.is_absolute() {
+        return Err(refuse(format!(
+            "{dir}: a bundle directory must be an absolute path"
+        )));
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Part::ParentDir))
+    {
+        return Err(refuse(format!("{dir}: a bundle directory has no .. in it")));
+    }
+    let clean: PathBuf = path.components().collect();
+    let below = clean.strip_prefix(root).map_err(|_| {
+        refuse(format!(
+            "{dir}: not below the checkpoint root {}",
+            root.display()
+        ))
+    })?;
+    if below.as_os_str().is_empty() {
+        return Err(refuse(format!(
+            "{dir}: is the checkpoint root itself; name a directory below it"
+        )));
+    }
+    // Each directory between the root and the bundle must be a directory,
+    // not a link. They are looked at one by one with lstat rather than
+    // resolved: under Seatbelt only paths below the root may be looked at,
+    // and resolving a path looks at every directory above it.
+    let mut walked = root.to_path_buf();
+    let parts: Vec<_> = below.components().collect();
+    for part in &parts[..parts.len() - 1] {
+        walked.push(part);
+        let meta = std::fs::symlink_metadata(&walked)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", walked.display())))?;
+        if !meta.file_type().is_dir() {
+            return Err(refuse(format!(
+                "{dir}: {} is a link or not a directory",
+                walked.display()
+            )));
+        }
+    }
+    Ok(clean)
+}
+
+/// Writes a bundle of `ram`, with no vCPU and no device, to `name` below
+/// `root`, checks it with [`verify`] and removes it. `profile` is the one the
+/// bundle records, made before confinement, since reading the host's facts
+/// needs calls the confinement refuses; its RAM regions and vCPU count are
+/// set here.
+///
+/// The sandbox selftests run it under the production confinement, so they
+/// prove that the writer and the reader need no right the confinement of the
+/// control socket's thread does not grant.
+///
+/// # Errors
+///
+/// Errors as resolving the directory, the writer, the reader or the removal
+/// does.
+pub fn selftest_round_trip(
+    root: &Path,
+    name: &str,
+    ram: &GuestRamView,
+    profile: &MachineProfile,
+) -> io::Result<()> {
+    let dir = resolve_in_root(root, &root.join(name).to_string_lossy())?;
+    let dir = dir.as_path();
+    let mut profile = profile.clone();
+    profile.arch = "aarch64".into();
+    profile.backend = "selftest".into();
+    profile.ram_regions = ram.regions().into_iter().map(Into::into).collect();
+    profile.vcpus = 0;
+    let mut w = BundleWriter::create(dir)?;
+    w.write_bytes(Component::Profile, profile.to_json().as_bytes())?;
+    w.write_ram(ram, &|| false)?;
+    w.write_json(
+        Component::Cpu,
+        &CpuState::new(crate::plugin::GuestArch::Aarch64, Vec::new()),
+    )?;
+    w.write_json(
+        Component::Platform,
+        &PlatformState::not_captured(crate::plugin::GuestArch::Aarch64, "selftest"),
+    )?;
+    let devices = DevicesDoc {
+        states: DeviceStates::default(),
+        irq_levels: IrqLevels::default(),
+    };
+    w.write_bytes(Component::Devices, &devices.to_json()?)?;
+    w.write_json(
+        Component::Session,
+        &Session {
+            version: DOC_VERSION,
+            sandbox_id: "selftest".into(),
+            epoch: 0,
+            txid: None,
+            captured_at_unix_ms: unix_ms(),
+            then: "continue".into(),
+        },
+    )?;
+    w.seal(Vec::new())?;
+    let verified = verify(dir);
+    std::fs::remove_dir_all(dir)?;
+    verified.map(|_| ())
 }
 
 #[cfg(test)]
@@ -1619,6 +1748,33 @@ mod tests {
             std::fs::symlink_metadata(&dir).is_ok(),
             "the drop removed a directory it did not create"
         );
+    }
+
+    #[test]
+    fn a_bundle_directory_must_be_below_the_root() {
+        let scratch = Scratch::new("resolve");
+        let root = scratch.0.canonicalize().unwrap();
+        std::fs::create_dir(root.join("sb")).unwrap();
+        let ok = |dir: &str| resolve_in_root(&root, dir).unwrap();
+        let refused = |dir: &str| resolve_in_root(&root, dir).unwrap_err().to_string();
+        let r = root.display();
+        assert_eq!(ok(&format!("{r}/ck")), root.join("ck"));
+        assert_eq!(ok(&format!("{r}/sb/tx1/")), root.join("sb/tx1"));
+        assert!(refused("ck").contains("absolute"));
+        assert!(refused(&format!("{r}/../ck")).contains("no .. in it"));
+        // A `.` inside the path names the same directory, and goes.
+        assert_eq!(ok(&format!("{r}/./ck")), root.join("ck"));
+        assert!(refused("/etc/ck").contains("not below the checkpoint root"));
+        assert!(refused(&format!("{r}")).contains("the checkpoint root itself"));
+        assert!(refused(&format!("{r}-other/ck")).contains("not below"));
+        // A link inside the root can point anywhere.
+        std::os::unix::fs::symlink("/tmp", root.join("out")).unwrap();
+        assert!(
+            refused(&format!("{r}/out/ck")).contains("is a link"),
+            "{}",
+            refused(&format!("{r}/out/ck"))
+        );
+        assert!(resolve_in_root(&root, &format!("{r}/none/ck")).is_err());
     }
 
     #[test]

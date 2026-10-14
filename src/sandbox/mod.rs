@@ -34,6 +34,17 @@ pub(crate) fn confine_io_thread() {
     seccomp::install_thread(seccomp::Thread::Vmm);
 }
 
+/// Confines the control socket's thread of a run that may write checkpoints.
+///
+/// On Linux the thread installs the `control` seccomp filter, which is `vmm`
+/// with the file calls a bundle needs. On macOS the Seatbelt profile already
+/// covers the whole process, with the checkpoint root as its one writable
+/// subtree outside the shares.
+pub(crate) fn confine_control_thread() {
+    #[cfg(target_os = "linux")]
+    seccomp::install_thread(seccomp::Thread::Control);
+}
+
 /// Checks that a run can start in this process with the sandbox as `sandbox`
 /// asks.
 ///

@@ -179,16 +179,59 @@ pub fn enter_with_readonly_shares(roots: &[PathBuf]) -> io::Result<()> {
 /// Installs the production profile with independently read-only or writable
 /// virtio-fs exports. The boolean is true only for a writable share.
 pub fn enter_with_shares(shares: &[(PathBuf, bool)]) -> io::Result<()> {
-    enter_with_paths(
+    enter_for(shares, None)
+}
+
+/// Installs the production profile with the virtio-fs exports of
+/// [`enter_with_shares`] and, when the run may write checkpoints, its
+/// canonical checkpoint root as one more writable subtree.
+///
+/// The control socket's thread writes a bundle there after confinement, as
+/// virtio-fs opens files lazily below an export, so the root gets the same
+/// narrow subtree rule and no fsctl.
+pub fn enter_for(shares: &[(PathBuf, bool)], checkpoint_root: Option<&Path>) -> io::Result<()> {
+    let policy = policy_for(
         shares
             .iter()
             .map(|(root, writable)| (root.as_path(), *writable)),
-    )
+    )?;
+    install(with_checkpoint_root(policy, checkpoint_root)?)
+}
+
+/// Appends the checkpoint root's subtree rule to `policy`, when there is a
+/// root.
+fn with_checkpoint_root(mut policy: String, root: Option<&Path>) -> io::Result<String> {
+    if let Some(root) = root {
+        policy.push_str(&format!(
+            "\n;; A checkpoint writes its bundle only below this canonical root, named at boot.\n\
+             (allow file-read* file-write* (subpath \"{}\"))\n",
+            sbpl_path(root)?
+        ));
+    }
+    Ok(policy)
 }
 
 fn enter_with_paths<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io::Result<()> {
     let policy = policy_for(roots)?;
     install(policy)
+}
+
+/// Returns `path` as an SBPL string body: UTF-8, free of control characters,
+/// with its backslashes and quotes escaped.
+fn sbpl_path(path: &Path) -> io::Result<String> {
+    let text = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a Seatbelt path is not valid UTF-8",
+        )
+    })?;
+    if text.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a Seatbelt path contains a control character",
+        ));
+    }
+    Ok(text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// The profile text for a set of exports: [`PROFILE`], a subtree rule per
@@ -316,12 +359,34 @@ pub struct SelftestFixtures {
     /// change that let the read-only branch grant writes would pass every
     /// test in the file.
     export_ro: std::path::PathBuf,
+    /// A canonical directory, entered as the checkpoint root, so the
+    /// selftest proves the bundle writer and reader against the subtree rule
+    /// the VMM installs for it.
+    checkpoint_root: std::path::PathBuf,
+    /// The profile the bundle probes record, made before entry as the boot
+    /// makes it.
+    profile: crate::checkpoint::profile::MachineProfile,
 }
 
 /// The probe list. Ordered denials-first so a profile that is accidentally
 /// permissive reads as a wall of failures rather than one buried line.
 fn probes() -> Vec<Probe> {
     vec![
+        Probe {
+            what: "write a checkpoint bundle outside the checkpoint root",
+            expect_ok: false,
+            run: |f| {
+                // The fixtures' directory, resolved, so the resolve passes
+                // and only the profile can refuse.
+                let outside = f.export_ro.parent().unwrap_or(&f.dir);
+                crate::checkpoint::bundle::selftest_round_trip(
+                    outside,
+                    "bundle-outside",
+                    &f.pre_mapped,
+                    &f.profile,
+                )
+            },
+        },
         Probe {
             what: "open a file for reading (/etc/hosts)",
             expect_ok: false,
@@ -640,6 +705,18 @@ fn probes() -> Vec<Probe> {
                     .map_err(|_| io::Error::other("thread join failed"))
             },
         },
+        Probe {
+            what: "write and verify a checkpoint bundle below the checkpoint root",
+            expect_ok: true,
+            run: |f| {
+                crate::checkpoint::bundle::selftest_round_trip(
+                    &f.checkpoint_root,
+                    "bundle",
+                    &f.pre_mapped,
+                    &f.profile,
+                )
+            },
+        },
     ]
 }
 
@@ -712,6 +789,11 @@ pub fn selftest() -> io::Result<usize> {
     let export_ro = export_ro.canonicalize()?;
     std::fs::write(export_ro.join("readable"), b"x")?;
     let _ = std::fs::remove_file(export_ro.join("denied"));
+    let checkpoint_root = dir.join("checkpoints");
+    std::fs::create_dir_all(&checkpoint_root)?;
+    let checkpoint_root = checkpoint_root.canonicalize()?;
+    let _ = std::fs::remove_dir_all(checkpoint_root.join("bundle"));
+    let _ = std::fs::remove_dir_all(dir.join("bundle-outside"));
     let fixtures = SelftestFixtures {
         pre_opened: std::fs::File::create(dir.join("ledger"))?,
         pre_bound: {
@@ -727,13 +809,18 @@ pub fn selftest() -> io::Result<usize> {
         dir: dir.clone(),
         export: export.clone(),
         export_ro: export_ro.clone(),
+        checkpoint_root: checkpoint_root.clone(),
+        profile: crate::checkpoint::profile::MachineProfile::for_this_host("aarch64", "selftest"),
     };
 
     println!(
         "hvi sandbox selftest: installing the production profile \
-         (one writable export, one read-only)"
+         (one writable export, one read-only, a checkpoint root)"
     );
-    enter_with_shares(&[(export.clone(), true), (export_ro, false)])?;
+    enter_for(
+        &[(export.clone(), true), (export_ro, false)],
+        Some(&checkpoint_root),
+    )?;
     println!("hvi sandbox selftest: sandbox is up\n");
 
     let mut bad = 0usize;
@@ -882,6 +969,25 @@ mod tests {
             ],
             "the composed policy's allow set changed; see policy_for in src/sandbox/seatbelt.rs"
         );
+    }
+
+    /// The checkpoint root adds one subtree rule and nothing else, and its
+    /// path is data in the profile, never policy.
+    #[test]
+    fn a_checkpoint_root_adds_one_subtree_rule() {
+        let base = policy_for(std::iter::empty()).unwrap();
+        assert_eq!(with_checkpoint_root(base.clone(), None).unwrap(), base);
+        let policy = with_checkpoint_root(base.clone(), Some(Path::new("/var/ck \"x\")"))).unwrap();
+        let added: Vec<&str> = policy[base.len()..]
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("(allow"))
+            .collect();
+        assert_eq!(
+            added,
+            [r#"(allow file-read* file-write* (subpath "/var/ck \"x\")"))"#]
+        );
+        assert!(with_checkpoint_root(base, Some(Path::new("/var/ck\n(allow default)"))).is_err());
     }
 
     /// The tty rule is only defensible because the process cannot open a tty in

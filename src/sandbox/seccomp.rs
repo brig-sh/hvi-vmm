@@ -64,7 +64,11 @@
 //! when it is enabled), the threads a plugin starts with `VmHandle::spawn`, the
 //! thread that receives the stop signals and the ledger writer. The ledger
 //! writer starts with the ledger, before the filters are armed, and installs
-//! `vmm` before its first write after the filters are armed.
+//! `vmm` before its first write after the filters are armed. `control` is `vmm`
+//! plus the file calls a checkpoint bundle needs (`openat`, `mkdirat`,
+//! `renameat`, `unlinkat` and the `stat` family), and only the control socket's
+//! thread installs it, and only when the run has a checkpoint root. That thread
+//! parses the control protocol, never guest data.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
@@ -86,7 +90,8 @@
 //!
 //! Everything acquired during setup is finished by the time any filter is in,
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
-//! absent from both lists. A compromised virtio backend cannot open a file.
+//! absent from `vmm` and `vcpu`. A compromised virtio backend cannot open a
+//! file.
 //!
 //! # The default action, and diagnosing it
 //!
@@ -111,6 +116,9 @@ pub enum Thread {
     Vmm,
     /// A vCPU thread: KVM plus the device models it services inline.
     Vcpu,
+    /// The control socket's thread when a checkpoint root is set: `vmm` plus
+    /// the file calls that write a checkpoint bundle.
+    Control,
 }
 
 impl Thread {
@@ -119,6 +127,7 @@ impl Thread {
         match self {
             Thread::Vmm => "vmm",
             Thread::Vcpu => "vcpu",
+            Thread::Control => "control",
         }
     }
 }
@@ -211,7 +220,7 @@ pub fn install(thread: Thread) -> io::Result<()> {
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
-    /// Whether this thread installed the `vmm` or `vcpu` filter, through
+    /// Whether this thread installed a filter, through
     /// [`install_thread`] or as the thread that calls `boot`.
     ///
     /// A thread that inherited a filter from the thread that started it reads
@@ -239,15 +248,15 @@ pub(crate) fn is_thread_filtered() -> bool {
     INSTALLED.get()
 }
 
-/// Turns filtering on for the threads spawned after this call, and proves both
-/// filters compile first.
+/// Turns filtering on for the threads spawned after this call, and proves every
+/// filter compiles first.
 ///
 /// Compiling here is the point: it turns "this distro's kernel headers spell a
 /// syscall differently" into a boot error on the thread that calls `boot`,
 /// where it can be reported, instead of a `SIGSYS` inside a device thread later
 /// on.
 pub fn arm() -> io::Result<()> {
-    for thread in [Thread::Vmm, Thread::Vcpu] {
+    for thread in [Thread::Vmm, Thread::Vcpu, Thread::Control] {
         program(thread)?;
     }
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -606,6 +615,29 @@ fn probes() -> Vec<Probe> {
                 let _ = std::thread::spawn(|| 0u8).join();
             },
         },
+        Probe {
+            what: "create a socket (control)",
+            thread: Thread::Control,
+            expect_ok: false,
+            // SAFETY: socket(2) with constant arguments.
+            run: || {
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            },
+        },
+        // A checkpoint on the control socket's thread: the real bundle writer
+        // and reader, over guest RAM mapped before the filter went in.
+        Probe {
+            what: "write and verify a checkpoint bundle (control)",
+            thread: Thread::Control,
+            expect_ok: true,
+            run: probe_bundle_round_trip,
+        },
+        Probe {
+            what: "write a checkpoint bundle (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: false,
+            run: probe_bundle_round_trip,
+        },
         // The ledger writer sleeps under the vmm filter before it tries a
         // failed write again. Which syscall a sleep reaches depends on std and
         // the libc.
@@ -618,6 +650,45 @@ fn probes() -> Vec<Probe> {
             },
         },
     ]
+}
+
+/// Guest RAM mapped by the selftest before it forks a probe, for the probes
+/// that write a bundle: a mapping cannot be made under the filters.
+static PROBE_RAM: std::sync::OnceLock<crate::memory::GuestRam> = std::sync::OnceLock::new();
+
+/// The profile the bundle probes record, made before the fork for the same
+/// reason: reading the host's facts needs calls no filter allows.
+static PROBE_PROFILE: std::sync::OnceLock<crate::checkpoint::profile::MachineProfile> =
+    std::sync::OnceLock::new();
+
+/// The exit code of a bundle probe whose round trip failed without a trap.
+const BUNDLE_PROBE_FAILED: i32 = 96;
+
+/// Writes, verifies and removes a bundle of [`PROBE_RAM`] under the temp dir.
+///
+/// A round trip that fails without a trap exits the child with
+/// [`BUNDLE_PROBE_FAILED`], which the runner counts as a mismatch either
+/// way. Ignoring the error let the `control` probe match when an early
+/// `mkdirat` or `openat` failed with `EEXIST` or `EACCES`, so the writer's
+/// later calls never ran and one missing from the filter went unseen.
+fn probe_bundle_round_trip() {
+    let result = match (PROBE_RAM.get(), PROBE_PROFILE.get()) {
+        (Some(ram), Some(profile)) => {
+            let name = format!("hvi-seccomp-bundle-{}", std::process::id());
+            crate::checkpoint::bundle::selftest_round_trip(
+                &std::env::temp_dir(),
+                &name,
+                ram,
+                profile,
+            )
+        }
+        _ => Err(io::Error::other("no guest RAM or profile was made")),
+    };
+    if let Err(e) = result {
+        eprintln!("  (the bundle round trip failed: {e})");
+        // SAFETY: terminating the forked child without running destructors.
+        unsafe { libc::_exit(BUNDLE_PROBE_FAILED) };
+    }
 }
 
 /// Result of running one probe in a child process.
@@ -702,6 +773,14 @@ pub fn selftest() -> io::Result<usize> {
     }
     let (vmm, vcpu) = allowed_counts()?;
     println!("hvi seccomp selftest: vmm allows {vmm} syscalls, vcpu allows {vcpu}");
+    let shared = crate::memory::SharedRam::new(crate::memory::RamRegion::ALIGN as usize)?;
+    let _ = PROBE_RAM.set(crate::memory::GuestRam::new(
+        &shared,
+        &[shared.region_at(0)],
+    )?);
+    let _ = PROBE_PROFILE.set(crate::checkpoint::profile::MachineProfile::for_this_host(
+        "aarch64", "selftest",
+    ));
     println!("hvi seccomp selftest: each probe runs in a child that installs the real filter\n");
 
     let mut bad = 0usize;
@@ -729,6 +808,9 @@ pub fn selftest() -> io::Result<usize> {
         let actual = match outcome {
             Outcome::Allowed => "ran".to_string(),
             Outcome::Trapped => "killed by SIGSYS".to_string(),
+            Outcome::Other(s) if s == BUNDLE_PROBE_FAILED << 8 => {
+                "exited: the bundle round trip failed".to_string()
+            }
             Outcome::Other(s) => format!("unexpected wait status {s:#x}"),
         };
         println!(
@@ -750,7 +832,7 @@ mod tests {
     /// is a test failure on any Linux host.
     #[test]
     fn filters_compile_for_this_arch() {
-        for thread in [Thread::Vmm, Thread::Vcpu] {
+        for thread in [Thread::Vmm, Thread::Vcpu, Thread::Control] {
             let p = program(thread).expect("filter should compile");
             assert!(!p.is_empty(), "{:?} compiled to an empty program", thread);
         }
@@ -761,7 +843,7 @@ mod tests {
     #[test]
     fn filters_trap_on_mismatch() {
         let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        for key in ["vmm", "vcpu"] {
+        for key in ["vmm", "vcpu", "control"] {
             assert_eq!(
                 doc[key]["default_action"], "trap",
                 "{key} must trap on a syscall outside its list"
@@ -790,6 +872,54 @@ mod tests {
         let extra: Vec<_> = vcpu.difference(&vmm).collect();
         assert!(extra.is_empty(), "vcpu allows what vmm does not: {extra:?}");
         assert!(vcpu.len() < vmm.len(), "vcpu should be the tighter filter");
+    }
+
+    /// The control filter is `vmm` and the file calls of a bundle, nothing
+    /// else, so a right granted there for another reason stands out, and it
+    /// never gains what would let the thread reach the network or another
+    /// program.
+    #[test]
+    fn control_is_vmm_plus_the_bundle_file_calls() {
+        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
+        let names = |k: &str| -> std::collections::BTreeSet<String> {
+            doc[k]["filter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["syscall"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (vmm, control) = (names("vmm"), names("control"));
+        assert!(vmm.is_subset(&control), "control lacks part of vmm");
+        let file_calls = [
+            "openat",
+            "mkdir",
+            "mkdirat",
+            "rename",
+            "renameat",
+            "renameat2",
+            "unlink",
+            "unlinkat",
+            "rmdir",
+            "newfstatat",
+            "lstat",
+            "statx",
+            "fstat",
+            "getdents64",
+            "readlink",
+            "readlinkat",
+        ];
+        for extra in control.difference(&vmm) {
+            assert!(
+                file_calls.contains(&extra.as_str()),
+                "control allows {extra}, which writing a bundle does not need"
+            );
+        }
+        for forbidden in [
+            "socket", "connect", "execve", "execveat", "ptrace", "seccomp", "prctl",
+        ] {
+            assert!(!control.contains(forbidden), "control allows {forbidden}");
+        }
     }
 
     /// The point of installing after setup is that the process can no longer
