@@ -52,7 +52,7 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
-use crate::checkpoint::profile::{hex, MachineProfile, ProfileCell};
+use crate::checkpoint::profile::{hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
@@ -148,14 +148,35 @@ fn read_u64(vcpu: &VcpuFd, id: u64) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
+/// Returns `DCZID_EL0` as this thread reads it.
+///
+/// Older kernels do not serve it through `KVM_GET_ONE_REG`. The guest reads
+/// the hardware's value, since KVM does not trap it, and EL0 may read it too:
+/// the block size is the hardware's, and Linux lets userspace and KVM lets a
+/// guest kernel use `DC ZVA`, so the prohibit bit is clear for both.
+fn host_dczid_el0() -> u64 {
+    let value: u64;
+    // SAFETY: reads a system register EL0 may read; no memory is touched.
+    unsafe {
+        std::arch::asm!("mrs {}, dczid_el0", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 /// Returns the machine profile of this boot, read from the boot vCPU.
 fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, boot: &VcpuFd) -> MachineProfile {
     let mut p = arm64_profile::profile("kvm", machine);
     p.cpu.ident = read_u64(boot, REG_MIDR_EL1).map(hex);
     for (name, id) in ID_REGS {
-        if let Some(value) = read_u64(boot, id) {
-            p.cpu.id_regs.insert(name.to_string(), hex(value));
-        }
+        let value = match read_u64(boot, id) {
+            Some(value) => Some(value),
+            None if name == "DCZID_EL0" => Some(host_dczid_el0()),
+            None => None,
+        };
+        // A register KVM does not serve is recorded as unread, which the
+        // compatibility check refuses on either side.
+        let value = value.map_or_else(|| UNKNOWN.to_string(), hex);
+        p.cpu.id_regs.insert(name.to_string(), value);
     }
     p.firmware.psci_version =
         read_u64(boot, REG_PSCI_VERSION).map(|v| format!("{}.{}", v >> 16, v & 0xffff));
