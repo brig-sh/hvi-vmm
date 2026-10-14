@@ -94,6 +94,60 @@ pub struct MachineProfile {
     /// The number of virtio-fs shares. A share's state is host file handles,
     /// which do not move, so a profile with any is never compatible.
     pub fs_shares: u32,
+    /// The machine profile the guest was given, as `--profile` names it.
+    /// [`NATIVE`] is not written, so a native profile reads as it did before
+    /// portable profiles existed.
+    #[serde(default = "native", skip_serializing_if = "is_native")]
+    pub profile: String,
+    /// A portable profile's CPU baseline: the ID registers every host gives
+    /// the guest, by name, as hex. Not written on the native profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<BTreeMap<String, String>>,
+    /// A portable profile's interrupt controller. Not written on the native
+    /// profile, whose controller is `gic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irq: Option<Irq>,
+    /// A portable profile's clock and timer device. Not written on the
+    /// native profile, whose guest uses the architected timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<Time>,
+}
+
+/// The name of the native machine profile.
+pub const NATIVE: &str = "native";
+
+fn native() -> String {
+    NATIVE.to_string()
+}
+
+#[allow(clippy::ptr_arg)] // serde passes the field as it is declared
+fn is_native(profile: &String) -> bool {
+    profile == NATIVE
+}
+
+/// A portable profile's interrupt controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Irq {
+    /// `gicv2`.
+    pub kind: String,
+    /// Where the guest finds it.
+    pub layout: Gic,
+}
+
+/// A portable profile's clock and timer device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Time {
+    /// `hvi-time`.
+    pub kind: String,
+    /// The rate of the counter under the device on this host. The guest
+    /// reads time in nanoseconds, so two hosts may differ here.
+    pub counter_freq_hz: u64,
+    /// The guest physical address of the pvclock page.
+    pub page_base: u64,
+    /// The guest physical address of the timer blocks.
+    pub timers_base: u64,
+    /// The timers' GIC interrupt ID.
+    pub intid: u32,
 }
 
 /// The hvi a profile was written by.
@@ -236,6 +290,10 @@ impl MachineProfile {
             },
             agent_sock: false,
             fs_shares: 0,
+            profile: native(),
+            baseline: None,
+            irq: None,
+            time: None,
         }
     }
 
@@ -270,11 +328,17 @@ impl MachineProfile {
     /// equal, a value either side could not read never matches, and neither
     /// side may have virtio-fs shares.
     ///
+    /// A portable profile has rules of its own; see
+    /// [`portable_compatible_with`](Self::portable_compatible_with).
+    ///
     /// # Errors
     ///
     /// Errors with one reason per difference, each naming the field and both
     /// values.
     pub fn compatible_with(&self, other: &Self) -> Result<(), Vec<String>> {
+        if self.profile != NATIVE || other.profile != NATIVE {
+            return self.portable_compatible_with(other);
+        }
         let mut why = Vec::new();
         for (side, p) in [("source", self), ("destination", other)] {
             if p.profile_version != PROFILE_VERSION {
@@ -439,6 +503,148 @@ impl MachineProfile {
             "firmware.boot_params_sha256",
             json(&self.firmware.boot_params_sha256),
             json(&other.firmware.boot_params_sha256),
+        );
+        differ(
+            "agent_sock",
+            self.agent_sock.to_string(),
+            other.agent_sock.to_string(),
+        );
+        if why.is_empty() {
+            Ok(())
+        } else {
+            Err(why)
+        }
+    }
+}
+
+impl MachineProfile {
+    /// Returns whether a guest built against the portable profile `self`
+    /// can run on `other`, which may be another host and another hypervisor.
+    ///
+    /// The guest of a portable profile sees the profile's machine, not the
+    /// host's, so the rules compare what the profile fixes and leave out
+    /// what it hides:
+    ///
+    /// - Compared: the profile's name, the profile and checkpoint formats, the
+    ///   hvi commit, the architecture, the CPU baseline, the interrupt
+    ///   controller, the clock device but for its counter rate, RAM, the vCPUs,
+    ///   the devices but for how each reaches the host, the PSCI version, the
+    ///   devicetree digest and the agent socket.
+    /// - Not compared: the hypervisor, the host, the counter rate (the guest
+    ///   reads nanoseconds), the CPU's identity and ID registers as read (the
+    ///   baseline is what the guest sees; `CTR_EL0` and `CLIDR_EL1` differ
+    ///   between a Mac and a Pi and neither can be set), and the host page
+    ///   size, which need only be 4 KiB or 16 KiB on the destination.
+    ///
+    /// Whether the destination host can present the baseline at all is
+    /// its backend's check, at its boot: Hypervisor.framework compares the
+    /// baseline with the host's registers, KVM also needs a vGICv2, a 40-bit
+    /// guest address space and writable fields (`portable::kvm_host_problems`).
+    ///
+    /// # Errors
+    ///
+    /// Errors with one reason per difference.
+    pub fn portable_compatible_with(&self, other: &Self) -> Result<(), Vec<String>> {
+        let mut why = Vec::new();
+        for (side, p) in [("source", self), ("destination", other)] {
+            if p.profile_version != PROFILE_VERSION {
+                why.push(format!(
+                    "profile_version: the {side} is version {}, this hvi reads {PROFILE_VERSION}",
+                    p.profile_version
+                ));
+            }
+            if p.checkpoint_format != CHECKPOINT_FORMAT {
+                why.push(format!(
+                    "checkpoint_format: the {side} writes format {}, this hvi reads \
+                     {CHECKPOINT_FORMAT}",
+                    p.checkpoint_format
+                ));
+            }
+            if p.hvi_build.git_sha == UNKNOWN {
+                why.push(format!(
+                    "hvi_build.git_sha: the {side}'s hvi does not know its commit"
+                ));
+            }
+            if p.fs_shares != 0 {
+                why.push(format!(
+                    "fs_shares: the {side} has {} virtio-fs share(s), whose host file \
+                     handles cannot move",
+                    p.fs_shares
+                ));
+            }
+            if p.profile != NATIVE && (p.baseline.is_none() || p.irq.is_none() || p.time.is_none())
+            {
+                why.push(format!(
+                    "profile: the {side}'s {} profile lacks its baseline, irq or time",
+                    p.profile
+                ));
+            }
+        }
+        if !matches!(other.page_size, 0x1000 | 0x4000) {
+            why.push(format!(
+                "page_size: the destination maps guest RAM with {}-byte pages; a portable \
+                 guest needs 4 KiB or 16 KiB",
+                other.page_size
+            ));
+        }
+        let mut differ = |field: &str, a: String, b: String| {
+            if a != b {
+                why.push(format!(
+                    "{field}: {a} on the source, {b} on the destination"
+                ));
+            }
+        };
+        differ("profile", self.profile.clone(), other.profile.clone());
+        differ("arch", self.arch.clone(), other.arch.clone());
+        differ(
+            "hvi_build.git_sha",
+            self.hvi_build.git_sha.clone(),
+            other.hvi_build.git_sha.clone(),
+        );
+        differ("baseline", json(&self.baseline), json(&other.baseline));
+        differ("irq", json(&self.irq), json(&other.irq));
+        // The counter rate is the host's; the guest reads nanoseconds.
+        let device = |p: &Self| {
+            json(&p.time.as_ref().map(|t| Time {
+                counter_freq_hz: 0,
+                ..t.clone()
+            }))
+        };
+        differ("time", device(self), device(other));
+        differ("gic", json(&self.gic), json(&other.gic));
+        differ(
+            "ram_regions",
+            json(&self.ram_regions),
+            json(&other.ram_regions),
+        );
+        differ("vcpus", self.vcpus.to_string(), other.vcpus.to_string());
+        if self.devices.len() != other.devices.len() {
+            differ(
+                "devices",
+                format!("{} devices", self.devices.len()),
+                format!("{} devices", other.devices.len()),
+            );
+        }
+        // How a device reaches the host (the network's stub, gateway or
+        // tap) is the host's business; the guest sees the same device.
+        for (index, (a, b)) in self.devices.iter().zip(&other.devices).enumerate() {
+            let seen = |d: &Device| {
+                json(&Device {
+                    mode: None,
+                    ..d.clone()
+                })
+            };
+            differ(&format!("devices[{index}]"), seen(a), seen(b));
+        }
+        differ(
+            "firmware.psci_version",
+            json(&self.firmware.psci_version),
+            json(&other.firmware.psci_version),
+        );
+        differ(
+            "firmware.dtb_sha256",
+            json(&self.firmware.dtb_sha256),
+            json(&other.firmware.dtb_sha256),
         );
         differ(
             "agent_sock",
@@ -740,6 +946,10 @@ mod tests {
             },
             agent_sock: true,
             fs_shares: 0,
+            profile: native(),
+            baseline: None,
+            irq: None,
+            time: None,
         }
     }
 
@@ -789,6 +999,166 @@ mod tests {
                 r#""firmware":{"psci_version":"1.0","dtb_sha256":"abababababababababababababababababababababababababababababababab","boot_params_sha256":null},"#,
                 r#""agent_sock":true,"fs_shares":0}"#,
             )
+        );
+    }
+
+    /// The profile a portable guest writes on a Mac: `sample` with the
+    /// portable fields.
+    fn portable_mac() -> MachineProfile {
+        let v2 = Gic {
+            version: 2,
+            gicd_base: 0x0800_0000,
+            gicd_size: 0x1_0000,
+            gicr_base: 0x0801_0000,
+            gicr_size: 0x1_0000,
+        };
+        let mut p = sample();
+        p.profile = "portable-arm64-v1".into();
+        p.cpu.ident = Some("0x414fd0b1".into());
+        p.cpu.id_regs.insert("CTR_EL0".into(), "0x99444c004".into());
+        p.gic = Some(v2.clone());
+        p.firmware.psci_version = Some("1.1".into());
+        p.baseline = Some(
+            [
+                ("MIDR_EL1", "0x414fd0b1"),
+                ("ID_AA64PFR0_EL1", "0x1100000010110011"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        );
+        p.irq = Some(Irq {
+            kind: "gicv2".into(),
+            layout: v2,
+        });
+        p.time = Some(Time {
+            kind: "hvi-time".into(),
+            counter_freq_hz: 24_000_000,
+            page_base: 0x0d10_0000,
+            timers_base: 0x0d11_0000,
+            intid: 20,
+        });
+        p.devices[1].mode = Some("stub".into());
+        p
+    }
+
+    /// The same guest's profile on a Pi: another hypervisor, host, counter
+    /// rate, register reads and network mode.
+    fn portable_pi() -> MachineProfile {
+        let mut p = portable_mac();
+        p.backend = "kvm".into();
+        p.host = Host {
+            os: "linux".into(),
+            kernel_or_macos_build: "6.12.25+rpt-rpi-2712".into(),
+        };
+        p.counter_freq_hz = 54_000_000;
+        if let Some(t) = p.time.as_mut() {
+            t.counter_freq_hz = 54_000_000;
+        }
+        p.cpu.id_regs.insert("CTR_EL0".into(), "0x9444c004".into());
+        p.cpu
+            .id_regs
+            .insert("ID_AA64PFR0_EL1".into(), "0x1100000010110011".into());
+        p.devices[1].mode = Some("tap".into());
+        p
+    }
+
+    #[test]
+    fn a_portable_guest_moves_between_a_mac_and_a_pi() {
+        assert_eq!(portable_mac().compatible_with(&portable_pi()), Ok(()));
+        assert_eq!(portable_pi().compatible_with(&portable_mac()), Ok(()));
+        // The native rules would have refused it on six counts.
+        let mut as_native = (portable_mac(), portable_pi());
+        as_native.0.profile = NATIVE.into();
+        as_native.1.profile = NATIVE.into();
+        assert!(reasons(&as_native.0, &as_native.1).len() >= 5);
+    }
+
+    #[test]
+    fn a_portable_profile_compares_what_the_guest_sees() {
+        let refused = |field: &str, change: &dyn Fn(&mut MachineProfile)| {
+            let mut other = portable_pi();
+            change(&mut other);
+            let why = reasons(&portable_mac(), &other);
+            assert_eq!(why.len(), 1, "{field}: {why:?}");
+            assert!(why[0].starts_with(&format!("{field}: ")), "{why:?}");
+        };
+        refused("baseline", &|p| {
+            p.baseline
+                .as_mut()
+                .unwrap()
+                .insert("ID_AA64ISAR0_EL1".into(), "0x1".into());
+        });
+        refused("irq", &|p| p.irq.as_mut().unwrap().layout.gicd_base = 0);
+        refused("time", &|p| {
+            p.time.as_mut().unwrap().kind = "kvm-clock".into()
+        });
+        refused("time", &|p| p.time.as_mut().unwrap().intid = 27);
+        refused("firmware.dtb_sha256", &|p| {
+            p.firmware.dtb_sha256 = Some("cd".repeat(32));
+        });
+        refused("vcpus", &|p| p.vcpus = 1);
+        refused("ram_regions", &|p| p.ram_regions[0].size = 256 << 20);
+        refused("devices[1]", &|p| p.devices[1].irq = Some(49));
+        refused("firmware.psci_version", &|p| {
+            p.firmware.psci_version = Some("1.0".into());
+        });
+        refused("hvi_build.git_sha", &|p| {
+            p.hvi_build.git_sha = "f".repeat(40)
+        });
+        refused("page_size", &|p| p.page_size = 0x1_0000);
+        refused("fs_shares", &|p| p.fs_shares = 1);
+        refused("agent_sock", &|p| p.agent_sock = false);
+        // A 4 KiB destination is fine.
+        let mut four_k = portable_pi();
+        four_k.page_size = 0x1000;
+        assert_eq!(portable_mac().compatible_with(&four_k), Ok(()));
+    }
+
+    #[test]
+    fn a_portable_guest_never_lands_on_a_native_one() {
+        let mut native_pi = portable_pi();
+        native_pi.profile = NATIVE.into();
+        native_pi.baseline = None;
+        native_pi.irq = None;
+        native_pi.time = None;
+        let why = reasons(&portable_mac(), &native_pi);
+        assert!(
+            why.iter()
+                .any(|w| w == "profile: portable-arm64-v1 on the source, native on the destination"),
+            "{why:?}"
+        );
+        assert!(why.iter().any(|w| w.starts_with("baseline: ")), "{why:?}");
+        assert!(!reasons(&native_pi, &portable_mac()).is_empty());
+        // A portable profile missing its contract is refused outright.
+        let mut bare = portable_mac();
+        bare.time = None;
+        assert!(reasons(&bare, &bare)
+            .iter()
+            .any(|w| w.contains("lacks its baseline, irq or time")));
+    }
+
+    /// The portable fields are written after the native ones, and a native
+    /// profile writes none of them, so its bytes are as they were.
+    #[test]
+    fn portable_fields_are_written_only_for_a_portable_profile() {
+        let native_json = sample().to_json();
+        for key in ["\"profile\":", "\"baseline\":", "\"irq\":{", "\"time\":"] {
+            assert!(!native_json.contains(key), "{key} in {native_json}");
+        }
+        let p = portable_mac();
+        let text = p.to_json();
+        assert!(text.ends_with(concat!(
+            r#""fs_shares":0,"profile":"portable-arm64-v1","#,
+            r#""baseline":{"ID_AA64PFR0_EL1":"0x1100000010110011","MIDR_EL1":"0x414fd0b1"},"#,
+            r#""irq":{"kind":"gicv2","layout":{"version":2,"gicd_base":134217728,"gicd_size":65536,"gicr_base":134283264,"gicr_size":65536}},"#,
+            r#""time":{"kind":"hvi-time","counter_freq_hz":24000000,"page_base":219152384,"timers_base":219217920,"intid":20}}"#,
+        )), "{text}");
+        assert_eq!(MachineProfile::from_json(&text), Ok(p));
+        // A profile written before the fields existed reads as native.
+        assert_eq!(
+            MachineProfile::from_json(&native_json).unwrap().profile,
+            NATIVE
         );
     }
 
