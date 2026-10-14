@@ -1524,7 +1524,12 @@ impl IoStart {
         // it. A failure to start it ends the timer thread again.
         let test = match (&shared.hvitime, hvitime::TestRestore::from_env()) {
             (Some(device), Some(test)) => {
-                match test.spawn(Arc::clone(device), Arc::clone(&shared.guest.vcpus), || {}) {
+                match test.spawn(
+                    Arc::clone(device),
+                    Arc::clone(&shared.guest.vcpus),
+                    || {},
+                    || {},
+                ) {
                     Ok(thread) => Some(thread),
                     Err(e) => {
                         device.stop();
