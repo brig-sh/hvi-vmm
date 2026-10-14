@@ -310,7 +310,8 @@ little-endian:
 | 0x20 | `u32 mult`, 0x24 `u32 shift` | `ns = base_ns + ((cnt - base_counter) * mult) >> shift`, 96-bit product. |
 | 0x28 | `u64 wall_ns` | The host's `CLOCK_REALTIME` at guest nanosecond `base_ns`. |
 | 0x30 | `u64 downtime_total_ns` | Time the guest spent stopped across restores and host sleeps. |
-| 0x38 | `u64 flags` | 0. |
+| 0x38 | `u32 flags` | 0. |
+| 0x3c | `u32 host_sleeps` | How many publishes so far followed a host sleep (see [Host sleep](#host-sleep)). A restore carries it on. |
 
 `shift` is 24 and `mult` the nearest integer to `(10^9 << 24) / freq`:
 699050667 at 24 MHz, 310689185 at 54 MHz, which is what the guest kernel's
@@ -409,7 +410,7 @@ The canonical checkpoint form (`HviTimeState`, `platform.json` `timer`, kind
 
 ```text
 {"page":{"generation","counter_freq_hz","base_counter","base_ns","mult","shift",
-         "wall_ns","downtime_total_ns"},
+         "wall_ns","downtime_total_ns","host_sleeps"},
  "guest_ns_at_capture",
  "counter_at_capture",
  "cpus":[{"deadline_ns" (null when disarmed),"status","ctrl"}]}
@@ -419,12 +420,14 @@ The canonical checkpoint form (`HviTimeState`, `platform.json` `timer`, kind
 `guest_ns_at_capture`, at `page.counter_freq_hz`. A restore sets the
 destination's counter offset so the guest's counter starts no lower than
 that value scaled to the destination's rate, rounded up
-(`HviTimeState::counter_target`). An older state without it reads as 0.
+(`HviTimeState::counter_target`). An older state without it reads as 0,
+and so does one without `page.host_sleeps`.
 
 `HviTime::restore` publishes the page again from the destination's counter:
 `base_ns` is `guest_ns_at_capture`, `base_counter` the destination's counter
-now, `mult` the destination's, `wall_ns` the destination's clock, and the
-time since the capture is added to `downtime_total_ns`. The generation goes
+now, `mult` the destination's, `wall_ns` the destination's clock,
+`host_sleeps` the captured count, and the time since the capture is added
+to `downtime_total_ns`. The generation goes
 up by 2, every vCPU's `STATUS` gains `GEN_CHANGED`, deadlines are armed
 again (one already due fires at once) and each line follows its restored
 state. The guest's driver then sets its delay loop for the new rate in the
@@ -448,9 +451,13 @@ back as written`.
 
 Every vCPU takes `GEN_CHANGED` and schedules the driver's work item, which
 can then run more than once for one publish. The driver handles each
-generation once: it keeps the generation it last handled, starting from the
-boot page's, and counts the publishes since in `migrations`. An Image
-before the third patch of the series ran the work once per vCPU that took
+generation once: it keeps the generation and the `host_sleeps` count it
+last handled, starting from the boot page's, and splits the publishes since
+into host sleeps (the growth of `host_sleeps`) and restores. It counts the
+restores in `migrations` and the host sleeps in `host_sleeps`, which
+`/sys/kernel/hvi_time/snapshot` prints just before `migrations`. An Image
+before the fourth patch of the series counted a host-sleep publish in
+`migrations`. An Image before the third patch of the series ran the work once per vCPU that took
 the bit. `tools/checkpoint-e2e.sh --portable --cpus 4` on rp2, three runs
 of each Image: the old one logged and counted the move 2, 3 and 3 times,
 the current one once each time. On the Mac one run of each counted 1: the

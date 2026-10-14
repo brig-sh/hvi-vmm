@@ -438,7 +438,7 @@ impl GicV3State {
         // The distributor implements interrupt IDs in groups of 32, and the
         // last group stops at 1019.
         let max = GICV3_MAX_INTIDS - 32;
-        if self.spi_count > max || (self.spi_count % 32 != 0 && self.spi_count != max) {
+        if self.spi_count > max || (!self.spi_count.is_multiple_of(32) && self.spi_count != max) {
             return Err(format!(
                 "irq: {} SPIs, not a multiple of 32 up to {max}",
                 self.spi_count
@@ -535,7 +535,7 @@ pub fn base64_encode(data: &[u8]) -> String {
 #[must_use]
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let value = |c: u8| B64.iter().position(|&b| b == c).map(|v| v as u32);
@@ -762,6 +762,7 @@ pub(crate) mod tests {
                 shift: 24,
                 wall_ns: 1_000,
                 downtime_total_ns: 0,
+                host_sleeps: 0,
             },
             guest_ns_at_capture: 5_000,
             counter_at_capture: 280,
