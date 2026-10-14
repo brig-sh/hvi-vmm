@@ -649,8 +649,9 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vsock: cfg.agent_sock.is_some(),
         fs_count: 0,
         // A restore rebuilds the native machine, whose guest has the timer's
-        // interrupts.
+        // interrupts and no hvi-time.
         timer: ArchTimer::Interrupts,
+        hvi_time: false,
     };
     let net_mode = if cfg.net_gateway.is_some() {
         Some("gateway")
@@ -1066,6 +1067,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 clock_frequency: ArchTimer::PORTABLE_HZ,
             }
         },
+        hvi_time: false,
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;

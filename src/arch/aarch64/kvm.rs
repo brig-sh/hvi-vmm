@@ -344,6 +344,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         vsock: has_vsock,
         fs_count: 0,
         timer: fdt::ArchTimer::Interrupts,
+        hvi_time: false,
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
