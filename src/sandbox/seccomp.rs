@@ -283,6 +283,63 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
     Ok((count("vmm"), count("vcpu")))
 }
 
+/// Keeps glibc's malloc to its main arena, so no thread under a filter ever
+/// makes it open a file. `main` calls this before anything else, while the
+/// process has one thread.
+///
+/// glibc's malloc opens two files on its own, both from a thread that is
+/// allocating or freeing, and either is a `SIGSYS` under the `vmm` filter,
+/// which allows no `openat`:
+///
+/// - `/sys/devices/system/cpu/online`. A thread that allocates gets an arena of
+///   its own. The first time one needs a new arena while more than `arena_test`
+///   (eight on a 64-bit host) exist, `arena_get2` in `malloc/arena.c` fixes the
+///   arena limit: to `M_ARENA_MAX` when it is set, and otherwise from the CPU
+///   count. Upstream 2.36 counts CPUs with `sched_getaffinity`, which the lists
+///   allow. The 2.36 that Debian 12 ships carries a release-branch change that
+///   calls `__get_nprocs` instead, which reads this file.
+/// - `/proc/sys/vm/overcommit_memory`. The first time a heap of an arena other
+///   than the main one shrinks, `shrink_heap` reads it, through
+///   `check_may_shrink_heap` in `malloc-sysdep.h`. Capping the arenas at any
+///   number above one leaves this read in place: with a cap of four, a guest
+///   with heavy agent traffic still killed the VMM within a minute.
+///
+/// With `M_ARENA_MAX` at 1 before any thread allocates, `arena_get2` takes the
+/// limit from it without counting CPUs, and every thread shares the main
+/// arena. No other arena exists, so no other heap exists to shrink. The main
+/// arena grows and trims with `brk` and `mmap`, which the lists allow.
+/// Nothing else in glibc's malloc opens a file after startup: the hugepage
+/// settings are read in `ptmalloc_init`, before `main`, and only when the
+/// `glibc.malloc.hugetlb` tunable asks for them.
+///
+/// The cost is one malloc lock for the whole process, which the per-thread
+/// cache in front of it softens. That is how the musl build always runs,
+/// since musl's malloc has a single lock. musl has no `mallopt`, and musl
+/// 1.2.5's `src/malloc` opens no file and asks for no CPU count, so there this
+/// does nothing. The selftest's allocation probes check both builds.
+///
+/// macOS needs none of this. Its malloc is not glibc's, and Seatbelt answers
+/// an open outside the profile with an error, not a signal, so a library that
+/// tries one carries on.
+///
+/// # Errors
+///
+/// Errors if glibc refuses the setting.
+pub fn one_malloc_arena() -> io::Result<()> {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: mallopt with a positive arena count; it only stores the
+        // value, under the main arena's lock.
+        let set = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+        if set != 1 {
+            return Err(io::Error::other(
+                "glibc refused to keep malloc to one arena",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The seccomp filters of a run, compiled before its I/O and vCPU threads
 /// start.
 ///
@@ -608,6 +665,27 @@ fn probes() -> Vec<Probe> {
             expect_ok: false,
             run: probe_bundle_round_trip,
         },
+        // The two files glibc's malloc opens by itself, from whichever thread
+        // allocates or frees (`one_malloc_arena` has the detail). A guest
+        // with busy agent traffic reached both, and the VMM died of SIGSYS
+        // mid-run. Each probe fails unless `main` kept malloc to one arena.
+        //
+        // More than eight threads holding arenas at once: glibc's next arena
+        // decision reads /sys/devices/system/cpu/online.
+        Probe {
+            what: "allocate on many threads at once (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            run: probe_many_arenas,
+        },
+        // A thread's own arena giving memory back: the first shrink of its
+        // heap reads /proc/sys/vm/overcommit_memory.
+        Probe {
+            what: "free a thread's heap memory (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            run: probe_heap_shrink,
+        },
         // The stop sleeps under the vmm filter while it waits for a ledger that
         // a thread left running holds. Which syscall a sleep reaches depends on
         // std and the libc.
@@ -659,6 +737,52 @@ fn probe_bundle_round_trip() {
         // SAFETY: terminating the forked child without running destructors.
         unsafe { libc::_exit(BUNDLE_PROBE_FAILED) };
     }
+}
+
+/// Threads the many-arenas probe keeps alive at once. glibc decides its arena
+/// limit when a thread needs a new arena and more than `arena_test` exist, and
+/// `arena_test` is eight on a 64-bit host whatever its core count, so 32 gets
+/// past it on any host.
+const ARENA_PROBE_THREADS: usize = 32;
+
+/// Spawns [`ARENA_PROBE_THREADS`] threads that each allocate and touch a small
+/// buffer and a 1 MiB one, and hold both until every thread has, so no arena
+/// goes back to glibc's free list for the next thread to reuse.
+fn probe_many_arenas() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(ARENA_PROBE_THREADS));
+    let threads: Vec<_> = (0..ARENA_PROBE_THREADS)
+        .map(|i| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // A nonzero fill, so the allocation is written to and does not
+                // come from calloc's already-zero pages.
+                let fill = u8::try_from(i % 255).unwrap_or(0) + 1;
+                let small = vec![fill; 4096];
+                let big = vec![fill; 1 << 20];
+                barrier.wait();
+                std::hint::black_box((&small, &big));
+            })
+        })
+        .collect();
+    for thread in threads {
+        let _ = thread.join();
+    }
+}
+
+/// Allocates 16 MiB on a new thread in 64 KiB pieces, under glibc's smallest
+/// mmap threshold so they come from the thread's arena, and frees them newest
+/// first. Each free joins the top of the heap, and once that top passes the
+/// trim threshold glibc shrinks the heap. In an arena other than the main one,
+/// that shrink is where it reads the overcommit setting.
+fn probe_heap_shrink() {
+    let _ = std::thread::spawn(|| {
+        let mut pieces: Vec<Vec<u8>> = (0..256).map(|_| vec![1u8; 64 << 10]).collect();
+        while let Some(piece) = pieces.pop() {
+            std::hint::black_box(&piece);
+            drop(piece);
+        }
+    })
+    .join();
 }
 
 /// Result of running one probe in a child process.
