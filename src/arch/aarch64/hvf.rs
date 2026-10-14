@@ -1561,6 +1561,14 @@ impl IoStart {
             });
             let timer = Arc::clone(device);
             io_threads.on_stop(move || timer.stop());
+            // The in-process restore test, when `HVI_TIME_TEST_RESTORE` asks
+            // for it.
+            if let Some(test) = hvitime::TestRestore::from_env() {
+                let (device, vcpus) = (Arc::clone(device), Arc::clone(&shared.guest.vcpus));
+                io_threads.spawn("hvi-time test restore", move |_| {
+                    test.run(&device, &vcpus);
+                });
+            }
         }
         io_threads
     }

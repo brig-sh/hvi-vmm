@@ -726,6 +726,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // thread, which it inherits from, is not filtered yet.
     if let Some(device) = &shared.hvitime {
         spawn_timer(&mut io_threads, device);
+        if let Some(test) = hvitime::TestRestore::from_env() {
+            let (device, vcpus) = (Arc::clone(device), Arc::clone(&shared.guest.vcpus));
+            io_threads.spawn("hvi-time test restore", move |_| {
+                test.run(&device, &vcpus);
+            });
+        }
     }
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
