@@ -193,11 +193,13 @@ pub struct BootConfig {
     pub mem_bytes: u64,
     pub cmdline: String,
     pub disk: Option<String>,
-    /// The SHA-256 of `disk` as it was before the guest first booted from
+    /// The SHA-256 of `disk` as this boot opens it, before this hvi writes
     /// it, as 64 lowercase hex digits, which the machine profile records
-    /// (`disk_base_sha256`). hvi does not hash the disk itself: whoever
-    /// made the image did, and keeps a copy, so a move can send only the
-    /// blocks the guest wrote. It needs `disk`.
+    /// (`disk_base_sha256`). hvi tracks only the writes it serves from this
+    /// boot on, so a disk that an earlier boot wrote needs a new digest, or
+    /// no flag. hvi does not hash the disk itself: whoever made the image
+    /// did, and keeps a copy, so a move can send only the blocks the guest
+    /// wrote. It needs `disk`.
     pub disk_base_sha256: Option<String>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
