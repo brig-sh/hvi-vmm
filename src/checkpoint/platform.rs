@@ -399,11 +399,13 @@ impl GicV3State {
         if self.version != 3 {
             return Err(format!("irq: GIC version {}, not 3", self.version));
         }
-        if self.spi_count > GICV3_MAX_INTIDS - 32 || self.spi_count % 32 != 0 {
+        // The distributor implements interrupt IDs in groups of 32, and the
+        // last group stops at 1019.
+        let max = GICV3_MAX_INTIDS - 32;
+        if self.spi_count > max || (self.spi_count % 32 != 0 && self.spi_count != max) {
             return Err(format!(
-                "irq: {} SPIs, not a multiple of 32 up to {}",
-                self.spi_count,
-                GICV3_MAX_INTIDS - 32
+                "irq: {} SPIs, not a multiple of 32 up to {max}",
+                self.spi_count
             ));
         }
         let intids = (self.spi_count + 32) as usize;
@@ -663,6 +665,7 @@ mod tests {
         refused(&|g| g.version = 2, "GIC version 2");
         refused(&|g| g.spi_count = 33, "33 SPIs");
         refused(&|g| g.spi_count = 1024, "1024 SPIs");
+        refused(&|g| g.spi_count = 990, "990 SPIs");
         refused(&|g| g.spi_count = 64, "dist.igroupr has 2 registers, 3");
         refused(&|g| g.dist.ipriorityr.push(0), "dist.ipriorityr has 17");
         refused(

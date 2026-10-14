@@ -741,6 +741,8 @@ pub(crate) enum Output {
 /// # Errors
 ///
 /// Errors on an import.
+// HVF has its own, so only the Linux builds call it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn serve_from_regs_view<V: SafepointVcpu>(
     arch: GuestArch,
     backend: &str,
