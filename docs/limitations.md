@@ -74,12 +74,17 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| A checkpoint bundle cannot be restored yet. | Each vCPU's state is partial: PC, PSTATE, the stack pointers and four translation registers on arm64, RIP and CR3 on x86-64. The interrupt controller and the guest counter are marked `not-captured`. There is no `hvi restore`. | Defect |
+| A KVM checkpoint bundle cannot be restored yet. | On KVM each vCPU's state is partial: PC, PSTATE, the stack pointers and four translation registers on arm64, RIP and CR3 on x86-64. The interrupt controller and the guest counter are marked `not-captured`. `hvi restore` runs on HVF only. | Defect |
+| An HVF bundle moves only to the same macOS build, CPU and hvi commit. | The `hv_gic_state` blob is opaque and versioned by the OS, and the restore refuses every machine profile difference: the macOS build, `MIDR_EL1`, every ID register, the counter frequency, the GIC layout, the hvi commit (and a build with uncommitted changes). | Platform |
+| A restored guest's wall clock is behind. | Its counter goes on from the capture, so its `CLOCK_REALTIME` lags the host's by the time it was away, until the guest's own time sync corrects it. hvi does not set it. | Design |
+| A restore resets the guest's vsock connections. | Their host ends stayed on the source. The guest sees each one reset. | Design |
+| A guest using SME cannot be checkpointed. | A vCPU in SME streaming mode or with ZA storage on fails the capture: the schema has no place for its Z, P and ZA registers. Linux enters those modes only while a task uses SME. | Design |
+| `GICR_CTLR` is not in the canonical GIC state. | Hypervisor.framework has no call that reads it. The HVF restore loads the `hv_gic_state` blob, which holds it, so only a future import of the canonical form would miss it. | Platform |
 | A checkpoint stops the guest for the whole capture. | Downtime grows with the guest RAM in use: about 0.3 s for 100 MiB on an Apple M5 Pro, 1.2 s on a Raspberry Pi 5, 3 s for 350 MiB on the Pi. Each file is synced while the guest is stopped, so a host whose storage is busy stretches it: 14 s for 90 MiB on the Pi while a build ran. There are no pre-copy rounds. A client's reply timeout must allow for it. | Defect |
 | A checkpoint needs `--checkpoint-root`. | Without it every `checkpoint` is refused. The bundle goes in a new or empty directory below the root, reached through no link. | Design |
 | A guest with virtio-fs shares cannot be checkpointed. | Its share is host descriptors and inode numbers that do not move. The checkpoint is refused before anything pauses. | Design |
 | The fence lives only as long as the process. | A fenced VM refuses `resume` until it stops. Nothing is written, so a caller that must survive a crash of the source records the fence itself. | Design |
-| An arm64 secondary starting during a checkpoint can be recorded as off. | A secondary on HVF that has taken its `CPU_ON` but not yet entered its run loop is not waited for and is written as `"power":"off"`. The window is the guest's own CPU bring-up, early in its boot. | Defect |
+| A secondary that starts during a checkpoint fails it. | A secondary on HVF that takes its `CPU_ON` after the export's wait ended is neither off nor exported, so the capture replies `capture_failed` and the caller tries again. The window is the guest's own CPU bring-up, early in its boot. | Design |
 | A pause does not stop guest time. | The guest's counter keeps running while it is paused. On resume its clock has jumped by the pause, and timers that fell due fire at once. | Design |
 | One client at a time. | A connected client that sends nothing keeps the next one waiting in the backlog. | Design |
 | The socket has no authentication. | Anyone who can connect can pause or stop the VM. Its directory's permissions are the only control. | Design |
