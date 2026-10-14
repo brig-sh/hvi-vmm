@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::checkpoint::control::{
     format_response, parse_request, Error, ErrorCode, Request, Response, VmState, MAX_LINE,
@@ -44,9 +44,14 @@ use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus};
 use crate::teardown::{PauseGate, StopToken};
 use crate::LOG_PREFIX;
 
-/// How long a pause waits for the I/O threads, and then for the vCPUs, and
-/// how long `profile` waits for the profile to be complete.
+/// How long a pause waits for the I/O threads and the vCPUs together, and how
+/// long `profile` waits for the profile to be complete. No request waits
+/// longer, so a client that allows a little more than this for a reply never
+/// gives up on a pause that later succeeds.
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often a wait for the profile looks at whether the VM still runs.
+const PROFILE_POLL: Duration = Duration::from_millis(50);
 
 /// A bound control socket and the profile it reports.
 pub(crate) struct ControlSocket {
@@ -248,10 +253,7 @@ impl<K: Kick> Machine<'_, K> {
             self.state = VmState::Stopping;
         }
         let response = match request {
-            Request::Profile => match self.profile.get(self.timeout) {
-                Some(profile) => Response::Profile(Box::new(profile)),
-                None => refuse(ErrorCode::NotReady, "the boot vCPU has not started yet"),
-            },
+            Request::Profile => self.profile(),
             Request::Status => Response::Status {
                 state: self.state,
                 vcpus: self.vcpus.started(),
@@ -274,14 +276,37 @@ impl<K: Kick> Machine<'_, K> {
         (response, None)
     }
 
-    /// Holds the I/O threads, then parks the vCPUs. Pausing a paused VM
-    /// succeeds and changes nothing.
+    /// Returns the profile once it is complete.
+    ///
+    /// The wait ends with the stop as well as at its deadline. The stop cannot
+    /// wake the profile's condition variable, so the wait is cut into short
+    /// ones, or a `profile` asked before the boot vCPU starts would keep this
+    /// thread past the deadline the join of the I/O threads has.
+    fn profile(&self) -> Response {
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Some(profile) = self.profile.get(left.min(PROFILE_POLL)) {
+                return Response::Profile(Box::new(profile));
+            }
+            if !self.vcpus.is_running() {
+                return refuse(ErrorCode::Stopped, "the run is ending");
+            }
+            if left.is_zero() {
+                return refuse(ErrorCode::NotReady, "the boot vCPU has not started yet");
+            }
+        }
+    }
+
+    /// Holds the I/O threads, then parks the vCPUs, within one deadline for
+    /// both. Pausing a paused VM succeeds and changes nothing.
     fn pause(&mut self) -> Response {
         match self.state {
             VmState::Paused | VmState::Fenced => return Response::State(self.state),
             VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
             VmState::Running => {}
         }
+        let deadline = Instant::now() + self.timeout;
         if let Err(inside) = self.gate.pause(self.timeout) {
             // The gate gives up on the stop as well as at its deadline.
             if !self.vcpus.is_running() {
@@ -296,7 +321,10 @@ impl<K: Kick> Machine<'_, K> {
                 ),
             );
         }
-        match self.vcpus.pause_from_control(self.timeout) {
+        // The vCPUs get what the gate left of the deadline, so the reply comes
+        // within the one deadline the client is told about.
+        let left = deadline.saturating_duration_since(Instant::now());
+        match self.vcpus.pause_from_control(left) {
             Ok(_) => {
                 self.state = VmState::Paused;
                 Response::State(VmState::Paused)
@@ -675,6 +703,67 @@ mod tests {
         f.replies.read_line(&mut reply).unwrap();
         assert_eq!(reply, "{\"v\":1,\"ok\":true,\"state\":\"stopping\"}\n");
         assert_stops(&f.vcpus, "the unterminated stop was dropped");
+    }
+
+    // An I/O thread that stays inside the gate fails the pause before any
+    // vCPU is asked to park, and the gate opens again.
+    #[test]
+    fn a_busy_io_thread_times_the_pause_out_with_the_vcpus_running() {
+        let mut f = Fixture::new("gate", 1, 0);
+        let token = f.source.token();
+        let inside = token.enter();
+        let reply = f.ask(r#"{"v":1,"op":"pause"}"#);
+        assert!(
+            reply.starts_with(
+                r#"{"v":1,"ok":false,"code":"timeout","error":"1 I/O thread(s) still busy"#
+            ),
+            "{reply}"
+        );
+        assert!(!f.source.gate().is_paused(), "the gate stayed closed");
+        assert_eq!(f.vcpus.parked(), 0);
+        drop(inside);
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"running","vcpus":1,"vcpus_parked":0}"#
+        );
+    }
+
+    // A plugin's pause and the socket's are kept out of each other: the socket
+    // refuses while a plugin holds the vCPUs and leaves the gate open.
+    #[test]
+    fn a_plugin_pause_makes_the_socket_busy() {
+        let mut f = Fixture::new("busy", 2, 0);
+        // As cpu0 would, it waits for every started vCPU but one.
+        assert!(f.vcpus.pause(), "the plugin's pause");
+        let reply = f.ask(r#"{"v":1,"op":"pause"}"#);
+        assert!(
+            reply.starts_with(r#"{"v":1,"ok":false,"code":"busy""#),
+            "{reply}"
+        );
+        assert!(!f.source.gate().is_paused(), "the gate stayed closed");
+        f.vcpus.resume();
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"pause"}"#),
+            r#"{"v":1,"ok":true,"state":"paused"}"#
+        );
+    }
+
+    // A profile asked before the boot vCPU starts must not hold the server
+    // past the stop, whose join has a shorter deadline.
+    #[test]
+    fn a_wait_for_the_profile_ends_with_the_stop() {
+        let mut f = Fixture::new("profile-stop", 1, 0);
+        let vcpus = Arc::clone(&f.vcpus);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            vcpus.stop();
+        });
+        let reply = f.ask(r#"{"v":1,"op":"profile"}"#);
+        stopper.join().unwrap();
+        assert!(
+            reply.starts_with(r#"{"v":1,"ok":false,"code":"stopped""#),
+            "{reply}"
+        );
     }
 
     #[test]
