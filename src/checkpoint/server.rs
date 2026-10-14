@@ -1157,10 +1157,16 @@ mod tests {
             "{reply}"
         );
         assert!(!f.source.gate().is_paused(), "the gate stayed closed");
-        assert_eq!(
-            f.ask(r#"{"v":1,"op":"status"}"#),
-            r#"{"v":1,"ok":true,"state":"running","vcpus":2,"vcpus_parked":0}"#
-        );
+        // The vCPU that parked leaves its park on its own thread after the
+        // release, so the count reaches 0 a moment after the reply.
+        let running = r#"{"v":1,"ok":true,"state":"running","vcpus":2,"vcpus_parked":0}"#;
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut status = f.ask(r#"{"v":1,"op":"status"}"#);
+        while status != running && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+            status = f.ask(r#"{"v":1,"op":"status"}"#);
+        }
+        assert_eq!(status, running);
     }
 
     #[test]
