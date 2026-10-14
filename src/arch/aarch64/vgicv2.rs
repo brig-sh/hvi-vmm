@@ -572,7 +572,7 @@ pub(crate) mod tests {
     /// reading the latch or a level line, SGI sources, `GICC_PMR` shifted
     /// and `GICC_APR1-3` reading 0.
     #[derive(Default)]
-    struct Fake {
+    pub(crate) struct Fake {
         ncpu: usize,
         regs: RefCell<HashMap<(usize, u64), u32>>,
         cpu_regs: RefCell<HashMap<(usize, u64), u32>>,
@@ -584,7 +584,7 @@ pub(crate) mod tests {
     }
 
     impl Fake {
-        fn new(ncpu: usize) -> Self {
+        pub(crate) fn new(ncpu: usize) -> Self {
             let f = Self {
                 ncpu,
                 ..Self::default()
