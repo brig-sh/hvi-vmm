@@ -138,10 +138,13 @@ pub struct VirtioBlk {
     /// synchronous stderr write per request — ruinous under fio). Enable with
     /// `HVI_BLK_TRACE=1`; the structured ledger still records every request.
     trace: bool,
-    /// The writes and flushes served since the device was built.
+    /// The writes and flushes served since the guest booted: by this
+    /// device, and by every device of earlier processes the guest was
+    /// restored from.
     ///
-    /// A checkpoint records it, so two captures of one run can tell whether
-    /// the guest changed the disk between them without reading the image.
+    /// A checkpoint records it, so two captures of one guest can tell
+    /// whether the guest changed the disk between them without reading the
+    /// image, and a restore carries it on, so it only grows across moves.
     generation: u64,
 }
 
@@ -238,7 +241,8 @@ impl VirtioBlk {
         self.sync_irq();
     }
 
-    /// Returns the number of writes and flushes the device has served.
+    /// Returns the number of writes and flushes the guest has had served
+    /// since it booted.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
@@ -280,7 +284,8 @@ impl VirtioBlk {
 
     /// Rebuilds the device a checkpoint describes over the disk at `path`,
     /// opened read-write as [`VirtioBlk::open`] opens it, and the restored
-    /// guest RAM `mem`.
+    /// guest RAM `mem`. Its generation goes on from `generation`, the one
+    /// the checkpoint's `disk.json` records.
     ///
     /// The disk must be the size the guest was told. A guest's filesystem
     /// sized itself to that capacity at mount, so a smaller disk fails its
@@ -295,7 +300,12 @@ impl VirtioBlk {
     /// `capacity_sectors`, or when the state is of another version, has a
     /// queue the transport would not have accepted, or has registers this
     /// device never holds.
-    pub fn restore(path: &str, mem: &GuestRam, state: &BlkState) -> std::io::Result<Self> {
+    pub fn restore(
+        path: &str,
+        mem: &GuestRam,
+        state: &BlkState,
+        generation: u64,
+    ) -> std::io::Result<Self> {
         state.check(mem)?;
         let queue = Queue::from_state(mem, &state.queue)?;
         let mut dev = Self::open(path)?;
@@ -312,6 +322,7 @@ impl VirtioBlk {
         dev.dev_feat_sel = state.common.dev_feat_sel;
         dev.interrupt_status = state.common.interrupt_status;
         dev.queue = queue;
+        dev.generation = generation;
         Ok(dev)
     }
 
@@ -1231,7 +1242,7 @@ mod state_tests {
         let json = serde_json::to_vec(&state).unwrap();
         let back: BlkState = serde_json::from_slice(&json).unwrap();
         assert_eq!(back, state);
-        let mut restored = VirtioBlk::restore(disk.path(), &mem, &back).unwrap();
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &back, 1046).unwrap();
         assert_eq!(restored.state(), state);
 
         // The restored device carries on where the first left off: the next
@@ -1242,6 +1253,15 @@ mod state_tests {
         assert_eq!(mem.read_u16(USED + 2).unwrap(), 2, "two chains used");
         assert_eq!(mem.read_u16(BASE + 0x6000).unwrap() as u8, VIRTIO_BLK_S_OK);
         assert_eq!(restored.state().queue.last_avail, 2);
+
+        // Its generation goes on from the checkpoint's: a read leaves it,
+        // and a flush moves it on by one.
+        assert_eq!(restored.generation(), 1046);
+        post_read(&mem, 2);
+        mem.write_u32(BASE + 0x4000, VIRTIO_BLK_T_FLUSH).unwrap();
+        restored.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        assert_eq!(mem.read_u16(USED + 2).unwrap(), 3, "three chains used");
+        assert_eq!(restored.generation(), 1047);
     }
 
     /// A restored device with an interrupt the driver had not acknowledged
@@ -1255,7 +1275,7 @@ mod state_tests {
         served_one_read(&mut blk, &mem);
         let pending = blk.state();
 
-        let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending).unwrap();
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending, 0).unwrap();
         let line = Arc::new(LevelLine::default());
         restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         assert!(line.is_high(), "the pending interrupt is asserted");
@@ -1268,7 +1288,7 @@ mod state_tests {
             },
             ..pending
         };
-        let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet).unwrap();
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet, 0).unwrap();
         let line = Arc::new(LevelLine::default());
         restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         assert_eq!(line.sets(), 0, "a line with nothing pending is not set");
@@ -1281,7 +1301,7 @@ mod state_tests {
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut blk = VirtioBlk::open(disk.path()).unwrap();
         served_one_read(&mut blk, &mem);
-        let err = VirtioBlk::restore(other.path(), &mem, &blk.state())
+        let err = VirtioBlk::restore(other.path(), &mem, &blk.state(), 0)
             .err()
             .expect("a 3-sector disk is not the 2-sector one the guest has");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1295,7 +1315,7 @@ mod state_tests {
         let mut blk = VirtioBlk::open(disk.path()).unwrap();
         served_one_read(&mut blk, &mem);
         let smaller = GuestRam::from_ranges(&[(BASE, 0x2000)]);
-        let err = VirtioBlk::restore(disk.path(), &smaller, &blk.state()).err();
+        let err = VirtioBlk::restore(disk.path(), &smaller, &blk.state(), 0).err();
         assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
     }
 
@@ -1325,7 +1345,7 @@ mod state_tests {
             },
         ];
         for state in bad {
-            let err = VirtioBlk::restore(disk.path(), &mem, &state).err();
+            let err = VirtioBlk::restore(disk.path(), &mem, &state, 0).err();
             assert_eq!(
                 err.map(|e| e.kind()),
                 Some(std::io::ErrorKind::InvalidData),

@@ -188,7 +188,8 @@ pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
 /// It returns how the run ended. `failure` is a failure the caller met as it
 /// started the run, from the spawn of the vCPU threads on. Without one, the
 /// calling thread waits until a vCPU thread exits or a stop is requested. It
-/// then stops the VM, joins the vCPU threads and stops `io_threads`, each by
+/// then stops the VM, joins the vCPU threads and stops `io_threads`, when the
+/// run started them, each by
 /// [`STOP_TIMEOUT`], and writes out the ledger tail, which the flush cadence
 /// alone would leave in the buffer.
 ///
@@ -209,7 +210,7 @@ pub(crate) fn run_to_stop<K: Kick>(
     guest: &Guest<K>,
     threads: VcpuThreads,
     mut failure: Option<Box<dyn std::error::Error + Send + Sync>>,
-    io_threads: IoThreads<K>,
+    io_threads: Option<IoThreads<K>>,
 ) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     // A panic from here on stops the VM, and the I/O threads as `io_threads`
     // drops, so the guest does not run on with nothing left to stop it.
@@ -239,8 +240,8 @@ pub(crate) fn run_to_stop<K: Kick>(
     let mut left_running = threads.join_timeout(&guest.vcpus, STOP_TIMEOUT).err();
 
     // The I/O threads stop once the vCPUs have exited or been left running; see
-    // `teardown`.
-    if let Err(e) = io_threads.stop() {
+    // `teardown`. A restore that failed before it started them has none.
+    if let Some(Err(e)) = io_threads.map(IoThreads::stop) {
         left_running.get_or_insert(e);
     }
 
@@ -378,7 +379,7 @@ mod tests {
             guest,
             threads,
             failure.map(Into::into),
-            IoThreads::idle(Arc::clone(&guest.vcpus)),
+            Some(IoThreads::idle(Arc::clone(&guest.vcpus))),
         )
         .map_err(|e| e.to_string())
     }

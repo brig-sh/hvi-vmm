@@ -1,19 +1,21 @@
 # Checkpoints
 
 A checkpoint captures a running guest into a bundle: a directory that holds
-its RAM, its vCPUs, its devices and the machine it was built against. The
-plan is that another hvi restores the bundle on a compatible host, and the
-guest runs on there without rebooting.
+its RAM, its vCPUs, its devices and the machine it was built against.
+`hvi restore` resumes the bundle in another hvi process on a compatible host,
+and the guest runs on there without rebooting.
 
-That plan is not finished. This page says what works today and what does
-not.
+This page says what works today and what does not.
 
 - **Works:** the bundle format, the capture on the control socket on all
-  three backends, the fence that keeps a source from running again, and
-  `hvi checkpoint-verify`.
-- **Does not work yet:** a bundle cannot be restored. Each vCPU's state is
-  partial, and the interrupt controller and the guest counter are not
-  captured. [What is captured](#what-is-captured) has the details.
+  three backends, the fence that keeps a source from running again,
+  `hvi checkpoint-verify`, and on HVF (macOS) the whole capture and
+  `hvi restore`: a guest moves from one hvi process to another on the same
+  Mac and goes on where it was.
+- **Does not work yet:** a KVM bundle cannot be restored. On KVM each vCPU's
+  state is partial, and the interrupt controller and the guest counter are
+  not captured. A bundle moves only between hosts on the same macOS build,
+  CPU and hvi commit. [What is captured](#what-is-captured) has the details.
 
 ## Taking a checkpoint
 
@@ -138,18 +140,23 @@ the first problem, naming the file, and exits 1:
 
 ```text
 bundle ok: manifest sha256 fb9fbc73425d49e4dd02374b61b591f0dfc6a19891791d46bccf6ee6823036d4
-written by hvi 0.1.0 (aa0bd9ed8f21dd49792f25f86e4fa686b17e200b), aarch64 on hvf
-  profile.json             1208 bytes
-  ram.bin              93126656 bytes
+written by hvi 0.1.0 (4ea836ffa0bca2049ae80d3b601a50a19909e6ef), aarch64 on hvf
+  profile.json             1478 bytes
+  ram.bin              94359552 bytes
   ram.map                 16400 bytes
-  cpu.json                  659 bytes
-  platform.json             258 bytes
-  devices.json              177 bytes
-  session.json              115 bytes
-  manifest.json            1678 bytes
-RAM: 93126656 of 536870912 bytes present; 2 vCPU(s)
-partial: vCPU registers, interrupt controller and timer not captured, so no restore can resume this bundle
+  cpu.json                 8597 bytes
+  platform.json          180878 bytes
+  devices.json             1180 bytes
+  disk.json                 228 bytes
+  session.json              108 bytes
+  manifest.json            1873 bytes
+RAM: 94359552 of 536870912 bytes present; 2 vCPU(s)
+complete: every part a restore needs is captured
 ```
+
+A bundle from a KVM host ends with `partial: vCPU registers, interrupt
+controller and timer not captured, so no restore can resume this bundle`
+instead.
 
 ```text
 hvi: /var/lib/sb1/checkpoints/tx-42: ram.bin: SHA-256 does not match the manifest
@@ -166,12 +173,12 @@ on the byte layout of the build that wrote it.
 | `profile.json` | The source's machine profile. See [cli.md](cli.md#the-control-socket). |
 | `ram.bin` | The pages of guest RAM that are not all zero, region by region, in address order, with nothing between them. |
 | `ram.map` | A 16-byte header (`HVIRAM01`, a little-endian `u32` page size of 4096, a little-endian `u32` region count), then one bitmap per region. Bit `i` is bit `i % 8` of byte `i / 8`. 1 means page `i` is the next page in `ram.bin`, and 0 means the page is all zero. |
-| `cpu.json` | `{"version":1,"arch":"aarch64"\|"x86_64","vcpus":[...]}`. Registers by architectural name, values as `"0x..."` strings. Each vCPU says whether it is `partial`. |
-| `platform.json` | The interrupt controller (`irq`) and the guest counter (`timer`), and an optional backend blob. Both sections are `{"kind":"not-captured","reason":...}` today. |
+| `cpu.json` | `{"version":1,"arch":"aarch64"\|"x86_64","vcpus":[...]}`. Registers by architectural name, values as `"0x..."` strings. Each vCPU says whether it is `partial`. See [The vCPU state](#the-vcpu-state). |
+| `platform.json` | The interrupt controller (`irq`) and the guest counter (`timer`), each tagged with its `kind`, and an optional backend blob. See [The platform state](#the-platform-state). |
 | `devices.json` | Every device's state, with a `null` for a device the guest does not have, and `irq_levels`: the level of each device's interrupt line at the capture, so a restore can drive the lines again. |
-| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot), `synced: true`, and `sha256_sparse: null`, which whoever moves the disk fills in. |
+| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot, which a restore carries on, so it only grows across moves), `synced: true`, and `sha256_sparse: null`, which whoever moves the disk fills in. |
 | `session.json` | The sandbox id, `epoch`, `txid`, the capture time and `then`. |
-| `manifest.json` | Every other file's name, size and SHA-256, the RAM regions with their present page counts, the SHA-256 of `profile.json`, the hvi build, `capabilities` (empty today) and the seal time. |
+| `manifest.json` | Every other file's name, size and SHA-256, the RAM regions with their present page counts, the SHA-256 of `profile.json`, the hvi build, `capabilities` (what a restore must be able to load: `hvf-gic-state-v1` on HVF, empty on KVM) and the seal time. |
 
 The writer syncs the parent of a bundle directory it creates, so the
 directory itself survives a host crash. It syncs each component to stable
@@ -208,6 +215,54 @@ The reader trusts nothing in the directory:
 Any mismatch is refused with the name of the file. Nothing is truncated,
 skipped or repaired.
 
+### The vCPU state
+
+An arm64 vCPU that ran is written whole on HVF:
+
+```text
+{"id":0,"power":"on",
+ "regs":{"x0":"0x..",..,"x30":"0x..","sp_el0":"0x..","sp_el1":"0x..","pc":"0x..",
+         "pstate":"0x3c5","fpcr":"0x0","fpsr":"0x0"},
+ "simd":["<32 hex digits>", ... 32 of them, q0 first],
+ "sysregs":{"SCTLR_EL1":"0x..",...,"MPIDR_EL1":"0x80000000"},
+ "timer":{"vtimer_masked":false},
+ "backend":"hvf","partial":false}
+```
+
+`sysregs` holds the EL1 and EL0 registers of `AARCH64_SYSREGS` in
+`src/checkpoint/cpu.rs`: the MMU and exception registers, the thread
+pointers, `CNTKCTL_EL1`, `CNTV_CTL_EL0` and `CNTV_CVAL_EL0`, the
+pointer-authentication keys, `MDSCR_EL1`, `MDCCINT_EL1`, the 16 breakpoint
+and 16 watchpoint register pairs, `ACTLR_EL1` and `MPIDR_EL1`. A register
+the export fails to read fails the capture. Five are optional, because only
+some hosts have them (SME, or new in macOS 15.2): `SCXTNUM_EL0`,
+`SCXTNUM_EL1`, `TPIDR2_EL0`, `SMCR_EL1` and `SMPRI_EL1`. One the host
+lacks is listed under `unavailable` instead. A vCPU in SME streaming mode or
+with ZA storage on fails the capture: its Z, P and ZA registers have no place
+in the schema.
+
+A secondary the guest never started is `"power":"off"` with no registers.
+One the guest sent a `CPU_ON` that its thread had not taken yet is
+`{"pending_on":{"entry":"0x..","ctx":"0x.."}}`, and a restore starts it from
+there. The KVM backends still write `"partial": true` with PC, PSTATE, SP_EL0,
+SP_EL1, SCTLR_EL1, TCR_EL1, TTBR0_EL1 and TTBR1_EL1 on arm64, and RIP and
+CR3 on x86-64.
+
+### The platform state
+
+| Section | `kind` | Written by | Holds |
+| --- | --- | --- | --- |
+| `irq` | `hv-gic-v3` | HVF | The GICv3 in canonical form: `dist` (`GICD_CTLR`, then `igroupr`, `isenabler`, `ispendr`, `isactiver`, `ipriorityr`, `icfgr` by register number from 0, and `irouter` by interrupt ID), `redist` and `icc` for each vCPU that ran, and `spi_count`. |
+| `timer` | `arch-timer` | HVF | `counter_freq_hz`, `counter_at_capture` (the guest's `CNTVCT_EL0` as vCPU 0 saw it) and `host_monotonic_at_capture_ns`. |
+| either | `not-captured` | KVM | `reason`. A restore refuses it. |
+
+`backend_adjunct` carries HVF's own GIC state, the `hv_gic_state` blob,
+as `{"kind":"hvf_gic_state","data_b64":...,"sha256":...}`. A restore on
+HVF loads the blob, not the canonical registers, and only the same macOS build
+is sure to load it. The canonical part is for a later import on another
+backend. `GICR_CTLR` is not in `redist`: Hypervisor.framework has no call
+that reads it. The portable profile adds the kinds `gicv2` and `hvi-time`.
+
 ## How the capture works
 
 1. The control thread refuses what it can without pausing: the state, the
@@ -218,18 +273,28 @@ skipped or repaired.
 3. It asks every vCPU to export its state. Only a vCPU's own thread can read
    its registers on HVF and on KVM. So each vCPU does the export at its
    park point, out of the guest, and stays parked. A vCPU that was already
-   parked by an earlier `pause` is woken to do it.
-4. With everything still, it locks every device mutex and collects the device
+   parked by an earlier `pause` is woken to do it. On HVF the export also
+   reads the vCPU's GIC redistributor and CPU interface, which only its own
+   thread may read.
+4. Once every vCPU has exported, it asks vCPU 0 for the platform, in a
+   request of its own. The wait between the two requests is the barrier:
+   the framework gives the `hv_gic_state` blob only while every vCPU is
+   stopped, and vCPU 0 reads it, the distributor and the counter after all
+   the others are done. A KVM vCPU 0 hands back nothing, and the platform
+   is written as `not-captured`.
+5. With everything still, it locks every device mutex and collects the device
    states. Then it checks them as a restore would. A state that a restore
    would refuse fails the capture here, before any file is written, while the
    guest can still run on. The vsock device is the one that can reach such a
    state, with more connections or waiting packets than a restore takes.
-5. It syncs the disk image with `fdatasync`.
-6. It writes the profile, RAM, the vCPUs, the platform, the devices, the disk
+6. It syncs the disk image with `fdatasync`.
+7. It writes the profile, RAM, the vCPUs, the platform, the devices, the disk
    and the session, then seals the manifest.
-7. It replies, then resumes the VM, or keeps it parked for `fence`.
+8. It replies, then resumes the VM, or keeps it parked for `fence`.
 
-Steps 2 and 3 share one 2 s deadline. A stop of the run during the capture
+Steps 2 to 4 share one 2 s deadline. A vCPU that starts during the capture,
+after the wait for the exports ended, fails it with `capture_failed`, since it
+is neither off nor exported; the caller can try again. A stop of the run during the capture
 ends it between components and between reads of RAM.
 
 ### Confinement
@@ -260,18 +325,19 @@ written from a `vmm` thread (Linux), is refused.
 
 ## What is captured
 
-| Part | Today | Next |
+| Part | HVF (macOS) | KVM (Linux) |
 | --- | --- | --- |
-| Guest RAM | Whole, without zero pages. | Dirty tracking for pre-copy rounds. |
-| Device state | Whole: virtio-blk, virtio-net and virtio-vsock queues and registers, the PL011, or the 16550 and the CMOS RTC. | |
-| Disk | Synced, with its size and generation. The image itself is not in the bundle; whoever moves the sandbox moves the disk. | A dirty-sector bitmap. |
-| vCPU registers | **Partial.** On arm64: PC, PSTATE, SP_EL0, SP_EL1, SCTLR_EL1, TCR_EL1, TTBR0_EL1 and TTBR1_EL1. On x86-64: RIP and CR3. A register the backend could not read is 0. | HVF and KVM exports of every register, under the same names. |
-| A secondary arm64 vCPU the guest never started | `"power":"off"`. | A pending `CPU_ON` recorded as `pending_on`. |
-| Interrupt controller | **Not captured.** | The GICv3 state on HVF, the vGIC state on KVM arm64, the irqchip and PIT on KVM x86-64. |
-| Guest counter | **Not captured.** | The counter value at the capture, so the guest's counter continues from it. |
+| Guest RAM | Whole, without zero pages. | The same. |
+| Device state | Whole: virtio-blk, virtio-net and virtio-vsock queues and registers, and the PL011. | The same, with the 16550 and the CMOS RTC on x86-64. |
+| Disk | Synced, with its size and generation. The image itself is not in the bundle; whoever moves the sandbox moves the disk. | The same. |
+| vCPU registers | Whole. See [The vCPU state](#the-vcpu-state). | **Partial**: the plugin register view. A register the backend could not read is 0. |
+| A secondary the guest never started | `off`, or `pending_on` with the entry and context of the `CPU_ON` it had not taken. | Every KVM vCPU starts at once. |
+| Interrupt controller | The `hv_gic_state` blob, and the GICv3 registers in canonical form. | **Not captured.** |
+| Guest counter | The counter at the capture. | **Not captured.** |
 
-A restore must refuse a vCPU marked `partial` and a `not-captured` section.
-`hvi checkpoint-verify` reports both.
+A restore refuses a vCPU marked `partial` and a `not-captured` section.
+`hvi checkpoint-verify` reports both. Dirty tracking for pre-copy rounds and
+a dirty-sector bitmap for the disk come later.
 
 ### What a capture can lose
 
@@ -290,16 +356,118 @@ the bundle either: bytes still in a host socket, the gateway's own
 connections, and the host ends of vsock connections. A restore resets the
 vsock connections, so the guest sees each one shut down.
 
+## Restoring a bundle
+
+```sh
+hvi restore --from /var/lib/sb1/checkpoints/tx-42 \
+    --control-sock /run/sb1/ctl-2.sock --checkpoint-root /var/lib/sb1/checkpoints \
+    --disk root.img --net-stub --agent-sock /run/sb1/agent-2.sock
+```
+
+The flags are in [cli.md](cli.md#restore). The machine comes from the bundle.
+The flags name what it needs from this host, and must match what the guest
+had: `--disk` when it had a disk, the network mode it ran on, and
+`--agent-sock` when it had a vsock device. The restored guest comes up
+paused. `status` reports `restored-paused`, and the guest runs once a client
+sends `resume`. `stop` ends it without it ever running. A checkpoint of a
+restored guest works as of any other, so a guest can move again.
+
+A restore runs these steps, in this order:
+
+1. **Refuse or go on.** It opens the bundle and checks it as
+   `checkpoint-verify` does. It then lists every reason this host cannot
+   resume it, and stops with all of them before it creates anything:
+   - a vCPU state that is partial or not whole;
+   - an interrupt controller or counter `kind` this backend has no import
+     for, or a missing GIC blob or capability;
+   - more vCPUs than the host's VMs take, or RAM that is not one region at
+     `0x40000000` in whole host pages;
+   - flags that do not match the devices: a disk missing, extra or of
+     another size, another network mode or MAC, an agent socket missing or
+     extra;
+   - every difference between the bundle's machine profile and this host's,
+     which it builds as a boot does. RAM, the vCPU count and the devicetree
+     digest come from the bundle, since the restore loads no kernel and
+     builds no devicetree: guest RAM holds both. `MIDR_EL1` is readable only
+     on a vCPU's thread, so vCPU 0 compares it as soon as it exists, before
+     anything is loaded.
+2. **The machine.** It creates the VM and its GIC as a boot does, maps RAM of
+   the bundle's size and copies the image in.
+3. **The devices.** It rebuilds virtio-blk over the reopened disk,
+   virtio-net over the network the flags give, virtio-vsock and the PL011,
+   each from its state. Each device's line level must be the one
+   `devices.json` recorded. It then ends the vsock connections, whose host
+   end stayed on the source: the guest sees each one reset. The agent
+   bridge, the control socket and the profile file are bound or created
+   before Seatbelt, as at boot. A `--net-gateway` that cannot be reached is
+   an error. A boot falls back to the stub stack instead, but the restored
+   guest already holds an address on the gateway's network.
+4. **Confinement.** Seatbelt goes on with the same rules as at boot. Every
+   file the restore reads is read before this, so a restore needs no allow a
+   boot does not have.
+5. **The vCPUs.** The I/O threads are held at the pause gate, and the vCPUs
+   by the control socket, before any thread starts. The vCPU threads create
+   their vCPUs in index order, as at boot: the framework numbers vCPUs as
+   they are created, and the GIC blob may hold per-vCPU state by that
+   number. Each one that ran parks at its first checkpoint. A secondary that
+   was off waits for its `CPU_ON`, and one that was `pending_on` starts from
+   a refilled mailbox. The control thread waits until every vCPU exists,
+   the ones that were off as well, and every one that ran or was
+   `pending_on` is parked. It then posts three import steps, and waits for
+   every vCPU between them:
+   - **A.** Each vCPU loads its registers, SIMD registers, system
+     registers and vtimer mask.
+   - **B.** vCPU 0 loads the GIC from the blob with `hv_gic_set_state`. All
+     vCPUs exist by now and none has run, as the framework requires.
+   - **C.** Each vCPU loads its ICC registers, which the blob does not hold.
+6. **The lines.** `hv_gic_set_state` sets the GIC's view of every line, so
+   each device line is driven again, to the device's level.
+7. **Restored-paused.** The I/O threads start, held at the gate, and the
+   control socket reports `restored-paused`. `resume` releases the vCPUs
+   and then the I/O threads.
+
+A failure after step 1 stops everything that started and exits 1 with the
+reason. Nothing is written to the bundle or the disk before the guest runs.
+
+### Timings
+
+Measured with `tools/checkpoint-e2e.sh` on an Apple M5 Pro running macOS
+26.7, with an ext4 disk, the stub network and an agent socket. Four runs of
+each, the range given. Each stat is defined in the script:
+
+| Guest | `pause_ms` | `capture_ms` | Bundle | Restore to restored-paused | Checkpoint request to resume reply |
+| --- | --- | --- | --- | --- | --- |
+| 2 vCPUs, 512 MiB | 2 to 3 | 251 to 341 | 92 to 95 MB | 347 to 393 ms | 606 to 743 ms |
+| 1 vCPU, 1024 MiB | 3 to 5 | 378 to 586 | 104 MB | 388 to 413 ms | 776 to 989 ms |
+
+The fence reply to the resume reply is the restore's time plus well under a
+millisecond: the script starts `hvi restore` as soon as the fence replies.
+
+The restore's time is mostly reading the bundle twice: `Bundle::open` hashes
+every component, and the copy of RAM hashes `ram.bin` again as it reads it.
+`resume` replies in under a millisecond.
+
 ## Clock policy
 
-The guest's counters (CNTVCT on arm64, the TSC and kvmclock on x86-64)
-continue from the captured value. Downtime is invisible to the guest's
-monotonic clock. A timer whose deadline passed during the downtime fires on
-the first entry after the restore. The guest's wall clock is behind by the
-downtime until the guest's own time sync corrects it. hull's `/urunc-epoch`
-only sets the boot time. QEMU behaves the same way by default, when it is run
-without `-rtc clock=host` for the monotonic counter.
+The guest's counter continues from the captured value. On HVF, the capture
+records `CNTVCT_EL0` as vCPU 0 sees it, `mach_absolute_time()` less its
+vtimer offset. A restore fixes one vtimer offset for every vCPU when the
+first vCPU is about to enter the guest after `resume`, so that `CNTVCT_EL0`
+goes on from `counter_at_capture`. Neither the time the guest was away nor
+the time it waited restored-paused shows on its counter. A secondary the
+guest brings up later gets the same offset. The policy is:
 
-Today's capture does not record the counter, so this is the policy a restore
-will follow, not one in effect yet. A `pause` alone does not stop guest time:
-the counter runs on through it.
+- **The monotonic clock continues.** `CLOCK_MONOTONIC` and the uptime go on
+  from the capture.
+- **Deadlines that passed fire.** A timer whose deadline passed while the
+  guest was away fires on the first entry after the restore.
+- **The wall clock is not corrected.** `CLOCK_REALTIME` goes on from the
+  captured time too, so the guest's clock is behind the host's by the time
+  it was away. Nothing corrects it until the guest's own time sync does:
+  hvi has no guest agent to set it, and hull's `/urunc-epoch` only sets the
+  boot time.
+
+QEMU behaves the same way by default, when it is run without `-rtc
+clock=host` for the monotonic counter. A `pause` alone does not stop guest
+time: the counter runs on through it. The KVM backends do not capture the
+counter yet.

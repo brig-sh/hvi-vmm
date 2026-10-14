@@ -77,6 +77,14 @@ bundle below its root from any thread, and a bundle holds the guest's RAM in
 clear. Give each hvi process a root of its own, mode 0700, and never share one
 between sandboxes.
 
+`hvi restore` enters the same profile, and reads the whole bundle before it
+does: the manifest and every document, and guest RAM, which it copies into the
+VM. The confined process opens no bundle file, so a restore needs no rule a
+boot does not have. The reader checks every count and size in the bundle
+before it allocates by it, and every hash before it uses a byte. A bundle is
+still a whole guest: its RAM and registers run as the guest. Restore only
+bundles from a source you would run that guest from.
+
 A writable export adds one more: `system-fsctl` for the single command
 `FSIOC_SYNC_VOLUME`, which is how SYNCFS writes out the export's volume
 (`sync_volume_np(3)`). It is a command filter, not a path filter, so the

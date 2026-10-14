@@ -13,11 +13,23 @@ Usage:
     tools/mk-initramfs.py [--out target/initramfs.cpio]
                           [--alpine-version 3.20.10] [--cache <dir>]
                           [--keep-alive SECS] [--net-static ADDR/PLEN,GW]
+                          [--checkpoint-workload]
 
 --keep-alive replaces the shell with a "HVI-INITRAMFS-UP" line, a sleep of
 SECS and a power-off, for an unattended run such as CI. --net-static replaces
 the eth0 block with a static address, a default route via GW and three pings
 of it, for a tap boot where GW is the host side of the tap. CI uses both.
+
+--checkpoint-workload starts the workload tools/checkpoint-e2e.sh checks a
+restore against before the shell: a loop that counts in a shell variable
+every 200 ms and prints the count with the guest's uptime (its monotonic
+clock, to 10 ms) and its wall clock (`date +%s`), holds a file
+open on fd 3 after unlinking it, and writes and syncs a file on an ext4
+/dev/vda when there is one. When /tmp/go appears (the script types `touch
+/tmp/go` on the console after the restore) the loop prints its count, reads
+fd 3 and the disk file, writes and syncs a second file, and times a sleep 5.
+Beside it, a CPU-bound awk at the lowest priority adds 0.25 to a double,
+checks it against its count, and prints both every 500000 additions.
 
 The tarball is fetched once and cached (default: alongside --out).
 """
@@ -61,6 +73,64 @@ fi
 KEEP_ALIVE_TAIL = b"""/bin/busybox echo "HVI-INITRAMFS-UP"
 /bin/busybox sleep %d
 /bin/busybox poweroff -f
+"""
+
+# The checkpoint workload (--checkpoint-workload), inserted before the shell.
+# Everything it checks lives in the loop's own process: the count in a shell
+# variable, and the unlinked file on fd 3, so only a guest that kept that
+# process's memory and descriptors can print them after a restore.
+#
+# The awk loop is there for the registers a shell that sleeps hardly uses.
+# It never sleeps, so at a capture it is most likely on a vCPU, with its
+# floating-point registers and its thread pointer (TPIDR_EL0, which musl
+# reads for every lock) live in that vCPU rather than saved by the guest
+# kernel. Its sums are exact in a double, so a value the restore changed
+# shows as an FP-BAD line, a count that does not go on, or no FP line at
+# all. It is a likely catch, not a certain one: the capture may find it
+# off the vCPU, or between uses of a register.
+CHECKPOINT_WORKLOAD = b"""# Checkpoint workload (--checkpoint-workload).
+/bin/busybox echo "HVI-WORKLOAD-BOOT"
+if [ -b /dev/vda ]; then
+	/bin/busybox mkdir -p /mnt
+	if /bin/busybox mount -t ext4 /dev/vda /mnt; then
+		/bin/busybox echo "written-before $(/bin/busybox cut -d' ' -f1 /proc/uptime)" > /mnt/before
+		/bin/busybox sync
+		/bin/busybox echo "DISK-READY $(/bin/busybox cat /mnt/before)"
+	fi
+fi
+/bin/busybox nice -n 19 /bin/busybox awk 'BEGIN {
+	x = 0
+	for (n = 1; ; n++) {
+		x += 0.25
+		if (x != n * 0.25) { printf "FP-BAD %d %.17g\\n", n, x; exit 1 }
+		if (n % 500000 == 0) { printf "FP %d %.17g\\n", n, x; fflush() }
+	}
+}' &
+(
+	/bin/busybox echo "kept open after unlink" > /tmp/unlinked
+	exec 3< /tmp/unlinked
+	/bin/busybox rm /tmp/unlinked
+	n=0
+	while true; do
+		n=$((n+1))
+		/bin/busybox echo "TICK $n $(/bin/busybox cut -d' ' -f1 /proc/uptime) $(/bin/busybox date +%s)"
+		if [ -e /tmp/go ]; then
+			/bin/busybox rm /tmp/go
+			/bin/busybox echo "COUNTER $n"
+			/bin/busybox echo "FD3 $(/bin/busybox cat <&3)"
+			if [ -e /mnt/before ]; then
+				/bin/busybox echo "DISK-BEFORE $(/bin/busybox cat /mnt/before)"
+				/bin/busybox echo "written-after $n" > /mnt/after
+				/bin/busybox sync
+				/bin/busybox echo "DISK-AFTER $(/bin/busybox cat /mnt/after)"
+			fi
+			/bin/busybox echo "SLEEP-START $(/bin/busybox cut -d' ' -f1 /proc/uptime)"
+			/bin/busybox sleep 5
+			/bin/busybox echo "SLEEP-END $(/bin/busybox cut -d' ' -f1 /proc/uptime)"
+		fi
+		/bin/busybox sleep 0.2
+	done
+) &
 """
 
 # Replacement eth0 block for a tap-mode boot (--net-static): a caller-chosen
@@ -128,7 +198,7 @@ class CpioWriter:
         return bytes(self.buf)
 
 
-def build(tar_bytes, keep_alive=None, net_static=None):
+def build(tar_bytes, keep_alive=None, net_static=None, workload=False):
     cpio = CpioWriter()
     seen_dirs = set()
 
@@ -168,6 +238,11 @@ def build(tar_bytes, keep_alive=None, net_static=None):
         end = init.index(b"fi\n", start) + len(b"fi\n")
         block = NET_STATIC % (addr.encode(), gw.encode(), gw.encode())
         init = init[:start] + block + init[end:]
+    if workload:
+        # Start the workload just before the interactive shell.
+        marker = b"# Interactive shell on the console"
+        head, tail = init.split(marker, 1)
+        init = head + CHECKPOINT_WORKLOAD + marker + tail
     if keep_alive is not None:
         # Replace everything from the interactive shell onwards.
         head = init.split(b"# Interactive shell on the console")[0]
@@ -195,6 +270,12 @@ def main():
         "ADDR/PLEN, route via GW, and ping GW a few times (for the CI tap "
         "boot, where GW is the host side of the tap)",
     )
+    ap.add_argument(
+        "--checkpoint-workload",
+        action="store_true",
+        help="start the workload tools/checkpoint-e2e.sh checks a restore "
+        "against before the shell",
+    )
     args = ap.parse_args()
 
     ver = args.alpine_version
@@ -217,7 +298,7 @@ def main():
 
         tar_bytes = gzip.decompress(f.read())
 
-    out = build(tar_bytes, args.keep_alive, args.net_static)
+    out = build(tar_bytes, args.keep_alive, args.net_static, args.checkpoint_workload)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(out)
