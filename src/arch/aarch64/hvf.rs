@@ -698,6 +698,7 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -
     p.agent_sock = cfg.agent_sock.is_some();
     p.fs_shares = u32::try_from(cfg.fs_shares.len()).unwrap_or(u32::MAX);
     p.set_disks(&cfg.disks);
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 
@@ -1092,7 +1093,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         0
     };
 
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
+    let disks = Disk::place(
+        block::open_boot_disks(&cfg.disks, cfg.disk_base_sha256.is_some(), None)?,
+        virtio_blk_base,
+    );
     // virtio-net: gateway relay (real egress) when a gateway socket is given,
     // else the built-in user-space stack. `net_reader` carries the gateway read
     // side to the RX reader thread, spawned once the shared state exists.

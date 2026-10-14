@@ -22,6 +22,12 @@
 //! The transport is modern virtio-mmio (version 2), enough for the Linux
 //! `virtio_mmio` and `virtio_blk` drivers to negotiate `VIRTIO_F_VERSION_1`,
 //! set up one queue, and read and write.
+//!
+//! The device also keeps the disk's dirty blocks for a move: a bitmap of
+//! the 64 KiB blocks the guest wrote since it booted, and one of the blocks
+//! it wrote since a mover last read them, see [`DirtyBlocks`] and
+//! [`VirtioBlk::read_dirty`]. A mover that holds the image the guest booted
+//! from then sends only those blocks.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -36,7 +42,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use crate::checkpoint::bundle::hex;
 use crate::config;
 use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
@@ -87,6 +95,219 @@ const SECTOR: u64 = 512;
 /// The [`BlkState`] format this build writes and reads. Version 2 added the
 /// disk's serial and its read-only flag.
 pub const BLK_STATE_VERSION: u32 = 2;
+
+/// The size of a block in the dirty bitmaps: 64 KiB, so a 16 GiB disk takes
+/// a 32 KiB bitmap and a block is 128 sectors.
+pub const DIRTY_BLOCK_BYTES: u64 = 64 << 10;
+
+/// The largest disk whose blocks written since boot a checkpoint records,
+/// 4 TiB. Its bitmap is 8 MiB, 11,184,812 characters of base64, which the
+/// 12 MiB limit on `disk.json` holds with room for the rest of the document.
+/// A disk with a base digest (`--disk-base-sha256`) must be no larger, so a
+/// move by its blocks always carries the bitmap on; a larger disk without
+/// one is checkpointed without it.
+pub const MAX_BITMAP_DISK_BYTES: u64 = 4 << 40;
+
+/// The most rounds [`VirtioBlk::read_dirty`] reads after a round 0, so the
+/// list of rounds a device keeps, and `disk.json` records, stays small. A
+/// move takes a handful; a mover that needs more starts over at round 0.
+pub const MAX_ROUNDS: usize = 1024;
+
+/// A bitmap of a disk's [`DIRTY_BLOCK_BYTES`] blocks.
+///
+/// Bit `i` is bit `i % 8` of byte `i / 8`, as in a checkpoint's `ram.map`,
+/// and block `i` covers bytes `i * 64 KiB` up to the next block or the end
+/// of the disk: the last block is short when the disk is not a whole number
+/// of blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirtyBlocks {
+    bits: Vec<u8>,
+    blocks: u64,
+}
+
+impl DirtyBlocks {
+    /// Returns an empty bitmap for a disk of `size_bytes`.
+    #[must_use]
+    pub fn for_size(size_bytes: u64) -> Self {
+        let blocks = size_bytes.div_ceil(DIRTY_BLOCK_BYTES);
+        Self {
+            bits: vec![0; Self::len_for(blocks)],
+            blocks,
+        }
+    }
+
+    /// Returns the length in bytes of the bitmap of `blocks` blocks.
+    #[must_use]
+    pub fn len_for(blocks: u64) -> usize {
+        // A disk of 2^64 bytes has 2^48 blocks, a 32 TiB bitmap: the length
+        // fits a usize on any host that could hold the bitmap.
+        usize::try_from(blocks.div_ceil(8)).unwrap_or(usize::MAX)
+    }
+
+    /// Takes `bits` as the bitmap of a disk of `size_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `bits` is not as long as the disk's bitmap, or sets a
+    /// bit past the disk's last block.
+    pub fn from_bytes(bits: Vec<u8>, size_bytes: u64) -> std::io::Result<Self> {
+        let blocks = size_bytes.div_ceil(DIRTY_BLOCK_BYTES);
+        let want = Self::len_for(blocks);
+        if bits.len() != want {
+            return Err(invalid(format_args!(
+                "the dirty bitmap is {} bytes, a disk of {size_bytes} bytes has {want}",
+                bits.len()
+            )));
+        }
+        let spare = (want as u64 * 8 - blocks) as u32;
+        if spare > 0 && bits.last().is_some_and(|b| b >> (8 - spare) != 0) {
+            return Err(invalid(format_args!(
+                "the dirty bitmap sets a block past the {blocks} blocks of the disk"
+            )));
+        }
+        Ok(Self { bits, blocks })
+    }
+
+    /// Returns the number of blocks the bitmap covers.
+    #[must_use]
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    /// Returns the bitmap's bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bits
+    }
+
+    /// Marks every block the `len` bytes at `offset` touch. Bytes past the
+    /// last block mark nothing.
+    pub fn mark(&mut self, offset: u64, len: u64) {
+        if len == 0 || self.blocks == 0 {
+            return;
+        }
+        let first = offset / DIRTY_BLOCK_BYTES;
+        let last = (offset.saturating_add(len - 1) / DIRTY_BLOCK_BYTES).min(self.blocks - 1);
+        for block in first..=last {
+            self.bits[(block / 8) as usize] |= 1 << (block % 8);
+        }
+    }
+
+    /// Returns whether block `block` is marked.
+    #[must_use]
+    pub fn is_set(&self, block: u64) -> bool {
+        block < self.blocks && self.bits[(block / 8) as usize] & (1 << (block % 8)) != 0
+    }
+
+    /// Returns the number of marked blocks.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        self.bits.iter().map(|b| u64::from(b.count_ones())).sum()
+    }
+
+    /// Returns the marked blocks in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.bits
+            .iter()
+            .enumerate()
+            .filter(|(_, &bits)| bits != 0)
+            .flat_map(|(byte, &bits)| {
+                (0..8u64)
+                    .filter(move |bit| bits & (1 << bit) != 0)
+                    .map(move |bit| byte as u64 * 8 + bit)
+            })
+    }
+
+    /// Returns the bitmap and leaves this one empty.
+    fn take(&mut self) -> Self {
+        let empty = vec![0; self.bits.len()];
+        Self {
+            bits: std::mem::replace(&mut self.bits, empty),
+            blocks: self.blocks,
+        }
+    }
+}
+
+/// Which dirty blocks [`VirtioBlk::read_dirty`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirtySince {
+    /// Every block the guest wrote since it booted, over every restore of
+    /// it. Reading them starts the rounds of a move: this is round 0.
+    Boot,
+    /// The blocks the guest wrote since the last read, which this read
+    /// clears: the next round.
+    Round,
+}
+
+/// One read of the dirty blocks, as `disk.json` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskRound {
+    /// The round's number: 0 for the blocks since boot, then 1, 2 and on.
+    pub round: u32,
+    /// The device's generation when the round was read. A write after it
+    /// is in a later round.
+    pub generation: u64,
+    /// The number of blocks the round holds.
+    pub blocks: u64,
+    /// The SHA-256 of the round's bitmap, the bytes `disk-dirty` returned
+    /// as `bitmap_b64`, as lowercase hex: a destination that hashes the
+    /// bitmap it applied shows it applied the set the source read.
+    #[serde(default)]
+    pub bitmap_sha256: Option<String>,
+    /// The digest of the round's `disk-blocks` stream, as its reply gives
+    /// it in `sent_sha256`, once `{"round":k}` sent the round whole before
+    /// the next read; `null` until then, and for a round streamed after
+    /// the capture.
+    #[serde(default)]
+    pub sent_sha256: Option<String>,
+}
+
+/// What [`VirtioBlk::read_dirty`] returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirtyRead {
+    /// The round this read is.
+    pub round: u32,
+    /// The device's generation when it was read.
+    pub generation: u64,
+    /// The blocks.
+    pub dirty: DirtyBlocks,
+    /// The SHA-256 of the bitmap's bytes, as lowercase hex.
+    pub bitmap_sha256: String,
+}
+
+/// The dirty blocks a virtio-blk device keeps for a move.
+///
+/// Neither bitmap is part of the guest's view of the device, so a reset
+/// leaves them: a guest that reboots keeps the disk it wrote.
+#[derive(Debug)]
+struct Dirty {
+    /// Every block written since the guest booted.
+    since_boot: DirtyBlocks,
+    /// Every block written since the last read.
+    since_read: DirtyBlocks,
+    /// The reads since round 0, in order.
+    rounds: Vec<DiskRound>,
+    /// The blocks the last read returned, which `disk-blocks` may export by
+    /// its round number.
+    last: Option<DirtyBlocks>,
+}
+
+impl Dirty {
+    fn new(size_bytes: u64) -> Self {
+        Self {
+            since_boot: DirtyBlocks::for_size(size_bytes),
+            since_read: DirtyBlocks::for_size(size_bytes),
+            rounds: Vec::new(),
+            last: None,
+        }
+    }
+
+    fn mark(&mut self, offset: u64, len: u64) {
+        self.since_boot.mark(offset, len);
+        self.since_read.mark(offset, len);
+    }
+}
 
 /// What a checkpoint keeps of a virtio-blk device.
 ///
@@ -178,6 +399,8 @@ pub struct VirtioBlk {
     /// whether the guest changed the disk between them without reading the
     /// image, and a restore carries it on, so it only grows across moves.
     generation: u64,
+    /// The blocks the guest wrote, for a move.
+    dirty: Dirty,
 }
 
 /// Size in bytes of whatever is behind `file`.
@@ -415,7 +638,61 @@ impl VirtioBlk {
             serial_text: Arc::from(serial),
             trace: std::env::var_os("HVI_BLK_TRACE").is_some(),
             generation: 0,
+            dirty: Dirty::new(capacity_sectors * SECTOR),
         })
+    }
+
+    /// Opens `path` as [`open`](Self::open) does, and gives it the base of
+    /// [`take_base`](Self::take_base).
+    ///
+    /// # Errors
+    ///
+    /// Errors as [`open`](Self::open) and [`take_base`](Self::take_base) do.
+    #[cfg(test)]
+    pub(crate) fn open_with_base(
+        path: &str,
+        has_base: bool,
+        written: Option<&[u8]>,
+    ) -> std::io::Result<Self> {
+        let mut dev = Self::open(path)?;
+        dev.take_base(path, has_base, written)?;
+        Ok(dev)
+    }
+
+    /// Takes what a boot was told of the disk at `path`, this device's: that
+    /// it was given the digest of the disk's base image when `has_base`, and,
+    /// with `written`, the bitmap of the blocks where the disk already differs
+    /// from that base, which start the blocks written since boot.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `has_base` and the disk is larger than
+    /// [`MAX_BITMAP_DISK_BYTES`]: a checkpoint could not record the blocks it
+    /// wrote since boot, which a move by its blocks needs. Errors too when
+    /// `written` is not the bitmap of this disk.
+    pub fn take_base(
+        &mut self,
+        path: &str,
+        has_base: bool,
+        written: Option<&[u8]>,
+    ) -> std::io::Result<()> {
+        if has_base && self.size_bytes() > MAX_BITMAP_DISK_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "--disk-base-sha256: {path} is {} bytes, and a move by its blocks takes a \
+                     disk of at most 4 TiB",
+                    self.size_bytes()
+                ),
+            ));
+        }
+        if let Some(bits) = written {
+            self.dirty.since_boot = DirtyBlocks::from_bytes(bits.to_vec(), self.size_bytes())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("--disk-written for {path}: {e}"))
+                })?;
+        }
+        Ok(())
     }
 
     /// Releases the disk's lock, so another hvi may open the disk while
@@ -483,6 +760,126 @@ impl VirtioBlk {
         self.capacity_sectors * SECTOR
     }
 
+    /// Returns the blocks the guest wrote since it booted, over every
+    /// restore of it.
+    #[must_use]
+    pub fn dirty_since_boot(&self) -> &DirtyBlocks {
+        &self.dirty.since_boot
+    }
+
+    /// Returns the rounds read since the last round 0, in order.
+    #[must_use]
+    pub fn rounds(&self) -> &[DiskRound] {
+        &self.dirty.rounds
+    }
+
+    /// Returns the number of the last round read and the blocks it
+    /// returned.
+    #[must_use]
+    pub fn last_round(&self) -> Option<(u32, &DirtyBlocks)> {
+        let round = self.dirty.rounds.last()?.round;
+        Some((round, self.dirty.last.as_ref()?))
+    }
+
+    /// Reads the dirty blocks `since` asks for, and starts a round.
+    ///
+    /// [`DirtySince::Boot`] returns every block written since boot, clears
+    /// the blocks written since the last read, and starts the rounds over
+    /// at round 0. [`DirtySince::Round`] returns the blocks written since the
+    /// last read and clears them: the next round. Either way a write the
+    /// guest makes after this call is in the next round, since the guest
+    /// writes under the same lock the caller holds.
+    ///
+    /// # Errors
+    ///
+    /// Errors when a round is asked for before round 0, or past the
+    /// [`MAX_ROUNDS`]th after it.
+    pub fn read_dirty(&mut self, since: DirtySince) -> std::io::Result<DirtyRead> {
+        let (round, dirty) = match since {
+            DirtySince::Boot => {
+                self.dirty.rounds.clear();
+                self.dirty.since_read.take();
+                (0, self.dirty.since_boot.clone())
+            }
+            DirtySince::Round => {
+                let Some(last) = self.dirty.rounds.last() else {
+                    return Err(invalid(format_args!(
+                        "no round 0 yet: read the blocks since boot first"
+                    )));
+                };
+                if self.dirty.rounds.len() > MAX_ROUNDS {
+                    return Err(invalid(format_args!(
+                        "{MAX_ROUNDS} rounds were read after round 0: read the blocks since \
+                         boot to start over"
+                    )));
+                }
+                let round = last.round + 1;
+                (round, self.dirty.since_read.take())
+            }
+        };
+        let bitmap_sha256 = hex(&Sha256::digest(dirty.as_bytes()));
+        self.dirty.rounds.push(DiskRound {
+            round,
+            generation: self.generation,
+            blocks: dirty.count(),
+            bitmap_sha256: Some(bitmap_sha256.clone()),
+            sent_sha256: None,
+        });
+        self.dirty.last = Some(dirty.clone());
+        Ok(DirtyRead {
+            round,
+            generation: self.generation,
+            dirty,
+            bitmap_sha256,
+        })
+    }
+
+    /// Records that `disk-blocks` sent round `round` whole, with the stream
+    /// digest `sent_sha256`, when it is still the last round read. Returns
+    /// whether it was.
+    pub fn record_sent(&mut self, round: u32, sent_sha256: String) -> bool {
+        match self.dirty.rounds.last_mut() {
+            Some(last) if last.round == round => {
+                last.sent_sha256 = Some(sent_sha256);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the length of block `block` of the disk: [`DIRTY_BLOCK_BYTES`],
+    /// or less for the last block of a disk that is not a whole number of
+    /// blocks. `None` for a block past the disk.
+    #[must_use]
+    pub fn block_len(&self, block: u64) -> Option<u64> {
+        let size = self.size_bytes();
+        let start = block.checked_mul(DIRTY_BLOCK_BYTES)?;
+        (start < size).then(|| (size - start).min(DIRTY_BLOCK_BYTES))
+    }
+
+    /// Reads block `block` of the disk into `out`, which must be
+    /// [`block_len`](Self::block_len) bytes long.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the block is past the disk, `out` is not its length, or
+    /// the read fails.
+    pub fn read_block(&self, block: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let len = self.block_len(block).ok_or_else(|| {
+            invalid(format_args!(
+                "block {block} is past the {} blocks of the disk",
+                self.dirty.since_boot.blocks()
+            ))
+        })?;
+        if out.len() as u64 != len {
+            return Err(invalid(format_args!(
+                "block {block} is {len} bytes, not {}",
+                out.len()
+            )));
+        }
+        self.file.read_exact_at(out, block * DIRTY_BLOCK_BYTES)
+    }
+
     /// Writes the disk's data to stable storage, as a guest flush does.
     ///
     /// A checkpoint calls it with the guest parked, so the image another host
@@ -516,7 +913,10 @@ impl VirtioBlk {
     /// Rebuilds the device a checkpoint describes over the disk at `path`,
     /// opened as [`VirtioBlk::open_as`] opens it with the state's mode and
     /// serial, and the restored guest RAM `mem`. Its generation goes on from
-    /// `generation`, the one the checkpoint's `disk.json` records.
+    /// `generation`, the one the checkpoint's `disk.json` records, and its
+    /// blocks written since boot from `since_boot`, the ones `disk.json`
+    /// records, so a later move still sends every block that differs from the
+    /// image the guest booted from. Its rounds start over.
     ///
     /// The disk must be the size the guest was told. A guest's filesystem
     /// sized itself to that capacity at mount, so a smaller disk fails its
@@ -528,14 +928,16 @@ impl VirtioBlk {
     /// # Errors
     ///
     /// Errors when the disk cannot be opened, when its size is not
-    /// `capacity_sectors`, or when the state is of another version, has a
-    /// queue the transport would not have accepted, or has registers this
-    /// device never holds.
+    /// `capacity_sectors`, when `since_boot` is the bitmap of a disk of
+    /// another size, or when the state is of another version, has a queue
+    /// the transport would not have accepted, or has registers this device
+    /// never holds.
     pub fn restore(
         path: &str,
         mem: &GuestRam,
         state: &BlkState,
         generation: u64,
+        since_boot: Option<DirtyBlocks>,
     ) -> std::io::Result<Self> {
         state.check(mem)?;
         let queue = Queue::from_state(mem, &state.queue)?;
@@ -552,6 +954,16 @@ impl VirtioBlk {
         dev.status = state.common.status;
         dev.dev_feat_sel = state.common.dev_feat_sel;
         dev.interrupt_status = state.common.interrupt_status;
+        if let Some(since_boot) = since_boot {
+            if since_boot.blocks() != dev.dirty.since_boot.blocks() {
+                return Err(invalid(format_args!(
+                    "virtio-blk: the dirty bitmap covers {} blocks, {path} has {}",
+                    since_boot.blocks(),
+                    dev.dirty.since_boot.blocks()
+                )));
+            }
+            dev.dirty.since_boot = since_boot;
+        }
         dev.queue = queue;
         dev.generation = generation;
         Ok(dev)
@@ -755,6 +1167,26 @@ impl VirtioBlk {
         Ok(base)
     }
 
+    /// Writes `buf` at byte `base` of the disk, as a guest write does, once
+    /// [`byte_range`](Self::byte_range) has checked the range.
+    ///
+    /// The blocks are marked before the write, so a write that fails part
+    /// way is still in the next round: the blocks may hold some of it.
+    fn write_at(&mut self, base: u64, buf: &[u8]) -> std::io::Result<()> {
+        self.dirty.mark(base, buf.len() as u64);
+        self.file.write_all_at(buf, base)?;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Writes `buf` at byte `base` as a guest write would, for a test that
+    /// has no queue to post one on.
+    #[cfg(test)]
+    pub(crate) fn write_for_test(&mut self, base: u64, buf: &[u8]) {
+        self.byte_range(base / SECTOR, buf.len() as u64).unwrap();
+        self.write_at(base, buf).unwrap();
+    }
+
     /// Runs a single virtio-blk request. The first readable segment is the
     /// 16-byte header (type, _, sector); the last writable segment is the
     /// status byte; the segments between carry data.
@@ -803,9 +1235,8 @@ impl VirtioBlk {
                     mem.read(a, &mut buf[o..o + l as usize]).map_err(other)?;
                     o += l as usize;
                 }
-                self.file.write_all_at(&buf, base).map_err(other)?;
+                self.write_at(base, &buf).map_err(other)?;
                 data_bytes = total as u64;
-                self.generation += 1;
                 VIRTIO_BLK_S_OK
             }
             VIRTIO_BLK_T_FLUSH => {
@@ -911,6 +1342,31 @@ pub fn open_disks(disks: &[config::DiskConfig]) -> Result<Vec<Arc<Mutex<VirtioBl
         opened.push((Arc::new(Mutex::new(blk)), id));
     }
     Ok(opened.into_iter().map(|(blk, _)| blk).collect())
+}
+
+/// Opens the disks of a boot as [`open_disks`] does, and gives disk 0 the base
+/// the boot named, as [`VirtioBlk::take_base`] takes it: `has_base` when it was
+/// given `--disk-base-sha256`, and `written` from `--disk-written`.
+///
+/// `BootConfig::validate` refuses a base without exactly one writable disk, so
+/// disk 0 is the guest's only disk whenever there is a base.
+///
+/// # Errors
+///
+/// Errors as [`open_disks`] and [`VirtioBlk::take_base`] do.
+pub fn open_boot_disks(
+    disks: &[config::DiskConfig],
+    has_base: bool,
+    written: Option<&[u8]>,
+) -> Result<Vec<Arc<Mutex<VirtioBlk>>>, String> {
+    let opened = open_disks(disks)?;
+    if let (Some(dev), Some(disk)) = (opened.first(), disks.first()) {
+        dev.lock()
+            .unwrap()
+            .take_base(&disk.path, has_base, written)
+            .map_err(|e| format!("virtio-blk disk 0 ({}): {e}", disk.path))?;
+    }
+    Ok(opened)
 }
 
 /// Writes `src` across the guest segments `segs`, each up to its length, and
@@ -1841,7 +2297,7 @@ mod state_tests {
         assert_eq!(back, state);
         // As a fenced source does, so the restore can take the disk.
         assert!(blk.release_lock());
-        let mut restored = VirtioBlk::restore(disk.path(), &mem, &back, 1046).unwrap();
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &back, 1046, None).unwrap();
         assert_eq!(restored.state(), state);
 
         // The restored device carries on where the first left off: the next
@@ -1875,7 +2331,7 @@ mod state_tests {
         let pending = blk.state();
         drop(blk);
 
-        let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending, 0).unwrap();
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &pending, 0, None).unwrap();
         let line = Arc::new(LevelLine::default());
         restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         assert!(line.is_high(), "the pending interrupt is asserted");
@@ -1889,7 +2345,7 @@ mod state_tests {
             ..pending
         };
         drop(restored);
-        let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet, 0).unwrap();
+        let mut restored = VirtioBlk::restore(disk.path(), &mem, &quiet, 0, None).unwrap();
         let line = Arc::new(LevelLine::default());
         restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         assert_eq!(line.sets(), 0, "a line with nothing pending is not set");
@@ -1912,7 +2368,7 @@ mod state_tests {
             "{err}"
         );
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let err = VirtioBlk::restore(disk.path(), &mem, &first.state(), 0)
+        let err = VirtioBlk::restore(disk.path(), &mem, &first.state(), 0, None)
             .err()
             .expect("a restore opened a locked disk");
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
@@ -1932,7 +2388,7 @@ mod state_tests {
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut blk = VirtioBlk::open(disk.path()).unwrap();
         served_one_read(&mut blk, &mem);
-        let err = VirtioBlk::restore(other.path(), &mem, &blk.state(), 0)
+        let err = VirtioBlk::restore(other.path(), &mem, &blk.state(), 0, None)
             .err()
             .expect("a 3-sector disk is not the 2-sector one the guest has");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1946,7 +2402,7 @@ mod state_tests {
         let mut blk = VirtioBlk::open(disk.path()).unwrap();
         served_one_read(&mut blk, &mem);
         let smaller = GuestRam::from_ranges(&[(BASE, 0x2000)]);
-        let err = VirtioBlk::restore(disk.path(), &smaller, &blk.state(), 0).err();
+        let err = VirtioBlk::restore(disk.path(), &smaller, &blk.state(), 0, None).err();
         assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
     }
 
@@ -1981,12 +2437,322 @@ mod state_tests {
             },
         ];
         for state in bad {
-            let err = VirtioBlk::restore(disk.path(), &mem, &state, 0).err();
+            let err = VirtioBlk::restore(disk.path(), &mem, &state, 0, None).err();
             assert_eq!(
                 err.map(|e| e.kind()),
                 Some(std::io::ErrorKind::InvalidData),
                 "{state:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    const BASE: u64 = 0x4000_0000;
+    /// Three whole blocks and one sector: the last block is short.
+    const SIZE: u64 = 3 * DIRTY_BLOCK_BYTES + 512;
+    /// virtio-blk `VIRTIO_BLK_T_DISCARD`, which the device does not offer.
+    const T_DISCARD: u32 = 11;
+
+    /// A disk of [`SIZE`] bytes, each byte its offset's low byte, removed on
+    /// drop.
+    struct Disk(std::path::PathBuf);
+
+    impl Disk {
+        fn new(tag: &str) -> Disk {
+            let path = std::env::temp_dir()
+                .join(format!("hvi-blk-dirty-{tag}-{}.img", std::process::id()));
+            let bytes: Vec<u8> = (0..SIZE).map(|i| i as u8).collect();
+            std::fs::write(&path, bytes).unwrap();
+            Disk(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Submits one request of `typ` at `sector` with 16 bytes of 0xee and
+    /// returns the status byte.
+    fn submit(blk: &mut VirtioBlk, mem: &GuestRam, typ: u32, sector: u64) -> u8 {
+        let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
+        let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
+        mem.write_u32(hdr, typ).unwrap();
+        mem.write_u64(hdr + 8, sector).unwrap();
+        mem.write(data, &[0xee; 16]).unwrap();
+        mem.write_u8(status, 0xff).unwrap();
+        let data_flag = if typ == VIRTIO_BLK_T_IN {
+            VIRTQ_DESC_F_WRITE
+        } else {
+            0
+        };
+        for (i, (addr, len, flags)) in [
+            (hdr, 16, VIRTQ_DESC_F_NEXT),
+            (data, 16, VIRTQ_DESC_F_NEXT | data_flag),
+            (status, 1, VIRTQ_DESC_F_WRITE),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let d = desc + i as u64 * 16;
+            mem.write_u64(d, addr).unwrap();
+            mem.write_u32(d + 8, len).unwrap();
+            mem.write_u16(d + 12, flags).unwrap();
+            mem.write_u16(d + 14, i as u16 + 1).unwrap();
+        }
+        let idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, 0)
+            .unwrap();
+        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        if !blk.queue.is_ready() {
+            blk.mmio(mem, mmio::QUEUE_NUM, true, 8);
+            blk.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc);
+            blk.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail);
+            blk.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used);
+            blk.mmio(mem, mmio::QUEUE_READY, true, 1);
+        }
+        blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
+        mem.read_u16(status).unwrap() as u8
+    }
+
+    fn set(dirty: &DirtyBlocks) -> Vec<u64> {
+        dirty.iter().collect()
+    }
+
+    /// The first sector of block `block`.
+    fn sector(block: u64) -> u64 {
+        block * DIRTY_BLOCK_BYTES / SECTOR
+    }
+
+    // Bit i is bit i % 8 of byte i / 8, as in ram.map: hull decodes both
+    // with one function.
+    #[test]
+    fn the_bitmap_marks_every_block_a_range_touches_in_ram_map_order() {
+        let mut d = DirtyBlocks::for_size(20 * DIRTY_BLOCK_BYTES - 1);
+        assert_eq!(d.blocks(), 20);
+        assert_eq!(d.as_bytes().len(), 3);
+        d.mark(9 * DIRTY_BLOCK_BYTES, 1);
+        assert_eq!(d.as_bytes(), &[0, 0b10, 0]);
+        d.mark(DIRTY_BLOCK_BYTES - 1, 2);
+        assert_eq!(set(&d), [0, 1, 9]);
+        d.mark(5 * DIRTY_BLOCK_BYTES, 0);
+        assert_eq!(d.count(), 3);
+        // A range that runs past the disk marks up to its last block, and
+        // one that starts past it marks nothing.
+        d.mark(19 * DIRTY_BLOCK_BYTES, 4 * DIRTY_BLOCK_BYTES);
+        d.mark(40 * DIRTY_BLOCK_BYTES, 1);
+        d.mark(u64::MAX - 1, 10);
+        assert_eq!(set(&d), [0, 1, 9, 19]);
+        assert!(d.is_set(19) && !d.is_set(20) && !d.is_set(u64::MAX));
+    }
+
+    #[test]
+    fn a_bitmap_of_another_disk_is_refused() {
+        let ok = DirtyBlocks::from_bytes(vec![0b1000_0001, 0b0000_0100], 11 * DIRTY_BLOCK_BYTES)
+            .unwrap();
+        assert_eq!(set(&ok), [0, 7, 10]);
+        let short = DirtyBlocks::from_bytes(vec![0], 11 * DIRTY_BLOCK_BYTES).unwrap_err();
+        assert!(short.to_string().contains("is 1 bytes"), "{short}");
+        let past =
+            DirtyBlocks::from_bytes(vec![0, 0b0000_1000], 11 * DIRTY_BLOCK_BYTES).unwrap_err();
+        assert!(past.to_string().contains("past the 11 blocks"), "{past}");
+        assert!(DirtyBlocks::from_bytes(Vec::new(), 0).is_ok());
+    }
+
+    // Only a write changes the disk. A read, a flush, a refused write and a
+    // discard the device never offered leave both bitmaps alone; the flush
+    // still moves the generation.
+    #[test]
+    fn writes_mark_the_bitmaps_and_nothing_else_does() {
+        let disk = Disk::new("marks");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        assert_eq!(blk.dirty_since_boot().blocks(), 4);
+
+        assert_eq!(submit(&mut blk, &mem, VIRTIO_BLK_T_IN, sector(1)), 0);
+        assert_eq!(submit(&mut blk, &mem, VIRTIO_BLK_T_FLUSH, 0), 0);
+        assert_eq!(blk.generation(), 1);
+        assert_eq!(blk.dirty_since_boot().count(), 0);
+        assert_eq!(
+            submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, SIZE / SECTOR),
+            VIRTIO_BLK_S_IOERR
+        );
+        let before = std::fs::read(disk.path()).unwrap();
+        assert_eq!(submit(&mut blk, &mem, T_DISCARD, sector(2)), 0);
+        assert_eq!(std::fs::read(disk.path()).unwrap(), before);
+        assert_eq!(blk.dirty_since_boot().count(), 0);
+
+        // The last sector of block 0 and the short last block.
+        assert_eq!(submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, sector(1) - 1), 0);
+        assert_eq!(submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, sector(3)), 0);
+        assert_eq!(set(blk.dirty_since_boot()), [0, 3]);
+        assert_eq!(blk.generation(), 3);
+
+        // A reset, as a guest reboot makes, keeps the disk and the bitmaps.
+        blk.mmio(&mem, mmio::STATUS, true, 0);
+        assert_eq!(set(blk.dirty_since_boot()), [0, 3]);
+        assert_eq!(
+            set(&blk.read_dirty(DirtySince::Boot).unwrap().dirty),
+            [0, 3]
+        );
+    }
+
+    // Round 0 is every block since boot; each later round is what was
+    // written since the read before, which the read clears.
+    #[test]
+    fn each_round_holds_the_writes_since_the_read_before() {
+        let disk = Disk::new("rounds");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        let err = blk.read_dirty(DirtySince::Round).unwrap_err();
+        assert!(err.to_string().contains("no round 0"), "{err}");
+        assert!(blk.rounds().is_empty());
+
+        submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, sector(2));
+        let r0 = blk.read_dirty(DirtySince::Boot).unwrap();
+        assert_eq!((r0.round, r0.generation, set(&r0.dirty)), (0, 1, vec![2]));
+
+        submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, sector(1));
+        submit(&mut blk, &mem, VIRTIO_BLK_T_FLUSH, 0);
+        let r1 = blk.read_dirty(DirtySince::Round).unwrap();
+        assert_eq!((r1.round, r1.generation, set(&r1.dirty)), (1, 3, vec![1]));
+        assert_eq!(
+            blk.last_round().map(|(n, d)| (n, set(d))),
+            Some((1, vec![1]))
+        );
+
+        let r2 = blk.read_dirty(DirtySince::Round).unwrap();
+        assert_eq!((r2.round, r2.dirty.count()), (2, 0));
+        assert_eq!(set(blk.dirty_since_boot()), [1, 2]);
+        let listed: Vec<(u32, u64, u64)> = blk
+            .rounds()
+            .iter()
+            .map(|r| (r.round, r.generation, r.blocks))
+            .collect();
+        assert_eq!(listed, [(0, 1, 1), (1, 3, 1), (2, 3, 0)]);
+        // Each round records its bitmap's digest, and is sent once a
+        // disk-blocks of it says so, only while it is the last round.
+        for (listed, read) in blk.rounds().iter().zip([&r0, &r1, &r2]) {
+            let want = hex(&Sha256::digest(read.dirty.as_bytes()));
+            assert_eq!(read.bitmap_sha256, want);
+            assert_eq!(listed.bitmap_sha256.as_ref(), Some(&want));
+            assert_eq!(listed.sent_sha256, None);
+        }
+        assert!(!blk.record_sent(1, "11".repeat(32)));
+        assert!(blk.record_sent(2, "22".repeat(32)));
+        assert_eq!(blk.rounds()[2].sent_sha256, Some("22".repeat(32)));
+        assert_eq!(blk.rounds()[1].sent_sha256, None);
+
+        // Reading since boot again starts the rounds over, and clears the
+        // writes since the last read: round 0 already holds them.
+        submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 0);
+        let again = blk.read_dirty(DirtySince::Boot).unwrap();
+        assert_eq!((again.round, set(&again.dirty)), (0, vec![0, 1, 2]));
+        assert_eq!(blk.rounds().len(), 1);
+        assert_eq!(blk.read_dirty(DirtySince::Round).unwrap().dirty.count(), 0);
+    }
+
+    #[test]
+    fn blocks_read_back_as_the_disk_holds_them_and_the_last_is_short() {
+        let disk = Disk::new("read");
+        let blk = VirtioBlk::open(disk.path()).unwrap();
+        let image = std::fs::read(disk.path()).unwrap();
+        assert_eq!(blk.block_len(0), Some(DIRTY_BLOCK_BYTES));
+        assert_eq!(blk.block_len(3), Some(512));
+        assert_eq!(blk.block_len(4), None);
+        assert_eq!(blk.block_len(u64::MAX), None);
+        let mut out = vec![0u8; 512];
+        blk.read_block(3, &mut out).unwrap();
+        assert_eq!(out, image[3 * DIRTY_BLOCK_BYTES as usize..]);
+        let mut out = vec![0u8; DIRTY_BLOCK_BYTES as usize];
+        blk.read_block(1, &mut out).unwrap();
+        assert_eq!(
+            out,
+            image[DIRTY_BLOCK_BYTES as usize..2 * DIRTY_BLOCK_BYTES as usize]
+        );
+        let past = blk.read_block(4, &mut out).unwrap_err();
+        assert!(past.to_string().contains("past the 4 blocks"), "{past}");
+        assert!(
+            blk.read_block(3, &mut out).is_err(),
+            "a buffer of another length"
+        );
+    }
+
+    // A restored device goes on from the blocks the source wrote since boot,
+    // so the next move still sends every block that differs from the image
+    // the guest booted from.
+    #[test]
+    fn a_restore_carries_the_blocks_written_since_boot() {
+        let disk = Disk::new("seed");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, sector(1));
+        blk.read_dirty(DirtySince::Boot).unwrap();
+        let (state, since_boot) = (blk.state(), blk.dirty_since_boot().clone());
+        assert!(blk.release_lock());
+        drop(blk);
+
+        let mut restored =
+            VirtioBlk::restore(disk.path(), &mem, &state, 1, Some(since_boot)).unwrap();
+        assert!(restored.rounds().is_empty());
+        submit(&mut restored, &mem, VIRTIO_BLK_T_OUT, sector(3));
+        assert_eq!(set(restored.dirty_since_boot()), [1, 3]);
+        let r0 = restored.read_dirty(DirtySince::Boot).unwrap();
+        assert_eq!((r0.generation, set(&r0.dirty)), (2, vec![1, 3]));
+        assert!(restored.release_lock());
+        drop(restored);
+
+        let other = DirtyBlocks::for_size(SIZE + DIRTY_BLOCK_BYTES);
+        let err = VirtioBlk::restore(disk.path(), &mem, &state, 1, Some(other))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("covers 5 blocks"), "{err}");
+    }
+
+    // A mover that keeps reading rounds cannot grow the list without
+    // bound: past the cap it starts over at round 0.
+    #[test]
+    fn rounds_stop_at_the_cap_until_round_0_is_read_again() {
+        let disk = Disk::new("cap");
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        blk.read_dirty(DirtySince::Boot).unwrap();
+        for want in 1..=MAX_ROUNDS as u32 {
+            assert_eq!(blk.read_dirty(DirtySince::Round).unwrap().round, want);
+        }
+        let err = blk.read_dirty(DirtySince::Round).unwrap_err();
+        assert!(err.to_string().contains("start over"), "{err}");
+        assert_eq!(blk.rounds().len(), MAX_ROUNDS + 1);
+        assert_eq!(blk.read_dirty(DirtySince::Boot).unwrap().round, 0);
+        assert_eq!(blk.read_dirty(DirtySince::Round).unwrap().round, 1);
+    }
+
+    // A disk with a base must be one whose bitmap a checkpoint can hold.
+    #[test]
+    fn a_disk_over_4_tib_takes_no_base() {
+        let path = std::env::temp_dir().join(format!("hvi-blk-4tib-{}.img", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let sized = |len: u64| {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(len).unwrap();
+        };
+        sized(MAX_BITMAP_DISK_BYTES);
+        let blk = VirtioBlk::open_with_base(&path, true, None).unwrap();
+        assert_eq!(blk.dirty_since_boot().blocks(), 1 << 26);
+        drop(blk);
+        sized(MAX_BITMAP_DISK_BYTES + DIRTY_BLOCK_BYTES);
+        let err = VirtioBlk::open_with_base(&path, true, None).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("at most 4 TiB"), "{err}");
+        assert!(VirtioBlk::open_with_base(&path, false, None).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 }

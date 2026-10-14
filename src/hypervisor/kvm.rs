@@ -637,6 +637,7 @@ mod stop_tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disks: Vec::new(),
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,
