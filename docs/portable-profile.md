@@ -845,7 +845,7 @@ on the Mac and 849 on the Pi, checkpoint request to resume reply 917 ms and
 1817 ms, the `timerfd` 6.000049 s and 6.000048 s.
 
 **Moves with 2 vCPUs.** On 2026-10-14 the same script moved a 2-vCPU
-guest from this Mac to rp1 (a Pi 5, KVM, Linux 6.12.25) and back, with
+guest from this Mac to rp1 (a Pi 5 Model B, KVM) and back, with
 hvi at `a586ec7` built on each host, the current Image `e85e4338…`, the
 same initramfs, `--cpus 2 --drift-secs 60`, over the LAN. Each way passed
 all 41 checks, `migrations=1` among them:
@@ -861,9 +861,28 @@ all 41 checks, `migrations=1` among them:
 | `CLOCK_REALTIME` less the host's, first 10 s: median, worst | 0.63 ms, 3.69 ms | 0.19 ms, 0.33 ms |
 | The same after 70 s | 0.31 ms | 0.28 ms |
 
-The commands are the ones above with `--dst rp1` or `--src rp1`, `--cpus 2`
-and `--drift-secs 60`. `--negative` was not run with 2 vCPUs: its altered
-bundle sets the vCPU count to 2, which is then no change.
+rp1 runs Linux `6.12.25+rpt-rpi-2712`; Tailscale had a direct LAN path to
+it, 5 ms round trip. With `$S` the Mac's work directory and `/home/pmoust/h6fix`
+rp1's:
+
+```sh
+# Mac to Pi
+tools/migrate-e2e.sh --src local --dst rp1 \
+    --src-hvi $S/hvi-mac --dst-hvi /home/pmoust/h6fix/hvi-pi \
+    --kernel $S/Image --initramfs $S/initramfs-migrate.cpio \
+    --src-dir $S/m2p/src --dst-dir /home/pmoust/h6fix/m2p --out $S/m2p/out \
+    --cpus 2 --drift-secs 60
+# Pi to Mac
+tools/migrate-e2e.sh --src rp1 --dst local \
+    --src-hvi /home/pmoust/h6fix/hvi-pi --dst-hvi $S/hvi-mac \
+    --kernel /home/pmoust/h6fix/Image \
+    --initramfs /home/pmoust/h6fix/initramfs-migrate.cpio \
+    --src-dir /home/pmoust/h6fix/p2m --dst-dir $S/p2m/dst --out $S/p2m/out \
+    --cpus 2 --drift-secs 60
+```
+
+`--negative` was not run with 2 vCPUs: its altered bundle sets the vCPU
+count to 2, which is then no change.
 
 **A Mac that sleeps stops the guest's clocks.** An earlier Pi to Mac run
 went through a clamshell sleep and two maintenance sleeps of the Mac
