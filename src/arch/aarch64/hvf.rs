@@ -1962,7 +1962,8 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                     }
                     (Irqchip::Soft(p), Some(device)) => {
                         read_platform |= matches!(work, Work::ExportPlatform);
-                        hvf_state::serve_portable(cpu_id, &vcpu, &p.gic, device, work)
+                        let pending = sh.restoring.as_ref().and_then(|r| r.hvitime.as_ref());
+                        hvf_state::serve_portable(cpu_id, &vcpu, &p.gic, device, pending, work)
                     }
                     (Irqchip::Soft(_), None) => {
                         Err(std::io::Error::other("the portable guest has no hvi-time"))

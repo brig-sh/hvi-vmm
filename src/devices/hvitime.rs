@@ -278,6 +278,16 @@ pub struct HviTimeState {
 }
 
 impl HviTimeState {
+    /// Returns each vCPU's line level as the state has it: high while its
+    /// timer is enabled and its `STATUS` is not 0.
+    #[must_use]
+    pub fn lines(&self) -> Vec<bool> {
+        self.cpus
+            .iter()
+            .map(|c| c.ctrl & CTRL_ENABLE != 0 && c.status != 0)
+            .collect()
+    }
+
     /// Returns the value the guest's counter must start from on a host
     /// whose counter runs at `freq_hz`, so that a guest that reads the raw
     /// counter never sees it go back: `counter_at_capture` scaled from the
@@ -937,6 +947,13 @@ impl PendingPublish {
             state,
             done: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Returns the state when it has not been published yet: the guest has
+    /// not run since the restore, so a capture now must write this state,
+    /// not the device's, which holds nothing until the publish.
+    pub(crate) fn unpublished(&self) -> Option<&HviTimeState> {
+        self.done.get().is_none().then_some(&self.state)
     }
 
     /// Restores the state into `device`, once, and logs the page it
@@ -1852,6 +1869,11 @@ mod tests {
         }
         assert_eq!(dest.page().read().generation, state.page.generation + 2);
         assert_eq!(dest.page().read().base_ns, state.guest_ns_at_capture);
+        assert!(pending.unpublished().is_none());
+        assert_eq!(
+            PendingPublish::new(state.clone()).unpublished(),
+            Some(&state)
+        );
         let mut three = state;
         three.cpus.push(three.cpus[0]);
         let refused = PendingPublish::new(three);
@@ -1860,5 +1882,22 @@ mod tests {
             .publish(&dest)
             .unwrap_err()
             .contains("3 vCPU timers"));
+    }
+
+    #[test]
+    fn a_state_gives_its_lines() {
+        let (counter, lines) = (Counter::default(), Lines::default());
+        let mut state = device(&counter, &lines).state();
+        state.cpus[0] = CpuTimerState {
+            deadline_ns: None,
+            status: STATUS_EXPIRED,
+            ctrl: CTRL_ENABLE,
+        };
+        state.cpus[1] = CpuTimerState {
+            deadline_ns: None,
+            status: STATUS_EXPIRED,
+            ctrl: 0,
+        };
+        assert_eq!(state.lines(), vec![true, false]);
     }
 }
