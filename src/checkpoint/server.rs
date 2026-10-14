@@ -691,6 +691,7 @@ impl<K: Kick> Machine<'_, K> {
                 blocks: read.dirty.blocks(),
                 dirty: read.dirty.count(),
                 generation: read.generation,
+                bitmap_sha256: read.bitmap_sha256,
                 bitmap_b64: base64_encode(read.dirty.as_bytes()),
             }),
             Err(e) => refuse(ErrorCode::Refused, e.to_string()),
@@ -714,6 +715,10 @@ impl<K: Kick> Machine<'_, K> {
         let dev = match self.disk() {
             Ok(dev) => dev,
             Err(refusal) => return send(conn, stop, &refusal),
+        };
+        let round = match selection {
+            BlockSelection::Round(round) => Some(round),
+            BlockSelection::Blocks(_) => None,
         };
         let blocks = {
             let dev = lock_or_recover(&dev);
@@ -766,13 +771,23 @@ impl<K: Kick> Machine<'_, K> {
             };
         }
         let response = match exported {
-            Ok(sent) => Response::DiskBlocks(DiskBlocksReply {
-                blocks: sent.blocks,
-                bytes: sent.bytes,
-                batches: sent.batches,
-                generation: lock_or_recover(&dev).generation(),
-                max_lock_us: sent.max_lock_us,
-            }),
+            Ok(sent) => {
+                // Every batch is on the connection: the round went out
+                // whole, which disk.json records if it is captured later.
+                let mut dev = lock_or_recover(&dev);
+                if let Some(round) = round {
+                    dev.record_sent(round, sent.sent_sha256.clone());
+                }
+                Response::DiskBlocks(DiskBlocksReply {
+                    round,
+                    blocks: sent.blocks,
+                    bytes: sent.bytes,
+                    batches: sent.batches,
+                    generation: dev.generation(),
+                    max_lock_us: sent.max_lock_us,
+                    sent_sha256: sent.sent_sha256,
+                })
+            }
             Err(e) => refuse(ErrorCode::CaptureFailed, format!("reading the disk: {e}")),
         };
         send(conn, stop, &response)
@@ -3011,6 +3026,16 @@ mod tests {
                 self.replies.read_line(&mut text).unwrap();
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if value.get("v").is_some() {
+                    if value["ok"] == true {
+                        // The reply's digest is the batches' digests, in
+                        // order, as the reader saw them.
+                        let chain: String = headers
+                            .iter()
+                            .map(|h: &disk::BatchHeader| h.sha256.as_str())
+                            .collect();
+                        let want = hex(&Sha256::digest(chain.as_bytes()));
+                        assert_eq!(value["sent_sha256"], want.as_str(), "{value}");
+                    }
                     return (value, headers);
                 }
                 let header: disk::BatchHeader = serde_json::from_value(value).unwrap();
@@ -3099,6 +3124,8 @@ mod tests {
         disk.write(7, 0xb2);
         let (done, headers) = f.stream(r#"{"v":1,"op":"disk-blocks","round":0}"#, &mut image);
         assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(done["round"], 0, "{done}");
+        let round0_sent = done["sent_sha256"].as_str().unwrap().to_string();
         assert_eq!(
             headers
                 .iter()
@@ -3149,6 +3176,19 @@ mod tests {
             .map(|r| (r.round, r.generation, r.blocks))
             .collect();
         assert_eq!(rounds, [(0, 4, 4), (1, 5, 1)]);
+        // Round 0 went out by its number and is recorded sent, with the
+        // digest its reply gave; round 1 went out as a list, which records
+        // nothing. Each records its bitmap's digest, as disk-dirty gave it.
+        assert_eq!(disk_json.rounds[0].sent_sha256, Some(round0_sent));
+        assert_eq!(disk_json.rounds[1].sent_sha256, None);
+        assert_eq!(
+            disk_json.rounds[0].bitmap_sha256.as_deref(),
+            r0["bitmap_sha256"].as_str()
+        );
+        assert_eq!(
+            disk_json.rounds[1].bitmap_sha256.as_deref(),
+            r1["bitmap_sha256"].as_str()
+        );
         let since_boot = disk_json.dirty_since_boot().unwrap().unwrap();
         assert_eq!(since_boot.iter().collect::<Vec<_>>(), [1, 2, 3, 7, 40]);
         let r2 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
