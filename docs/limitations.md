@@ -49,6 +49,10 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
+| A portable guest's REALTIME drifts from the host between restores. | `hvi-time` runs REALTIME on the host's counter, not on its NTP-disciplined clock, so it moves away by the counter's error, up to about 30 ppm measured on rp2. Nothing resynchronises it until a restore. Run NTP in the guest if that matters. | Design |
+| A portable guest's high-resolution `clock_gettime` is a system call. | The vDSO has no `hvi-time` mode, so it falls back to the syscall. Coarse clocks stay in the vDSO. | Design |
+| The portable profile has no checkpoint yet. | `hvi-time` has its canonical state and restore, tested in one process (`HVI_TIME_TEST_RESTORE`). Moving a guest between hosts needs the checkpoint itself and the vGICv2 import and export, which do not exist yet. | Defect |
+| On KVM the `hvi-time` timer thread is an ordinary thread. | A few timer fires a minute land 0.5 to 3.5 ms late on a busy Pi 5. hvi does not ask for a real-time policy, which needs privileges. A late fire is never early. | Design |
 | 8 vCPUs on a GICv2 arm64 host. | GICv2 addresses at most 8 CPU interfaces. The guest's controller follows the host's, so this is not a choice. A GICv3 host has no such cap. Not having this cap is not "unlimited": other limits still apply. | Platform |
 | x86 vCPUs share one CPUID blob. | The APIC id a guest reports for a secondary CPU varies run to run. | Defect |
 | The default `--cmdline` names `ttyAMA0`. | That is the arm64 console. The x86 backend appends `console=ttyS0` itself, so a guest still gets one, but the default leaves a dead `console=` and a bare `earlycon` on the line. | Design |
