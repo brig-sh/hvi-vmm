@@ -201,10 +201,17 @@ Just before the capture it starts a 6 s `timerfd` and a 6 s `sleep`. Beside
 the checks above, it checks that the clocksource is `hvi-time` and
 `el0check` passes before and after the move, that both timers fire after
 the resume 6 s of guest time after they were armed, that the guest driver
-logged the move, generation 4, and counts it (`migrations=1`, or up to one
-per vCPU: the driver runs its migration work again on a vCPU that takes
-`GEN_CHANGED` after the work has run), and that the guest's wall clock
-is the host's again. The uptime the ticks carry is `CLOCK_BOOTTIME`, which
+logged the move, generation 4, and counts it once (`migrations=1`), and that
+the guest's wall clock is the host's again.
+
+With more than one vCPU the count can come out higher, up to one per vCPU.
+That is a defect of the portable kernel's `hvi-time` driver: it runs its
+migration work for each vCPU that takes `GEN_CHANGED`, so it logs one
+move more than once and moves the wall clock again each time, by about
+1 µs. The fix is for the driver to remember the last generation it
+handled. Until then the script reports such a count as `xfail`, an
+expected failure that does not fail the run, and lists it under
+`expected_failures` in `summary.json`. The uptime the ticks carry is `CLOCK_BOOTTIME`, which
 `hvi-time` moves on by the downtime, so the continuity checks take the
 downtime the restore logged off.
 
