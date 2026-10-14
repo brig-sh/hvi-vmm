@@ -537,6 +537,7 @@ mod stop_tests {
             plugin,
             sandbox: !cfg!(debug_assertions),
             profile: MachineProfileKind::Native,
+            arch_timer_irq: true,
             stop: None,
         }
     }
