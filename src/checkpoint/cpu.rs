@@ -24,13 +24,14 @@
 //! either hypervisor. The control thread asks for it with a `Work` request
 //! (see `Vcpus::request_export`).
 //!
-//! The HVF backend writes the whole arm64 state: the general, SIMD and
-//! floating-point registers, every system register of
-//! [`AARCH64_SYSREGS`] and the virtual timer's mask. The KVM backends still
-//! write only the register view the plugin interface has: on arm64 PC,
-//! PSTATE, SP_EL0, SP_EL1 and four translation registers; on x86-64 RIP and
-//! CR3. Such a state says `"partial": true`, and a restore refuses it. The
-//! KVM exports that fill the rest come next and write the same names.
+//! Both arm64 backends write the whole state: the general, SIMD and
+//! floating-point registers, every system register of [`AARCH64_SYSREGS`]
+//! the vCPU has, and the virtual timer's mask. KVM names its registers by
+//! id, which `checkpoint::kvm_regs` maps to these names, and records beside
+//! them its firmware registers, the few registers only it has, and any
+//! pending SError. The x86-64 backend still writes only the register view
+//! the plugin interface has, RIP and CR3. Such a state says
+//! `"partial": true`, and a restore refuses it.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -38,7 +39,7 @@ use std::io;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::checkpoint::platform::{IrqCpuState, PlatformState};
-use crate::hypervisor::guest::VcpuRegs;
+use crate::hypervisor::guest::SafepointVcpu;
 use crate::plugin::{GuestArch, RegsView};
 
 /// The [`CpuState`] format this build writes and reads.
@@ -931,15 +932,15 @@ pub(crate) enum Output {
 /// gives a partial state, the platform is not read, and an import is
 /// refused.
 ///
-/// This is the work the KVM backends do until their own export and import
-/// exist.
+/// This is the work the x86-64 backend does until its own export and
+/// import exist.
 ///
 /// # Errors
 ///
 /// Errors on an import.
-// HVF has its own, so only the Linux builds call it.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-pub(crate) fn serve_from_regs_view<V: VcpuRegs>(
+// The arm64 backends have their own, so only the x86-64 build calls it.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn serve_from_regs_view<V: SafepointVcpu>(
     arch: GuestArch,
     backend: &str,
     id: u32,

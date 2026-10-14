@@ -60,6 +60,7 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::arch::aarch64::fdt;
+use crate::arch::aarch64::kvm_state;
 use crate::arch::aarch64::layout::{
     GicLayout, GicVersion, HVI_TIME_PAGE_BASE, HVI_TIME_TIMERS_BASE, RAM_BASE, UART_BASE,
     UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
@@ -70,6 +71,7 @@ use crate::arch::aarch64::portable::{self, KvmHost};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::arch::aarch64::vgicv2::{self, Bank, Lines, VgicV2};
 use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu::{Output, VcpuState, Work};
 use crate::checkpoint::profile::{hex, host_page_size, MachineProfile, ProfileCell, UNKNOWN};
 use crate::config::{BootConfig, MachineProfileKind, Stop};
 use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, TimerLine};
@@ -1108,6 +1110,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         kick_handle,
         &sh.guest,
         sh.plugin.as_deref(),
+        |vcpu, work| serve(&sh, cpu_id, vcpu, work),
         |exit| {
             match exit {
                 VcpuExit::MmioRead(addr, data) => on_mmio(&sh, addr, true, data),
@@ -1125,6 +1128,25 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             ControlFlow::Continue(())
         },
     );
+}
+
+/// Carries out the control socket's `work` for vCPU `cpu`, parked on its
+/// own thread: its whole state by name (see `kvm_state`).
+///
+/// A KVM restore loads every vCPU before any thread runs, so there is no
+/// import here.
+fn serve(_sh: &Shared, cpu: u32, vcpu: &VcpuFd, work: Work<'_>) -> std::io::Result<Option<Output>> {
+    match work {
+        Work::Export => Ok(Some(Output::Vcpu {
+            state: VcpuState::Aarch64(kvm_state::export(cpu, vcpu)?),
+            irq: None,
+        })),
+        Work::ExportPlatform => Ok(None),
+        Work::Import(..) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("vCPU {cpu}: a KVM restore loads the vCPUs before they run"),
+        )),
+    }
 }
 
 impl SafepointVcpu for VcpuFd {
