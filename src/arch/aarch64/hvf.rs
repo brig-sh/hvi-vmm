@@ -55,6 +55,7 @@ use crate::arch::aarch64::layout::{
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
+use crate::arch::aarch64::portable;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::checkpoint::bundle::IrqLevels;
 use crate::checkpoint::capture::Console;
@@ -214,6 +215,8 @@ struct Portable {
     layout: GicLayout,
     /// Host counter ticks to nanoseconds, as `(numer, denom)`.
     timebase: (u64, u64),
+    /// Why the boot was refused, when a vCPU thread refused it.
+    refused: Mutex<Option<String>>,
 }
 
 /// The [`Kick`] implementation for Hypervisor.framework vCPUs.
@@ -539,6 +542,13 @@ const FEATURE_REGS: [(&str, FeatureReg); 14] = [
 fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -> MachineProfile {
     let mut p = arm64_profile::profile("hvf", machine);
     fill_hvf(&mut p);
+    if cfg.profile == MachineProfileKind::PortableArm64V1 {
+        // The guest reads the baseline, which each vCPU writes and checks
+        // before its first instruction. MIDR_EL1 is the profile's ident.
+        for (name, value) in portable::BASELINE.into_iter().skip(1) {
+            p.cpu.id_regs.insert(name.to_string(), hex(value));
+        }
+    }
     for (fs, share) in fs.iter().zip(&cfg.fs_shares) {
         let mut entry = device("virtio-fs", fs.base, Some(fs.intid), None);
         entry.mode = Some(if share.mode.writable() { "rw" } else { "ro" }.to_string());
@@ -878,11 +888,19 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             gic: Mutex::new(Gicv2::new(num_cpus)),
             layout: gic,
             timebase: host_timebase(),
+            refused: Mutex::new(None),
         })
     });
     let (vm, irqchip) = create_vm(&gic, portable.clone())?;
     let (shared_ram, ram) = map_ram(cfg.mem_bytes)?;
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
+    // The portable guest also gets kernel arguments that keep it off what
+    // its baseline hides.
+    let cmdline = if is_portable {
+        portable::cmdline(&cfg.cmdline)
+    } else {
+        cfg.cmdline.clone()
+    };
 
     let virtio = match &cfg.disk {
         Some(path) => {
@@ -1039,7 +1057,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
-        cmdline: &cfg.cmdline,
+        cmdline: &cmdline,
     }
     .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
 
@@ -1049,7 +1067,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         gic: &gic,
         layout: &layout,
         vcpus: num_cpus,
-        cmdline: &cfg.cmdline,
+        cmdline: &cmdline,
         devices: fdt_devices,
         net_mode: match (&net, &net_reader) {
             (Some(_), Some(_)) => Some("gateway"),
@@ -1482,6 +1500,13 @@ fn run(
     if let Some(e) = failure {
         return Err(e);
     }
+    if let Some(reason) = shared
+        .portable
+        .as_ref()
+        .and_then(|p| lock_or_recover(&p.refused).take())
+    {
+        return Err(reason.into());
+    }
     Ok(shared.guest.vcpus.stop_reason())
 }
 
@@ -1601,6 +1626,15 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set. A GICv2 reads the
     // same aff0.
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
+    if let Some(p) = &sh.portable {
+        // Before the profile reads MIDR_EL1 and before the guest's first
+        // instruction.
+        if let Err(e) = set_baseline(&vcpu, cpu_id == 0) {
+            eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
+            lock_or_recover(&p.refused).get_or_insert(e);
+            return;
+        }
+    }
     sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
     // A restore loads the GIC only once every vCPU, the ones that were off
     // as well, exists. See `checkpoint::restore::import`.
@@ -2141,6 +2175,73 @@ fn is_physical_counter(iss: u64) -> bool {
     (op0, op1, crn, crm) == (3, 3, 14, 0) && (op2 == 1 || op2 == 5) && iss & 1 == 1
 }
 
+/// The system registers of [`portable::BASELINE`], in its order.
+const BASELINE_REGS: [SysReg; 12] = [
+    SysReg::MIDR_EL1,
+    SysReg::ID_AA64PFR0_EL1,
+    SysReg::ID_AA64PFR1_EL1,
+    SysReg::ID_AA64ZFR0_EL1,
+    SysReg::ID_AA64SMFR0_EL1,
+    SysReg::ID_AA64ISAR0_EL1,
+    SysReg::ID_AA64ISAR1_EL1,
+    SysReg::ID_AA64MMFR0_EL1,
+    SysReg::ID_AA64MMFR1_EL1,
+    SysReg::ID_AA64MMFR2_EL1,
+    SysReg::ID_AA64DFR0_EL1,
+    SysReg::ID_AA64DFR1_EL1,
+];
+
+/// Gives `vcpu` the portable CPU baseline, and logs it when `log`.
+///
+/// Hypervisor.framework accepts a value above what the host has without
+/// complaint, and the guest then reads it, so a write proves nothing. Each
+/// register is read back instead.
+///
+/// # Errors
+///
+/// Errors naming every register that does not read back as written, or a
+/// `DCZID_EL0` (which no backend can set) other than the profile's.
+fn set_baseline(vcpu: &Vcpu, log: bool) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    for ((name, value), reg) in portable::BASELINE.into_iter().zip(BASELINE_REGS) {
+        if let Err(e) = vcpu.set_sys_reg(reg, value) {
+            wrong.push(format!("{name} cannot be set ({e:?})"));
+            continue;
+        }
+        match vcpu.get_sys_reg(reg) {
+            Ok(back) if back == value => {}
+            Ok(back) => wrong.push(format!("{name} reads {back:#x}, not {value:#x}")),
+            Err(e) => wrong.push(format!("{name} does not read back ({e:?})")),
+        }
+    }
+    let config = VcpuConfig::new();
+    let dczid = config.get_feature_reg(FeatureReg::DCZID_EL0).unwrap_or(0);
+    if dczid != portable::DCZID_EL0 {
+        wrong.push(format!(
+            "DCZID_EL0 is {dczid:#x} here, not {:#x}",
+            portable::DCZID_EL0
+        ));
+    }
+    if !wrong.is_empty() {
+        return Err(format!(
+            "the portable-arm64-v1 CPU baseline does not hold on this host: {}",
+            wrong.join("; ")
+        ));
+    }
+    if log {
+        let regs: Vec<String> = portable::BASELINE
+            .iter()
+            .map(|(name, value)| format!("{name}={value:#x}"))
+            .collect();
+        let ctr = config.get_feature_reg(FeatureReg::CTR_EL0).unwrap_or(0);
+        eprintln!(
+            "{LOG_PREFIX} portable-arm64-v1 CPU baseline: {} (host CTR_EL0={ctr:#x} DCZID_EL0={dczid:#x}, not settable)",
+            regs.join(" ")
+        );
+    }
+    Ok(())
+}
+
 /// Services a PL011 MMIO access.
 fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);
@@ -2416,12 +2517,20 @@ mod tests {
         assert_eq!(IRQ_LINE as u32, 0);
     }
 
+    #[test]
+    fn baseline_registers_are_written_in_the_order_they_are_named() {
+        for ((name, _), reg) in portable::BASELINE.iter().zip(BASELINE_REGS) {
+            assert_eq!(format!("{reg:?}"), *name);
+        }
+    }
+
     /// A portable machine with `cpus` vCPUs.
     fn machine(cpus: u32) -> Portable {
         Portable {
             gic: Mutex::new(Gicv2::new(cpus)),
             layout: GicLayout::QEMU_VIRT_V2,
             timebase: (125, 3),
+            refused: Mutex::new(None),
         }
     }
 
