@@ -1343,6 +1343,16 @@ mod tests {
     use super::*;
     use crate::arch::aarch64::vgicv2::tests::busy_state;
 
+    /// The two raw requests are the numbers the kernel's headers give.
+    #[test]
+    fn the_raw_ioctl_requests_are_the_kernels() {
+        assert_eq!(u64::from(KVM_ARM_SET_COUNTER_OFFSET as u32), 0x4010_aeb5);
+        assert_eq!(
+            u64::from(KVM_ARM_GET_REG_WRITABLE_MASKS as u32),
+            0x8040_aeb6
+        );
+    }
+
     /// A VM with a vGICv2 and `ncpu` vCPUs, set up as the boot sets them up
     /// and never run.
     fn vgic_vm(ncpu: u32) -> (VmFd, DeviceFd, Vec<VcpuFd>) {
