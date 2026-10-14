@@ -18,12 +18,12 @@
 //! pages written since. Two kinds of writer change guest RAM:
 //!
 //! - the guest's vCPUs, which the hypervisor sees: KVM keeps a dirty log per
-//!   memory slot, and on HVF hvi write-protects RAM and records each fault.
-//!   A backend reports them to the mover;
-//! - hvi's own threads, which write through [`GuestRam`](super::GuestRam):
-//!   the virtio devices fill guest buffers and publish used rings. The
-//!   hypervisor never sees those writes, so `GuestRam` records each one in
-//!   its [`DirtyLog`].
+//!   memory slot, and on HVF hvi write-protects RAM and records each fault. A
+//!   backend reports them through [`GuestWriteLog`];
+//! - hvi's own threads, which write through [`GuestRam`](super::GuestRam): the
+//!   virtio devices fill guest buffers and publish used rings. The hypervisor
+//!   never sees those writes, so `GuestRam` records each one in its
+//!   [`DirtyLog`].
 //!
 //! Both are cut into periods by a reader that takes the set and clears it in
 //! one step, and both report in [`DirtyPages`], one bit per 4 KiB page.
@@ -365,6 +365,40 @@ impl DirtyPages {
             }
         }
         out
+    }
+}
+
+/// The guest's own writes to its RAM, as the hypervisor records them.
+///
+/// A move starts it, collects from it once per round, and stops it. The
+/// backend records at its own granule, the host page on KVM and the IPA
+/// granule on HVF, and reports every 4 KiB page of a granule written.
+pub(crate) trait GuestWriteLog: Send + Sync {
+    /// Starts recording. Writes before this are not reported.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the hypervisor refuses; nothing is recorded then.
+    fn start(&self) -> io::Result<()>;
+
+    /// Adds to `into` the pages written since [`start`](Self::start) or the
+    /// last collect, and starts a new period.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the hypervisor refuses or `into` is of other regions.
+    fn collect(&self, into: &mut DirtyPages) -> io::Result<()>;
+
+    /// Stops recording and gives the guest its RAM back as it was.
+    fn stop(&self);
+
+    /// Returns the bytes one record covers, for the reply's account.
+    fn granule(&self) -> u64;
+
+    /// Returns the write faults hvi served since the start and the host
+    /// nanoseconds they took, on a backend where hvi serves them.
+    fn fault_stats(&self) -> Option<(u64, u64)> {
+        None
     }
 }
 

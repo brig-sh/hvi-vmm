@@ -30,6 +30,7 @@ mod guest;
 mod region;
 mod shared;
 
+pub(crate) use dirty::GuestWriteLog;
 pub use dirty::{DirtyLog, DirtyPages, DIRTY_PAGE};
 pub use guest::{GuestRam, GuestRamView};
 pub use region::RamRegion;

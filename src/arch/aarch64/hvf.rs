@@ -919,6 +919,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus,
+            write_log: None,
         }),
         pl011: Arc::new(Mutex::new(pl011)),
         fs: Vec::new(),
@@ -1232,6 +1233,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             net,
             vsock,
             vcpus,
+            write_log: None,
             plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
@@ -1257,9 +1259,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
-    if let Some(obs) = &shared.plugin {
-        obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
-    }
+    let plugin_threads = shared.guest.attach(shared.plugin.as_ref())?;
+
+    // A binary's stop signals get their handlers, and the thread that receives
+    // them starts, before the terminal goes into raw mode, so a first stop
+    // signal stops the run rather than ending the process with the terminal
+    // raw. The sandbox below confines the whole process, that thread included.
+    crate::signal::start_stop_signal_thread()?;
 
     let _raw = terminal::RawTerm::enable();
 
