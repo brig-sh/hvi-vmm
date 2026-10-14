@@ -707,9 +707,9 @@ const RESTORER_PORTABLE: Restorer = restore::portable("hvf");
 // confinement constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
 pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
-    let opened =
-        restore::open(std::path::Path::new(&cfg.from)).map_err(|e| format!("{}: {e}", cfg.from))?;
-    let source = opened.profile();
+    let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
+    let source_profile = opened.profile().clone();
+    let source = &source_profile;
     let is_portable = source.profile == MachineProfileKind::PortableArm64V1.name();
     let can = if is_portable {
         &RESTORER_PORTABLE
@@ -850,13 +850,13 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         })
     });
     let (vm, irqchip) = create_vm(&gic, portable.clone())?;
-    let (shared_ram, ram) = map_ram(ram_size)?;
-    // ram.bin is hashed here, as it is copied, and refused like the open
-    // refuses a component: named with the bundle.
-    opened
-        .bundle
-        .load_ram(&ram)
+    // A bundle directory's ram.bin is hashed here, as it is copied, and
+    // refused like the open refuses a component: named with the bundle. A
+    // stream's RAM was filled and checked as it was read.
+    let (shared_ram, ram) = opened
+        .guest_ram()
         .map_err(|e| format!("{}: {e}", cfg.from))?;
+    map_guest_ram(&ram)?;
 
     // The devices, from their state, over this host's resources.
     let rebuild::Devices {
@@ -1425,6 +1425,13 @@ fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::er
         &shared_ram,
         &[shared_ram.region_at(RAM_BASE)],
     )?);
+    map_guest_ram(&ram)?;
+    Ok((shared_ram, ram))
+}
+
+/// Maps every region of `ram` into the VM at its address, read, write and
+/// execute.
+fn map_guest_ram(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
     for region in ram.memory().iter() {
         let ipa = region.start_addr().raw_value();
         // SAFETY: the region is a live, page-aligned mapping of `len()` bytes
@@ -1443,7 +1450,7 @@ fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::er
             return Err(format!("hv_vm_map(guest RAM -> {ipa:#x}) failed: {ret:#x}").into());
         }
     }
-    Ok((shared_ram, ram))
+    Ok(())
 }
 
 /// The most times in a row one vCPU may fault on the same RAM granule
