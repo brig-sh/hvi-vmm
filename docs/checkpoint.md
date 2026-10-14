@@ -585,7 +585,8 @@ there with the same flags. What carries over:
   the destination's starts no lower than the capture's, scaled to its rate.
 
 The bundle's hvi commit must equal the destination's, so build both hosts
-from one commit.
+from one commit, with no uncommitted changes: a build with them is refused
+on either side, as for the native machine.
 
 Run so far: a portable bundle restored on the host that took it, on the
 Mac and on a Pi 5 (`tools/checkpoint-e2e.sh --portable`), and one move each
