@@ -653,6 +653,10 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         kick_handle,
         &sh.guest,
         sh.plugin.as_deref(),
+        // The x86-64 export is still the plugin's register view.
+        |vcpu, work| {
+            crate::checkpoint::cpu::serve_from_regs_view(sh.guest.arch, "kvm", cpu_id, vcpu, work)
+        },
         |vcpu| {
             match vcpu.run() {
                 Ok(VcpuExit::IoIn(port, data)) => {

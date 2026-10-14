@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use kvm_ioctls::{VcpuFd, VmFd};
 
 use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu::{Output, Work};
 use crate::checkpoint::profile::ProfileCell;
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{BootConfig, Stop};
@@ -279,13 +280,15 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 /// parks at the quiesce checkpoint, lets `plugin` look at the guest from the
 /// boot vCPU, and then calls `run`. `run` enters the guest once, services the
 /// exit, and returns `false` to end the loop. Every way out of the loop ends
-/// the VM, a panic included.
+/// the VM, a panic included. `serve` does the work the control socket asks
+/// of a parked vCPU, on this thread.
 pub(crate) fn run_vcpu(
     cpu: u32,
     mut vcpu: VcpuFd,
     kick_handle: VcpuFd,
     guest: &Guest<Kicker>,
     plugin: Option<&dyn Plugin>,
+    mut serve: impl FnMut(&VcpuFd, Work<'_>) -> std::io::Result<Option<Output>>,
     mut run: impl FnMut(&mut VcpuFd) -> bool,
 ) {
     // The vCPU filter goes in before this thread touches anything the guest
@@ -314,9 +317,7 @@ pub(crate) fn run_vcpu(
         // Safe point for every vCPU: park here while cpu0 lets a plugin look at
         // the guest, or the control socket captures it, doing on this thread
         // the work only it can.
-        guest.vcpus.checkpoint_with(cpu, |work| {
-            crate::checkpoint::cpu::serve_from_regs_view(guest.arch, "kvm", cpu, &vcpu, work)
-        });
+        guest.vcpus.checkpoint_with(cpu, |work| serve(&vcpu, work));
         // The plugin runs on cpu0, between guest entries, because only this
         // thread can read this vCPU's registers. It is on the hot path: with no
         // plugin this is a null check.
