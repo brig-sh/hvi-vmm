@@ -64,15 +64,19 @@ glibc's malloc does open two files on its own, from whichever thread is
 allocating or freeing at the time:
 
 - `/sys/devices/system/cpu/online`, to size its arena limit the first time a
-  thread needs a new arena while more than eight exist. Upstream glibc 2.36
-  asks `sched_getaffinity` instead. The 2.36 in Debian 12 carries a
-  release-branch change to `__get_nprocs`, which reads this file
-  (`malloc/arena.c`, `arena_get2`).
+  thread needs a new arena while more than eight exist (`malloc/arena.c`,
+  `arena_get2`, which calls `__get_nprocs`). Every glibc reads it except the
+  2.35 to 2.38 releases as first tagged, which asked `sched_getaffinity`
+  there. Upstream went back to `__get_nprocs` in 2.39 (commit 472894d2cfee,
+  BZ 30945), and the 2.35 to 2.38 release branches carry the same change, so
+  any distribution that takes them reads the file too. Debian 12's 2.36 does.
 - `/proc/sys/vm/overcommit_memory`, the first time the heap of an arena other
   than the main one shrinks (`check_may_shrink_heap`, called from
-  `shrink_heap`).
+  `shrink_heap`). This read is in every glibc, unpatched upstream included.
 
-Both reads were found on a Raspberry Pi 5 running Debian 12. A guest with heavy
+Neither is specific to Debian or to arm64: an x86-64 host on a current glibc
+reaches both. They were found on a Raspberry Pi 5 running Debian 12, whose
+glibc 2.36-9+rpt2+deb12u12 and deb12u13 both trap. A guest with heavy
 agent traffic kept enough vsock bridge threads allocating at once to reach
 them, and the VMM died of `SIGSYS`. Allowing `openat` would undo the point of
 the lists, so a confined run keeps glibc's malloc to its main arena instead.
