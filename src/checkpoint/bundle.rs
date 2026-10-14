@@ -63,7 +63,13 @@ use crate::checkpoint::profile::{
     this_build, HviBuild, MachineProfile, CHECKPOINT_FORMAT, MAX_PROFILE_BYTES,
 };
 use crate::checkpoint::ram::{self, RamImage, RegionImage, PAGE_SIZE};
+use crate::devices::legacy::pl011::Pl011State;
+use crate::devices::legacy::rtc_cmos::RtcState;
+use crate::devices::legacy::uart16550::UartState;
 use crate::devices::state::DeviceStates;
+use crate::devices::virtio::block::BlkState;
+use crate::devices::virtio::net::NetState;
+use crate::devices::virtio::vsock::VsockState;
 use crate::memory::{GuestRam, GuestRamView};
 
 /// The manifest's file name.
@@ -249,6 +255,42 @@ pub struct DevicesDoc {
     pub irq_levels: IrqLevels,
 }
 
+/// `devices.json` as the writer writes it, borrowing the states.
+#[derive(Serialize)]
+struct DevicesOut<'a> {
+    #[serde(flatten)]
+    states: &'a DeviceStates,
+    irq_levels: IrqLevels,
+}
+
+/// `devices.json` as the reader decodes it: the [`DeviceStates`] fields and
+/// `irq_levels` in one struct, so the document is decoded in one pass.
+///
+/// Going through `serde_json::Value` first cost about 32 bytes per JSON
+/// number, and the vsock buffers are lists of numbers: a crafted 32 MiB
+/// document took 608 MiB before it was refused. `flatten` cannot be used
+/// here, since it does not refuse unknown fields. Building the
+/// [`DeviceStates`] below names every field, so a field added there and not
+/// here does not compile.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevicesIn {
+    version: u32,
+    #[serde(deserialize_with = "Option::deserialize")]
+    blk: Option<BlkState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    net: Option<NetState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    vsock: Option<VsockState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pl011: Option<Pl011State>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    uart: Option<UartState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    rtc: Option<RtcState>,
+    irq_levels: IrqLevels,
+}
+
 impl DevicesDoc {
     /// Encodes the document.
     ///
@@ -256,12 +298,11 @@ impl DevicesDoc {
     ///
     /// Errors as `serde_json` does, which for these types it does not.
     pub fn to_json(&self) -> io::Result<Vec<u8>> {
-        let mut doc = serde_json::to_value(&self.states).map_err(io::Error::other)?;
-        let levels = serde_json::to_value(self.irq_levels).map_err(io::Error::other)?;
-        doc.as_object_mut()
-            .ok_or_else(|| io::Error::other("device states are not a JSON object"))?
-            .insert("irq_levels".to_string(), levels);
-        serde_json::to_vec(&doc).map_err(io::Error::other)
+        serde_json::to_vec(&DevicesOut {
+            states: &self.states,
+            irq_levels: self.irq_levels,
+        })
+        .map_err(io::Error::other)
     }
 
     /// Decodes the document, refusing one without `irq_levels` and every
@@ -271,16 +312,22 @@ impl DevicesDoc {
     ///
     /// Errors, as `InvalidData`, on any of those.
     pub fn from_json(json: &[u8]) -> io::Result<Self> {
-        let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
-        let mut doc: serde_json::Value =
-            serde_json::from_slice(json).map_err(|e| invalid(e.to_string()))?;
-        let levels = doc
-            .as_object_mut()
-            .and_then(|fields| fields.remove("irq_levels"))
-            .ok_or_else(|| invalid("no irq_levels".to_string()))?;
-        let irq_levels = serde_json::from_value(levels).map_err(|e| invalid(e.to_string()))?;
-        let states = DeviceStates::from_json(&serde_json::to_vec(&doc).map_err(io::Error::other)?)?;
-        Ok(Self { states, irq_levels })
+        let doc: DevicesIn = serde_json::from_slice(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let states = DeviceStates {
+            version: doc.version,
+            blk: doc.blk,
+            net: doc.net,
+            vsock: doc.vsock,
+            pl011: doc.pl011,
+            uart: doc.uart,
+            rtc: doc.rtc,
+        };
+        states.check_versions()?;
+        Ok(Self {
+            states,
+            irq_levels: doc.irq_levels,
+        })
     }
 }
 
@@ -1891,9 +1938,16 @@ mod tests {
         let json = doc.to_json().unwrap();
         assert_eq!(
             String::from_utf8(json.clone()).unwrap(),
-            r#"{"blk":null,"irq_levels":{"blk":true,"net":false,"uart":false,"vsock":false},"net":null,"pl011":null,"rtc":null,"uart":null,"version":1,"vsock":null}"#
+            r#"{"version":1,"blk":null,"net":null,"vsock":null,"pl011":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#
         );
         assert_eq!(DevicesDoc::from_json(&json).unwrap(), doc);
+        // Bundles written before this build have the keys in sorted order.
+        let sorted = br#"{"blk":null,"irq_levels":{"blk":true,"net":false,"uart":false,"vsock":false},"net":null,"pl011":null,"rtc":null,"uart":null,"version":1,"vsock":null}"#;
+        assert_eq!(DevicesDoc::from_json(sorted).unwrap(), doc);
+        let no_net = br#"{"version":1,"blk":null,"vsock":null,"pl011":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#;
+        assert!(DevicesDoc::from_json(no_net).is_err());
+        let old = br#"{"version":2,"blk":null,"net":null,"vsock":null,"pl011":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#;
+        assert!(DevicesDoc::from_json(old).is_err());
         let without = br#"{"version":1,"blk":null,"net":null,"vsock":null,"pl011":null,"uart":null,"rtc":null}"#;
         assert!(DevicesDoc::from_json(without).is_err());
         let extra = String::from_utf8(json)
