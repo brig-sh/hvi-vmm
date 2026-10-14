@@ -14,7 +14,8 @@
 
 //! The guest-visible contract of the `portable-arm64-v1` machine profile
 //! that does not depend on the hypervisor: the CPU baseline, the kernel
-//! arguments, the devicetree's inputs and the firmware's answers.
+//! arguments, the devicetree's inputs, the firmware's answers and what a
+//! KVM host must offer to present them.
 //!
 //! The values come from measurements on a Raspberry Pi 5 (KVM, Linux
 //! 6.12.25) and an Apple M5 Pro (Hypervisor.framework, macOS 26.7). See
@@ -84,7 +85,8 @@ const ALLOWED_RAISES: [(&str, u32, &str); 2] = [
 ];
 
 /// Returns the fields of baseline register `name` that claim more than the
-/// host's `host` value of it, one description each.
+/// host's `host` value of it, one description each, allowing the raises a
+/// backend can make (`ALLOWED_RAISES`).
 ///
 /// A host must back every field: Hypervisor.framework accepts a raised
 /// field and the guest then reads it, so a guest told of a feature its
@@ -94,6 +96,11 @@ const ALLOWED_RAISES: [(&str, u32, &str); 2] = [
 /// never claims more. `ALLOWED_RAISES` are let through.
 #[must_use]
 pub fn excess_fields(name: &str, baseline: u64, host: u64) -> Vec<String> {
+    excess(name, baseline, host, &ALLOWED_RAISES)
+}
+
+/// [`excess_fields`] with the raises in `allowed` let through.
+fn excess(name: &str, baseline: u64, host: u64, allowed: &[(&str, u32, &str)]) -> Vec<String> {
     let mut out = Vec::new();
     for shift in (0..64).step_by(4) {
         let b = (baseline >> shift) & 0xf;
@@ -104,11 +111,7 @@ pub fn excess_fields(name: &str, baseline: u64, host: u64) -> Vec<String> {
         } else {
             b > h
         };
-        if raised
-            && !ALLOWED_RAISES
-                .iter()
-                .any(|(n, s, _)| *n == name && *s == shift)
-        {
+        if raised && !allowed.iter().any(|(n, s, _)| *n == name && *s == shift) {
             out.push(format!(
                 "{name}[{}:{shift}] is {b:#x} in the baseline but {h:#x} on this host",
                 shift + 3
@@ -146,8 +149,6 @@ pub fn cmdline(cmdline: &str) -> String {
 /// Both backends take it from [`devicetree`], so a guest given the same
 /// configuration on a Mac and on a Pi gets the same tree, byte for byte,
 /// and the same `dtb_sha256` in its profile.
-// Only the macOS backend serves the profile so far.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct Devicetree {
     /// The GICv2, at QEMU virt's v2 addresses.
@@ -166,7 +167,6 @@ pub(crate) struct Devicetree {
 /// # Errors
 ///
 /// Errors when `vcpus` is more than a GICv2 reaches.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn devicetree(
     cfg: &BootConfig,
     vcpus: u32,
@@ -193,6 +193,91 @@ pub(crate) fn devicetree(
             hvi_time: true,
         },
     })
+}
+
+/// What a KVM host offers a portable guest, as the backend reads it before
+/// the guest's first instruction.
+#[derive(Debug, Clone)]
+pub struct KvmHost {
+    /// Whether KVM creates a vGICv2 here.
+    pub vgic_v2: bool,
+    /// The host page size, in bytes.
+    pub page_size: u64,
+    /// The largest guest physical address size KVM offers, in bits.
+    pub ipa_bits: u32,
+    /// The value KVM gives a new guest of each [`BASELINE`] register, by
+    /// name. A register it does not report is missing.
+    pub id_regs: Vec<(&'static str, u64)>,
+    /// The writable mask of each [`BASELINE`] register, by name, when KVM
+    /// reports them (`KVM_ARM_GET_REG_WRITABLE_MASKS`). A field whose mask
+    /// is 0xf can be lowered.
+    pub writable: Option<Vec<(&'static str, u64)>>,
+}
+
+/// Returns why a KVM host cannot present the portable machine, one reason
+/// each, or nothing when it can.
+///
+/// KVM lowers an ID register field only, never raises it, and not every
+/// field can be written: `MIDR_EL1` cannot be changed at all, so the host
+/// must be a Cortex-A76 r4p1. The rest of the machine needs a vGICv2, the
+/// guest's 40-bit physical address space and 4 KiB or 16 KiB host pages
+/// (the baseline offers the guest no 64 KiB granule).
+#[must_use]
+pub fn kvm_host_problems(host: &KvmHost) -> Vec<String> {
+    let mut why = Vec::new();
+    if !host.vgic_v2 {
+        why.push(
+            "KVM offers no vGICv2 here (a GICv3-only host); the portable profile's interrupt \
+             controller is a GICv2"
+                .to_string(),
+        );
+    }
+    if host.page_size != 0x1000 && host.page_size != 0x4000 {
+        why.push(format!(
+            "the host page size is {} bytes; the portable profile needs 4 KiB or 16 KiB",
+            host.page_size
+        ));
+    }
+    if host.ipa_bits < 40 {
+        why.push(format!(
+            "KVM offers a {}-bit guest physical address space; the baseline has 40 bits",
+            host.ipa_bits
+        ));
+    }
+    let find = |list: &[(&'static str, u64)], name: &str| {
+        list.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+    };
+    for (name, value) in BASELINE {
+        let Some(have) = find(&host.id_regs, name) else {
+            why.push(format!("{name} cannot be read on this host"));
+            continue;
+        };
+        if name == "MIDR_EL1" {
+            if have != value {
+                why.push(format!(
+                    "MIDR_EL1 is {have:#x} here and KVM cannot change it; the baseline is \
+                     {value:#x} (Cortex-A76 r4p1)"
+                ));
+            }
+            continue;
+        }
+        // KVM takes no raise at all.
+        why.extend(excess(name, value, have, &[]));
+        let Some(mask) = host.writable.as_deref().and_then(|m| find(m, name)) else {
+            continue;
+        };
+        for shift in (0..64).step_by(4) {
+            let (b, h) = ((value >> shift) & 0xf, (have >> shift) & 0xf);
+            if b != h && (mask >> shift) & 0xf != 0xf {
+                why.push(format!(
+                    "{name}[{}:{shift}] is {h:#x} here and must read {b:#x}, but KVM does not \
+                     let that field be written",
+                    shift + 3
+                ));
+            }
+        }
+    }
+    why
 }
 
 /// SMCCC and PSCI function IDs and return values the portable firmware
@@ -434,6 +519,105 @@ mod tests {
         );
         // VMIDBits is let through only in MMFR1.
         assert_eq!(excess_fields("ID_AA64MMFR2_EL1", 0x20, 0).len(), 1);
+    }
+
+    /// What KVM on rp2 (Raspberry Pi 5, Linux 6.12.25) gives a new guest and
+    /// lets userspace write, from the P0 probe (`probe.out`).
+    fn pi5() -> KvmHost {
+        KvmHost {
+            vgic_v2: true,
+            page_size: 0x4000,
+            ipa_bits: 40,
+            id_regs: vec![
+                ("MIDR_EL1", 0x414f_d0b1),
+                ("ID_AA64PFR0_EL1", 0x1100_0000_1011_1112),
+                ("ID_AA64PFR1_EL1", 0x10),
+                ("ID_AA64ZFR0_EL1", 0),
+                ("ID_AA64SMFR0_EL1", 0),
+                ("ID_AA64ISAR0_EL1", 0x0000_1000_1021_1120),
+                ("ID_AA64ISAR1_EL1", 0x0010_0001),
+                ("ID_AA64MMFR0_EL1", 0x0010_1122),
+                ("ID_AA64MMFR1_EL1", 0x1021_2122),
+                ("ID_AA64MMFR2_EL1", 0x1011),
+                ("ID_AA64DFR0_EL1", 0x1030_5008),
+                ("ID_AA64DFR1_EL1", 0),
+            ],
+            writable: Some(vec![
+                ("MIDR_EL1", 0),
+                ("ID_AA64PFR0_EL1", 0xffff_00f0_0f00_ffff),
+                ("ID_AA64PFR1_EL1", 0x0000_000f_0000_00ff),
+                ("ID_AA64ZFR0_EL1", 0x0ff0_ff0f_0fff_00ff),
+                ("ID_AA64SMFR0_EL1", 0),
+                ("ID_AA64ISAR0_EL1", 0xffff_ffff_ffff_fff0),
+                ("ID_AA64ISAR1_EL1", 0xffff_ffff_00ff_f00f),
+                ("ID_AA64MMFR0_EL1", 0xff00_f000_ffff_ff0f),
+                ("ID_AA64MMFR1_EL1", 0xffff_f0f0_0fff_f00f),
+                ("ID_AA64MMFR2_EL1", 0xf0ff_000f_f00f_ffff),
+                ("ID_AA64DFR0_EL1", 0x0000_00f0_00f0_0f0f),
+                ("ID_AA64DFR1_EL1", 0),
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_pi5_presents_the_portable_machine() {
+        assert_eq!(kvm_host_problems(&pi5()), Vec::<String>::new());
+        // Without the masks, the comparison alone decides.
+        let mut no_masks = pi5();
+        no_masks.writable = None;
+        assert_eq!(kvm_host_problems(&no_masks), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_kvm_host_that_cannot_present_it_is_named() {
+        let mut host = pi5();
+        host.vgic_v2 = false;
+        host.page_size = 0x1_0000;
+        host.ipa_bits = 36;
+        let why = kvm_host_problems(&host);
+        assert_eq!(why.len(), 3, "{why:?}");
+        assert!(why[0].contains("vGICv2"));
+        assert!(why[1].contains("65536"));
+        assert!(why[2].contains("36-bit"));
+        // A 4 KiB host is fine.
+        host = pi5();
+        host.page_size = 0x1000;
+        assert!(kvm_host_problems(&host).is_empty());
+
+        // Another CPU: MIDR cannot be changed.
+        let mut a72 = pi5();
+        a72.id_regs[0].1 = 0x410f_d083;
+        assert!(kvm_host_problems(&a72)[0].starts_with("MIDR_EL1 is 0x410fd083"));
+
+        // A host without DotProd cannot be raised to it.
+        let mut no_dp = pi5();
+        no_dp.id_regs[5].1 = 0x0000_0000_1021_1120;
+        assert_eq!(
+            kvm_host_problems(&no_dp),
+            vec!["ID_AA64ISAR0_EL1[47:44] is 0x1 in the baseline but 0x0 on this host"]
+        );
+
+        // KVM takes no raise, not even the two hvf makes: a host with
+        // VMIDBits 0 is refused.
+        let mut low_vmid = pi5();
+        low_vmid.id_regs[8].1 = 0x1021_2102;
+        let why = kvm_host_problems(&low_vmid);
+        assert_eq!(
+            why[0],
+            "ID_AA64MMFR1_EL1[7:4] is 0x2 in the baseline but 0x0 on this host"
+        );
+
+        // A field that must be lowered but is fixed: RAS 2 on a host whose
+        // mask keeps RAS read-only.
+        let mut ras2 = pi5();
+        ras2.id_regs[1].1 = 0x1100_0000_2011_1112;
+        assert_eq!(
+            kvm_host_problems(&ras2),
+            vec![
+                "ID_AA64PFR0_EL1[31:28] is 0x2 here and must read 0x1, but KVM does not let \
+                 that field be written"
+            ]
+        );
     }
 
     /// The baseline keeps the GIC system-register interface off, which is
