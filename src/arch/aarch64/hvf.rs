@@ -56,7 +56,7 @@ use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, PluginThreads, VcpuRegs};
 use crate::hypervisor::run::{record_start, run_to_stop};
-use crate::hypervisor::vcpus::{panic_message, Kick, Outcome, Vcpus};
+use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
@@ -685,6 +685,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         report_fs_usage(index, &fs.dev);
     }
 
+    // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
+    // error goes back as `run_to_stop` returned it.
     result
 }
 
@@ -833,7 +835,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         // usable without a debugger.
         sh.guest.vcpus.report(Outcome::Failed(format!(
             "vcpu{cpu_id}: panicked ({}); last exit {:?}, pc {:#x}",
-            panic_message(&*payload),
+            crate::panic_message(payload.as_ref()),
             last_exit(),
             vcpu.get_reg(Reg::PC).unwrap_or(0)
         )));

@@ -260,7 +260,7 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
     let mut failure: Option<Box<dyn std::error::Error + Send + Sync>> =
         spawned.err().map(Into::into);
 
-    // The guest is already running by now, so a failure to filter the main
+    // The guest is already running by now, so a failure to filter the calling
     // thread stops it like any other failure.
     if let Err(e) = filters.install() {
         // The error is printed here, since a spawn failure ahead of it is the
@@ -269,6 +269,8 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
         failure.get_or_insert(e.into());
     }
 
+    // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
+    // error goes back as `run_to_stop` returned it.
     run_to_stop(guest, threads, failure, io_threads)
 }
 
@@ -640,21 +642,18 @@ mod stop_tests {
     #[ignore]
     fn request_stops_a_guest_that_never_exits() {
         assert!(Kvm::new().is_ok(), "/dev/kvm is not usable");
-        let (stop, registration) = StopHandle::new_pair().unwrap();
-        let mut cfg = config(spinning_kernel(), None);
-        cfg.stop = Some(registration);
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(crate::boot(cfg).map_err(|e| e.to_string()));
-        });
+        let run = crate::spawn(config(spinning_kernel(), None)).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        stop.request_stop();
-        let outcome = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("boot returns once the stop is requested");
+        run.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !run.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(run.is_finished(), "the run ends once the stop is requested");
+        let outcome = run.wait();
         assert!(
             matches!(outcome, Ok(Stop::Requested)),
-            "boot returned {outcome:?}"
+            "the run returned {outcome:?}"
         );
     }
 

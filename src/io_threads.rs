@@ -78,16 +78,42 @@ impl<K: Kick> Drop for StopOnPanic<K> {
 pub(crate) struct IoThreads<K: Kick> {
     /// The vCPUs of the run, which a thread that panics stops.
     vcpus: Arc<Vcpus<K>>,
-    /// The stop the threads poll.
-    source: StopSource,
+    /// The stop the threads poll, and the actions it runs.
+    stop: StopPlan,
     /// The console reader, which the stop also has to signal.
     console: IoThread,
     /// Every other thread.
     threads: Vec<IoThread>,
     /// The count each thread notes on as it ends.
     finish_count: Arc<FinishCount>,
-    /// The actions the stop runs before it joins the threads.
-    stop_actions: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+/// The stop of a run's I/O threads: the stop they poll, and the actions for the
+/// threads that wait on something else.
+///
+/// Dropping it runs it, so the threads also stop when the `IoThreads` that
+/// holds it drops without a [`stop`](IoThreads::stop), as in an unwind.
+struct StopPlan {
+    /// The stop the threads poll.
+    source: StopSource,
+    /// The actions that run after the request, in the order they were added.
+    actions: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl StopPlan {
+    /// Requests the stop and runs the actions not yet run.
+    fn run(&mut self) {
+        self.source.request_stop();
+        for action in std::mem::take(&mut self.actions) {
+            action();
+        }
+    }
+}
+
+impl Drop for StopPlan {
+    fn drop(&mut self) {
+        self.run();
+    }
 }
 
 impl<K: Kick> IoThreads<K> {
@@ -122,11 +148,13 @@ impl<K: Kick> IoThreads<K> {
         );
         let mut io_threads = Self {
             vcpus: Arc::clone(&guest.vcpus),
-            source,
+            stop: StopPlan {
+                source,
+                actions: Vec::new(),
+            },
             console,
             threads: Vec::new(),
             finish_count,
-            stop_actions: Vec::new(),
         };
         if let Some(bridge) = bridge {
             io_threads.spawn("agent bridge", move |stop| bridge.run(&stop));
@@ -177,7 +205,7 @@ impl<K: Kick> IoThreads<K> {
     {
         let thread = IoThread::spawn(
             name,
-            self.source.token(),
+            self.stop.source.token(),
             &self.finish_count,
             Arc::clone(&self.vcpus),
             body,
@@ -192,7 +220,7 @@ impl<K: Kick> IoThreads<K> {
     /// such as a condition variable. The action must return at once.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn on_stop(&mut self, action: impl FnOnce() + Send + 'static) {
-        self.stop_actions.push(Box::new(action));
+        self.stop.actions.push(Box::new(action));
     }
 
     /// Requests the stop and joins every thread.
@@ -207,11 +235,8 @@ impl<K: Kick> IoThreads<K> {
     /// # Errors
     ///
     /// Errors with the first thread that did not stop in time.
-    pub(crate) fn stop(self) -> std::io::Result<()> {
-        self.source.request_stop();
-        for action in self.stop_actions {
-            action();
-        }
+    pub(crate) fn stop(mut self) -> std::io::Result<()> {
+        self.stop.run();
         let deadline = Instant::now() + STOP_TIMEOUT;
         self.console
             .kick_until_finished(&self.finish_count, deadline);
@@ -244,11 +269,13 @@ impl<K: Kick + 'static> IoThreads<K> {
         );
         Self {
             vcpus,
-            source,
+            stop: StopPlan {
+                source,
+                actions: Vec::new(),
+            },
             console,
             threads: Vec::new(),
             finish_count,
-            stop_actions: Vec::new(),
         }
     }
 }
@@ -382,6 +409,19 @@ mod tests {
             Arc::clone(vcpus),
             move |_| body(),
         )
+    }
+
+    // An unwind drops the threads without `stop`. They are still asked to stop,
+    // and the actions for the threads a token does not reach still run.
+    #[test]
+    fn dropping_the_threads_runs_their_stop() {
+        let mut threads = IoThreads::idle(vcpus());
+        let (ran, has_run) = std::sync::mpsc::channel();
+        threads.on_stop(move || ran.send(()).unwrap());
+        let token = threads.stop.source.token();
+        drop(threads);
+        assert!(has_run.try_recv().is_ok(), "the stop action did not run");
+        assert!(!token.sleep(Duration::from_secs(5)).unwrap());
     }
 
     #[test]

@@ -332,7 +332,7 @@ impl<K: Kick> Vcpus<K> {
                     if let Err(payload) = unwound {
                         exit.vcpus.report(Outcome::Failed(format!(
                             "vcpu{id}: panicked ({})",
-                            panic_message(&*payload)
+                            crate::panic_message(payload.as_ref())
                         )));
                     }
                 });
@@ -389,18 +389,6 @@ impl<K: Kick> Drop for ExitGuard<K> {
         self.vcpus.exited.fetch_add(1, Ordering::SeqCst);
         self.vcpus.stop_handle.wake();
     }
-}
-
-/// Returns the message a panic carried, from its payload.
-///
-/// A `panic!` carries a `&str` or a `String`, and any other payload reads as
-/// `unknown payload`.
-pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown payload".to_string())
 }
 
 /// The vCPU threads [`Vcpus::spawn`] started.

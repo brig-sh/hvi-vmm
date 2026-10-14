@@ -43,8 +43,9 @@ powered off or reset. `Requested` means the host asked the run to stop (see
 `boot` returns an error that names the vCPU and says how it failed.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
-guest, and nothing in hvi restarts one. If your integration wants a reboot,
-call `boot` again yourself.
+guest, and nothing in hvi restarts one. If your integration wants a reboot, call
+`boot` again yourself, from a thread of its own after a sandboxed run on Linux
+(see [Stopping a run from the host](#stopping-a-run-from-the-host)).
 
 The call blocks until the guest stops, a vCPU fails, or a stop is requested. It
 reads the process's stdin for the whole run, one byte at a time, as the guest
@@ -153,6 +154,38 @@ flushed, and `boot` returns `Stop::Requested`. A failure a thread reports, or a
 guest stop a vCPU reports, before `boot` reads how the run ended takes the place
 of `Stop::Requested`. A plugin asks for the same stop with
 `VmHandle::request_stop`.
+
+`hvi::spawn` does this for a caller that runs the guest beside its own work. It
+creates the pair, starts a thread that calls `boot` and returns a `Run` at once:
+
+```rust
+let run = hvi::spawn(cfg)?;
+// ...
+run.request_stop();
+let stop = run.wait()?;
+```
+
+`Run::wait` returns what `boot` returned, and `Run::is_finished` says whether
+the run has ended. A `BootConfig` whose `stop` is set keeps that stop, and
+`Run::stop_handle` returns a handle on it. Dropping a `Run` leaves the guest
+running until it stops on its own, and a process that exits before the run ends
+skips the terminal restore and the ledger flush, so call `wait` before
+returning. On Linux, `boot` installs its seccomp filter on the thread that calls
+it, which with `spawn` is the `run` thread. On macOS the Seatbelt profile
+confines the whole process, the thread that called `spawn` included, from the
+start of the run until the process exits.
+
+A process runs one guest at a time, since runs that overlap share stdin, the
+terminal settings, the stop signals and the seccomp state. `boot` refuses a run
+while another is in progress. It refuses every run after one that left a thread
+running or whose `boot` unwound from a panic, since what that run left behind
+still shares them.
+
+A sandboxed run leaves its confinement in place after `boot` returns. On Linux
+the `vmm` seccomp filter stays on the thread that called `boot`, and it refuses
+opening a file, so a later `boot` from that thread dies of `SIGSYS`. Start each
+sandboxed run from a thread of its own, as `spawn` does. On macOS the Seatbelt
+profile stays on the whole process.
 
 The library installs no handler for a stop signal. To stop the run on `SIGTERM`,
 `SIGINT` and `SIGHUP`, as the `hvi` binary does, call

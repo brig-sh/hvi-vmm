@@ -388,6 +388,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         });
     }
 
+    // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
+    // error goes back as `run_guest` returned it.
     run_guest(
         &shared.guest,
         &shared,

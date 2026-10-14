@@ -52,6 +52,12 @@ impl StopRegistration {
     pub(crate) fn into_handle(self) -> StopHandle {
         StopHandle(self.0)
     }
+
+    /// Returns a handle on the stop the registration belongs to, and keeps the
+    /// registration.
+    pub(crate) fn handle(&self) -> StopHandle {
+        StopHandle(Arc::clone(&self.0))
+    }
 }
 
 /// What [`Inner::first`] holds when a request without a signal came first.
@@ -244,6 +250,13 @@ impl Waker {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn registration_handle_shares_its_stop() {
+        let (handle, registration) = StopHandle::new_pair().unwrap();
+        registration.handle().request_stop();
+        assert!(handle.is_stop_requested());
+    }
 
     #[test]
     fn request_wakes_a_waiter_and_marks_the_handle() {

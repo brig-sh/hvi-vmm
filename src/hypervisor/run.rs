@@ -24,6 +24,7 @@
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -38,11 +39,85 @@ use crate::sync::try_lock_until;
 use crate::teardown::STOP_TIMEOUT;
 use crate::LOG_PREFIX;
 
+/// The slot every run of this process claims.
+pub(crate) static RUN_SLOT: RunSlot = RunSlot::new();
+
+/// What a [`RunSlot`] holds: no run.
+const FREE: u8 = 0;
+/// What a [`RunSlot`] holds: a run in progress.
+const HELD: u8 = 1;
+/// What a [`RunSlot`] holds: a run that left something behind, for good.
+const KEPT: u8 = 2;
+
+/// The one run a process has at a time.
+///
+/// Runs that overlap share stdin, the terminal settings, the stop signals and
+/// the seccomp state, so a run claims the slot as `boot` starts and releases it
+/// as `boot` returns. A run that left a thread running, or whose `boot` unwound
+/// from a panic, keeps the slot for the life of the process, since what it left
+/// behind still shares all of that.
+pub(crate) struct RunSlot(AtomicU8);
+
+impl RunSlot {
+    /// Returns a free slot.
+    pub(crate) const fn new() -> Self {
+        RunSlot(AtomicU8::new(FREE))
+    }
+
+    /// Claims the slot for a run.
+    ///
+    /// # Errors
+    ///
+    /// Errors while another run holds the slot, and once a run has kept it.
+    pub(crate) fn claim(&self) -> Result<RunClaim<'_>, &'static str> {
+        match self
+            .0
+            .compare_exchange(FREE, HELD, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Ok(RunClaim {
+                slot: self,
+                keep: false,
+            }),
+            Err(KEPT) => Err(
+                "an earlier run left a thread running or panicked, so this process cannot start another",
+            ),
+            Err(_) => Err("another run is in progress, and a process runs one guest at a time"),
+        }
+    }
+}
+
+/// A run's hold on a [`RunSlot`], which dropping it releases.
+pub(crate) struct RunClaim<'a> {
+    /// The slot this claim holds.
+    slot: &'a RunSlot,
+    /// Whether the run left a thread running.
+    keep: bool,
+}
+
+impl RunClaim<'_> {
+    /// Keeps the slot held after the run, which left a thread running.
+    pub(crate) fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for RunClaim<'_> {
+    fn drop(&mut self) {
+        let state = if self.keep || std::thread::panicking() {
+            KEPT
+        } else {
+            FREE
+        };
+        self.slot.0.store(state, Ordering::SeqCst);
+    }
+}
+
 /// The error of a run that left a thread running.
 ///
 /// It keeps the error that failed the run as it was, beside the thread left
 /// running, so [`BootError::get_ref`](crate::config::BootError::get_ref)
 /// returns the former. It reads as the error, then the thread.
+/// [`boot`](crate::boot) keeps the run's [`RunClaim`] when it sees one.
 #[derive(Debug)]
 pub(crate) struct LeftRunning {
     /// The error that failed the run.
@@ -63,6 +138,23 @@ impl fmt::Display for LeftRunning {
 impl std::error::Error for LeftRunning {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.error.source()
+    }
+}
+
+/// A guard that stops the VM if the thread that owns the stop unwinds from a
+/// panic.
+///
+/// The I/O threads stop as the run's `IoThreads` drops in the same unwind.
+struct StopOnUnwind<'a, K: Kick> {
+    /// The vCPUs the guard stops.
+    vcpus: &'a crate::hypervisor::vcpus::Vcpus<K>,
+}
+
+impl<K: Kick> Drop for StopOnUnwind<'_, K> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.vcpus.stop();
+        }
     }
 }
 
@@ -119,6 +211,11 @@ pub(crate) fn run_to_stop<K: Kick>(
     mut failure: Option<Box<dyn std::error::Error + Send + Sync>>,
     io_threads: IoThreads<K>,
 ) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    // A panic from here on stops the VM, and the I/O threads as `io_threads`
+    // drops, so the guest does not run on with nothing left to stop it.
+    let _unwind = StopOnUnwind {
+        vcpus: &guest.vcpus,
+    };
     let mut announced = 0;
     if failure.is_none() {
         let waited = guest.vcpus.wait_for_stop(|| {
@@ -511,6 +608,52 @@ mod tests {
         });
         assert_eq!(payload["reason"], "requested");
         assert_eq!(payload["signal"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn run_slot_refuses_an_overlapping_run() {
+        let slot = RunSlot::new();
+        let first = slot.claim().unwrap();
+        assert!(slot.claim().is_err());
+        drop(first);
+        drop(slot.claim().unwrap());
+    }
+
+    #[test]
+    fn run_slot_stays_held_after_a_run_left_a_thread_running() {
+        let slot = RunSlot::new();
+        slot.claim().unwrap().keep();
+        let error = slot
+            .claim()
+            .err()
+            .expect("a run after one left a thread running");
+        assert!(error.contains("left a thread running"), "{error}");
+    }
+
+    #[test]
+    fn run_slot_stays_held_after_a_run_panicked() {
+        let slot = std::sync::Arc::new(RunSlot::new());
+        let claimed = std::sync::Arc::clone(&slot);
+        let panicked = std::thread::spawn(move || {
+            let _claim = claimed.claim().unwrap();
+            panic!("the run panicked");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(slot.claim().is_err());
+    }
+
+    #[test]
+    fn unwind_stops_the_vcpus() {
+        let guest = guest(1);
+        let vcpus = Arc::clone(&guest.vcpus);
+        let unwound = std::thread::spawn(move || {
+            let _unwind = StopOnUnwind { vcpus: &vcpus };
+            panic!("the loop panicked");
+        })
+        .join();
+        assert!(unwound.is_err());
+        assert!(!guest.vcpus.is_running());
     }
 
     #[test]

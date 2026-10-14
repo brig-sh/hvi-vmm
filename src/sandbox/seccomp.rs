@@ -58,25 +58,26 @@
 //! Two filters, because the threads are not alike. `vcpu` is the tight one and
 //! it matters most: MMIO exits are serviced inline on the vCPU thread, so the
 //! virtio device models -- the code that parses guest descriptors -- run there.
-//! `vmm` covers the main thread, the host-side I/O threads (the console reader,
-//! the agent bridge and its per-connection readers, the tap and gateway
-//! readers, and the debug watchdog when it is enabled), the threads a plugin
-//! starts with `VmHandle::spawn` and the thread that receives the stop signals.
+//! `vmm` covers the thread that calls `boot`, the boot thread below, the
+//! host-side I/O threads (the console reader, the agent bridge and its
+//! per-connection readers, the tap and gateway readers, and the debug watchdog
+//! when it is enabled), the threads a plugin starts with `VmHandle::spawn` and
+//! the thread that receives the stop signals.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
 //!
 //! ```text
-//! main: acquire everything, spawn the I/O threads ─┐
+//! boot: acquire everything, spawn the I/O threads ─┐
 //!                     each I/O thread installs `vmm` at its start
-//! main: spawn the vCPU threads ────────────────────┤
+//! boot: spawn the vCPU threads ────────────────────┤
 //!                     each vCPU thread installs `vcpu` at its start
-//! main: install `vmm` on itself, then join ────────┘
+//! boot: install `vmm` on itself, then join ────────┘
 //! ```
 //!
 //! Nothing is ever spawned *underneath* a filter except the per-connection
 //! vsock readers, which the agent bridge creates and which correctly inherit
-//! `vmm`. Had the main thread instead installed its filter first and relied on
+//! `vmm`. Had the boot thread instead installed its filter first and relied on
 //! inheritance, every thread wanting a filter of its own would have needed
 //! `seccomp` allowed, which hands a compromised backend the ability to install
 //! filters. The order above costs nothing and avoids that.
@@ -104,7 +105,7 @@ use seccompiler::{BpfProgram, TargetArch};
 /// Which filter a thread installs on itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Thread {
-    /// The main thread and the host-side I/O threads.
+    /// The thread that calls `boot` and the host-side I/O threads.
     Vmm,
     /// A vCPU thread: KVM plus the device models it services inline.
     Vcpu,
@@ -213,8 +214,9 @@ thread_local! {
 /// filters compile first.
 ///
 /// Compiling here is the point: it turns "this distro's kernel headers spell a
-/// syscall differently" into a boot error on the main thread, where it can be
-/// reported, instead of a `SIGSYS` inside a device thread later on.
+/// syscall differently" into a boot error on the thread that calls `boot`,
+/// where it can be reported, instead of a `SIGSYS` inside a device thread later
+/// on.
 pub fn arm() -> io::Result<()> {
     for thread in [Thread::Vmm, Thread::Vcpu] {
         program(thread)?;
@@ -225,10 +227,10 @@ pub fn arm() -> io::Result<()> {
 
 /// Installs `thread`'s filter if [`arm`] was called, and aborts if it cannot.
 ///
-/// Called at the top of each thread hvi spawns *before* the main thread filters
-/// itself. Not called by the per-connection vsock readers: those are spawned by
-/// an already-filtered thread and correctly inherit its filter -- calling
-/// `seccomp` from under a filter that does not allow it would trap.
+/// Called at the top of each thread hvi spawns *before* the thread that calls
+/// `boot` filters itself. Not called by the per-connection vsock readers: those
+/// are spawned by an already-filtered thread and correctly inherit its filter.
+/// Calling `seccomp` from under a filter that does not allow it would trap.
 ///
 /// Aborting rather than returning an error is deliberate. There is no
 /// meaningful recovery inside a worker thread: continuing would run a
@@ -274,7 +276,8 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
 /// start.
 ///
 /// Each thread installs its own filter as it starts, with [`install_thread`].
-/// [`Filters::install`] installs the main thread's filter, last.
+/// [`Filters::install`] installs the filter of the thread that calls `boot`,
+/// last.
 pub(crate) struct Filters {
     /// The number of syscalls each filter allows, when the sandbox is on.
     counts: Option<(usize, usize)>,
@@ -305,12 +308,12 @@ impl Filters {
         self.counts.is_some()
     }
 
-    /// Filters the calling main thread and reports the confinement on stderr.
+    /// Filters the calling thread, the one that called `boot`, and reports the
+    /// confinement on stderr.
     ///
-    /// It must run once every thread the main thread spawns exists. That order
-    /// lets both allowlists refuse `seccomp` itself, since nothing is created
-    /// under a filter except the per-connection vsock threads, which inherit
-    /// it.
+    /// It must run once every thread that thread spawns exists. That order lets
+    /// both allowlists refuse `seccomp` itself, since nothing is created under
+    /// a filter except the per-connection vsock threads, which inherit it.
     ///
     /// # Errors
     ///
@@ -551,7 +554,8 @@ fn probes() -> Vec<Probe> {
             thread: Thread::Vmm,
             expect_ok: true,
             // `IoThreads::stop` ends the console reader's blocking read with
-            // the kick signal, sent from the main thread under this filter.
+            // the kick signal, sent from the thread that calls `boot` under
+            // this filter.
             run: || {
                 use crate::signal::{install_kick_handler, kick_signal};
                 install_kick_handler();
