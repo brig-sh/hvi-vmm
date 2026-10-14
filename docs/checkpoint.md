@@ -430,13 +430,16 @@ reason. Nothing is written to the bundle or the disk before the guest runs.
 ### Timings
 
 Measured with `tools/checkpoint-e2e.sh` on an Apple M5 Pro running macOS
-26.7, with an ext4 disk, the stub network and an agent socket. Three runs of
+26.7, with an ext4 disk, the stub network and an agent socket. Four runs of
 each, the range given. Each stat is defined in the script:
 
 | Guest | `pause_ms` | `capture_ms` | Bundle | Restore to restored-paused | Checkpoint request to resume reply |
 | --- | --- | --- | --- | --- | --- |
 | 2 vCPUs, 512 MiB | 2 to 3 | 251 to 341 | 92 to 95 MB | 347 to 393 ms | 606 to 743 ms |
-| 1 vCPU, 1024 MiB | 4 to 5 | 378 to 473 | 104 MB | 388 to 413 ms | 776 to 941 ms |
+| 1 vCPU, 1024 MiB | 3 to 5 | 378 to 586 | 104 MB | 388 to 413 ms | 776 to 989 ms |
+
+The fence reply to the resume reply is the restore's time plus well under a
+millisecond: the script starts `hvi restore` as soon as the fence replies.
 
 The restore's time is mostly reading the bundle twice: `Bundle::open` hashes
 every component, and the copy of RAM hashes `ram.bin` again as it reads it.
