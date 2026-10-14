@@ -21,7 +21,8 @@
 //! blocks `first` to `first + count - 1`, which are adjacent on the disk and
 //! start at byte `offset`. `sha256` is the digest of those bytes. A batch
 //! holds at most [`BATCH_BLOCKS`] blocks, and a line with a `"v"` key, the
-//! op's reply, ends the stream.
+//! op's reply, ends the stream. The reply's `sent_sha256` is the SHA-256 of
+//! the batches' `sha256` texts in order (see [`Exported::sent_sha256`]).
 //!
 //! Each block is read with the device's lock held, one block at a time, so
 //! the guest's I/O waits for one 64 KiB read at most. A block the guest
@@ -73,7 +74,7 @@ pub struct BatchHeader {
 }
 
 /// What an export sent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Exported {
     /// The blocks.
     pub blocks: u64,
@@ -84,6 +85,11 @@ pub struct Exported {
     /// The longest the device's lock was held for one block, in
     /// microseconds, from taking it to releasing it.
     pub max_lock_us: u64,
+    /// The stream's digest, as lowercase hex: the SHA-256 of every batch
+    /// header's `sha256` text, in order, with nothing between them. A
+    /// reader that hashes the digests of the batches it applied the same
+    /// way shows it applied every batch, in order.
+    pub sent_sha256: String,
 }
 
 /// Refuses `blocks` unless every block is on a disk of `total` blocks and
@@ -141,6 +147,7 @@ pub(crate) fn export(
     out: &mut dyn FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<Exported> {
     let mut sent = Exported::default();
+    let mut stream = Sha256::new();
     let mut buf = Vec::with_capacity((BATCH_BLOCKS * DIRTY_BLOCK_BYTES) as usize);
     for (number, (first, count)) in (0u64..).zip(batches(blocks)) {
         buf.clear();
@@ -168,6 +175,7 @@ pub(crate) fn export(
             size: buf.len() as u64,
             sha256: hex(&Sha256::digest(&buf)),
         };
+        stream.update(header.sha256.as_bytes());
         let mut line = serde_json::to_vec(&header).map_err(io::Error::other)?;
         line.push(b'\n');
         out(&line)?;
@@ -176,6 +184,7 @@ pub(crate) fn export(
         sent.bytes += buf.len() as u64;
         sent.batches += 1;
     }
+    sent.sent_sha256 = hex(&stream.finalize());
     Ok(sent)
 }
 
@@ -262,6 +271,7 @@ mod tests {
             [0, 1, 2, 3, 4]
         );
         assert_eq!(headers[4].size, 512);
+        let chain: String = headers.iter().map(|h| h.sha256.as_str()).collect();
         assert_eq!(
             sent,
             Exported {
@@ -269,6 +279,7 @@ mod tests {
                 bytes: 23 * DIRTY_BLOCK_BYTES + 512,
                 batches: 5,
                 max_lock_us: sent.max_lock_us,
+                sent_sha256: hex(&Sha256::digest(chain.as_bytes())),
             }
         );
         for block in 0..=40u64 {

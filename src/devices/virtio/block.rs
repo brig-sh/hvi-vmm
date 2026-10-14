@@ -39,7 +39,9 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use crate::checkpoint::bundle::hex;
 use crate::memory::GuestRam;
 
 use crate::devices::irq::{Irq, IrqLine};
@@ -232,6 +234,17 @@ pub struct DiskRound {
     pub generation: u64,
     /// The number of blocks the round holds.
     pub blocks: u64,
+    /// The SHA-256 of the round's bitmap, the bytes `disk-dirty` returned
+    /// as `bitmap_b64`, as lowercase hex: a destination that hashes the
+    /// bitmap it applied shows it applied the set the source read.
+    #[serde(default)]
+    pub bitmap_sha256: Option<String>,
+    /// The digest of the round's `disk-blocks` stream, as its reply gives
+    /// it in `sent_sha256`, once `{"round":k}` sent the round whole before
+    /// the next read; `null` until then, and for a round streamed after
+    /// the capture.
+    #[serde(default)]
+    pub sent_sha256: Option<String>,
 }
 
 /// What [`VirtioBlk::read_dirty`] returns.
@@ -243,6 +256,8 @@ pub struct DirtyRead {
     pub generation: u64,
     /// The blocks.
     pub dirty: DirtyBlocks,
+    /// The SHA-256 of the bitmap's bytes, as lowercase hex.
+    pub bitmap_sha256: String,
 }
 
 /// The dirty blocks a virtio-blk device keeps for a move.
@@ -640,17 +655,34 @@ impl VirtioBlk {
                 (round, self.dirty.since_read.take())
             }
         };
+        let bitmap_sha256 = hex(&Sha256::digest(dirty.as_bytes()));
         self.dirty.rounds.push(DiskRound {
             round,
             generation: self.generation,
             blocks: dirty.count(),
+            bitmap_sha256: Some(bitmap_sha256.clone()),
+            sent_sha256: None,
         });
         self.dirty.last = Some(dirty.clone());
         Ok(DirtyRead {
             round,
             generation: self.generation,
             dirty,
+            bitmap_sha256,
         })
+    }
+
+    /// Records that `disk-blocks` sent round `round` whole, with the stream
+    /// digest `sent_sha256`, when it is still the last round read. Returns
+    /// whether it was.
+    pub fn record_sent(&mut self, round: u32, sent_sha256: String) -> bool {
+        match self.dirty.rounds.last_mut() {
+            Some(last) if last.round == round => {
+                last.sent_sha256 = Some(sent_sha256);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Returns the length of block `block` of the disk: [`DIRTY_BLOCK_BYTES`],
@@ -2043,26 +2075,24 @@ mod dirty_tests {
         let r2 = blk.read_dirty(DirtySince::Round).unwrap();
         assert_eq!((r2.round, r2.dirty.count()), (2, 0));
         assert_eq!(set(blk.dirty_since_boot()), [1, 2]);
-        assert_eq!(
-            blk.rounds(),
-            [
-                DiskRound {
-                    round: 0,
-                    generation: 1,
-                    blocks: 1
-                },
-                DiskRound {
-                    round: 1,
-                    generation: 3,
-                    blocks: 1
-                },
-                DiskRound {
-                    round: 2,
-                    generation: 3,
-                    blocks: 0
-                },
-            ]
-        );
+        let listed: Vec<(u32, u64, u64)> = blk
+            .rounds()
+            .iter()
+            .map(|r| (r.round, r.generation, r.blocks))
+            .collect();
+        assert_eq!(listed, [(0, 1, 1), (1, 3, 1), (2, 3, 0)]);
+        // Each round records its bitmap's digest, and is sent once a
+        // disk-blocks of it says so, only while it is the last round.
+        for (listed, read) in blk.rounds().iter().zip([&r0, &r1, &r2]) {
+            let want = hex(&Sha256::digest(read.dirty.as_bytes()));
+            assert_eq!(read.bitmap_sha256, want);
+            assert_eq!(listed.bitmap_sha256.as_ref(), Some(&want));
+            assert_eq!(listed.sent_sha256, None);
+        }
+        assert!(!blk.record_sent(1, "11".repeat(32)));
+        assert!(blk.record_sent(2, "22".repeat(32)));
+        assert_eq!(blk.rounds()[2].sent_sha256, Some("22".repeat(32)));
+        assert_eq!(blk.rounds()[1].sent_sha256, None);
 
         // Reading since boot again starts the rounds over, and clears the
         // writes since the last read: round 0 already holds them.
