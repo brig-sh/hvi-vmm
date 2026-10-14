@@ -30,6 +30,12 @@
 //!
 //! On Linux the signing step does not apply; the binary needs `/dev/kvm`.
 //!
+//! On Linux, `main` first calls `hvi::sandbox::seccomp::one_malloc_arena()`,
+//! before any thread starts. Keep that call when you copy this file. It boots
+//! with `sandbox: true`, and without the call glibc's malloc can open a file
+//! from a filtered thread, which the seccomp filter answers by killing the
+//! process with `SIGSYS`.
+//!
 //! It demonstrates the six rules that fail quietly:
 //!
 //! 1. `safepoint` runs between guest entries, so the nothing-to-do case is one
@@ -219,6 +225,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // First, while this is the only thread: the boot below is confined, and
+    // glibc's malloc must stay on one arena under the seccomp filters.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
+        eprintln!("watch_guest: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = run() {
         eprintln!("watch_guest: {e}");
         std::process::exit(1);
