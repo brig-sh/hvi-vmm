@@ -24,6 +24,7 @@ Four journeys. Start at the one that matches what you are doing.
 | --- | --- |
 | [architecture.md](architecture.md) | Backends, boot protocols, the device model, guest memory, and concurrency. |
 | [embedding.md](embedding.md) | Linking hvi as a library: `BootConfig`, `hvi::boot`, `hvi::spawn`, and the process-global configuration outside it. |
+| [checkpoint.md](checkpoint.md) | Capturing a guest into a bundle on the control socket: the bundle format, the capture, the fence, what is captured today and what is not, and the clock policy. |
 | [plugins.md](plugins.md) | The `Plugin` / `VmHandle` / `CpuHandle` / `IoSink` contract, hook ordering, and the six rules that fail quietly. |
 | [security.md](security.md) | The threat model, what confinement does and does not do, and the residual risks. |
 | [limitations.md](limitations.md) | Every known limit in one place, with its consequence and whether it is a defect or a design choice. |
