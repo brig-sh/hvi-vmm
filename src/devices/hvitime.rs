@@ -213,6 +213,7 @@ pub trait TimerLine: Send + Sync {
 ///
 /// It is also the `page` part of the canonical checkpoint state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PageState {
     /// The sequence count: even when the page is stable, and 2 more at every
     /// publish.
@@ -247,6 +248,7 @@ impl PageState {
 
 /// One vCPU's timer in the canonical checkpoint state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CpuTimerState {
     /// The armed deadline in guest ns, or `None` when disarmed.
     pub deadline_ns: Option<u64>,
@@ -259,6 +261,7 @@ pub struct CpuTimerState {
 /// The canonical checkpoint state of `hvi-time` (`platform.json`, `timer`,
 /// kind `hvi-time`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HviTimeState {
     /// The page the guest was reading.
     pub page: PageState,

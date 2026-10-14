@@ -659,6 +659,7 @@ fn fill_hvf(p: &mut MachineProfile) {
 const RESTORER: Restorer = Restorer {
     arch: GuestArch::Aarch64,
     backend: "hvf",
+    profiles: &["native"],
     irq_kinds: &["hv-gic-v3"],
     timer_kinds: &["arch-timer"],
     adjunct: Some(HVF_GIC_STATE),
@@ -691,6 +692,12 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         restore::open(std::path::Path::new(&cfg.from)).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source = opened.profile();
     let mut why = restore::refusals(&opened, &cfg, &RESTORER);
+    // A machine this restore does not rebuild is refused for that alone:
+    // set against the native machine below, every part of its profile
+    // would read as a difference.
+    if !RESTORER.profiles.contains(&source.profile.as_str()) {
+        return Err(Box::new(Refused(why)));
+    }
     let ram_size = match source.ram_regions.as_slice() {
         [region] if region.gpa == RAM_BASE => Some(region.size),
         _ => {

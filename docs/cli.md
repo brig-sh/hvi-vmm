@@ -241,7 +241,8 @@ before it creates anything, and otherwise brings the guest up
 Each flag needs exactly what the guest had: the network mode and the
 devices are part of the machine it was built against. `--net-tap` is not
 taken. The kernel, initramfs, command line, vCPU count and RAM size come
-from the bundle.
+from the bundle. A bundle of a `--profile portable-arm64-v1` guest is
+refused: no backend restores the portable profile yet.
 
 ## `dump-fdt`
 
