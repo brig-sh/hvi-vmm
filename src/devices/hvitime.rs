@@ -149,6 +149,7 @@ mod page {
     pub const WALL_NS: usize = 0x28;
     pub const DOWNTIME_TOTAL_NS: usize = 0x30;
     pub const FLAGS: usize = 0x38;
+    pub const HOST_SLEEPS: usize = 0x3c;
 }
 
 /// Timer register offsets within a vCPU's block.
@@ -390,8 +391,15 @@ pub struct PageState {
     /// `base_ns`: the guest's wall clock is `wall_ns` plus the guest
     /// nanoseconds since `base_ns`.
     pub wall_ns: u64,
-    /// How long the guest has been stopped across restores, in total.
+    /// How long the guest has been stopped across restores and host
+    /// sleeps, in total.
     pub downtime_total_ns: u64,
+    /// How many of the publishes so far followed a host sleep. The guest
+    /// driver counts the publishes it handles, and tells the host-sleep
+    /// ones from the restores by this count. A restore carries it on. A
+    /// state without it reads as 0.
+    #[serde(default)]
+    pub host_sleeps: u32,
 }
 
 impl PageState {
@@ -558,7 +566,9 @@ impl PvclockPage {
             .store(state.wall_ns, Ordering::Relaxed);
         self.u64_at(page::DOWNTIME_TOTAL_NS)
             .store(state.downtime_total_ns, Ordering::Relaxed);
-        self.u64_at(page::FLAGS).store(0, Ordering::Relaxed);
+        self.u32_at(page::FLAGS).store(0, Ordering::Relaxed);
+        self.u32_at(page::HOST_SLEEPS)
+            .store(state.host_sleeps, Ordering::Relaxed);
         // Every field is visible before the even generation.
         fence(Ordering::Release);
         generation.store(state.generation, Ordering::Relaxed);
@@ -578,6 +588,7 @@ impl PvclockPage {
                 shift: self.u32_at(page::SHIFT).load(Ordering::Relaxed),
                 wall_ns: self.u64_at(page::WALL_NS).load(Ordering::Relaxed),
                 downtime_total_ns: self.u64_at(page::DOWNTIME_TOTAL_NS).load(Ordering::Relaxed),
+                host_sleeps: self.u32_at(page::HOST_SLEEPS).load(Ordering::Relaxed),
             };
             fence(Ordering::Acquire);
             if generation & 1 == 0
@@ -736,6 +747,7 @@ impl HviTime {
                     shift: SHIFT,
                     wall_ns: 0,
                     downtime_total_ns: 0,
+                    host_sleeps: 0,
                 },
                 timers: vec![Timer::RESET; vcpus],
                 frozen: false,
@@ -771,6 +783,7 @@ impl HviTime {
             shift: SHIFT,
             wall_ns: self.host.realtime_ns(),
             downtime_total_ns: 0,
+            host_sleeps: 0,
         };
         self.page.publish(&g.clock);
         g.slept_at_publish = self.host.slept_ns();
@@ -1027,6 +1040,7 @@ impl HviTime {
             // since base_ns: the host's wall clock now.
             wall_ns: wall.wrapping_sub(now.wrapping_sub(g.clock.base_ns)),
             downtime_total_ns: g.clock.downtime_total_ns.saturating_add(behind),
+            host_sleeps: g.clock.host_sleeps.wrapping_add(1),
             ..g.clock
         };
         self.page.publish(&g.clock);
@@ -1153,6 +1167,7 @@ impl HviTime {
             shift: SHIFT,
             wall_ns: wall,
             downtime_total_ns: state.page.downtime_total_ns.saturating_add(downtime),
+            host_sleeps: state.page.host_sleeps,
         };
         self.page.publish(&g.clock);
         g.slept_at_publish = self.host.slept_ns();
@@ -1887,6 +1902,7 @@ mod tests {
             shift: generation % 32,
             wall_ns: g * 13,
             downtime_total_ns: g * 17,
+            host_sleeps: generation.wrapping_mul(19),
         }
     }
 
@@ -1953,6 +1969,7 @@ mod tests {
             shift: 24,
             wall_ns: 0x3333,
             downtime_total_ns: 0x4444,
+            host_sleeps: 0x55,
         });
         // SAFETY: reading the live mapping.
         let bytes = unsafe { std::slice::from_raw_parts(page.host_ptr(), 0x40) };
@@ -1969,7 +1986,8 @@ mod tests {
         assert_eq!(le32(0x24), 24);
         assert_eq!(le64(0x28), 0x3333);
         assert_eq!(le64(0x30), 0x4444);
-        assert_eq!(le64(0x38), 0);
+        assert_eq!(le32(0x38), 0);
+        assert_eq!(le32(0x3c), 0x55);
     }
 
     #[test]
@@ -1999,6 +2017,7 @@ mod tests {
             "\"shift\"",
             "\"wall_ns\"",
             "\"downtime_total_ns\"",
+            "\"host_sleeps\"",
             "\"guest_ns_at_capture\"",
             "\"cpus\"",
             "\"deadline_ns\":null",
@@ -2291,6 +2310,7 @@ mod tests {
             host.realtime() - (dev.now_ns() - page.base_ns)
         );
         assert_eq!(page.downtime_total_ns, 30_000_000_000);
+        assert_eq!((before.host_sleeps, page.host_sleeps), (0, 1));
         assert_eq!(guest_wall(&dev), host.realtime());
         // Both vCPUs are told; the enabled one's line goes high, and its
         // deadline is left as it was.
@@ -2408,6 +2428,10 @@ mod tests {
             .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
             .is_none());
         assert_eq!(dev.page().read().generation, state.page.generation + 2);
+        // The restore carries the host-sleep count on, so the driver's
+        // count of the publishes since stays right.
+        assert_eq!(state.page.host_sleeps, 1);
+        assert_eq!(dev.page().read().host_sleeps, 1);
     }
 
     // The timer thread looks at the sleep clock at least once a second,

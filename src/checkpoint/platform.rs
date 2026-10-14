@@ -762,6 +762,7 @@ pub(crate) mod tests {
                 shift: 24,
                 wall_ns: 1_000,
                 downtime_total_ns: 0,
+                host_sleeps: 0,
             },
             guest_ns_at_capture: 5_000,
             counter_at_capture: 280,
