@@ -150,8 +150,7 @@ pub enum Slot {
 /// How a checked register's value is compared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Check {
-    /// A firmware register, under `firmware` by name, compared by what the
-    /// guest sees of it (see [`firmware_view`]).
+    /// A firmware register, under `firmware` by name, which must be equal.
     Firmware(&'static str),
     /// A register only KVM has, under `fixed` by name: the bits of `mask`
     /// must be equal, and a state from HVF, which cannot carry the
@@ -223,32 +222,18 @@ pub const FIRMWARE: [(u64, &str); 7] = [
 
 /// The firmware registers' values for a portable guest on HVF, whose PSCI
 /// and SMCCC answers mirror KVM's on the Pi (`portable::smccc_arch_features`):
-/// PSCI 1.1, workaround 1 not required (2), workaround 2 not supported (0),
-/// workaround 3 available (1), and no firmware services.
+/// PSCI 1.1, workaround 1 not required (2), workaround 2 not required (3),
+/// workaround 3 available (1), and no firmware services. They are the
+/// values a portable vCPU on rp2 reads, once the baseline hides SSBS.
 pub const PORTABLE_HVF_FIRMWARE: [(&str, u64); 7] = [
     ("PSCI_VERSION", 0x1_0001),
     ("SMCCC_ARCH_WORKAROUND_1", 2),
-    ("SMCCC_ARCH_WORKAROUND_2", 0),
+    ("SMCCC_ARCH_WORKAROUND_2", 3),
     ("SMCCC_ARCH_WORKAROUND_3", 1),
     ("STD_BMAP", 0),
     ("STD_HYP_BMAP", 0),
     ("VENDOR_HYP_BMAP", 0),
 ];
-
-/// Returns a firmware register's value as the guest sees it, so that two
-/// that look the same to a guest compare equal.
-///
-/// Workaround 2's register reads 0 (not available) on a native vCPU on the
-/// Pi and 3 (not required) once the portable baseline is written (measured
-/// on rp2); either way a guest never calls the workaround, so both read as
-/// "not called" here.
-#[must_use]
-pub fn firmware_view(name: &str, value: u64) -> u64 {
-    match (name, value) {
-        ("SMCCC_ARCH_WORKAROUND_2", 0 | 3) => 0,
-        _ => value,
-    }
-}
 
 /// The registers only KVM lists that a guest cannot change, or keeps at one
 /// value, by encoding. Measured on rp2; see the module documentation.
@@ -340,11 +325,11 @@ pub fn classify(id: u64) -> Class {
 fn classify_core(id: u64) -> Class {
     let word = id & 0xffff;
     let size = id & !(COPROC_MASK | 0xffff);
-    if size == ARM64 | SIZE_U64 && word < 0x3e && word % 2 == 0 {
+    if size == ARM64 | SIZE_U64 && word < 0x3e && word.is_multiple_of(2) {
         return Class::Shared(Slot::X((word / 2) as u8));
     }
     if size == ARM64 | SIZE_U128 && (0x54..0x54 + 4 * AARCH64_SIMD_REGS as u64).contains(&word) {
-        return if (word - 0x54) % 4 == 0 {
+        return if (word - 0x54).is_multiple_of(4) {
             Class::Shared(Slot::Q(((word - 0x54) / 4) as u8))
         } else {
             Class::Refused("not the start of a SIMD register")
@@ -586,16 +571,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn firmware_compares_by_what_the_guest_sees() {
-        assert_eq!(
-            firmware_view("SMCCC_ARCH_WORKAROUND_2", 0),
-            firmware_view("SMCCC_ARCH_WORKAROUND_2", 3)
-        );
-        assert_ne!(
-            firmware_view("SMCCC_ARCH_WORKAROUND_2", 0),
-            firmware_view("SMCCC_ARCH_WORKAROUND_2", 1)
-        );
+    fn hvf_answers_as_a_portable_vcpu_on_the_pi() {
         // The portable vCPU's measured values are the ones HVF mirrors.
+        let mut seen = 0;
         for (_, id, value) in fixture().into_iter().filter(|r| r.0 == "portable") {
             if let Class::CheckedEqual(Check::Firmware(name)) = classify(id) {
                 let value = u64::from_str_radix(value, 16).unwrap();
@@ -604,12 +582,10 @@ pub(crate) mod tests {
                     .find(|(n, _)| *n == name)
                     .unwrap()
                     .1;
-                assert_eq!(
-                    firmware_view(name, value),
-                    firmware_view(name, hvf),
-                    "{name}"
-                );
+                assert_eq!(value, hvf, "{name}");
+                seen += 1;
             }
         }
+        assert_eq!(seen, PORTABLE_HVF_FIRMWARE.len());
     }
 }
