@@ -11,9 +11,12 @@ guest of the same configuration the same devicetree, byte for byte. A guest
 kernel with the `hvi,time-v1` driver keeps time in nanoseconds on both hosts,
 although the counter under it runs at 24 MHz on Apple silicon and at 54 MHz
 on the Pi. Checkpoint and restore are not implemented yet, so a guest cannot
-move between hosts in this increment; the device's state and its restore
-are, and a test hook exercises the restore in one process (see
-[Restore](#restore)). The x86-64 KVM backend refuses the profile.
+move between hosts in this increment. The pieces a checkpoint needs exist
+and are tested: the `hvi-time` state and its restore, the software GICv2's
+state, and the import and export of KVM's vGICv2 in that same form (see
+[Capture and restore on KVM](#capture-and-restore-on-kvm)). A test hook
+exercises the restore in one process (see [Restore](#restore)); nothing
+writes a checkpoint yet. The x86-64 KVM backend refuses the profile.
 
 The default, `--profile native`, is unchanged: the host's own CPU features and,
 on macOS, Apple's in-kernel GICv3.
@@ -163,6 +166,44 @@ The canonical checkpoint form is `Gicv2State` in `devices/gicv2.rs`: the
 distributor's registers for all 256 interrupts (the slots of interrupts 0-31
 are zero there) and, for each CPU, its interface and its banked state for
 interrupts 0-31, with the source CPUs of each pending SGI.
+
+### Capture and restore on KVM
+
+`arch/aarch64/vgicv2.rs` reads KVM's vGICv2 into `Gicv2State` and writes
+one back, through the `KVM_DEV_ARM_VGIC_GRP_DIST_REGS` and
+`KVM_DEV_ARM_VGIC_GRP_CPU_REGS` attributes. Every vCPU must be out of
+`KVM_RUN` meanwhile; KVM answers `EBUSY` otherwise. What KVM's userspace
+view (Linux 6.12, `arch/arm64/kvm/vgic/`) makes the conversion do:
+
+- The import writes `GICD_IIDR` first, because KVM drops `GICD_IGROUPR`
+  writes until it has seen one. It then writes group, configuration,
+  priorities and targets, then clears each enable, active and pending set
+  with all-ones before it sets the state's, so it is exact on a vGIC that
+  has already run.
+- A `GICD_ISPENDR` write to an SGI makes the writer its only source, so SGIs
+  go through `GICD_SPENDSGIR` with their source CPUs.
+- `GICD_ISPENDR` reads latch OR line for a level interrupt. The export
+  takes the line levels from hvi's devices and leaves them out of the
+  latch. A level interrupt whose latch and line are both set comes out with
+  the line only: the one loss.
+- After the registers, the import sets the lines hvi drives with
+  `KVM_IRQ_LINE`: the level SPIs, and PPI 20 of each vCPU. KVM ignores a
+  line it owns itself (its timers, the PMU), so a state with another PPI's
+  line high is refused.
+- `GICC_PMR` is its five priority bits, shifted right by 3. A GICv2 host has
+  `GICC_APR0` only, so a state with `GICC_APR1-3` set is refused.
+  `GICC_BPR` and `GICC_ABPR` read 0 from a fresh vCPU; the export gives the
+  guest's view, 2 and 3.
+- The import reads every register back and refuses the state, naming each
+  register, when one differs.
+
+An ignored test (`a_gicv2_state_round_trips_through_kvm`, run on rp2 with
+`--ignored`) loads a busy state from the software model into a 2-vCPU
+vGICv2: pending edge and level SPIs, a level line, SGIs from both CPUs, an
+active interrupt and its `GICC_APR0` bit, and one CPU's `hvi-time` line.
+231 registers read back as written and the export equals the state. On
+KVM, `HVI_TIME_TEST_RESTORE` also exports the live guest's vGIC while the
+vCPUs are held, imports it back and exports it again.
 
 ### Delivery on Hypervisor.framework
 
@@ -362,7 +403,9 @@ Checkpoints do not exist yet. `HVI_TIME_TEST_RESTORE=<at>,<downtime>` runs
 the restore in one process: at `<at>` seconds it pauses the vCPUs, freezes
 and captures the device, holds the guest for `<downtime>` seconds, restores
 and resumes. It shows everything a same-host restore shows. A change of
-counter rate needs two hosts.
+counter rate needs two hosts. On KVM it also round-trips the vGIC while the
+guest is held, which logs `vGICv2 round trip while held: 231 registers read
+back as written`.
 
 ### Clock policy
 
@@ -371,6 +414,10 @@ counter rate needs two hosts.
   restore.
 - **REALTIME** follows the host's clock at boot (the driver sets it from
   `wall_ns` when the guest's clock still reads 1970) and after each restore.
+  The boot set is an `fs_initcall_sync`, after timekeeping has switched to
+  `hvi-time`: set earlier, while timekeeping still reads the jiffies
+  clocksource, the switch carries the time over in whole jiffies, and
+  REALTIME started up to 4 ms off the host.
   In between it runs on the host's counter, not on the host's disciplined
   clock, so it drifts from the host by the counter's error. Fitted over
   four 85 s boots against host timestamps with about 1 ms of jitter: -8 to
@@ -465,6 +512,27 @@ The restore test (`HVI_TIME_TEST_RESTORE=27,5`) on each host, across the
 The stock 6.12.95 kernel with `--arch-timer-irq --cpus 2` boots and ticks
 on both hosts: `TICK 19` at `date=57`, `sleep 5` from `uptime` 60.22 to
 65.22.
+
+The tables above are from the first portable Image. Its driver set the
+wall clock before the clocksource switch, and the restore then moved the
+clock by about 1 ms more than the downtime (5001383267 ns against
+5000096767 ns on the Pi). The current Image (sha256 `32725b9b…`, Linux
+`6.12.95-00002-g4cfd86639cc9`) sets it after the switch, and was booted
+again on both hosts, with the console stamped to the microsecond, with hvi
+built at the commit that adds the vGICv2 import:
+
+| Check | Mac | Pi |
+| --- | --- | --- |
+| Boot order | `Switched to clocksource hvi-time` at 0.024 s, `hvi-time: wall clock` at 0.028 s | 0.047 s, then 0.057 s |
+| Guest REALTIME minus host stamp, every `CLOCKS` and `EL0CHECK` line, 1 vCPU | -0.19 to -0.97 ms | -0.42 to -3.03 ms |
+| The same, 2 vCPUs | -0.18 to -2.54 ms | -0.37 to -1.39 ms |
+| Restore, 2 vCPUs: wall clock moved against the downtime | 5004273946 ns against 5004274196 ns | 5000800163 ns against 5000800219 ns |
+| Restore: host, REALTIME, MONOTONIC across the hold | 10.006885, 10.006528, 5.002255 s | 10.004107, 10.003894, 5.003094 s |
+| `dtb_sha256`, 1 and 2 vCPUs | `d8975a56…`, `ffe55778…` | the same |
+
+No line has the guest ahead of the host. Each stamp is taken after the
+guest printed its line, so a correct clock reads at or before it, and the
+console path's latency makes the guest look further behind than it is.
 
 ## Limits
 
