@@ -170,6 +170,13 @@ last, under a temporary name, syncs it, renames it into place and syncs the
 directory. So a directory without `manifest.json` is not a bundle, whatever
 else is in it. A capture that fails before the seal removes what it wrote.
 
+The writer refuses what the reader below would refuse. A component larger
+than the reader's limit for it, or a manifest that fails the reader's checks,
+fails the capture with `capture_failed` before the seal, while the VM can
+still run on. Without this, a fenced source could seal a bundle that no
+restore opens, and the session would be lost. The vsock device can reach
+such a size: `devices.json` writes every byte it holds as a JSON number.
+
 The reader trusts nothing in the directory:
 
 - It reads the manifest only up to 1 MiB.
