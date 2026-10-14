@@ -584,9 +584,17 @@ there with the same flags. What carries over:
 The bundle's hvi commit must equal the destination's, so build both hosts
 from one commit.
 
-hvi has been run with a portable bundle restored on the host that took it,
-on the Mac and on a Pi 5 (`tools/checkpoint-e2e.sh --portable`); a move
-from one host to the other has not been run yet.
+Run so far: a portable bundle restored on the host that took it, on the
+Mac and on a Pi 5 (`tools/checkpoint-e2e.sh --portable`), and one move each
+way between an Apple M5 Pro and a Pi 5 by hand: a 1-vCPU, 512 MiB guest
+with an ext4 disk and the stub network, fenced, copied with `rsync --sparse`
+(the bundle is 95 MB) and restored with the same flags, under Seatbelt and
+seccomp. In both, the guest's count went on by one, the `awk` sum went on
+exact, no boot banner appeared, `hvi-time` was published at the
+destination's rate (24 MHz to 54 MHz and back) and the guest's wall clock
+read the host's second. The downtime was the copy: 204 s from the Mac to
+the Pi over the tailnet, 33 s back. The end-to-end script's checks have
+not been run across hosts.
 
 ### Timings
 
