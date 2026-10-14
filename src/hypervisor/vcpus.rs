@@ -130,8 +130,8 @@ struct WorkTable {
 
 /// What the control thread asks of every vCPU.
 #[derive(Clone)]
-// `hvi restore` posts `Import`; until it exists, only the tests do.
-#[allow(dead_code)]
+// Only the HVF restore posts `Import` so far.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 enum WorkRequest {
     /// Each vCPU writes its state.
     Export,
@@ -319,8 +319,8 @@ impl<K: Kick> Vcpus<K> {
     /// Asks every vCPU to carry out `step` of a restore from `plan`, its
     /// own state by index, at its checkpoint, and wakes the ones parked
     /// already.
-    // `hvi restore` is the caller; until it exists, only the tests are.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Only the HVF restore calls it so far.
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
     pub(crate) fn request_import(&self, step: ImportStep, plan: Arc<ImportPlan>) {
         self.post(WorkRequest::Import(step, plan));
     }

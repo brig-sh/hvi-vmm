@@ -38,7 +38,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint::cpu::arch_name;
+use crate::checkpoint::cpu::{arch_name, MAX_VCPUS};
 use crate::checkpoint::profile::sha256_hex;
 use crate::plugin::GuestArch;
 
@@ -396,6 +396,12 @@ impl PlatformState {
 impl GicV3State {
     /// See [`PlatformState::check`].
     fn check(&self, vcpus: u32) -> Result<(), String> {
+        // Bounded before the per-vCPU tables below are allocated by it.
+        if vcpus == 0 || vcpus as usize > MAX_VCPUS {
+            return Err(format!(
+                "irq: a machine of {vcpus} vCPUs, and a GIC state covers 1 to {MAX_VCPUS}"
+            ));
+        }
         if self.version != 3 {
             return Err(format!("irq: GIC version {}, not 3", self.version));
         }
@@ -527,7 +533,7 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -685,6 +691,10 @@ mod tests {
         refused(&|g| g.redist[1].vcpu = 0, "redist lists vCPU 0 twice");
         refused_on(&|_| {}, 1, "redist lists vCPU 1, and the machine has 1");
         refused(&|g| g.icc[0].vcpu = 9, "icc lists vCPU 9");
+        // A count from a document is bounded before anything is allocated
+        // by it.
+        refused_on(&|_| {}, u32::MAX, "a machine of 4294967295 vCPUs");
+        refused_on(&|_| {}, 0, "a machine of 0 vCPUs");
         refused(
             &|g| {
                 g.redist[0].ipriorityr.pop();
@@ -712,12 +722,12 @@ mod tests {
 
     #[test]
     fn base64_round_trips_and_refuses_what_it_would_not_write() {
-        for data in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+        for data in [&b""[..], b"h", b"hv", b"hvi", b"hvi-", b"hvi-v", b"hvi-vm"] {
             let text = base64_encode(data);
             assert_eq!(base64_decode(&text).as_deref(), Some(data), "{text}");
         }
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"hvi-vm"), "aHZpLXZt");
+        assert_eq!(base64_encode(b"hv"), "aHY=");
         let all: Vec<u8> = (0..=255).collect();
         assert_eq!(base64_decode(&base64_encode(&all)).unwrap(), all);
         for bad in [

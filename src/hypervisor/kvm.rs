@@ -288,7 +288,7 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_to_stop` returned it.
-    run_to_stop(guest, threads, failure, io_threads)
+    run_to_stop(guest, threads, failure, Some(io_threads))
 }
 
 /// Runs vCPU `cpu` on the calling thread until the VM stops.

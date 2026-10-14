@@ -89,6 +89,11 @@ pub enum VmState {
     Running,
     /// The I/O threads are held and the vCPUs parked.
     Paused,
+    /// Paused as `hvi restore` leaves a guest it loaded from a bundle: every
+    /// vCPU and the interrupt controller hold the bundle's state, and the
+    /// guest has not run here yet. `resume` runs it, as from `paused`.
+    #[serde(rename = "restored-paused")]
+    RestoredPaused,
     /// Paused for good after a checkpoint that fenced it.
     Fenced,
     /// The run is ending.

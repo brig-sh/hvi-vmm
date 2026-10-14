@@ -20,7 +20,8 @@
 //! `--control-sock` socket, and `server` the I/O thread that serves it.
 //! [`bundle`] is the directory a capture writes and a restore reads, with
 //! guest RAM in [`ram`], the vCPUs in [`cpu`] and the interrupt controller and
-//! counter in [`platform`].
+//! counter in [`platform`]. `restore` holds what every backend's `hvi restore`
+//! shares.
 
 pub mod bundle;
 pub(crate) mod capture;
@@ -29,4 +30,5 @@ pub mod cpu;
 pub mod platform;
 pub mod profile;
 pub mod ram;
+pub(crate) mod restore;
 pub(crate) mod server;

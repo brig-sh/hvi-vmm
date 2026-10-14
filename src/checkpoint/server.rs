@@ -79,6 +79,9 @@ pub(crate) struct ControlSocket {
     checkpoint_root: Option<CheckpointRoot>,
     /// What only the backend knows of a capture, once it has said.
     parts: Option<CaptureParts>,
+    /// The state the VM starts in: running after a boot, restored-paused
+    /// after a restore.
+    initial: VmState,
 }
 
 /// The checkpoint root, resolved, and as the operator spelled it.
@@ -182,6 +185,7 @@ impl ControlSocket {
             profile,
             checkpoint_root,
             parts: None,
+            initial: VmState::Running,
         })
     }
 
@@ -199,6 +203,16 @@ impl ControlSocket {
             disk_path,
             console,
         });
+        self
+    }
+
+    /// Starts the VM as `hvi restore` hands it over: restored-paused, with the
+    /// I/O threads held and the control socket holding the vCPUs parked.
+    #[must_use]
+    // Only the HVF restore calls it so far.
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+    pub(crate) fn restored(mut self) -> Self {
+        self.initial = VmState::RestoredPaused;
         self
     }
 
@@ -261,7 +275,7 @@ impl ControlSocket {
         timeout: Duration,
     ) {
         let mut machine = Machine {
-            state: VmState::Running,
+            state: self.initial,
             gate,
             vcpus,
             profile: &self.profile,
@@ -464,7 +478,7 @@ impl<K: Kick> Machine<'_, K> {
                 return refuse(ErrorCode::Fenced, "the VM was fenced after a checkpoint")
             }
             VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
-            VmState::Running | VmState::Paused => {}
+            VmState::Running | VmState::Paused | VmState::RestoredPaused => {}
         }
         let Some((_, root)) = &self.capture else {
             return refuse(
@@ -499,8 +513,8 @@ impl<K: Kick> Machine<'_, K> {
         };
 
         let started = Instant::now();
-        let was_paused = self.state == VmState::Paused;
-        if !was_paused {
+        let found = self.state;
+        if found == VmState::Running {
             if let Response::Error(e) = self.pause() {
                 return Response::Error(e);
             }
@@ -508,7 +522,7 @@ impl<K: Kick> Machine<'_, K> {
         let exported = match self.export(started + self.timeout) {
             Ok(exported) => exported,
             Err(e) => {
-                self.back_to(was_paused);
+                self.back_to(found);
                 return Response::Error(e);
             }
         };
@@ -533,7 +547,7 @@ impl<K: Kick> Machine<'_, K> {
                     self.state = VmState::Stopping;
                     return refuse(ErrorCode::Stopped, format!("the run is ending: {e}"));
                 }
-                self.back_to(was_paused);
+                self.back_to(found);
                 return refuse(
                     ErrorCode::CaptureFailed,
                     format!("{e}; nothing was kept, and the VM is as it was"),
@@ -541,7 +555,7 @@ impl<K: Kick> Machine<'_, K> {
             }
         };
         match then {
-            Then::Continue => self.back_to(was_paused),
+            Then::Continue => self.back_to(found),
             Then::Fence => self.state = VmState::Fenced,
         }
         Response::Checkpoint {
@@ -668,15 +682,14 @@ impl<K: Kick> Machine<'_, K> {
         }
     }
 
-    /// Returns the VM to where a checkpoint found it: paused, or running.
-    fn back_to(&mut self, paused: bool) {
-        if paused {
-            self.state = VmState::Paused;
-        } else {
+    /// Returns the VM to where a checkpoint found it, `found`: paused as it
+    /// was, or running.
+    fn back_to(&mut self, found: VmState) {
+        if found == VmState::Running {
             let _ = self.vcpus.resume_from_control();
             self.gate.unpause();
-            self.state = VmState::Running;
         }
+        self.state = found;
     }
 
     /// Returns the profile once it is complete.
@@ -705,7 +718,9 @@ impl<K: Kick> Machine<'_, K> {
     /// both. Pausing a paused VM succeeds and changes nothing.
     fn pause(&mut self) -> Response {
         match self.state {
-            VmState::Paused | VmState::Fenced => return Response::State(self.state),
+            VmState::Paused | VmState::RestoredPaused | VmState::Fenced => {
+                return Response::State(self.state)
+            }
             VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
             VmState::Running => {}
         }
@@ -754,7 +769,7 @@ impl<K: Kick> Machine<'_, K> {
             VmState::Running => Response::State(VmState::Running),
             VmState::Fenced => refuse(ErrorCode::Fenced, "the VM was fenced after a checkpoint"),
             VmState::Stopping => refuse(ErrorCode::Stopped, "the run is ending"),
-            VmState::Paused => {
+            VmState::Paused | VmState::RestoredPaused => {
                 // The only error is a quiesce the socket no longer holds, which
                 // the stop's own release explains; the gate opens either way.
                 let _ = self.vcpus.resume_from_control();
@@ -817,6 +832,10 @@ mod tests {
         unstarted: u32,
         /// A `CPU_ON` waiting for one of those, as (vCPU, entry, context).
         pending: Option<(u32, u64, u64)>,
+        /// Whether the VM is handed over as `hvi restore` hands it: the
+        /// `parking` vCPUs import a plan of their states first, and the
+        /// socket starts restored-paused.
+        restore: bool,
         /// Whether the run has a checkpoint root and what to capture.
         capture: bool,
         /// A virtio-net device the capture holds.
@@ -846,6 +865,8 @@ mod tests {
         root: std::path::PathBuf,
         /// The checkpoint root as the fixture named it at bind, unresolved.
         given_root: std::path::PathBuf,
+        /// The import steps the vCPUs carried out, when restored.
+        log: crate::checkpoint::restore::tests::Log,
     }
 
     impl Fixture {
@@ -880,7 +901,13 @@ mod tests {
                 },
                 StopHandle::new_pair().unwrap().0,
             ));
+            let log = crate::checkpoint::restore::tests::Log::default();
+            if spec.restore {
+                vcpus.pause_from_control(Duration::ZERO).unwrap();
+                source.gate().pause(Duration::ZERO).unwrap();
+            }
             let fake_vcpus = (0..spec.parking)
+                .filter(|_| !spec.restore)
                 .map(|cpu| {
                     vcpus.mark_started(vcpus.started());
                     let vcpus = Arc::clone(&vcpus);
@@ -903,6 +930,21 @@ mod tests {
                     })
                 })
                 .collect();
+            let fake_vcpus: Vec<JoinHandle<()>> = if spec.restore {
+                let fakes = (0..spec.parking)
+                    .map(|cpu| {
+                        crate::checkpoint::restore::tests::importing_vcpu(&vcpus, cpu, &log, None)
+                    })
+                    .collect();
+                let plan = crate::checkpoint::restore::tests::plan(spec.parking, spec.unstarted);
+                crate::checkpoint::restore::import(&vcpus, &plan, Duration::from_secs(5), || {
+                    spec.parking + spec.unstarted
+                })
+                .unwrap();
+                fakes
+            } else {
+                fake_vcpus
+            };
             for _ in 0..spec.stuck {
                 vcpus.mark_started(vcpus.started());
             }
@@ -922,12 +964,15 @@ mod tests {
                 .unwrap();
             }
             let root_arg = spec.capture.then(|| root.to_str().unwrap().to_string());
-            let socket = ControlSocket::bind(
+            let mut socket = ControlSocket::bind(
                 path.to_str().unwrap(),
                 Arc::clone(&cell),
                 root_arg.as_deref(),
             )
             .unwrap();
+            if spec.restore {
+                socket = socket.restored();
+            }
             let capture = spec.capture.then(|| Capture {
                 arch: GuestArch::Aarch64,
                 backend: "hvf",
@@ -981,6 +1026,7 @@ mod tests {
                 path,
                 given_root: root.clone(),
                 root: std::fs::canonicalize(&root).unwrap(),
+                log,
             }
         }
 
@@ -1422,6 +1468,72 @@ mod tests {
         let platform = bundle.platform().unwrap();
         assert!(platform.is_partial());
         assert!(bundle.manifest().capabilities.is_empty());
+    }
+
+    // `hvi restore` hands the socket a VM whose vCPUs imported their states
+    // step by step and wait parked, and whose I/O threads are held. Nothing
+    // runs until `resume`, and `stop` still ends it from there.
+    #[test]
+    fn a_restored_vm_waits_restored_paused_until_resume() {
+        let mut f = Fixture::with(
+            "restored",
+            Spec {
+                parking: 2,
+                unstarted: 1,
+                restore: true,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        crate::checkpoint::restore::tests::assert_barriers(&f.log.lock().unwrap(), 2);
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"restored-paused","vcpus":2,"vcpus_parked":2}"#
+        );
+        assert!(
+            f.source.gate().is_paused(),
+            "the I/O threads ran before resume"
+        );
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"pause"}"#),
+            r#"{"v":1,"ok":true,"state":"restored-paused"}"#
+        );
+        // A restored VM is a VM: it can be captured before it ever runs, and
+        // the capture leaves it as it found it.
+        let line = f.checkpoint("again", "continue");
+        assert_eq!(reply(&line)["state"], "restored-paused", "{line}");
+        assert_eq!(f.vcpus.parked(), 2);
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"resume"}"#),
+            r#"{"v":1,"ok":true,"state":"running"}"#
+        );
+        f.assert_running();
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"stop"}"#),
+            r#"{"v":1,"ok":true,"state":"stopping"}"#
+        );
+        assert_stops(&f.vcpus, "the restored VM did not stop");
+    }
+
+    #[test]
+    fn a_restored_vm_stops_without_ever_running() {
+        let mut f = Fixture::with(
+            "restored-stop",
+            Spec {
+                parking: 1,
+                restore: true,
+                ..Spec::default()
+            },
+        );
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"stop"}"#),
+            r#"{"v":1,"ok":true,"state":"stopping"}"#
+        );
+        assert_stops(&f.vcpus, "the restored VM did not stop");
+        assert!(
+            f.source.gate().is_paused(),
+            "the stop released the I/O threads"
+        );
     }
 
     // The source's half of a move: once captured it must never run again,
