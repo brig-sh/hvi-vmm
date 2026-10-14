@@ -21,21 +21,25 @@ applies them as they arrive.
 Every batch is checked before it is written: its header must be one this tool
 knows, its blocks must be adjacent and inside the image, its offset must be
 its first block's, and its bytes must have the SHA-256 the header gives. The
-image is never grown. On success it prints one JSON line: the blocks, bytes
-and batches applied, and hvi's reply. It exits 1 on any refusal, leaving the
-batches before the bad one applied.
+image is never grown. The reply must count the blocks, bytes and batches this
+tool applied, and its sent_sha256 must be the SHA-256 of the batches' digests
+in order, so a stream that lost a batch is refused. On success it prints one
+JSON line: the blocks, bytes and batches applied, and hvi's reply. It exits 1
+on any refusal, leaving the batches before the bad one applied.
 """
 
 import argparse
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 
 BLOCK = 64 << 10
 HEADER_KEYS = {"component", "batch", "first", "count", "offset", "size", "sha256"}
 MAX_LINE = 64 << 10
+HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def fail(why):
@@ -49,7 +53,10 @@ def read_line(stream):
         fail("the stream ended before the reply line")
     if len(line) > MAX_LINE or not line.endswith(b"\n"):
         fail("a line is too long or the stream ended inside it")
-    return json.loads(line)
+    try:
+        return json.loads(line)
+    except ValueError as e:
+        fail(f"a line is not JSON: {e}")
 
 
 def read_exact(stream, n):
@@ -63,22 +70,40 @@ def read_exact(stream, n):
     return b"".join(parts)
 
 
+def is_count(x):
+    return isinstance(x, int) and not isinstance(x, bool) and x >= 0
+
+
+def check_reply(reply, blocks, byte_count, batches, chain):
+    """Refuses a reply that does not describe the batches applied."""
+    if reply.get("ok") is not True:
+        fail(f"hvi refused: {reply.get('code')}: {reply.get('error')}")
+    got = {k: reply.get(k) for k in ("blocks", "bytes", "batches")}
+    want = {"blocks": blocks, "bytes": byte_count, "batches": batches}
+    if got != want:
+        fail(f"the reply counts {got}, and the stream held {want}")
+    if reply.get("sent_sha256") != chain.hexdigest():
+        fail("the reply's sent_sha256 is not the digest of the batches applied")
+
+
 def apply(stream, fd, image_size):
     """Applies every batch on `stream` to `fd`; returns the totals and the reply."""
     blocks = byte_count = batches = 0
+    chain = hashlib.sha256()
     while True:
         value = read_line(stream)
         if not isinstance(value, dict):
             fail(f"not a JSON object: {value!r}")
         if "v" in value:
-            if not value.get("ok"):
-                fail(f"hvi refused: {value.get('code')}: {value.get('error')}")
+            check_reply(value, blocks, byte_count, batches, chain)
             return {"blocks": blocks, "bytes": byte_count, "batches": batches, "reply": value}
         if set(value) != HEADER_KEYS or value["component"] != "disk-blocks":
             fail(f"not a batch header: {value!r}")
         first, count, offset, size = (value[k] for k in ("first", "count", "offset", "size"))
-        if not all(isinstance(x, int) and x >= 0 for x in (first, count, offset, size)):
-            fail(f"batch {value['batch']}: a field is not a count")
+        if not all(is_count(x) for x in (value["batch"], first, count, offset, size)):
+            fail(f"batch {batches}: a field is not a count")
+        if not isinstance(value["sha256"], str) or not HEX64.fullmatch(value["sha256"]):
+            fail(f"batch {batches}: sha256 is not 64 lowercase hex digits")
         if value["batch"] != batches:
             fail(f"batch {value['batch']} came where batch {batches} was due")
         if count == 0 or offset != first * BLOCK:
@@ -93,6 +118,7 @@ def apply(stream, fd, image_size):
         if hashlib.sha256(data).hexdigest() != value["sha256"]:
             fail(f"batch {batches}: the bytes do not match their SHA-256")
         os.pwrite(fd, data, offset)
+        chain.update(value["sha256"].encode())
         blocks += count
         byte_count += size
         batches += 1
