@@ -9,7 +9,8 @@ This page says what works today and what does not.
 
 - **Works:** the bundle format, the capture on the control socket on all
   three backends, the fence that keeps a source from running again,
-  `hvi checkpoint-verify`, and `hvi restore`:
+  `hvi checkpoint-verify`, live moves (the `migrate` op streams a guest
+  while it runs, see [Live moves](#live-moves)), and `hvi restore`:
   - on HVF (macOS), a native guest moves from one hvi process to another on
     the same Mac and goes on where it was;
   - a guest of the portable profile (`--profile portable-arm64-v1`, see
@@ -176,7 +177,10 @@ hvi: /var/lib/sb1/checkpoints/tx-42: ram.bin: SHA-256 does not match the manifes
 
 ## The bundle format
 
-`checkpoint_format` 1. Every document is JSON with fields by name and a
+The bundle directory is `checkpoint_format` 1; the stream of a live move
+is format 2 (see [The stream format](#the-stream-format)), with the same
+documents. A profile gives the newest format its hvi writes, now 2, and a
+directory may hold a profile of either. Every document is JSON with fields by name and a
 `version`. No file holds a native struct layout, so a bundle does not depend
 on the byte layout of the build that wrote it.
 
@@ -659,6 +663,200 @@ there, before any device, disk or socket exists, with the same
 everything. On the same Mac, 2 vCPUs and 512 MiB, one run each: restore to
 restored-paused 196.0 ms native and 199.6 ms portable, against 525.7 and
 538.9 ms before the change. `resume` replies in under a millisecond.
+
+## Live moves
+
+A checkpoint stops the guest for as long as it takes to write all of its
+RAM. A live move stops it only for what it wrote last: the source sends its
+RAM in rounds while the guest runs, then pauses it for the final round and
+its state. The control socket's `migrate` op does it, on the connection
+that asked, since a confined hvi may write to a socket it accepted but
+cannot open a new one:
+
+```text
+{"v":1,"op":"migrate","then":"fence","txid":"tx-43","epoch":8}
+```
+
+hvi then writes the stream (see [The stream format](#the-stream-format))
+on that connection and, after its manifest, the reply line:
+
+```json
+{"v":1,"ok":true,"state":"fenced","manifest_sha256":"...","stats":{
+ "rounds":[{"round":0,"in_pause":false,"pages":25664,"data_pages":23817,"bytes":35627331,"ms":188,"dirty_pages_per_s":0},
+           {"round":1,"in_pause":true,"pages":804,"data_pages":604,"bytes":406935,"ms":2,"dirty_pages_per_s":4150}],
+ "stop_reason":"converged","threshold_bytes":8388608,"precopy_ms":189,"pause_ms":0,"paused_ms":7,
+ "final_round_bytes":406935,"ram_total_bytes":536870912,"ram_present_bytes":97251328,
+ "ram_raw_bytes":100028416,"ram_stream_bytes":36024172,"stream_bytes":36045338,
+ "write_granule":16384,"write_faults":202,"write_fault_ns":3219,
+ "precopy_end_unix_ms":1792019500123,"sealed_at_unix_ms":1792019500131}}
+```
+
+`pause_ms` is the time to park the vCPUs, `paused_ms` the time from the
+pause to the manifest written: the source's part of the downtime. The rest
+is the transport and the destination's restore. A `migrate` needs no
+`--checkpoint-root`, since it writes no file. It refuses, before the first
+frame and with the VM untouched, what a `checkpoint` refuses, and a backend
+that keeps no record of the guest's writes.
+
+### The rounds
+
+Round 0 sends every page that is not zero, with the guest running; a run
+of 64 zero pages is left out, since fresh RAM on the destination is zero.
+Each later round sends the pages written during the round before, from two
+records, ORed into one set of 4 KiB pages:
+
+- **The guest's own stores.** On KVM, every RAM slot is registered again
+  with `KVM_MEM_LOG_DIRTY_PAGES` when the move starts (a flags-only change,
+  which KVM takes while the vCPUs run), and each round reads
+  `KVM_GET_DIRTY_LOG`, which returns and clears the log and write-protects
+  the pages again. On Hypervisor.framework, which keeps no dirty log, hvi
+  write-protects guest RAM with `hv_vm_protect`; a store to a protected
+  granule exits to the vCPU's thread as a data abort, and hvi records the
+  granule, makes it writable and lets the store run again. Each round
+  protects again the granules recorded. The record and the protection
+  change under one lock, so no granule is writable without being recorded.
+  Both count in their own unit, the host page on KVM (16 KiB on a
+  Raspberry Pi 5's kernel) and the IPA granule on HVF (16 KiB on Apple
+  silicon), and each one written adds all its 4 KiB pages.
+- **hvi's own writes.** A virtio device fills guest buffers and used rings
+  from host threads, which no hypervisor sees. Guest RAM keeps a log, one
+  atomic bit per 4 KiB page, that every write accessor marks after it
+  writes, so a round that takes the mark reads the written bytes.
+
+The rounds with the guest running stop when the pages written during the
+last one come to at most 8 MiB or 2% of the RAM round 0 found present,
+whichever is larger (`converged`), after 5 rounds (`round_cap`), or 60 s
+after the start (`time_cap`); `max_rounds` and `max_secs` on the request
+lower or change those two. Then the guest is paused as for a checkpoint,
+the disk is synced, and the final round sends the pages left and every page
+written since, with nothing running. A guest that writes faster than the
+rounds copy never converges: the round cap ends it, and its final round is
+as large as what it writes in one round, so the pause lasts as long as
+that takes to send. The final round is always taken paused.
+
+Only the control thread writes the stream. A slow reader holds it up, and
+the guest runs on meanwhile; the pause starts once the last round with the
+guest running is written. A zero page in a later round is sent as a clear
+bit, and the destination zeroes it where an earlier round wrote it.
+
+### The fence of a live move
+
+A failure before the manifest leaves the VM as the request found it, and
+the client reads it as a reply line where the next frame header was due.
+`then: "fence"` fences once the manifest is written to the connection,
+which is before the client has read it, and releases the disk's lock at
+once, since the destination may open the disk as soon as it has the
+manifest. A fenced VM can be streamed again with another `migrate`, which
+the caller does when its first stream did not arrive: the guest has not
+run since, so the stream is the same machine, and the VM stays fenced.
+
+### The stream format
+
+`checkpoint_format` 2: a sequence of frames, each one line of JSON then
+exactly `size` bytes whose SHA-256 is `sha256`:
+
+```text
+{"component":"ram-round-0","size":1049352,"sha256":"5c2e..."}\n<1049352 bytes>
+```
+
+| Component | Frames | Holds |
+| --- | --- | --- |
+| `profile.json` | 1 | The source's machine profile, first, so the destination can refuse it or build RAM for it before anything else arrives. |
+| `ram-round-0` .. `ram-round-K` | 1 or more each | Guest RAM, in chunks. The last round is the one taken paused. |
+| `cpu.json`, `platform.json`, `devices.json` | 1 each | As in the bundle directory. |
+| `disk.json` | 1, when the guest has a disk | As in the bundle directory. |
+| `session.json` | 1 | As in the bundle directory. |
+| `manifest.json` | 1 | Every other component with its size, its frame count and the SHA-256 of all its frames' bytes in order, the RAM regions and page size, each round's pages and bytes and whether it was taken paused, the profile's hash, the capabilities a restore needs, and the seal time. |
+
+A RAM round is cut into frames of about 1 MiB, so neither side holds a
+whole round. A frame is a sequence of chunks, each a 24-byte header,
+little-endian, then its payload:
+
+| Bytes | Field |
+| --- | --- |
+| 0..8 | The first page, counted from page 0 of the first region across every region in order. A chunk lies in one region. |
+| 8..16 | The present bitmap: bit `i` set means page `first + i` is in the payload, clear means it is all zero. |
+| 16..18 | The page count, 1 to 64. |
+| 18..20 | Flags: bit 0 set means the payload is the pages as they are; clear means one LZ4 block (`lz4_flex`). |
+| 20..24 | The payload length. |
+
+The payload is the present pages in order, compressed unless that would
+make them larger. The reader checks each frame's header against its limits
+(a header line of at most 1 KiB, a RAM frame of at most 8 MiB, a document
+at most the directory's limit for it, at most 64 rounds) before it reads
+the bytes, and the hash before it uses them. It checks every chunk header
+in a frame before the frame writes a page, and that each payload is
+exactly its present pages. The components must come in the order above,
+and the manifest must list exactly what was read: a frame dropped,
+repeated, reordered or changed is refused, as is a stream that ends before
+the manifest. A reply line where a frame header was due ends the stream
+with the source's error.
+
+### Restoring a stream
+
+```sh
+hvi restore --from-stream /run/sb1/stream.sock --stream-keep /var/lib/sb1/checkpoints/tx-43 \
+    --control-sock /run/sb1/ctl-2.sock --checkpoint-root /var/lib/sb1/checkpoints \
+    --disk root.img --net-stub --agent-sock /run/sb1/agent-2.sock
+```
+
+The restore connects to the socket (or reads stdin, with `-`) before it is
+confined, and reads the stream whole before anything runs. Once
+`profile.json` is in and its RAM regions are checked, it allocates guest
+RAM and applies each round to it as it arrives, a later page over an
+earlier one; no RAM reaches disk. After the manifest it parses the
+documents, refuses with every reason as a directory restore does, and
+otherwise builds the VM over the RAM it filled and waits restored-paused.
+A streaming source releases the disk's lock as it fences, which can land
+just after the restore read the manifest, so a restore from a stream waits
+up to 2 s for the lock. `--stream-keep` writes the documents and the
+manifest, as they came and unsynced, as the record of what was restored.
+A stream read from stdin leaves stdin as `/dev/null`, so the console never
+reads what followed the stream.
+
+### Live-move timings
+
+Measured with `tools/stream-e2e.sh` (see
+[testing.md](testing.md#the-live-move-end-to-end-test)): a portable guest
+with 2 vCPUs, an ext4 disk, the stub network and an agent socket, moved
+twice on the same host; the stream goes from the source's control
+connection through a Python relay into the restore's socket. Downtime is
+from the end of the last round with the guest running to the resume reply.
+The busy guest runs `tools/guest/dirty.c`, which rewrites 256 MiB of
+pseudo-random pages over and over (about 2.5 GiB/s on the Mac, 560 MiB/s
+in the Pi's guest); its pages
+do not compress, and it never converges.
+
+| Host | Guest | Rounds | Round 0 | Each later round | Final round | Dirty rate | Downtime |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Apple M5 Pro, macOS 26.7 | idle, 512 MiB | 2 | 35.6 MB in 188 ms | | 0.41 MB, 2 ms | 4,150 pages/s | 21.7 ms |
+| Apple M5 Pro | 256 MiB writer, 1024 MiB | 6 (round cap) | 306 MB in 737 ms | 269 MB in 521 to 545 ms | 269 MB, 441 ms | 90,000 to 126,000 pages/s | 460 ms |
+| Raspberry Pi 5, KVM | idle, 512 MiB | 2 | 35.8 MB in 1528 ms | | 0.48 MB, 12 ms | 595 pages/s | 65 ms |
+| Raspberry Pi 5 | 256 MiB writer, 1024 MiB | 6 (round cap) | 306 MB in 3616 to 4656 ms | 269 MB in 2385 to 3265 ms | 269 MB, 1614 to 1693 ms | 14,000 to 28,000 pages/s | 1675 to 3487 ms |
+
+- The idle guest's RAM compresses 2.8 to 1 (100 MB of pages in 36 MB);
+  the writer's 1.05 to 1. On the Pi the idle round 0 took 0.5 s on a quiet
+  host and 1.5 s while another session's build ran.
+- HVF write faults: 202 in the idle move, 83,400 per move with the writer,
+  at 0.8 to 3.2 us of host time each in hvi's handler. The ignored test
+  `a_protected_granule_faults_once_and_the_store_completes` puts one
+  fault at about 6 us end to end, 1.2 us of it in hvi, on the M5 Pro.
+- `paused_ms`, the source's part: 7 ms idle on the Mac, 12 to 43 ms on the
+  Pi, and with the writer about 440 ms on the Mac and 1.6 to 3.5 s on the
+  Pi, nearly all of it the final round. The disk's sync inside the pause
+  took 3.9 s once on the Pi, on a disk with 64 MiB not yet synced while
+  another build ran.
+- The destination's part, manifest to restored-paused: 10 to 58 ms.
+- A native HVF guest (2 vCPUs, 512 MiB) moved the same way, three runs:
+  22 to 27 ms of downtime.
+- Mac to Pi: an idle portable guest with 2 vCPUs, 512 MiB and no disk (the
+  disk's transfer is the mover's), streamed from the M5 Pro into
+  `hvi restore --from-stream -` on a Pi 5 through `ssh` (5 ms round trip),
+  two runs: round 0 put 36 MB on the link in 755 to 779 ms (46 to 47 MB/s,
+  about 128 MB/s of guest RAM), the paused round 0.42 MB, `paused_ms` 25 to
+  29, the whole move 0.79 to 0.81 s, and at most 83 to 85 ms of downtime,
+  read on the Mac as the resume reply arrived back over `ssh`. The guest
+  counted on and printed no boot banner.
 
 ## Clock policy
 

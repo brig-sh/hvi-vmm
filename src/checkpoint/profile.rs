@@ -39,8 +39,11 @@ use sha2::{Digest, Sha256};
 /// The version of the profile format this hvi writes and reads.
 pub const PROFILE_VERSION: u32 = 1;
 
-/// The version of the checkpoint bundle format this hvi writes and reads.
-pub const CHECKPOINT_FORMAT: u32 = 1;
+/// The newest checkpoint format this hvi writes and reads: 2, the streamed
+/// bundle of a live move. A profile carries it, so a mover can tell an hvi
+/// that streams from one that writes only the bundle directory, format 1,
+/// which this hvi still writes for `checkpoint` and reads.
+pub const CHECKPOINT_FORMAT: u32 = 2;
 
 /// The largest profile [`MachineProfile::from_json`] parses. A real one is a
 /// few KiB; the bound keeps a hostile file from costing more than that.
@@ -1070,7 +1073,7 @@ mod tests {
             concat!(
                 r#"{"profile_version":1,"arch":"aarch64","backend":"hvf","#,
                 r#""hvi_build":{"version":"0.1.0","git_sha":"0123456789abcdef0123456789abcdef01234567"},"#,
-                r#""checkpoint_format":1,"host":{"os":"macos","kernel_or_macos_build":"25G62"},"#,
+                r#""checkpoint_format":2,"host":{"os":"macos","kernel_or_macos_build":"25G62"},"#,
                 r#""cpu":{"ident":"0x611f0490","id_regs":{"ID_AA64PFR0_EL1":"0x1100000011111112"}},"#,
                 r#""counter_freq_hz":24000000,"#,
                 r#""gic":{"version":3,"gicd_base":134217728,"gicd_size":65536,"gicr_base":134873088,"gicr_size":131072},"#,
@@ -1515,13 +1518,13 @@ mod tests {
     fn other_versions_are_refused() {
         let mut v2 = sample();
         v2.profile_version = 2;
-        v2.checkpoint_format = 2;
+        v2.checkpoint_format = 3;
         let why = reasons(&sample(), &v2);
         assert_eq!(
             why,
             [
                 "profile_version: the destination is version 2, this hvi reads 1",
-                "checkpoint_format: the destination writes format 2, this hvi reads 1",
+                "checkpoint_format: the destination writes format 3, this hvi reads 2",
             ]
         );
     }

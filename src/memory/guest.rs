@@ -28,7 +28,7 @@ use vm_memory::{
     VolatileSlice, WriteVolatile,
 };
 
-use crate::memory::{RamRegion, SharedRam};
+use crate::memory::{DirtyLog, RamRegion, SharedRam};
 
 impl RamRegion {
     /// Maps this region of `file` with `prot` as its own `MAP_SHARED` mapping,
@@ -310,9 +310,17 @@ impl GuestRamView {
 /// It adds the write accessors, the host pointer and, on Linux, the KVM memory
 /// slot registration. It dereferences to [`GuestRamView`] for the read
 /// accessors, whose documentation covers how access behaves.
+///
+/// Every write accessor marks the pages it wrote in the [`DirtyLog`], after
+/// the write, so a live move copies them again. [`host_ptr`](Self::host_ptr)
+/// cannot: its caller marks what it writes with
+/// [`mark_dirty`](Self::mark_dirty). Writes through [`memory`](Self::memory),
+/// the `vm-memory` collection, are not marked; only the boot's loaders use it.
 pub struct GuestRam {
     /// The mapping and the read accessors.
     view: GuestRamView,
+    /// The pages hvi's own threads wrote.
+    dirty: DirtyLog,
 }
 
 // The read accessors live on the view, so a `&GuestRam` reads through it the
@@ -342,7 +350,13 @@ impl GuestRam {
             .iter()
             .map(|region| region.map(shared.file(), libc::PROT_READ | libc::PROT_WRITE))
             .collect::<io::Result<Vec<_>>>()?;
-        GuestRamView::from_arc_regions(mappings).map(|view| GuestRam { view })
+        GuestRamView::from_arc_regions(mappings).map(GuestRam::over)
+    }
+
+    /// Wraps `view` with an empty dirty log over its regions.
+    fn over(view: GuestRamView) -> Self {
+        let dirty = DirtyLog::new(&view.regions());
+        GuestRam { view, dirty }
     }
 
     /// Builds guest RAM from anonymous mappings, one region per `(gpa, len)`,
@@ -357,7 +371,7 @@ impl GuestRam {
             })
             .collect();
         let view = GuestRamView::from_arc_regions(mappings).expect("anonymous guest RAM");
-        GuestRam { view }
+        GuestRam::over(view)
     }
 
     /// Registers every region as a KVM memory slot of `vm`, numbered in
@@ -368,10 +382,53 @@ impl GuestRam {
     /// Errors if KVM refuses a slot.
     #[cfg(target_os = "linux")]
     pub fn register_kvm_slots(&self, vm: &kvm_ioctls::VmFd) -> io::Result<()> {
+        self.set_kvm_slots(vm, 0)
+    }
+
+    /// Turns KVM's dirty log on or off for every RAM slot, by registering
+    /// each slot again with only its flags changed, which KVM takes in place
+    /// while the vCPUs run. Turning it on starts every slot clean.
+    ///
+    /// # Errors
+    ///
+    /// Errors if KVM refuses a slot; the slots before it keep the new flag.
+    #[cfg(target_os = "linux")]
+    pub fn set_kvm_dirty_log(&self, vm: &kvm_ioctls::VmFd, on: bool) -> io::Result<()> {
+        self.set_kvm_slots(
+            vm,
+            if on {
+                kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES
+            } else {
+                0
+            },
+        )
+    }
+
+    /// Returns and clears KVM's dirty log of RAM slot `index`: one bit per
+    /// host page, set for each page a vCPU wrote since the last call.
+    ///
+    /// # Errors
+    ///
+    /// Errors if there is no such region or KVM refuses.
+    #[cfg(target_os = "linux")]
+    pub fn kvm_dirty_log(&self, vm: &kvm_ioctls::VmFd, index: usize) -> io::Result<Vec<u64>> {
+        let mapping = self.view.mapped.get(index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("no RAM slot {index}"))
+        })?;
+        let size = usize::try_from(mapping.region.size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RAM slot too large"))?;
+        vm.get_dirty_log(index as u32, size)
+            .map_err(io::Error::from)
+    }
+
+    /// Registers every region as KVM memory slot `index`, in address order,
+    /// with `flags`.
+    #[cfg(target_os = "linux")]
+    fn set_kvm_slots(&self, vm: &kvm_ioctls::VmFd, flags: u32) -> io::Result<()> {
         for (index, mapping) in self.view.mapped.iter().enumerate() {
             let slot = kvm_bindings::kvm_userspace_memory_region {
                 slot: index as u32,
-                flags: 0, // no dirty tracking
+                flags,
                 guest_phys_addr: mapping.region.gpa,
                 memory_size: mapping.region.size,
                 userspace_addr: mapping.mmap.as_ptr() as u64,
@@ -381,6 +438,18 @@ impl GuestRam {
             unsafe { vm.set_user_memory_region(slot) }.map_err(io::Error::from)?;
         }
         Ok(())
+    }
+
+    /// Returns the log of the pages hvi's own threads wrote.
+    #[must_use]
+    pub fn dirty_log(&self) -> &DirtyLog {
+        &self.dirty
+    }
+
+    /// Marks `[gpa, gpa+len)` written, for a caller that wrote it through
+    /// [`host_ptr`](Self::host_ptr). Call it after the write.
+    pub fn mark_dirty(&self, gpa: u64, len: u64) {
+        self.dirty.mark(gpa, len);
     }
 
     /// Returns the underlying region collection.
@@ -400,6 +469,7 @@ impl GuestRam {
     /// the next.
     pub fn write(&self, gpa: u64, data: &[u8]) -> io::Result<()> {
         self.view.slice(gpa, data.len())?.copy_from(data);
+        self.dirty.mark(gpa, data.len() as u64);
         Ok(())
     }
 
@@ -421,7 +491,9 @@ impl GuestRam {
     /// claim.
     ///
     /// The caller must stay within `len` and expect the bytes to change under
-    /// it, as with `read` and `write`.
+    /// it, as with `read` and `write`. A caller that writes through the
+    /// pointer marks what it wrote with [`mark_dirty`](Self::mark_dirty), or
+    /// a live move misses it.
     pub fn host_ptr(&self, gpa: u64, len: usize) -> io::Result<*mut u8> {
         Ok(self.view.slice(gpa, len)?.ptr_guard_mut().as_ptr())
     }
@@ -447,6 +519,7 @@ impl GuestRam {
     fn store<T: ByteValued>(&self, gpa: u64, v: T) -> io::Result<()> {
         let slice = self.view.slice(gpa, size_of::<T>())?;
         slice.get_ref::<T>(0).map_err(out_of_ram)?.store(v);
+        self.dirty.mark(gpa, size_of::<T>() as u64);
         Ok(())
     }
 }
@@ -458,22 +531,29 @@ fn out_of_ram<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Er
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const ALIGN: usize = RamRegion::ALIGN as usize;
 
-    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
-    // every component of a path comes from the guest. This test reads the
-    // process's own `/proc/self/smaps`.
     #[cfg(target_os = "linux")]
     #[test]
-    #[allow(clippy::disallowed_methods)]
     fn guest_ram_is_left_out_of_core_files() {
         let shared = SharedRam::new(ALIGN).expect("an aligned region of guest RAM should allocate");
         let ram = GuestRam::new(&shared, &[shared.region_at(0)])
             .expect("guest RAM should map over the region");
-        let start = ram.host_ptr(0, 1).unwrap() as usize;
+        assert_left_out_of_core_files(&ram, 0);
+    }
+
+    /// Asserts that the mapping of `ram` at `gpa` has the `dd` flag in
+    /// `smaps`, which leaves it out of core files.
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This reads the
+    // process's own `/proc/self/smaps`.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn assert_left_out_of_core_files(ram: &GuestRam, gpa: u64) {
+        let start = ram.host_ptr(gpa, 1).unwrap() as usize;
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
         let header = format!("{start:x}-");
         let flags = smaps
@@ -540,6 +620,34 @@ mod tests {
         let mut got = [0u8; 4];
         ram.read(base + 0x10, &mut got).unwrap();
         assert_eq!(u32::from_le_bytes(got), 0xdead_beef);
+    }
+
+    // Every write accessor marks what it wrote; a read, a refused write and
+    // a host pointer handed out do not.
+    #[test]
+    fn the_write_accessors_mark_their_pages() {
+        use crate::memory::DirtyPages;
+        let base = 0x4000_0000;
+        let ram = GuestRam::from_ranges(&[(base, 0x10_0000)]);
+        let taken = |ram: &GuestRam| {
+            let mut set = DirtyPages::new(&ram.regions());
+            ram.dirty_log().take_into(&mut set).unwrap();
+            set.runs(64)
+        };
+        ram.write(base + 0x1ffe, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(taken(&ram), vec![(0, 1, 2)]);
+        ram.write_u8(base + 0x3000, 1).unwrap();
+        ram.write_u16(base + 0x4000, 1).unwrap();
+        ram.write_u32(base + 0x5000, 1).unwrap();
+        ram.write_u64(base + 0x6000, 1).unwrap();
+        assert_eq!(taken(&ram), vec![(0, 3, 4)]);
+        let mut buf = [0u8; 8];
+        ram.read(base, &mut buf).unwrap();
+        assert!(ram.write(base + 0x10_0000 - 2, &[0; 4]).is_err());
+        let _ = ram.host_ptr(base + 0x8000, 8).unwrap();
+        assert_eq!(taken(&ram), vec![]);
+        ram.mark_dirty(base + 0x8000, 8);
+        assert_eq!(taken(&ram), vec![(0, 8, 1)]);
     }
 
     #[test]

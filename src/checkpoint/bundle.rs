@@ -94,6 +94,11 @@ pub const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 /// The format of the small documents beside the RAM image.
 pub const DOC_VERSION: u32 = 1;
 
+/// The `checkpoint_format` of a bundle directory's manifest. The streamed
+/// bundle is format 2, see [`stream`](super::stream); the directory keeps
+/// format 1, and a profile in it may give either.
+pub const DIRECTORY_FORMAT: u32 = 1;
+
 /// One file of a bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
@@ -216,7 +221,7 @@ pub struct RamSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// [`CHECKPOINT_FORMAT`] when written by this build.
+    /// [`DIRECTORY_FORMAT`].
     pub checkpoint_format: u32,
     /// The hvi that wrote the bundle.
     pub hvi_build: HviBuild,
@@ -435,7 +440,7 @@ impl<R: Read> Read for Hashing<R> {
 }
 
 /// Returns `digest` as lowercase hex.
-fn hex(digest: &[u8]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -667,7 +672,7 @@ impl BundleWriter {
             .map(|(_, e)| e.sha256.clone())
             .unwrap_or_default();
         let manifest = Manifest {
-            checkpoint_format: CHECKPOINT_FORMAT,
+            checkpoint_format: DIRECTORY_FORMAT,
             hvi_build: this_build(),
             components: self.written.iter().map(|(_, e)| e.clone()).collect(),
             ram: RamSummary {
@@ -865,11 +870,11 @@ impl Bundle {
         let profile = read_component(dir, profile)?;
         let profile = std::str::from_utf8(&profile).map_err(|e| bad("profile.json", e))?;
         let profile = MachineProfile::from_json(profile).map_err(|e| bad("profile.json", e))?;
-        if profile.checkpoint_format != CHECKPOINT_FORMAT {
+        if !(DIRECTORY_FORMAT..=CHECKPOINT_FORMAT).contains(&profile.checkpoint_format) {
             return Err(bad(
                 "profile.json",
                 format!(
-                    "checkpoint_format {}, this build reads {CHECKPOINT_FORMAT}",
+                    "checkpoint_format {}, this build reads {DIRECTORY_FORMAT} to {CHECKPOINT_FORMAT}",
                     profile.checkpoint_format
                 ),
             ));
@@ -975,12 +980,7 @@ impl Bundle {
         if self.entry(Component::Disk).is_none() {
             return Ok(None);
         }
-        let disk: DiskState = serde_json::from_slice(&self.read(Component::Disk)?)
-            .map_err(|e| bad("disk.json", e))?;
-        if disk.version != DOC_VERSION {
-            return Err(bad("disk.json", format!("version {}", disk.version)));
-        }
-        Ok(Some(disk))
+        parse_disk(&self.read(Component::Disk)?).map(Some)
     }
 
     /// Returns `session.json`.
@@ -989,15 +989,7 @@ impl Bundle {
     ///
     /// Errors when it cannot be read or is not the document.
     pub fn session(&self) -> io::Result<Session> {
-        let session: Session = serde_json::from_slice(&self.read(Component::Session)?)
-            .map_err(|e| bad("session.json", e))?;
-        if session.version != DOC_VERSION {
-            return Err(bad("session.json", format!("version {}", session.version)));
-        }
-        if session.then != "continue" && session.then != "fence" {
-            return Err(bad("session.json", format!("then {:?}", session.then)));
-        }
-        Ok(session)
+        parse_session(&self.read(Component::Session)?)
     }
 
     /// Copies the RAM image into `ram`, which must be fresh RAM of the
@@ -1033,14 +1025,43 @@ impl Bundle {
     }
 }
 
+/// Parses `disk.json`.
+///
+/// # Errors
+///
+/// Errors when it is not the document.
+pub fn parse_disk(bytes: &[u8]) -> io::Result<DiskState> {
+    let disk: DiskState = serde_json::from_slice(bytes).map_err(|e| bad("disk.json", e))?;
+    if disk.version != DOC_VERSION {
+        return Err(bad("disk.json", format!("version {}", disk.version)));
+    }
+    Ok(disk)
+}
+
+/// Parses `session.json`.
+///
+/// # Errors
+///
+/// Errors when it is not the document.
+pub fn parse_session(bytes: &[u8]) -> io::Result<Session> {
+    let session: Session = serde_json::from_slice(bytes).map_err(|e| bad("session.json", e))?;
+    if session.version != DOC_VERSION {
+        return Err(bad("session.json", format!("version {}", session.version)));
+    }
+    if session.then != "continue" && session.then != "fence" {
+        return Err(bad("session.json", format!("then {:?}", session.then)));
+    }
+    Ok(session)
+}
+
 /// Checks the manifest against the format and the limits, before anything is
 /// read or allocated by what it says.
 fn check_manifest(manifest: &Manifest) -> io::Result<()> {
-    if manifest.checkpoint_format != CHECKPOINT_FORMAT {
+    if manifest.checkpoint_format != DIRECTORY_FORMAT {
         return Err(bad(
             MANIFEST,
             format!(
-                "checkpoint_format {}, this build reads {CHECKPOINT_FORMAT}",
+                "checkpoint_format {}, a bundle directory is {DIRECTORY_FORMAT}",
                 manifest.checkpoint_format
             ),
         ));

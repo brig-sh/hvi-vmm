@@ -44,7 +44,7 @@ use crate::devices::state::{DeviceStates, DEVICE_STATES_VERSION};
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
-use crate::memory::GuestRam;
+use crate::memory::{GuestRam, GuestWriteLog};
 use crate::plugin::GuestArch;
 use crate::LOG_PREFIX;
 
@@ -73,6 +73,7 @@ pub(crate) enum Console {
 }
 
 /// What a backend hands the control socket so it can write checkpoints.
+#[derive(Clone)]
 pub(crate) struct Capture {
     /// The guest architecture.
     pub(crate) arch: GuestArch,
@@ -90,6 +91,9 @@ pub(crate) struct Capture {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The console UART, and the RTC on x86-64.
     pub(crate) console: Console,
+    /// The hypervisor's record of the guest's writes to RAM, which a live
+    /// move reads; `None` where the backend keeps none.
+    pub(crate) write_log: Option<Arc<dyn GuestWriteLog>>,
     /// Run after each component is written, so a test can fail or stop a
     /// capture part way.
     #[cfg(test)]
@@ -203,6 +207,44 @@ impl Capture {
         Ok(DevicesDoc { states, irq_levels })
     }
 
+    /// Syncs the disk, when the guest has one, and returns its state.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the sync fails.
+    pub(crate) fn disk_state(&self) -> io::Result<Option<DiskState>> {
+        let Some((dev, path)) = &self.block else {
+            return Ok(None);
+        };
+        let dev = dev.lock().unwrap();
+        dev.sync_data()
+            .map_err(|e| io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
+        Ok(Some(DiskState {
+            version: DOC_VERSION,
+            path_hint: path.clone(),
+            size_bytes: dev.size_bytes(),
+            sha256_sparse: None,
+            generation: dev.generation(),
+            synced: true,
+        }))
+    }
+
+    /// Returns `session.json` for `request`.
+    pub(crate) fn session(&self, request: &Request<'_>) -> Session {
+        Session {
+            version: DOC_VERSION,
+            sandbox_id: self.sandbox_id.clone(),
+            epoch: request.epoch,
+            txid: request.txid.map(str::to_string),
+            captured_at_unix_ms: unix_ms(),
+            then: match request.then {
+                Then::Continue => "continue",
+                Then::Fence => "fence",
+            }
+            .to_string(),
+        }
+    }
+
     /// Writes the bundle of the still guest into `writer` and seals it.
     ///
     /// The device states are gathered and checked first, and the disk synced
@@ -224,22 +266,7 @@ impl Capture {
         stopping: &dyn Fn() -> bool,
     ) -> io::Result<Sealed> {
         let devices = self.device_states()?;
-        let disk = match &self.block {
-            Some((dev, path)) => {
-                let dev = dev.lock().unwrap();
-                dev.sync_data()
-                    .map_err(|e| io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
-                Some(DiskState {
-                    version: DOC_VERSION,
-                    path_hint: path.clone(),
-                    size_bytes: dev.size_bytes(),
-                    sha256_sparse: None,
-                    generation: dev.generation(),
-                    synced: true,
-                })
-            }
-            None => None,
-        };
+        let disk = self.disk_state()?;
         let check = || {
             if stopping() {
                 Err(io::Error::new(
@@ -266,21 +293,7 @@ impl Capture {
             writer.write_json(Component::Disk, disk)?;
             self.after(Component::Disk)?;
         }
-        writer.write_json(
-            Component::Session,
-            &Session {
-                version: DOC_VERSION,
-                sandbox_id: self.sandbox_id.clone(),
-                epoch: request.epoch,
-                txid: request.txid.map(str::to_string),
-                captured_at_unix_ms: unix_ms(),
-                then: match request.then {
-                    Then::Continue => "continue",
-                    Then::Fence => "fence",
-                }
-                .to_string(),
-            },
-        )?;
+        writer.write_json(Component::Session, &self.session(request))?;
         self.after(Component::Session)?;
         check()?;
         writer.seal(exported.capabilities)
