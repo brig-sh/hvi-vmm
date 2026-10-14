@@ -460,7 +460,7 @@ back as written`.
 - **BOOTTIME** moves on with REALTIME across a restore.
 - **EL0 counter reads** (`CNTVCT_EL0`, `CNTFRQ_EL0`) trap to the guest
   kernel, which answers with a synthetic 54 MHz counter derived from guest
-  nanoseconds, on both hosts. `test/el0check.c` checks this.
+  nanoseconds, on both hosts. `tools/guest/el0check.c` checks this.
 - **`clock_gettime`** of a high-resolution clock is a system call: the vDSO
   has no `hvi-time` mode. Coarse clocks stay in the vDSO.
 - **`udelay`** is calibrated with the host's counter rate (`lpj` 96000 on the

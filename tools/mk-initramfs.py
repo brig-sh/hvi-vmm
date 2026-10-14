@@ -30,8 +30,8 @@ open on fd 3 after unlinking it, and writes and syncs a file on an ext4
 fd 3 and the disk file, writes and syncs a second file, and times a sleep 5.
 Beside it, a CPU-bound awk at the lowest priority adds 0.25 to a double,
 checks it against its count, and prints both every 500000 additions.
-When the image holds /el0check (test/el0check.c, kept with the portable
-kernel's patches and not in this repository, built static), the workload runs it at boot and again on /tmp/go, and
+When the image holds /el0check (tools/guest/el0check.c, built static), the
+workload runs it at boot and again on /tmp/go, and
 prints the guest's clocksource and hvi-time's migration log lines, for
 tools/checkpoint-e2e.sh --portable.
 
