@@ -128,8 +128,18 @@ each. On the Pi it is KVM's vGICv2. On the Mac it is hvi's software model,
 - `GICD_ITARGETSR0-7` are banked and read-only, with the reading CPU's bit in
   every byte. Enables, pending and active bits and priorities of interrupts
   0-31 are banked per CPU.
-- All interrupts are group 0 and signalled as IRQs. Only EOImode 0 exists:
-  `GICC_EOIR` drops the priority and deactivates, and there is no `GICC_DIR`.
+- `GICC_CTLR` keeps EnableGrp0, EnableGrp1, AckCtl, FIQEn, CBPR and
+  EOImode: a guest on the Pi that writes `0xffffffff` reads `0x21f`. The
+  bypass bits read as zero.
+- With EOImode 0, `GICC_EOIR` drops the priority and deactivates the
+  interrupt. With EOImode 1 it only drops the priority, and `GICC_DIR` at
+  offset `0x1000` deactivates. The drop clears the highest active priority,
+  whichever interrupt the write names, and only an active interrupt is
+  deactivated. This is what a guest on the Pi sees.
+- Interrupts reset to group 0 and are all signalled as IRQs. CBPR applies
+  `GICC_BPR` to group 1. FIQEn and AckCtl are kept but change nothing: no
+  interrupt becomes an FIQ, and `GICC_IAR` acknowledges either group. Linux
+  sets neither.
 
 The model keeps each interrupt's enable, line level, software latch and
 active state apart. KVM's v2 userspace interface cannot report the line level
