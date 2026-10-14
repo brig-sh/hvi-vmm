@@ -921,11 +921,23 @@ A move then runs:
    round 0; then `disk-dirty` since the last round and `disk-blocks` for
    it, until a round is small. The destination applies each round into
    its copy of the base as it arrives.
-3. `pause`, then the final round: `disk-dirty` since the last round and its
-   `disk-blocks`. With the guest still, it is the last write there will be.
-4. `checkpoint` with `then: "fence"`. Its `disk.json` lists the rounds,
-   the last read at the disk's final generation.
-5. On the destination, `hvi restore --disk <the copy> --disk-rounds N`.
+3. The final round, read with the guest still, so no write comes after
+   it. Either order works:
+   - `pause`, then `disk-dirty` since the last round and its
+     `disk-blocks`, then `checkpoint` with `then: "fence"`. Its
+     `disk.json` lists the final round too.
+   - `checkpoint` with `then: "fence"`, then `disk-dirty` since the last
+     round and its `disk-blocks`. `disk.json` was written before that
+     read and does not list it, but a fenced guest never writes again,
+     so the read is at the generation `disk.json` records.
+4. On the destination, `hvi restore --disk <the copy> --disk-generation G`,
+   where `G` is the `generation` of the `disk-dirty` reply that started
+   the final round.
+
+`G` must come from the `disk-dirty` reply, not from the `disk-blocks`
+reply. While the guest runs, a write can land between the read and the
+end of its export: the `disk-blocks` reply's generation then counts a
+write that only the next round holds. After a fence the two are equal.
 
 A block applied twice is harmless: a later round carries the newer bytes.
 
@@ -977,11 +989,12 @@ the disk's, or whose bitmap is not the bitmap of a disk this size; it
 checks the bitmap's length before it decodes it.
 
 Only the mover knows how it made the destination's disk, so it says so:
-`hvi restore --disk-rounds N` means `--disk` is the base with rounds 0 to
-N - 1 applied. The restore then refuses, with its other reasons and before
-it creates anything, a `disk.json` with no base, with another number of
-rounds, or whose last round was read at a generation below the disk's: the
-guest wrote after that round, and the disk lacks the write. Without the
+`hvi restore --disk-generation G` means `--disk` is the base with every
+round applied, and the last round's `disk-dirty` read was at generation
+`G`. The restore then refuses, with its other reasons and before it
+creates anything, a `disk.json` with no base, or one captured at another
+generation. A `G` below it means the guest wrote after that round and the
+disk lacks the write, as when a mover skips the final round. Without the
 flag nothing about rounds is checked, so rounds left over from a move that
 was given up do not refuse a bundle whose disk was copied whole.
 
@@ -1008,8 +1021,7 @@ loop wrote random 64 KiB blocks with `conv=fsync` while the rounds ran:
 The base with the four rounds applied had the live disk's SHA-256. From
 the `pause` request to the final round applied took 141 ms. The fenced
 bundle verified, its `disk.json` (3.3 KB) listed the four rounds with the
-last at the disk's generation, a restore from the copy with
-`--disk-rounds 3` was refused and with `--disk-rounds 4` came up
+last at the disk's generation, a restore from the copy came up
 restored-paused, reported the source's 1923 blocks since boot, and its
 guest answered after `resume`. The rates include the Python reader's
 hashing; scattered single blocks cost one batch each.

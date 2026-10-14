@@ -259,7 +259,7 @@ before it creates anything, and otherwise brings the guest up
 | `--control-sock <path>` | required | The control socket, as for `boot`. The guest waits on it for `resume`, so a restore without one could never run. |
 | `--checkpoint-root <dir>` | required | The directory a later `checkpoint` of the restored guest writes below, as for `boot`. |
 | `--disk <path>` | none | The disk to reopen for the guest's virtio-blk. Required when the guest had a disk, refused when it had none. It must be the size the guest was given, and no other process may hold it locked: a second restore onto the disk of a running guest fails (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
-| `--disk-rounds <n>` | none | Says `--disk` is the guest's base image with rounds 0 to n - 1 of `disk-blocks` applied. The restore then refuses a `disk.json` with no base, with another number of rounds, or whose last round was read before the guest's last write. Needs `--disk`. See [checkpoint.md](checkpoint.md#restoring-onto-the-base). |
+| `--disk-generation <g>` | none | Says `--disk` is the guest's base image with every round of `disk-blocks` applied, the last of them started by a `disk-dirty` reply whose `generation` was `g`. The restore then refuses a `disk.json` with no base, or captured at another generation: the guest wrote after that round. Needs `--disk`. See [checkpoint.md](checkpoint.md#restoring-onto-the-base). |
 | `--net-stub` | off | The built-in stack, for a guest that ran on it. |
 | `--net-gateway <socket>` | none | The gateway, for a guest that ran on one. Unlike `boot`, a gateway that cannot be reached is an error, not a fallback to the stub. |
 | `--net-mac <mac>` | none | Optional: the bundle holds the MAC. One given here must be that MAC. |
