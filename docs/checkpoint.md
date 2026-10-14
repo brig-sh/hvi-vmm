@@ -779,8 +779,10 @@ the round's `sent_sha256`.
 
 `tools/apply-blocks.py --image <copy> --sock <control socket> --round <k>`
 applies a round as a destination would: it checks each header, that the
-blocks are inside the image and at their own offset, and each digest, and
-never grows the image. `--stream FILE` reads a saved stream instead.
+blocks are inside the image and at their own offset, and each digest,
+never grows the image, and refuses a reply whose counts or `sent_sha256`
+are not those of the batches it applied. `--stream FILE` reads a saved
+stream instead.
 
 ### Restoring onto the base
 
