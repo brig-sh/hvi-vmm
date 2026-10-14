@@ -26,6 +26,8 @@
 //! | `status` | none | `state`, `vcpus`, `vcpus_parked` |
 //! | `stop` | ends the run, as a guest power-off would | `state` |
 //! | `checkpoint` | captures the VM into a bundle directory | `state`, `dir`, `manifest_sha256`, `stats` |
+//! | `disk-dirty` | reads the disk blocks written since boot or since the last read | `since`, `round`, `block_size`, `blocks`, `dirty`, `generation`, `bitmap_b64` |
+//! | `disk-blocks` | streams disk blocks, see [`disk`](super::disk) | `blocks`, `bytes`, `batches`, `generation`, `max_lock_us` |
 //!
 //! A refusal is `{"v":1,"ok":false,"code":...,"error":...}`, where `code` is
 //! one of the [`ErrorCode`] spellings and `error` is prose for a person.
@@ -34,7 +36,9 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::checkpoint::disk::MAX_REQUEST_BLOCKS;
 use crate::checkpoint::profile::MachineProfile;
+use crate::devices::virtio::block::DirtySince;
 
 /// The protocol version every request and reply carries as `v`.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -68,6 +72,20 @@ pub enum Request {
         /// The caller's epoch for the sandbox, recorded in `session.json`.
         epoch: u64,
     },
+    /// Read the disk blocks the guest wrote, and start a round.
+    DiskDirty(DirtySince),
+    /// Stream the bytes of disk blocks.
+    DiskBlocks(BlockSelection),
+}
+
+/// The disk blocks a `disk-blocks` request names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockSelection {
+    /// These blocks, ascending.
+    Blocks(Vec<u64>),
+    /// The blocks of this round, which must be the last one `disk-dirty`
+    /// read.
+    Round(u32),
 }
 
 /// What a VM does after a checkpoint that succeeded.
@@ -201,8 +219,48 @@ pub enum Response {
         /// What the capture took.
         stats: CheckpointStats,
     },
+    /// The answer to `disk-dirty`.
+    DiskDirty(DiskDirtyReply),
+    /// The answer to a `disk-blocks` that sent every block, after them.
+    DiskBlocks(DiskBlocksReply),
     /// A refusal.
     Error(Error),
+}
+
+/// What `disk-dirty` reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiskDirtyReply {
+    /// `boot` or `round`, as asked.
+    pub since: &'static str,
+    /// The round this read started: 0 for `boot`.
+    pub round: u32,
+    /// The size of a block, 65536.
+    pub block_size: u64,
+    /// The number of blocks of the disk, the last one maybe short.
+    pub blocks: u64,
+    /// The number of blocks set in the bitmap.
+    pub dirty: u64,
+    /// The disk's generation at the read.
+    pub generation: u64,
+    /// The bitmap, bit `i` of byte `i / 8` (low bit first) for block `i`,
+    /// as standard base64.
+    pub bitmap_b64: String,
+}
+
+/// What `disk-blocks` reports once it has sent every batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiskBlocksReply {
+    /// The blocks sent.
+    pub blocks: u64,
+    /// Their bytes, without the header lines.
+    pub bytes: u64,
+    /// The batches.
+    pub batches: u64,
+    /// The disk's generation after the last block was read.
+    pub generation: u64,
+    /// The longest the disk was held from the guest for one block, in
+    /// microseconds.
+    pub max_lock_us: u64,
 }
 
 /// What a checkpoint took, as its reply reports it.
@@ -292,6 +350,17 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
                 epoch,
             }
         }
+        "disk-dirty" => Request::DiskDirty(match fields.get("since").and_then(Value::as_str) {
+            Some("boot") => DirtySince::Boot,
+            Some("round") => DirtySince::Round,
+            _ => {
+                return Err(Error::new(
+                    ErrorCode::BadRequest,
+                    "disk-dirty needs \"since\": \"boot\" or \"round\"",
+                ))
+            }
+        }),
+        "disk-blocks" => Request::DiskBlocks(parse_selection(&fields)?),
         other => {
             return Err(Error::new(
                 ErrorCode::UnknownOp,
@@ -299,6 +368,36 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
             ))
         }
     })
+}
+
+/// Parses what a `disk-blocks` request names: a `blocks` list of block
+/// numbers, or a `round`.
+fn parse_selection(fields: &serde_json::Map<String, Value>) -> Result<BlockSelection, Error> {
+    let bad = |message: String| Error::new(ErrorCode::BadRequest, message);
+    match (fields.get("blocks"), fields.get("round")) {
+        (Some(Value::Array(list)), None) => {
+            if list.len() > MAX_REQUEST_BLOCKS {
+                return Err(bad(format!(
+                    "\"blocks\" lists {} blocks, at most {MAX_REQUEST_BLOCKS} per request",
+                    list.len()
+                )));
+            }
+            let blocks = list
+                .iter()
+                .map(Value::as_u64)
+                .collect::<Option<Vec<u64>>>()
+                .ok_or_else(|| bad("\"blocks\" must list unsigned integers".into()))?;
+            Ok(BlockSelection::Blocks(blocks))
+        }
+        (None, Some(round)) => round
+            .as_u64()
+            .and_then(|r| u32::try_from(r).ok())
+            .map(BlockSelection::Round)
+            .ok_or_else(|| bad("\"round\" must be a round number".into())),
+        _ => Err(bad(
+            "disk-blocks needs a \"blocks\" list or a \"round\", not both".into(),
+        )),
+    }
 }
 
 /// Formats `response` as one line of JSON, without the newline.
@@ -334,6 +433,13 @@ pub fn format_response(response: &Response) -> String {
         dir: &'a str,
         manifest_sha256: &'a str,
         stats: CheckpointStats,
+    }
+    #[derive(Serialize)]
+    struct BodyReply<'a, T> {
+        v: u64,
+        ok: bool,
+        #[serde(flatten)]
+        body: &'a T,
     }
     #[derive(Serialize)]
     struct ErrorReply<'a> {
@@ -378,6 +484,8 @@ pub fn format_response(response: &Response) -> String {
             manifest_sha256,
             stats: *stats,
         }),
+        Response::DiskDirty(body) => serde_json::to_string(&BodyReply { v, ok: true, body }),
+        Response::DiskBlocks(body) => serde_json::to_string(&BodyReply { v, ok: true, body }),
         Response::Error(e) => serde_json::to_string(&ErrorReply {
             v,
             ok: false,
@@ -425,9 +533,46 @@ mod tests {
                     epoch: 7,
                 },
             ),
+            (
+                r#"{"v":1,"op":"disk-dirty","since":"boot"}"#,
+                Request::DiskDirty(DirtySince::Boot),
+            ),
+            (
+                r#"{"v":1,"op":"disk-dirty","since":"round"}"#,
+                Request::DiskDirty(DirtySince::Round),
+            ),
+            (
+                r#"{"v":1,"op":"disk-blocks","blocks":[0,7,9]}"#,
+                Request::DiskBlocks(BlockSelection::Blocks(vec![0, 7, 9])),
+            ),
+            (
+                r#"{"v":1,"op":"disk-blocks","round":3}"#,
+                Request::DiskBlocks(BlockSelection::Round(3)),
+            ),
         ] {
             assert_eq!(parse_request(line), Ok(want), "{line}");
         }
+    }
+
+    #[test]
+    fn malformed_disk_requests_are_refused() {
+        for line in [
+            r#"{"v":1,"op":"disk-dirty"}"#,
+            r#"{"v":1,"op":"disk-dirty","since":"now"}"#,
+            r#"{"v":1,"op":"disk-blocks"}"#,
+            r#"{"v":1,"op":"disk-blocks","blocks":[1],"round":1}"#,
+            r#"{"v":1,"op":"disk-blocks","blocks":[-1]}"#,
+            r#"{"v":1,"op":"disk-blocks","blocks":[1.5]}"#,
+            r#"{"v":1,"op":"disk-blocks","blocks":"1"}"#,
+            r#"{"v":1,"op":"disk-blocks","round":4294967296}"#,
+        ] {
+            assert_eq!(refused(line).0, ErrorCode::BadRequest, "{line}");
+        }
+        let many = format!(
+            r#"{{"v":1,"op":"disk-blocks","blocks":[{}]}}"#,
+            vec!["1"; MAX_REQUEST_BLOCKS + 1].join(",")
+        );
+        assert!(refused(&many).1.contains("at most 8192"));
     }
 
     // A client that ends lines with CRLF, as `nc -C` and some libraries do,
@@ -541,6 +686,38 @@ mod tests {
                 r#"{"v":1,"ok":true,"state":"fenced","dir":"/ck/1","manifest_sha256":"ab","#,
                 r#""stats":{"pause_ms":3,"capture_ms":900,"ram_present_bytes":4096,"#,
                 r#""ram_total_bytes":8192,"bundle_bytes":5000}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn disk_replies_are_pinned() {
+        assert_eq!(
+            format_response(&Response::DiskDirty(DiskDirtyReply {
+                since: "round",
+                round: 2,
+                block_size: 65536,
+                blocks: 10,
+                dirty: 2,
+                generation: 41,
+                bitmap_b64: "AQI=".into(),
+            })),
+            concat!(
+                r#"{"v":1,"ok":true,"since":"round","round":2,"block_size":65536,"#,
+                r#""blocks":10,"dirty":2,"generation":41,"bitmap_b64":"AQI="}"#
+            )
+        );
+        assert_eq!(
+            format_response(&Response::DiskBlocks(DiskBlocksReply {
+                blocks: 2,
+                bytes: 131_072,
+                batches: 1,
+                generation: 41,
+                max_lock_us: 90,
+            })),
+            concat!(
+                r#"{"v":1,"ok":true,"blocks":2,"bytes":131072,"batches":1,"#,
+                r#""generation":41,"max_lock_us":90}"#
             )
         );
     }
