@@ -712,12 +712,12 @@ pub(crate) mod tests {
 
     #[test]
     fn base64_round_trips_and_refuses_what_it_would_not_write() {
-        for data in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+        for data in [&b""[..], b"h", b"hv", b"hvi", b"hvi-", b"hvi-v", b"hvi-vm"] {
             let text = base64_encode(data);
             assert_eq!(base64_decode(&text).as_deref(), Some(data), "{text}");
         }
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"hvi-vm"), "aHZpLXZt");
+        assert_eq!(base64_encode(b"hv"), "aHY=");
         let all: Vec<u8> = (0..=255).collect();
         assert_eq!(base64_decode(&base64_encode(&all)).unwrap(), all);
         for bad in [
