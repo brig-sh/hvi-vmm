@@ -584,6 +584,18 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             )
             .into());
         }
+        // Without the masks the readback below is the only check that a
+        // lowered field took, so the log says which one ran.
+        eprintln!(
+            "{LOG_PREFIX} portable-arm64-v1 host check: vGICv2, {}-byte pages, {}-bit IPA, {} ID registers read, writable masks {}",
+            host.page_size,
+            host.ipa_bits,
+            host.id_regs.len(),
+            match &host.writable {
+                Some(masks) => format!("reported for {} registers", masks.len()),
+                None => "not reported".to_string(),
+            }
+        );
         set_baseline(&vcpus)?;
         let offset = set_counter_offset(&kvm, &vm, &vcpus[0])?;
         let device = Arc::new(HviTime::new(
