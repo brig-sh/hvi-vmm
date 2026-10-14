@@ -182,9 +182,12 @@ from its reply, to the `resume` reply. It exits 1 when a check failed.
 [checkpoint.md](checkpoint.md#timings) has the figures.
 
 `--portable` boots the portable profile instead, on the Mac or on a Pi 5,
-with the portable kernel and an initramfs that also holds `el0check` (the
-portable kernel's `test/el0check.c`) and `tfd` (`tools/guest/tfd.c`), both
-static arm64 binaries:
+with the portable kernel and an initramfs that also holds `el0check` and
+`tfd` (`tools/guest/tfd.c`), both static arm64 binaries. `el0check.c` is not
+in this repository: it is the acceptance test of the portable kernel's EL0
+counter patch, GPL-2.0, and is kept with that kernel's two patches as
+`test/el0check.c`, beside `patches/`. Build each with
+`gcc -O2 -static`:
 
 ```sh
 python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \

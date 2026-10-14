@@ -29,8 +29,9 @@
 # (--profile portable-arm64-v1) and the kernel must be the portable one,
 # with hvi-time. The initramfs must then hold /el0check and /tfd
 # (tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd;
-# el0check is the portable kernel's test/el0check.c and tfd is
-# tools/guest/tfd.c, both built static). Just before the capture the
+# el0check is test/el0check.c, kept with the portable kernel's patches
+# and not in this repository, and tfd is tools/guest/tfd.c, both built
+# static). Just before the capture the
 # script starts a 6 s timerfd and a 6 s sleep, and checks after the
 # restore: the clocksource is hvi-time, el0check passes, the guest driver
 # logged the migration (generation 4) and counts it, both timers fire
