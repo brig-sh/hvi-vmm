@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! The guest-visible contract of the `portable-arm64-v1` machine profile
-//! that does not depend on the hypervisor: the CPU baseline and the kernel
-//! arguments.
+//! that does not depend on the hypervisor: the CPU baseline, the kernel
+//! arguments and the firmware's answers.
 //!
 //! The values come from measurements on a Raspberry Pi 5 (KVM, Linux
 //! 6.12.25) and an Apple M5 Pro (Hypervisor.framework, macOS 26.7). See
@@ -68,9 +68,145 @@ pub fn cmdline(cmdline: &str) -> String {
     }
 }
 
+/// SMCCC and PSCI function IDs and return values the portable firmware
+/// answers.
+pub mod fw {
+    pub const SMCCC_VERSION: u32 = 0x8000_0000;
+    pub const SMCCC_ARCH_FEATURES: u32 = 0x8000_0001;
+    pub const SMCCC_ARCH_WORKAROUND_1: u32 = 0x8000_8000;
+    pub const SMCCC_ARCH_WORKAROUND_2: u32 = 0x8000_7fff;
+    pub const SMCCC_ARCH_WORKAROUND_3: u32 = 0x8000_3fff;
+
+    pub const PSCI_VERSION: u32 = 0x8400_0000;
+    pub const CPU_SUSPEND_32: u32 = 0x8400_0001;
+    pub const CPU_SUSPEND_64: u32 = 0xc400_0001;
+    pub const CPU_OFF: u32 = 0x8400_0002;
+    pub const CPU_ON_32: u32 = 0x8400_0003;
+    pub const CPU_ON_64: u32 = 0xc400_0003;
+    pub const AFFINITY_INFO_32: u32 = 0x8400_0004;
+    pub const AFFINITY_INFO_64: u32 = 0xc400_0004;
+    pub const MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
+    pub const SYSTEM_OFF: u32 = 0x8400_0008;
+    pub const SYSTEM_RESET: u32 = 0x8400_0009;
+    pub const PSCI_FEATURES: u32 = 0x8400_000a;
+    pub const SYSTEM_RESET2_32: u32 = 0x8400_0012;
+    pub const SYSTEM_RESET2_64: u32 = 0xc400_0012;
+
+    /// PSCI 1.1, and SMCCC 1.1.
+    pub const VERSION_1_1: u64 = 0x0001_0001;
+    pub const SUCCESS: u64 = 0;
+    pub const NOT_SUPPORTED: u64 = (-1i64) as u64;
+    pub const INVALID_PARAMETERS: u64 = (-2i64) as u64;
+    pub const ALREADY_ON: u64 = (-4i64) as u64;
+    /// `MIGRATE_INFO_TYPE`: no Trusted OS that needs migrating.
+    pub const MIGRATE_NOT_REQUIRED: u64 = 2;
+    /// `AFFINITY_INFO` states.
+    pub const AFFINITY_ON: u64 = 0;
+    pub const AFFINITY_OFF: u64 = 1;
+    /// `SMCCC_ARCH_FEATURES` for a workaround the CPU does not need.
+    pub const WORKAROUND_NOT_REQUIRED: u64 = 1;
+}
+
+/// The functions `PSCI_FEATURES` reports as implemented.
+///
+/// Measured on rp2 (KVM, Linux 6.12.25, firmware bitmaps lowered to 0) with
+/// `scratchpad/portable/p1/smccc_probe.c`: these answer 0 and every other
+/// PSCI 0.2-1.1 function answers `NOT_SUPPORTED`, `SYSTEM_SUSPEND` included.
+const PSCI_IMPLEMENTED: [u32; 15] = [
+    fw::PSCI_VERSION,
+    fw::CPU_SUSPEND_32,
+    fw::CPU_SUSPEND_64,
+    fw::CPU_OFF,
+    fw::CPU_ON_32,
+    fw::CPU_ON_64,
+    fw::AFFINITY_INFO_32,
+    fw::AFFINITY_INFO_64,
+    fw::MIGRATE_INFO_TYPE,
+    fw::SYSTEM_OFF,
+    fw::SYSTEM_RESET,
+    fw::PSCI_FEATURES,
+    fw::SYSTEM_RESET2_32,
+    fw::SYSTEM_RESET2_64,
+    fw::SMCCC_VERSION,
+];
+
+/// Returns what `PSCI_FEATURES(function)` answers.
+#[must_use]
+pub fn psci_features(function: u32) -> u64 {
+    if PSCI_IMPLEMENTED.contains(&function) {
+        fw::SUCCESS
+    } else {
+        fw::NOT_SUPPORTED
+    }
+}
+
+/// Returns what `SMCCC_ARCH_FEATURES(function)` answers.
+///
+/// On the Pi, KVM answers that the Cortex-A76 does not need workaround 1
+/// (Spectre v2), that workaround 2 (SSB) is not available and that
+/// workaround 3 (Spectre-BHB) is. Every other function is not supported,
+/// `SMCCC_ARCH_SOC_ID` included.
+#[must_use]
+pub fn smccc_arch_features(function: u32) -> u64 {
+    match function {
+        fw::SMCCC_ARCH_WORKAROUND_1 => fw::WORKAROUND_NOT_REQUIRED,
+        fw::SMCCC_ARCH_WORKAROUND_3 => fw::SUCCESS,
+        _ => fw::NOT_SUPPORTED,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The answers a KVM guest on rp2 read, from `smccc_probe.out`
+    /// ("LOWERED" section).
+    #[test]
+    fn firmware_answers_match_the_pi() {
+        assert_eq!(smccc_arch_features(0x8000_8000), 1);
+        assert_eq!(smccc_arch_features(0x8000_7fff), u64::MAX);
+        assert_eq!(smccc_arch_features(0x8000_3fff), 0);
+        for f in [0x8000_0000, 0x8000_0001, 0x8000_0002] {
+            assert_eq!(smccc_arch_features(f), u64::MAX, "{f:#x}");
+        }
+        for f in [
+            0x8400_0000,
+            0xc400_0001,
+            0x8400_0001,
+            0x8400_0002,
+            0xc400_0003,
+            0x8400_0003,
+            0xc400_0004,
+            0x8400_0004,
+            0x8400_0006,
+            0x8400_0008,
+            0x8400_0009,
+            0x8400_000a,
+            0xc400_0012,
+            0x8400_0012,
+            0x8000_0000,
+        ] {
+            assert_eq!(psci_features(f), 0, "{f:#x}");
+        }
+        for f in [
+            0xc400_000e,
+            0x8400_000e,
+            0xc400_0005,
+            0xc400_0007,
+            0x8400_000b,
+            0xc400_000c,
+            0xc400_000d,
+            0x8400_000f,
+            0xc400_0010,
+            0xc400_0011,
+            0x8400_0013,
+            0x8000_0001,
+            0x8000_8000,
+            0x8400_1234,
+        ] {
+            assert_eq!(psci_features(f), u64::MAX, "{f:#x}");
+        }
+    }
 
     #[test]
     fn kernel_arguments_are_appended() {
