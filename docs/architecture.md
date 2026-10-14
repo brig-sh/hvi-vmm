@@ -399,9 +399,9 @@ not a vCPU. Its `pause` first closes the I/O threads' `PauseGate`
 bridge and its connections, and the macOS virtio-fs workers passes the gate
 around every call that takes a device mutex or writes guest RAM, so the pause
 waits only for the work in progress, never for traffic. It then calls
-`Vcpus::pause_from_control`, which waits up to 2 s for every started vCPU,
-since its caller parks none. A step that misses its deadline is undone and the
-VM runs on. The plugin and the control socket share one quiesce, and whichever
+`Vcpus::pause_from_control`, which waits for every started vCPU, since its
+caller parks none. The two waits share one 2 s deadline, and a pause that misses
+it is undone and the VM runs on. The plugin and the control socket share one quiesce, and whichever
 holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU
