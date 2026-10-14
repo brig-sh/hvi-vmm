@@ -584,6 +584,15 @@ impl VirtioVsock {
         self.irq.set(self.irq_level());
     }
 
+    /// Sets the interrupt line to the device's level, whatever it was last
+    /// set to, after a restore loaded the interrupt controller. See
+    /// `Irq::redrive`.
+    // Only the HVF restore calls it so far.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn redrive_irq(&mut self) {
+        self.irq.redrive(self.irq_level());
+    }
+
     fn queue(&mut self) -> &mut Queue {
         &mut self.queues[(self.queue_sel % 3) as usize]
     }

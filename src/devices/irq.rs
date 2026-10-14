@@ -65,6 +65,22 @@ impl Irq {
     }
 }
 
+impl Irq {
+    /// Sets the line to `level` whatever level it was last set to.
+    ///
+    /// A restore calls it once the interrupt controller has been loaded:
+    /// loading it sets every line to the captured level behind the device's
+    /// back, so the level recorded here may no longer be the line's.
+    // Only the HVF restore calls it so far.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn redrive(&mut self, level: bool) {
+        let Some(line) = &self.line else { return };
+        if line.set_level(level).is_ok() {
+            self.high = level;
+        }
+    }
+}
+
 /// A line for tests that records what the device set it to.
 #[cfg(test)]
 pub(crate) mod test_line {
@@ -157,6 +173,20 @@ mod tests {
         for level in [false, true, true, true, false, false, true] {
             irq.set(level);
         }
+        assert_eq!(line.sets.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn redrive_sets_the_line_whatever_was_recorded() {
+        let line = Arc::new(CountingLine::default());
+        let mut irq = Irq::default();
+        irq.connect(Arc::clone(&line) as Arc<dyn IrqLine>);
+        irq.set(true);
+        irq.redrive(true);
+        irq.redrive(true);
+        assert_eq!(line.sets.load(Ordering::SeqCst), 3);
+        // The level is recorded: a set to it changes nothing.
+        irq.set(true);
         assert_eq!(line.sets.load(Ordering::SeqCst), 3);
     }
 
