@@ -24,11 +24,13 @@
 //! either hypervisor. The control thread asks for it with a `Work` request
 //! (see `Vcpus::request_export`).
 //!
-//! What the backends read today is the register view the plugin interface
-//! has: on arm64 PC, PSTATE, SP_EL0, SP_EL1 and four translation registers; on
-//! x86-64 RIP and CR3. That is far short of a vCPU a restore could resume, so
-//! such a state says `"partial": true`, and a restore must refuse it. The HVF
-//! and KVM exports that fill the rest come next and write the same names.
+//! The HVF backend writes the whole arm64 state: the general, SIMD and
+//! floating-point registers, every system register of
+//! [`AARCH64_SYSREGS`] and the virtual timer's mask. The KVM backends still
+//! write only the register view the plugin interface has: on arm64 PC,
+//! PSTATE, SP_EL0, SP_EL1 and four translation registers; on x86-64 RIP and
+//! CR3. Such a state says `"partial": true`, and a restore refuses it. The
+//! KVM exports that fill the rest come next and write the same names.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -84,6 +86,173 @@ pub enum Power {
     },
 }
 
+/// A vCPU's own part of the virtual timer, beside `CNTV_CTL_EL0` and
+/// `CNTV_CVAL_EL0` in the system registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VcpuTimer {
+    /// Whether the hypervisor holds the virtual timer's interrupt masked.
+    pub vtimer_masked: bool,
+}
+
+/// Whether a restore needs a system register of [`AARCH64_SYSREGS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    /// A failed read fails the export, and a state without it is refused.
+    Required,
+    /// A register only some hosts have (SME, or new in macOS 15.2). A failed
+    /// read lists it under `unavailable`, and a state may lack it.
+    Optional,
+}
+
+/// Every arm64 system register `sysregs` may hold, by architectural name.
+///
+/// This is the EL1 and EL0 state a running Linux guest keeps in system
+/// registers, apart from the ID registers, which the machine profile
+/// compares instead, and the counter, which `platform.json` carries.
+pub const AARCH64_SYSREGS: [(&str, Need); 106] = [
+    ("SCTLR_EL1", Need::Required),
+    ("ACTLR_EL1", Need::Required),
+    ("CPACR_EL1", Need::Required),
+    ("TTBR0_EL1", Need::Required),
+    ("TTBR1_EL1", Need::Required),
+    ("TCR_EL1", Need::Required),
+    ("MAIR_EL1", Need::Required),
+    ("AMAIR_EL1", Need::Required),
+    ("VBAR_EL1", Need::Required),
+    ("ELR_EL1", Need::Required),
+    ("SPSR_EL1", Need::Required),
+    ("ESR_EL1", Need::Required),
+    ("FAR_EL1", Need::Required),
+    ("PAR_EL1", Need::Required),
+    ("AFSR0_EL1", Need::Required),
+    ("AFSR1_EL1", Need::Required),
+    ("CONTEXTIDR_EL1", Need::Required),
+    ("TPIDR_EL0", Need::Required),
+    ("TPIDRRO_EL0", Need::Required),
+    ("TPIDR_EL1", Need::Required),
+    ("CNTKCTL_EL1", Need::Required),
+    ("CSSELR_EL1", Need::Required),
+    ("CNTV_CTL_EL0", Need::Required),
+    ("CNTV_CVAL_EL0", Need::Required),
+    ("MDSCR_EL1", Need::Required),
+    ("MDCCINT_EL1", Need::Required),
+    ("APIAKEYLO_EL1", Need::Required),
+    ("APIAKEYHI_EL1", Need::Required),
+    ("APIBKEYLO_EL1", Need::Required),
+    ("APIBKEYHI_EL1", Need::Required),
+    ("APDAKEYLO_EL1", Need::Required),
+    ("APDAKEYHI_EL1", Need::Required),
+    ("APDBKEYLO_EL1", Need::Required),
+    ("APDBKEYHI_EL1", Need::Required),
+    ("APGAKEYLO_EL1", Need::Required),
+    ("APGAKEYHI_EL1", Need::Required),
+    ("MPIDR_EL1", Need::Required),
+    ("SCXTNUM_EL0", Need::Optional),
+    ("SCXTNUM_EL1", Need::Optional),
+    ("TPIDR2_EL0", Need::Optional),
+    ("SMCR_EL1", Need::Optional),
+    ("SMPRI_EL1", Need::Optional),
+    ("DBGBVR0_EL1", Need::Required),
+    ("DBGBCR0_EL1", Need::Required),
+    ("DBGWVR0_EL1", Need::Required),
+    ("DBGWCR0_EL1", Need::Required),
+    ("DBGBVR1_EL1", Need::Required),
+    ("DBGBCR1_EL1", Need::Required),
+    ("DBGWVR1_EL1", Need::Required),
+    ("DBGWCR1_EL1", Need::Required),
+    ("DBGBVR2_EL1", Need::Required),
+    ("DBGBCR2_EL1", Need::Required),
+    ("DBGWVR2_EL1", Need::Required),
+    ("DBGWCR2_EL1", Need::Required),
+    ("DBGBVR3_EL1", Need::Required),
+    ("DBGBCR3_EL1", Need::Required),
+    ("DBGWVR3_EL1", Need::Required),
+    ("DBGWCR3_EL1", Need::Required),
+    ("DBGBVR4_EL1", Need::Required),
+    ("DBGBCR4_EL1", Need::Required),
+    ("DBGWVR4_EL1", Need::Required),
+    ("DBGWCR4_EL1", Need::Required),
+    ("DBGBVR5_EL1", Need::Required),
+    ("DBGBCR5_EL1", Need::Required),
+    ("DBGWVR5_EL1", Need::Required),
+    ("DBGWCR5_EL1", Need::Required),
+    ("DBGBVR6_EL1", Need::Required),
+    ("DBGBCR6_EL1", Need::Required),
+    ("DBGWVR6_EL1", Need::Required),
+    ("DBGWCR6_EL1", Need::Required),
+    ("DBGBVR7_EL1", Need::Required),
+    ("DBGBCR7_EL1", Need::Required),
+    ("DBGWVR7_EL1", Need::Required),
+    ("DBGWCR7_EL1", Need::Required),
+    ("DBGBVR8_EL1", Need::Required),
+    ("DBGBCR8_EL1", Need::Required),
+    ("DBGWVR8_EL1", Need::Required),
+    ("DBGWCR8_EL1", Need::Required),
+    ("DBGBVR9_EL1", Need::Required),
+    ("DBGBCR9_EL1", Need::Required),
+    ("DBGWVR9_EL1", Need::Required),
+    ("DBGWCR9_EL1", Need::Required),
+    ("DBGBVR10_EL1", Need::Required),
+    ("DBGBCR10_EL1", Need::Required),
+    ("DBGWVR10_EL1", Need::Required),
+    ("DBGWCR10_EL1", Need::Required),
+    ("DBGBVR11_EL1", Need::Required),
+    ("DBGBCR11_EL1", Need::Required),
+    ("DBGWVR11_EL1", Need::Required),
+    ("DBGWCR11_EL1", Need::Required),
+    ("DBGBVR12_EL1", Need::Required),
+    ("DBGBCR12_EL1", Need::Required),
+    ("DBGWVR12_EL1", Need::Required),
+    ("DBGWCR12_EL1", Need::Required),
+    ("DBGBVR13_EL1", Need::Required),
+    ("DBGBCR13_EL1", Need::Required),
+    ("DBGWVR13_EL1", Need::Required),
+    ("DBGWCR13_EL1", Need::Required),
+    ("DBGBVR14_EL1", Need::Required),
+    ("DBGBCR14_EL1", Need::Required),
+    ("DBGWVR14_EL1", Need::Required),
+    ("DBGWCR14_EL1", Need::Required),
+    ("DBGBVR15_EL1", Need::Required),
+    ("DBGBCR15_EL1", Need::Required),
+    ("DBGWVR15_EL1", Need::Required),
+    ("DBGWCR15_EL1", Need::Required),
+];
+
+/// The general registers `regs` holds for a vCPU that runs, in the order a
+/// backend writes them: `x0`..`x30`, then the stack pointers, `pc`, `pstate`
+/// and the floating-point control and status.
+#[must_use]
+pub fn aarch64_reg_names() -> Vec<String> {
+    (0..31)
+        .map(|n| format!("x{n}"))
+        .chain(
+            ["sp_el0", "sp_el1", "pc", "pstate", "fpcr", "fpsr"]
+                .iter()
+                .map(|name| (*name).to_string()),
+        )
+        .collect()
+}
+
+/// The number of SIMD and floating-point registers, `q0`..`q31`.
+pub const AARCH64_SIMD_REGS: usize = 32;
+
+/// Returns a 128-bit SIMD register as `simd` holds it: 32 lowercase hex
+/// digits, no prefix.
+#[must_use]
+pub fn simd_hex(value: u128) -> String {
+    format!("{value:032x}")
+}
+
+/// Parses a SIMD register as [`simd_hex`] writes it, and nothing else.
+#[must_use]
+pub fn parse_simd(text: &str) -> Option<u128> {
+    if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u128::from_str_radix(text, 16).ok()
+}
+
 /// One arm64 vCPU.
 ///
 /// `regs` holds `x0`..`x30`, `sp_el0`, `sp_el1`, `pc`, `pstate`, `fpcr` and
@@ -110,9 +279,9 @@ pub struct Aarch64Vcpu {
     pub simd: Vec<String>,
     /// The system registers, by name.
     pub sysregs: BTreeMap<String, Hex64>,
-    /// Whether the virtual timer's interrupt is masked, on HVF.
+    /// The vCPU's view of the virtual timer, on HVF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vtimer_masked: Option<bool>,
+    pub timer: Option<VcpuTimer>,
     /// `hvf` or `kvm`.
     pub backend: String,
     /// KVM registers this build has no name for, by id, both as hex.
@@ -123,6 +292,101 @@ pub struct Aarch64Vcpu {
     pub unavailable: Vec<String>,
     /// Whether this is less than a restore needs.
     pub partial: bool,
+}
+
+impl Aarch64Vcpu {
+    /// Checks that the state is whole, so a restore can load it as it is.
+    ///
+    /// A vCPU that runs needs every general register of
+    /// [`aarch64_reg_names`], all [`AARCH64_SIMD_REGS`] SIMD registers in the
+    /// [`simd_hex`] form, every required system register of
+    /// [`AARCH64_SYSREGS`] and its timer. An optional register may be absent
+    /// only when `unavailable` names it. No name outside those lists is
+    /// accepted, since a restore would have nowhere to put it. A vCPU that
+    /// is off, or waits for its `CPU_ON`, holds no register at all.
+    ///
+    /// # Errors
+    ///
+    /// Errors with the first thing that does not hold, naming the vCPU.
+    pub fn check_restorable(&self) -> Result<(), String> {
+        let id = self.id;
+        let refuse = |why: String| Err(format!("vCPU {id}: {why}"));
+        if self.partial {
+            return refuse("the state is partial".to_string());
+        }
+        if !self.kvm_extra.is_empty() {
+            return refuse(format!(
+                "{} KVM register(s) this build has no name for",
+                self.kvm_extra.len()
+            ));
+        }
+        if self.power != Power::On {
+            if !self.regs.is_empty() || !self.simd.is_empty() || !self.sysregs.is_empty() {
+                return refuse("a vCPU that is not on holds registers".to_string());
+            }
+            return Ok(());
+        }
+        let names = aarch64_reg_names();
+        if let Some(name) = names.iter().find(|n| !self.regs.contains_key(*n)) {
+            return refuse(format!("register {name} is missing"));
+        }
+        if let Some(name) = self.regs.keys().find(|n| !names.contains(n)) {
+            return refuse(format!("unknown register {name:?}"));
+        }
+        if self.simd.len() != AARCH64_SIMD_REGS {
+            return refuse(format!(
+                "{} SIMD registers, not {AARCH64_SIMD_REGS}",
+                self.simd.len()
+            ));
+        }
+        if let Some((n, _)) = self
+            .simd
+            .iter()
+            .enumerate()
+            .find(|(_, q)| parse_simd(q).is_none())
+        {
+            return refuse(format!("q{n} is not 32 hex digits"));
+        }
+        let need = |name: &str| {
+            AARCH64_SYSREGS
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, need)| *need)
+        };
+        if let Some(name) = self.sysregs.keys().find(|n| need(n).is_none()) {
+            return refuse(format!("unknown system register {name:?}"));
+        }
+        if let Some(name) = self
+            .unavailable
+            .iter()
+            .find(|n| need(n) != Some(Need::Optional))
+        {
+            return refuse(format!(
+                "{name} is listed as unavailable, and a restore needs it"
+            ));
+        }
+        for (name, need) in AARCH64_SYSREGS {
+            let unread = self.unavailable.iter().any(|n| n == name);
+            match (self.sysregs.contains_key(name), unread) {
+                (true, true) => return refuse(format!("{name} is both read and unavailable")),
+                (false, false) => {
+                    return refuse(format!(
+                        "system register {name} is missing{}",
+                        if need == Need::Optional {
+                            " and not listed as unavailable"
+                        } else {
+                            ""
+                        }
+                    ))
+                }
+                _ => {}
+            }
+        }
+        if self.timer.is_none() {
+            return refuse("the virtual timer is missing".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// One x86-64 vCPU, as KVM holds it.
@@ -226,7 +490,7 @@ impl VcpuState {
                     ("TTBR0_EL1", view.ttbr0),
                     ("TTBR1_EL1", view.ttbr1),
                 ]),
-                vtimer_masked: None,
+                timer: None,
                 backend: backend.to_string(),
                 kvm_extra: BTreeMap::new(),
                 unavailable: Vec::new(),
@@ -265,7 +529,7 @@ impl VcpuState {
                 regs: BTreeMap::new(),
                 simd: Vec::new(),
                 sysregs: BTreeMap::new(),
-                vtimer_masked: None,
+                timer: None,
                 backend: backend.to_string(),
                 kvm_extra: BTreeMap::new(),
                 unavailable: Vec::new(),
@@ -465,6 +729,182 @@ mod tests {
                 r#"]}"#
             )
         );
+    }
+
+    /// A whole state, every register set to a value of its own.
+    pub(crate) fn whole(id: u32) -> Aarch64Vcpu {
+        Aarch64Vcpu {
+            id,
+            power: Power::On,
+            mp_state: None,
+            regs: aarch64_reg_names()
+                .into_iter()
+                .zip(1u64..)
+                .map(|(name, v)| (name, Hex64(v)))
+                .collect(),
+            simd: (0..AARCH64_SIMD_REGS as u128)
+                .map(|q| simd_hex(q << 64 | q))
+                .collect(),
+            sysregs: AARCH64_SYSREGS
+                .iter()
+                .zip(0x100u64..)
+                .map(|((name, _), v)| ((*name).to_string(), Hex64(v)))
+                .collect(),
+            timer: Some(VcpuTimer {
+                vtimer_masked: false,
+            }),
+            backend: "hvf".to_string(),
+            kvm_extra: BTreeMap::new(),
+            unavailable: Vec::new(),
+            partial: false,
+        }
+    }
+
+    // The shape of a whole state, pinned on a small one: the schema is the
+    // contract with the KVM export, which writes the same document.
+    #[test]
+    fn a_whole_arm64_state_is_pinned() {
+        let state = VcpuState::Aarch64(Aarch64Vcpu {
+            id: 0,
+            power: Power::On,
+            mp_state: None,
+            regs: [("pc", 0xffff_8000_0801_0000u64), ("x0", 7)]
+                .into_iter()
+                .map(|(n, v)| (n.to_string(), Hex64(v)))
+                .collect(),
+            simd: vec![simd_hex(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)],
+            sysregs: [("CNTV_CTL_EL0".to_string(), Hex64(5))].into(),
+            timer: Some(VcpuTimer {
+                vtimer_masked: true,
+            }),
+            backend: "hvf".to_string(),
+            kvm_extra: BTreeMap::new(),
+            unavailable: vec!["TPIDR2_EL0".to_string()],
+            partial: false,
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"id":0,"power":"on","regs":{"pc":"0xffff800008010000","x0":"0x7"},"#,
+                r#""simd":["0102030405060708090a0b0c0d0e0f10"],"#,
+                r#""sysregs":{"CNTV_CTL_EL0":"0x5"},"timer":{"vtimer_masked":true},"#,
+                r#""backend":"hvf","unavailable":["TPIDR2_EL0"],"partial":false}"#
+            )
+        );
+        let doc = CpuState::new(GuestArch::Aarch64, vec![state]);
+        let json = serde_json::to_vec(&doc).unwrap();
+        assert_eq!(CpuState::from_json(&json).unwrap(), doc);
+    }
+
+    #[test]
+    fn a_whole_state_is_restorable_and_reads_back() {
+        let state = whole(0);
+        state.check_restorable().unwrap();
+        let doc = CpuState::new(GuestArch::Aarch64, vec![VcpuState::Aarch64(state)]);
+        assert!(!doc.is_partial());
+        let json = serde_json::to_vec(&doc).unwrap();
+        assert_eq!(CpuState::from_json(&json).unwrap(), doc);
+        // A vCPU that never started is whole as it is.
+        let VcpuState::Aarch64(off) = VcpuState::powered_off(GuestArch::Aarch64, "hvf", 1) else {
+            unreachable!()
+        };
+        off.check_restorable().unwrap();
+    }
+
+    #[test]
+    fn a_state_a_restore_cannot_load_is_refused() {
+        let refused = |edit: &dyn Fn(&mut Aarch64Vcpu), want: &str| {
+            let mut state = whole(3);
+            edit(&mut state);
+            let err = state.check_restorable().unwrap_err();
+            assert!(err.starts_with("vCPU 3: "), "{err}");
+            assert!(err.contains(want), "{err} lacks {want:?}");
+        };
+        refused(&|s| s.partial = true, "partial");
+        refused(
+            &|s| {
+                s.regs.remove("x17");
+            },
+            "register x17 is missing",
+        );
+        refused(
+            &|s| {
+                s.regs.insert("x31".into(), Hex64(0));
+            },
+            "unknown register \"x31\"",
+        );
+        refused(
+            &|s| {
+                s.simd.pop();
+            },
+            "31 SIMD registers",
+        );
+        refused(&|s| s.simd[4] = "0x12".into(), "q4 is not 32 hex digits");
+        refused(&|s| s.simd[5] = "g".repeat(32), "q5 is not 32 hex digits");
+        refused(
+            &|s| {
+                s.sysregs.remove("TTBR1_EL1");
+            },
+            "system register TTBR1_EL1 is missing",
+        );
+        refused(
+            &|s| {
+                s.sysregs.remove("TPIDR2_EL0");
+            },
+            "TPIDR2_EL0 is missing and not listed as unavailable",
+        );
+        refused(
+            &|s| s.unavailable.push("SCTLR_EL1".into()),
+            "SCTLR_EL1 is listed as unavailable",
+        );
+        refused(
+            &|s| s.unavailable.push("SMCR_EL1".into()),
+            "SMCR_EL1 is both read and unavailable",
+        );
+        refused(
+            &|s| {
+                s.sysregs.insert("HCR_EL2".into(), Hex64(0));
+            },
+            "unknown system register \"HCR_EL2\"",
+        );
+        refused(&|s| s.timer = None, "virtual timer is missing");
+        refused(
+            &|s| {
+                s.kvm_extra.insert("0x1".into(), "0x2".into());
+            },
+            "KVM register",
+        );
+        refused(&|s| s.power = Power::Off, "not on holds registers");
+        // An optional register the host did not have is fine when listed.
+        let mut state = whole(0);
+        state.sysregs.remove("SCXTNUM_EL1");
+        state.unavailable.push("SCXTNUM_EL1".into());
+        state.check_restorable().unwrap();
+    }
+
+    #[test]
+    fn simd_registers_parse_only_as_written() {
+        for v in [0u128, 1, u128::MAX, 0xdead_beef << 64] {
+            assert_eq!(parse_simd(&simd_hex(v)), Some(v));
+        }
+        for bad in [
+            "",
+            "0x0",
+            "+0000000000000000000000000000000",
+            &"0".repeat(33),
+        ] {
+            assert_eq!(parse_simd(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_system_register_list_has_no_duplicates() {
+        let mut names: Vec<&str> = AARCH64_SYSREGS.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), AARCH64_SYSREGS.len());
+        assert_eq!(aarch64_reg_names().len(), 37);
     }
 
     #[test]
