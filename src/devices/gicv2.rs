@@ -374,7 +374,7 @@ impl Gicv2 {
                     continue;
                 }
                 let prio = self.priority(cpu, irq);
-                if best.map_or(true, |(_, p)| prio < p) {
+                if best.is_none_or(|(_, p)| prio < p) {
                     best = Some((irq, prio));
                 }
             }
@@ -1019,6 +1019,7 @@ fn sub_word(word: u32, offset: u64, width: u8) -> u32 {
 /// never writes it. A CPU's `latch0` holds its PPI latches and, for each SGI,
 /// whether any source is pending; `sgi_sources` has the sources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Gicv2State {
     pub dist: DistState,
     pub cpus: Vec<CpuState>,
@@ -1071,6 +1072,7 @@ impl Gicv2State {
 
 /// The distributor part of [`Gicv2State`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DistState {
     pub ctlr: u32,
     pub igroupr: Vec<u32>,
@@ -1085,6 +1087,7 @@ pub struct DistState {
 
 /// One CPU interface and its banked distributor state in [`Gicv2State`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CpuState {
     pub ctlr: u32,
     pub pmr: u32,
