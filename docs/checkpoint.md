@@ -706,8 +706,10 @@ The guest's clock is `hvi-time`, and its restore republishes the page
 - **The driver counts each publish once**, however many vCPUs take
   `GEN_CHANGED`, with the portable kernel's third patch: `migrations` is 1
   after a move on 2 or 4 vCPUs. hvi also publishes the page after a host
-  sleep ([portable-profile.md](portable-profile.md#host-sleep)), which the
-  driver counts the same way.
+  sleep ([portable-profile.md](portable-profile.md#host-sleep)); with the
+  fourth patch the driver counts those in `host_sleeps`, not in
+  `migrations`. The series is in
+  [tools/guest/kernel](../tools/guest/kernel/README.md).
 
 Measured with `tools/checkpoint-e2e.sh --portable`, one run on each host,
 1 vCPU, 512 MiB:

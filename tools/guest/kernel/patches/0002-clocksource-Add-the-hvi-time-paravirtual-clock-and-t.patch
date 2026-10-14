@@ -1,0 +1,727 @@
+From 4cfd86639cc95440718f575e4d458ca309efdb7f Mon Sep 17 00:00:00 2001
+From: Panagiotis Moustafellos <pmoust@nofire.ai>
+Date: Wed, 14 Oct 2026 04:29:32 +0300
+Subject: [PATCH 2/4] clocksource: Add the hvi-time paravirtual clock and timer
+ driver
+
+A guest of the hvi VMM can be checkpointed on one host and restored on
+another whose counter runs at a different frequency: 24 MHz on Apple
+silicon under Hypervisor.framework, 54 MHz on a Raspberry Pi 5 under
+KVM. The arch timer driver caches the boot frequency in its
+clocksource, sched_clock, clockevent and the delay loop, so every
+kernel clock runs at the wrong rate after such a move.
+
+hvi exposes an "hvi,time-v1" device instead: a pvclock page that maps
+CNTVCT_EL0 to guest nanoseconds (base_counter, base_ns, mult, shift
+under a generation seqlock) and that hvi republishes on restore, plus a
+per-CPU one-shot timer that takes an absolute guest nanosecond deadline
+and raises a per-CPU PPI. Guest nanoseconds stop while the guest is
+stopped, so CLOCK_MONOTONIC stays continuous across a restore.
+
+The driver registers a 1 GHz clocksource and sched_clock on the page
+and a per-CPU oneshot clockevent on the timer, all at rating 500 so
+they win over the arch timer. Each CPU uses the timer block of its
+vCPU index, MPIDR_EL1.Aff0. Disarming the timer also clears a latched
+expiry, because the PPI is level and would otherwise stay high.
+
+When hvi signals a new generation, the interrupt handler rescales
+loops_per_jiffy at once, so udelay() is never short on a faster
+counter, and a work item moves CLOCK_REALTIME and CLOCK_BOOTTIME on by
+the time the guest was stopped and touches the lockup watchdogs. A
+core initcall fixes loops_per_jiffy after the boot calibration. An
+fs_initcall_sync sets the wall clock when nothing has. It runs after
+timekeeping has switched to hvi-time, because a clock set while
+timekeeping still reads the jiffies clocksource is forwarded in whole
+jiffies at the switch and starts up to one jiffy off the host.
+
+The driver registers a synthetic 54 MHz counter with
+arm64_set_el0_counter(). With the previous patch, EL0 counter access
+then stays disabled and userspace reads of CNTVCT_EL0 and CNTFRQ_EL0
+trap to that counter. /sys/kernel/hvi_time/ exposes the page state for
+tests.
+
+The driver must be built in: TIMER_OF_DECLARE runs from time_init(),
+sched_clock_register() is __init and timekeeping_inject_sleeptime64()
+is not exported and exists only with PM_SLEEP and RTC_HCTOSYS. It adds
+CPUHP_AP_HVI_TIME_STARTING so that each CPU gets its clockevent before
+it enables interrupts, as the arch timer does. There is no device tree
+binding for "hvi,time-v1"; the series is not meant for upstream as is.
+
+Signed-off-by: Panagiotis Moustafellos <pmoust@nofire.ai>
+---
+ drivers/clocksource/Kconfig    |  20 ++
+ drivers/clocksource/Makefile   |   1 +
+ drivers/clocksource/hvi-time.c | 607 +++++++++++++++++++++++++++++++++
+ include/linux/cpuhotplug.h     |   1 +
+ 4 files changed, 629 insertions(+)
+ create mode 100644 drivers/clocksource/hvi-time.c
+
+diff --git a/drivers/clocksource/Kconfig b/drivers/clocksource/Kconfig
+index abfc2aa85..c2f90dda0 100644
+--- a/drivers/clocksource/Kconfig
++++ b/drivers/clocksource/Kconfig
+@@ -755,4 +755,24 @@ config EP93XX_TIMER
+ 	  Enables support for the Cirrus Logic timer block
+ 	  EP93XX.
+ 
++config HVI_TIME
++	bool "hvi paravirtual clock and timer"
++	depends on ARM64 && OF
++	depends on PM_SLEEP && RTC_HCTOSYS
++	select TIMER_OF
++	help
++	  Clocksource, sched_clock and per-CPU clockevent for guests of the
++	  hvi VMM. They read a pvclock page that the VMM republishes when the
++	  guest is restored on another host, so guest time stays continuous
++	  across hosts with different counter frequencies. EL0 access to the
++	  counter is kept disabled, so userspace reads of CNTVCT_EL0 and
++	  CNTFRQ_EL0 trap and see a fixed 54 MHz counter.
++
++	  Restores move CLOCK_BOOTTIME on with
++	  timekeeping_inject_sleeptime64(), which exists only with PM_SLEEP
++	  and RTC_HCTOSYS.
++
++	  Say N unless the kernel runs under hvi with the hvi,time-v1
++	  device in its device tree.
++
+ endmenu
+diff --git a/drivers/clocksource/Makefile b/drivers/clocksource/Makefile
+index 227437852..824fb3b37 100644
+--- a/drivers/clocksource/Makefile
++++ b/drivers/clocksource/Makefile
+@@ -63,6 +63,7 @@ obj-$(CONFIG_REALTEK_OTTO_TIMER)	+= timer-rtl-otto.o
+ 
+ obj-$(CONFIG_ARC_TIMERS)		+= arc_timer.o
+ obj-$(CONFIG_ARM_ARCH_TIMER)		+= arm_arch_timer.o
++obj-$(CONFIG_HVI_TIME)			+= hvi-time.o
+ obj-$(CONFIG_ARM_GLOBAL_TIMER)		+= arm_global_timer.o
+ obj-$(CONFIG_ARMV7M_SYSTICK)		+= armv7m_systick.o
+ obj-$(CONFIG_ARM_TIMER_SP804)		+= timer-sp804.o
+diff --git a/drivers/clocksource/hvi-time.c b/drivers/clocksource/hvi-time.c
+new file mode 100644
+index 000000000..ab3e71613
+--- /dev/null
++++ b/drivers/clocksource/hvi-time.c
+@@ -0,0 +1,607 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * hvi-time: paravirtual clock and timer for guests of the hvi VMM.
++ *
++ * The VMM publishes a pvclock page in guest memory. It maps the raw
++ * counter (CNTVCT_EL0) to guest nanoseconds:
++ *
++ *   ns = base_ns + ((cntvct - base_counter) * mult) >> shift
++ *
++ * and republishes it when the guest is restored, possibly on a host with
++ * another counter frequency. Guest nanoseconds do not advance while the
++ * guest is stopped. Each CPU also has a one-shot timer that fires at an
++ * absolute guest nanosecond deadline and raises a per-CPU interrupt.
++ *
++ * The driver gives the kernel a 1 GHz clocksource, sched_clock and per-CPU
++ * clockevent built on the page, so no kernel clock depends on the counter
++ * frequency. After a restore it rescales loops_per_jiffy for udelay() and
++ * steps the wall clock. It also registers a synthetic 54 MHz counter, derived
++ * from guest nanoseconds, for EL0 counter reads. Those reads trap only
++ * because update_cntkctl_el1() keeps EL0 counter access disabled once that
++ * counter is registered: without it every exec would enable direct access
++ * to the host counter again.
++ *
++ * Device tree (no upstream binding; the series is out of tree):
++ *
++ *   compatible = "hvi,time-v1";
++ *   reg = <pvclock page, at least 0x40 bytes of RAM>,
++ *         <timer blocks, 0x100 bytes per vCPU>;
++ *   interrupts = <one level-high PPI>;
++ *
++ * The timer block of a CPU is at MPIDR_EL1.Aff0 * 0x100, Aff0 being the
++ * VMM's vCPU index.
++ */
++
++#define pr_fmt(fmt) "hvi-time: " fmt
++
++#include <linux/atomic.h>
++#include <linux/clockchips.h>
++#include <linux/clocksource.h>
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/kobject.h>
++#include <linux/math64.h>
++#include <linux/nmi.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/percpu.h>
++#include <linux/rcupdate.h>
++#include <linux/sched_clock.h>
++#include <linux/sysfs.h>
++#include <linux/timekeeping.h>
++#include <linux/workqueue.h>
++
++#include <asm/arch_timer.h>
++#include <asm/smp_plat.h>
++#include <asm/traps.h>
++
++/* pvclock page, little-endian */
++#define HVI_PAGE_MAGIC		0x00	/* u32 */
++#define HVI_PAGE_VERSION	0x04	/* u32 */
++#define HVI_PAGE_GENERATION	0x08	/* u32, odd while the VMM writes */
++#define HVI_PAGE_FREQ		0x0c	/* u32, host counter Hz */
++#define HVI_PAGE_BASE_COUNTER	0x10	/* u64 */
++#define HVI_PAGE_BASE_NS	0x18	/* u64 */
++#define HVI_PAGE_MULT		0x20	/* u32 */
++#define HVI_PAGE_SHIFT		0x24	/* u32 */
++#define HVI_PAGE_WALL_NS	0x28	/* u64, host CLOCK_REALTIME */
++#define HVI_PAGE_DOWNTIME_NS	0x30	/* u64 */
++#define HVI_PAGE_SIZE		0x40
++
++#define HVI_TIME_MAGIC		0x4d545648	/* "HVTM" */
++#define HVI_TIME_VERSION	1
++
++/* Per-CPU timer block at cpu * HVI_TIMER_STRIDE, u64 registers */
++#define HVI_TIMER_DEADLINE_NS	0x00
++#define HVI_TIMER_NOW_NS	0x08
++#define HVI_TIMER_STATUS	0x10
++#define HVI_TIMER_CTRL		0x18
++#define HVI_TIMER_STRIDE	0x100
++
++#define HVI_STATUS_EXPIRED	BIT(0)
++#define HVI_STATUS_GEN_CHANGED	BIT(1)
++#define HVI_CTRL_ENABLE		BIT(0)
++#define HVI_DEADLINE_NONE	U64_MAX
++
++/* Rate of the synthetic counter that trapped EL0 reads see */
++#define HVI_EL0_COUNTER_HZ	54000000
++
++/* A wall clock earlier than this many seconds after 1970 was never set */
++#define HVI_EPOCH_SLACK_SEC	(365LL * 24 * 3600)
++
++struct hvi_time_cpu {
++	struct clock_event_device evt;
++	void __iomem *regs;
++};
++
++struct hvi_time_snap {
++	u32 generation;
++	u32 freq;
++	u32 mult;
++	u32 shift;
++	u64 base_counter;
++	u64 base_ns;
++	u64 wall_ns;
++	u64 downtime_ns;
++	u64 cntvct;
++	u64 now_ns;
++};
++
++static void __iomem *hvi_page __ro_after_init;
++static void __iomem *hvi_timer_base __ro_after_init;
++static int hvi_time_irq __ro_after_init;
++static bool hvi_time_active __ro_after_init;
++static atomic_t hvi_time_migrations = ATOMIC_INIT(0);
++static DEFINE_PER_CPU(struct hvi_time_cpu, hvi_time_pcpu);
++
++/*
++ * The page is ordinary memory mapped cacheable, so the plain accessors
++ * below are cheap. Each is a single load: the compiler must not merge
++ * them into pairs, which an emulated mapping could not decode.
++ */
++static __always_inline u32 hvi_page_read32(unsigned int off)
++{
++	return le32_to_cpu((__force __le32)__raw_readl(hvi_page + off));
++}
++
++static __always_inline u64 hvi_page_read64(unsigned int off)
++{
++	return le64_to_cpu((__force __le64)__raw_readq(hvi_page + off));
++}
++
++static __always_inline u64 hvi_time_read_ns(void)
++{
++	u64 base_counter, base_ns, cnt;
++	u32 gen, mult, shift;
++
++	do {
++		gen = hvi_page_read32(HVI_PAGE_GENERATION);
++		smp_rmb(); /* fields after the generation, as the VMM wrote */
++		base_counter = hvi_page_read64(HVI_PAGE_BASE_COUNTER);
++		base_ns = hvi_page_read64(HVI_PAGE_BASE_NS);
++		mult = hvi_page_read32(HVI_PAGE_MULT);
++		shift = hvi_page_read32(HVI_PAGE_SHIFT);
++		cnt = __arch_counter_get_cntvct();
++		smp_rmb(); /* fields before the generation re-read */
++	} while ((gen & 1) || gen != hvi_page_read32(HVI_PAGE_GENERATION));
++
++	return base_ns + mul_u64_u32_shr(cnt - base_counter, mult, shift);
++}
++
++static void hvi_time_snapshot(struct hvi_time_snap *s)
++{
++	u32 gen;
++
++	do {
++		gen = hvi_page_read32(HVI_PAGE_GENERATION);
++		smp_rmb(); /* fields after the generation, as the VMM wrote */
++		s->freq = hvi_page_read32(HVI_PAGE_FREQ);
++		s->base_counter = hvi_page_read64(HVI_PAGE_BASE_COUNTER);
++		s->base_ns = hvi_page_read64(HVI_PAGE_BASE_NS);
++		s->mult = hvi_page_read32(HVI_PAGE_MULT);
++		s->shift = hvi_page_read32(HVI_PAGE_SHIFT);
++		s->wall_ns = hvi_page_read64(HVI_PAGE_WALL_NS);
++		s->downtime_ns = hvi_page_read64(HVI_PAGE_DOWNTIME_NS);
++		s->cntvct = __arch_counter_get_cntvct();
++		smp_rmb(); /* fields before the generation re-read */
++	} while ((gen & 1) || gen != hvi_page_read32(HVI_PAGE_GENERATION));
++
++	s->generation = gen;
++	s->now_ns = s->base_ns +
++		mul_u64_u32_shr(s->cntvct - s->base_counter, s->mult, s->shift);
++}
++
++static u64 hvi_time_cs_read(struct clocksource *cs)
++{
++	return hvi_time_read_ns();
++}
++
++static u64 notrace hvi_time_sched_clock_read(void)
++{
++	return hvi_time_read_ns();
++}
++
++static u64 hvi_time_el0_counter(void)
++{
++	return mul_u64_u32_div(hvi_time_read_ns(),
++			       HVI_EL0_COUNTER_HZ / 1000000, 1000);
++}
++
++static struct clocksource hvi_time_clocksource = {
++	.name	= "hvi-time",
++	.rating	= 500,
++	.read	= hvi_time_cs_read,
++	.mask	= CLOCKSOURCE_MASK(64),
++	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
++};
++
++static inline void __iomem *hvi_evt_regs(struct clock_event_device *evt)
++{
++	return container_of(evt, struct hvi_time_cpu, evt)->regs;
++}
++
++static int hvi_time_set_next_event(unsigned long delta,
++				   struct clock_event_device *evt)
++{
++	writeq_relaxed(hvi_time_read_ns() + delta,
++		       hvi_evt_regs(evt) + HVI_TIMER_DEADLINE_NS);
++	return 0;
++}
++
++/*
++ * Disarm, then drop an expiry that latched before the disarm: the PPI is
++ * level and would otherwise stay high on a stopped device. GEN_CHANGED is
++ * left alone so that a pending restore is still handled.
++ */
++static void hvi_time_disarm_regs(void __iomem *regs)
++{
++	writeq_relaxed(HVI_DEADLINE_NONE, regs + HVI_TIMER_DEADLINE_NS);
++	writeq_relaxed(HVI_STATUS_EXPIRED, regs + HVI_TIMER_STATUS);
++}
++
++static int hvi_time_disarm(struct clock_event_device *evt)
++{
++	hvi_time_disarm_regs(hvi_evt_regs(evt));
++	return 0;
++}
++
++/*
++ * Restore: the page now describes another host's counter. Guest
++ * nanoseconds carry on from the checkpoint, so MONOTONIC is continuous;
++ * REALTIME and BOOTTIME move on by the time the guest was stopped.
++ */
++static void hvi_time_migrate(struct work_struct *work)
++{
++	struct hvi_time_snap s;
++	struct timespec64 ts;
++	u64 target_ns;
++	s64 delta;
++
++	hvi_time_snapshot(&s);
++
++	/* Host wall clock now = published wall clock + guest ns since then */
++	target_ns = s.wall_ns + (s.now_ns - s.base_ns);
++	delta = (s64)(target_ns - ktime_get_real_ns());
++
++	if (delta > 0) {
++		/* REALTIME and BOOTTIME move on, MONOTONIC does not */
++		ts = ns_to_timespec64(delta);
++		timekeeping_inject_sleeptime64(&ts);
++	} else if (delta < -(s64)NSEC_PER_MSEC) {
++		ts = ns_to_timespec64(target_ns);
++		do_settimeofday64(&ts);
++	}
++
++	touch_all_softlockup_watchdogs();
++	clocksource_touch_watchdog();
++	rcu_cpu_stall_reset();
++	atomic_inc(&hvi_time_migrations);
++
++	pr_info("generation %u: counter %u Hz, lpj %lu, wall clock moved %lld ns, downtime total %llu ns\n",
++		s.generation, s.freq, loops_per_jiffy, delta, s.downtime_ns);
++}
++
++static DECLARE_WORK(hvi_time_migrate_work, hvi_time_migrate);
++
++/* Counter frequency of the current page, read under the seqlock */
++static u32 hvi_time_page_freq(void)
++{
++	u32 gen, freq;
++
++	do {
++		gen = hvi_page_read32(HVI_PAGE_GENERATION);
++		smp_rmb(); /* fields after the generation, as the VMM wrote */
++		freq = hvi_page_read32(HVI_PAGE_FREQ);
++		smp_rmb(); /* fields before the generation re-read */
++	} while ((gen & 1) || gen != hvi_page_read32(HVI_PAGE_GENERATION));
++
++	return freq;
++}
++
++static irqreturn_t hvi_time_interrupt(int irq, void *dev_id)
++{
++	struct hvi_time_cpu *c = dev_id;
++	u64 status;
++
++	status = readq_relaxed(c->regs + HVI_TIMER_STATUS);
++	if (!status)
++		return IRQ_NONE;
++
++	/* RW1C: clear what we saw; the line drops once STATUS is 0 */
++	writeq_relaxed(status, c->regs + HVI_TIMER_STATUS);
++
++	if (status & HVI_STATUS_GEN_CHANGED) {
++		/*
++		 * udelay() counts the new host's counter from now on. Rescale
++		 * before anything else runs, not in the work item, or delays
++		 * are too short on a faster counter until the worker runs.
++		 */
++		loops_per_jiffy = hvi_time_page_freq() / HZ;
++		schedule_work(&hvi_time_migrate_work);
++	}
++
++	if ((status & HVI_STATUS_EXPIRED) && c->evt.event_handler)
++		c->evt.event_handler(&c->evt);
++
++	return IRQ_HANDLED;
++}
++
++/* Index of a CPU's timer block: its vCPU index, MPIDR_EL1.Aff0 */
++static unsigned int hvi_time_block(unsigned int cpu)
++{
++	return MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 0);
++}
++
++static int hvi_time_starting_cpu(unsigned int cpu)
++{
++	struct hvi_time_cpu *c = this_cpu_ptr(&hvi_time_pcpu);
++	struct clock_event_device *evt = &c->evt;
++
++	c->regs = hvi_timer_base + hvi_time_block(cpu) * HVI_TIMER_STRIDE;
++	hvi_time_disarm_regs(c->regs);
++	writeq_relaxed(HVI_CTRL_ENABLE, c->regs + HVI_TIMER_CTRL);
++
++	/*
++	 * EL0 counter reads must trap so that they see the 54 MHz counter.
++	 * This covers the time before the first exec on this CPU, and an
++	 * arch timer that enabled access; update_cntkctl_el1() keeps the
++	 * bits clear from then on.
++	 */
++	arch_timer_set_cntkctl(arch_timer_get_cntkctl() &
++			       ~(ARCH_TIMER_USR_VCT_ACCESS_EN |
++				 ARCH_TIMER_USR_PCT_ACCESS_EN));
++
++	evt->name = "hvi-time";
++	evt->features = CLOCK_EVT_FEAT_ONESHOT;
++	evt->rating = 500;
++	evt->irq = hvi_time_irq;
++	evt->cpumask = cpumask_of(cpu);
++	evt->set_next_event = hvi_time_set_next_event;
++	evt->set_state_shutdown = hvi_time_disarm;
++	evt->set_state_oneshot_stopped = hvi_time_disarm;
++	clockevents_config_and_register(evt, NSEC_PER_SEC, NSEC_PER_USEC,
++					600 * NSEC_PER_SEC);
++
++	enable_percpu_irq(hvi_time_irq, IRQ_TYPE_NONE);
++	return 0;
++}
++
++static int hvi_time_dying_cpu(unsigned int cpu)
++{
++	struct hvi_time_cpu *c = this_cpu_ptr(&hvi_time_pcpu);
++
++	disable_percpu_irq(hvi_time_irq);
++	writeq_relaxed(HVI_DEADLINE_NONE, c->regs + HVI_TIMER_DEADLINE_NS);
++	writeq_relaxed(0, c->regs + HVI_TIMER_CTRL);
++	return 0;
++}
++
++static int __init hvi_time_of_init(struct device_node *np)
++{
++	struct resource page_res, timer_res;
++	u32 magic, version, gen, freq, mult, shift;
++	unsigned int cpu, blocks = 0;
++	unsigned long hwirq = 0;
++	struct irq_data *d;
++	int ret;
++
++	ret = of_address_to_resource(np, 0, &page_res);
++	if (ret) {
++		pr_err("%pOF: no pvclock page reg\n", np);
++		return ret;
++	}
++	ret = of_address_to_resource(np, 1, &timer_res);
++	if (ret) {
++		pr_err("%pOF: no timer reg\n", np);
++		return ret;
++	}
++
++	hvi_time_irq = irq_of_parse_and_map(np, 0);
++	if (hvi_time_irq <= 0) {
++		pr_err("%pOF: no interrupt\n", np);
++		return -EINVAL;
++	}
++	d = irq_get_irq_data(hvi_time_irq);
++	if (d)
++		hwirq = irqd_to_hwirq(d);
++
++	pr_info("%pOF: page %pR, timers %pR, irq %d (hwirq %lu)\n",
++		np, &page_res, &timer_res, hvi_time_irq, hwirq);
++
++	for_each_possible_cpu(cpu) {
++		u64 mpidr = cpu_logical_map(cpu) & MPIDR_HWID_BITMASK;
++
++		if (mpidr & ~(u64)MPIDR_LEVEL_MASK) {
++			pr_err("CPU%u: MPIDR %#llx has Aff1-3 set, no timer block for it\n",
++			       cpu, mpidr);
++			ret = -EINVAL;
++			goto out_irq;
++		}
++		blocks = max(blocks, hvi_time_block(cpu) + 1);
++	}
++
++	if (resource_size(&page_res) < HVI_PAGE_SIZE ||
++	    resource_size(&timer_res) < (resource_size_t)blocks * HVI_TIMER_STRIDE) {
++		pr_err("reg too small for %u timer blocks\n", blocks);
++		ret = -EINVAL;
++		goto out_irq;
++	}
++
++	/* The page is RAM the VMM writes: map it cacheable, not as a device */
++	hvi_page = ioremap_cache(page_res.start, resource_size(&page_res));
++	if (!hvi_page) {
++		ret = -ENOMEM;
++		goto out_irq;
++	}
++
++	magic = hvi_page_read32(HVI_PAGE_MAGIC);
++	version = hvi_page_read32(HVI_PAGE_VERSION);
++	gen = hvi_page_read32(HVI_PAGE_GENERATION);
++	freq = hvi_page_read32(HVI_PAGE_FREQ);
++	mult = hvi_page_read32(HVI_PAGE_MULT);
++	shift = hvi_page_read32(HVI_PAGE_SHIFT);
++	pr_info("page: magic %#010x version %u generation %u counter %u Hz mult %u shift %u\n",
++		magic, version, gen, freq, mult, shift);
++
++	if (magic != HVI_TIME_MAGIC || version != HVI_TIME_VERSION) {
++		pr_err("no pvclock page (want magic %#010x version %u), not using hvi-time\n",
++		       HVI_TIME_MAGIC, HVI_TIME_VERSION);
++		ret = -ENODEV;
++		goto out_page;
++	}
++	if (!freq || !mult || shift > 32 || (gen & 1)) {
++		pr_err("pvclock page is not usable, not using hvi-time\n");
++		ret = -EINVAL;
++		goto out_page;
++	}
++
++	hvi_timer_base = ioremap(timer_res.start, resource_size(&timer_res));
++	if (!hvi_timer_base) {
++		ret = -ENOMEM;
++		goto out_page;
++	}
++
++	ret = request_percpu_irq(hvi_time_irq, hvi_time_interrupt, "hvi-time",
++				 &hvi_time_pcpu);
++	if (ret) {
++		pr_err("cannot request irq %d: %d\n", hvi_time_irq, ret);
++		goto out_timers;
++	}
++
++	ret = cpuhp_setup_state(CPUHP_AP_HVI_TIME_STARTING,
++				"clockevents/hvi_time:starting",
++				hvi_time_starting_cpu, hvi_time_dying_cpu);
++	if (ret < 0) {
++		pr_err("cannot set up CPU hotplug state: %d\n", ret);
++		goto out_percpu_irq;
++	}
++
++	clocksource_register_hz(&hvi_time_clocksource, NSEC_PER_SEC);
++	sched_clock_register(hvi_time_sched_clock_read, 64, NSEC_PER_SEC);
++	arm64_set_el0_counter(hvi_time_el0_counter, HVI_EL0_COUNTER_HZ);
++	hvi_time_active = true;
++
++	pr_info("clocksource, sched_clock and clockevent at 1 GHz, now %llu ns\n",
++		hvi_time_read_ns());
++	return 0;
++
++out_percpu_irq:
++	free_percpu_irq(hvi_time_irq, &hvi_time_pcpu);
++out_timers:
++	iounmap(hvi_timer_base);
++	hvi_timer_base = NULL;
++out_page:
++	iounmap(hvi_page);
++	hvi_page = NULL;
++out_irq:
++	irq_dispose_mapping(hvi_time_irq);
++	hvi_time_irq = 0;
++	return ret;
++}
++
++TIMER_OF_DECLARE(hvi_time, "hvi,time-v1", hvi_time_of_init);
++
++/*
++ * time_init() set lpj_fine from the DT arch timer rate and the delay loop
++ * was calibrated with it, but udelay() counts the real counter. Correct it
++ * as early as possible.
++ */
++static int __init hvi_time_lpj_init(void)
++{
++	if (!hvi_time_active)
++		return 0;
++
++	loops_per_jiffy = hvi_time_page_freq() / HZ;
++	pr_info("counter %u Hz, lpj %lu\n", hvi_time_page_freq(),
++		loops_per_jiffy);
++	return 0;
++}
++core_initcall(hvi_time_lpj_init);
++
++/*
++ * Take the wall clock from the VMM when nothing has set it yet. This runs
++ * after clocksource_done_booting() (fs_initcall) has switched timekeeping
++ * to hvi-time. Set any earlier, while timekeeping still reads the jiffies
++ * clocksource, the switch forwards the time since the set in whole
++ * jiffies, and REALTIME starts up to one jiffy off the host.
++ */
++static int __init hvi_time_wall_init(void)
++{
++	struct hvi_time_snap s;
++	struct timespec64 ts;
++
++	if (!hvi_time_active)
++		return 0;
++
++	if (ktime_get_real_seconds() < HVI_EPOCH_SLACK_SEC) {
++		hvi_time_snapshot(&s);
++		if (s.wall_ns) {
++			ts = ns_to_timespec64(s.wall_ns + (s.now_ns - s.base_ns));
++			do_settimeofday64(&ts);
++		}
++	}
++
++	pr_info("wall clock %lld s\n", ktime_get_real_seconds());
++	return 0;
++}
++fs_initcall_sync(hvi_time_wall_init);
++
++/*
++ * Self-check for tests: /sys/kernel/hvi_time/. The single-value files
++ * follow the sysfs rule; "snapshot" prints one consistent read of all
++ * of them on one line.
++ */
++static ssize_t snapshot_show(struct kobject *kobj, struct kobj_attribute *attr,
++			     char *buf)
++{
++	struct hvi_time_snap s;
++	u64 mmio_now_ns;
++
++	preempt_disable();
++	hvi_time_snapshot(&s);
++	mmio_now_ns = readq_relaxed(this_cpu_ptr(&hvi_time_pcpu)->regs +
++				    HVI_TIMER_NOW_NS);
++	preempt_enable();
++
++	return sysfs_emit(buf,
++			  "generation=%u counter_freq_hz=%u base_counter=%llu base_ns=%llu mult=%u shift=%u wall_ns=%llu downtime_total_ns=%llu cntvct=%llu now_ns=%llu mmio_now_ns=%llu lpj=%lu migrations=%d\n",
++			  s.generation, s.freq, s.base_counter, s.base_ns,
++			  s.mult, s.shift, s.wall_ns, s.downtime_ns, s.cntvct,
++			  s.now_ns, mmio_now_ns, loops_per_jiffy,
++			  atomic_read(&hvi_time_migrations));
++}
++
++#define HVI_SNAP_ATTR(_name, _fmt, _expr)				\
++static ssize_t _name##_show(struct kobject *kobj,			\
++			    struct kobj_attribute *attr, char *buf)	\
++{									\
++	struct hvi_time_snap s;						\
++									\
++	hvi_time_snapshot(&s);						\
++	return sysfs_emit(buf, _fmt "\n", _expr);			\
++}									\
++static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
++
++HVI_SNAP_ATTR(generation, "%u", s.generation);
++HVI_SNAP_ATTR(counter_freq_hz, "%u", s.freq);
++HVI_SNAP_ATTR(now_ns, "%llu", s.now_ns);
++HVI_SNAP_ATTR(cntvct, "%llu", s.cntvct);
++static struct kobj_attribute snapshot_attr = __ATTR_RO(snapshot);
++
++static struct attribute *hvi_time_attrs[] = {
++	&generation_attr.attr,
++	&counter_freq_hz_attr.attr,
++	&now_ns_attr.attr,
++	&cntvct_attr.attr,
++	&snapshot_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group hvi_time_attr_group = {
++	.attrs = hvi_time_attrs,
++};
++
++static int __init hvi_time_sysfs_init(void)
++{
++	struct kobject *kobj;
++	int ret;
++
++	if (!hvi_time_active)
++		return 0;
++
++	kobj = kobject_create_and_add("hvi_time", kernel_kobj);
++	if (!kobj)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(kobj, &hvi_time_attr_group);
++	if (ret)
++		kobject_put(kobj);
++	return ret;
++}
++late_initcall(hvi_time_sysfs_init);
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 6645faf1c..b95407efb 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -177,6 +177,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_CSKY_TIMER_STARTING,
+ 	CPUHP_AP_TI_GP_TIMER_STARTING,
+ 	CPUHP_AP_HYPERV_TIMER_STARTING,
++	CPUHP_AP_HVI_TIME_STARTING,
+ 	/* Must be the last timer callback */
+ 	CPUHP_AP_DUMMY_TIMER_STARTING,
+ 	CPUHP_AP_ARM_XEN_STARTING,
+-- 
+2.51.2
+
