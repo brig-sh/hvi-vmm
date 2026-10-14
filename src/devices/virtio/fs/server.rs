@@ -7328,20 +7328,22 @@ mod tests {
     /// disk that way.
     #[test]
     fn read_only_export_does_not_sync_the_host() {
-        let (_dir, mut dev) = fixture_with_access(false);
+        let (dir, mut dev) = fixture_with_access(false);
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The same for a writable export the guest has not written to: the cost
     /// is owed to writes, not to holding the share.
     #[test]
     fn writable_export_with_no_writes_does_not_sync_the_host() {
-        let (_dir, mut dev) = fixture_with_access(true);
+        let (dir, mut dev) = fixture_with_access(true);
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// And once a write has landed the sync does happen -- once. A guest
@@ -7349,7 +7351,7 @@ mod tests {
     /// until it writes again.
     #[test]
     fn syncfs_syncs_the_host_once_per_batch_of_writes() {
-        let (_dir, mut dev) = fixture_with_access(true);
+        let (dir, mut dev) = fixture_with_access(true);
         write_and_close(&mut dev, "first", b"hello");
 
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
@@ -7364,6 +7366,7 @@ mod tests {
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A volume sync that fails is reported to the guest, and the writes it
@@ -7396,6 +7399,7 @@ mod tests {
             2,
             "the pending batch was not retried"
         );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A reset drops every handle without flushing it, so writes made before
@@ -7404,7 +7408,7 @@ mod tests {
     /// skips them.
     #[test]
     fn reset_keeps_a_pending_host_sync() {
-        let (_dir, mut dev) = fixture_with_access(true);
+        let (dir, mut dev) = fixture_with_access(true);
         write_and_close(&mut dev, "before-reset", b"hello");
         dev.reset();
         assert_eq!(dev.host_sync_count(), 0);
@@ -7412,6 +7416,7 @@ mod tests {
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A guest binding a Unix socket sends MKNOD with S_IFSOCK. It has to
