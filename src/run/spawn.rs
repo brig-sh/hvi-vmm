@@ -139,7 +139,7 @@ mod tests {
             plugin: None,
             sandbox: false,
             profile: crate::config::MachineProfileKind::Native,
-            arch_timer_irq: true,
+            arch_timer_irq: None,
             stop: Some(registration),
         };
         let run = spawn(cfg).unwrap();

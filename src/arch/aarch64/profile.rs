@@ -264,6 +264,107 @@ mod tests {
         assert_ne!(a.firmware.dtb_sha256, c.firmware.dtb_sha256);
     }
 
+    /// A portable guest given the same configuration on hvf and on KVM gets
+    /// the same devicetree, and so the same digest, because both backends
+    /// take its inputs from `portable::devicetree` and lay out RAM, the
+    /// kernel and the initramfs with the same loader.
+    #[test]
+    fn a_portable_devicetree_is_the_same_on_both_backends() {
+        use crate::config::BootConfig;
+        let cfg = |cmdline: &str, timer: Option<bool>| BootConfig {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 512 << 20,
+            cmdline: cmdline.into(),
+            disk: None,
+            fs_shares: Vec::new(),
+            net: true,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: String::new(),
+            vcpus: 2,
+            agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
+            plugin: None,
+            sandbox: false,
+            profile: MachineProfileKind::PortableArm64V1,
+            arch_timer_irq: timer,
+            stop: None,
+        };
+        let layout = layout();
+        let digest = |backend: &str, cfg: &BootConfig| {
+            let dt = portable::devicetree(cfg, 2, true, true, false).unwrap();
+            let machine = Arm64Machine {
+                gic: &dt.gic,
+                layout: &layout,
+                vcpus: 2,
+                cmdline: &dt.cmdline,
+                devices: dt.devices,
+                net_mode: Some(if backend == "kvm" { "tap" } else { "stub" }),
+                ram_regions: vec![crate::memory::RamRegion {
+                    gpa: 0x4000_0000,
+                    size: 512 << 20,
+                    file_offset: 0,
+                }],
+                profile: cfg.profile,
+            };
+            profile(backend, &machine)
+        };
+        let base = cfg("console=ttyAMA0", None);
+        let (hvf, kvm) = (digest("hvf", &base), digest("kvm", &base));
+        assert!(hvf.firmware.dtb_sha256.is_some());
+        assert_eq!(hvf.firmware.dtb_sha256, kvm.firmware.dtb_sha256);
+        assert_eq!(hvf.profile, "portable-arm64-v1");
+        assert_eq!(hvf.baseline, kvm.baseline);
+        assert_eq!(hvf.irq, kvm.irq);
+        assert_eq!(hvf.irq.as_ref().map(|i| i.layout.version), Some(2));
+        let time = hvf.time.as_ref().unwrap();
+        assert_eq!(
+            (time.page_base, time.timers_base, time.intid),
+            (0x0d10_0000, 0x0d11_0000, 20)
+        );
+        let kinds: Vec<_> = hvf.devices.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "pl011",
+                "virtio-blk",
+                "virtio-net",
+                "hvi-time-page",
+                "hvi-time"
+            ]
+        );
+        // The tree is the portable one: hvi-time, the prefixed command line
+        // and a timer without interrupts. Each change moves the digest.
+        let tree = |cfg: &BootConfig| {
+            let dt = portable::devicetree(cfg, 2, true, true, false).unwrap();
+            fdt::build(
+                &layout,
+                &dt.gic,
+                2,
+                &dt.cmdline,
+                dt.devices,
+                &[0; fdt::RNG_SEED_LEN],
+                0,
+            )
+            .unwrap()
+        };
+        let blob = tree(&base);
+        let has = |needle: &str| blob.windows(needle.len()).any(|w| w == needle.as_bytes());
+        assert!(has("hvi,time-v1"));
+        assert!(has(
+            "arm64.nopauth arm64.nobti arm64.nosve arm64.nosme arm64.nomte console=ttyAMA0"
+        ));
+        assert!(fdt::tests::prop(&blob, "timer", "interrupts").is_none());
+        assert_eq!(sha256_hex(&blob), hvf.firmware.dtb_sha256.clone().unwrap());
+        let debug = digest("kvm", &cfg("console=ttyAMA0", Some(true)));
+        assert_ne!(debug.firmware.dtb_sha256, hvf.firmware.dtb_sha256);
+    }
+
     #[test]
     fn devices_are_listed_with_their_windows_and_lines() {
         let (gic, layout) = (GicLayout::QEMU_VIRT, layout());
