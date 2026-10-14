@@ -66,7 +66,9 @@
 //! calls a checkpoint bundle needs (`openat`, `mkdirat`, `renameat`, `unlinkat`
 //! and the `stat` family), and only the control socket's thread installs it,
 //! and only when the run has a checkpoint root. That thread parses the control
-//! protocol, never guest data.
+//! protocol, never guest data. seccomp cannot filter the path a call names, so
+//! `control` does not hold the thread to the root: hvi's own path check does,
+//! see `docs/security.md`.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
