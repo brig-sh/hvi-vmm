@@ -375,6 +375,13 @@ pub struct RestoreConfig {
     pub checkpoint_root: Option<String>,
     /// The disk image to reopen for the guest's virtio-blk device.
     pub disk: Option<String>,
+    /// How many rounds of `disk-blocks` the mover applied onto its copy of
+    /// the guest's base image to make `disk`: rounds 0 to N - 1, as
+    /// `disk.json` lists them. `None` when the disk was copied whole. With
+    /// it, the restore refuses a disk.json whose rounds are not those N, or
+    /// whose last round was read before the guest's last write, since the
+    /// disk would then lack that write.
+    pub disk_rounds: Option<u32>,
     /// The built-in network stack, for a guest that ran on it.
     pub net: bool,
     /// The gateway stream socket, for a guest that ran on a gateway.

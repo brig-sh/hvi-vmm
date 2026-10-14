@@ -503,10 +503,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Runs `restore`, which resumes a checkpoint bundle in this process.
 ///
-/// `restore (--from <bundle> | --from-stream <socket>|- [--stream-keep <dir>])
-/// --control-sock <path> --checkpoint-root <dir>
-/// [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac <mac>]
-/// [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
+/// `restore (--from <bundle> [--disk-rounds <n>] | --from-stream
+/// <socket>|- [--stream-keep <dir>]) --control-sock <path> --checkpoint-root
+/// <dir> [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac
+/// <mac>] [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
 /// [--profile-out <path>] [--no-sandbox]`. The guest waits restored-paused
 /// until a client sends `resume` on the control socket.
 fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -516,6 +516,7 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut control_sock = None;
     let mut checkpoint_root = None;
     let mut disk = None;
+    let mut disk_rounds = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_mac = None;
@@ -538,6 +539,13 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--control-sock" => control_sock = Some(value("--control-sock")?),
             "--checkpoint-root" => checkpoint_root = Some(value("--checkpoint-root")?),
             "--disk" => disk = Some(value("--disk")?),
+            "--disk-rounds" => {
+                let v = value("--disk-rounds")?;
+                disk_rounds = Some(
+                    v.parse()
+                        .map_err(|_| format!("--disk-rounds is not a round count: {v}"))?,
+                );
+            }
             "--net-stub" => net = true,
             "--net-gateway" => net_gateway = Some(value("--net-gateway")?),
             "--net-mac" => {
@@ -587,6 +595,7 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             checkpoint_root.ok_or("restore needs --checkpoint-root, as the next move does")?,
         ),
         disk,
+        disk_rounds,
         net,
         net_gateway,
         net_mac,

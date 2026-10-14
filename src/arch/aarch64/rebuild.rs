@@ -69,15 +69,22 @@ pub(crate) fn devices(
     let block = match (&cfg.disk, &states.blk) {
         (Some(path), Some(state)) => {
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            // The refusals made sure disk.json is there.
+            // The refusals made sure disk.json is there, and the bundle's
+            // reader checked its bitmap.
             let generation = opened.disk.as_ref().map_or(0, |d| d.generation);
+            let since_boot = match &opened.disk {
+                Some(disk) => disk
+                    .dirty_since_boot()
+                    .map_err(|e| format!("disk.json: {e}"))?,
+                None => None,
+            };
             // A streaming source releases the disk's lock as it fences,
             // just after it sends the manifest, so a restore that read the
             // stream quickly can find it still held. It waits a little for
             // that; a disk another guest holds stays refused.
             let deadline = std::time::Instant::now() + DISK_LOCK_WAIT;
             let dev = loop {
-                match VirtioBlk::restore(path, ram, state, generation, None) {
+                match VirtioBlk::restore(path, ram, state, generation, since_boot.clone()) {
                     Err(e)
                         if opened.streamed()
                             && e.kind() == std::io::ErrorKind::WouldBlock
