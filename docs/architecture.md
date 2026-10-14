@@ -469,10 +469,12 @@ silicon, 54 MHz on the Pi). It knows nothing of the hypervisor:
 - The backend supplies the guest's counter (`GuestCounter`) and the timers'
   lines (`TimerLine`), maps the page read-only into the guest and routes the
   timer window to `HviTime::mmio_read` and `mmio_write`.
-- hvi writes the page under a sequence count at boot and at every restore.
-  The guest reads it without an exit.
+- hvi writes the page under a sequence count at boot, at every restore and
+  after a host sleep. The guest reads it without an exit.
 - One thread per VM, started with the I/O threads and ended before them,
-  sleeps until the earliest armed deadline and raises the vCPU's line. On
+  sleeps until the earliest armed deadline and raises the vCPU's line. It
+  wakes at least once a second to look for a host sleep, and publishes the
+  page again after one (`HostClock`, read from the host by `SystemClock`). On
   macOS it runs under `THREAD_TIME_CONSTRAINT_POLICY`, on Linux with a 1 ns
   timer slack and the `vmm` seccomp filter.
 - Lock order: the device's lock, then the GIC's. Wakes of vCPUs happen after
