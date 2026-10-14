@@ -32,8 +32,9 @@
 //!   ns = base_ns + ((cnt - base_counter) * mult) >> shift
 //!   ```
 //!
-//!   hvi writes it at boot and at every restore, under a sequence count the
-//!   guest retries on, and never otherwise. A guest reads it without an exit.
+//!   hvi writes it at boot, at every restore and after the host sleeps,
+//!   under a sequence count the guest retries on, and never otherwise. A
+//!   guest reads it without an exit.
 //! - The **timer blocks**, one 0x100-byte MMIO block per vCPU at `cpu * 0x100`,
 //!   `cpu` being the vCPU index (`MPIDR_EL1.Aff0`):
 //!
@@ -61,6 +62,16 @@
 //! fires at once, on the vCPU that wrote it. A deadline never fires early:
 //! after every wake the thread reads the counter again and goes back to sleep
 //! for what is left.
+//!
+//! The same thread watches for a host sleep. The guest's counter does not run
+//! while a Mac sleeps, so guest nanoseconds stop with it and the wall clock
+//! the guest derives from the page falls behind the host's by the sleep. The
+//! thread wakes at least once a second and compares a host clock that runs
+//! only while the host sleeps ([`HostClock::slept_ns`]) with its value at the
+//! last publish. When it grew by [`SLEEP_REPUBLISH_NS`] or more, the page is
+//! published again as a restore publishes it, on the same counter and rate:
+//! guest nanoseconds go on, the wall clock is the host's, and every vCPU gets
+//! `GEN_CHANGED`, so the guest driver steps its wall clock forward.
 //!
 //! The device knows nothing of the hypervisor. The backend supplies the
 //! guest's counter ([`GuestCounter`]) and the interrupt line ([`TimerLine`]),
@@ -106,11 +117,20 @@ pub const SHIFT: u32 = 24;
 /// `(10^9 << SHIFT) / freq` is 2^32, one more than `mult` holds.
 pub const MIN_COUNTER_HZ: u32 = 3_906_251;
 
+/// How much the host must have slept since the last publish before the
+/// timer thread publishes the page again: 50 ms. The sleep clock grows only
+/// while the host sleeps, so anything short of this is the error of reading
+/// two clocks one after the other, and a real sleep is far longer.
+pub const SLEEP_REPUBLISH_NS: u64 = 50_000_000;
+/// The longest the timer thread waits without looking at the sleep clock.
+const SLEEP_CHECK_EVERY: Duration = Duration::from_secs(1);
+
 /// `DEADLINE_NS` of a disarmed timer.
 pub const DISARMED: u64 = u64::MAX;
 /// `STATUS.EXPIRED`: the armed deadline has passed.
 pub const STATUS_EXPIRED: u64 = 1 << 0;
-/// `STATUS.GEN_CHANGED`: hvi published a new page after a restore.
+/// `STATUS.GEN_CHANGED`: hvi published a new page, after a restore or a
+/// host sleep.
 pub const STATUS_GEN_CHANGED: u64 = 1 << 1;
 /// `CTRL.ENABLE`.
 pub const CTRL_ENABLE: u64 = 1 << 0;
@@ -207,6 +227,142 @@ pub trait TimerLine: Send + Sync {
     fn wake(&self, mask: u8) {
         let _ = mask;
     }
+}
+
+/// The host clocks the device reads beside the guest's counter.
+pub trait HostClock: Send + Sync {
+    /// Returns the host's `CLOCK_REALTIME`, in nanoseconds.
+    fn realtime_ns(&self) -> u64;
+
+    /// Returns how long the host has slept, in nanoseconds, since some
+    /// fixed point: a clock that runs only while the host sleeps.
+    fn slept_ns(&self) -> u64;
+}
+
+/// The host's own clocks, shifted by a simulated host sleep when
+/// `HVI_TIME_TEST_SLEEP` asks for one.
+pub struct SystemClock {
+    test: Option<TestSleep>,
+}
+
+impl SystemClock {
+    /// Returns the host's clocks, shifted as `HVI_TIME_TEST_SLEEP` asks.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let test = TestSleep::from_env();
+        if let Some(t) = &test {
+            eprintln!(
+                "{} hvi-time test sleep: the host clocks move {:.3} s ahead {:.3} s from now",
+                crate::LOG_PREFIX,
+                t.slept.as_secs_f64(),
+                t.at.as_secs_f64()
+            );
+        }
+        Self { test }
+    }
+
+    /// What the sleep test adds to both clocks now, in nanoseconds.
+    fn shift_ns(&self) -> u64 {
+        self.test.as_ref().map_or(0, TestSleep::shift_ns)
+    }
+}
+
+impl HostClock for SystemClock {
+    fn realtime_ns(&self) -> u64 {
+        realtime_ns().saturating_add(self.shift_ns())
+    }
+
+    fn slept_ns(&self) -> u64 {
+        host_slept_ns().saturating_add(self.shift_ns())
+    }
+}
+
+/// A host sleep simulated in one process: `HVI_TIME_TEST_SLEEP=<at>,<secs>`.
+///
+/// `at` seconds after the device is made, the host's wall clock and its
+/// sleep clock, as the device reads them, move `secs` seconds ahead at once.
+/// To the device that is what a host sleep of `secs` with the guest's counter
+/// stopped looks like: the host slept, and its wall clock is `secs` past the
+/// one the guest derives from the page. The guest's REALTIME then moves
+/// `secs` ahead of the real host's, which is how a test sees it re-align.
+/// It cannot stop the guest's counter, which a real sleep on a Mac does.
+///
+/// Debugging only: it is read from the environment so that no CLI flag
+/// promises it.
+struct TestSleep {
+    /// When the device was made.
+    start: Instant,
+    at: Duration,
+    slept: Duration,
+}
+
+impl TestSleep {
+    /// Reads `HVI_TIME_TEST_SLEEP`, or `None` when it is unset or not two
+    /// numbers of seconds.
+    fn from_env() -> Option<Self> {
+        Self::parse(&std::env::var("HVI_TIME_TEST_SLEEP").ok()?)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let (at, slept) = value.split_once(',')?;
+        Some(Self {
+            start: Instant::now(),
+            at: Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+            slept: Duration::try_from_secs_f64(slept.trim().parse().ok()?).ok()?,
+        })
+    }
+
+    fn shift_ns(&self) -> u64 {
+        if self.start.elapsed() < self.at {
+            0
+        } else {
+            u64::try_from(self.slept.as_nanos()).unwrap_or(u64::MAX)
+        }
+    }
+}
+
+/// Returns how long the host has slept since it booted: on macOS the
+/// continuous clock, which runs in sleep, less the uptime clock, which does
+/// not (`mach_continuous_time` less `mach_absolute_time`); on Linux
+/// `CLOCK_BOOTTIME` less `CLOCK_MONOTONIC`. Both pairs share their rate and
+/// their adjustments, so the difference moves only while the host sleeps,
+/// and drifts with nothing.
+///
+/// The two clocks are read one after the other, so the awake clock is read
+/// on both sides of the other and the read is taken again, up to three
+/// times, when more than 1 ms passed in between.
+fn host_slept_ns() -> u64 {
+    #[cfg(target_os = "macos")]
+    let (awake, continuous) = (libc::CLOCK_UPTIME_RAW, libc::CLOCK_MONOTONIC_RAW);
+    #[cfg(not(target_os = "macos"))]
+    let (awake, continuous) = (libc::CLOCK_MONOTONIC, libc::CLOCK_BOOTTIME);
+    let mut slept = 0;
+    for _ in 0..3 {
+        let before = clock_ns(awake);
+        let total = clock_ns(continuous);
+        let after = clock_ns(awake);
+        slept = total.saturating_sub(before / 2 + after / 2);
+        if after.saturating_sub(before) < 1_000_000 {
+            break;
+        }
+    }
+    slept
+}
+
+/// Returns clock `id` in nanoseconds, or 0 when it cannot be read.
+fn clock_ns(id: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for the call.
+    if unsafe { libc::clock_gettime(id, &mut ts) } != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
 /// The contents of the pvclock page.
@@ -493,6 +649,9 @@ struct Inner {
     frozen: bool,
     /// Set by [`HviTime::stop`]: the timer thread returns.
     stopped: bool,
+    /// [`HostClock::slept_ns`] at the last publish, or when the device was
+    /// made.
+    slept_at_publish: u64,
 }
 
 /// The `hvi-time` device of one VM. See the module documentation.
@@ -500,6 +659,7 @@ pub struct HviTime {
     page: PvclockPage,
     counter: Box<dyn GuestCounter>,
     line: Box<dyn TimerLine>,
+    host: Box<dyn HostClock>,
     /// The host counter's rate, which every publish on this host carries.
     freq: u32,
     /// [`mult_for`] of `freq`.
@@ -529,12 +689,36 @@ impl HviTime {
         counter: Box<dyn GuestCounter>,
         line: Box<dyn TimerLine>,
     ) -> io::Result<Self> {
+        Self::with_host_clock(
+            vcpus,
+            freq_hz,
+            counter,
+            line,
+            Box::new(SystemClock::from_env()),
+        )
+    }
+
+    /// Returns the device as [`new`](Self::new) does, reading the host's
+    /// wall and sleep clocks from `host`.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new).
+    pub fn with_host_clock(
+        vcpus: usize,
+        freq_hz: u64,
+        counter: Box<dyn GuestCounter>,
+        line: Box<dyn TimerLine>,
+        host: Box<dyn HostClock>,
+    ) -> io::Result<Self> {
         let (freq, mult) =
             counter_rate(freq_hz).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let slept_at_publish = host.slept_ns();
         Ok(Self {
             page: PvclockPage::new()?,
             counter,
             line,
+            host,
             freq,
             mult,
             vcpus,
@@ -552,6 +736,7 @@ impl HviTime {
                 timers: vec![Timer::RESET; vcpus],
                 frozen: false,
                 stopped: false,
+                slept_at_publish,
             }),
             changed: Condvar::new(),
         })
@@ -580,10 +765,11 @@ impl HviTime {
             base_ns: 0,
             mult: self.mult,
             shift: SHIFT,
-            wall_ns: realtime_ns(),
+            wall_ns: self.host.realtime_ns(),
             downtime_total_ns: 0,
         };
         self.page.publish(&g.clock);
+        g.slept_at_publish = self.host.slept_ns();
     }
 
     /// Returns guest nanoseconds now.
@@ -741,6 +927,15 @@ impl HviTime {
             if g.stopped {
                 return;
             }
+            if let Some(woke) = self.republish_if_host_slept(&mut g) {
+                drop(g);
+                woke.log();
+                if woke.wake != 0 {
+                    self.line.wake(woke.wake);
+                }
+                g = lock_or_recover(&self.inner);
+                continue;
+            }
             let now = g.clock.guest_ns(self.counter.now());
             let mut wake = 0;
             let mut earliest: Option<u64> = None;
@@ -774,17 +969,69 @@ impl HviTime {
                 let until_report = at.saturating_duration_since(Instant::now());
                 sleep = Some(sleep.map_or(until_report, |s| s.min(until_report)));
             }
-            g = match sleep {
-                None => self
-                    .changed
-                    .wait(g)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                Some(d) => match self.changed.wait_timeout(g, d) {
-                    Ok((g, _)) => g,
-                    Err(poisoned) => poisoned.into_inner().0,
-                },
+            // Never longer than a second, so a host sleep is seen soon after
+            // the wake even when no deadline is armed.
+            let d = sleep.map_or(SLEEP_CHECK_EVERY, |s| s.min(SLEEP_CHECK_EVERY));
+            g = match self.changed.wait_timeout(g, d) {
+                Ok((g, _)) => g,
+                Err(poisoned) => poisoned.into_inner().0,
             };
         }
+    }
+
+    /// Publishes the page again when the host slept [`SLEEP_REPUBLISH_NS`]
+    /// or more since the last publish, and returns what it did. The guest's
+    /// counter stops while a Mac sleeps, so the wall clock the guest derives
+    /// from the page is behind the host's by the sleep.
+    ///
+    /// The new page is a restore's on the same counter: guest nanoseconds go
+    /// on from now, the wall clock is the host's, and the downtime grows by
+    /// how far the guest's wall clock was behind. Every vCPU's `STATUS`
+    /// gains `GEN_CHANGED`, and the deadlines stay as they are, since guest
+    /// nanoseconds did not jump. A host whose counter ran through the sleep
+    /// gets the same publish, with the wall clock 0 behind.
+    ///
+    /// Nothing is published while the device is frozen, since a capture is
+    /// reading it, or before the first publish, when a restored VM waits
+    /// for its [`PendingPublish`]: that publish takes the sleep clock again.
+    fn republish_if_host_slept(&self, g: &mut Inner) -> Option<Woke> {
+        if g.frozen || g.clock.generation == 0 {
+            return None;
+        }
+        let slept_now = self.host.slept_ns();
+        let slept = slept_now.saturating_sub(g.slept_at_publish);
+        if slept < SLEEP_REPUBLISH_NS {
+            return None;
+        }
+        let counter = self.counter.now();
+        let now = g.clock.guest_ns(counter);
+        let wall = self.host.realtime_ns();
+        let guest_wall = g
+            .clock
+            .wall_ns
+            .wrapping_add(now.wrapping_sub(g.clock.base_ns));
+        let behind = wall.saturating_sub(guest_wall);
+        g.clock = PageState {
+            generation: g.clock.generation.wrapping_add(2),
+            base_counter: counter,
+            base_ns: now,
+            wall_ns: wall,
+            downtime_total_ns: g.clock.downtime_total_ns.saturating_add(behind),
+            ..g.clock
+        };
+        self.page.publish(&g.clock);
+        g.slept_at_publish = slept_now;
+        let mut wake = 0;
+        for cpu in 0..g.timers.len() {
+            g.timers[cpu].status |= STATUS_GEN_CHANGED;
+            wake |= self.update_line(g, cpu);
+        }
+        Some(Woke {
+            slept,
+            behind,
+            generation: g.clock.generation,
+            wake,
+        })
     }
 
     /// Ends [`run_timer`](Self::run_timer).
@@ -880,7 +1127,7 @@ impl HviTime {
                 state.page.generation
             ));
         }
-        let wall = realtime_ns();
+        let wall = self.host.realtime_ns();
         // The host wall clock at the capture, as the guest computed it.
         let captured_wall = state
             .page
@@ -898,6 +1145,7 @@ impl HviTime {
             downtime_total_ns: state.page.downtime_total_ns.saturating_add(downtime),
         };
         self.page.publish(&g.clock);
+        g.slept_at_publish = self.host.slept_ns();
         g.frozen = false;
         for (t, s) in g.timers.iter_mut().zip(&state.cpus) {
             t.deadline = s.deadline_ns.unwrap_or(DISARMED);
@@ -920,6 +1168,32 @@ impl HviTime {
             self.line.wake(wake);
         }
         Ok(())
+    }
+}
+
+/// What [`HviTime::republish_if_host_slept`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Woke {
+    /// How long the host slept since the last publish, in nanoseconds.
+    slept: u64,
+    /// How far the guest's wall clock was behind the host's.
+    behind: u64,
+    /// The generation it published.
+    generation: u32,
+    /// The vCPUs to wake.
+    wake: u8,
+}
+
+impl Woke {
+    fn log(&self) {
+        eprintln!(
+            "{} hvi-time: the host slept {:.3} s; published generation {}, the guest's wall \
+             clock was {:.3} s behind",
+            crate::LOG_PREFIX,
+            self.slept as f64 / 1e9,
+            self.generation,
+            self.behind as f64 / 1e9
+        );
     }
 }
 
@@ -1899,5 +2173,244 @@ mod tests {
             ctrl: 0,
         };
         assert_eq!(state.lines(), vec![true, false]);
+    }
+
+    /// Host clocks the test moves by hand.
+    #[derive(Clone)]
+    struct Host {
+        realtime: Arc<AtomicU64>,
+        slept: Arc<AtomicU64>,
+    }
+
+    impl Host {
+        /// Clocks at a 2026 wall clock, with 7 s of sleep since the boot.
+        fn new() -> Self {
+            Self {
+                realtime: Arc::new(AtomicU64::new(1_780_000_000_000_000_000)),
+                slept: Arc::new(AtomicU64::new(7_000_000_000)),
+            }
+        }
+
+        /// The host is awake for `ns`: the wall clock moves, the sleep
+        /// clock does not.
+        fn run(&self, ns: u64) {
+            self.realtime.fetch_add(ns, Ordering::SeqCst);
+        }
+
+        /// The host sleeps for `ns`: both move.
+        fn sleep(&self, ns: u64) {
+            self.realtime.fetch_add(ns, Ordering::SeqCst);
+            self.slept.fetch_add(ns, Ordering::SeqCst);
+        }
+
+        fn realtime(&self) -> u64 {
+            self.realtime.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HostClock for Host {
+        fn realtime_ns(&self) -> u64 {
+            self.realtime()
+        }
+
+        fn slept_ns(&self) -> u64 {
+            self.slept.load(Ordering::SeqCst)
+        }
+    }
+
+    /// [`device`] on host clocks the test moves, not yet published.
+    fn device_on(counter: &Counter, lines: &Lines, host: &Host) -> HviTime {
+        counter.set(1000);
+        HviTime::with_host_clock(
+            2,
+            24_000_000,
+            Box::new(counter.clone()),
+            Box::new(lines.clone()),
+            Box::new(host.clone()),
+        )
+        .unwrap()
+    }
+
+    /// The guest's wall clock as its driver derives it from the page.
+    fn guest_wall(dev: &HviTime) -> u64 {
+        let page = dev.page().read();
+        page.wall_ns + (dev.now_ns() - page.base_ns)
+    }
+
+    // A Mac that sleeps stops the guest's counter: after the wake, the page
+    // is published again with the host's wall clock, guest time goes on,
+    // and every vCPU is told.
+    #[test]
+    fn a_host_sleep_publishes_the_page_again() {
+        let (counter, lines, host) = (Counter::default(), Lines::default(), Host::new());
+        let dev = device_on(&counter, &lines, &host);
+        dev.publish_boot();
+        dev.mmio_write(0x18, 8, CTRL_ENABLE);
+        dev.mmio_write(0x00, 8, 9_000_000_000);
+        // Awake for 2 s: the counter and the wall clock move together.
+        counter.set(1000 + ticks(2_000_000_000));
+        host.run(2_000_000_000);
+        let before = dev.page().read();
+        assert_eq!(guest_wall(&dev), host.realtime());
+        // Asleep for 30 s: the wall clock moves and the counter does not.
+        host.sleep(30_000_000_000);
+        assert_eq!(host.realtime() - guest_wall(&dev), 30_000_000_000);
+        let woke = dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .expect("a 30 s sleep publishes");
+        assert_eq!(
+            woke,
+            Woke {
+                slept: 30_000_000_000,
+                behind: 30_000_000_000,
+                generation: before.generation + 2,
+                wake: 0b01,
+            }
+        );
+        let page = dev.page().read();
+        assert_eq!(page.generation, before.generation + 2);
+        assert_eq!((page.counter_freq_hz, page.mult), (24_000_000, 699_050_667));
+        assert_eq!(page.base_counter, 1000 + ticks(2_000_000_000));
+        // Guest nanoseconds go on where they were; the wall clock is the
+        // host's again, and the sleep counts as downtime.
+        assert!(
+            page.base_ns.abs_diff(2_000_000_000) <= 1,
+            "{}",
+            page.base_ns
+        );
+        assert_eq!(page.wall_ns, host.realtime());
+        assert_eq!(page.downtime_total_ns, 30_000_000_000);
+        assert_eq!(guest_wall(&dev), host.realtime());
+        // Both vCPUs are told; the enabled one's line goes high, and its
+        // deadline is left as it was.
+        assert_eq!(dev.mmio_read(0x10, 8), STATUS_GEN_CHANGED);
+        assert_eq!(dev.mmio_read(0x110, 8), STATUS_GEN_CHANGED);
+        assert_eq!(lines.take(), vec![(0, true)]);
+        assert_eq!(dev.mmio_read(0x00, 8), 9_000_000_000);
+        // Published once: the same sleep does not publish again.
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+    }
+
+    // What the timer thread does not take for a sleep: a short one, and a
+    // process stopped with SIGSTOP, whose counter runs on with the host's
+    // wall clock.
+    #[test]
+    fn a_short_sleep_or_a_stopped_process_publishes_nothing() {
+        let (counter, lines, host) = (Counter::default(), Lines::default(), Host::new());
+        let dev = device_on(&counter, &lines, &host);
+        dev.publish_boot();
+        let page = dev.page().read();
+        host.sleep(SLEEP_REPUBLISH_NS - 1);
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+        // Stopped for 10 s: the counter, the wall clock and nothing else.
+        counter.set(1000 + ticks(10_000_000_000));
+        host.run(10_000_000_000);
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+        assert_eq!(dev.page().read(), page);
+        assert!(lines.take().is_empty());
+        // The short sleeps add up: the one that passes the threshold
+        // publishes them all.
+        host.sleep(1);
+        let woke = dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .expect("the sleeps add up to the threshold");
+        assert_eq!(woke.slept, SLEEP_REPUBLISH_NS);
+    }
+
+    // Before the first publish the page holds nothing a restore could go on
+    // from, and a frozen device is being captured: neither publishes. A
+    // restore takes the sleep clock again, so a sleep while restored-paused
+    // is not published a second time.
+    #[test]
+    fn a_host_sleep_waits_for_the_publish_and_the_thaw() {
+        let (counter, lines, host) = (Counter::default(), Lines::default(), Host::new());
+        let dev = device_on(&counter, &lines, &host);
+        host.sleep(60_000_000_000);
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+        assert_eq!(dev.page().read().generation, 0);
+        dev.publish_boot();
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+
+        dev.freeze();
+        host.sleep(60_000_000_000);
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+        // A capture after which the guest goes on: the sleep is published
+        // once the device thaws.
+        dev.thaw();
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_some());
+
+        // Frozen for a capture, the host sleeps, and the state is restored.
+        let state = dev.state();
+        dev.freeze();
+        host.sleep(60_000_000_000);
+        dev.restore(&state).unwrap();
+        assert!(dev
+            .republish_if_host_slept(&mut lock_or_recover(&dev.inner))
+            .is_none());
+        assert_eq!(dev.page().read().generation, state.page.generation + 2);
+    }
+
+    // The timer thread looks at the sleep clock at least once a second,
+    // even with no deadline armed.
+    #[test]
+    fn the_timer_thread_publishes_after_a_host_sleep() {
+        let (counter, lines, host) = (Counter::default(), Lines::default(), Host::new());
+        let dev = Arc::new(device_on(&counter, &lines, &host));
+        dev.publish_boot();
+        let generation = dev.page().read().generation;
+        let thread = spawn_timer(&dev, || {}).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        host.sleep(5_000_000_000);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dev.page().read().generation == generation {
+            assert!(Instant::now() < deadline, "no publish after the sleep");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let page = dev.page().read();
+        assert_eq!(page.generation, generation + 2);
+        assert_eq!(page.downtime_total_ns, 5_000_000_000);
+        dev.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn the_sleep_test_moves_both_clocks_at_its_time() {
+        assert!(TestSleep::parse("1").is_none());
+        assert!(TestSleep::parse("x,1").is_none());
+        assert!(TestSleep::parse("-1,1").is_none());
+        let now = TestSleep::parse("0, 2.5").unwrap();
+        assert_eq!(now.shift_ns(), 2_500_000_000);
+        let later = TestSleep::parse("3600,2.5").unwrap();
+        assert_eq!(later.shift_ns(), 0);
+        let clock = SystemClock { test: Some(now) };
+        let real = SystemClock { test: None };
+        let shifted = clock.realtime_ns() - real.realtime_ns();
+        assert!(shifted.abs_diff(2_500_000_000) < 1_000_000_000, "{shifted}");
+        let slept = clock.slept_ns() - real.slept_ns();
+        assert!(slept.abs_diff(2_500_000_000) < 1_000_000, "{slept}");
+    }
+
+    // The host's own sleep clock does not move while the host is awake,
+    // to well within the threshold.
+    #[test]
+    fn the_host_sleep_clock_holds_still_while_the_host_is_awake() {
+        let a = host_slept_ns();
+        std::thread::sleep(Duration::from_millis(50));
+        let b = host_slept_ns();
+        assert!(b.abs_diff(a) < SLEEP_REPUBLISH_NS / 10, "{a} then {b}");
     }
 }
