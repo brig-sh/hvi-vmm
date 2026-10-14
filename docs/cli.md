@@ -459,7 +459,7 @@ captures and restores `hvi-time` in the same process while the vCPUs are
 paused. See [portable-profile.md](portable-profile.md#restore).
 `HVI_TIME_TEST_SLEEP=<at>,<secs>` is one too: it moves the host clocks
 `hvi-time` reads `<secs>` ahead at `<at>`, as a host sleep would, and logs
-`hvi-time test sleep: …` at the start. See
+`hvi-time test sleep: …` at the start. `tools/sleep-e2e.py` uses it. See
 [portable-profile.md](portable-profile.md#host-sleep).
 
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
