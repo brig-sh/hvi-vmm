@@ -249,7 +249,10 @@ little-endian:
 
 `shift` is 24 and `mult` the nearest integer to `(10^9 << 24) / freq`:
 699050667 at 24 MHz, 310689185 at 54 MHz, which is what the guest kernel's
-pvclock test pins. hvi writes the generation odd, then the fields, then the
+pvclock test pins. `mult` fits in 32 bits only for a counter faster than
+3,906,250 Hz, so hvi refuses to boot a portable guest on a host whose
+`CNTFRQ_EL0` is below 3,906,251 Hz, is 0, or does not fit in the 32-bit
+field. hvi writes the generation odd, then the fields, then the
 generation even, with release fences between. The guest reads under that
 sequence count and retries.
 
