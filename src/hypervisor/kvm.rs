@@ -216,7 +216,7 @@ pub(crate) fn start_io_threads(
     let control = cfg
         .control_sock
         .as_deref()
-        .map(|path| ControlSocket::bind(path, profile))
+        .map(|path| ControlSocket::bind(path, profile, cfg.checkpoint_root.as_deref()))
         .transpose()?;
     let source = StopSource::new()?;
     let io_threads = IoThreads::start(
@@ -524,6 +524,7 @@ mod stop_tests {
             agent_sock: None,
             profile_out: None,
             control_sock: None,
+            checkpoint_root: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
             stop: None,
