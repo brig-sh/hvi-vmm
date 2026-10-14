@@ -299,15 +299,29 @@ guest stopped: SystemOff
 
 ## vCPU limits
 
-The only cap inside hvi is the vGICv2 one on Linux/arm64:
+hvi has three caps. On Linux/arm64 a vGICv2 host takes at most 8 vCPUs:
 
 ```text
 this host offers only vGICv2, which supports at most 8 vCPUs (asked for 16)
 ```
 
-macOS and x86-64 have no hvi-side cap. An over-large `--cpus` on macOS spawns
-that many threads, and the run then fails with `hvi: vcpuN: vcpu_create failed`
-and exit 1. The absence of a cap is not unlimited capacity.
+A vGICv3 host takes at most 507, since each vCPU adds a redistributor frame from
+a fixed base and the frames must end below the UART:
+
+```text
+512 vCPUs would push the GIC redistributors into the UART at 0xc000000; at most 507 fit
+```
+
+An x86-64 guest takes at most 254, since the MP table and the ACPI tables give
+each vCPU a one-byte APIC id and the IOAPIC the next one:
+
+```text
+x86-64 supports at most 254 vCPUs (asked for 300)
+```
+
+macOS has no hvi-side cap. An over-large `--cpus` there spawns that many
+threads, and the run then fails with exit 1 and `hvi: vcpuN: vcpu_create
+failed`. The absence of a cap is not unlimited capacity.
 
 ## See also
 

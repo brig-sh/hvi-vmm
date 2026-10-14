@@ -23,6 +23,7 @@
 //! points at the config table right after it.
 
 use crate::arch::x86_64::layout::{IOAPIC_ADDR, LAPIC_ADDR, MPTABLE_ADDR};
+use crate::arch::x86_64::MAX_VCPUS;
 
 const APIC_VERSION: u8 = 0x14;
 const CPU_ENABLED: u8 = 1;
@@ -40,9 +41,18 @@ fn checksum(bytes: &[u8]) -> u8 {
     (!sum).wrapping_add(1) // value that makes the total sum zero
 }
 
-/// Builds the MP table for `num_cpus` (bytes to write at `MPTABLE_ADDR`).
+/// Builds the MP table for `num_cpus` vCPUs, as the bytes to write at
+/// `MPTABLE_ADDR`.
+///
+/// # Panics
+///
+/// Panics if `num_cpus` exceeds [`MAX_VCPUS`].
 #[must_use]
 pub fn build(num_cpus: u32) -> Vec<u8> {
+    assert!(
+        num_cpus <= MAX_VCPUS,
+        "{num_cpus} vCPUs, at most {MAX_VCPUS}"
+    );
     let config_phys = (MPTABLE_ADDR as u32) + 16; // config table follows the FP
 
     // --- config table entries ---

@@ -138,6 +138,10 @@ hvi is young. Read these before you build on it.
 - **virtio-fs is macOS only**, one request queue per share, no DAX window.
 - **8 vCPUs on a GICv2 arm64 host.** The guest interrupt controller follows
   the host, and GICv2 caps there.
+- **507 vCPUs on a GICv3 arm64 Linux host.** Each vCPU adds a redistributor
+  frame, and the frames must end below the UART.
+- **254 vCPUs on x86-64.** Each vCPU gets a one-byte APIC id, and the IOAPIC
+  the next one.
 - **The event ledger is per packet and egress only.** It is not aggregated per
   flow, and it is not a tamper-proof record.
 - **The arm64/KVM backend is unit-tested on its stop path only.** Its only tests

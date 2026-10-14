@@ -49,7 +49,9 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| 8 vCPUs on a GICv2 arm64 host. | GICv2 addresses at most 8 CPU interfaces. The guest's controller follows the host's, so this is not a choice. A GICv3 host has no such cap. Not having this cap is not "unlimited": other limits still apply. | Platform |
+| 254 vCPUs on x86-64. | The MP table and the ACPI tables give each vCPU a one-byte local APIC id and the IOAPIC the next one, so more vCPUs would share ids. x2APIC ids would lift the cap. | Design |
+| 8 vCPUs on a GICv2 arm64 host. | GICv2 addresses at most 8 CPU interfaces. The guest's controller follows the host's, so this is not a choice. | Platform |
+| 507 vCPUs on a GICv3 arm64 Linux host. | Each vCPU adds a redistributor frame from a fixed base, and the frames must end below the UART. Moving the UART or the redistributors higher would lift the cap. | Design |
 | x86 vCPUs share one CPUID blob. | The APIC id a guest reports for a secondary CPU varies run to run. | Defect |
 | The default `--cmdline` names `ttyAMA0`. | That is the arm64 console. The x86 backend appends `console=ttyS0` itself, so a guest still gets one, but the default leaves a dead `console=` and a bare `earlycon` on the line. | Design |
 | `tools/mk-initramfs.py` builds an arm64 initramfs only. | An x86-64 guest needs its own. | Design |

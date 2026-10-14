@@ -54,7 +54,7 @@ use crate::arch::x86_64::layout::{
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::arch::x86_64::loader::LoadedKernel;
-use crate::arch::x86_64::mptable;
+use crate::arch::x86_64::{mptable, MAX_VCPUS};
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
@@ -163,8 +163,13 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
         );
     }
-    install_kick_handler();
     let num_cpus = cfg.vcpus.max(1);
+    if num_cpus > MAX_VCPUS {
+        return Err(
+            format!("x86-64 supports at most {MAX_VCPUS} vCPUs (asked for {num_cpus})").into(),
+        );
+    }
+    install_kick_handler();
 
     let kvm = Kvm::new()?;
     // A kick relies on `kvm_run.immediate_exit`. Without it, one that lands
@@ -831,6 +836,37 @@ mod cmdline_tests {
     fn separator_at_the_end_stays_last() {
         let got = splice_kernel_args("rdinit=/init --", "console=ttyS0");
         assert_eq!(got, "rdinit=/init console=ttyS0 --");
+    }
+}
+
+#[cfg(test)]
+mod vcpu_cap_tests {
+    use super::boot;
+    use crate::config::BootConfig;
+
+    #[test]
+    fn more_vcpus_than_the_cap_are_refused() {
+        let cfg = BootConfig {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 128 << 20,
+            cmdline: String::new(),
+            disk: None,
+            fs_shares: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: "cap-test".to_string(),
+            vcpus: 255,
+            agent_sock: None,
+            plugin: None,
+            sandbox: false,
+            stop: None,
+        };
+        let error = boot(cfg).unwrap_err().to_string();
+        assert_eq!(error, "x86-64 supports at most 254 vCPUs (asked for 255)");
     }
 }
 

@@ -43,6 +43,7 @@ use acpi_tables::xsdt::XSDT;
 use acpi_tables::Aml;
 
 use crate::arch::x86_64::layout::{ACPI_ADDR, ACPI_PM_PORT, IOAPIC_ADDR, LAPIC_ADDR, SCI_GSI};
+use crate::arch::x86_64::MAX_VCPUS;
 use crate::devices::legacy::acpi_pm::{
     PM1_CONTROL, PM1_CONTROL_LEN, PM1_EVENT_LEN, PM1_STATUS, RESET_REGISTER, RESET_VALUE,
     SLP_TYP_S5,
@@ -65,8 +66,16 @@ const IAPC_MSI_NOT_SUPPORTED: u16 = 1 << 3;
 
 /// Builds the tables for `num_cpus` vCPUs, as the bytes to write at
 /// [`ACPI_ADDR`].
+///
+/// # Panics
+///
+/// Panics if `num_cpus` exceeds [`MAX_VCPUS`].
 #[must_use]
 pub fn build(num_cpus: u32) -> Vec<u8> {
+    assert!(
+        num_cpus <= MAX_VCPUS,
+        "{num_cpus} vCPUs, at most {MAX_VCPUS}"
+    );
     let mut tables = Tables::new();
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, OEM_TABLE_ID, OEM_REVISION);
     Name::new("_S5_".into(), &Package::new(vec![&SLP_TYP_S5])).to_aml_bytes(&mut dsdt);
@@ -242,7 +251,7 @@ mod tests {
     // The guest scans 0xe0000-0xfffff on 16-byte boundaries for the RSDP.
     #[test]
     fn rsdp_sits_where_the_guest_scans() {
-        let blob = build(255);
+        let blob = build(MAX_VCPUS);
         assert_eq!(&blob[0..8], b"RSD PTR ");
         assert!((0xe_0000..HIGH_MEM_START).contains(&ACPI_ADDR));
         assert_eq!(ACPI_ADDR % 16, 0);
@@ -302,6 +311,26 @@ mod tests {
         assert_eq!(at, madt.len());
         assert_eq!(apic_ids, [0, 1, 2]);
         assert_eq!(ioapic, Some((3, IOAPIC_ADDR)));
+    }
+
+    #[test]
+    fn madt_ids_stay_distinct_at_the_vcpu_cap() {
+        let blob = build(MAX_VCPUS);
+        let madt = table(&blob, xsdt_entries(&blob)[1]);
+        let mut at = HEADER_LEN + 8;
+        let mut apic_ids = Vec::new();
+        let mut ioapic = None;
+        while at < madt.len() {
+            match madt[at] {
+                MADT_LOCAL_APIC => apic_ids.push(madt[at + 3]),
+                MADT_IO_APIC => ioapic = Some(madt[at + 2]),
+                _ => {}
+            }
+            at += usize::from(madt[at + 1]);
+        }
+        let expected: Vec<u8> = (0..=253).collect();
+        assert_eq!(apic_ids, expected);
+        assert_eq!(ioapic, Some(254));
     }
 
     #[test]
