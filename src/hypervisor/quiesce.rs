@@ -73,7 +73,7 @@ impl Quiesce {
     /// registers and the memory it has written are stable for the plugin.
     #[must_use]
     pub fn checkpoint(&self) -> Duration {
-        self.checkpoint_serving(|| false, || {});
+        self.checkpoint_serving(|| false, || {})
     }
 
     /// [`checkpoint`](Self::checkpoint), for a vCPU that also carries out work
@@ -84,7 +84,14 @@ impl Quiesce {
     /// asked under the lock, before every wait, and a requester posts work
     /// and then calls [`wake`](Self::wake), which takes the lock, so a post
     /// made while the vCPU is between its check and its wait still wakes it.
-    pub(crate) fn checkpoint_serving(&self, due: impl Fn() -> bool, mut serve: impl FnMut()) {
+    /// Returns how long the thread stayed parked, the time `serve` ran
+    /// included.
+    #[must_use]
+    pub(crate) fn checkpoint_serving(
+        &self,
+        due: impl Fn() -> bool,
+        mut serve: impl FnMut(),
+    ) -> Duration {
         // Fast path: no quiesce pending, no lock taken. The load is
         // sequentially consistent to pair with the store in `request`.
         if !self.requested.load(Ordering::SeqCst) {
@@ -122,6 +129,14 @@ impl Quiesce {
         // A vCPU that raises the requester's target and then loads the flag
         // either sees the request or has its raise seen by the requester.
         self.requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns whether a quiesce is in effect.
+    ///
+    /// A vCPU that waits outside the hypervisor, such as one in an emulated
+    /// WFI, checks it so it can leave the wait and park at its checkpoint.
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
     }
 
     /// Waits until `n` vCPUs have parked, for at most `PARK_TIMEOUT`.
@@ -255,7 +270,7 @@ mod tests {
                 Arc::clone(&released),
             );
             std::thread::spawn(move || {
-                q.checkpoint_serving(
+                let _ = q.checkpoint_serving(
                     || due.load(Ordering::SeqCst),
                     || {
                         due.store(false, Ordering::SeqCst);
