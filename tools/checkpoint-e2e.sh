@@ -5,20 +5,23 @@
 # The guest runs the workload `tools/mk-initramfs.py --checkpoint-workload`
 # builds: a loop that counts in a shell variable every 200 ms and prints the
 # count with the guest's wall clock, a file it holds open on fd 3 after
-# unlinking it, and a file it wrote and synced on an ext4 /dev/vda.
+# unlinking it, a file it wrote and synced on an ext4 /dev/vda, and a
+# CPU-bound awk that sums a double and prints it with its count.
 #
 # 1. Boot the guest with --control-sock, --checkpoint-root, --disk,
 #    --net-stub and --agent-sock, and let it count.
 # 2. Checkpoint it with then=fence.
 # 3. Start `hvi restore` as a second process with its own sockets, wait for
 #    it to report restored-paused, and resume it. Stop the fenced source.
-# 4. Check the restored guest: its count goes on from the captured one and no
-#    boot banner appears; on request it reads fd 3 and the disk file, writes
-#    and syncs another, and a `sleep 5` takes 5 s of host time. Its wall
-#    clock goes on from the captured time.
-# 5. Move it once more, into a third process, and check it counts on there.
-#    Stop both, and read the file the guest wrote from the image on the
-#    host.
+# 4. Check the restored guest: its count and the awk's sum go on from the
+#    captured ones and no boot banner appears; a second restore of the
+#    bundle onto its disk is refused; on request it reads fd 3 and the disk
+#    file, writes and syncs another, and a `sleep 5` takes 5 s of host
+#    time. Its wall clock goes on from the captured time.
+# 5. Move it once more, into a third process. Hold that one restored-paused
+#    for a second and check the guest did not run, then resume it and check
+#    it counts on. Stop both, check the disk generation grew over the
+#    moves, and read the file the guest wrote from the image on the host.
 #
 # Usage:
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
@@ -27,9 +30,9 @@
 #
 # DIR receives the checkpoint root (with the bundle), the disk image, both
 # processes' consoles, their profiles and summary.json with the timings.
-# The disk needs mke2fs from e2fsprogs (Homebrew: brew install e2fsprogs),
-# found on PATH or in /opt/homebrew/opt/e2fsprogs/sbin; without it, pass
-# --no-disk. Sockets go in a short directory under /tmp, since a socket path
+# The disk needs mke2fs and debugfs from e2fsprogs (Homebrew: brew install
+# e2fsprogs), found on PATH or in /opt/homebrew/opt/e2fsprogs/sbin; without
+# them, pass --no-disk. Sockets go in a short directory under /tmp, since a socket path
 # is limited to 104 bytes on macOS. Exits 0 when every check passed.
 set -euo pipefail
 
@@ -58,13 +61,16 @@ out="$(cd "$out" && pwd -P)"
 root="$out/root"
 rm -rf "$root"
 mkdir -m 700 "$root"
-image=""
+image="" debugfs=""
 if [ "$disk" = yes ]; then
     mke2fs="$(command -v mke2fs || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)"
-    if [ ! -x "$mke2fs" ]; then
-        echo "$0: mke2fs not found; install e2fsprogs or pass --no-disk" >&2
-        exit 2
-    fi
+    debugfs="$(command -v debugfs || echo /opt/homebrew/opt/e2fsprogs/sbin/debugfs)"
+    for tool in "$mke2fs" "$debugfs"; do
+        if [ ! -x "$tool" ]; then
+            echo "$0: $(basename "$tool") not found; install e2fsprogs or pass --no-disk" >&2
+            exit 2
+        fi
+    done
     image="$out/disk.img"
     rm -f "$image"
     "$mke2fs" -q -t ext4 -F "$image" 64M
@@ -72,14 +78,11 @@ fi
 socks="$(mktemp -d /tmp/hvi-e2e.XXXXXX)"
 trap 'rm -rf "$socks"' EXIT
 
-python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" <<'PY'
+python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" \
+    "$debugfs" <<'PY'
 import json, os, re, socket, subprocess, sys, threading, time
 
-hvi, kernel, initramfs, out, root, socks, cpus, mem, image = sys.argv[1:]
-debugfs = next(
-    (p for p in [*(os.path.join(d, "debugfs") for d in os.environ.get("PATH", "").split(":")),
-                 "/opt/homebrew/opt/e2fsprogs/sbin/debugfs"] if os.access(p, os.X_OK)),
-    None)
+hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs = sys.argv[1:]
 t0 = time.monotonic()
 failures = []
 
@@ -169,6 +172,29 @@ def tick(s):
     return (int(m.group(1)), float(m.group(2)), int(m.group(3))) if m else None
 
 
+# The awk prints its count and sum every FP_STEP additions of 0.25.
+FP_STEP = 500000
+
+
+def fp(s):
+    """Returns an FP line's count and sum."""
+    m = re.search(r"FP (\d+) (\S+)$", s)
+    return (int(m.group(1)), float(m.group(2))) if m else None
+
+
+def fp_goes_on(before, after, where):
+    """Checks the awk's lines across a move: every sum exact, and the first
+    line after the move the next after the last one before it."""
+    lines = [fp(s) for _, s in before.outputs(r"FP ") + after.outputs(r"FP ")]
+    exact = all(x == n * 0.25 for n, x in lines)
+    last = [fp(s)[0] for t, s in before.outputs(r"FP ")]
+    first = after.wait_for(r"FP \d+ ", 30)
+    check(not before.outputs(r"FP-BAD") and not after.outputs(r"FP-BAD") and exact
+          and bool(last) and first is not None and fp(first[1])[0] == last[-1] + FP_STEP,
+          f"the awk's floating-point sum goes on {where}: last before {last[-1] if last else None}, "
+          f"first after {fp(first[1])[0] if first else None}, every sum exact: {exact}")
+
+
 common = ["--net-stub"] + (["--disk", image] if image else [])
 src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs,
                        "--cpus", cpus, "--mem-mib", mem,
@@ -206,8 +232,6 @@ resumed, resume_at = dctl.ask(op="resume")
 check(fence.get("ok") is True and fence.get("state") == "fenced", "checkpoint then=fence")
 stats = fence.get("stats", {})
 check(status.get("state") == "restored-paused", f"the restore reports restored-paused ({status})")
-check(not dst.outputs(r"TICK ", after=0) or min(t for t, _ in dst.outputs(r"TICK ")) > resume_at,
-      "the restored guest did not run before resume")
 check(resumed.get("state") == "running", "resume")
 restore_ms = (status_at - spawned_at) * 1000
 before = [(t, tick(s)) for t, s in src.outputs(r"TICK ") if t <= fence_at]
@@ -243,6 +267,19 @@ if first:
     wall_lag = time.time() - wall
 check(not dst.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT|ARM64 guest on hvi|DISK-READY"),
       "no boot banner in the restored guest: it did not reboot")
+fp_goes_on(src, dst, "over the move")
+
+if image:
+    # hvi does not consume a bundle, so the disk lock is what keeps a second
+    # guest off the disk the restored one writes.
+    dup = subprocess.run([hvi, "restore", "--from", bundle,
+                          "--control-sock", f"{socks}/dup.sock", "--checkpoint-root", root,
+                          "--agent-sock", f"{socks}/dup-agent.sock"] + common,
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    dst.note("second restore: exit %d: %s" % (dup.returncode, dup.stderr.replace("\n", " | ")))
+    check(dup.returncode == 1 and "is locked by another process" in dup.stderr
+          and not os.path.exists(f"{socks}/dup.sock"),
+          f"a second restore onto the running guest's disk is refused (exit {dup.returncode})")
 
 dst.type("touch /tmp/go\n")
 got = dst.wait_for(r"SLEEP-END ", 30)
@@ -276,13 +313,28 @@ third = Guest("restored-again", [hvi, "restore", "--from", os.path.join(root, "m
                                  "--agent-sock", f"{socks}/third-agent.sock"] + common)
 tctl = Control(third, f"{socks}/third.sock")
 status3, _ = tctl.ask(op="status")
+# Held restored-paused for five tick periods: a guest that ran in that time
+# would print, and its clock would have moved on by the time it resumes.
+time.sleep(1.0)
+held, _ = tctl.ask(op="status")
+time.sleep(0.1)
+check(held.get("state") == "restored-paused" and held.get("vcpus_parked") == int(cpus)
+      and not third.outputs(r"TICK |FP "),
+      f"the guest did not run while restored-paused for 1 s ({held})")
 tctl.ask(op="resume")
 last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
+# The guest's last uptime reading before the second fence: the last tick,
+# or the end of the sleep that came after it.
+uptime2 = max([tick(s)[1] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
+              + [float(s.split()[1]) for t, s in dst.outputs(r"SLEEP-END ")], default=None)
 moved = third.wait_for(r"TICK ", 10)
+on = tick(moved[1])[1] - uptime2 if moved and uptime2 is not None else None
 check(status3.get("state") == "restored-paused" and moved is not None
-      and tick(moved[1])[0] == last2[-1] + 1,
-      f"it resumes in a third process and counts on from {last2[-1] if last2 else None}")
+      and tick(moved[1])[0] == last2[-1] + 1 and on is not None and on < 0.5,
+      f"it resumes in a third process and counts on from {last2[-1] if last2 else None}, "
+      f"its uptime {on} s on from the last reading before the move")
 check(not third.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT"), "the third process did not reboot it")
+fp_goes_on(dst, third, "over the second move")
 
 stop, _ = dctl.ask(op="stop")
 try:
@@ -298,10 +350,17 @@ except subprocess.TimeoutExpired:
     third.p.kill()
     third_rc = None
 check(third_rc == 0, f"stop ends the guest in the third process (exit {third_rc})")
-if image and debugfs and after_n:
+generations = None
+if image:
     cat = subprocess.run([debugfs, "-R", "cat /after", image], capture_output=True, text=True)
-    check(cat.stdout.strip() == f"written-after {after_n}",
+    check(after_n is not None and cat.stdout.strip() == f"written-after {after_n}",
           f"the image holds the post-restore write: {cat.stdout.strip()!r}")
+    generations = []
+    for name in ("move", "move-again"):
+        with open(os.path.join(root, name, "disk.json")) as f:
+            generations.append(json.load(f)["generation"])
+    check(0 < generations[0] < generations[1],
+          f"the disk generation grows over the moves: {generations}")
 
 bundle_bytes = sum(os.path.getsize(os.path.join(bundle, f)) for f in os.listdir(bundle))
 summary = {
@@ -315,6 +374,7 @@ summary = {
     "downtime_checkpoint_request_to_resume_reply_ms": round((resume_at - fence_sent) * 1000, 1),
     "last_count_before": last_n, "host_sleep_s": host_sleep, "guest_sleep_s": guest_sleep,
     "guest_wall_clock_lag_s": wall_lag,
+    "disk_generations": generations,
     "failures": failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
