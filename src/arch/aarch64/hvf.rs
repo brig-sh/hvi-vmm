@@ -1771,6 +1771,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // drops the pending IRQ after every run, so it is set before each
             // one.
             if let Some(p) = portable {
+                resample_vtimer(&vcpu, p, cpu_id, &mut vtimer);
                 let pending = lock_or_recover(&p.gic).irq_pending(cpu_id as usize);
                 let _ = vcpu.set_pending_interrupt(IRQ_LINE, pending);
             }
@@ -1793,7 +1794,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                     Firmware::Continue => {}
                                     Firmware::Stop => break,
                                     Firmware::Suspend => {
-                                        wait_for_interrupt(&vcpu, &sh, p, cpu_id, &vtimer);
+                                        wait_for_interrupt(&vcpu, &sh, p, cpu_id, &mut vtimer);
                                     }
                                 }
                             } else if service_psci(&vcpu, &sh) {
@@ -1863,7 +1864,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             if let Some(p) = portable {
                                 advance_pc(&vcpu);
                                 if syn & 0b11 == 0 {
-                                    wait_for_interrupt(&vcpu, &sh, p, cpu_id, &vtimer);
+                                    wait_for_interrupt(&vcpu, &sh, p, cpu_id, &mut vtimer);
                                 }
                             }
                         }
@@ -2081,11 +2082,14 @@ impl Vtimer {
 /// It returns once the software GIC has an interrupt for the vCPU, the
 /// guest's timer is due, a pause asks the vCPU to park, or the VM stops. The
 /// guest then resumes after its WFI, which may always complete early.
-fn wait_for_interrupt(vcpu: &Vcpu, sh: &Shared, p: &Portable, cpu: u32, vtimer: &Vtimer) {
+fn wait_for_interrupt(vcpu: &Vcpu, sh: &Shared, p: &Portable, cpu: u32, vtimer: &mut Vtimer) {
     let vcpus = &sh.guest.vcpus;
     let Some(idle) = vcpus.kicker().idle.get(cpu as usize) else {
         return;
     };
+    // A guest that stopped its timer before it took the interrupt sleeps
+    // until its next deadline, not on a stale line.
+    resample_vtimer(vcpu, p, cpu, vtimer);
     // A raised timer line is the GIC's to report.
     let deadline = if vtimer.raised {
         None
@@ -2172,6 +2176,21 @@ fn service_gic(
     if out.deactivated == Some(VTIMER_INTID) {
         end_vtimer_interrupt(vcpu, p, cpu, vtimer);
     }
+}
+
+/// Drops the timer line hvi raised if the guest has not taken the
+/// interrupt and the timer no longer fires.
+///
+/// The NO_HZ idle path stops the timer with IRQs masked, after the
+/// `VTIMER_ACTIVATED` exit raised the line. KVM re-evaluates the timer on
+/// every guest entry, so a guest on the Pi never takes that interrupt; this
+/// does the same while PPI 27 is raised and not active. Once it is active,
+/// the guest's deactivation decides (`end_vtimer_interrupt`).
+fn resample_vtimer(vcpu: &Vcpu, p: &Portable, cpu: u32, vtimer: &mut Vtimer) {
+    if !vtimer.raised || lock_or_recover(&p.gic).is_active(cpu as usize, VTIMER_INTID) {
+        return;
+    }
+    end_vtimer_interrupt(vcpu, p, cpu, vtimer);
 }
 
 /// Handles the guest's end of the timer interrupt hvi raised.
