@@ -139,6 +139,22 @@ impl<K> Guest<K> {
             lock_or_recover(dev).connect_irq(vsock);
         }
     }
+
+    /// Sets each virtio device's line to the device's level, once a restore
+    /// has loaded the interrupt controller. See `Irq::redrive`.
+    // Only the HVF restore calls it so far.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn redrive_irqs(&self) {
+        if let Some(dev) = &self.block {
+            lock_or_recover(dev).redrive_irq();
+        }
+        if let Some(dev) = &self.net {
+            lock_or_recover(dev).redrive_irq();
+        }
+        if let Some(dev) = &self.vsock {
+            lock_or_recover(dev).redrive_irq();
+        }
+    }
 }
 
 impl<K: Kick> Guest<K> {
