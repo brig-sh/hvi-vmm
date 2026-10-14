@@ -194,17 +194,19 @@ impl Opened {
 
 /// Opens the bundle at `dir` and reads every document in it.
 ///
-/// [`Bundle::open`] checks the manifest against its limits and every
-/// component's size and hash; this then checks `ram.map` against the
-/// manifest and parses `cpu.json`, `platform.json`, `devices.json`,
-/// `disk.json` and `session.json`. Nothing is allocated by a count the
-/// manifest or a document gives before that count is checked.
+/// [`Bundle::open_for_restore`] checks the manifest against its limits and
+/// every component's size and hash, but for the hash of `ram.bin`:
+/// [`Bundle::load_ram`] checks that as it copies the image into the new
+/// guest's RAM, before any device, disk or socket exists. This then checks
+/// `ram.map` against the manifest and parses `cpu.json`, `platform.json`,
+/// `devices.json`, `disk.json` and `session.json`. Nothing is allocated by a
+/// count the manifest or a document gives before that count is checked.
 ///
 /// # Errors
 ///
 /// Errors, naming the file, on the first thing that does not hold.
 pub(crate) fn open(dir: &Path) -> std::io::Result<Opened> {
-    let bundle = Bundle::open(dir)?;
+    let bundle = Bundle::open_for_restore(dir)?;
     ram::check_map(
         &bundle.read(Component::RamMap)?,
         &bundle.manifest().ram.regions,
