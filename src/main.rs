@@ -35,8 +35,7 @@ use std::sync::Arc;
 use hvi::config;
 use hvi::devices::virtio::tap;
 use hvi::plugin::builtin::{Chain, IoTrace, MemoryDump};
-use hvi::signal::{exit_by_signal, stop_on_signals};
-use hvi::stop::StopHandle;
+use hvi::signal::StopOnSignals;
 
 #[cfg(target_arch = "aarch64")]
 use hvi::arch::aarch64::{fdt, layout, loader};
@@ -400,10 +399,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "macos"))]
     let _ = (fs_uid, fs_gid);
 
-    // A stop signal asks the run to stop. Once `boot` has returned, the process
-    // ends by that signal.
-    let (stop_handle, stop_registration) = StopHandle::new_pair()?;
-    stop_on_signals(&stop_handle)?;
+    // A stop signal asks the run to stop, and `finish` ends the process by it.
+    let (signals, stop_registration) = StopOnSignals::new()?;
     // A fatal signal restores the terminal before it ends the process.
     hvi::terminal::restore_on_fatal_signals()?;
     let cfg = config::BootConfig {
@@ -432,27 +429,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         stop: Some(stop_registration),
     };
     eprintln!("booting {kernel_path} with {mem_mib} MiB ...");
-    let result = hvi::boot(cfg);
-    // A run a signal asked to stop ends the process by that signal, whether the
-    // run then stopped cleanly or failed.
-    if let Some(signal) = stop_handle.signal() {
-        // stderr can be a closed pipe or, after `SIGHUP`, a terminal that hung
-        // up, where `eprintln!` would panic, so the last line ignores a failed
-        // write, here and below.
-        let mut stderr = std::io::stderr();
-        let _ = match &result {
-            Ok(stop) => writeln!(stderr, "guest stopped: {stop:?}"),
-            Err(e) => writeln!(stderr, "hvi: {e}"),
-        };
-        exit_by_signal(signal);
-    }
-    let stop = result?;
-    let _ = writeln!(std::io::stderr(), "guest stopped: {stop:?}");
-    Ok(())
+    signals.finish(hvi::boot(cfg))
 }
 
 fn main() {
     if let Err(e) = run() {
+        // stderr can be a closed pipe, where `eprintln!` would panic, so a
+        // failed write is ignored.
         let _ = writeln!(std::io::stderr(), "hvi: {e}");
         std::process::exit(1);
     }

@@ -23,7 +23,8 @@
 //! after the first ends the process at once. Once `boot` has returned, the
 //! binary calls [`exit_by_signal`] with the handle's
 //! [`signal`](StopHandle::signal), so the process ends the way the signal would
-//! have ended it.
+//! have ended it. [`StopOnSignals`] does both for a binary that ends with its
+//! run.
 //!
 //! A kick ends a blocking call on the thread it is sent to: `KVM_RUN` on a KVM
 //! vCPU thread, and the console reader's read of stdin on every backend.
@@ -34,7 +35,8 @@ use std::time::Instant;
 
 use signal_hook::iterator::{Handle, Signals};
 
-use crate::stop::StopHandle;
+use crate::config::{BootError, Stop};
+use crate::stop::{StopHandle, StopRegistration};
 use crate::sync::lock_or_recover;
 use crate::teardown::STOP_TIMEOUT;
 
@@ -108,8 +110,8 @@ impl StopSignals {
 /// A first stop signal that arrives once the run of `handle` has ended asks a
 /// finished run to stop and has no effect. Only another one, [`STOP_TIMEOUT`]
 /// or more later, ends the process. A binary that keeps running after `boot`
-/// returns checks [`StopHandle::signal`] once it is done, as hvi's binary does
-/// at once.
+/// returns checks [`StopHandle::signal`] once it is done, as
+/// [`StopOnSignals::finish`] does.
 ///
 /// # Errors
 ///
@@ -215,6 +217,55 @@ pub fn exit_by_signal(signal: libc::c_int) -> ! {
     raise_with_default_action(signal);
     unblock(&[signal]);
     std::process::exit(128 + signal)
+}
+
+/// A binary's stop on the stop signals, from before `boot` to the end of the
+/// process.
+///
+/// [`new`](Self::new) makes the stop signals request a stop on a new pair, as
+/// [`stop_on_signals`] does, and returns the registration a run takes in
+/// [`BootConfig::stop`](crate::config::BootConfig::stop). Once `boot` has
+/// returned, [`finish`](Self::finish) prints how the run ended and ends the
+/// process, by the stop signal if one asked for the stop.
+pub struct StopOnSignals {
+    /// The handle the stop signals request the stop on.
+    handle: StopHandle,
+}
+
+impl StopOnSignals {
+    /// Returns a `StopOnSignals` and the registration a run takes to be stopped
+    /// by the stop signals.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the pipe the stop request is written to cannot be created, or
+    /// as [`stop_on_signals`] does.
+    pub fn new() -> io::Result<(StopOnSignals, StopRegistration)> {
+        let (handle, registration) = StopHandle::new_pair()?;
+        stop_on_signals(&handle)?;
+        Ok((StopOnSignals { handle }, registration))
+    }
+
+    /// Prints how the run ended and ends the process.
+    ///
+    /// The line on stderr is `guest stopped: <stop>` or `hvi: <error>`, and a
+    /// failed write is ignored, since stderr can be a closed pipe or, after
+    /// `SIGHUP`, a terminal that hung up. A write to a closed pipe fails only
+    /// while `SIGPIPE` is ignored, as the Rust runtime sets it before `main`;
+    /// under its default action the write ends the process. When a stop signal
+    /// asked for the stop, the process then ends by that signal, as
+    /// [`exit_by_signal`] ends it, whether the run stopped or failed. Otherwise
+    /// it exits with status 0 after a stop and 1 after a failure.
+    pub fn finish(self, result: Result<Stop, BootError>) -> ! {
+        match &result {
+            Ok(stop) => stderrln!("guest stopped: {stop:?}"),
+            Err(e) => stderrln!("hvi: {e}"),
+        }
+        if let Some(signal) = self.handle.signal() {
+            exit_by_signal(signal);
+        }
+        std::process::exit(i32::from(result.is_err()))
+    }
 }
 
 /// Returns the signal that kicks a thread out of a blocking call.
@@ -341,16 +392,18 @@ mod tests {
 
     /// Runs [`stop_signal_child`] for `case` in a process of its own, so no
     /// other test has touched the signals' actions, and returns how it ended
-    /// and what it wrote to stdout.
+    /// and what it wrote to stdout and to stderr.
     ///
     /// A child that hangs fails the test rather than holding it up.
-    fn run_child(case: &str) -> (ExitStatus, String) {
+    fn run_child(case: &str) -> (ExitStatus, String, String) {
+        // `--nocapture`, since the case can end the process before the test
+        // harness prints what it captured.
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "signal::tests::stop_signal_child"])
+            .args(["--exact", "signal::tests::stop_signal_child", "--nocapture"])
             .env(CHILD, case)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -372,7 +425,14 @@ mod tests {
             .unwrap()
             .read_to_string(&mut out)
             .unwrap();
-        (status, out)
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        (status, out, err)
     }
 
     /// Whether the handler a test installs before [`stop_on_signals`] ran.
@@ -471,6 +531,30 @@ mod tests {
                 block(&[libc::SIGTERM]);
                 exit_by_signal(libc::SIGTERM);
             }
+            "finish-stopped"
+            | "finish-failed"
+            | "finish-by-signal"
+            | "finish-failed-by-signal"
+            | "finish-requested-then-by-signal" => {
+                let (signals, _registration) = StopOnSignals::new().unwrap();
+                if case == "finish-requested-then-by-signal" {
+                    signals.handle.request_stop();
+                }
+                if case.ends_with("by-signal") {
+                    unignore(libc::SIGTERM);
+                    signals.handle.request_stop_by(libc::SIGTERM);
+                }
+                // The parent sees this, so the case ran before the process
+                // ended.
+                std::io::stdout().write_all(b"finishing\n").unwrap();
+                std::io::stdout().flush().unwrap();
+                signals.finish(match case.as_str() {
+                    "finish-failed" | "finish-failed-by-signal" => {
+                        Err(BootError::new("vcpu0: failed".into()))
+                    }
+                    _ => Ok(Stop::Requested),
+                });
+            }
             other => unreachable!("unknown case {other}"),
         }
     }
@@ -490,7 +574,7 @@ mod tests {
 
     #[test]
     fn stop_signal_requests_a_stop_and_names_the_signal() {
-        let (status, _) = run_child("request");
+        let (status, _, _) = run_child("request");
         assert_eq!(status.code(), Some(10), "child ended with {status:?}");
     }
 
@@ -498,13 +582,13 @@ mod tests {
     // within the window and has no effect.
     #[test]
     fn stop_signal_repeated_within_the_window_has_no_effect() {
-        let (status, _) = run_child("repeat");
+        let (status, _, _) = run_child("repeat");
         assert_eq!(status.code(), Some(11), "child ended with {status:?}");
     }
 
     #[test]
     fn ignored_stop_signal_stays_ignored() {
-        let (status, _) = run_child("ignored");
+        let (status, _, _) = run_child("ignored");
         assert_eq!(status.code(), Some(12), "child ended with {status:?}");
     }
 
@@ -512,19 +596,19 @@ mod tests {
     // action after, is registered by the next call.
     #[test]
     fn stop_signal_no_longer_ignored_joins_after_a_run() {
-        let (status, _) = run_child("unignored-later");
+        let (status, _, _) = run_child("unignored-later");
         assert_eq!(status.code(), Some(14), "child ended with {status:?}");
     }
 
     #[test]
     fn earlier_stop_signal_handler_still_runs() {
-        let (status, _) = run_child("earlier");
+        let (status, _, _) = run_child("earlier");
         assert_eq!(status.code(), Some(13), "child ended with {status:?}");
     }
 
     #[test]
     fn exit_by_signal_ends_the_process_by_a_blocked_signal() {
-        let (status, _) = run_child("exit-blocked");
+        let (status, _, _) = run_child("exit-blocked");
         assert_eq!(
             status.signal(),
             Some(libc::SIGTERM),
@@ -536,7 +620,7 @@ mod tests {
     // had, so it can still end a process that never reaches a run.
     #[test]
     fn stop_signal_before_boot_keeps_its_action() {
-        let (status, _) = run_child("before-boot");
+        let (status, _, _) = run_child("before-boot");
         assert_eq!(
             status.signal(),
             Some(libc::SIGTERM),
@@ -546,7 +630,7 @@ mod tests {
 
     #[test]
     fn second_stop_signal_ends_the_process() {
-        let (status, out) = run_child("second");
+        let (status, out, _) = run_child("second");
         assert_eq!(
             status.signal(),
             Some(libc::SIGTERM),
@@ -555,6 +639,71 @@ mod tests {
         assert!(
             out.contains("requested\n"),
             "the first signal ended the child"
+        );
+    }
+
+    #[test]
+    fn finish_exits_0_after_a_stop() {
+        let (status, out, err) = run_child("finish-stopped");
+        assert_eq!(status.code(), Some(0), "child ended with {status:?}");
+        assert!(out.contains("finishing\n"), "the case did not run");
+        assert!(
+            err.contains("guest stopped: Requested\n"),
+            "finish printed {err:?}"
+        );
+    }
+
+    #[test]
+    fn finish_exits_1_after_a_failure() {
+        let (status, out, err) = run_child("finish-failed");
+        assert_eq!(status.code(), Some(1), "child ended with {status:?}");
+        assert!(out.contains("finishing\n"), "the case did not run");
+        assert!(
+            err.contains("hvi: vcpu0: failed\n"),
+            "finish printed {err:?}"
+        );
+    }
+
+    #[test]
+    fn finish_ends_the_process_by_the_signal_that_asked_after_a_failure() {
+        let (status, out, err) = run_child("finish-failed-by-signal");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "child ended with {status:?}"
+        );
+        assert!(out.contains("finishing\n"), "the case did not run");
+        assert!(
+            err.contains("hvi: vcpu0: failed\n"),
+            "finish printed {err:?}"
+        );
+    }
+
+    // A plugin or an I/O thread asked first. The signal still ends the process
+    // by it, as a service manager that sent it expects.
+    #[test]
+    fn finish_ends_the_process_by_a_signal_after_another_request() {
+        let (status, out, _) = run_child("finish-requested-then-by-signal");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "child ended with {status:?}"
+        );
+        assert!(out.contains("finishing\n"), "the case did not run");
+    }
+
+    #[test]
+    fn finish_ends_the_process_by_the_signal_that_asked() {
+        let (status, out, err) = run_child("finish-by-signal");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "child ended with {status:?}"
+        );
+        assert!(out.contains("finishing\n"), "the case did not run");
+        assert!(
+            err.contains("guest stopped: Requested\n"),
+            "finish printed {err:?}"
         );
     }
 
