@@ -54,6 +54,7 @@ use crate::checkpoint::control::{
 use crate::checkpoint::cpu::{Output, VcpuState};
 use crate::checkpoint::platform::PlatformState;
 use crate::checkpoint::profile::{MachineProfile, ProfileCell};
+use crate::config::MachineProfileKind;
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus, WorkResult};
@@ -500,6 +501,15 @@ impl<K: Kick> Machine<'_, K> {
                 ),
             );
         }
+        if profile.profile != MachineProfileKind::Native.name() {
+            return refuse(
+                ErrorCode::Refused,
+                format!(
+                    "the guest has the {} machine profile, which no backend checkpoints yet",
+                    profile.profile
+                ),
+            );
+        }
         let writer = match BundleWriter::create(&dir) {
             Ok(writer) => writer,
             Err(e) => return refuse(ErrorCode::Refused, e.to_string()),
@@ -840,6 +850,8 @@ mod tests {
         net: Option<Arc<std::sync::Mutex<crate::devices::virtio::net::VirtioNet>>>,
         /// The profile's virtio-fs share count.
         fs_shares: u32,
+        /// The profile's machine profile, when not native.
+        machine: Option<&'static str>,
         /// The component after which the capture fails.
         fail_after: Option<Component>,
         /// The component after which the run is stopped.
@@ -959,6 +971,9 @@ mod tests {
                     p.cpu.ident = Some("0x61".into());
                     p.vcpus = count;
                     p.fs_shares = spec.fs_shares;
+                    if let Some(machine) = spec.machine {
+                        p.profile = machine.to_string();
+                    }
                     p.ram_regions = regions.into_iter().map(Into::into).collect();
                 })
                 .unwrap();
@@ -1730,6 +1745,26 @@ mod tests {
             &mut shares,
             &format!(r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#, dir.display()),
             "virtio-fs share",
+        );
+        assert!(
+            std::fs::symlink_metadata(&dir).is_err(),
+            "a refusal left a directory"
+        );
+
+        let mut portable = Fixture::with(
+            "ck-portable",
+            Spec {
+                parking: 1,
+                capture: true,
+                machine: Some("portable-arm64-v1"),
+                ..Spec::default()
+            },
+        );
+        let dir = portable.root.join("ck");
+        refused(
+            &mut portable,
+            &format!(r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#, dir.display()),
+            "the portable-arm64-v1 machine profile, which no backend checkpoints yet",
         );
         assert!(
             std::fs::symlink_metadata(&dir).is_err(),
