@@ -176,7 +176,7 @@ on the byte layout of the build that wrote it.
 | `cpu.json` | `{"version":1,"arch":"aarch64"\|"x86_64","vcpus":[...]}`. Registers by architectural name, values as `"0x..."` strings. Each vCPU says whether it is `partial`. See [The vCPU state](#the-vcpu-state). |
 | `platform.json` | The interrupt controller (`irq`) and the guest counter (`timer`), each tagged with its `kind`, and an optional backend blob. See [The platform state](#the-platform-state). |
 | `devices.json` | Every device's state, with a `null` for a device the guest does not have, and `irq_levels`: the level of each device's interrupt line at the capture, so a restore can drive the lines again. |
-| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot), `synced: true`, and `sha256_sparse: null`, which whoever moves the disk fills in. |
+| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot, which a restore carries on, so it only grows across moves), `synced: true`, and `sha256_sparse: null`, which whoever moves the disk fills in. |
 | `session.json` | The sandbox id, `epoch`, `txid`, the capture time and `then`. |
 | `manifest.json` | Every other file's name, size and SHA-256, the RAM regions with their present page counts, the SHA-256 of `profile.json`, the hvi build, `capabilities` (what a restore must be able to load: `hvf-gic-state-v1` on HVF, empty on KVM) and the seal time. |
 
