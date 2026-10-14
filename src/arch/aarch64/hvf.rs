@@ -28,6 +28,7 @@
 // clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -301,6 +302,10 @@ struct CreateOrder {
     next: Mutex<u32>,
     /// Signals the end of a turn.
     turn: Condvar,
+    /// How many vCPUs exist, each with its affinity set. A failed create
+    /// ends its turn but is not counted, so a restore that waits for every
+    /// vCPU to exist does not take a failure for the last one.
+    created: AtomicU32,
 }
 
 impl CreateOrder {
@@ -326,6 +331,16 @@ impl CreateOrder {
     fn done(&self) {
         *lock_or_recover(&self.next) += 1;
         self.turn.notify_all();
+    }
+
+    /// Counts one more vCPU as existing, once its thread has set it up.
+    fn mark_created(&self) {
+        self.created.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Returns how many vCPUs exist.
+    fn created(&self) -> u32 {
+        self.created.load(Ordering::SeqCst)
     }
 }
 
@@ -1287,7 +1302,9 @@ fn run(
 /// level each restored device holds, which is the captured one except where
 /// ending the vsock connections queued packets for the guest.
 fn load(shared: &Shared, restore: &RestoreRun) -> Result<(), String> {
-    import(&shared.guest.vcpus, &restore.plan, IMPORT_TIMEOUT)?;
+    import(&shared.guest.vcpus, &restore.plan, IMPORT_TIMEOUT, || {
+        shared.create_order.created()
+    })?;
     let levels = &restore.irq_levels;
     let lines = [
         (
@@ -1387,6 +1404,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
     sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
+    // A restore loads the GIC only once every vCPU, the ones that were off
+    // as well, exists. See `checkpoint::restore::import`.
+    sh.create_order.mark_created();
 
     if cpu_id == 0 {
         // Only this thread can read the register, and the guest has not run
