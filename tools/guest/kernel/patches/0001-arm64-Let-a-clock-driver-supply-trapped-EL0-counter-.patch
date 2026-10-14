@@ -1,0 +1,179 @@
+From 374488579075999396d676cfcd5ea0ae2a3bba74 Mon Sep 17 00:00:00 2001
+From: Panagiotis Moustafellos <pmoust@nofire.ai>
+Date: Wed, 14 Oct 2026 04:29:31 +0300
+Subject: [PATCH 1/4] arm64: Let a clock driver supply trapped EL0 counter
+ reads
+
+When CNTKCTL_EL1 leaves EL0 counter access disabled, EL0 reads of
+CNTVCT_EL0, CNTVCTSS_EL0 and CNTFRQ_EL0 trap and the kernel emulates
+them with the raw counter and the arch timer rate. A guest that is
+checkpointed on one host and restored on another with a different
+counter frequency (24 MHz on Apple silicon, 54 MHz on a Raspberry Pi 5)
+then shows userspace a counter whose rate changes under it, while
+CNTFRQ_EL0 keeps the boot value.
+
+Add arm64_set_el0_counter() so that a paravirtual clock driver can
+register, once at boot, a counter read function and a fixed rate for
+these emulated reads. The AArch64 and AArch32 handlers use it when it
+is set.
+
+Registering such a counter also has to keep the reads trapping.
+update_cntkctl_el1() sets EL0VCTEN on every exec (through
+arch_setup_new_exec() and do_set_tsc_mode(PR_TSC_ENABLE)), on
+prctl(PR_SET_TSC) and on a context switch between tasks with different
+TIF_32BIT or TIF_TSC_SIGSEGV flags, and with EL0VCTEN set CNTVCT_EL0
+and CNTFRQ_EL0 read the host values directly. Make it keep EL0VCTEN
+clear while a counter is registered, the same as for the errata that
+need every counter read trapped. A static key tracks this, enabled from
+the driver's TIMER_OF init after jump_label_init().
+
+Without a registered counter the behaviour is unchanged.
+
+Signed-off-by: Panagiotis Moustafellos <pmoust@nofire.ai>
+---
+ arch/arm64/include/asm/traps.h | 14 ++++++++++++
+ arch/arm64/kernel/process.c    |  4 +++-
+ arch/arm64/kernel/traps.c      | 39 ++++++++++++++++++++++++++++++----
+ 3 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm64/include/asm/traps.h b/arch/arm64/include/asm/traps.h
+index e3e8944a7..aa7972a17 100644
+--- a/arch/arm64/include/asm/traps.h
++++ b/arch/arm64/include/asm/traps.h
+@@ -7,6 +7,7 @@
+ #ifndef __ASM_TRAP_H
+ #define __ASM_TRAP_H
+ 
++#include <linux/jump_label.h>
+ #include <linux/list.h>
+ #include <asm/esr.h>
+ #include <asm/ptrace.h>
+@@ -37,6 +38,19 @@ int ubsan_brk_handler(struct pt_regs *regs, unsigned long esr);
+ 
+ int early_brk64(unsigned long addr, unsigned long esr, struct pt_regs *regs);
+ 
++void arm64_set_el0_counter(u64 (*read)(void), u32 rate);
++
++DECLARE_STATIC_KEY_FALSE(arm64_el0_counter_key);
++
++/*
++ * True once a clock driver supplies the counter for trapped EL0 reads.
++ * EL0 access to the counter must then stay disabled in CNTKCTL_EL1.
++ */
++static __always_inline bool arm64_el0_counter_overridden(void)
++{
++	return static_branch_unlikely(&arm64_el0_counter_key);
++}
++
+ /*
+  * Move regs->pc to next instruction and do necessary setup before it
+  * is executed.
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 2edf88c1c..3d799a090 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -56,6 +56,7 @@
+ #include <asm/stacktrace.h>
+ #include <asm/switch_to.h>
+ #include <asm/system_misc.h>
++#include <asm/traps.h>
+ 
+ #if defined(CONFIG_STACKPROTECTOR) && !defined(CONFIG_STACKPROTECTOR_PER_TASK)
+ #include <linux/stackprotector.h>
+@@ -491,13 +492,14 @@ static void entry_task_switch(struct task_struct *next)
+  * Handle sysreg updates for ARM erratum 1418040 which affects the 32bit view of
+  * CNTVCT, various other errata which require trapping all CNTVCT{,_EL0}
+  * accesses and prctl(PR_SET_TSC). Ensure access is disabled iff a workaround is
+- * required or PR_TSC_SIGSEGV is set.
++ * required, PR_TSC_SIGSEGV is set or a clock driver emulates the EL0 counter.
+  */
+ static void update_cntkctl_el1(struct task_struct *next)
+ {
+ 	struct thread_info *ti = task_thread_info(next);
+ 
+ 	if (test_ti_thread_flag(ti, TIF_TSC_SIGSEGV) ||
++	    arm64_el0_counter_overridden() ||
+ 	    has_erratum_handler(read_cntvct_el0) ||
+ 	    (IS_ENABLED(CONFIG_ARM64_ERRATUM_1418040) &&
+ 	     this_cpu_has_cap(ARM64_WORKAROUND_1418040) &&
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index e6e815ef0..6803bdfa8 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -605,6 +605,37 @@ static void ctr_read_handler(unsigned long esr, struct pt_regs *regs)
+ 	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
+ }
+ 
++/*
++ * A paravirtual clock driver can give trapped EL0 counter reads a counter
++ * of its own, one that keeps its rate when the guest moves to a host with
++ * a different CNTFRQ_EL0. While it does, update_cntkctl_el1() keeps EL0
++ * access to the counter disabled so that these reads keep trapping.
++ */
++DEFINE_STATIC_KEY_FALSE(arm64_el0_counter_key);
++static u64 (*el0_counter_read)(void) __ro_after_init;
++static u32 el0_counter_rate __ro_after_init;
++
++void __init arm64_set_el0_counter(u64 (*read)(void), u32 rate)
++{
++	el0_counter_rate = rate;
++	el0_counter_read = read;
++	static_branch_enable(&arm64_el0_counter_key);
++}
++
++static u64 el0_cntvct(void)
++{
++	if (arm64_el0_counter_overridden())
++		return el0_counter_read();
++	return arch_timer_read_counter();
++}
++
++static u32 el0_cntfrq(void)
++{
++	if (arm64_el0_counter_overridden())
++		return el0_counter_rate;
++	return arch_timer_get_rate();
++}
++
+ static void cntvct_read_handler(unsigned long esr, struct pt_regs *regs)
+ {
+ 	if (test_thread_flag(TIF_TSC_SIGSEGV)) {
+@@ -612,7 +643,7 @@ static void cntvct_read_handler(unsigned long esr, struct pt_regs *regs)
+ 	} else {
+ 		int rt = ESR_ELx_SYS64_ISS_RT(esr);
+ 
+-		pt_regs_write_reg(regs, rt, arch_timer_read_counter());
++		pt_regs_write_reg(regs, rt, el0_cntvct());
+ 		arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
+ 	}
+ }
+@@ -624,7 +655,7 @@ static void cntfrq_read_handler(unsigned long esr, struct pt_regs *regs)
+ 	} else {
+ 		int rt = ESR_ELx_SYS64_ISS_RT(esr);
+ 
+-		pt_regs_write_reg(regs, rt, arch_timer_get_rate());
++		pt_regs_write_reg(regs, rt, el0_cntfrq());
+ 		arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
+ 	}
+ }
+@@ -721,7 +752,7 @@ static void compat_cntfrq_read_handler(unsigned long esr, struct pt_regs *regs)
+ {
+ 	int reg = (esr & ESR_ELx_CP15_32_ISS_RT_MASK) >> ESR_ELx_CP15_32_ISS_RT_SHIFT;
+ 
+-	pt_regs_write_reg(regs, reg, arch_timer_get_rate());
++	pt_regs_write_reg(regs, reg, el0_cntfrq());
+ 	arm64_skip_faulting_instruction(regs, 4);
+ }
+ 
+@@ -738,7 +769,7 @@ static void compat_cntvct_read_handler(unsigned long esr, struct pt_regs *regs)
+ {
+ 	int rt = (esr & ESR_ELx_CP15_64_ISS_RT_MASK) >> ESR_ELx_CP15_64_ISS_RT_SHIFT;
+ 	int rt2 = (esr & ESR_ELx_CP15_64_ISS_RT2_MASK) >> ESR_ELx_CP15_64_ISS_RT2_SHIFT;
+-	u64 val = arch_timer_read_counter();
++	u64 val = el0_cntvct();
+ 
+ 	pt_regs_write_reg(regs, rt, lower_32_bits(val));
+ 	pt_regs_write_reg(regs, rt2, upper_32_bits(val));
+-- 
+2.51.2
+

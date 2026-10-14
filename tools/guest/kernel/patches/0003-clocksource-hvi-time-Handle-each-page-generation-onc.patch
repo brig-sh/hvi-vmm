@@ -1,0 +1,107 @@
+From 51cdb81da818a2347945a06a3f3b8e9955873937 Mon Sep 17 00:00:00 2001
+From: Panagiotis Moustafellos <pmoust@nofire.ai>
+Date: Wed, 14 Oct 2026 22:08:30 +0300
+Subject: [PATCH 3/4] clocksource: hvi-time: Handle each page generation once
+
+Every CPU takes GEN_CHANGED after a publish and schedules the migration
+work. When the work had already run for the first CPU, the next CPU's
+interrupt ran it again: it logged the generation twice, counted two
+migrations for one move and moved the wall clock a second time by the
+little that had passed.
+
+Keep the generation the work last handled, set from the page at probe,
+and compare under a mutex. A run that finds the same generation does
+nothing; otherwise the count grows by the publishes since, so two quick
+publishes before the work runs still count as two. The VMM now also
+publishes after a host sleep, so the count is of publishes, not only of
+moves between hosts.
+
+Signed-off-by: Panagiotis Moustafellos <pmoust@nofire.ai>
+---
+ drivers/clocksource/hvi-time.c | 32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/clocksource/hvi-time.c b/drivers/clocksource/hvi-time.c
+index ab3e71613..e593f12c4 100644
+--- a/drivers/clocksource/hvi-time.c
++++ b/drivers/clocksource/hvi-time.c
+@@ -8,9 +8,10 @@
+  *   ns = base_ns + ((cntvct - base_counter) * mult) >> shift
+  *
+  * and republishes it when the guest is restored, possibly on a host with
+- * another counter frequency. Guest nanoseconds do not advance while the
+- * guest is stopped. Each CPU also has a one-shot timer that fires at an
+- * absolute guest nanosecond deadline and raises a per-CPU interrupt.
++ * another counter frequency, and when the host wakes from a sleep. Guest
++ * nanoseconds do not advance while the guest is stopped. Each CPU also has
++ * a one-shot timer that fires at an absolute guest nanosecond deadline and
++ * raises a per-CPU interrupt.
+  *
+  * The driver gives the kernel a 1 GHz clocksource, sched_clock and per-CPU
+  * clockevent built on the page, so no kernel clock depends on the counter
+@@ -118,6 +119,9 @@ static void __iomem *hvi_timer_base __ro_after_init;
+ static int hvi_time_irq __ro_after_init;
+ static bool hvi_time_active __ro_after_init;
+ static atomic_t hvi_time_migrations = ATOMIC_INIT(0);
++/* The page generation the migration work last handled */
++static u32 hvi_time_handled_gen;
++static DEFINE_MUTEX(hvi_time_migrate_lock);
+ static DEFINE_PER_CPU(struct hvi_time_cpu, hvi_time_pcpu);
+ 
+ /*
+@@ -232,18 +236,32 @@ static int hvi_time_disarm(struct clock_event_device *evt)
+ }
+ 
+ /*
+- * Restore: the page now describes another host's counter. Guest
+- * nanoseconds carry on from the checkpoint, so MONOTONIC is continuous;
++ * Restore or host wake: the page has a new generation, possibly for another
++ * host's counter. Guest nanoseconds carry on, so MONOTONIC is continuous;
+  * REALTIME and BOOTTIME move on by the time the guest was stopped.
++ *
++ * Every CPU takes GEN_CHANGED and schedules this work, and it can run again
++ * after the first CPU's run. It handles each generation once: it counts the
++ * generations since the one it last handled, and does nothing when there
++ * are none.
+  */
+ static void hvi_time_migrate(struct work_struct *work)
+ {
+ 	struct hvi_time_snap s;
+ 	struct timespec64 ts;
+ 	u64 target_ns;
++	u32 moves;
+ 	s64 delta;
+ 
++	mutex_lock(&hvi_time_migrate_lock);
+ 	hvi_time_snapshot(&s);
++	if (s.generation == hvi_time_handled_gen) {
++		mutex_unlock(&hvi_time_migrate_lock);
++		return;
++	}
++	/* The generation goes up by 2 at every publish */
++	moves = (s.generation - hvi_time_handled_gen) / 2;
++	hvi_time_handled_gen = s.generation;
+ 
+ 	/* Host wall clock now = published wall clock + guest ns since then */
+ 	target_ns = s.wall_ns + (s.now_ns - s.base_ns);
+@@ -261,7 +279,8 @@ static void hvi_time_migrate(struct work_struct *work)
+ 	touch_all_softlockup_watchdogs();
+ 	clocksource_touch_watchdog();
+ 	rcu_cpu_stall_reset();
+-	atomic_inc(&hvi_time_migrations);
++	atomic_add(moves, &hvi_time_migrations);
++	mutex_unlock(&hvi_time_migrate_lock);
+ 
+ 	pr_info("generation %u: counter %u Hz, lpj %lu, wall clock moved %lld ns, downtime total %llu ns\n",
+ 		s.generation, s.freq, loops_per_jiffy, delta, s.downtime_ns);
+@@ -440,6 +459,7 @@ static int __init hvi_time_of_init(struct device_node *np)
+ 		ret = -EINVAL;
+ 		goto out_page;
+ 	}
++	hvi_time_handled_gen = gen;
+ 
+ 	hvi_timer_base = ioremap(timer_res.start, resource_size(&timer_res));
+ 	if (!hvi_timer_base) {
+-- 
+2.51.2
+
