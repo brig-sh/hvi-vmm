@@ -47,6 +47,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_version();
             Ok(())
         }
+        Some("checkpoint-verify") => {
+            let dir = args
+                .get(2)
+                .ok_or("checkpoint-verify needs the bundle directory")?;
+            let verified = hvi::checkpoint::bundle::verify(std::path::Path::new(dir))
+                .map_err(|e| format!("{dir}: {e}"))?;
+            println!("{verified}");
+            Ok(())
+        }
         Some("dump-fdt") => {
             #[cfg(target_arch = "aarch64")]
             {
@@ -139,14 +148,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             eprintln!(
-                "hvi — a microVMM\n\nusage: hvi \
-                 <boot|dump-fdt|smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
+                "hvi — a microVMM\n\nusage: hvi <boot|checkpoint-verify|dump-fdt|smoke|\
+                 sandbox-selftest|seccomp-selftest|--version> [args]"
             );
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected `boot`, `dump-fdt`, `smoke`, \
-             `sandbox-selftest`, `seccomp-selftest` or `--version`"
+            "unknown subcommand {other:?}; expected `boot`, `checkpoint-verify`, `dump-fdt`, \
+             `smoke`, `sandbox-selftest`, `seccomp-selftest` or `--version`"
         )
         .into()),
     }
