@@ -930,7 +930,10 @@ mod tests {
                     })
                     .collect();
                 let plan = crate::checkpoint::restore::tests::plan(spec.parking, spec.unstarted);
-                crate::checkpoint::restore::import(&vcpus, &plan, Duration::from_secs(5)).unwrap();
+                crate::checkpoint::restore::import(&vcpus, &plan, Duration::from_secs(5), || {
+                    spec.parking + spec.unstarted
+                })
+                .unwrap();
                 fakes
             } else {
                 fake_vcpus

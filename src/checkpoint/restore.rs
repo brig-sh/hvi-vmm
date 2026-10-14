@@ -20,7 +20,9 @@
 //!
 //! 1. each vCPU loads its registers and its timer;
 //! 2. vCPU 0 loads the interrupt controller, once every vCPU exists and none
-//!    has run, as `hv_gic_set_state` requires;
+//!    has run, as `hv_gic_set_state` requires: the import waits for the backend
+//!    to have created every vCPU, the ones that were off as well, before it
+//!    posts the first step;
 //! 3. each vCPU loads its own part of the interrupt controller, its CPU
 //!    interface, which step 2 reset.
 //!
@@ -68,30 +70,38 @@ fn starts(state: &VcpuState) -> bool {
 /// Loads `plan` into the vCPUs, in the three steps of [`IMPORT_STEPS`].
 ///
 /// The caller holds the vCPUs paused from the control socket, so each one
-/// parks at its first checkpoint, before it enters the guest. Every vCPU that
-/// [`starts`] must have started within `timeout`, and each step must finish
-/// within `timeout` of its post.
+/// parks at its first checkpoint, before it enters the guest. `created`
+/// returns how many vCPUs the backend has created. Every vCPU must have been
+/// created, and every one that [`starts`] must have started, within
+/// `timeout`, before the first step is posted: a vCPU that was off takes no
+/// part in the import, but the interrupt controller of the second step holds
+/// its state too, and the hypervisor loads it only once every vCPU exists.
+/// Each step must then finish within `timeout` of its post.
 ///
 /// # Errors
 ///
-/// Errors, naming the vCPU and the step, when a vCPU did not start, did not
-/// finish a step in time, or could not load its part; or when the VM stopped.
+/// Errors, naming the vCPU and the step, when a vCPU was not created or did
+/// not start, did not finish a step in time, or could not load its part; or
+/// when the VM stopped.
 pub(crate) fn import<K: Kick>(
     vcpus: &Vcpus<K>,
     plan: &Arc<ImportPlan>,
     timeout: Duration,
+    created: impl Fn() -> u32,
 ) -> Result<(), String> {
+    let total = u32::try_from(plan.vcpus.len()).unwrap_or(u32::MAX);
     let expected = plan.vcpus.iter().filter(|v| starts(v)).count() as u32;
     let deadline = Instant::now() + timeout;
-    while vcpus.started() < expected {
+    while vcpus.started() < expected || created() < total {
         if !vcpus.is_running() {
             return Err("the run ended before the vCPUs started".to_string());
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "{} of {expected} vCPUs started in time",
-                vcpus.started()
-            ));
+            return Err(if created() < total {
+                format!("{} of {total} vCPUs were created in time", created())
+            } else {
+                format!("{} of {expected} vCPUs started in time", vcpus.started())
+            });
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -925,9 +935,59 @@ pub(crate) mod tests {
             .map(|cpu| importing_vcpu(&vcpus, cpu, &log, None))
             .collect();
         // vCPU 2 was off, and its thread waits for the guest, as at boot.
-        import(&vcpus, &plan(2, 1), Duration::from_secs(5)).unwrap();
+        import(&vcpus, &plan(2, 1), Duration::from_secs(5), || 3).unwrap();
         assert_barriers(&log.lock().unwrap(), 2);
         assert_eq!(vcpus.parked(), 2, "a vCPU left its park during the import");
+        vcpus.stop();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_controller_waits_for_every_vcpu_to_exist() {
+        // vCPUs 2 and 3 were off. Their threads create them in turn after
+        // vCPU 1's, and nothing else orders them before the import.
+        let vcpus = Arc::new(Vcpus::new(
+            4,
+            NoKick,
+            crate::run::StopHandle::new_pair().unwrap().0,
+        ));
+        vcpus.pause_from_control(Duration::ZERO).unwrap();
+        let log = Log::default();
+        let threads: Vec<_> = (0..2)
+            .map(|cpu| importing_vcpu(&vcpus, cpu, &log, None))
+            .collect();
+        let created = Arc::new(std::sync::atomic::AtomicU32::new(2));
+        let late = {
+            let (created, log) = (Arc::clone(&created), Arc::clone(&log));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                let early = log.lock().unwrap().clone();
+                created.store(4, std::sync::atomic::Ordering::SeqCst);
+                early
+            })
+        };
+        import(&vcpus, &plan(2, 2), Duration::from_secs(5), || {
+            created.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .unwrap();
+        let early = late.join().unwrap();
+        assert!(
+            early.is_empty(),
+            "a step ran before every vCPU existed: {early:?}"
+        );
+        assert_barriers(&log.lock().unwrap(), 2);
+
+        // One that is never created times the import out, and no step runs.
+        let log_len = log.lock().unwrap().len();
+        let err = import(&vcpus, &plan(2, 2), Duration::from_millis(100), || 3).unwrap_err();
+        assert_eq!(err, "3 of 4 vCPUs were created in time");
+        assert_eq!(
+            log.lock().unwrap().len(),
+            log_len,
+            "a step ran without vCPU 3"
+        );
         vcpus.stop();
         for thread in threads {
             thread.join().unwrap();
@@ -947,7 +1007,7 @@ pub(crate) mod tests {
             importing_vcpu(&vcpus, 0, &log, None),
             importing_vcpu(&vcpus, 1, &log, Some(ImportStep::IrqCpu)),
         ];
-        let err = import(&vcpus, &plan(2, 0), Duration::from_secs(5)).unwrap_err();
+        let err = import(&vcpus, &plan(2, 0), Duration::from_secs(5), || 2).unwrap_err();
         assert_eq!(err, "vCPU 1, IrqCpu step: the hypervisor refused it");
         vcpus.stop();
         for thread in threads {
@@ -971,7 +1031,7 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let started = Instant::now();
-        let err = import(&vcpus, &plan(2, 0), Duration::from_millis(100)).unwrap_err();
+        let err = import(&vcpus, &plan(2, 0), Duration::from_millis(100), || 2).unwrap_err();
         assert_eq!(err, "1 of 2 vCPUs started in time");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(log.lock().unwrap().is_empty(), "a step ran without vCPU 1");
@@ -981,7 +1041,7 @@ pub(crate) mod tests {
         let stopped = Vcpus::new(1, NoKick, crate::run::StopHandle::new_pair().unwrap().0);
         stopped.stop();
         assert_eq!(
-            import(&stopped, &plan(1, 0), Duration::from_secs(5)).unwrap_err(),
+            import(&stopped, &plan(1, 0), Duration::from_secs(5), || 1).unwrap_err(),
             "the run ended before the vCPUs started"
         );
     }
