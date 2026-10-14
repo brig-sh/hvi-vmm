@@ -223,6 +223,23 @@ the same status it would have seen with no handler. A first stop signal that
 arrives after the run has ended asks a finished run to stop, so a binary that
 keeps running after `boot` returns checks `handle.signal()` once it is done.
 
+`hvi::signal::StopOnSignals` does all of this for a binary that ends with its
+run, as the `hvi` binary does:
+
+```rust
+let (signals, registration) = hvi::signal::StopOnSignals::new()?;
+cfg.stop = Some(registration);
+signals.finish(hvi::boot(cfg))
+```
+
+`finish` prints `guest stopped: <stop>` or `hvi: <error>` on stderr, ignoring a
+failed write, and ends the process by the first stop signal that asked, even
+after another request. With no such signal it exits with status 0 after a stop
+and 1 after a failure. A write to a closed pipe fails only while `SIGPIPE` is
+ignored, as the Rust runtime sets it before `main`. Under its default action the
+write ends the process. With `spawn`, pass the registration the same way and
+call `signals.finish(run.wait())` once the caller is done with the run.
+
 `boot` restores the terminal it put in raw mode when it returns. A signal that
 ends the process skips that restore. `hvi::terminal::restore_on_fatal_signals()`
 installs a handler for each signal in `hvi::terminal::fatal_signals()` that has
