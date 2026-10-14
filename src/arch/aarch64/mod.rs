@@ -36,6 +36,8 @@ pub(crate) mod hvf;
 pub(crate) mod hvf_state;
 #[cfg(target_os = "linux")]
 pub(crate) mod kvm;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) mod kvm_state;
 #[cfg(target_os = "macos")]
 pub mod smoke;
 // The KVM backend's; built on macOS only for its tests.
