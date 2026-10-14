@@ -1143,7 +1143,12 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
         &[shared_ram.region_at(RAM_BASE)],
     )?);
     ram.register_kvm_slots(&vm)?;
-    opened.bundle.load_ram(&ram)?;
+    // ram.bin is hashed here, as it is copied, and refused like the open
+    // refuses a component: named with the bundle.
+    opened
+        .bundle
+        .load_ram(&ram)
+        .map_err(|e| format!("{}: {e}", cfg.from))?;
     let rebuild::Devices {
         block,
         net,
