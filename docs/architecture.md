@@ -408,7 +408,11 @@ around every call that takes a device mutex or writes guest RAM, so the pause
 waits only for the work in progress, never for traffic. It then calls
 `Vcpus::pause_from_control`, which waits for every started vCPU, since its
 caller parks none. The two waits share one 2 s deadline, and a pause that misses
-it is undone and the VM runs on. The plugin and the control socket share one quiesce, and whichever
+it is undone and the VM runs on. The agent bridge reads its sockets inside the
+gate, but the console reader and the network relays read before they enter it,
+so a pause can find a console byte, a tap frame or the gateway relay's buffered
+stream off the host and not yet in a device. Pause and resume lose nothing; a
+checkpoint will have to take those buffers too. The plugin and the control socket share one quiesce, and whichever
 holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU

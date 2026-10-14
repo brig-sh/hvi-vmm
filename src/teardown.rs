@@ -133,6 +133,17 @@ impl Drop for FinishGuard {
 ///
 /// The fast path of [`enter`](Self::enter) is two atomic operations and takes
 /// no lock, since the network relay passes it once per frame.
+///
+/// A pause does not yet hold everything a checkpoint needs. The agent
+/// bridge's reader reads inside the gate, so its bytes are either still in
+/// the socket or already in the device. The console reader and the network
+/// relays read first and enter the gate to deliver, so a pause can find one
+/// console byte, one tap frame, or the gateway relay's buffered stream taken
+/// off the host and not yet in the device. Pause and resume on one host lose
+/// nothing, but a checkpoint taken then would drop it; capture has to take
+/// those buffers too, or move those reads inside the gate. The console cannot
+/// simply move: stdin is a shared terminal, which this does not make
+/// non-blocking.
 #[derive(Default)]
 pub struct PauseGate {
     /// Set while a pause holds the gate closed.
