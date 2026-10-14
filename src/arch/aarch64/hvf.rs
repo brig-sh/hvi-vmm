@@ -424,78 +424,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     check_export_overlap(&cfg.fs_shares)?;
     let num_cpus = cfg.vcpus.max(1);
 
-    // In-kernel GICv3; sizes from the framework so the DTB matches hv_gic.
-    let gicd_align = GicConfig::get_distributor_base_alignment()? as u64;
-    let gicr_align = GicConfig::get_redistributor_base_alignment()? as u64;
-    let gic = GicLayout {
-        // Apple's hv_gic is a GICv3; unlike KVM there is nothing to negotiate.
-        version: GicVersion::V3,
-        gicd_base: align_down(GicLayout::QEMU_VIRT.gicd_base, gicd_align),
-        gicd_size: GicConfig::get_distributor_size()? as u64,
-        gicr_base: align_down(GicLayout::QEMU_VIRT.gicr_base, gicr_align),
-        gicr_size: GicConfig::get_redistributor_region_size()? as u64,
-    };
+    let gic = gic_layout()?;
     eprintln!(
         "{LOG_PREFIX} {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
         gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
     );
-    // Every device window has to clear the GIC, and only here is it known how
-    // much GIC there is: the framework sizes the redistributor region, and it
-    // is far larger than QEMU's. The fixed windows are checked once, the
-    // virtio-fs ones again below as each share is placed, because those climb
-    // with the share count.
+    let vm = create_vm(&gic)?;
+    let (shared_ram, ram) = map_ram(cfg.mem_bytes)?;
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
-    for (name, base, size) in [
-        ("UART", UART_BASE, UART_SIZE),
-        ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
-        ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
-        ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
-    ] {
-        let end = base.saturating_add(size);
-        if base < gic_end || end > DEVICE_WINDOW_END {
-            return Err(format!(
-                "{name} at {base:#x}..{end:#x} does not fit between the GIC \
-                 (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
-            )
-            .into());
-        }
-    }
-
-    let mut gic_config = GicConfig::new();
-    gic_config.set_distributor_base(gic.gicd_base)?;
-    gic_config.set_redistributor_base(gic.gicr_base)?;
-    let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config)?;
-
-    // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
-    // rather than allocated by applevisor, so an out-of-process plugin can
-    // map the same pages. applevisor's memory_create uses hv_vm_allocate,
-    // which hands back a pointer with no nameable backing object; hv_vm_map
-    // accepts any page-aligned host pointer, so the guest gets the mapping
-    // `GuestRam` made of the object. This is the path `hvi smoke --shm`
-    // exercises.
-    let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
-    let ram = Arc::new(GuestRam::new(
-        &shared_ram,
-        &[shared_ram.region_at(RAM_BASE)],
-    )?);
-    for region in ram.memory().iter() {
-        let ipa = region.start_addr().raw_value();
-        // SAFETY: the region is a live, page-aligned mapping of `len()` bytes
-        // that lives as long as `ram`, which outlives the VM.
-        let ret = unsafe {
-            applevisor_sys::hv_vm_map(
-                region.as_ptr().cast::<std::ffi::c_void>(),
-                ipa,
-                region.len() as usize,
-                applevisor_sys::HV_MEMORY_READ
-                    | applevisor_sys::HV_MEMORY_WRITE
-                    | applevisor_sys::HV_MEMORY_EXEC,
-            )
-        };
-        if ret != 0 {
-            return Err(format!("hv_vm_map(guest RAM -> {ipa:#x}) failed: {ret:#x}").into());
-        }
-    }
 
     let virtio = match &cfg.disk {
         Some(path) => {
@@ -707,41 +643,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         profile,
     };
 
-    // Each device sets its own interrupt line, from the methods that change its
-    // level and so under the lock that decides it.
-    let line = |intid, kick: bool| -> Arc<dyn IrqLine> {
-        Arc::new(HvfIrqLine {
-            vm: vm.clone(),
-            intid,
-            kick: kick.then(|| Arc::clone(&shared.guest.vcpus)),
-        })
-    };
-    lock_or_recover(&shared.pl011).connect_irq(line(UART_INTID, false));
-    shared.guest.connect_irqs(
-        line(VIRTIO_INTID, true),
-        line(VIRTIO_NET_INTID, true),
-        line(VIRTIO_VSOCK_INTID, true),
-    );
-    for fs in &shared.fs {
-        lock_or_recover(&fs.dev).connect_irq(line(fs.intid, true));
-    }
+    connect_lines(&shared);
 
     // Bound before Seatbelt for the same reason as the agent socket.
-    let control = cfg
-        .control_sock
-        .as_deref()
-        .map(|path| {
-            ControlSocket::bind(
-                path,
-                Arc::clone(&shared.profile),
-                cfg.checkpoint_root.as_deref(),
-            )
-            .map(|control| {
-                let console = Console::Pl011(Arc::clone(&shared.pl011));
-                control.capturing("hvf", cfg.disk.clone(), console)
-            })
-        })
-        .transpose()?;
+    let control = bind_control(&cfg, &shared)?;
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
@@ -755,19 +660,159 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     let _raw = terminal::RawTerm::enable();
 
-    // Confine the process before the first I/O thread exists. Everything above
-    // acquires host authority (the VM, the guest-RAM mapping, the block file,
-    // the ledger, the gateway connection, the listeners, the terminal), and
-    // everything below only services guest I/O with what is already open. An
-    // error here returns before there is an I/O thread to stop. See
-    // `sandbox::seatbelt`.
+    confine(cfg.sandbox, &fs_access, control.as_ref())?;
+
+    run(shared, num_cpus, stop_source, bridge, net_reader, control)
+}
+
+/// Returns the in-kernel GICv3's placement, with sizes from the framework so
+/// the devicetree matches `hv_gic`, once every fixed device window is checked
+/// to clear it.
+fn gic_layout() -> Result<GicLayout, Box<dyn std::error::Error>> {
+    let gicd_align = GicConfig::get_distributor_base_alignment()? as u64;
+    let gicr_align = GicConfig::get_redistributor_base_alignment()? as u64;
+    let gic = GicLayout {
+        // Apple's hv_gic is a GICv3; unlike KVM there is nothing to negotiate.
+        version: GicVersion::V3,
+        gicd_base: align_down(GicLayout::QEMU_VIRT.gicd_base, gicd_align),
+        gicd_size: GicConfig::get_distributor_size()? as u64,
+        gicr_base: align_down(GicLayout::QEMU_VIRT.gicr_base, gicr_align),
+        gicr_size: GicConfig::get_redistributor_region_size()? as u64,
+    };
+    // Every device window has to clear the GIC, and only here is it known how
+    // much GIC there is: the framework sizes the redistributor region, and it
+    // is far larger than QEMU's. The fixed windows are checked here, and the
+    // virtio-fs ones in `boot` as each share is placed, because those climb
+    // with the share count.
+    let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
+    for (name, base, size) in [
+        ("UART", UART_BASE, UART_SIZE),
+        ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
+        ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
+        ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
+    ] {
+        let end = base.saturating_add(size);
+        if base < gic_end || end > DEVICE_WINDOW_END {
+            return Err(format!(
+                "{name} at {base:#x}..{end:#x} does not fit between the GIC \
+                 (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
+            )
+            .into());
+        }
+    }
+    Ok(gic)
+}
+
+/// Creates the VM with its GICv3 at `gic`.
+fn create_vm(gic: &GicLayout) -> Result<VmGic, Box<dyn std::error::Error>> {
+    let mut gic_config = GicConfig::new();
+    gic_config.set_distributor_base(gic.gicd_base)?;
+    gic_config.set_redistributor_base(gic.gicr_base)?;
+    Ok(VirtualMachine::with_gic(
+        VirtualMachineConfig::new(),
+        gic_config,
+    )?)
+}
+
+/// Allocates `mem_bytes` of guest RAM and maps it at `RAM_BASE`.
+fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::error::Error>> {
+    // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
+    // rather than allocated by applevisor, so an out-of-process plugin can
+    // map the same pages. applevisor's memory_create uses hv_vm_allocate,
+    // which hands back a pointer with no nameable backing object; hv_vm_map
+    // accepts any page-aligned host pointer, so the guest gets the mapping
+    // `GuestRam` made of the object. This is the path `hvi smoke --shm`
+    // exercises.
+    let shared_ram = SharedRam::new(mem_bytes as usize)?;
+    let ram = Arc::new(GuestRam::new(
+        &shared_ram,
+        &[shared_ram.region_at(RAM_BASE)],
+    )?);
+    for region in ram.memory().iter() {
+        let ipa = region.start_addr().raw_value();
+        // SAFETY: the region is a live, page-aligned mapping of `len()` bytes
+        // that lives as long as `ram`, which outlives the VM.
+        let ret = unsafe {
+            applevisor_sys::hv_vm_map(
+                region.as_ptr().cast::<std::ffi::c_void>(),
+                ipa,
+                region.len() as usize,
+                applevisor_sys::HV_MEMORY_READ
+                    | applevisor_sys::HV_MEMORY_WRITE
+                    | applevisor_sys::HV_MEMORY_EXEC,
+            )
+        };
+        if ret != 0 {
+            return Err(format!("hv_vm_map(guest RAM -> {ipa:#x}) failed: {ret:#x}").into());
+        }
+    }
+    Ok((shared_ram, ram))
+}
+
+/// Connects the UART, the virtio devices and the virtio-fs devices to their
+/// GIC lines.
+fn connect_lines(shared: &Shared) {
+    // Each device sets its own interrupt line, from the methods that change its
+    // level and so under the lock that decides it.
+    let line = |intid, kick: bool| -> Arc<dyn IrqLine> {
+        Arc::new(HvfIrqLine {
+            vm: shared.vm.clone(),
+            intid,
+            kick: kick.then(|| Arc::clone(&shared.guest.vcpus)),
+        })
+    };
+    lock_or_recover(&shared.pl011).connect_irq(line(UART_INTID, false));
+    shared.guest.connect_irqs(
+        line(VIRTIO_INTID, true),
+        line(VIRTIO_NET_INTID, true),
+        line(VIRTIO_VSOCK_INTID, true),
+    );
+    for fs in &shared.fs {
+        lock_or_recover(&fs.dev).connect_irq(line(fs.intid, true));
+    }
+}
+
+/// Binds the control socket `cfg` asks for, before confinement.
+fn bind_control(
+    cfg: &BootConfig,
+    shared: &Shared,
+) -> Result<Option<ControlSocket>, Box<dyn std::error::Error>> {
+    Ok(cfg
+        .control_sock
+        .as_deref()
+        .map(|path| {
+            ControlSocket::bind(
+                path,
+                Arc::clone(&shared.profile),
+                cfg.checkpoint_root.as_deref(),
+            )
+            .map(|control| {
+                let console = Console::Pl011(Arc::clone(&shared.pl011));
+                control.capturing("hvf", cfg.disk.clone(), console)
+            })
+        })
+        .transpose()?)
+}
+
+/// Confines the process before the first I/O thread exists, when `sandbox`
+/// is set.
+fn confine(
+    sandbox: bool,
+    fs_access: &[(std::path::PathBuf, bool)],
+    control: Option<&ControlSocket>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Everything before this acquires host authority (the VM, the guest-RAM
+    // mapping, the block file, the ledger, the gateway connection, the
+    // listeners, the terminal), and everything after only services guest I/O
+    // with what is already open. An error here returns before there is an
+    // I/O thread to stop. See `sandbox::seatbelt`.
     //
     // Failing closed: a profile that will not install is a profile nobody has
     // tested, and continuing would hand a guest-facing process the host's full
     // ambient authority under a log line claiming it was sandboxed.
-    if cfg.sandbox {
-        let checkpoint_root = control.as_ref().and_then(ControlSocket::checkpoint_root);
-        seatbelt::enter_for(&fs_access, checkpoint_root)
+    if sandbox {
+        let checkpoint_root = control.and_then(ControlSocket::checkpoint_root);
+        seatbelt::enter_for(fs_access, checkpoint_root)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         stderrln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
     } else {
@@ -775,7 +820,19 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             "{LOG_PREFIX} seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority"
         );
     }
+    Ok(())
+}
 
+/// Starts the I/O threads and one thread per vCPU, and runs the guest until
+/// it stops.
+fn run(
+    shared: Shared,
+    num_cpus: u32,
+    stop_source: StopSource,
+    bridge: Option<VsockBridge>,
+    net_reader: Option<std::os::unix::net::UnixStream>,
+    control: Option<ControlSocket>,
+) -> Result<Stop, Box<dyn std::error::Error>> {
     // The I/O threads, which are joined after the vCPUs. `teardown` describes
     // the stop.
     install_kick_handler();
@@ -800,8 +857,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             Arc::clone(&shared.guest.ram),
             Arc::clone(&fs.wake),
         );
-        io_threads.spawn("virtio-fs worker", move |_| {
-            run_fs_worker(&dev, &ram, &wake);
+        io_threads.spawn("virtio-fs worker", move |stop| {
+            run_fs_worker(&dev, &ram, &wake, &stop);
         });
         let wake = Arc::clone(&fs.wake);
         io_threads.on_stop(move || wake.stop());
