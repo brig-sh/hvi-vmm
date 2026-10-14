@@ -264,12 +264,18 @@ mod tests {
         assert_ne!(a.firmware.dtb_sha256, c.firmware.dtb_sha256);
     }
 
-    /// A portable guest given the same configuration on hvf and on KVM gets
-    /// the same devicetree, and so the same digest, because both backends
-    /// take its inputs from `portable::devicetree` and lay out RAM, the
-    /// kernel and the initramfs with the same loader.
+    /// The portable profile's devicetree and its digest do not depend on
+    /// the backend's name or its network mode: `portable::devicetree` given
+    /// one configuration, under either name, yields one digest, and the
+    /// profile records the same baseline, GIC and `hvi-time` windows.
+    ///
+    /// This feeds both names the same layout through the shared helper, so
+    /// it cannot catch a backend that hands the loader other inputs (the
+    /// command line, the vCPU count, the devices). The evidence for that
+    /// is the boots: a 1-vCPU guest on this Mac and on rp2 records the same
+    /// `dtb_sha256`, and so does a 2-vCPU guest.
     #[test]
-    fn a_portable_devicetree_is_the_same_on_both_backends() {
+    fn portable_devicetree_inputs_do_not_depend_on_the_backend() {
         use crate::config::BootConfig;
         let cfg = |cmdline: &str, timer: Option<bool>| BootConfig {
             kernel: Vec::new(),
