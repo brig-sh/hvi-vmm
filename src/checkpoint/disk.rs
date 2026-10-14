@@ -42,9 +42,11 @@ use crate::sync::lock_or_recover;
 pub const BATCH_BLOCKS: u64 = 16;
 
 /// The most block numbers one `disk-blocks` request lists. A request line is
-/// at most 64 KiB, so a mover asks for a longer list in several requests, or
-/// names a round.
-pub const MAX_REQUEST_BLOCKS: usize = 8192;
+/// at most 64 KiB ([`MAX_LINE`](super::control::MAX_LINE)): 4096 numbers of
+/// up to 13 digits, every block of a disk under 2^56 bytes, fit in one with
+/// their commas and the rest of the request. A mover asks for a longer list
+/// in several requests, or names a round, which is the way to send a bulk.
+pub const MAX_REQUEST_BLOCKS: usize = 4096;
 
 /// The `component` every batch header carries.
 pub const BATCH_COMPONENT: &str = "disk-blocks";

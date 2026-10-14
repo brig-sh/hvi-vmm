@@ -572,7 +572,27 @@ mod tests {
             r#"{{"v":1,"op":"disk-blocks","blocks":[{}]}}"#,
             vec!["1"; MAX_REQUEST_BLOCKS + 1].join(",")
         );
-        assert!(refused(&many).1.contains("at most 8192"));
+        assert!(refused(&many).1.contains("at most 4096"));
+    }
+
+    // The longest list a request may name fits a request line even with
+    // the widest block numbers of a disk under 2^56 bytes, so it is parsed,
+    // not cut off as too long.
+    #[test]
+    fn the_longest_block_list_fits_a_request_line() {
+        let widest = ((1u64 << 56) / (64 << 10) - 1).to_string();
+        assert_eq!(widest.len(), 13);
+        let line = format!(
+            r#"{{"v":1,"op":"disk-blocks","blocks":[{}]}}"#,
+            vec![widest.as_str(); MAX_REQUEST_BLOCKS].join(",")
+        );
+        assert!(line.len() <= MAX_LINE, "{} bytes", line.len());
+        match parse_request(&line) {
+            Ok(Request::DiskBlocks(BlockSelection::Blocks(list))) => {
+                assert_eq!(list.len(), MAX_REQUEST_BLOCKS);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     // A client that ends lines with CRLF, as `nc -C` and some libraries do,

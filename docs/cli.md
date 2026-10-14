@@ -197,7 +197,7 @@ and each reply is one line:
 | `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
 | `checkpoint` | Captures the VM into a new bundle directory below `--checkpoint-root`, then resumes it or fences it. See [checkpoint.md](checkpoint.md#taking-a-checkpoint). |
 | `disk-dirty` | `{"since":"boot"}` or `{"since":"round"}`. Replies with the disk's 64 KiB blocks the guest wrote since it booted, or since the last `disk-dirty`, as a base64 bitmap under `bitmap_b64`, with `round`, `block_size`, `blocks` (of the disk), `dirty` (set in the bitmap) and `generation`. Each read starts a round: `boot` is round 0 and clears what `round` would return. With the guest paused it syncs the disk first. See [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks). |
-| `disk-blocks` | `{"blocks":[3,4,9]}` (ascending, at most 8192) or `{"round":k}` (the round the last `disk-dirty` read). Streams the blocks' bytes on the connection in batches, each a header line and its bytes, then replies with `blocks`, `bytes`, `batches`, `generation` and `max_lock_us`. See [checkpoint.md](checkpoint.md#the-block-stream). |
+| `disk-blocks` | `{"blocks":[3,4,9]}` (ascending, at most 4096) or `{"round":k}` (the round the last `disk-dirty` read). Streams the blocks' bytes on the connection in batches, each a header line and its bytes, then replies with `blocks`, `bytes`, `batches`, `generation` and `max_lock_us`. See [checkpoint.md](checkpoint.md#the-block-stream). |
 
 `disk-dirty` and `disk-blocks` need `--checkpoint-root` and a disk, as a move
 does, and work in every state but `stopping`; without either they are
