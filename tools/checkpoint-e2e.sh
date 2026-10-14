@@ -23,10 +23,22 @@
 #    it counts on. Stop both, check the disk generation grew over the
 #    moves, and read the file the guest wrote from the image on the host.
 #
+# With --portable the guest boots the portable profile
+# (--profile portable-arm64-v1) and the kernel must be the portable one,
+# with hvi-time. The initramfs must then hold /el0check and /tfd
+# (tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd;
+# el0check is the portable kernel's test/el0check.c and tfd is
+# tools/guest/tfd.c, both built static). Just before the capture the
+# script starts a 6 s timerfd and a 6 s sleep, and checks after the
+# restore: the clocksource is hvi-time, el0check passes, the guest driver
+# logged the migration and reads migrations=1, both timers fire after the
+# resume 6 s of guest time after they were armed, and the guest's wall
+# clock is the host's again.
+#
 # Usage:
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs target/initramfs-workload.cpio --out DIR \
-#       [--cpus 2] [--mem 512] [--no-disk]
+#       [--cpus 2] [--mem 512] [--no-disk] [--portable]
 #
 # DIR receives the checkpoint root (with the bundle), the disk image, both
 # processes' consoles, their profiles and summary.json with the timings.
@@ -36,7 +48,7 @@
 # is limited to 104 bytes on macOS. Exits 0 when every check passed.
 set -euo pipefail
 
-hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes
+hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no
 while [ $# -gt 0 ]; do
     case "$1" in
         --hvi) hvi="$2"; shift 2 ;;
@@ -46,7 +58,8 @@ while [ $# -gt 0 ]; do
         --cpus) cpus="$2"; shift 2 ;;
         --mem) mem="$2"; shift 2 ;;
         --no-disk) disk=no; shift ;;
-        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk]" >&2; exit 2 ;;
+        --portable) portable=yes; shift ;;
+        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable]" >&2; exit 2 ;;
     esac
 done
 for v in hvi kernel initramfs out; do
@@ -63,8 +76,10 @@ rm -rf "$root"
 mkdir -m 700 "$root"
 image="" debugfs=""
 if [ "$disk" = yes ]; then
-    mke2fs="$(command -v mke2fs || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)"
-    debugfs="$(command -v debugfs || echo /opt/homebrew/opt/e2fsprogs/sbin/debugfs)"
+    sbin=/opt/homebrew/opt/e2fsprogs/sbin
+    [ -x "$sbin/mke2fs" ] || sbin=/sbin
+    mke2fs="$(command -v mke2fs || echo "$sbin/mke2fs")"
+    debugfs="$(command -v debugfs || echo "$sbin/debugfs")"
     for tool in "$mke2fs" "$debugfs"; do
         if [ ! -x "$tool" ]; then
             echo "$0: $(basename "$tool") not found; install e2fsprogs or pass --no-disk" >&2
@@ -79,11 +94,14 @@ socks="$(mktemp -d /tmp/hvi-e2e.XXXXXX)"
 trap 'rm -rf "$socks"' EXIT
 
 python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" \
-    "$debugfs" <<'PY'
+    "$debugfs" "$portable" <<'PY'
 import json, os, re, socket, subprocess, sys, threading, time
 
-hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs = sys.argv[1:]
+hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs, portable = sys.argv[1:]
+portable = portable == "yes"
 t0 = time.monotonic()
+# Host wall-clock time at monotonic time t0, to read a line's host time.
+wall_t0 = time.time() - (time.monotonic() - t0)
 failures = []
 
 
@@ -160,6 +178,17 @@ class Control:
         return json.loads(reply), got
 
 
+def downtime(guest, before=0.0):
+    """Returns how far hvi-time moved the portable guest's wall clock and
+    CLOCK_BOOTTIME at its restore, less `before`, in seconds; 0 for a
+    native guest, whose clocks do not move."""
+    if not portable:
+        return 0.0
+    got = guest.wait_for(r"hvi-time: published generation .* downtime total \d+ ns", 10)
+    total = int(re.search(r"downtime total (\d+) ns", got[1]).group(1)) if got else 0
+    return total / 1e9 - before
+
+
 def check(ok, what):
     print(("  ok   " if ok else "  FAIL ") + what, flush=True)
     if not ok:
@@ -196,23 +225,38 @@ def fp_goes_on(before, after, where):
 
 
 common = ["--net-stub"] + (["--disk", image] if image else [])
+profile = ["--profile", "portable-arm64-v1"] if portable else []
 src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs,
-                       "--cpus", cpus, "--mem-mib", mem,
+                       "--cpus", cpus, "--mem-mib", mem] + profile + [
                        "--control-sock", f"{socks}/src.sock", "--checkpoint-root", root,
                        "--agent-sock", f"{socks}/src-agent.sock",
                        "--profile-out", os.path.join(out, "source-profile.json")] + common)
-print(f"checkpoint e2e: {cpus} vCPU(s), {mem} MiB, disk {'yes' if image else 'no'}", flush=True)
-# The guest has no RTC, so its wall clock starts at 0. Give it this host's,
-# so its drift over the move can be read against the host's.
-if src.wait_for(r"TICK 3 ", 120):
+print(f"checkpoint e2e: {cpus} vCPU(s), {mem} MiB, disk {'yes' if image else 'no'}, "
+      f"profile {'portable-arm64-v1' if portable else 'native'}", flush=True)
+# The native guest has no RTC, so its wall clock starts at 0. Give it this
+# host's, so its drift over the move can be read against the host's. The
+# portable guest's hvi-time gives it the host's at boot.
+if src.wait_for(r"TICK 3 ", 120) and not portable:
     src.type(f"date -s @{int(time.time())} >/dev/null\n")
 ready = src.wait_for(r"TICK 15 ", 120)
 check(ready is not None, "the source guest booted and counts")
 if image:
     check(bool(src.outputs(r"DISK-READY written-before ")), "the source wrote and synced /mnt/before")
+if portable:
+    check(bool(src.outputs(r"EL0CHECK PASS")), "the source guest's EL0 reads the synthetic counter")
+    check(bool(src.outputs(r"^CLOCKSOURCE hvi-time$")), "the source guest's clocksource is hvi-time")
 if not ready:
     src.p.kill()
     sys.exit(1)
+if portable:
+    # Two timers armed just before the capture, which must fire after the
+    # resume, 6 s of guest time after they were armed.
+    src.type("/tfd 6 &\n")
+    src.type("/bin/busybox echo \"NANOSLEEP-START $(/bin/busybox cut -d' ' -f1 /proc/uptime)\"; "
+             "( /bin/busybox sleep 6; /bin/busybox echo \"NANOSLEEP-END "
+             "$(/bin/busybox cut -d' ' -f1 /proc/uptime)\" ) &\n")
+    armed = src.wait_for(r"TIMERFD-ARMED ", 10) and src.wait_for(r"^NANOSLEEP-START [0-9]", 10)
+    check(bool(armed), "a timerfd and a sleep are armed before the capture")
 
 # The move itself runs straight through, as a caller would run it, so its
 # timings are the move's: the checks that need a pause come afterwards.
@@ -257,17 +301,52 @@ if first:
     n, uptime, wall = tick(line)
     check(n == last_n + 1, f"the count goes on: last before the fence {last_n}, first after {n}")
     host_gap = first_at - last_tick_at
-    check(uptime - last_uptime < 0.5,
+    # The ticks carry /proc/uptime, CLOCK_BOOTTIME, which on the portable
+    # profile moves on by the downtime; its monotonic clock does not.
+    moved = downtime(dst)
+    check(uptime - last_uptime - moved < 0.5,
           f"the guest's monotonic clock goes on from the capture: {uptime - last_uptime:.2f} s "
-          f"between the two ticks in the guest, {host_gap:.3f} s on the host")
-    check(0 <= wall - last_wall <= 1,
-          f"the guest's wall clock goes on from the captured time: {last_wall} then {wall}")
-    # The policy: no realtime correction without a guest agent, so the
-    # guest's wall clock now lags the host's by the time it was away.
+          f"between the two ticks in the guest ({moved:.3f} s of it the downtime its clock "
+          f"was moved by), {host_gap:.3f} s on the host")
+    if portable:
+        # hvi-time moved the guest's wall clock by the downtime. `date +%s`
+        # is whole seconds, so it reads up to 1 s behind the host.
+        host_wall = wall_t0 + first_at
+        check(-0.2 <= host_wall - wall <= 1.5,
+              f"the guest's wall clock is the host's again: guest {wall}, host {host_wall:.3f}")
+    else:
+        check(0 <= wall - last_wall <= 1,
+              f"the guest's wall clock goes on from the captured time: {last_wall} then {wall}")
+    # The native guest gets no realtime correction without a guest agent,
+    # so its wall clock now lags the host's by the time it was away.
     wall_lag = time.time() - wall
 check(not dst.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT|ARM64 guest on hvi|DISK-READY"),
       "no boot banner in the restored guest: it did not reboot")
 fp_goes_on(src, dst, "over the move")
+
+timers = {}
+if portable:
+    fired = dst.wait_for(r"TIMERFD-FIRED ", 15)
+    if fired:
+        elapsed = float(fired[1].split()[2])
+        timers["timerfd_guest_s"] = elapsed
+        check(fired[0] > resume_at and 5.99 <= elapsed <= 6.3,
+              f"the timerfd armed before the capture fired after the resume, {elapsed:.3f} s "
+              f"of guest time after it was armed")
+    else:
+        check(False, "the timerfd armed before the capture fired")
+    end = dst.wait_for(r"^NANOSLEEP-END [0-9]", 15)
+    start = src.outputs(r"^NANOSLEEP-START [0-9]")
+    if end and start:
+        # /proc/uptime is CLOCK_BOOTTIME, which hvi-time moves on by the
+        # downtime, as it does the wall clock.
+        slept = float(end[1].split()[1]) - float(start[0][1].split()[1]) - downtime(dst)
+        timers["nanosleep_guest_s"] = round(slept, 3)
+        check(end[0] > resume_at and 5.97 <= slept <= 6.3,
+              f"the sleep armed before the capture ended after the resume, {slept:.2f} s of "
+              f"guest monotonic time after it began")
+    else:
+        check(False, "the sleep armed before the capture ended")
 
 if image:
     # hvi does not consume a bundle, so the disk lock is what keeps a second
@@ -282,18 +361,29 @@ if image:
           f"a second restore onto the running guest's disk is refused (exit {dup.returncode})")
 
 dst.type("touch /tmp/go\n")
-got = dst.wait_for(r"SLEEP-END ", 30)
+got = dst.wait_for(r"(?<!NANO)SLEEP-END ", 30)
 check(got is not None, "the workload answered the request")
 counter = dst.outputs(r"COUNTER ")
 check(bool(counter) and int(counter[0][1].split()[1]) > last_n, f"the count after the restore: {counter[:1]}")
 check(bool(dst.outputs(r"FD3 kept open after unlink$")), "the unlinked file is still readable on fd 3")
+if portable:
+    go = counter[0][0] if counter else 0.0
+    check(bool(dst.outputs(r"EL0CHECK PASS", after=go)),
+          "after the restore, EL0 still reads the synthetic counter")
+    check(bool(dst.outputs(r"^CLOCKSOURCE hvi-time$", after=go)),
+          "after the restore, the clocksource is still hvi-time")
+    check(bool(dst.outputs(r"^MIGRATION .*hvi-time: generation 4:", after=go)),
+          "the guest driver logged the move")
+    snap = dst.outputs(r"EL0CHECK snapshot1: .* migrations=", after=go)
+    check(bool(snap) and snap[0][1].endswith(" migrations=1"),
+          f"the guest driver counts one move: {snap[0][1].split()[-1] if snap else None}")
 after_n = None
 if image:
     check(bool(dst.outputs(r"DISK-BEFORE written-before ")), "the file written before the move is on the disk")
     written = dst.outputs(r"DISK-AFTER written-after \d+")
     check(bool(written), "a write after the restore works")
     after_n = written[0][1].split()[-1] if written else None
-start, end = dst.outputs(r"SLEEP-START "), dst.outputs(r"SLEEP-END ")
+start, end = dst.outputs(r"(?<!NANO)SLEEP-START "), dst.outputs(r"(?<!NANO)SLEEP-END ")
 if start and end:
     host_sleep = end[0][0] - start[0][0]
     guest_sleep = float(end[0][1].split()[1]) - float(start[0][1].split()[1])
@@ -326,9 +416,11 @@ last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
 # The guest's last uptime reading before the second fence: the last tick,
 # or the end of the sleep that came after it.
 uptime2 = max([tick(s)[1] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
-              + [float(s.split()[1]) for t, s in dst.outputs(r"SLEEP-END ")], default=None)
+              + [float(s.split()[1]) for t, s in dst.outputs(r"(?<!NANO)SLEEP-END ")], default=None)
 moved = third.wait_for(r"TICK ", 10)
 on = tick(moved[1])[1] - uptime2 if moved and uptime2 is not None else None
+if on is not None:
+    on -= downtime(third, downtime(dst))
 check(status3.get("state") == "restored-paused" and moved is not None
       and tick(moved[1])[0] == last2[-1] + 1 and on is not None and on < 0.5,
       f"it resumes in a third process and counts on from {last2[-1] if last2 else None}, "
@@ -375,6 +467,7 @@ summary = {
     "last_count_before": last_n, "host_sleep_s": host_sleep, "guest_sleep_s": guest_sleep,
     "guest_wall_clock_lag_s": wall_lag,
     "disk_generations": generations,
+    "portable": portable, **timers,
     "failures": failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
