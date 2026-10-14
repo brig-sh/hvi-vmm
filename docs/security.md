@@ -122,6 +122,11 @@ checkpoint root it installs `vmm` like the other I/O threads. All three use a
 default action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
 
+No list allows `openat` outside `control`, and glibc's malloc would otherwise
+open a sysfs or procfs file from a filtered thread, so on glibc a confined run
+keeps malloc to one arena, set before any thread starts (see
+[the allowlists' README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself)).
+
 seccomp cannot filter the path a call names. The `control` filter therefore
 lets that one thread read, create, rename and remove files anywhere the user
 hvi runs as can, not only below the checkpoint root. On Linux the rule that a
@@ -159,7 +164,7 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 27 probes, 16 expect denial, 11 expect success
-hvi seccomp-selftest    # Linux: 23 probes, 11 expect a SIGSYS trap, 12 expect success
+hvi seccomp-selftest    # Linux: 25 probes, 11 expect a SIGSYS trap, 14 expect success
 ```
 
 Both install the profile or the filters that actually ship and check both

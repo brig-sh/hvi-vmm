@@ -283,7 +283,32 @@ want it.
 
 ## Configuration outside `BootConfig`
 
-One thing a caller sets is not in the struct.
+Two things a caller sets are not in the struct. Both matter.
+
+**glibc's malloc on Linux.** An embedder that boots with `sandbox: true` must
+call `hvi::sandbox::seccomp::one_malloc_arena()` first in its own `main`, before
+it starts any thread:
+
+```rust
+#[cfg(target_os = "linux")]
+if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
+    eprintln!("{e}");
+    std::process::exit(1);
+}
+```
+
+The `seccomp` module exists on Linux only, hence the `cfg`. On musl the call
+does nothing. Without it, glibc's malloc can open a file from a filtered
+thread, and the seccomp filter kills the process with `SIGSYS`. A confined KVM
+boot sets the same thing before it starts a thread, but by then it may do
+little. An arena one of your threads already made stays in use, and glibc can
+hand it to a filtered thread. If one of your threads has needed a new arena
+while more than eight existed, glibc has also fixed its arena limit, and
+ignores the setting. The setting is process-wide, so your own threads share the
+one arena too. The `hvi` binary and
+[`examples/watch_guest.rs`](../examples/watch_guest.rs) both make this call.
+See [the allowlists'
+README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself).
 
 **Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE` and `HVI_X86_TRACE`
 are read from the process environment, not from `BootConfig`. An embedder that
