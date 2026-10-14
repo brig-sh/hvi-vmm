@@ -16,7 +16,11 @@ and are tested: the `hvi-time` state and its restore, the software GICv2's
 state, and the import and export of KVM's vGICv2 in that same form (see
 [Capture and restore on KVM](#capture-and-restore-on-kvm)). A test hook
 exercises the restore in one process (see [Restore](#restore)); nothing
-writes a checkpoint yet. The x86-64 KVM backend refuses the profile.
+writes a checkpoint yet. The control socket refuses a `checkpoint` of a
+portable guest before it pauses anything, and `hvi restore` refuses a
+portable bundle (see
+[checkpoint.md](checkpoint.md#the-platform-state)). The x86-64 KVM backend
+refuses the profile.
 
 The default, `--profile native`, is unchanged: the host's own CPU features and,
 on macOS, Apple's in-kernel GICv3.
@@ -540,7 +544,8 @@ console path's latency makes the guest look further behind than it is.
   `KVM_CAP_READONLY_MEM`, and 4 KiB or 16 KiB pages. hvi refuses the boot and
   names each problem.
 - Checkpoint and restore are not implemented; `hvi-time`'s state and restore
-  are, and are tested in one process only.
+  are, and are tested in one process only. A checkpoint of a portable guest
+  is refused, and so is a restore of a portable bundle.
 - At most 8 vCPUs, the GICv2 limit.
 - No virtio-fs: `--share-ro` and `--share-rw` are refused, because a guest
   meant to move keeps its storage on virtio-blk, which every host offers.
