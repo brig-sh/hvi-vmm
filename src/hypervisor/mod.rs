@@ -19,12 +19,15 @@
 //! and is the handle a plugin gets. `vcpus` holds the vCPU threads of a VM,
 //! from their spawn to their join. `kvm` holds what the two KVM backends share:
 //! the kick, the interrupt line, the frame of the run loop, the start of the
-//! I/O threads under seccomp and the start of the guest. `quiesce` parks every
-//! vCPU at a safe point between guest entries, so a plugin that reads guest
-//! memory sees a guest that is not running.
+//! I/O threads under seccomp and the start of the guest, and `kvm_dirty` the
+//! dirty log a live move reads. `quiesce` parks every vCPU at a safe point
+//! between guest entries, so a plugin that reads guest memory sees a guest that
+//! is not running.
 
 pub(crate) mod guest;
 #[cfg(target_os = "linux")]
 pub(crate) mod kvm;
+#[cfg(target_os = "linux")]
+pub(crate) mod kvm_dirty;
 pub mod quiesce;
 pub(crate) mod vcpus;
