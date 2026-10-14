@@ -30,7 +30,7 @@ use crate::checkpoint::bundle::{
 };
 use crate::checkpoint::control::Then;
 use crate::checkpoint::cpu::{CpuState, VcpuState};
-use crate::checkpoint::platform::PlatformState;
+use crate::checkpoint::platform::{base64_encode, PlatformState};
 use crate::checkpoint::profile::MachineProfile;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::pl011::Pl011;
@@ -39,7 +39,7 @@ use crate::devices::legacy::rtc_cmos::RtcCmos;
 #[cfg(target_arch = "x86_64")]
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::state::{DeviceStates, DEVICE_STATES_VERSION};
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{VirtioBlk, DIRTY_BLOCK_BYTES, MAX_BITMAP_DISK_BYTES};
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::memory::{GuestRam, GuestWriteLog};
@@ -204,13 +204,18 @@ impl Capture {
     /// # Errors
     ///
     /// Errors when the sync fails.
-    pub(crate) fn disk_state(&self) -> io::Result<Option<DiskState>> {
+    pub(crate) fn disk_state(&self, profile: &MachineProfile) -> io::Result<Option<DiskState>> {
         let Some((dev, path)) = &self.block else {
             return Ok(None);
         };
         let dev = lock_or_recover(dev);
         dev.sync_data()
             .map_err(|e| io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
+        // A disk over 4 TiB has no base (its boot refuses one), and its
+        // bitmap would not fit disk.json: it goes without, as before the
+        // bitmap existed.
+        let since_boot = (dev.size_bytes() <= MAX_BITMAP_DISK_BYTES)
+            .then(|| base64_encode(dev.dirty_since_boot().as_bytes()));
         Ok(Some(DiskState {
             version: DOC_VERSION,
             path_hint: path.clone(),
@@ -218,6 +223,10 @@ impl Capture {
             sha256_sparse: None,
             generation: dev.generation(),
             synced: true,
+            base_sha256: profile.disk_base_sha256.clone(),
+            block_size: since_boot.is_some().then_some(DIRTY_BLOCK_BYTES),
+            dirty_since_boot_b64: since_boot,
+            rounds: dev.rounds().to_vec(),
         }))
     }
 
@@ -258,7 +267,7 @@ impl Capture {
         stopping: &dyn Fn() -> bool,
     ) -> io::Result<Sealed> {
         let devices = self.device_states()?;
-        let disk = self.disk_state()?;
+        let disk = self.disk_state(profile)?;
         let check = || {
             if stopping() {
                 Err(io::Error::new(

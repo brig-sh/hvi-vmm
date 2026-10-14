@@ -441,6 +441,14 @@ pub struct BootConfig {
     pub mem_bytes: u64,
     pub cmdline: String,
     pub disk: Option<String>,
+    /// The SHA-256 of `disk` as this boot opens it, before this hvi writes
+    /// it, as 64 lowercase hex digits, which the machine profile records
+    /// (`disk_base_sha256`). hvi tracks only the writes it serves from this
+    /// boot on, so a disk that an earlier boot wrote needs a new digest, or
+    /// no flag. hvi does not hash the disk itself: whoever made the image
+    /// did, and keeps a copy, so a move can send only the blocks the guest
+    /// wrote. It needs `disk`.
+    pub disk_base_sha256: Option<String>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -622,6 +630,13 @@ pub struct RestoreConfig {
     pub checkpoint_root: Option<String>,
     /// The disk image to reopen for the guest's virtio-blk device.
     pub disk: Option<String>,
+    /// The `generation` of the `disk-dirty` reply that started the last
+    /// round of `disk-blocks` the mover applied onto its copy of the
+    /// guest's base image to make `disk`. `None` when the disk was copied
+    /// whole. With it, the restore refuses a disk.json with no base, or
+    /// captured at another generation: the guest wrote after that round,
+    /// and the disk lacks the write.
+    pub disk_generation: Option<u64>,
     /// The built-in network stack, for a guest that ran on it.
     pub net: bool,
     /// The gateway stream socket, for a guest that ran on a gateway.
@@ -859,6 +874,7 @@ mod tests {
             mem_bytes: 0,
             cmdline: String::new(),
             disk: None,
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,
