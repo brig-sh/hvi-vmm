@@ -144,20 +144,8 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
     }
 }
 
-/// Boots `cfg` on KVM (x86-64) and runs the guest until it powers off, resets,
-/// or the host requests a stop.
-///
-/// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
-/// the call returns an error that says how.
-///
-/// Every thread this call itself starts has exited when it returns, or the call
-/// returns an error naming the first that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
-/// exception is the thread that receives the stop signals, which the first run
-/// after [`stop_on_signals`](crate::signal::stop_on_signals) starts for the
-/// life of the process. What remains of the VM is a `VmHandle` a plugin kept,
-/// in a field or on a thread it started from `attach`.
-pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+/// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
+pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     if !cfg.fs_shares.is_empty() {
         return Err(
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
@@ -435,7 +423,7 @@ fn setup_long_mode(
     vcpu: &VcpuFd,
     entry: u64,
     zero_page: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut sregs = vcpu.get_sregs()?;
     let cs = seg(0x08, true);
     let ds = seg(0x10, false);
@@ -469,7 +457,7 @@ fn setup_long_mode(
 /// Identity-maps the first 4 GiB with 1 GiB pages: `PML4[0]`->PDPT,
 /// `PDPT[0..4]` = huge leaves. Covers RAM, the virtio MMIO hole, and the APIC
 /// region.
-fn write_boot_page_tables(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
+fn write_boot_page_tables(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ram.write_u64(PML4_ADDR, PDPT_ADDR | PDE64_PRESENT_RW)?;
     for i in 0..4u64 {
         ram.write_u64(PDPT_ADDR + i * 8, (i << 30) | PDE64_PRESENT_RW_PS)?;
@@ -478,7 +466,7 @@ fn write_boot_page_tables(ram: &GuestRam) -> Result<(), Box<dyn std::error::Erro
 }
 
 /// A tiny boot GDT (null, 64-bit code, data) matching `seg()` above.
-fn write_boot_gdt(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
+fn write_boot_gdt(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Access/flags encoded to match the kvm_segment cache we set.
     let code: u64 = 0x00af_9b00_0000_ffff; // present, code, long-mode, g
     let data: u64 = 0x00cf_9300_0000_ffff; // present, data, 32-bit, g

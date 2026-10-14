@@ -115,20 +115,8 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
 }
 
-/// Boots `cfg` on KVM and runs the guest until it powers off, resets, or the
-/// host requests a stop.
-///
-/// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
-/// the call returns an error that says how.
-///
-/// Every thread this call itself starts has exited when it returns, or the call
-/// returns an error naming the first that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
-/// exception is the thread that receives the stop signals, which the first run
-/// after [`stop_on_signals`](crate::signal::stop_on_signals) starts for the
-/// life of the process. What remains of the VM is a `VmHandle` a plugin kept,
-/// in a field or on a thread it started from `attach`.
-pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+/// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
+pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     if !cfg.fs_shares.is_empty() {
         return Err(
             "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
@@ -550,7 +538,7 @@ fn set_gic_addr(
     gic: &kvm_ioctls::DeviceFd,
     addr_type: u32,
     gpa: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let val: u64 = gpa;
     let attr = kvm_device_attr {
         flags: 0,
@@ -567,7 +555,7 @@ fn set_gic_attr_u32(
     group: u32,
     attr: u64,
     val: &u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let a = kvm_device_attr {
         flags: 0,
         group,

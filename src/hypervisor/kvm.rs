@@ -193,7 +193,7 @@ pub(crate) fn start_io_threads(
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
-) -> Result<(seccomp::Filters, IoThreads<Kicker>), Box<dyn std::error::Error>> {
+) -> Result<(seccomp::Filters, IoThreads<Kicker>), Box<dyn std::error::Error + Send + Sync>> {
     let plugin_threads = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
     // A binary's stop signals get their handlers, and the thread that receives
@@ -244,7 +244,7 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
     run: fn(u32, VcpuFd, VcpuFd, S),
     filters: seccomp::Filters,
     io_threads: IoThreads<Kicker>,
-) -> Result<Stop, Box<dyn std::error::Error>> {
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let _raw = terminal::RawTerm::enable();
 
     // Log mode traps nothing, so the run is not confined under it.
@@ -257,7 +257,8 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
             .map(|(vcpu, kick_handle)| (vcpu, kick_handle, shared.clone(), run)),
         |id, (vcpu, kick_handle, shared, run)| run(id, vcpu, kick_handle, shared),
     );
-    let mut failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
+    let mut failure: Option<Box<dyn std::error::Error + Send + Sync>> =
+        spawned.err().map(Into::into);
 
     // The guest is already running by now, so a failure to filter the main
     // thread stops it like any other failure.

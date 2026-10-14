@@ -38,9 +38,9 @@ usual mistake:
 
 Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file
 with a `Kick` and an `IrqLine` implementation and a `Guest` built from them, its
-`mod` line in `arch/<arch>/mod.rs`, its `pub use` of `boot` and its target in
-the build guard, both in `lib.rs`, and its dependencies in `Cargo.toml`. Porting
-to a new guest architecture is a much larger job.
+`mod` line in `arch/<arch>/mod.rs`, its `use ... as backend` line and its target
+in the build guard, both in `lib.rs`, and its dependencies in `Cargo.toml`.
+Porting to a new guest architecture is a much larger job.
 
 On any other target the build stops with a compile error.
 
@@ -48,7 +48,7 @@ On any other target the build stops with a compile error.
 flowchart TB
     subgraph host["Host process (hvi)"]
         cli["main.rs — CLI<br/>parses flags → BootConfig"]
-        subgraph backend["hvi::boot(BootConfig) → Stop  (one of three, cfg-selected)"]
+        subgraph backend["backend boot(BootConfig) → Stop  (one of three, cfg-selected, called by hvi::boot)"]
             direction LR
             m1["arch/aarch64/hvf.rs<br/>Hypervisor.framework"]
             m2["arch/aarch64/kvm.rs<br/>KVM / aarch64"]
@@ -76,15 +76,15 @@ flowchart TB
 
 ### The entry point
 
-Every backend exposes the same signature:
+Every backend has the same signature:
 
 ```rust
-pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>>;
+pub(crate) fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>>;
 ```
 
-The crate root re-exports the one for the host target as `hvi::boot`, so the CLI
-and a linking crate use the same call. `Stop` is `SystemOff`, `SystemReset` or
-`Requested`.
+`hvi::boot` calls the one for the host target and returns its error as a
+`BootError`, so the CLI and a linking crate use the same call. `Stop` is
+`SystemOff`, `SystemReset` or `Requested`.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 

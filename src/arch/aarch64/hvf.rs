@@ -310,20 +310,8 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
 }
 
-/// Boots `cfg` and runs the guest until it powers off, resets, or the host
-/// requests a stop.
-///
-/// Returns the [`Stop`] that ended the run. When a vCPU fails, the run ends and
-/// the call returns an error that says how.
-///
-/// Every thread this call itself starts has exited when it returns, or the call
-/// returns an error naming the first that did not stop within
-/// [`crate::teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
-/// exception is the thread that receives the stop signals, which the first run
-/// after [`stop_on_signals`](crate::signal::stop_on_signals) starts for the
-/// life of the process. What remains of the VM is a `VmHandle` a plugin kept,
-/// in a field or on a thread it started from `attach`.
-pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+/// Boots `cfg` on Hypervisor.framework, as [`crate::boot`] describes.
+pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
     loader::LoadedKernel::from_header(&cfg.kernel)?;
@@ -687,7 +675,7 @@ pub fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .guest
         .vcpus
         .spawn((0..num_cpus).map(|_| shared.clone()), run_cpu);
-    let failure: Option<Box<dyn std::error::Error>> = spawned.err().map(Into::into);
+    let failure: Option<Box<dyn std::error::Error + Send + Sync>> = spawned.err().map(Into::into);
     let result = run_to_stop(&shared.guest, threads, failure, io_threads);
 
     // What the guest actually spent, reported once on the way out. #34 asks

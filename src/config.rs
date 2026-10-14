@@ -15,6 +15,7 @@
 //! Backend-independent boot configuration and result types, shared by every
 //! hypervisor backend.
 
+use std::fmt;
 use std::path::PathBuf;
 
 /// Access granted to a host directory exported through virtio-fs.
@@ -144,8 +145,7 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
-/// Inputs for a boot. Populated by `main::boot_guest` from the CLI and handed
-/// to the active backend's `boot()`.
+/// Inputs for a boot, which [`boot`](crate::boot) takes.
 pub struct BootConfig {
     pub kernel: Vec<u8>,
     pub initramfs: Option<Vec<u8>>,
@@ -230,10 +230,73 @@ pub enum Stop {
     Requested,
 }
 
+/// The error [`boot`](crate::boot) returns.
+///
+/// It carries the error that failed the run, which says what failed, such as a
+/// vCPU or a thread and how it failed. Its message is that error's, and it
+/// names any thread the run left running. [`get_ref`](Self::get_ref) returns
+/// the carried error, which a caller can downcast to the type it expects, and
+/// [`source`](std::error::Error::source) returns what caused it, when anything
+/// did.
+#[derive(Debug)]
+pub struct BootError {
+    /// The error that failed the run.
+    error: Box<dyn std::error::Error + Send + Sync>,
+    /// The thread the run left running, when the error does not name it.
+    left_running: Option<String>,
+}
+
+impl BootError {
+    /// Returns a `BootError` that carries `error`.
+    ///
+    /// The error of a run that left a thread running is taken apart, so the
+    /// error that failed the run is the one carried.
+    pub(crate) fn new(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        match error.downcast::<crate::hypervisor::run::LeftRunning>() {
+            Ok(left) => BootError {
+                error: left.error,
+                left_running: left.left.map(|left| left.to_string()),
+            },
+            Err(error) => BootError {
+                error,
+                left_running: None,
+            },
+        }
+    }
+
+    /// Returns the error this one carries.
+    #[must_use]
+    pub fn get_ref(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        &*self.error
+    }
+
+    /// Returns the error this one carries, consuming it.
+    #[must_use]
+    pub fn into_inner(self) -> Box<dyn std::error::Error + Send + Sync> {
+        self.error
+    }
+}
+
+impl fmt::Display for BootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.left_running {
+            Some(left) => write!(f, "{}, and {left}", self.error),
+            None => fmt::Display::fmt(&self.error, f),
+        }
+    }
+}
+
+impl std::error::Error for BootError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, CachePolicy, FsShare, ShareMode};
+    use super::{check_export_overlap, BootError, CachePolicy, FsShare, ShareMode};
+    use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
 
     fn shares(pairs: &[(&str, ShareMode)]) -> Vec<FsShare> {
@@ -360,5 +423,76 @@ mod tests {
         check_export_overlap(&shares(&[("/srv/root", ShareMode::ReadWrite)]))
             .expect("one export is fine");
         check_export_overlap(&[]).expect("no exports at all is fine");
+    }
+
+    #[test]
+    fn boot_error_reads_as_the_failure_it_carries() {
+        let failure = Outcome::Failed("vcpu1: KVM internal error".to_string())
+            .into_result()
+            .unwrap_err();
+        let error = BootError::new(failure);
+        assert_eq!(error.to_string(), "vcpu1: KVM internal error");
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    /// A failure with a cause, as an error from a step `boot` takes.
+    #[derive(Debug)]
+    struct Setup(std::io::Error);
+
+    impl std::fmt::Display for Setup {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "opening /dev/kvm: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Setup {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn boot_error_hands_back_the_error_it_carries() {
+        let cause = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let error = BootError::new(Box::new(Setup(cause)));
+        let source = std::error::Error::source(&error).expect("the carried error's cause");
+        let cause = source
+            .downcast_ref::<std::io::Error>()
+            .expect("an io::Error");
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.get_ref().downcast_ref::<Setup>().is_some());
+        assert!(error.into_inner().downcast::<Setup>().is_ok());
+    }
+
+    #[test]
+    fn boot_error_keeps_the_failure_typed_beside_a_thread_left_running() {
+        let failure = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        let left = std::io::Error::other("vcpu1 did not stop within 1s");
+        let error = BootError::new(Box::new(crate::hypervisor::run::LeftRunning {
+            error: Box::new(failure),
+            left: Some(left),
+        }));
+        assert!(error
+            .to_string()
+            .ends_with(", and vcpu1 did not stop within 1s"));
+        let failure = error
+            .get_ref()
+            .downcast_ref::<std::io::Error>()
+            .expect("an io::Error");
+        assert_eq!(failure.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn boot_error_converts_and_crosses_threads() {
+        fn caller() -> Result<(), Box<dyn std::error::Error>> {
+            let failed: Result<(), BootError> = Err(BootError::new("vcpu0: failed".into()));
+            failed?;
+            Ok(())
+        }
+        assert_eq!(caller().unwrap_err().to_string(), "vcpu0: failed");
+        let error = std::thread::spawn(|| BootError::new("vcpu0: failed".into()))
+            .join()
+            .unwrap();
+        assert_eq!(error.to_string(), "vcpu0: failed");
     }
 }
