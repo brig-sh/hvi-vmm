@@ -965,6 +965,11 @@ pub(crate) mod tests {
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let thread = importing_vcpu(&vcpus, 0, &log, None);
+        // The fake marks itself started on its own thread, which a loaded
+        // host may not have run yet when the import starts its short wait.
+        while vcpus.started() < 1 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let started = Instant::now();
         let err = import(&vcpus, &plan(2, 0), Duration::from_millis(100)).unwrap_err();
         assert_eq!(err, "1 of 2 vCPUs started in time");
