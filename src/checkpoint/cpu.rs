@@ -37,6 +37,7 @@ use std::io;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::checkpoint::platform::{IrqCpuState, PlatformState};
 use crate::hypervisor::guest::SafepointVcpu;
 use crate::plugin::{GuestArch, RegsView};
 
@@ -513,6 +514,27 @@ impl VcpuState {
         }
     }
 
+    /// Returns the state of an arm64 vCPU the guest asked to start with PSCI
+    /// `CPU_ON` at `entry`, with `ctx` for `x0`, whose thread had not taken
+    /// the request.
+    ///
+    /// It holds no register, as one that is off holds none: a restore
+    /// starts it as the request would have. An x86-64 vCPU never waits so,
+    /// and is written as off.
+    #[must_use]
+    pub fn pending_on(arch: GuestArch, backend: &str, id: u32, entry: u64, ctx: u64) -> Self {
+        match Self::powered_off(arch, backend, id) {
+            Self::Aarch64(mut vcpu) => {
+                vcpu.power = Power::PendingOn {
+                    entry: Hex64(entry),
+                    ctx: Hex64(ctx),
+                };
+                Self::Aarch64(vcpu)
+            }
+            other => other,
+        }
+    }
+
     /// Returns the state of a vCPU the guest never brought up.
     ///
     /// Only an arm64 vCPU can be in this state: every x86-64 vCPU enters KVM
@@ -647,17 +669,73 @@ pub fn arch_name(arch: GuestArch) -> &'static str {
 }
 
 /// A request a vCPU carries out on its own thread, outside the guest.
+// The HVF restore is the only caller of `Import`, and the HVF export the only
+// backend that hands back a platform; until both exist, only the tests do.
+#[allow(dead_code)]
 pub(crate) enum Work<'a> {
-    /// Write this vCPU's state.
+    /// Write this vCPU's state, and its own part of the interrupt
+    /// controller.
     Export,
-    /// Load this state into this vCPU.
-    Import(&'a VcpuState),
+    /// Once every vCPU has exported: vCPU 0 reads the interrupt controller,
+    /// the counter and the backend's blob, and the others do nothing.
+    ExportPlatform,
+    /// One step of a restore, for this vCPU, from `plan`.
+    Import(ImportStep, &'a ImportPlan),
+}
+
+/// The steps of a restore, in order. The control thread waits for every
+/// vCPU to finish one before it posts the next, so each is a barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// See `Work`.
+#[allow(dead_code)]
+pub(crate) enum ImportStep {
+    /// Each vCPU loads its registers and its timer.
+    Vcpu,
+    /// vCPU 0 loads the interrupt controller, once every vCPU exists and
+    /// none has run. The others do nothing.
+    Platform,
+    /// Each vCPU loads its own part of the interrupt controller, which the
+    /// step before reset.
+    IrqCpu,
+}
+
+/// What a restore loads into the vCPUs and the interrupt controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImportPlan {
+    /// Every vCPU's state, by index.
+    pub(crate) vcpus: Vec<VcpuState>,
+    /// The interrupt controller and the counter.
+    pub(crate) platform: PlatformState,
+}
+
+/// What a vCPU hands back from its work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+// See `Work`.
+#[allow(dead_code)]
+pub(crate) enum Output {
+    /// From [`Work::Export`]: its state, and its part of the interrupt
+    /// controller when the backend reads one.
+    Vcpu {
+        /// The vCPU's state.
+        state: VcpuState,
+        /// Its redistributor and CPU interface.
+        irq: Option<IrqCpuState>,
+    },
+    /// From [`Work::ExportPlatform`] on vCPU 0.
+    Platform {
+        /// The platform, without the vCPUs' parts of the interrupt
+        /// controller, which the control thread adds.
+        platform: PlatformState,
+        /// What a restore must be able to load, for the manifest.
+        capabilities: Vec<String>,
+    },
 }
 
 /// Carries out `work` with what the plugin register view reads: an export
-/// gives a partial state and an import is refused.
+/// gives a partial state, the platform is not read, and an import is
+/// refused.
 ///
-/// This is the work every backend does until its own export and import
+/// This is the work the KVM backends do until their own export and import
 /// exist.
 ///
 /// # Errors
@@ -669,20 +747,16 @@ pub(crate) fn serve_from_regs_view<V: SafepointVcpu>(
     id: u32,
     vcpu: &V,
     work: Work<'_>,
-) -> io::Result<Option<VcpuState>> {
+) -> io::Result<Option<Output>> {
     match work {
-        Work::Export => Ok(Some(VcpuState::from_regs_view(
-            arch,
-            backend,
-            id,
-            &vcpu.regs(),
-        ))),
-        Work::Import(state) => Err(io::Error::new(
+        Work::Export => Ok(Some(Output::Vcpu {
+            state: VcpuState::from_regs_view(arch, backend, id, &vcpu.regs()),
+            irq: None,
+        })),
+        Work::ExportPlatform => Ok(None),
+        Work::Import(..) => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!(
-                "the {backend} backend cannot load a vCPU state yet (vCPU {})",
-                state.id()
-            ),
+            format!("the {backend} backend cannot load a vCPU state yet (vCPU {id})"),
         )),
     }
 }
