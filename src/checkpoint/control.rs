@@ -26,6 +26,12 @@
 //! | `status` | none | `state`, `vcpus`, `vcpus_parked` |
 //! | `stop` | ends the run, as a guest power-off would | `state` |
 //! | `checkpoint` | captures the VM into a bundle directory | `state`, `dir`, `manifest_sha256`, `stats` |
+//! | `migrate` | streams the VM on this connection while it runs, then paused | `state`, `manifest_sha256`, `stats` |
+//!
+//! `migrate` writes a streamed bundle (see [`stream`](super::stream)) on the
+//! connection before its reply line: the frames first, the reply after the
+//! manifest. A refusal before the first frame, or a failure after it, is a
+//! reply line where the next frame header was due.
 //!
 //! A refusal is `{"v":1,"ok":false,"code":...,"error":...}`, where `code` is
 //! one of the [`ErrorCode`] spellings and `error` is prose for a person.
@@ -34,6 +40,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::checkpoint::migrate::{RoundStats, StopReason};
 use crate::checkpoint::profile::MachineProfile;
 
 /// The protocol version every request and reply carries as `v`.
@@ -68,7 +75,29 @@ pub enum Request {
         /// The caller's epoch for the sandbox, recorded in `session.json`.
         epoch: u64,
     },
+    /// Stream the VM on the connection, then continue or fence it.
+    Migrate(Migrate),
 }
+
+/// A `migrate` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Migrate {
+    /// What the VM does after a stream that was sealed.
+    pub then: Then,
+    /// The caller's transaction id, recorded in `session.json`.
+    pub txid: Option<String>,
+    /// The caller's epoch for the sandbox, recorded in `session.json`.
+    pub epoch: u64,
+    /// The most rounds taken with the guest running, when the caller sets
+    /// fewer than the default 5; 1 sends RAM once running and once paused.
+    pub max_rounds: Option<u32>,
+    /// The longest the rounds run before the pause, in seconds, when the
+    /// caller sets a cap other than the default 60.
+    pub max_secs: Option<u64>,
+}
+
+/// The most rounds a `migrate` may ask for, below the stream's limit.
+pub const MAX_MIGRATE_ROUNDS: u32 = 16;
 
 /// What a VM does after a checkpoint that succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,8 +230,59 @@ pub enum Response {
         /// What the capture took.
         stats: CheckpointStats,
     },
+    /// The answer to a `migrate` whose stream was sealed.
+    Migrate {
+        /// The state the VM is in now: as before, or `fenced`.
+        state: VmState,
+        /// The SHA-256 of the stream's `manifest.json`.
+        manifest_sha256: String,
+        /// What the move took.
+        stats: Box<MigrateStats>,
+    },
     /// A refusal.
     Error(Error),
+}
+
+/// What a `migrate` took, as its reply reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrateStats {
+    /// Every RAM round, the final one last.
+    pub rounds: Vec<RoundStats>,
+    /// Why the rounds with the guest running ended.
+    pub stop_reason: StopReason,
+    /// The dirty set, in bytes, at or below which they would have ended.
+    pub threshold_bytes: u64,
+    /// From the start of round 0 to the pause, in milliseconds.
+    pub precopy_ms: u64,
+    /// From the pause to every vCPU parked with its state exported.
+    pub pause_ms: u64,
+    /// From the pause to the manifest written: the source's part of the
+    /// time the guest is stopped.
+    pub paused_ms: u64,
+    /// The bytes of the final round, sent paused.
+    pub final_round_bytes: u64,
+    /// The size of guest RAM.
+    pub ram_total_bytes: u64,
+    /// The bytes of guest RAM that were not zero in round 0.
+    pub ram_present_bytes: u64,
+    /// The page bytes the rounds carried before compression.
+    pub ram_raw_bytes: u64,
+    /// The bytes the rounds put on the stream.
+    pub ram_stream_bytes: u64,
+    /// The whole stream, frame headers and documents included.
+    pub stream_bytes: u64,
+    /// The bytes one record of the guest's writes covers: the host page on
+    /// KVM, the IPA granule on HVF.
+    pub write_granule: u64,
+    /// The write faults hvi served, on a backend where it serves them.
+    pub write_faults: Option<u64>,
+    /// The mean host time of one, in nanoseconds.
+    pub write_fault_ns: Option<u64>,
+    /// When the last round with the guest running was written, in
+    /// milliseconds since the Unix epoch.
+    pub precopy_end_unix_ms: u64,
+    /// When the manifest was written.
+    pub sealed_at_unix_ms: u64,
 }
 
 /// What a checkpoint took, as its reply reports it.
@@ -248,6 +328,30 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
         "resume" => Request::Resume,
         "status" => Request::Status,
         "stop" => Request::Stop,
+        "migrate" => Request::Migrate(Migrate {
+            then: then_of(&fields)?,
+            txid: txid_of(&fields)?,
+            epoch: epoch_of(&fields)?,
+            max_rounds: match fields.get("max_rounds") {
+                None => None,
+                Some(n) => Some(
+                    n.as_u64()
+                        .filter(|n| (1..=u64::from(MAX_MIGRATE_ROUNDS)).contains(n))
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorCode::BadRequest,
+                                format!("\"max_rounds\" must be 1 to {MAX_MIGRATE_ROUNDS}"),
+                            )
+                        })? as u32,
+                ),
+            },
+            max_secs: match fields.get("max_secs") {
+                None => None,
+                Some(n) => Some(n.as_u64().filter(|n| *n <= 3600).ok_or_else(|| {
+                    Error::new(ErrorCode::BadRequest, "\"max_secs\" must be 0 to 3600")
+                })?),
+            },
+        }),
         "checkpoint" => {
             let dir = fields
                 .get("dir")
@@ -256,40 +360,11 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
                 .ok_or_else(|| {
                     Error::new(ErrorCode::BadRequest, "checkpoint needs a \"dir\" string")
                 })?;
-            let then = match fields.get("then").map(Value::as_str) {
-                None | Some(Some("continue")) => Then::Continue,
-                Some(Some("fence")) => Then::Fence,
-                Some(_) => {
-                    return Err(Error::new(
-                        ErrorCode::BadRequest,
-                        "\"then\" must be \"continue\" or \"fence\"",
-                    ))
-                }
-            };
-            let txid = match fields.get("txid") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(txid)) if txid.len() <= 256 => Some(txid.clone()),
-                Some(_) => {
-                    return Err(Error::new(
-                        ErrorCode::BadRequest,
-                        "\"txid\" must be a string of at most 256 bytes",
-                    ))
-                }
-            };
-            let epoch = match fields.get("epoch") {
-                None => 0,
-                Some(epoch) => epoch.as_u64().ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::BadRequest,
-                        "\"epoch\" must be an unsigned integer",
-                    )
-                })?,
-            };
             Request::Checkpoint {
                 dir: dir.to_string(),
-                then,
-                txid,
-                epoch,
+                then: then_of(&fields)?,
+                txid: txid_of(&fields)?,
+                epoch: epoch_of(&fields)?,
             }
         }
         other => {
@@ -299,6 +374,43 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
             ))
         }
     })
+}
+
+/// Returns the request's `then`, `continue` when it gives none.
+fn then_of(fields: &serde_json::Map<String, Value>) -> Result<Then, Error> {
+    match fields.get("then").map(Value::as_str) {
+        None | Some(Some("continue")) => Ok(Then::Continue),
+        Some(Some("fence")) => Ok(Then::Fence),
+        Some(_) => Err(Error::new(
+            ErrorCode::BadRequest,
+            "\"then\" must be \"continue\" or \"fence\"",
+        )),
+    }
+}
+
+/// Returns the request's `txid`, if it gives one.
+fn txid_of(fields: &serde_json::Map<String, Value>) -> Result<Option<String>, Error> {
+    match fields.get("txid") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(txid)) if txid.len() <= 256 => Ok(Some(txid.clone())),
+        Some(_) => Err(Error::new(
+            ErrorCode::BadRequest,
+            "\"txid\" must be a string of at most 256 bytes",
+        )),
+    }
+}
+
+/// Returns the request's `epoch`, 0 when it gives none.
+fn epoch_of(fields: &serde_json::Map<String, Value>) -> Result<u64, Error> {
+    match fields.get("epoch") {
+        None => Ok(0),
+        Some(epoch) => epoch.as_u64().ok_or_else(|| {
+            Error::new(
+                ErrorCode::BadRequest,
+                "\"epoch\" must be an unsigned integer",
+            )
+        }),
+    }
 }
 
 /// Formats `response` as one line of JSON, without the newline.
@@ -334,6 +446,14 @@ pub fn format_response(response: &Response) -> String {
         dir: &'a str,
         manifest_sha256: &'a str,
         stats: CheckpointStats,
+    }
+    #[derive(Serialize)]
+    struct MigrateReply<'a> {
+        v: u64,
+        ok: bool,
+        state: VmState,
+        manifest_sha256: &'a str,
+        stats: &'a MigrateStats,
     }
     #[derive(Serialize)]
     struct ErrorReply<'a> {
@@ -378,6 +498,17 @@ pub fn format_response(response: &Response) -> String {
             manifest_sha256,
             stats: *stats,
         }),
+        Response::Migrate {
+            state,
+            manifest_sha256,
+            stats,
+        } => serde_json::to_string(&MigrateReply {
+            v,
+            ok: true,
+            state: *state,
+            manifest_sha256,
+            stats,
+        }),
         Response::Error(e) => serde_json::to_string(&ErrorReply {
             v,
             ok: false,
@@ -415,6 +546,26 @@ mod tests {
                     txid: None,
                     epoch: 0,
                 },
+            ),
+            (
+                r#"{"v":1,"op":"migrate","then":"fence","txid":"t2","epoch":3}"#,
+                Request::Migrate(Migrate {
+                    then: Then::Fence,
+                    txid: Some("t2".into()),
+                    epoch: 3,
+                    max_rounds: None,
+                    max_secs: None,
+                }),
+            ),
+            (
+                r#"{"v":1,"op":"migrate","max_rounds":2,"max_secs":0}"#,
+                Request::Migrate(Migrate {
+                    then: Then::Continue,
+                    txid: None,
+                    epoch: 0,
+                    max_rounds: Some(2),
+                    max_secs: Some(0),
+                }),
             ),
             (
                 r#"{"v":1,"op":"checkpoint","dir":"/tmp/ck","then":"fence","txid":"t1","epoch":7}"#,
@@ -487,6 +638,15 @@ mod tests {
             refused(r#"{"v":1,"op":"checkpoint","dir":"/d","epoch":-1}"#).0,
             ErrorCode::BadRequest
         );
+        for line in [
+            r#"{"v":1,"op":"migrate","then":"later"}"#,
+            r#"{"v":1,"op":"migrate","max_rounds":0}"#,
+            r#"{"v":1,"op":"migrate","max_rounds":17}"#,
+            r#"{"v":1,"op":"migrate","max_secs":3601}"#,
+            r#"{"v":1,"op":"migrate","epoch":"1"}"#,
+        ] {
+            assert_eq!(refused(line).0, ErrorCode::BadRequest, "{line}");
+        }
     }
 
     // The replies are the wire format hull parses, pinned byte for byte so a

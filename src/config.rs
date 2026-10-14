@@ -801,8 +801,14 @@ impl BootConfig {
 /// network of the mode it ran on when it had one, and an agent socket when it
 /// had a vsock device.
 pub struct RestoreConfig {
-    /// The bundle directory.
+    /// The bundle directory, or for a stream a name for it in messages.
     pub from: String,
+    /// The streamed bundle to read instead of a directory: `-` for stdin,
+    /// or the path of a Unix socket hvi connects to before confinement.
+    pub from_stream: Option<String>,
+    /// A new directory the stream's documents and manifest are kept in,
+    /// without RAM.
+    pub stream_keep: Option<String>,
     /// The control socket, bound before confinement. The guest waits
     /// restored-paused until a client sends `resume` on it.
     pub control_sock: String,

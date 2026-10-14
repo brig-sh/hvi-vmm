@@ -213,6 +213,40 @@ ticks carry is `CLOCK_BOOTTIME`, which
 `hvi-time` moves on by the downtime, so the continuity checks take the
 downtime the restore logged off.
 
+## The live-move end-to-end test
+
+`tools/stream-e2e.sh` is `tools/checkpoint-e2e.sh --stream`: both moves are
+live moves. The script sends the source's control connection a `migrate`
+with `then: "fence"`, relays the stream frame by frame through a Unix
+socket into `hvi restore --from-stream --stream-keep DIR` in the next
+process, and resumes the guest there. The checks are the bundle move's,
+with the documents the restore kept standing in for the bundle, except the
+second restore onto the running guest's disk, which needs a bundle
+directory. Both modes also check that the guest's `boot_id` is the same
+after each move.
+
+`--dirty-mib N` starts `/dirty` (`tools/guest/dirty.c`, built static) in
+the guest before the move. It rewrites N MiB of pseudo-random pages over
+and over and checks that each page still holds what its last pass wrote,
+so a page a move did not copy again after the guest wrote it prints
+`DIRTY-BAD`. The script checks that none does and that it writes on after
+each move. Timers armed before the move then run 20 s, to outlast the
+rounds. `summary.json` gives each move's rounds, bytes, dirty rates,
+compression, write faults, `paused_ms` and the downtime from the end of the
+last round with the guest running to the resume reply.
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --add dirty --out target/initramfs-stream.cpio
+tools/stream-e2e.sh --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-stream.cpio --out /tmp/stream --cpus 2 --mem 1024 \
+    --portable --dirty-mib 256
+```
+
+`dirty`, `el0check` and `tfd` are static arm64 binaries:
+`gcc -O2 -static -o dirty tools/guest/dirty.c` on an arm64 Linux host.
+The results are in [checkpoint.md](checkpoint.md#live-move-timings).
+
 ## The migration end-to-end test
 
 `tools/migrate-e2e.sh` moves a running portable guest from one host to

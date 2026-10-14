@@ -44,14 +44,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::checkpoint::bundle::{Bundle, Component, DevicesDoc, DiskState, Session};
-use crate::checkpoint::cpu::{arch_name, ImportPlan, ImportStep, Power, VcpuState, MAX_VCPUS};
-use crate::checkpoint::profile::{host_page_size, MachineProfile};
-use crate::checkpoint::ram;
+use crate::checkpoint::bundle::{
+    parse_disk, parse_session, Bundle, Component, DevicesDoc, DiskState, Session,
+};
+use crate::checkpoint::cpu::{
+    arch_name, CpuState, ImportPlan, ImportStep, Power, VcpuState, MAX_VCPUS,
+};
+use crate::checkpoint::platform::PlatformState;
+use crate::checkpoint::profile::{host_page_size, MachineProfile, RamRegion as ProfileRegion};
+use crate::checkpoint::{ram, stream};
 use crate::config::{DiskConfig, RestoreConfig};
 use crate::devices::virtio::block::BlkState;
 use crate::devices::virtio::net::NetMode;
 use crate::hypervisor::vcpus::{Kick, Vcpus, WorkResult};
+use crate::memory::{GuestRam, RamRegion, SharedRam};
 use crate::plugin::GuestArch;
 
 /// The import steps, in the order [`import`] posts them.
@@ -172,10 +178,32 @@ pub(crate) const fn portable(backend: &'static str) -> Restorer {
     }
 }
 
-/// A bundle opened for a restore, with every document read and parsed.
+/// Where a restore's guest RAM comes from.
+enum RamSource {
+    /// The bundle directory's image, copied in when the backend asks.
+    Bundle(Box<Bundle>),
+    /// RAM a stream filled as it was read.
+    Streamed {
+        /// The object behind it.
+        shared: SharedRam,
+        /// Its mapping.
+        ram: Arc<GuestRam>,
+    },
+    /// Handed to the backend already.
+    Taken,
+}
+
+/// A bundle opened for a restore, with every document read and parsed: a
+/// bundle directory, or a stream read whole.
 pub(crate) struct Opened {
-    /// The bundle, every component's size and hash checked.
-    pub(crate) bundle: Bundle,
+    /// The source's profile.
+    profile: MachineProfile,
+    /// What the manifest says a restore must be able to load.
+    capabilities: Vec<String>,
+    /// Guest RAM.
+    ram: RamSource,
+    /// Whether the bundle came as a stream.
+    from_stream: bool,
     /// The vCPUs and the platform to import.
     pub(crate) plan: Arc<ImportPlan>,
     /// The devices and their line levels.
@@ -189,7 +217,83 @@ pub(crate) struct Opened {
 impl Opened {
     /// Returns the source's machine profile.
     pub(crate) fn profile(&self) -> &MachineProfile {
-        self.bundle.profile()
+        &self.profile
+    }
+
+    /// Returns whether the bundle came as a stream.
+    pub(crate) fn streamed(&self) -> bool {
+        self.from_stream
+    }
+
+    /// Returns what the manifest says a restore must be able to load.
+    pub(crate) fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
+    /// Returns guest RAM, laid out as the profile's regions and holding the
+    /// guest's pages: copied from a bundle directory's image now, hashing
+    /// it as it goes, or filled by the stream as it was read.
+    ///
+    /// # Errors
+    ///
+    /// Errors when RAM cannot be allocated, the image does not match its
+    /// manifest, or RAM was taken already.
+    pub(crate) fn guest_ram(&mut self) -> std::io::Result<(SharedRam, Arc<GuestRam>)> {
+        match std::mem::replace(&mut self.ram, RamSource::Taken) {
+            RamSource::Bundle(bundle) => {
+                let (shared, ram) = alloc_ram(&self.profile.ram_regions)?;
+                bundle.load_ram(&ram)?;
+                Ok((shared, ram))
+            }
+            RamSource::Streamed { shared, ram } => Ok((shared, ram)),
+            RamSource::Taken => Err(std::io::Error::other("guest RAM was taken already")),
+        }
+    }
+}
+
+/// Allocates guest RAM for `regions`, laid out one after another in one
+/// object, as a boot lays them out.
+///
+/// # Errors
+///
+/// Errors when the regions are not ones a boot makes, or RAM cannot be
+/// allocated.
+fn alloc_ram(regions: &[ProfileRegion]) -> std::io::Result<(SharedRam, Arc<GuestRam>)> {
+    let total = regions
+        .iter()
+        .try_fold(0u64, |sum, r| sum.checked_add(r.size))
+        .filter(|total| *total <= stream::MAX_RAM_BYTES)
+        .ok_or_else(|| std::io::Error::other("the RAM regions are larger than a restore takes"))?;
+    let len = usize::try_from(total)
+        .map_err(|_| std::io::Error::other("the RAM regions do not fit this host"))?;
+    let shared = SharedRam::new(len)?;
+    let mut offset = 0;
+    let layout: Vec<RamRegion> = regions
+        .iter()
+        .map(|r| {
+            let region = RamRegion {
+                gpa: r.gpa,
+                size: r.size,
+                file_offset: offset,
+            };
+            offset += r.size;
+            region
+        })
+        .collect();
+    let ram = Arc::new(GuestRam::new(&shared, &layout)?);
+    Ok((shared, ram))
+}
+
+/// Opens what `cfg` names: the bundle directory of `--from`, or the stream
+/// of `--from-stream`, read whole.
+///
+/// # Errors
+///
+/// As [`open`] and [`open_stream`].
+pub(crate) fn open_config(cfg: &RestoreConfig) -> std::io::Result<Opened> {
+    match &cfg.from_stream {
+        Some(from) => open_stream(from, cfg.stream_keep.as_deref()),
+        None => open(Path::new(&cfg.from)),
     }
 }
 
@@ -218,7 +322,10 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<Opened> {
     let disk = bundle.disk()?;
     let session = bundle.session()?;
     Ok(Opened {
-        bundle,
+        profile: bundle.profile().clone(),
+        capabilities: bundle.manifest().capabilities.clone(),
+        ram: RamSource::Bundle(Box::new(bundle)),
+        from_stream: false,
         plan: Arc::new(ImportPlan {
             vcpus: cpu.vcpus,
             platform,
@@ -227,6 +334,171 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<Opened> {
         disk,
         session,
     })
+}
+
+/// Reads the streamed bundle at `from`, `-` for stdin or the path of a
+/// Unix socket to connect to, whole, and returns it opened.
+///
+/// Guest RAM is allocated once `profile.json` is read and its regions
+/// checked, and each RAM round is applied to it as it arrives, a later
+/// round over an earlier one. Every frame's hash is checked before its
+/// bytes are used and the manifest against everything read (see
+/// [`stream::receive`]); the documents are then parsed as a directory's
+/// are. Nothing runs until the restore has refused or built the VM. With
+/// `keep`, the documents and the manifest, but not RAM, are written to that
+/// new directory. Stdin that carried the stream is then replaced with
+/// `/dev/null`, so the console reads nothing that followed the stream.
+///
+/// # Errors
+///
+/// Errors, naming the component, on the first thing that does not hold.
+pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Opened> {
+    // The stream is the operator's, named on the command line.
+    #[allow(clippy::disallowed_methods)]
+    let input: Box<dyn std::io::Read> = if from == "-" {
+        Box::new(std::io::stdin().lock())
+    } else {
+        Box::new(
+            std::os::unix::net::UnixStream::connect(from)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("connecting to {from}: {e}")))?,
+        )
+    };
+    let mut reader = stream::StreamReader::new(std::io::BufReader::with_capacity(1 << 20, input));
+    let mut built = None;
+    let received = stream::receive(&mut reader, |bytes| {
+        let text = std::str::from_utf8(bytes).map_err(|e| stream_bad("profile.json", e))?;
+        let profile = MachineProfile::from_json(text).map_err(|e| stream_bad("profile.json", e))?;
+        let regions: Vec<stream::StreamRegion> = profile
+            .ram_regions
+            .iter()
+            .map(|r| stream::StreamRegion {
+                gpa: r.gpa,
+                size: r.size,
+            })
+            .collect();
+        // Checked before anything is allocated by them.
+        let space = stream::PageSpace::new(&regions)?;
+        let page = host_page_size();
+        if page == 0
+            || regions
+                .iter()
+                .any(|r| r.gpa % page != 0 || r.size % page != 0)
+        {
+            return Err(stream_bad(
+                "profile.json",
+                format!("the RAM regions are not whole {page}-byte host pages"),
+            ));
+        }
+        let (shared, ram) = alloc_ram(&profile.ram_regions)?;
+        built = Some((profile, shared, Arc::clone(&ram)));
+        Ok((space, ram))
+    })?;
+    if from == "-" {
+        // SAFETY: opens a path and moves the descriptor onto stdin; nothing
+        // else holds stdin's lock now that the read is done.
+        #[allow(clippy::disallowed_methods)]
+        let null = std::fs::File::open("/dev/null")?;
+        if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let (profile, shared, ram) =
+        built.ok_or_else(|| std::io::Error::other("the stream built no RAM"))?;
+    let listed: Vec<(u64, u64)> = received
+        .manifest
+        .ram
+        .regions
+        .iter()
+        .map(|r| (r.gpa, r.size))
+        .collect();
+    let had: Vec<(u64, u64)> = profile
+        .ram_regions
+        .iter()
+        .map(|r| (r.gpa, r.size))
+        .collect();
+    if listed != had {
+        return Err(stream_bad(
+            stream::MANIFEST,
+            "the RAM regions are not the profile's",
+        ));
+    }
+    let doc = |name: &str| {
+        received
+            .doc(name)
+            .ok_or_else(|| stream_bad(name, "is not in the stream"))
+    };
+    let cpu = CpuState::from_json(doc("cpu.json")?).map_err(|e| stream_bad("cpu.json", e))?;
+    let platform = PlatformState::from_json(doc("platform.json")?)
+        .map_err(|e| stream_bad("platform.json", e))?;
+    let devices =
+        DevicesDoc::from_json(doc("devices.json")?).map_err(|e| stream_bad("devices.json", e))?;
+    let disk = received.doc("disk.json").map(parse_disk).transpose()?;
+    let session = parse_session(doc("session.json")?)?;
+    if let Some(dir) = keep {
+        keep_documents(Path::new(dir), &received)?;
+    }
+    eprintln!(
+        "{} stream {from}: {} RAM round(s), {} bytes, manifest {}",
+        crate::LOG_PREFIX,
+        received.applied.len(),
+        received.stream_bytes,
+        received.manifest_sha256
+    );
+    Ok(Opened {
+        profile,
+        capabilities: received.manifest.capabilities.clone(),
+        ram: RamSource::Streamed { shared, ram },
+        from_stream: true,
+        plan: Arc::new(ImportPlan {
+            vcpus: cpu.vcpus,
+            platform,
+        }),
+        devices,
+        disk,
+        session,
+    })
+}
+
+/// Returns an `InvalidData` error naming `what`.
+fn stream_bad(what: &str, why: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{what}: {why}"))
+}
+
+/// Writes the documents of `received` and its manifest, as they came, into
+/// `dir`, which must not exist yet: the record of what was restored, with
+/// no RAM. They are not synced: the restore waits on this before the guest
+/// can resume, and a sync on a busy disk took seconds; a caller that needs
+/// the record durable syncs it.
+fn keep_documents(dir: &Path, received: &stream::Received) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    // The directory is the operator's, named on the command line.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::create_dir(dir).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("--stream-keep {}: {e}", dir.display()))
+    })?;
+    let files = std::iter::once(("profile.json", received.profile.as_slice()))
+        .chain(
+            received
+                .docs
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice())),
+        )
+        .chain(std::iter::once((
+            stream::MANIFEST,
+            received.manifest_bytes.as_slice(),
+        )));
+    for (name, bytes) in files {
+        #[allow(clippy::disallowed_methods)]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join(name))?;
+        file.write_all(bytes)?;
+    }
+    Ok(())
 }
 
 /// Returns every reason `can` cannot resume `opened` with the host
@@ -329,7 +601,7 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
             why.push(format!("platform.json: {e}"));
         }
     }
-    for capability in &opened.bundle.manifest().capabilities {
+    for capability in opened.capabilities() {
         if !can.capabilities.contains(&capability.as_str()) {
             why.push(format!(
                 "manifest.json: the bundle needs {capability}, which this hvi does not have"
@@ -776,6 +1048,8 @@ pub(crate) mod tests {
     /// The flags that match [`parts`].
     fn config(scratch: &Scratch) -> RestoreConfig {
         RestoreConfig {
+            from_stream: None,
+            stream_keep: None,
             from: scratch.bundle().display().to_string(),
             control_sock: "/unused".into(),
             checkpoint_root: None,

@@ -92,9 +92,10 @@ use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, IoConfig, Kicker,
     KvmIrqLine,
 };
+use crate::hypervisor::kvm_dirty::KvmWriteLog;
 use crate::hypervisor::vcpus::{Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::run::StopHandle;
 use crate::sandbox::seccomp;
@@ -872,6 +873,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     set_u64(&vcpus[0], REG_X0, layout.dtb_addr);
     set_u64(&vcpus[0], REG_PSTATE, PSTATE_EL1H_DAIF);
 
+    // A live move reads KVM's dirty log of the RAM slots.
+    let write_log: Arc<dyn GuestWriteLog> =
+        Arc::new(KvmWriteLog::new(Arc::clone(&vm), Arc::clone(&ram)));
     let shared = Shared {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -888,6 +892,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 cfg.take_stop_handle()?,
             )),
             plugin_threads: PluginThreads::new(),
+            write_log: Some(write_log),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         fs: Arc::new(fs),
@@ -996,9 +1001,9 @@ const RESTORER: Restorer = restore::portable("kvm");
 // filters constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
 pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    let opened =
-        restore::open(std::path::Path::new(&cfg.from)).map_err(|e| format!("{}: {e}", cfg.from))?;
-    let source = opened.profile();
+    let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
+    let source_profile = opened.profile().clone();
+    let source = &source_profile;
     let mut why = restore::refusals(&opened, &cfg, &RESTORER);
     if !RESTORER.profiles.contains(&source.profile.as_str()) {
         why.push(
@@ -1056,11 +1061,13 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
     local.firmware.psci_version = Some("1.1".to_string());
     local.cpu.ident.clone_from(&source.cpu.ident);
     why.extend(restore::profile_refusals(source, &local));
-    let TimerState::HviTime(clock) = &opened.plan.platform.timer else {
+    // Held apart from `opened`, which hands over guest RAM below.
+    let plan = Arc::clone(&opened.plan);
+    let TimerState::HviTime(clock) = &plan.platform.timer else {
         why.push("platform.json: the counter is not hvi-time".to_string());
         return Err(Box::new(Refused(why)));
     };
-    let IrqState::Gicv2(gic_state) = &opened.plan.platform.irq else {
+    let IrqState::Gicv2(gic_state) = &plan.platform.irq else {
         why.push("platform.json: the interrupt controller is not a GICv2".to_string());
         return Err(Box::new(Refused(why)));
     };
@@ -1134,18 +1141,13 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
     }
     set_baseline(&vcpus)?;
 
-    let shared_ram = SharedRam::new(usize::try_from(ram_size)?)?;
-    let ram = Arc::new(GuestRam::new(
-        &shared_ram,
-        &[shared_ram.region_at(RAM_BASE)],
-    )?);
-    ram.register_kvm_slots(&vm)?;
-    // ram.bin is hashed here, as it is copied, and refused like the open
-    // refuses a component: named with the bundle.
-    opened
-        .bundle
-        .load_ram(&ram)
+    // A bundle directory's ram.bin is hashed here, as it is copied, and
+    // refused like the open refuses a component: named with the bundle. A
+    // stream's RAM was filled and checked as it was read.
+    let (shared_ram, ram) = opened
+        .guest_ram()
         .map_err(|e| format!("{}: {e}", cfg.from))?;
+    ram.register_kvm_slots(&vm)?;
     let rebuild::Devices {
         block,
         net,
@@ -1240,6 +1242,9 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
         .clone()
         .unwrap_or_else(|| opened.session.sandbox_id.clone());
     let emitter = Emitter::new(cfg.events.as_deref(), &sandbox_id)?;
+    // A live move reads KVM's dirty log of the RAM slots.
+    let write_log: Arc<dyn GuestWriteLog> =
+        Arc::new(KvmWriteLog::new(Arc::clone(&vm), Arc::clone(&ram)));
     let shared = Shared {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -1255,6 +1260,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
                 Kicker::new(num_cpus),
                 StopHandle::new_pair()?.0,
             )),
+            write_log: Some(write_log),
             plugin_threads: PluginThreads::new(),
         }),
         pl011,
