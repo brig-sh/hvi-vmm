@@ -119,7 +119,9 @@ pub struct Cpu {
     /// model and stepping on x86-64. `None` until it has been read.
     pub ident: Option<String>,
     /// Feature registers by name, each as hex. On x86-64 the names are CPUID
-    /// leaves and the values their four registers.
+    /// leaves and the values their four registers. A register the backend
+    /// asked for and could not read is recorded as [`UNKNOWN`] rather than
+    /// left out, so that two hosts that both fail to read it do not match.
     pub id_regs: BTreeMap<String, String>,
 }
 
@@ -292,6 +294,36 @@ impl MachineProfile {
             if p.cpu.ident.is_none() {
                 why.push(format!("cpu.ident: the {side}'s CPU identity was not read"));
             }
+            for (name, value) in &p.cpu.id_regs {
+                if value == UNKNOWN {
+                    why.push(format!("cpu.id_regs.{name}: the {side} could not read it"));
+                }
+            }
+            // The macOS build is what keeps the hv_gic state blob readable,
+            // below.
+            if p.backend == "hvf" && p.host.kernel_or_macos_build == UNKNOWN {
+                why.push(format!(
+                    "host.kernel_or_macos_build: the {side}'s macOS build was not read"
+                ));
+            }
+            // The firmware's handover is part of what the guest kernel holds,
+            // so the digest its architecture has must be there.
+            let firmware: &[(&str, &Option<String>)] = match p.arch.as_str() {
+                "aarch64" => &[
+                    ("firmware.psci_version", &p.firmware.psci_version),
+                    ("firmware.dtb_sha256", &p.firmware.dtb_sha256),
+                ],
+                "x86_64" => &[(
+                    "firmware.boot_params_sha256",
+                    &p.firmware.boot_params_sha256,
+                )],
+                _ => &[],
+            };
+            for (field, value) in firmware {
+                if value.is_none() {
+                    why.push(format!("{field}: the {side}'s was not read"));
+                }
+            }
             if p.counter_freq_hz == 0 {
                 why.push(format!(
                     "counter_freq_hz: the {side}'s counter frequency was not read"
@@ -352,7 +384,11 @@ impl MachineProfile {
                     .cloned()
                     .unwrap_or_else(|| "absent".to_string())
             };
-            differ(&format!("cpu.id_regs.{name}"), read(self), read(other));
+            let (a, b) = (read(self), read(other));
+            // An unread register is already a reason, above.
+            if a != UNKNOWN && b != UNKNOWN {
+                differ(&format!("cpu.id_regs.{name}"), a, b);
+            }
         }
         differ("gic", json(&self.gic), json(&other.gic));
         differ("x86", json(&self.x86), json(&other.x86));
@@ -765,7 +801,8 @@ mod tests {
 
     #[test]
     fn each_field_that_differs_is_named() {
-        refused_for("arch", |p| p.arch = "x86_64".into());
+        // Not x86_64, whose profile would also lack its boot page digest.
+        refused_for("arch", |p| p.arch = "riscv64".into());
         refused_for("backend", |p| p.backend = "kvm".into());
         refused_for("hvi_build.git_sha", |p| {
             p.hvi_build.git_sha = "fedcba9876543210fedcba9876543210fedcba98".into();
@@ -852,17 +889,64 @@ mod tests {
         a.hvi_build.git_sha = UNKNOWN.into();
         a.cpu.ident = None;
         a.counter_freq_hz = 0;
+        a.cpu
+            .id_regs
+            .insert("DCZID_EL0".into(), UNKNOWN.to_string());
+        a.host.kernel_or_macos_build = UNKNOWN.into();
+        a.firmware.psci_version = None;
+        a.firmware.dtb_sha256 = None;
         let why = reasons(&a, &a);
-        assert!(why
+        for field in [
+            "hvi_build.git_sha",
+            "cpu.ident",
+            "counter_freq_hz",
+            "cpu.id_regs.DCZID_EL0",
+            "host.kernel_or_macos_build",
+            "firmware.psci_version",
+            "firmware.dtb_sha256",
+        ] {
+            for side in ["source", "destination"] {
+                assert!(
+                    why.iter()
+                        .any(|w| w.starts_with(&format!("{field}: the {side}"))),
+                    "{field} on the {side}: {why:?}"
+                );
+            }
+        }
+        assert_eq!(why.len(), 14, "{why:?}");
+    }
+
+    // A register read on one side and not on the other is named once, as
+    // unread, not again as a difference.
+    #[test]
+    fn a_register_one_side_could_not_read_is_named_once() {
+        refused_for("cpu.id_regs.ID_AA64PFR0_EL1", |p| {
+            p.cpu
+                .id_regs
+                .insert("ID_AA64PFR0_EL1".into(), UNKNOWN.to_string());
+        });
+    }
+
+    // KVM's GIC state does not depend on the kernel, so an unread kernel
+    // release is no reason to refuse; an x86 guest needs its boot page digest
+    // and has no devicetree.
+    #[test]
+    fn unread_values_are_refused_only_where_they_count() {
+        let mut a = sample();
+        a.backend = "kvm".into();
+        a.host.kernel_or_macos_build = UNKNOWN.into();
+        assert_eq!(a.compatible_with(&a), Ok(()));
+        a.arch = "x86_64".into();
+        a.firmware = Firmware {
+            psci_version: None,
+            dtb_sha256: None,
+            boot_params_sha256: Some("ef".repeat(32)),
+        };
+        assert_eq!(a.compatible_with(&a), Ok(()));
+        a.firmware.boot_params_sha256 = None;
+        assert!(reasons(&a, &a)
             .iter()
-            .any(|w| w.starts_with("hvi_build.git_sha: the source")));
-        assert!(why
-            .iter()
-            .any(|w| w.starts_with("cpu.ident: the destination")));
-        assert!(why
-            .iter()
-            .any(|w| w.starts_with("counter_freq_hz: the source")));
-        assert_eq!(why.len(), 6, "{why:?}");
+            .any(|w| w.starts_with("firmware.boot_params_sha256: the source")));
     }
 
     #[test]
