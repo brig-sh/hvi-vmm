@@ -95,7 +95,7 @@ A refusal is `{"v":1,"ok":false,"code":...,"error":...}`.
 | `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, or a guest with virtio-fs shares. | Untouched: nothing was paused. |
 | `not_ready` | The machine profile is not complete yet. | Untouched. |
 | `timeout` | The I/O threads or the vCPUs did not park, or the vCPUs did not export their state, within 2 s. | As the request found it. |
-| `capture_failed` | Anything after the pause: a device state that a restore would refuse, a failed disk sync, a failed write. | As the request found it. The bundle directory is removed. |
+| `capture_failed` | Anything after the pause: a device state that a restore would refuse, a failed disk sync, a failed write or sync, a bundle the reader would refuse. | As the request found it. Every file the capture wrote is removed, the manifest included, and the directory too when the capture created it. |
 | `fenced` | The VM was fenced by an earlier checkpoint. | Still fenced. |
 | `stopped` | The run is ending. | Ending. |
 
@@ -165,10 +165,13 @@ on the byte layout of the build that wrote it.
 | `session.json` | The sandbox id, `epoch`, `txid`, the capture time and `then`. |
 | `manifest.json` | Every other file's name, size and SHA-256, the RAM regions with their present page counts, the SHA-256 of `profile.json`, the hvi build, `capabilities` (empty today) and the seal time. |
 
-The writer syncs each component to stable storage. It writes the manifest
-last, under a temporary name, syncs it, renames it into place and syncs the
-directory. So a directory without `manifest.json` is not a bundle, whatever
-else is in it. A capture that fails before the seal removes what it wrote.
+The writer syncs the parent of a bundle directory it creates, so the
+directory itself survives a host crash. It syncs each component to stable
+storage. It writes the manifest last, under a temporary name, syncs it,
+renames it into place and syncs the directory. The bundle is sealed only once
+that last sync returns. So a directory without `manifest.json` is not a
+bundle, whatever else is in it. A capture that fails before the seal removes
+what it wrote, including a manifest already renamed into place.
 
 The writer refuses what the reader below would refuse. A component larger
 than the reader's limit for it, or a manifest that fails the reader's checks,
