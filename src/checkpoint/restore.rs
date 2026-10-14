@@ -130,8 +130,11 @@ pub(crate) fn import<K: Kick>(
 pub(crate) struct Restorer {
     /// The guest architecture.
     pub(crate) arch: GuestArch,
-    /// `hvf` or `kvm`.
+    /// `hvf` or `kvm`: this host's backend.
     pub(crate) backend: &'static str,
+    /// The backends whose bundles it takes: its own, and for the portable
+    /// profile, whose machine is the same on both, the other one too.
+    pub(crate) sources: &'static [&'static str],
     /// The machine profiles, by name, whose guests it rebuilds.
     pub(crate) profiles: &'static [&'static str],
     /// The `irq` kinds of `platform.json` it has an import for.
@@ -142,6 +145,21 @@ pub(crate) struct Restorer {
     pub(crate) adjunct: Option<&'static str>,
     /// The manifest capabilities it provides.
     pub(crate) capabilities: &'static [&'static str],
+}
+
+/// Returns the restore of the portable profile on `backend`: the GICv2 in
+/// its canonical form and `hvi-time`, from a bundle of either backend.
+pub(crate) const fn portable(backend: &'static str) -> Restorer {
+    Restorer {
+        arch: GuestArch::Aarch64,
+        backend,
+        sources: &["hvf", "kvm"],
+        profiles: &["portable-arm64-v1"],
+        irq_kinds: &["gicv2"],
+        timer_kinds: &["hvi-time"],
+        adjunct: None,
+        capabilities: &[],
+    }
 }
 
 /// A bundle opened for a restore, with every document read and parsed.
@@ -209,17 +227,25 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
     let profile = opened.profile();
     let plan = &opened.plan;
     let arch = arch_name(can.arch);
-    if profile.arch != arch || profile.backend != can.backend {
+    if profile.arch != arch || !can.sources.contains(&profile.backend.as_str()) {
         why.push(format!(
-            "profile.json: an {} guest on {}, and this hvi restores {arch} on {}",
-            profile.arch, profile.backend, can.backend
+            "profile.json: an {} guest on {}, and this hvi restores {arch} guests from {} \
+             on {}{}",
+            profile.arch,
+            profile.backend,
+            can.sources.join(" or "),
+            can.backend,
+            if can.sources.len() == 1 {
+                " (only the portable profile moves between backends)"
+            } else {
+                ""
+            }
         ));
     }
     if !can.profiles.contains(&profile.profile.as_str()) {
         why.push(format!(
-            "profile.json: a {} guest, which this hvi does not restore{}",
-            profile.profile,
-            not_yet(&profile.profile)
+            "profile.json: a {} guest, which this hvi does not restore on {}",
+            profile.profile, can.backend
         ));
     }
     let vcpus_ok = profile.vcpus != 0 && profile.vcpus as usize <= MAX_VCPUS;
@@ -265,18 +291,16 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
     if !can.irq_kinds.contains(&platform.irq.kind()) {
         why.push(format!(
             "platform.json: the interrupt controller is {}, which this hvi cannot \
-             restore on {}{}",
+             restore on {}",
             platform.irq.kind(),
             can.backend,
-            not_yet(platform.irq.kind())
         ));
     }
     if !can.timer_kinds.contains(&platform.timer.kind()) {
         why.push(format!(
-            "platform.json: the counter is {}, which this hvi cannot restore on {}{}",
+            "platform.json: the counter is {}, which this hvi cannot restore on {}",
             platform.timer.kind(),
             can.backend,
-            not_yet(platform.timer.kind())
         ));
     }
     let adjunct = platform.backend_adjunct.as_ref().map(|a| a.kind.as_str());
@@ -302,18 +326,6 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
     }
     why.extend(device_refusals(opened, cfg, can));
     why
-}
-
-/// Returns why `name`, a machine profile or a `platform.json` kind, is not
-/// restored, when it is one of the portable profile's: this build boots
-/// that machine but has no restore for it yet.
-fn not_yet(name: &str) -> &'static str {
-    match name {
-        "portable-arm64-v1" | "gicv2" | "hvi-time" => {
-            " yet: the portable profile boots, but no backend restores its guests"
-        }
-        _ => "",
-    }
 }
 
 /// Returns every reason the host resources `cfg` names do not match the
@@ -572,6 +584,7 @@ pub(crate) mod tests {
     const HVF: Restorer = Restorer {
         arch: GuestArch::Aarch64,
         backend: "hvf",
+        sources: &["hvf"],
         profiles: &["native"],
         irq_kinds: &["hv-gic-v3"],
         timer_kinds: &["arch-timer"],
@@ -881,37 +894,81 @@ pub(crate) mod tests {
         );
     }
 
-    /// A guest of the portable profile is refused for that, and for the
-    /// two platform kinds no backend restores yet, each with the reason.
+    /// The parts of a portable bundle of `backend`: the GICv2 and
+    /// `hvi-time` for its platform, and no blob.
+    fn portable_parts(p: &mut Parts, backend: &str) {
+        p.profile.profile = "portable-arm64-v1".into();
+        p.profile.backend = backend.into();
+        p.platform.backend = backend.into();
+        for v in &mut p.vcpus {
+            if let VcpuState::Aarch64(v) = v {
+                v.backend = backend.into();
+            }
+        }
+        p.platform.irq = IrqState::Gicv2(Box::new(crate::devices::gicv2::Gicv2::new(2).state()));
+        p.platform.timer =
+            TimerState::HviTime(Box::new(crate::checkpoint::platform::tests::hvi_time(2)));
+        p.platform.backend_adjunct = None;
+        p.capabilities = Vec::new();
+    }
+
+    /// Returns the refusals of `can` for a bundle `edit` makes.
+    fn refused_by(name: &str, edit: impl FnOnce(&mut Parts), can: &Restorer) -> Vec<String> {
+        let scratch = Scratch::new(name);
+        let mut parts = parts(&scratch);
+        edit(&mut parts);
+        parts.write(&scratch.bundle());
+        refusals(&open(&scratch.bundle()).unwrap(), &config(&scratch), can)
+    }
+
+    // A portable bundle of either backend is restorable on either, and the
+    // native restore refuses it for its profile and its kinds.
     #[test]
-    fn a_portable_bundle_is_refused_as_not_restorable_yet() {
-        let reasons = refused(
-            "portable",
-            |p| {
-                p.profile.profile = "portable-arm64-v1".into();
-                p.platform.irq =
-                    IrqState::Gicv2(Box::new(crate::devices::gicv2::Gicv2::new(2).state()));
-                p.platform.timer =
-                    TimerState::HviTime(Box::new(crate::checkpoint::platform::tests::hvi_time(2)));
-                p.platform.backend_adjunct = None;
-                p.capabilities = Vec::new();
-            },
-            |_| {},
-        );
-        let yet = "yet: the portable profile boots, but no backend restores its guests";
+    fn a_portable_bundle_moves_between_backends_and_a_native_one_does_not() {
+        for from in ["hvf", "kvm"] {
+            for on in ["hvf", "kvm"] {
+                let reasons = refused_by(
+                    &format!("portable-{from}-{on}"),
+                    |p| portable_parts(p, from),
+                    &portable(on),
+                );
+                assert_eq!(reasons, Vec::<String>::new(), "{from} -> {on}");
+            }
+        }
+        let reasons = refused_by("portable-native", |p| portable_parts(p, "hvf"), &HVF);
         has(
             &reasons,
             &[
-                &format!("profile.json: a portable-arm64-v1 guest, which this hvi does not restore {yet}"),
-                &format!("the interrupt controller is gicv2, which this hvi cannot restore on hvf {yet}"),
-                &format!("the counter is hvi-time, which this hvi cannot restore on hvf {yet}"),
+                "profile.json: a portable-arm64-v1 guest, which this hvi does not restore on hvf",
+                "the interrupt controller is gicv2, which this hvi cannot restore on hvf",
+                "the counter is hvi-time, which this hvi cannot restore on hvf",
+                "the hvf_gic_state blob is missing",
             ],
         );
-        assert!(
-            !reasons
-                .iter()
-                .any(|r| r.contains("platform.json: irq") || r.contains("platform.json: timer")),
-            "the portable state itself was refused: {reasons:#?}"
+        // A native bundle of the other backend is refused for it.
+        let reasons = refused_by(
+            "native-kvm",
+            |p| {
+                p.profile.backend = "kvm".into();
+            },
+            &HVF,
+        );
+        has(
+            &reasons,
+            &[
+                "an aarch64 guest on kvm, and this hvi restores aarch64 guests from hvf on hvf \
+               (only the portable profile moves between backends)",
+            ],
+        );
+        // The portable restore refuses a native bundle.
+        let reasons = refused_by("native-portable", |_| {}, &portable("kvm"));
+        has(
+            &reasons,
+            &[
+                "a native guest, which this hvi does not restore on kvm",
+                "the interrupt controller is hv-gic-v3",
+                "the bundle needs hvf-gic-state-v1",
+            ],
         );
     }
 
