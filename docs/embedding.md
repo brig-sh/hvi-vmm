@@ -129,7 +129,7 @@ cargo build --release --example watch_guest
 | `net_mac` | `Option<[u8; 6]>` | Guest MAC, applied on every backend and mode. |
 | `events` | `Option<String>` | The ledger path. |
 | `sandbox_id` | `String` | Written into every ledger record. |
-| `vcpus` | `u32` | 1 or more. A GICv2 arm64 host refuses more than 8. |
+| `vcpus` | `u32` | 1 or more. Linux/arm64 refuses more than 8 on a GICv2 host and more than 507 on a GICv3 one, and x86-64 more than 254. |
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |

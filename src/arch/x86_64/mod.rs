@@ -23,6 +23,13 @@
 pub mod layout;
 pub mod loader;
 
+/// The most vCPUs an x86-64 guest can have.
+///
+/// The MP table and the MADT give each vCPU a one-byte local APIC id, from 0
+/// up, and the IOAPIC the id after the last vCPU's. With 254 vCPUs the IOAPIC
+/// takes 254, and 255, the broadcast id, stays unused.
+pub const MAX_VCPUS: u32 = 254;
+
 #[cfg(target_os = "linux")]
 pub mod acpi;
 #[cfg(target_os = "linux")]

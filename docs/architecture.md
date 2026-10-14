@@ -246,7 +246,8 @@ The GIC version is not a choice. KVM offers the vGIC that matches the host, so
 a GIC-400 host gets v2 and refuses more than 8 vCPUs, and a GICv3 host gets
 v3. The macOS backend is always v3, because Apple's `hv_gic` is one.
 
-Not having the GICv2 cap is not unlimited capacity. Other limits still apply.
+A v3 guest on KVM takes at most 507 vCPUs, since each vCPU adds a redistributor
+frame from a fixed base and the frames must end below the UART.
 
 ### 3.2 x86-64: the Linux 64-bit boot protocol
 
