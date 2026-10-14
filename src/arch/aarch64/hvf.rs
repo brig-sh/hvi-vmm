@@ -920,6 +920,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         })
     });
     let (vm, irqchip) = create_vm(&gic, portable.clone())?;
+    if is_portable {
+        // Before any vCPU exists, so a host that cannot back the baseline
+        // fails the boot with every missing field named.
+        check_baseline_on_host()?;
+    }
     let (shared_ram, ram) = map_ram(cfg.mem_bytes)?;
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
     // The portable guest also gets kernel arguments that keep it off what
@@ -2231,11 +2236,47 @@ const BASELINE_REGS: [SysReg; 12] = [
     SysReg::ID_AA64DFR1_EL1,
 ];
 
+/// Checks that this host can back the portable CPU baseline: no field of
+/// it claims more than the default vCPU configuration has.
+///
+/// Hypervisor.framework accepts a raised field and the guest then reads it
+/// (P0 HVF probe e2: `ID_AA64PFR0_EL1.SVE=1` and `ID_AA64ISAR0_EL1.SM3=1`
+/// on an M5 Pro, which has neither), so neither the write nor its readback
+/// can catch a raise. This comparison is what does. `MIDR_EL1` is identity,
+/// not a feature, and is not compared.
+///
+/// # Errors
+///
+/// Errors naming every field the host cannot back, and every register it
+/// cannot read.
+fn check_baseline_on_host() -> Result<(), String> {
+    let config = VcpuConfig::new();
+    let mut wrong = Vec::new();
+    for (name, value) in portable::BASELINE.into_iter().skip(1) {
+        let Some((_, reg)) = FEATURE_REGS.iter().find(|(n, _)| *n == name) else {
+            wrong.push(format!("{name} has no host value to compare with"));
+            continue;
+        };
+        match config.get_feature_reg(*reg) {
+            Ok(host) => wrong.extend(portable::excess_fields(name, value, host)),
+            Err(e) => wrong.push(format!("{name} cannot be read ({e:?})")),
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "this host cannot back the portable-arm64-v1 CPU baseline: {}",
+            wrong.join("; ")
+        ))
+    }
+}
+
 /// Gives `vcpu` the portable CPU baseline, and logs it when `log`.
 ///
-/// Hypervisor.framework accepts a value above what the host has without
-/// complaint, and the guest then reads it, so a write proves nothing. Each
-/// register is read back instead.
+/// `check_baseline_on_host` has already compared the baseline with the
+/// host, which is what catches a raised field. Each register is still read
+/// back, to catch a write that did not take.
 ///
 /// # Errors
 ///

@@ -34,9 +34,17 @@ Every value here was measured on 2026-10-14:
 
 ### ID registers
 
-Each vCPU is given these values before its first instruction. hvi reads each
-one back and refuses the boot if any differs: Hypervisor.framework accepts a
-value above what the hardware has without complaint, and KVM refuses a raise.
+Each vCPU is given these values before its first instruction. Before that,
+hvi compares every field with what the host offers a guest and refuses the
+boot, naming each field, if the baseline claims more than the host has.
+Hypervisor.framework accepts a value above what the hardware has without
+complaint and then reads it back, so only this comparison catches a raise.
+KVM refuses a raise itself. Fields are compared as Linux reads them: FP,
+AdvSIMD, TGran4, TGran64 and DoubleLock are signed (`0xf` means absent),
+the rest unsigned. The only raises allowed are `ID_AA64MMFR1_EL1` VMIDBits
+and VH, which the Pi fixes above the Mac's 0 and which describe EL2, which
+the guest does not have. hvi also reads every register back after writing
+it and refuses the boot if one differs.
 
 | Register | Value | What the guest sees |
 | --- | --- | --- |

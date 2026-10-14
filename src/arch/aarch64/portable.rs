@@ -50,6 +50,70 @@ pub const BASELINE: [(&str, u64); 12] = [
     ("ID_AA64DFR1_EL1", 0),
 ];
 
+/// The 4-bit ID register fields that are signed: 0xf means the feature is
+/// absent, 0 present, 1 present with more. Linux declares exactly these
+/// with `S_ARM64_FTR_BITS` in `arch/arm64/kernel/cpufeature.c` (6.12) for
+/// the registers of [`BASELINE`]. Every other field is unsigned. Each entry
+/// is a register and the field's low bit.
+const SIGNED_FIELDS: [(&str, u32); 5] = [
+    ("ID_AA64PFR0_EL1", 16),  // FP
+    ("ID_AA64PFR0_EL1", 20),  // AdvSIMD
+    ("ID_AA64MMFR0_EL1", 24), // TGran64
+    ("ID_AA64MMFR0_EL1", 28), // TGran4
+    ("ID_AA64DFR0_EL1", 36),  // DoubleLock
+];
+
+/// The fields [`BASELINE`] may hold above what a host has, and why that
+/// is safe. The Pi fixes them above the Mac's 0, and KVM refuses to lower
+/// them, so the Mac raises them.
+const ALLOWED_RAISES: [(&str, u32, &str); 2] = [
+    (
+        "ID_AA64MMFR1_EL1",
+        4,
+        "VMIDBits describes stage-2 translation, which needs EL2",
+    ),
+    (
+        "ID_AA64MMFR1_EL1",
+        8,
+        "VH describes EL2, which the baseline hides",
+    ),
+];
+
+/// Returns the fields of baseline register `name` that claim more than the
+/// host's `host` value of it, one description each.
+///
+/// A host must back every field: Hypervisor.framework accepts a raised
+/// field and the guest then reads it, so a guest told of a feature its
+/// host lacks would fault on the first instruction that uses it. An
+/// unsigned field claims more when it is larger, a signed field (see
+/// `SIGNED_FIELDS`) when it is larger as a signed number, so 0xf, absent,
+/// never claims more. `ALLOWED_RAISES` are let through.
+#[must_use]
+pub fn excess_fields(name: &str, baseline: u64, host: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    for shift in (0..64).step_by(4) {
+        let b = (baseline >> shift) & 0xf;
+        let h = (host >> shift) & 0xf;
+        let raised = if SIGNED_FIELDS.contains(&(name, shift)) {
+            // Sign-extend the nibble.
+            ((b as i8) << 4 >> 4) > ((h as i8) << 4 >> 4)
+        } else {
+            b > h
+        };
+        if raised
+            && !ALLOWED_RAISES
+                .iter()
+                .any(|(n, s, _)| *n == name && *s == shift)
+        {
+            out.push(format!(
+                "{name}[{}:{shift}] is {b:#x} in the baseline but {h:#x} on this host",
+                shift + 3
+            ));
+        }
+    }
+    out
+}
+
 /// `DCZID_EL0`, which no backend can set. Both hosts report 64-byte
 /// `DC ZVA` blocks.
 pub const DCZID_EL0: u64 = 0x4;
@@ -215,6 +279,87 @@ mod tests {
             cmdline("console=ttyAMA0"),
             format!("console=ttyAMA0 {KERNEL_ARGS}")
         );
+    }
+
+    /// The default guest ID registers of an Apple M5 Pro under
+    /// Hypervisor.framework without hv_gic (P0 report hvf.md, section 2).
+    const M5_PRO: [(&str, u64); 11] = [
+        ("ID_AA64PFR0_EL1", 0x1101_0000_1011_0011),
+        ("ID_AA64PFR1_EL1", 0x0000_0002_0200_0001),
+        ("ID_AA64ZFR0_EL1", 0x0000_1000_0120_0002),
+        ("ID_AA64SMFR0_EL1", 0x02f1_5cff_0000_0000),
+        ("ID_AA64ISAR0_EL1", 0x0221_1001_1021_2120),
+        ("ID_AA64ISAR1_EL1", 0x0000_2211_1021_1502),
+        ("ID_AA64MMFR0_EL1", 0x0000_1000_0f10_0022),
+        ("ID_AA64MMFR1_EL1", 0x0000_1000_1131_2000),
+        ("ID_AA64MMFR2_EL1", 0x1001_0011_0200_1011),
+        ("ID_AA64DFR0_EL1", 0x1030_5006),
+        ("ID_AA64DFR1_EL1", 0),
+    ];
+
+    fn baseline(name: &str) -> u64 {
+        BASELINE.iter().find(|(n, _)| *n == name).unwrap().1
+    }
+
+    #[test]
+    fn an_m5_pro_backs_the_baseline() {
+        for (name, host) in M5_PRO {
+            assert_eq!(
+                excess_fields(name, baseline(name), host),
+                Vec::<String>::new(),
+                "{name}"
+            );
+        }
+        // VMIDBits and VH are the raises let through.
+        assert_eq!(baseline("ID_AA64MMFR1_EL1") & 0xff0, 0x120);
+    }
+
+    #[test]
+    fn a_host_without_a_baseline_feature_is_refused() {
+        // No RAS (PFR0[31:28]).
+        let pfr0 = 0x1101_0000_0011_0011;
+        assert_eq!(
+            excess_fields("ID_AA64PFR0_EL1", baseline("ID_AA64PFR0_EL1"), pfr0),
+            vec!["ID_AA64PFR0_EL1[31:28] is 0x1 in the baseline but 0x0 on this host"]
+        );
+        // No floating point: FP is signed, 0xf is absent.
+        let pfr0 = 0x1101_0000_101f_0011;
+        assert_eq!(
+            excess_fields("ID_AA64PFR0_EL1", baseline("ID_AA64PFR0_EL1"), pfr0).len(),
+            1
+        );
+        // No DotProd or RDM.
+        let isar0 = 0x0221_0001_0021_2120;
+        assert_eq!(
+            excess_fields("ID_AA64ISAR0_EL1", baseline("ID_AA64ISAR0_EL1"), isar0).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn signed_fields_compare_as_signed() {
+        // TGran64 absent (0xf) in the baseline is never more than a host
+        // with 64K pages (0).
+        let mmfr0 = 0x0000_0000_0010_0022;
+        assert!(excess_fields("ID_AA64MMFR0_EL1", baseline("ID_AA64MMFR0_EL1"), mmfr0).is_empty());
+        // TGran4 present (0) is more than a host without 4K pages (0xf).
+        let mmfr0 = 0x0000_0000_ff10_0022;
+        assert_eq!(
+            excess_fields("ID_AA64MMFR0_EL1", baseline("ID_AA64MMFR0_EL1"), mmfr0),
+            vec!["ID_AA64MMFR0_EL1[31:28] is 0x0 in the baseline but 0xf on this host"]
+        );
+    }
+
+    #[test]
+    fn a_raise_outside_the_allowed_ones_is_refused() {
+        // A baseline that claimed SVE (PFR0[35:32]) on an M5 Pro.
+        let raised = baseline("ID_AA64PFR0_EL1") | (1 << 32);
+        assert_eq!(
+            excess_fields("ID_AA64PFR0_EL1", raised, M5_PRO[0].1),
+            vec!["ID_AA64PFR0_EL1[35:32] is 0x1 in the baseline but 0x0 on this host"]
+        );
+        // VMIDBits is let through only in MMFR1.
+        assert_eq!(excess_fields("ID_AA64MMFR2_EL1", 0x20, 0).len(), 1);
     }
 
     /// The baseline keeps the GIC system-register interface off, which is
