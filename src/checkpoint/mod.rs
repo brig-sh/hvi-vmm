@@ -33,3 +33,4 @@ pub mod profile;
 pub mod ram;
 pub(crate) mod restore;
 pub(crate) mod server;
+pub mod stream;
