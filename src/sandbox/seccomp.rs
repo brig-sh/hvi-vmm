@@ -768,12 +768,44 @@ fn probe_many_arenas() {
     }
 }
 
-/// Allocates 16 MiB on a new thread in 64 KiB pieces, under glibc's smallest
-/// mmap threshold so they come from the thread's arena, and frees them newest
-/// first. Each free joins the top of the heap, and once that top passes the
-/// trim threshold glibc shrinks the heap. In an arena other than the main one,
-/// that shrink is where it reads the overcommit setting.
+/// The mmap and trim thresholds the heap-shrink probe pins: 128 KiB, glibc's
+/// default for both.
+#[cfg(target_env = "gnu")]
+const SHRINK_PROBE_THRESHOLD: libc::c_int = 128 << 10;
+
+/// The exit code of a heap-shrink probe whose thresholds glibc refused.
+#[cfg(target_env = "gnu")]
+const SHRINK_PROBE_UNPINNED: i32 = 95;
+
+/// Allocates 16 MiB on a new thread in 64 KiB pieces, under the mmap threshold
+/// so they come from the thread's arena, and frees them newest first. Each free
+/// joins the top of the heap, and once that top passes the trim threshold glibc
+/// shrinks the heap. In an arena other than the main one, that shrink is where
+/// it reads the overcommit setting.
+///
+/// The probe means nothing unless 64 KiB stays under the mmap threshold and
+/// 16 MiB passes the trim threshold. Both are process state that can move:
+/// glibc raises the mmap threshold when the selftest's parent frees a mapped
+/// chunk, and `GLIBC_TUNABLES` can set either. With the trim threshold at
+/// 32 MiB or the mmap threshold at 32 KiB, the probe ran without ever
+/// shrinking a heap and passed on code that has the bug. So the child pins
+/// both first. `mallopt` also turns off glibc's moving threshold, and it makes
+/// no syscall, so it works under the filter.
 fn probe_heap_shrink() {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: mallopt with positive sizes; it only stores them, under the
+        // main arena's lock.
+        let pinned = unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, SHRINK_PROBE_THRESHOLD) == 1
+                && libc::mallopt(libc::M_TRIM_THRESHOLD, SHRINK_PROBE_THRESHOLD) == 1
+        };
+        if !pinned {
+            eprintln!("  (glibc refused the probe's malloc thresholds)");
+            // SAFETY: terminating the forked child without running destructors.
+            unsafe { libc::_exit(SHRINK_PROBE_UNPINNED) };
+        }
+    }
     let _ = std::thread::spawn(|| {
         let mut pieces: Vec<Vec<u8>> = (0..256).map(|_| vec![1u8; 64 << 10]).collect();
         while let Some(piece) = pieces.pop() {
