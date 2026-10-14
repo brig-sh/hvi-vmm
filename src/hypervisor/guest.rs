@@ -26,7 +26,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::checkpoint::cpu::{VcpuState, Work};
+use crate::checkpoint::cpu::{Output, Work};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
@@ -214,7 +214,7 @@ impl<K: Kick> Guest<K> {
         vcpu: &V,
         cpu: u32,
         plugin: Option<&dyn Plugin>,
-        serve: impl FnMut(Work<'_>) -> std::io::Result<Option<VcpuState>>,
+        serve: impl FnMut(Work<'_>) -> std::io::Result<Option<Output>>,
     ) {
         // A plugin's pause parks only the other vCPUs, so vcpu0 parks here only
         // for the control socket's.

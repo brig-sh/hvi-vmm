@@ -99,6 +99,16 @@ pub(crate) struct Capture {
 #[cfg(test)]
 pub(crate) type AfterComponent = Arc<dyn Fn(Component) -> io::Result<()> + Send + Sync>;
 
+/// What the vCPUs exported, on their own threads, for [`Capture::write`].
+pub(crate) struct Exported {
+    /// Every vCPU's state, by index.
+    pub(crate) vcpus: Vec<VcpuState>,
+    /// The interrupt controller and the counter.
+    pub(crate) platform: PlatformState,
+    /// What a restore must be able to load, for the manifest.
+    pub(crate) capabilities: Vec<String>,
+}
+
 /// What the caller of [`Capture::write`] supplies about the request.
 pub(crate) struct Request<'a> {
     /// What the source does after the capture.
@@ -184,8 +194,8 @@ impl Capture {
     ///
     /// The device states are gathered and checked first, and the disk synced
     /// second, so a refusal or a sync failure leaves no file written.
-    /// `vcpus` are the states the vCPUs exported, by index. `stopping` is
-    /// asked between components and between reads of guest RAM.
+    /// `exported` is what the vCPUs exported. `stopping` is asked between
+    /// components and between reads of guest RAM.
     ///
     /// # Errors
     ///
@@ -196,7 +206,7 @@ impl Capture {
         &self,
         mut writer: BundleWriter,
         profile: &MachineProfile,
-        vcpus: Vec<VcpuState>,
+        exported: Exported,
         request: &Request<'_>,
         stopping: &dyn Fn() -> bool,
     ) -> io::Result<Sealed> {
@@ -233,12 +243,9 @@ impl Capture {
         writer.write_ram(&self.ram, stopping)?;
         self.after(Component::RamMap)?;
         check()?;
-        writer.write_json(Component::Cpu, &CpuState::new(self.arch, vcpus))?;
+        writer.write_json(Component::Cpu, &CpuState::new(self.arch, exported.vcpus))?;
         self.after(Component::Cpu)?;
-        writer.write_json(
-            Component::Platform,
-            &PlatformState::not_captured(self.arch, self.backend),
-        )?;
+        writer.write_json(Component::Platform, &exported.platform)?;
         self.after(Component::Platform)?;
         writer.write_bytes(Component::Devices, &devices.to_json()?)?;
         self.after(Component::Devices)?;
@@ -263,6 +270,6 @@ impl Capture {
         )?;
         self.after(Component::Session)?;
         check()?;
-        writer.seal(Vec::new())
+        writer.seal(exported.capabilities)
     }
 }
