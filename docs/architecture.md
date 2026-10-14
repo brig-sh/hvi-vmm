@@ -421,11 +421,23 @@ same way, or finds the VM paused already. It then posts an export request to
 the vCPUs through `Vcpus::request_export`. Only a vCPU's own thread may read its
 registers, so each vCPU does the export at its checkpoint, through the closure
 its backend passes to `Vcpus::checkpoint_with`, and stays parked. A vCPU parked
-before the request is woken to do it. With every vCPU parked and every helper
+before the request is woken to do it. A second request, `Vcpus::request_platform`,
+then has vCPU 0 read the interrupt controller and the counter; on HVF that is
+the `hv_gic_state` blob, which the framework gives only with every vCPU
+stopped (`arch/aarch64/hvf_state.rs`). With every vCPU parked and every helper
 outside the gate, the control thread locks each device mutex, collects and
 checks the device states, syncs the disk and writes the bundle
 (`checkpoint/bundle.rs`, `checkpoint/ram.rs`), all before it resumes or fences
-the VM. See [checkpoint.md](checkpoint.md). The plugin and the control socket share one quiesce, and whichever
+the VM. See [checkpoint.md](checkpoint.md).
+
+`hvi restore` (`arch/aarch64/hvf.rs`, `checkpoint/restore.rs`) builds the same
+machine from a bundle: the VM and GIC as a boot does, RAM copied from the
+bundle, the devices from their state. It holds the gate and the quiesce before
+any vCPU thread starts, then posts three import requests through
+`Vcpus::request_import` and waits for every vCPU between them: each vCPU's
+registers, the GIC blob on vCPU 0, each vCPU's GIC CPU interface. The control
+socket then starts in `restored-paused`, and its `resume` is the first time
+the guest runs on this host. The plugin and the control socket share one quiesce, and whichever
 holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU
@@ -498,7 +510,7 @@ how it works.
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `acpi_pm.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
-| Control socket and checkpoints | `checkpoint/`: `control.rs`, `server.rs`, `profile.rs`, `capture.rs`, `bundle.rs`, `ram.rs`, `cpu.rs`, `platform.rs` |
+| Control socket, checkpoints and restore | `checkpoint/`: `control.rs`, `server.rs`, `profile.rs`, `capture.rs`, `bundle.rs`, `ram.rs`, `cpu.rs`, `platform.rs`, `restore.rs`; `arch/aarch64/hvf_state.rs` for HVF |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
