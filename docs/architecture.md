@@ -83,8 +83,9 @@ pub(crate) fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + 
 ```
 
 `hvi::boot` calls the one for the host target and returns its error as a
-`BootError`, so the CLI and a linking crate use the same call. `Stop` is
-`SystemOff`, `SystemReset` or `Requested`.
+`BootError`, so the CLI and a linking crate use the same call. `hvi::spawn`
+makes the same call on a thread of its own. `Stop` is `SystemOff`, `SystemReset`
+or `Requested`.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 

@@ -86,7 +86,7 @@ thread as that thread's first act:
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the main thread, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
+| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -108,9 +108,9 @@ Failure behaviour differs by install site, and all three fail closed:
 - A list that will not compile refuses the boot, before any thread is spawned.
 - A worker thread that cannot install its filter prints `[hvi] FATAL` and
   aborts the process.
-- The main thread installs its own filter after the vCPUs are running, so a
-  failure there stops the guest, waits for every thread and returns the error
-  from `boot`.
+- The thread that calls `boot` installs its own filter after the vCPUs are
+  running, so a failure there stops the guest, waits for every thread and
+  returns the error from `boot`.
 
 ### `HVI_SECCOMP=log` turns enforcement off
 

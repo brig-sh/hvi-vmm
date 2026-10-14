@@ -76,6 +76,18 @@ macro_rules! stderrln {
     }};
 }
 
+/// Returns the message of the panic whose payload is `payload`.
+///
+/// A `panic!` produces a `&str` or a `String` payload, and any other payload
+/// reads as `unknown payload`.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown payload".to_string())
+}
+
 pub mod arch;
 pub mod config;
 pub mod devices;
@@ -86,6 +98,7 @@ pub mod memory;
 pub mod plugin;
 pub mod sandbox;
 pub mod signal;
+mod spawn;
 pub mod stop;
 pub mod sync;
 pub mod teardown;
@@ -125,10 +138,27 @@ compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux onl
 /// # Errors
 ///
 /// Errors if the guest cannot be set up, if a vCPU or a thread fails, or if a
-/// thread does not stop in time.
+/// thread does not stop in time. Errors at once while another run is in
+/// progress in the process, and once a run has left a thread running or unwound
+/// from a panic, since a process runs one guest at a time.
+///
+/// A sandboxed run leaves its confinement in place: on Linux the seccomp filter
+/// on the calling thread, which refuses opening a file, and on macOS the
+/// Seatbelt profile on the whole process. A later sandboxed `boot` on Linux
+/// starts from a thread of its own, as [`spawn`](fn@spawn) does.
 pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> {
-    backend::boot(cfg).map_err(config::BootError::new)
+    let mut claim = hypervisor::run::RUN_SLOT
+        .claim()
+        .map_err(|e| config::BootError::new(e.into()))?;
+    backend::boot(cfg).map_err(|e| {
+        if e.is::<hypervisor::run::LeftRunning>() {
+            claim.keep();
+        }
+        config::BootError::new(e)
+    })
 }
+
+pub use spawn::{spawn, Run};
 
 /// This crate's version, so a binary built against it can report which VMM core
 /// it carries. Two binaries reporting the same core ran the same VMM.

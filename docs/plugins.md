@@ -18,11 +18,11 @@ For constructing the `BootConfig` that carries a plugin, read
 
 ## When each hook runs
 
-<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: attach on the main thread before any vCPU starts, safepoint on the boot vCPU between guest entries, IoSink on a device thread with the device lock held, and request from the console" width="760">
+<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: attach on the thread that calls boot before any vCPU starts, safepoint on the boot vCPU between guest entries, IoSink on a device thread with the device lock held, and request from the console" width="760">
 
 | Trait | Called | Thread |
 | --- | --- | --- |
-| `Plugin::attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | main |
+| `Plugin::attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` |
 | `Plugin::safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU |
 | `Plugin::request` | when the console reads `Ctrl-]` (0x1d) | the console input thread |
 | `IoSink::block`, egress `IoSink::net` | per request or frame, device lock held | a vCPU thread |
