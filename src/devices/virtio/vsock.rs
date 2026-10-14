@@ -1311,16 +1311,19 @@ impl VsockBridge {
                         break;
                     }
                 }
-                // `add_conn` makes the socket non-blocking, so a read can find
-                // nothing even after the poll.
-                let n = match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) if retry_read(&e) => continue,
-                    Err(_) => break,
-                };
+                // The read is inside the pause gate with the delivery, so a
+                // pause never finds bytes taken off the socket that the device
+                // does not hold yet; a checkpoint would lose them. `add_conn`
+                // makes the socket non-blocking, so the read never waits inside
+                // the gate, and it can find nothing even after the poll.
                 let gate = {
                     let _in = stop.enter();
+                    let n = match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if retry_read(&e) => continue,
+                        Err(_) => break,
+                    };
                     lock_or_recover(&dev).host_data(&mem, port, &buf[..n])
                 };
                 // Outside the pause gate, since the guest's credit may come
@@ -1382,6 +1385,51 @@ mod tests {
             dev.mmio(&mem, mmio::DEVICE_FEATURES, false, 0)
         };
         assert_eq!((page(1) << 32) | page(0), VirtioVsock::FEATURES);
+    }
+
+    /// Returns the number of bytes waiting to be read on `socket`.
+    fn unread(socket: &UnixStream) -> i32 {
+        use std::os::fd::AsRawFd;
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int through the pointer, which lives
+        // for the call.
+        let rc = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut n) };
+        assert_eq!(rc, 0, "FIONREAD");
+        n
+    }
+
+    // A reader that took bytes off the socket and then waited at a closed
+    // gate would hold them where a checkpoint cannot see them. Under a pause
+    // they must stay in the socket.
+    #[test]
+    fn a_paused_reader_leaves_the_bytes_in_the_socket() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let source = crate::teardown::StopSource::new().unwrap();
+        let dev = Arc::new(Mutex::new(VirtioVsock::new()));
+        let mem = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]));
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+        let watch = ours.try_clone().unwrap();
+        let port = lock_or_recover(&dev)
+            .add_conn(ours.try_clone().unwrap())
+            .unwrap();
+        source.gate().pause(Duration::from_secs(1)).unwrap();
+        let reader = VsockBridge::spawn_reader(&dev, &mem, &source.token(), port, ours);
+        peer.write_all(b"agent bytes").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(unread(&watch), 11, "the reader took bytes under a pause");
+        source.gate().unpause();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unread(&watch) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the reader never read after the resume"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        source.request_stop();
+        reader.join().unwrap();
     }
 
     #[test]
