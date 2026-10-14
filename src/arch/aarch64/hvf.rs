@@ -52,6 +52,7 @@ use applevisor::prelude::{
 
 use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt::{self, ArchTimer};
+use crate::arch::aarch64::hvf_dirty::HvfWriteLog;
 use crate::arch::aarch64::hvf_state;
 use crate::arch::aarch64::layout::{
     virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, HVI_TIME_PAGE_BASE,
@@ -84,7 +85,7 @@ use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView, VmHandle};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
@@ -572,6 +573,9 @@ struct Shared {
     /// The virtual timer offset of every portable vCPU, so that each reads
     /// the one counter the `hvi-time` page maps.
     vtimer_offset: u64,
+    /// The record of the guest's writes to RAM a live move keeps, whose
+    /// faults each vCPU serves on its own thread.
+    write_log: Arc<HvfWriteLog>,
 }
 
 /// The feature registers the profile records, by the name it records them
@@ -874,6 +878,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         Some(p) => Some(attach_hvitime(p, &vcpus, num_cpus, vtimer_offset)?),
         None => None,
     };
+    let write_log = Arc::new(HvfWriteLog::new(&ram.regions()));
     let shared = Shared {
         vm: vm.clone(),
         irqchip,
@@ -895,7 +900,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus,
-            write_log: None,
+            write_log: Some(Arc::clone(&write_log) as Arc<dyn GuestWriteLog>),
         }),
         pl011: Arc::new(Mutex::new(pl011)),
         fs: Vec::new(),
@@ -906,6 +911,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         portable,
         hvitime,
         vtimer_offset,
+        write_log,
     };
     connect_lines(&shared);
     let control = bind_control(
@@ -1198,6 +1204,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         Some(p) => Some(attach_hvitime(p, &vcpus, num_cpus, vtimer_offset)?),
         None => None,
     };
+    let write_log = Arc::new(HvfWriteLog::new(&ram.regions()));
 
     let shared = Shared {
         vm: vm.clone(),
@@ -1214,7 +1221,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus,
-            write_log: None,
+            write_log: Some(Arc::clone(&write_log) as Arc<dyn GuestWriteLog>),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         fs,
@@ -1225,6 +1232,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         portable,
         hvitime,
         vtimer_offset,
+        write_log,
     };
 
     connect_lines(&shared);
@@ -1412,6 +1420,34 @@ fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::er
         }
     }
     Ok((shared_ram, ram))
+}
+
+/// The most times in a row one vCPU may fault on the same RAM granule
+/// before hvi ends the run: the log made it writable after the first, so a
+/// granule that keeps faulting is one the framework will not unprotect, and
+/// re-running it would spin for ever.
+const RAM_FAULT_REPEATS: u32 = 64;
+
+/// The RAM faults one vCPU took in a row at one granule, with no other
+/// exit between them.
+#[derive(Default)]
+struct RamFaults {
+    /// The granule of the last fault.
+    last: Option<u64>,
+    /// How many faults in a row were there after the first.
+    repeats: u32,
+}
+
+impl RamFaults {
+    /// Counts a fault in the granule at `granule`.
+    fn note(&mut self, granule: u64) {
+        if self.last == Some(granule) {
+            self.repeats += 1;
+        } else {
+            self.last = Some(granule);
+            self.repeats = 0;
+        }
+    }
 }
 
 /// Connects the UART, the virtio devices and the virtio-fs devices to their
@@ -1952,6 +1988,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         offset: vcpu.get_vtimer_offset().unwrap_or(0),
         raised: false,
     };
+    let mut ram_faults = RamFaults::default();
     // The loop runs inside `catch_unwind` only for the report. A panic is
     // reported with where the guest was and what it last did, and the guard
     // ends the VM on the way out.
@@ -2032,6 +2069,12 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             }
             let exit = vcpu.get_exit_info();
             LAST_EXIT.with(|last| last.set(Some(exit.reason)));
+            // Only RAM faults in a row count towards the repeat cap.
+            if !matches!(exit.reason, ExitReason::EXCEPTION)
+                || Ec::from_syndrome(exit.exception.syndrome) != Ec::DataAbort
+            {
+                ram_faults = RamFaults::default();
+            }
             match exit.reason {
                 ExitReason::EXCEPTION => {
                     let syn = exit.exception.syndrome;
@@ -2054,7 +2097,28 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         }
                         Ec::DataAbort => {
                             let ipa = exit.exception.physical_address;
-                            if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
+                            // A write to guest RAM a live move protected:
+                            // the log records it and makes the granule
+                            // writable again, and the store runs again,
+                            // with the PC where it was.
+                            let ram_write = match sh.write_log.fault(ipa) {
+                                Ok(served) => served,
+                                Err(e) => {
+                                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
+                                    break;
+                                }
+                            };
+                            if ram_write {
+                                ram_faults.note(ipa & !(sh.write_log.granule() - 1));
+                                if ram_faults.repeats > RAM_FAULT_REPEATS {
+                                    eprintln!(
+                                        "{LOG_PREFIX} cpu{cpu_id}: guest RAM at {ipa:#x} faults \
+                                         again after it was made writable (pc {:#x})",
+                                        vcpu.get_reg(Reg::PC).unwrap_or(0)
+                                    );
+                                    break;
+                                }
+                            } else if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
                                 trace::exit(trace::Exit::Mmio);
                                 service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
                                 advance_pc(&vcpu);
