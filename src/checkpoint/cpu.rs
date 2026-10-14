@@ -21,7 +21,8 @@
 //!
 //! A vCPU writes its own state, on its own thread, at the point in its run
 //! loop where it parks, since only that thread may read its registers on
-//! either hypervisor.
+//! either hypervisor. The control thread asks for it with a `Work` request
+//! (see `Vcpus::request_export`).
 //!
 //! What the backends read today is the register view the plugin interface
 //! has: on arm64 PC, PSTATE, SP_EL0, SP_EL1 and four translation registers; on
@@ -34,6 +35,7 @@ use std::io;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::hypervisor::guest::SafepointVcpu;
 use crate::plugin::{GuestArch, RegsView};
 
 /// The [`CpuState`] format this build writes and reads.
@@ -377,6 +379,47 @@ pub fn arch_name(arch: GuestArch) -> &'static str {
     match arch {
         GuestArch::Aarch64 => "aarch64",
         GuestArch::X86_64 => "x86_64",
+    }
+}
+
+/// A request a vCPU carries out on its own thread, outside the guest.
+pub(crate) enum Work<'a> {
+    /// Write this vCPU's state.
+    Export,
+    /// Load this state into this vCPU.
+    Import(&'a VcpuState),
+}
+
+/// Carries out `work` with what the plugin register view reads: an export
+/// gives a partial state and an import is refused.
+///
+/// This is the work every backend does until its own export and import
+/// exist.
+///
+/// # Errors
+///
+/// Errors on an import.
+pub(crate) fn serve_from_regs_view<V: SafepointVcpu>(
+    arch: GuestArch,
+    backend: &str,
+    id: u32,
+    vcpu: &V,
+    work: Work<'_>,
+) -> io::Result<Option<VcpuState>> {
+    match work {
+        Work::Export => Ok(Some(VcpuState::from_regs_view(
+            arch,
+            backend,
+            id,
+            &vcpu.regs(),
+        ))),
+        Work::Import(state) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "the {backend} backend cannot load a vCPU state yet (vCPU {})",
+                state.id()
+            ),
+        )),
     }
 }
 

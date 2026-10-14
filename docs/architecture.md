@@ -421,7 +421,18 @@ device by the time a pause completes. Two pieces of input can still be off the
 host and not yet in a device: the start of a gateway frame whose rest has not
 arrived, and one console byte, since the console reader reads stdin, a shared
 terminal, outside the gate. Pause and resume lose neither; a checkpoint taken
-then drops them. The plugin and the control socket share one quiesce, and whichever
+then drops them.
+
+A `checkpoint` (`checkpoint/server.rs`, `checkpoint/capture.rs`) pauses the
+same way, or finds the VM paused already. It then posts an export request to
+the vCPUs through `Vcpus::request_export`. Only a vCPU's own thread may read its
+registers, so each vCPU does the export at its checkpoint, through the closure
+its backend passes to `Vcpus::checkpoint_with`, and stays parked. A vCPU parked
+before the request is woken to do it. With every vCPU parked and every helper
+outside the gate, the control thread locks each device mutex, collects and
+checks the device states, syncs the disk and writes the bundle
+(`checkpoint/bundle.rs`, `checkpoint/ram.rs`), all before it resumes or fences
+the VM. See [checkpoint.md](checkpoint.md). The plugin and the control socket share one quiesce, and whichever
 holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU
@@ -494,6 +505,7 @@ how it works.
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `acpi_pm.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
+| Control socket and checkpoints | `checkpoint/`: `control.rs`, `server.rs`, `profile.rs`, `capture.rs`, `bundle.rs`, `ram.rs`, `cpu.rs`, `platform.rs` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 

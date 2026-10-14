@@ -86,7 +86,12 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| The `checkpoint` op is refused. | `pause`, `resume`, `status`, `stop` and `profile` work. A capture is not implemented yet and replies `not_implemented`. | Defect |
+| A checkpoint bundle cannot be restored yet. | Each vCPU's state is partial: PC, PSTATE, the stack pointers and four translation registers on arm64, RIP and CR3 on x86-64. The interrupt controller and the guest counter are marked `not-captured`. There is no `hvi restore`. | Defect |
+| A checkpoint stops the guest for the whole capture. | Downtime grows with the guest RAM in use: about 0.3 s for 100 MiB on an Apple M5 Pro, 1.2 s on a Raspberry Pi 5, 3 s for 350 MiB on the Pi. Each file is synced while the guest is stopped, so a host whose storage is busy stretches it: 14 s for 90 MiB on the Pi while a build ran. There are no pre-copy rounds. A client's reply timeout must allow for it. | Defect |
+| A checkpoint needs `--checkpoint-root`. | Without it every `checkpoint` is refused. The bundle goes in a new or empty directory below the root, reached through no link. | Design |
+| A guest with virtio-fs shares cannot be checkpointed. | Its share is host descriptors and inode numbers that do not move. A `--fs socket=` export's state is in the caller's daemon, which writes guest RAM outside the dirty log. The checkpoint is refused before anything pauses. | Design |
+| The fence lives only as long as the process. | A fenced VM refuses `resume` until it stops. Nothing is written, so a caller that must survive a crash of the source records the fence itself. | Design |
+| An arm64 secondary starting during a checkpoint can be recorded as off. | A secondary on HVF that has taken its `CPU_ON` but not yet entered its run loop is not waited for and is written as `"power":"off"`. The window is the guest's own CPU bring-up, early in its boot. | Defect |
 | A pause does not stop guest time. | The guest's counter keeps running while it is paused. On resume its clock has jumped by the pause, and timers that fell due fire at once. | Design |
 | One client at a time. | A connected client that sends nothing keeps the next one waiting in the backlog. | Design |
 | The socket has no authentication. | Anyone who can connect can pause or stop the VM. Its directory's permissions are the only control. | Design |

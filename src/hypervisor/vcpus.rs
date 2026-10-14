@@ -32,13 +32,21 @@
 //! [`Vcpus::pause_from_control`]. They share one quiesce, so whichever holds it
 //! keeps the other out until it releases. Without that, a plugin's `resume`
 //! would let the guest run under a control pause that still reports it paused.
+//!
+//! The control socket's thread can also hand the parked vCPUs work that only
+//! each vCPU's own thread can do, since only that thread may read or write
+//! its registers: [`Vcpus::request_export`] and [`Vcpus::request_import`].
+//! Each vCPU does it at its checkpoint, parked and out of the guest, through
+//! the closure its backend passes to [`Vcpus::checkpoint_with`], and then
+//! stays parked.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::cpu::{VcpuState, Work};
 use crate::config::Stop;
 use crate::hypervisor::quiesce::Quiesce;
 use crate::run::StopHandle;
@@ -87,9 +95,48 @@ pub(crate) struct Vcpus<K> {
     stop_handle: StopHandle,
     /// The [`Kick`] implementation that kicks the vCPUs.
     kicker: K,
+    /// The work the control thread has posted, and each vCPU's result.
+    work: Mutex<WorkTable>,
+    /// Signals a result to the control thread waiting for them.
+    work_done: Condvar,
+    /// Per vCPU, whether work is posted that it has not taken. Read at every
+    /// checkpoint of a pause, so it is an atomic and not the table's lock.
+    work_due: Vec<AtomicBool>,
     /// What every stop runs after its kicks, in the order the backend added
     /// them.
     stop_hooks: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// The work posted to the vCPUs, and where each one is with it.
+#[derive(Default)]
+struct WorkTable {
+    /// What is asked, while something is.
+    request: Option<WorkRequest>,
+    /// Counts the requests, so a result for an ended request is dropped.
+    generation: u64,
+    /// Each vCPU's result, by index, once it has one.
+    results: Vec<Option<WorkResult>>,
+}
+
+/// What the control thread asks of every vCPU.
+#[derive(Clone)]
+enum WorkRequest {
+    /// Each vCPU writes its state.
+    Export,
+    /// Each vCPU loads its own state from the list, by index.
+    Import(Arc<Vec<VcpuState>>),
+}
+
+/// What one vCPU made of a work request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkResult {
+    /// It did the work, and this is the state it exported, if it exported one.
+    Done(Option<Box<VcpuState>>),
+    /// It could not, and this says why.
+    Failed(String),
+    /// It never took the request: the guest has not started it, so it has no
+    /// thread in its run loop.
+    NotStarted,
 }
 
 impl<K: Kick> Vcpus<K> {
@@ -107,6 +154,9 @@ impl<K: Kick> Vcpus<K> {
             exited: AtomicU32::new(0),
             stop_handle: stop,
             kicker,
+            work: Mutex::new(WorkTable::default()),
+            work_done: Condvar::new(),
+            work_due: (0..count).map(|_| AtomicBool::new(false)).collect(),
             stop_hooks: Mutex::new(Vec::new()),
         }
     }
@@ -156,14 +206,164 @@ impl<K: Kick> Vcpus<K> {
             .to_vec()
     }
 
-    /// Parks the calling vCPU thread while a quiesce is in effect.
+    /// Parks the calling thread while a quiesce is in effect, for the tests'
+    /// fake vCPUs, which serve no work.
     ///
-    /// Returns how long it stayed parked, zero when it did not park. A vCPU
-    /// thread calls it between guest entries, where its registers and the
-    /// memory it has written are stable.
+    /// Returns how long it stayed parked, zero when it did not park.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn checkpoint(&self) -> Duration {
         self.quiesce.checkpoint()
+    }
+
+    /// Parks the calling vCPU thread, `cpu`, while a quiesce is in effect,
+    /// and carries out through `serve` any work posted to it meanwhile.
+    ///
+    /// A vCPU thread calls it between guest entries, where its registers and
+    /// the memory it has written are stable. `serve` is the backend's: it
+    /// runs on this thread, so it may read and write this vCPU's registers.
+    /// Work posted before the vCPU parks is done before it waits, and work
+    /// posted while it waits wakes it, so the requester finds every parked
+    /// vCPU done whichever came first. Returns how long the vCPU stayed
+    /// parked, the work included, zero when it did not park.
+    #[must_use]
+    pub(crate) fn checkpoint_with(
+        &self,
+        cpu: u32,
+        mut serve: impl FnMut(Work<'_>) -> io::Result<Option<VcpuState>>,
+    ) -> Duration {
+        let Some(due) = self.work_due.get(cpu as usize) else {
+            return self.quiesce.checkpoint();
+        };
+        self.quiesce.checkpoint_serving(
+            || due.load(Ordering::SeqCst),
+            || self.serve(cpu, due, &mut serve),
+        )
+    }
+
+    /// Carries out the work due on vCPU `cpu` and records its result.
+    fn serve(
+        &self,
+        cpu: u32,
+        due: &AtomicBool,
+        serve: &mut impl FnMut(Work<'_>) -> io::Result<Option<VcpuState>>,
+    ) {
+        if !due.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let (request, generation) = {
+            let table = lock_or_recover(&self.work);
+            (table.request.clone(), table.generation)
+        };
+        let outcome = match &request {
+            None => return,
+            Some(WorkRequest::Export) => serve(Work::Export),
+            Some(WorkRequest::Import(states)) => match states.get(cpu as usize) {
+                Some(state) => serve(Work::Import(state)),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("no state for vCPU {cpu}"),
+                )),
+            },
+        };
+        let result = match outcome {
+            Ok(state) => WorkResult::Done(state.map(Box::new)),
+            Err(e) => WorkResult::Failed(e.to_string()),
+        };
+        let mut table = lock_or_recover(&self.work);
+        if table.generation == generation {
+            if let Some(slot) = table.results.get_mut(cpu as usize) {
+                *slot = Some(result);
+            }
+            self.work_done.notify_all();
+        }
+    }
+
+    /// Asks every vCPU to export its state at its checkpoint, and wakes the
+    /// ones parked already.
+    ///
+    /// The caller holds the vCPUs paused, or is about to, and collects the
+    /// states with [`wait_work`](Self::wait_work) and
+    /// [`end_work`](Self::end_work).
+    pub(crate) fn request_export(&self) {
+        self.post(WorkRequest::Export);
+    }
+
+    /// Asks every vCPU to load its own state from `states`, by index, at its
+    /// checkpoint, and wakes the ones parked already.
+    // `hvi restore` is the caller; until it exists, only the tests are.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn request_import(&self, states: Vec<VcpuState>) {
+        self.post(WorkRequest::Import(Arc::new(states)));
+    }
+
+    /// Posts `request` to every vCPU and wakes the parked ones.
+    fn post(&self, request: WorkRequest) {
+        {
+            let mut table = lock_or_recover(&self.work);
+            table.request = Some(request);
+            table.generation += 1;
+            table.results = vec![None; self.count as usize];
+        }
+        for due in &self.work_due {
+            due.store(true, Ordering::SeqCst);
+        }
+        self.quiesce.wake();
+    }
+
+    /// Waits until every started vCPU has a result for the posted work.
+    ///
+    /// The number of started vCPUs is read again as each result comes in, so
+    /// a secondary that starts during the wait is waited for too. A vCPU that
+    /// has not started has no result, and [`end_work`](Self::end_work) says
+    /// so.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the VM stops or the results are not all in by `timeout`.
+    pub(crate) fn wait_work(&self, timeout: Duration) -> Result<(), PauseError> {
+        let deadline = Instant::now() + timeout;
+        let mut table = lock_or_recover(&self.work);
+        loop {
+            if !self.is_running() {
+                return Err(PauseError::Stopped);
+            }
+            let done = table.results.iter().filter(|r| r.is_some()).count() as u32;
+            let expected = self.started();
+            if done >= expected {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(PauseError::Timeout {
+                    parked: done,
+                    expected,
+                });
+            }
+            // A stop notifies no one here, so the wait is cut into slices.
+            table = self
+                .work_done
+                .wait_timeout(table, left.min(Duration::from_millis(50)))
+                .map_or_else(|e| e.into_inner().0, |(table, _)| table);
+        }
+    }
+
+    /// Ends the posted work and returns each vCPU's result, by index.
+    ///
+    /// A vCPU that had not taken the work by now is reported
+    /// [`NotStarted`](WorkResult::NotStarted), and a result it records later
+    /// is dropped.
+    pub(crate) fn end_work(&self) -> Vec<WorkResult> {
+        for due in &self.work_due {
+            due.store(false, Ordering::SeqCst);
+        }
+        let mut table = lock_or_recover(&self.work);
+        table.request = None;
+        table.generation += 1;
+        std::mem::take(&mut table.results)
+            .into_iter()
+            .map(|r| r.unwrap_or(WorkResult::NotStarted))
+            .collect()
     }
 
     /// Parks every started vCPU but the calling one at its next checkpoint.
@@ -983,6 +1183,175 @@ mod tests {
             vcpus.pause_from_control(Duration::from_millis(10)),
             Err(PauseError::Stopped)
         );
+    }
+
+    /// Spawns fake vCPU `cpu`, started, which parks at every checkpoint
+    /// and serves work with `serve`.
+    fn serving_vcpu(
+        vcpus: &Arc<Vcpus<CountingKicker>>,
+        cpu: u32,
+        serve: fn(u32, Work<'_>) -> io::Result<Option<VcpuState>>,
+    ) -> JoinHandle<()> {
+        vcpus.mark_started(vcpus.started());
+        let vcpus = Arc::clone(vcpus);
+        std::thread::spawn(move || {
+            while vcpus.is_running() {
+                let _ = vcpus.checkpoint_with(cpu, |work| serve(cpu, work));
+                std::thread::yield_now();
+            }
+        })
+    }
+
+    fn export(cpu: u32, work: Work<'_>) -> io::Result<Option<VcpuState>> {
+        use crate::plugin::{GuestArch, RegsView};
+        let view = RegsView {
+            pc: 0x1000 + u64::from(cpu),
+            ..RegsView::default()
+        };
+        match work {
+            Work::Export => Ok(Some(VcpuState::from_regs_view(
+                GuestArch::Aarch64,
+                "test",
+                cpu,
+                &view,
+            ))),
+            Work::Import(state) if state.id() == cpu => Ok(None),
+            Work::Import(state) => Err(io::Error::other(format!(
+                "vCPU {cpu} was handed the state of vCPU {}",
+                state.id()
+            ))),
+        }
+    }
+
+    fn exported(results: &[WorkResult]) -> Vec<u32> {
+        results
+            .iter()
+            .map(|r| match r {
+                WorkResult::Done(Some(state)) => state.id(),
+                other => panic!("not an export: {other:?}"),
+            })
+            .collect()
+    }
+
+    // The vCPUs are parked before the export is asked for, as when a client
+    // pauses and then checkpoints. Work checked only on the way into a park
+    // would never reach them.
+    #[test]
+    fn parked_vcpus_export_when_asked() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let threads = [
+            serving_vcpu(&vcpus, 0, export),
+            serving_vcpu(&vcpus, 1, export),
+        ];
+        vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
+        vcpus.request_export();
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        assert_eq!(exported(&vcpus.end_work()), [0, 1]);
+        assert_eq!(vcpus.parked(), 2, "a vCPU left its park to export");
+        vcpus.resume_from_control().unwrap();
+        vcpus.stop();
+        for thread in threads {
+            assert!(exits(&thread));
+        }
+    }
+
+    // The export is asked for first and the vCPUs park afterwards, each
+    // exporting on its way in.
+    #[test]
+    fn vcpus_export_as_they_park() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let threads = [
+            serving_vcpu(&vcpus, 0, export),
+            serving_vcpu(&vcpus, 1, export),
+        ];
+        vcpus.request_export();
+        vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        assert_eq!(exported(&vcpus.end_work()), [0, 1]);
+        vcpus.resume_from_control().unwrap();
+        vcpus.stop();
+        for thread in threads {
+            assert!(exits(&thread));
+        }
+    }
+
+    // A secondary the guest has not brought up has no thread at a checkpoint,
+    // so the wait must not wait for it, and it is reported as such.
+    #[test]
+    fn a_vcpu_that_never_started_is_reported_not_started() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let first = serving_vcpu(&vcpus, 0, export);
+        vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
+        vcpus.request_export();
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        let results = vcpus.end_work();
+        assert!(matches!(&results[0], WorkResult::Done(Some(s)) if s.id() == 0));
+        assert_eq!(results[1], WorkResult::NotStarted);
+        vcpus.stop();
+        assert!(exits(&first));
+    }
+
+    #[test]
+    fn each_vcpu_imports_its_own_state() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let threads = [
+            serving_vcpu(&vcpus, 0, export),
+            serving_vcpu(&vcpus, 1, export),
+        ];
+        vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
+        let states = (0..2)
+            .map(|cpu| export(cpu, Work::Export).unwrap().unwrap())
+            .collect();
+        vcpus.request_import(states);
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            vcpus.end_work(),
+            [WorkResult::Done(None), WorkResult::Done(None)]
+        );
+        vcpus.stop();
+        for thread in threads {
+            assert!(exits(&thread));
+        }
+    }
+
+    #[test]
+    fn a_failed_export_is_reported_with_its_reason() {
+        fn refuse(_: u32, _: Work<'_>) -> io::Result<Option<VcpuState>> {
+            Err(io::Error::other("register read failed"))
+        }
+        let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));
+        let vcpu = serving_vcpu(&vcpus, 0, refuse);
+        vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
+        vcpus.request_export();
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            vcpus.end_work(),
+            [WorkResult::Failed("register read failed".into())]
+        );
+        vcpus.stop();
+        assert!(exits(&vcpu));
+    }
+
+    // A started vCPU that never reaches a checkpoint never exports, and the
+    // wait must say so in time rather than hang the control thread.
+    #[test]
+    fn the_wait_for_work_times_out() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let first = serving_vcpu(&vcpus, 0, export);
+        vcpus.mark_started(vcpus.started());
+        vcpus.request_export();
+        let started = Instant::now();
+        assert_eq!(
+            vcpus.wait_work(Duration::from_millis(100)),
+            Err(PauseError::Timeout {
+                parked: 0,
+                expected: 2
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        vcpus.end_work();
+        vcpus.stop();
+        assert!(exits(&first));
     }
 
     #[test]
