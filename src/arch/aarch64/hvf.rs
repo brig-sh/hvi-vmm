@@ -847,7 +847,12 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     });
     let (vm, irqchip) = create_vm(&gic, portable.clone())?;
     let (shared_ram, ram) = map_ram(ram_size)?;
-    opened.bundle.load_ram(&ram)?;
+    // ram.bin is hashed here, as it is copied, and refused like the open
+    // refuses a component: named with the bundle.
+    opened
+        .bundle
+        .load_ram(&ram)
+        .map_err(|e| format!("{}: {e}", cfg.from))?;
 
     // The devices, from their state, over this host's resources.
     let rebuild::Devices {
