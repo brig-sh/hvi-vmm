@@ -1566,7 +1566,7 @@ impl IoStart {
             if let Some(test) = hvitime::TestRestore::from_env() {
                 let (device, vcpus) = (Arc::clone(device), Arc::clone(&shared.guest.vcpus));
                 io_threads.spawn("hvi-time test restore", move |_| {
-                    test.run(&device, &vcpus);
+                    test.run(&device, &vcpus, || {});
                 });
             }
         }
