@@ -124,8 +124,9 @@ pub enum ErrorCode {
     /// The profile is not complete yet: the boot vCPU has not started.
     NotReady,
     /// The checkpoint cannot be taken as asked: no checkpoint root, a
-    /// directory outside it or in use, or a guest with virtio-fs shares. The
-    /// VM was not paused.
+    /// directory outside it or in use, a guest with virtio-fs shares, or one
+    /// of a machine profile no backend checkpoints yet. The VM was not
+    /// paused.
     Refused,
     /// The capture failed after the VM was paused; the VM runs on, or stays
     /// paused if it was paused before.

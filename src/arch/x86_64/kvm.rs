@@ -773,6 +773,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         |vcpu, work| {
             crate::checkpoint::cpu::serve_from_regs_view(sh.guest.arch, "kvm", cpu_id, vcpu, work)
         },
+        || ControlFlow::Continue(()),
         |exit| {
             // The trace reads registers through the vCPU's second handle, since
             // the exit borrows the one the run uses.

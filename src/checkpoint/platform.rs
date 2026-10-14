@@ -20,13 +20,18 @@
 //! | section | kind | written by |
 //! |---|---|---|
 //! | `irq` | `hv-gic-v3` | HVF's in-kernel GICv3 (`hv_gic`): [`GicV3State`] |
+//! | `irq` | `gicv2` | the portable profile's GICv2: [`Gicv2State`] |
 //! | `timer` | `arch-timer` | the architected counter: [`ArchTimerState`] |
-//! | either | `not-captured` | a backend that does not read it yet (KVM) |
+//! | `timer` | `hvi-time` | the portable profile's clock: [`HviTimeState`] |
+//! | either | `not-captured` | a backend that does not read it (KVM's vGICv3) |
 //!
-//! The portable profile adds `gicv2` and `hvi-time` beside them. A
-//! `not-captured` section is a marker with the reason, so a bundle says what
-//! it lacks instead of holding a default a restore could mistake for the
-//! real thing, and a restore refuses it.
+//! Both backends write `gicv2` and `hvi-time` for the portable profile: HVF
+//! from its software GICv2, KVM from its vGICv2 with the line levels hvi's
+//! devices hold (`arch::aarch64::vgicv2`), in the one canonical form, so a
+//! bundle from either loads on the other. KVM's native vGICv3 is not read,
+//! and is written `not-captured`. A `not-captured` section is a marker with
+//! the reason, so a bundle says what it lacks instead of holding a default
+//! a restore could mistake for the real thing, and a restore refuses it.
 //!
 //! The canonical GICv3 registers are what a later import on another backend
 //! would consume. HVF restores its own GIC from the opaque `hv_gic_state`
@@ -40,6 +45,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::cpu::{arch_name, MAX_VCPUS};
 use crate::checkpoint::profile::sha256_hex;
+use crate::devices::gicv2::Gicv2State;
+use crate::devices::hvitime::HviTimeState;
 use crate::plugin::GuestArch;
 
 /// The [`PlatformState`] format this build writes and reads.
@@ -71,6 +78,10 @@ pub enum IrqState {
     /// HVF's in-kernel GICv3.
     #[serde(rename = "hv-gic-v3")]
     HvGicV3(Box<GicV3State>),
+    /// The portable profile's GICv2, in the form both backends would read
+    /// and write.
+    #[serde(rename = "gicv2")]
+    Gicv2(Box<Gicv2State>),
 }
 
 impl IrqState {
@@ -80,6 +91,7 @@ impl IrqState {
         match self {
             Self::NotCaptured { .. } => "not-captured",
             Self::HvGicV3(_) => "hv-gic-v3",
+            Self::Gicv2(_) => "gicv2",
         }
     }
 }
@@ -196,6 +208,9 @@ pub enum TimerState {
     /// The architected generic timer, `CNTVCT_EL0`.
     #[serde(rename = "arch-timer")]
     ArchTimer(ArchTimerState),
+    /// The portable profile's `hvi-time` device.
+    #[serde(rename = "hvi-time")]
+    HviTime(Box<HviTimeState>),
 }
 
 impl TimerState {
@@ -205,6 +220,7 @@ impl TimerState {
         match self {
             Self::NotCaptured { .. } => "not-captured",
             Self::ArchTimer(_) => "arch-timer",
+            Self::HviTime(_) => "hvi-time",
         }
     }
 }
@@ -376,13 +392,27 @@ impl PlatformState {
     ///
     /// Errors with the first thing that does not hold.
     pub fn check(&self, vcpus: u32) -> Result<(), String> {
-        if let IrqState::HvGicV3(gic) = &self.irq {
-            gic.check(vcpus)?;
+        match &self.irq {
+            IrqState::HvGicV3(gic) => gic.check(vcpus)?,
+            IrqState::Gicv2(gic) => gic
+                .check_shape(vcpus as usize)
+                .map_err(|e| format!("irq: {e}"))?,
+            IrqState::NotCaptured { .. } => {}
         }
-        if let TimerState::ArchTimer(timer) = &self.timer {
-            if timer.counter_freq_hz == 0 {
+        match &self.timer {
+            TimerState::ArchTimer(timer) if timer.counter_freq_hz == 0 => {
                 return Err("timer: counter_freq_hz is 0".to_string());
             }
+            TimerState::HviTime(time) if time.page.counter_freq_hz == 0 => {
+                return Err("timer: page.counter_freq_hz is 0".to_string());
+            }
+            TimerState::HviTime(time) if time.cpus.len() != vcpus as usize => {
+                return Err(format!(
+                    "timer: {} vCPU timers, and the machine has {vcpus}",
+                    time.cpus.len()
+                ));
+            }
+            _ => {}
         }
         if let Some(adjunct) = &self.backend_adjunct {
             adjunct
@@ -718,6 +748,70 @@ pub(crate) mod tests {
             host_monotonic_at_capture_ns: 0,
         });
         assert!(freq.check(1).unwrap_err().contains("counter_freq_hz is 0"));
+    }
+
+    /// An `hvi-time` state of `vcpus` vCPUs, one with a deadline armed.
+    pub(crate) fn hvi_time(vcpus: usize) -> HviTimeState {
+        HviTimeState {
+            page: crate::devices::hvitime::PageState {
+                generation: 2,
+                counter_freq_hz: 54_000_000,
+                base_counter: 10,
+                base_ns: 0,
+                mult: 310_689_185,
+                shift: 24,
+                wall_ns: 1_000,
+                downtime_total_ns: 0,
+            },
+            guest_ns_at_capture: 5_000,
+            counter_at_capture: 280,
+            cpus: (0..vcpus)
+                .map(|cpu| crate::devices::hvitime::CpuTimerState {
+                    deadline_ns: (cpu == 0).then_some(9_000),
+                    status: 0,
+                    ctrl: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// The portable profile's kinds read back as written, and are checked
+    /// against the machine like the others, so a restore can name them.
+    #[test]
+    fn the_portable_kinds_read_back_and_are_checked() {
+        let state = PlatformState {
+            irq: IrqState::Gicv2(Box::new(crate::devices::gicv2::Gicv2::new(2).state())),
+            timer: TimerState::HviTime(Box::new(hvi_time(2))),
+            ..PlatformState::not_captured(GuestArch::Aarch64, "hvf")
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""irq":{"kind":"gicv2","dist":{"#), "{json}");
+        assert!(
+            json.contains(r#""timer":{"kind":"hvi-time","page":{"#),
+            "{json}"
+        );
+        assert_eq!(state.irq.kind(), "gicv2");
+        assert_eq!(state.timer.kind(), "hvi-time");
+        assert!(!state.is_partial());
+        assert_eq!(PlatformState::from_json(json.as_bytes()).unwrap(), state);
+        assert_eq!(state.check(2), Ok(()));
+        assert!(state
+            .check(1)
+            .unwrap_err()
+            .contains("GICv2 state has 2 CPUs"));
+        let timer_only = PlatformState {
+            irq: IrqState::NotCaptured { reason: "x".into() },
+            ..state.clone()
+        };
+        assert!(timer_only
+            .check(1)
+            .unwrap_err()
+            .contains("2 vCPU timers, and the machine has 1"));
+        let extra = json.replace(
+            r#""guest_ns_at_capture""#,
+            r#""extra":1,"guest_ns_at_capture""#,
+        );
+        assert!(PlatformState::from_json(extra.as_bytes()).is_err());
     }
 
     #[test]

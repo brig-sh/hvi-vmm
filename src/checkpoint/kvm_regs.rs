@@ -409,7 +409,8 @@ pub fn size_of(id: u64) -> usize {
 
 /// The system registers of the canonical table a portable guest's KVM vCPU
 /// does not have, because the baseline hides their feature: a state from
-/// HVF may hold them, and a KVM restore drops them.
+/// HVF holds them, and a KVM restore drops them when they are 0, as every
+/// one is on HVF for a portable guest (measured on an M5 Pro).
 ///
 /// The pointer-authentication keys (`ID_AA64ISAR1_EL1` hides PAuth, and the
 /// guest runs with `arm64.nopauth`), `SCXTNUM_EL0/1` (`ID_AA64PFR0_EL1.CSV2`

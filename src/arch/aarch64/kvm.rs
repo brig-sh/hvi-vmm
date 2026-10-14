@@ -74,6 +74,7 @@ use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::arch::aarch64::vgicv2::{self, Bank, Lines, VgicV2};
 use crate::checkpoint::capture::Console;
 use crate::checkpoint::cpu::{Output, VcpuState, Work};
+use crate::checkpoint::platform::{IrqState, PlatformState, TimerState, PLATFORM_STATE_VERSION};
 use crate::checkpoint::profile::{hex, host_page_size, MachineProfile, ProfileCell, UNKNOWN};
 use crate::config::{BootConfig, MachineProfileKind, Stop};
 use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, TimerLine};
@@ -303,6 +304,10 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
     /// The portable guest's `hvi-time`, or `None` on the native machine.
     hvitime: Option<Arc<HviTime>>,
+    /// The VM, for the vGIC's lines.
+    vm: Arc<VmFd>,
+    /// The in-kernel vGIC, whose state a portable checkpoint reads.
+    gic: Arc<DeviceFd>,
 }
 
 /// The portable guest's counter: the host's virtual counter less the VM's
@@ -875,6 +880,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         fs: Arc::new(fs),
         plugin: cfg.plugin.clone(),
         hvitime,
+        vm: Arc::clone(&vm),
+        gic: Arc::clone(&gicfd),
     };
 
     // Each device sets its own interrupt line, from the methods that change its
@@ -1159,6 +1166,7 @@ fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd) -> Result<u64, String
 
 /// Runs one vCPU until the VM stops, servicing its MMIO exits.
 fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
+    let read_platform = std::cell::Cell::new(false);
     if cpu_id == 0 {
         // Guest nanoseconds start at 0 at the boot vCPU's first entry.
         if let Some(device) = &sh.hvitime {
@@ -1171,7 +1179,20 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         kick_handle,
         &sh.guest,
         sh.plugin.as_deref(),
-        |vcpu, work| serve(&sh, cpu_id, vcpu, work),
+        |vcpu, work| {
+            read_platform.set(read_platform.get() || matches!(work, Work::ExportPlatform));
+            serve(&sh, cpu_id, vcpu, work)
+        },
+        || {
+            // A capture froze hvi-time to read it. A guest that goes on
+            // after it, as `then: "continue"` has it, gets its timers back.
+            if read_platform.replace(false) {
+                if let Some(device) = &sh.hvitime {
+                    device.thaw();
+                }
+            }
+            ControlFlow::Continue(())
+        },
         |exit| {
             match exit {
                 VcpuExit::MmioRead(addr, data) => on_mmio(&sh, addr, true, data),
@@ -1192,16 +1213,47 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
 }
 
 /// Carries out the control socket's `work` for vCPU `cpu`, parked on its
-/// own thread: its whole state by name (see `kvm_state`).
+/// own thread: its whole state by name (see `kvm_state`), and on vCPU 0 of
+/// a portable guest the platform, once every vCPU has exported.
 ///
-/// A KVM restore loads every vCPU before any thread runs, so there is no
-/// import here.
-fn serve(_sh: &Shared, cpu: u32, vcpu: &VcpuFd, work: Work<'_>) -> std::io::Result<Option<Output>> {
+/// The portable platform is the vGICv2, read in the canonical form with
+/// the line levels hvi's devices hold, and `hvi-time`, read frozen so no
+/// timer fires between the two; the caller thaws it if the guest goes on.
+/// The native machine's vGICv3 is not read, and its platform is written as
+/// not captured. A KVM restore loads every vCPU before any thread runs, so
+/// there is no import here.
+fn serve(sh: &Shared, cpu: u32, vcpu: &VcpuFd, work: Work<'_>) -> std::io::Result<Option<Output>> {
     match work {
         Work::Export => Ok(Some(Output::Vcpu {
             state: VcpuState::Aarch64(kvm_state::export(cpu, vcpu)?),
             irq: None,
         })),
+        Work::ExportPlatform if cpu == 0 => {
+            let Some(device) = &sh.hvitime else {
+                return Ok(None);
+            };
+            device.freeze();
+            let timer = device.state();
+            let ncpu = device.vcpus();
+            let vgic = KvmVgic {
+                gic: &sh.gic,
+                vm: &sh.vm,
+                ncpu,
+            };
+            let irq = vgicv2::export(&vgic, &device_lines(sh, ncpu))
+                .map_err(|e| std::io::Error::other(format!("the vGICv2: {e}")))?;
+            Ok(Some(Output::Platform {
+                platform: PlatformState {
+                    version: PLATFORM_STATE_VERSION,
+                    arch: "aarch64".to_string(),
+                    backend: "kvm".to_string(),
+                    irq: IrqState::Gicv2(Box::new(irq)),
+                    timer: TimerState::HviTime(Box::new(timer)),
+                    backend_adjunct: None,
+                },
+                capabilities: Vec::new(),
+            }))
+        }
         Work::ExportPlatform => Ok(None),
         Work::Import(..) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

@@ -42,12 +42,15 @@ use crate::checkpoint::cpu::{
     aarch64_reg_names, parse_simd, simd_hex, Aarch64Vcpu, Hex64, ImportStep, Need, Output, Power,
     VcpuState, VcpuTimer, Work, AARCH64_SYSREGS,
 };
+use crate::checkpoint::kvm_regs::{firmware_view, fixed_named, Check, PORTABLE_HVF_FIRMWARE};
 use crate::checkpoint::platform::{
     Adjunct, ArchTimerState, GicV3Dist, GicV3Icc, GicV3Redist, GicV3State, IrqCpuState, IrqState,
     PlatformState, TimerState, GICV3_MAX_INTIDS, HVF_GIC_STATE, HVF_GIC_STATE_CAPABILITY,
     PLATFORM_STATE_VERSION,
 };
 use crate::checkpoint::profile::counter_freq_hz;
+use crate::devices::gicv2::Gicv2;
+use crate::devices::hvitime::HviTime;
 
 /// The VM handle once the GICv3 is configured.
 type VmGic = VirtualMachineInstance<GicEnabled>;
@@ -155,6 +158,7 @@ fn import_vcpu(cpu: u32, vcpu: &Vcpu, state: &VcpuState) -> io::Result<Option<Ou
     if state.power != Power::On {
         return Ok(None);
     }
+    check_kvm_parts(state)?;
     let get = |name: &str| {
         state
             .regs
@@ -197,6 +201,109 @@ fn import_vcpu(cpu: u32, vcpu: &Vcpu, state: &VcpuState) -> io::Result<Option<Ou
             .map_err(|e| failed("the vtimer mask", e))?;
     }
     Ok(None)
+}
+
+/// Checks what a KVM vCPU recorded beside its registers against what a
+/// portable guest on HVF sees, since HVF has no such registers to load: its
+/// firmware answers, the registers only KVM has, and a pending SError or
+/// abort, which HVF cannot make pending. A state HVF wrote has none of
+/// them.
+fn check_kvm_parts(state: &Aarch64Vcpu) -> io::Result<()> {
+    let cpu = state.id;
+    for (name, value) in &state.firmware {
+        let here = PORTABLE_HVF_FIRMWARE
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, v)| *v);
+        if here.map(|v| firmware_view(name, v)) != Some(firmware_view(name, value.0)) {
+            return Err(io::Error::other(format!(
+                "vCPU {cpu}: firmware register {name} was {:#x} at the capture, and hvi's \
+                 firmware here answers as {}",
+                value.0,
+                here.map_or_else(|| "nothing".to_string(), |v| format!("{v:#x}"))
+            )));
+        }
+    }
+    for (name, value) in &state.fixed {
+        let Some(Check::Fixed { mask, hvf, .. }) = fixed_named(name) else {
+            return Err(io::Error::other(format!(
+                "vCPU {cpu}: unknown fixed register {name}"
+            )));
+        };
+        if value.0 & mask != hvf & mask {
+            return Err(io::Error::other(format!(
+                "vCPU {cpu}: {name} was {:#x} at the capture, and a guest here sees {hvf:#x}",
+                value.0
+            )));
+        }
+    }
+    if state.events.is_some_and(|e| e.any()) {
+        return Err(io::Error::other(format!(
+            "vCPU {cpu}: an SError or external abort is pending, which HVF cannot make \
+             pending"
+        )));
+    }
+    Ok(())
+}
+
+/// Carries out `work` for portable vCPU `cpu`, whose thread this is: the
+/// vCPU's registers as on the native machine, and on vCPU 0 the software
+/// GICv2 `gic` and the `hvi-time` device, which hvi holds itself.
+///
+/// The platform is read with the device frozen, so no timer fires between
+/// its state and the GIC's; the caller thaws it if the guest goes on. A
+/// restore loads the GIC in the platform step and leaves `hvi-time` to the
+/// guest's resume, when its page is published.
+///
+/// # Errors
+///
+/// As [`serve`].
+pub(crate) fn serve_portable(
+    cpu: u32,
+    vcpu: &Vcpu,
+    gic: &std::sync::Mutex<Gicv2>,
+    hvitime: &HviTime,
+    work: Work<'_>,
+) -> io::Result<Option<Output>> {
+    match work {
+        Work::Export => Ok(Some(Output::Vcpu {
+            state: export_vcpu_state(cpu, vcpu)?,
+            irq: None,
+        })),
+        Work::ExportPlatform if cpu == 0 => {
+            hvitime.freeze();
+            let timer = hvitime.state();
+            let irq = gic.lock().unwrap().state();
+            Ok(Some(Output::Platform {
+                platform: PlatformState {
+                    version: PLATFORM_STATE_VERSION,
+                    arch: "aarch64".to_string(),
+                    backend: "hvf".to_string(),
+                    irq: IrqState::Gicv2(Box::new(irq)),
+                    timer: TimerState::HviTime(Box::new(timer)),
+                    backend_adjunct: None,
+                },
+                capabilities: Vec::new(),
+            }))
+        }
+        Work::Import(ImportStep::Platform, plan) if cpu == 0 => {
+            let IrqState::Gicv2(state) = &plan.platform.irq else {
+                return Err(io::Error::other(format!(
+                    "the interrupt controller is {}, not gicv2",
+                    plan.platform.irq.kind()
+                )));
+            };
+            gic.lock()
+                .unwrap()
+                .restore(state)
+                .map_err(io::Error::other)?;
+            Ok(None)
+        }
+        Work::ExportPlatform | Work::Import(ImportStep::Platform | ImportStep::IrqCpu, _) => {
+            Ok(None)
+        }
+        Work::Import(ImportStep::Vcpu, plan) => import_vcpu(cpu, vcpu, &plan.vcpus[cpu as usize]),
+    }
 }
 
 /// Loads the GIC from the `hv_gic_state` blob, on vCPU 0's thread, once
@@ -262,6 +369,14 @@ fn failed(what: &str, e: impl std::fmt::Debug) -> io::Error {
 
 /// Reads vCPU `cpu`'s whole state and its part of the GIC.
 fn export_vcpu(cpu: u32, vcpu: &Vcpu) -> io::Result<Output> {
+    Ok(Output::Vcpu {
+        state: export_vcpu_state(cpu, vcpu)?,
+        irq: Some(export_gic_cpu(cpu, vcpu)?),
+    })
+}
+
+/// Reads vCPU `cpu`'s whole state.
+fn export_vcpu_state(cpu: u32, vcpu: &Vcpu) -> io::Result<VcpuState> {
     // The GIC blob may hold each vCPU's state by the framework's number, and
     // a restore creates vCPU n as number n. See `hvf::CreateOrder`.
     if vcpu.id() != u64::from(cpu) {
@@ -333,10 +448,7 @@ fn export_vcpu(cpu: u32, vcpu: &Vcpu) -> io::Result<Output> {
         unavailable,
         partial: false,
     });
-    Ok(Output::Vcpu {
-        state,
-        irq: Some(export_gic_cpu(cpu, vcpu)?),
-    })
+    Ok(state)
 }
 
 /// Reads vCPU `cpu`'s GICv3 redistributor and CPU interface.
