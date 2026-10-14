@@ -393,9 +393,7 @@ pub(crate) fn import(
                             })
                         });
                         match want {
-                            Some(want)
-                                if crate::checkpoint::kvm_regs::firmware_view(name, want)
-                                    == crate::checkpoint::kvm_regs::firmware_view(name, have) => {}
+                            Some(want) if want == have => {}
                             Some(want) => {
                                 return Err(fail(format!(
                                     "firmware register {name} is {have:#x} here and was \

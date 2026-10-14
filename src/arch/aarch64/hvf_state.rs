@@ -42,7 +42,7 @@ use crate::checkpoint::cpu::{
     aarch64_reg_names, parse_simd, simd_hex, Aarch64Vcpu, Hex64, ImportStep, Need, Output, Power,
     VcpuState, VcpuTimer, Work, AARCH64_SYSREGS,
 };
-use crate::checkpoint::kvm_regs::{firmware_view, fixed_named, Check, PORTABLE_HVF_FIRMWARE};
+use crate::checkpoint::kvm_regs::{fixed_named, Check, PORTABLE_HVF_FIRMWARE};
 use crate::checkpoint::platform::{
     Adjunct, ArchTimerState, GicV3Dist, GicV3Icc, GicV3Redist, GicV3State, IrqCpuState, IrqState,
     PlatformState, TimerState, GICV3_MAX_INTIDS, HVF_GIC_STATE, HVF_GIC_STATE_CAPABILITY,
@@ -215,7 +215,7 @@ fn check_kvm_parts(state: &Aarch64Vcpu) -> io::Result<()> {
             .iter()
             .find(|(known, _)| known == name)
             .map(|(_, v)| *v);
-        if here.map(|v| firmware_view(name, v)) != Some(firmware_view(name, value.0)) {
+        if here != Some(value.0) {
             return Err(io::Error::other(format!(
                 "vCPU {cpu}: firmware register {name} was {:#x} at the capture, and hvi's \
                  firmware here answers as {}",
