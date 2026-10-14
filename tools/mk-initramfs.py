@@ -28,6 +28,8 @@ open on fd 3 after unlinking it, and writes and syncs a file on an ext4
 /dev/vda when there is one. When /tmp/go appears (the script types `touch
 /tmp/go` on the console after the restore) the loop prints its count, reads
 fd 3 and the disk file, writes and syncs a second file, and times a sleep 5.
+Beside it, a CPU-bound awk at the lowest priority adds 0.25 to a double,
+checks it against its count, and prints both every 500000 additions.
 
 The tarball is fetched once and cached (default: alongside --out).
 """
@@ -77,6 +79,15 @@ KEEP_ALIVE_TAIL = b"""/bin/busybox echo "HVI-INITRAMFS-UP"
 # Everything it checks lives in the loop's own process: the count in a shell
 # variable, and the unlinked file on fd 3, so only a guest that kept that
 # process's memory and descriptors can print them after a restore.
+#
+# The awk loop is there for the registers a shell that sleeps hardly uses.
+# It never sleeps, so at a capture it is most likely on a vCPU, with its
+# floating-point registers and its thread pointer (TPIDR_EL0, which musl
+# reads for every lock) live in that vCPU rather than saved by the guest
+# kernel. Its sums are exact in a double, so a value the restore changed
+# shows as an FP-BAD line, a count that does not go on, or no FP line at
+# all. It is a likely catch, not a certain one: the capture may find it
+# off the vCPU, or between uses of a register.
 CHECKPOINT_WORKLOAD = b"""# Checkpoint workload (--checkpoint-workload).
 /bin/busybox echo "HVI-WORKLOAD-BOOT"
 if [ -b /dev/vda ]; then
@@ -87,6 +98,14 @@ if [ -b /dev/vda ]; then
 		/bin/busybox echo "DISK-READY $(/bin/busybox cat /mnt/before)"
 	fi
 fi
+/bin/busybox nice -n 19 /bin/busybox awk 'BEGIN {
+	x = 0
+	for (n = 1; ; n++) {
+		x += 0.25
+		if (x != n * 0.25) { printf "FP-BAD %d %.17g\\n", n, x; exit 1 }
+		if (n % 500000 == 0) { printf "FP %d %.17g\\n", n, x; fflush() }
+	}
+}' &
 (
 	/bin/busybox echo "kept open after unlink" > /tmp/unlinked
 	exec 3< /tmp/unlinked
