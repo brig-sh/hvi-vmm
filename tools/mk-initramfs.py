@@ -13,7 +13,7 @@ Usage:
     tools/mk-initramfs.py [--out target/initramfs.cpio]
                           [--alpine-version 3.20.10] [--cache <dir>]
                           [--keep-alive SECS] [--net-static ADDR/PLEN,GW]
-                          [--checkpoint-workload]
+                          [--checkpoint-workload] [--add FILE]...
 
 --keep-alive replaces the shell with a "HVI-INITRAMFS-UP" line, a sleep of
 SECS and a power-off, for an unattended run such as CI. --net-static replaces
@@ -30,6 +30,14 @@ open on fd 3 after unlinking it, and writes and syncs a file on an ext4
 fd 3 and the disk file, writes and syncs a second file, and times a sleep 5.
 Beside it, a CPU-bound awk at the lowest priority adds 0.25 to a double,
 checks it against its count, and prints both every 500000 additions.
+When the image holds /el0check (the portable kernel's test/el0check.c,
+built static), the workload runs it at boot and again on /tmp/go, and
+prints the guest's clocksource and hvi-time's migration log lines, for
+tools/checkpoint-e2e.sh --portable.
+
+--add FILE puts FILE at /<its name> in the image, executable; it may be
+given more than once. checkpoint-e2e.sh uses it for /el0check and for /tfd
+(tools/guest/tfd.c, a timer armed across a checkpoint).
 
 The tarball is fetched once and cached (default: alongside --out).
 """
@@ -98,6 +106,11 @@ if [ -b /dev/vda ]; then
 		/bin/busybox echo "DISK-READY $(/bin/busybox cat /mnt/before)"
 	fi
 fi
+# The portable profile's clock: what el0check reads, and the clocksource.
+if [ -x /el0check ]; then
+	/el0check --no-poweroff | /bin/busybox grep -E "PASS|FAIL|snapshot1"
+	/bin/busybox echo "CLOCKSOURCE $(/bin/busybox cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+fi
 /bin/busybox nice -n 19 /bin/busybox awk 'BEGIN {
 	x = 0
 	for (n = 1; ; n++) {
@@ -123,6 +136,11 @@ fi
 				/bin/busybox echo "written-after $n" > /mnt/after
 				/bin/busybox sync
 				/bin/busybox echo "DISK-AFTER $(/bin/busybox cat /mnt/after)"
+			fi
+			if [ -x /el0check ]; then
+				/el0check --no-poweroff | /bin/busybox grep -E "PASS|FAIL|snapshot1"
+				/bin/busybox echo "CLOCKSOURCE $(/bin/busybox cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+				/bin/busybox dmesg | /bin/busybox grep "hvi-time: generation" | /bin/busybox sed 's/^/MIGRATION /'
 			fi
 			/bin/busybox echo "SLEEP-START $(/bin/busybox cut -d' ' -f1 /proc/uptime)"
 			/bin/busybox sleep 5
@@ -198,7 +216,7 @@ class CpioWriter:
         return bytes(self.buf)
 
 
-def build(tar_bytes, keep_alive=None, net_static=None, workload=False):
+def build(tar_bytes, keep_alive=None, net_static=None, workload=False, extra=()):
     cpio = CpioWriter()
     seen_dirs = set()
 
@@ -248,6 +266,9 @@ def build(tar_bytes, keep_alive=None, net_static=None, workload=False):
         head = init.split(b"# Interactive shell on the console")[0]
         init = head + KEEP_ALIVE_TAIL % keep_alive
     cpio.add("init", S_IFREG | 0o755, init)
+    for path in extra:
+        with open(path, "rb") as f:
+            cpio.add(os.path.basename(path), S_IFREG | 0o755, f.read())
     return cpio.finish()
 
 
@@ -276,6 +297,13 @@ def main():
         help="start the workload tools/checkpoint-e2e.sh checks a restore "
         "against before the shell",
     )
+    ap.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="put FILE at /<its name> in the image, executable (repeatable)",
+    )
     args = ap.parse_args()
 
     ver = args.alpine_version
@@ -298,7 +326,9 @@ def main():
 
         tar_bytes = gzip.decompress(f.read())
 
-    out = build(tar_bytes, args.keep_alive, args.net_static, args.checkpoint_workload)
+    out = build(
+        tar_bytes, args.keep_alive, args.net_static, args.checkpoint_workload, args.add
+    )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(out)
