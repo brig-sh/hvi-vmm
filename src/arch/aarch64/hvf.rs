@@ -30,7 +30,11 @@
 //! no GIC: the guest gets the software GICv2 of [`crate::devices::gicv2`],
 //! each vCPU thread sets the vCPU's IRQ line from it before every guest
 //! entry, and a guest WFI exits to hvi, which sleeps the thread until the
-//! GIC has an interrupt for it or the guest's virtual timer is due.
+//! GIC has an interrupt for it or the guest's virtual timer is due. The
+//! portable guest's clock and timers are [`crate::devices::hvitime`]: its
+//! page is mapped read-only, its timer window is served here, and its timer
+//! thread raises PPI 20 in the software GIC, which wakes a vCPU sleeping in
+//! a WFI.
 
 // Resolved once while the VM is built, before any guest request; see
 // clippy.toml.
@@ -50,9 +54,9 @@ use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt::{self, ArchTimer};
 use crate::arch::aarch64::hvf_state;
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, HVI_TIME_PAGE_BASE,
+    HVI_TIME_TIMERS_BASE, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::portable::{self, fw};
@@ -66,6 +70,7 @@ use crate::checkpoint::restore::{self, import, Refused, Restorer};
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, MachineProfileKind, RestoreConfig, Stop};
 use crate::devices::gicv2::Gicv2;
+use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, TimerLine};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
@@ -195,6 +200,47 @@ impl IrqLine for SoftIrqLine {
             self.vcpus.kicker().wake_mask(out.wake);
         }
         Ok(())
+    }
+}
+
+/// The `hvi-time` lines on the software GICv2: PPI 20 of each vCPU.
+///
+/// As for [`SoftIrqLine`], a rise wakes the vCPU from whichever thread it
+/// comes: the timer thread, or another vCPU that wrote a deadline already
+/// due into this vCPU's block.
+struct HvfTimerLine {
+    /// The machine whose GIC has the lines.
+    portable: Arc<Portable>,
+    /// The vCPUs to wake.
+    vcpus: Arc<Vcpus<Kicker>>,
+}
+
+impl TimerLine for HvfTimerLine {
+    fn set(&self, cpu: usize, level: bool) -> u8 {
+        // The device holds its own lock here, and takes the GIC's after it;
+        // nothing takes them the other way round.
+        lock_or_recover(&self.portable.gic)
+            .set_ppi_line(cpu, hvitime::INTID, level)
+            .wake
+    }
+
+    fn wake(&self, mask: u8) {
+        if self.vcpus.is_running() {
+            self.vcpus.kicker().wake_mask(mask);
+        }
+    }
+}
+
+/// The portable guest's counter: `mach_absolute_time` less the virtual
+/// timer offset every vCPU of the VM is given.
+struct HvfCounter {
+    offset: u64,
+}
+
+impl GuestCounter for HvfCounter {
+    fn now(&self) -> u64 {
+        // SAFETY: `mach_absolute_time` takes no arguments and cannot fail.
+        unsafe { mach_absolute_time() }.wrapping_sub(self.offset)
     }
 }
 
@@ -540,6 +586,11 @@ struct Shared {
     profile: Arc<ProfileCell>,
     /// The portable profile's machine, or `None` on the native one.
     portable: Option<Arc<Portable>>,
+    /// The portable guest's `hvi-time`, or `None` on the native machine.
+    hvitime: Option<Arc<HviTime>>,
+    /// The virtual timer offset of every portable vCPU, so that each reads
+    /// the one counter the `hvi-time` page maps.
+    vtimer_offset: u64,
 }
 
 /// The feature registers the profile records, by the name it records them
@@ -856,6 +907,8 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         plugin: None,
         profile,
         portable: None,
+        hvitime: None,
+        vtimer_offset: 0,
     };
     connect_lines(&shared);
     let control = bind_control(
@@ -929,12 +982,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
     let (shared_ram, ram) = map_ram(cfg.mem_bytes)?;
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
-    // The portable guest also gets kernel arguments that keep it off what
-    // its baseline hides.
-    let cmdline = if is_portable {
-        portable::cmdline(&cfg.cmdline)
+    // Every portable vCPU gets one virtual timer offset, taken now, so that
+    // they all read one counter, which starts near 0 as a KVM guest's does.
+    // SAFETY: `mach_absolute_time` takes no arguments and cannot fail.
+    let vtimer_offset = if is_portable {
+        unsafe { mach_absolute_time() }
     } else {
-        cfg.cmdline.clone()
+        0
     };
 
     let virtio = match &cfg.disk {
@@ -1074,19 +1128,22 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
-    let fdt_devices = fdt::VirtioDevices {
-        blk: has_blk,
-        net: has_net,
-        vsock: has_vsock,
-        fs_count: fs.len(),
-        timer: if cfg.arch_timer_irq {
-            ArchTimer::Interrupts
-        } else {
-            ArchTimer::NoInterrupts {
-                clock_frequency: ArchTimer::PORTABLE_HZ,
-            }
-        },
-        hvi_time: false,
+    // The portable guest's devicetree comes from the same inputs on every
+    // backend: the GICv2, the kernel arguments that keep it off what its
+    // baseline hides, `/timer` without interrupts and `hvi-time`.
+    let (gic, cmdline, fdt_devices) = if is_portable {
+        let dt = portable::devicetree(&cfg, num_cpus, has_blk, has_net, has_vsock)?;
+        (dt.gic, dt.cmdline, dt.devices)
+    } else {
+        let devices = fdt::VirtioDevices {
+            blk: has_blk,
+            net: has_net,
+            vsock: has_vsock,
+            fs_count: fs.len(),
+            timer: ArchTimer::Interrupts,
+            hvi_time: false,
+        };
+        (gic, cfg.cmdline.clone(), devices)
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -1132,6 +1189,55 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         })
         .collect();
     let kicker = Kicker::new(vm.clone(), num_cpus, secondaries, is_portable);
+    let vcpus = Arc::new(Vcpus::new(num_cpus, kicker));
+
+    // The portable guest's clock and timers. The page is mapped read-only:
+    // the guest reads it without an exit and cannot write it.
+    let hvitime = match &portable {
+        Some(p) => {
+            let device = Arc::new(HviTime::new(
+                num_cpus as usize,
+                u32::try_from(crate::checkpoint::profile::counter_freq_hz()).unwrap_or(0),
+                Box::new(HvfCounter {
+                    offset: vtimer_offset,
+                }),
+                Box::new(HvfTimerLine {
+                    portable: Arc::clone(p),
+                    vcpus: Arc::clone(&vcpus),
+                }),
+            )?);
+            // SAFETY: the page is a live, page-aligned mapping of
+            // `PAGE_SIZE` bytes that lives as long as `device`, which
+            // outlives the VM.
+            let ret = unsafe {
+                applevisor_sys::hv_vm_map(
+                    device.page().host_ptr().cast::<std::ffi::c_void>(),
+                    HVI_TIME_PAGE_BASE,
+                    hvitime::PAGE_SIZE as usize,
+                    applevisor_sys::HV_MEMORY_READ,
+                )
+            };
+            if ret != 0 {
+                return Err(format!(
+                    "hv_vm_map(hvi-time page -> {HVI_TIME_PAGE_BASE:#x}, read-only) failed: {ret:#x}"
+                )
+                .into());
+            }
+            eprintln!(
+                "{LOG_PREFIX} hvi-time: page {HVI_TIME_PAGE_BASE:#x}+{:#x} (read-only), timers {HVI_TIME_TIMERS_BASE:#x}+{:#x}, PPI {} (INTID {}), counter {} Hz",
+                hvitime::PAGE_SIZE,
+                hvitime::TIMERS_SIZE,
+                hvitime::PPI,
+                hvitime::INTID,
+                device.counter_freq_hz()
+            );
+            if trace::enable_from_env() {
+                eprintln!("{LOG_PREFIX} hvi-time: HVI_TIME_TRACE on, exits counted");
+            }
+            Some(device)
+        }
+        None => None,
+    };
 
     let shared = Shared {
         vm: vm.clone(),
@@ -1147,7 +1253,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             block: virtio,
             net,
             vsock,
-            vcpus: Arc::new(Vcpus::new(num_cpus, kicker, cfg.take_stop_handle()?)),
+            vcpus,
             plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
@@ -1157,6 +1263,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
         profile,
         portable,
+        hvitime,
+        vtimer_offset,
     };
 
     connect_lines(&shared);
@@ -1171,13 +1279,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
-    let plugin_threads = shared.guest.attach(shared.plugin.as_ref())?;
-
-    // A binary's stop signals get their handlers, and the thread that receives
-    // them starts, before the terminal goes into raw mode, so a first stop
-    // signal stops the run rather than ending the process with the terminal
-    // raw. The sandbox below confines the whole process, that thread included.
-    crate::signal::start_stop_signal_thread()?;
+    if let Some(obs) = &shared.plugin {
+        obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
+    }
 
     let _raw = terminal::RawTerm::enable();
 
@@ -1218,12 +1322,21 @@ fn gic_layout(portable: bool, num_cpus: u32) -> Result<GicLayout, Box<dyn std::e
     // virtio-fs ones in `boot` as each share is placed, because those climb
     // with the share count.
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
-    for (name, base, size) in [
+    let mut fixed = vec![
         ("UART", UART_BASE, UART_SIZE),
         ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
         ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
         ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
-    ] {
+    ];
+    if portable {
+        fixed.push(("hvi-time page", HVI_TIME_PAGE_BASE, hvitime::PAGE_SIZE));
+        fixed.push((
+            "hvi-time timers",
+            HVI_TIME_TIMERS_BASE,
+            hvitime::TIMERS_SIZE,
+        ));
+    }
+    for (name, base, size) in fixed {
         let end = base.saturating_add(size);
         if base < gic_end || end > DEVICE_WINDOW_END {
             return Err(format!(
@@ -1381,11 +1494,28 @@ struct IoStart {
 }
 
 impl IoStart {
-    /// Starts the I/O threads, and each virtio-fs device's worker and
-    /// readahead threads. Each polls its stop token
-    /// beside its own descriptor, or takes the stop through its `FsWake` or
-    /// `ReadaheadStop`, and is joined after the vCPUs.
-    fn start(self, shared: &Shared) -> IoThreads<Kicker> {
+    /// Starts the I/O threads, each virtio-fs device's worker and readahead
+    /// threads, and the portable guest's hvi-time
+    /// timer thread. Each polls its stop token beside its own descriptor,
+    /// or takes the stop through its `FsWake`, its `ReadaheadStop` or its
+    /// device, and is joined after the vCPUs.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the timer thread cannot be started, which is started
+    /// first, so no thread is left to stop.
+    fn start(self, shared: &Shared) -> std::io::Result<IoThreads<Kicker>> {
+        // The hvi-time timer thread, on the scheduling that wakes it on
+        // time.
+        let timer = match &shared.hvitime {
+            Some(device) => Some(hvitime::spawn_timer(device, || {
+                eprintln!(
+                    "{LOG_PREFIX} hvi-time: timer thread on {}",
+                    hvitime::timer_thread_setup()
+                );
+            })?),
+            None => None,
+        };
         let mut io_threads = IoThreads::start(
             self.stop_source,
             &shared.guest,
@@ -1418,7 +1548,11 @@ impl IoStart {
             }
             io_threads.on_stop(move || stop.stop());
         }
-        io_threads
+        if let (Some(device), Some(thread)) = (&shared.hvitime, timer) {
+            let timer = Arc::clone(device);
+            io_threads.push_ended_by("hvi-time timer", thread, move || timer.stop());
+        }
+        Ok(io_threads)
     }
 }
 
@@ -1467,7 +1601,7 @@ fn run(
             .map_err(|e| format!("holding the vCPUs for the restore: {e}"))?;
     }
     let (mut io, mut started) = match restore {
-        None => (None, Some(io.start(&shared))),
+        None => (None, Some(io.start(&shared)?)),
         Some(_) => (Some(io), None),
     };
 
@@ -1483,7 +1617,12 @@ fn run(
         spawned.err().map(Into::into);
     if let (Some(restore), None) = (&restore, &failure) {
         match load(&shared, restore) {
-            Ok(()) => started = io.take().map(|io| io.start(&shared)),
+            Ok(()) => match io.take().map(|io| io.start(&shared)).transpose() {
+                Ok(io) => started = io,
+                Err(e) => {
+                    failure = Some(format!("starting the I/O threads: {e}").into());
+                }
+            },
             Err(e) => {
                 // What a vCPU found wrong is the cause; the import only saw
                 // the stop that followed.
@@ -1672,7 +1811,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     if let Some(p) = &sh.portable {
         // Before the profile reads MIDR_EL1 and before the guest's first
         // instruction.
-        if let Err(e) = set_baseline(&vcpu, cpu_id, cpu_id == 0) {
+        let set = set_baseline(&vcpu, cpu_id, cpu_id == 0)
+            .and_then(|()| set_vtimer_offset(&vcpu, sh.vtimer_offset));
+        if let Err(e) = set {
             eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
             lock_or_recover(&p.refused).get_or_insert(e);
             return;
@@ -1750,6 +1891,12 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // The plugin runs on vcpu0, between guest entries, because only this thread
     // can read this vCPU's registers.
     let plugin = sh.plugin.as_deref().filter(|_| cpu_id == 0);
+    if is_boot {
+        // Guest nanoseconds start at 0 at the boot vCPU's first entry.
+        if let Some(device) = &sh.hvitime {
+            device.publish_boot();
+        }
+    }
     let portable = sh.portable.as_deref();
     let mut vtimer = Vtimer {
         offset: vcpu.get_vtimer_offset().unwrap_or(0),
@@ -1799,6 +1946,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                     let syn = exit.exception.syndrome;
                     match Ec::from_syndrome(syn) {
                         Ec::Hvc | Ec::Smc => {
+                            trace::exit(trace::Exit::Hvc);
                             // Not restartable: the saved PC is already past
                             // HVC/SMC.
                             if let Some(p) = portable {
@@ -1816,9 +1964,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         Ec::DataAbort => {
                             let ipa = exit.exception.physical_address;
                             if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
+                                trace::exit(trace::Exit::Mmio);
                                 service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
                                 advance_pc(&vcpu);
                             } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
+                                trace::exit(trace::Exit::Mmio);
                                 if let Some(dev) = &sh.guest.block {
                                     service_dev(&vcpu, &sh, dev, ipa - VIRTIO_BASE, syn);
                                 }
@@ -1826,6 +1976,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE)
                                 .contains(&ipa)
                             {
+                                trace::exit(trace::Exit::Mmio);
                                 if let Some(dev) = &sh.guest.net {
                                     service_net(&vcpu, &sh, dev, ipa - VIRTIO_NET_BASE, syn);
                                 }
@@ -1833,6 +1984,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE)
                                 .contains(&ipa)
                             {
+                                trace::exit(trace::Exit::Mmio);
                                 if let Some(dev) = &sh.guest.vsock {
                                     service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
                                 }
@@ -1845,7 +1997,23 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                                 service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
                                 advance_pc(&vcpu);
                             } else if let Some(p) = portable.filter(|p| p.in_gic(ipa)) {
+                                trace::exit(trace::Exit::Gic);
                                 service_gic(&vcpu, &sh, p, cpu_id, ipa, syn, &mut vtimer);
+                                advance_pc(&vcpu);
+                            } else if let Some(device) = sh.hvitime.as_deref().filter(|_| {
+                                (HVI_TIME_TIMERS_BASE..HVI_TIME_TIMERS_BASE + hvitime::TIMERS_SIZE)
+                                    .contains(&ipa)
+                            }) {
+                                trace::exit(trace::Exit::Timer);
+                                service_hvitime(&vcpu, device, ipa - HVI_TIME_TIMERS_BASE, syn);
+                                advance_pc(&vcpu);
+                            } else if sh.hvitime.is_some()
+                                && (HVI_TIME_PAGE_BASE..HVI_TIME_PAGE_BASE + hvitime::PAGE_SIZE)
+                                    .contains(&ipa)
+                            {
+                                // A write to the read-only page: dropped, as
+                                // KVM drops one to a read-only memory slot.
+                                trace::exit(trace::Exit::Mmio);
                                 advance_pc(&vcpu);
                             } else {
                                 eprintln!(
@@ -1856,6 +2024,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             }
                         }
                         Ec::SysReg => {
+                            trace::exit(trace::Exit::SysReg);
                             // RAZ/WI: unmodeled system register. Without
                             // hv_gic the physical counter traps too, and reads
                             // the guest's counter.
@@ -1873,6 +2042,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         // Without it a WFI exits at once with the PC on it, so
                         // hvi steps past it and waits here.
                         Ec::Other(0x01) => {
+                            trace::exit(trace::Exit::Wfi);
                             if let Some(p) = portable {
                                 advance_pc(&vcpu);
                                 if syn & 0b11 == 0 {
@@ -1902,13 +2072,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         )));
                     }
                 }
-                Ec::SysReg => {
-                    // RAZ/WI: unmodeled system register.
-                    let iss = syn & 0x1ff_ffff;
-                    if iss & 1 == 1 {
-                        write_gpr(vcpu, ((iss >> 5) & 0x1f) as u8, 0);
-                    }
-                    advance_pc(vcpu);
+                ExitReason::VTIMER_ACTIVATED => {
+                    trace::exit(trace::Exit::Vtimer);
+                    let _ = vcpu.set_vtimer_mask(true);
                     // Without hv_gic the timer reaches the guest only as this
                     // exit. The line stays high, and the timer masked, until
                     // the guest ends the interrupt (`end_vtimer_interrupt`).
@@ -1917,10 +2083,13 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         lock_or_recover(&p.gic).set_ppi_line(cpu_id as usize, VTIMER_INTID, true);
                     }
                 }
-                Ec::Other(0x01) => {} // WFx: hvf handled the wait.
-                other => {
-                    return ControlFlow::Break(Outcome::Failed(format!(
-                        "vcpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
+                // Kicked: for a snapshot, a stop or an interrupt.
+                ExitReason::CANCELED => trace::exit(trace::Exit::Kicked),
+                ExitReason::UNKNOWN => {
+                    // hvf could not say why it exited, so there is nothing to
+                    // resume into.
+                    eprintln!(
+                        "{LOG_PREFIX} cpu{cpu_id}: unknown exit reason (pc {:#x})",
                         vcpu.get_reg(Reg::PC).unwrap_or(0)
                     )));
                 }
@@ -2195,6 +2364,41 @@ fn service_gic(
     }
     if out.deactivated == Some(VTIMER_INTID) {
         end_vtimer_interrupt(vcpu, p, cpu, vtimer);
+    }
+}
+
+/// Services a guest access to the `hvi-time` timer window, `offset` bytes
+/// in.
+fn service_hvitime(vcpu: &Vcpu, device: &HviTime, offset: u64, syndrome: u64) {
+    let da = DataAbort::from_syndrome(syndrome);
+    if !da.isv {
+        return;
+    }
+    if da.is_write {
+        device.mmio_write(offset, da.width, read_gpr(vcpu, da.reg));
+    } else {
+        let v = device.mmio_read(offset, da.width) & width_mask(da.width);
+        write_gpr(vcpu, da.reg, v);
+    }
+}
+
+/// Gives `vcpu` the VM's virtual timer offset and checks that it took, so
+/// every portable vCPU reads the counter the `hvi-time` page maps.
+///
+/// # Errors
+///
+/// Errors when the offset cannot be set or reads back otherwise.
+fn set_vtimer_offset(vcpu: &Vcpu, offset: u64) -> Result<(), String> {
+    vcpu.set_vtimer_offset(offset)
+        .map_err(|e| format!("the virtual timer offset cannot be set ({e:?})"))?;
+    match vcpu.get_vtimer_offset() {
+        Ok(back) if back == offset => Ok(()),
+        Ok(back) => Err(format!(
+            "the virtual timer offset reads {back:#x}, not {offset:#x}"
+        )),
+        Err(e) => Err(format!(
+            "the virtual timer offset does not read back ({e:?})"
+        )),
     }
 }
 

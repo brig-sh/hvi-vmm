@@ -105,6 +105,8 @@ struct StopPlan {
     source: StopSource,
     /// The actions that run after the request, in the order they were added.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+    /// What ends the threads that watch no stop token, called first.
+    enders: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl StopPlan {
@@ -173,6 +175,7 @@ impl<K: Kick> IoThreads<K> {
             },
             console,
             threads: Vec::new(),
+            enders: Vec::new(),
             finish_count,
         };
         if let Some(bridge) = bridge {
@@ -265,6 +268,21 @@ impl<K: Kick> IoThreads<K> {
         self.stop.actions.push(Box::new(action));
     }
 
+    /// Adds a thread the backend started that watches no stop token, with
+    /// `end`, which ends it. [`stop`](Self::stop) calls `end` before it
+    /// joins.
+    // Only the macOS backend starts such a thread so far, for `hvi-time`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn push_ended_by(
+        &mut self,
+        name: &'static str,
+        thread: JoinHandle<()>,
+        end: impl FnOnce() + Send + 'static,
+    ) {
+        self.threads.push((name, thread));
+        self.enders.push(Box::new(end));
+    }
+
     /// Requests the stop and joins every thread.
     ///
     /// The stop actions run after the request, in the order they were added.
@@ -279,6 +297,9 @@ impl<K: Kick> IoThreads<K> {
     /// Errors with the first thread that did not stop in time.
     pub(crate) fn stop(mut self) -> std::io::Result<()> {
         self.stop.run();
+        for end in self.enders {
+            end();
+        }
         let deadline = Instant::now() + STOP_TIMEOUT;
         self.console
             .kick_until_finished(&self.finish_count, deadline);
