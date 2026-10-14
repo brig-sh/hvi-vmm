@@ -101,8 +101,10 @@ pub struct VcpuTimer {
 pub enum Need {
     /// A failed read fails the export, and a state without it is refused.
     Required,
-    /// A register only some hosts have (SME, or new in macOS 15.2). A failed
-    /// read lists it under `unavailable`, and a state may lack it.
+    /// A register not every vCPU has: SME's and macOS 15.2's, which only
+    /// some Macs have, and the pointer-authentication keys, which a KVM
+    /// vCPU has only with PAuth, which hvi does not give it. A failed read
+    /// lists it under `unavailable`, and a state may lack it.
     Optional,
 }
 
@@ -138,16 +140,16 @@ pub const AARCH64_SYSREGS: [(&str, Need); 106] = [
     ("CNTV_CVAL_EL0", Need::Required),
     ("MDSCR_EL1", Need::Required),
     ("MDCCINT_EL1", Need::Required),
-    ("APIAKEYLO_EL1", Need::Required),
-    ("APIAKEYHI_EL1", Need::Required),
-    ("APIBKEYLO_EL1", Need::Required),
-    ("APIBKEYHI_EL1", Need::Required),
-    ("APDAKEYLO_EL1", Need::Required),
-    ("APDAKEYHI_EL1", Need::Required),
-    ("APDBKEYLO_EL1", Need::Required),
-    ("APDBKEYHI_EL1", Need::Required),
-    ("APGAKEYLO_EL1", Need::Required),
-    ("APGAKEYHI_EL1", Need::Required),
+    ("APIAKEYLO_EL1", Need::Optional),
+    ("APIAKEYHI_EL1", Need::Optional),
+    ("APIBKEYLO_EL1", Need::Optional),
+    ("APIBKEYHI_EL1", Need::Optional),
+    ("APDAKEYLO_EL1", Need::Optional),
+    ("APDAKEYHI_EL1", Need::Optional),
+    ("APDBKEYLO_EL1", Need::Optional),
+    ("APDBKEYHI_EL1", Need::Optional),
+    ("APGAKEYLO_EL1", Need::Optional),
+    ("APGAKEYHI_EL1", Need::Optional),
     ("MPIDR_EL1", Need::Required),
     ("SCXTNUM_EL0", Need::Optional),
     ("SCXTNUM_EL1", Need::Optional),
@@ -220,6 +222,143 @@ pub const AARCH64_SYSREGS: [(&str, Need); 106] = [
     ("DBGWCR15_EL1", Need::Required),
 ];
 
+/// The architectural encoding, `[op0, op1, CRn, CRm, op2]`, of every
+/// system register of [`AARCH64_SYSREGS`], in its order.
+///
+/// This is where a canonical name meets a hypervisor's number on KVM, whose
+/// `KVM_GET_ONE_REG` id of a system register is its encoding (see
+/// `checkpoint::kvm_regs`). The one exception is KVM's virtual timer:
+/// `KVM_REG_ARM_TIMER_CVAL` and `KVM_REG_ARM_TIMER_CNT` swap the encodings of
+/// `CNTV_CVAL_EL0` and `CNTVCT_EL0`, which `kvm_regs` undoes.
+pub const AARCH64_SYSREG_ENCODINGS: [(&str, [u8; 5]); 106] = [
+    ("SCTLR_EL1", [3, 0, 1, 0, 0]),
+    ("ACTLR_EL1", [3, 0, 1, 0, 1]),
+    ("CPACR_EL1", [3, 0, 1, 0, 2]),
+    ("TTBR0_EL1", [3, 0, 2, 0, 0]),
+    ("TTBR1_EL1", [3, 0, 2, 0, 1]),
+    ("TCR_EL1", [3, 0, 2, 0, 2]),
+    ("MAIR_EL1", [3, 0, 10, 2, 0]),
+    ("AMAIR_EL1", [3, 0, 10, 3, 0]),
+    ("VBAR_EL1", [3, 0, 12, 0, 0]),
+    ("ELR_EL1", [3, 0, 4, 0, 1]),
+    ("SPSR_EL1", [3, 0, 4, 0, 0]),
+    ("ESR_EL1", [3, 0, 5, 2, 0]),
+    ("FAR_EL1", [3, 0, 6, 0, 0]),
+    ("PAR_EL1", [3, 0, 7, 4, 0]),
+    ("AFSR0_EL1", [3, 0, 5, 1, 0]),
+    ("AFSR1_EL1", [3, 0, 5, 1, 1]),
+    ("CONTEXTIDR_EL1", [3, 0, 13, 0, 1]),
+    ("TPIDR_EL0", [3, 3, 13, 0, 2]),
+    ("TPIDRRO_EL0", [3, 3, 13, 0, 3]),
+    ("TPIDR_EL1", [3, 0, 13, 0, 4]),
+    ("CNTKCTL_EL1", [3, 0, 14, 1, 0]),
+    ("CSSELR_EL1", [3, 2, 0, 0, 0]),
+    ("CNTV_CTL_EL0", [3, 3, 14, 3, 1]),
+    ("CNTV_CVAL_EL0", [3, 3, 14, 3, 2]),
+    ("MDSCR_EL1", [2, 0, 0, 2, 2]),
+    ("MDCCINT_EL1", [2, 0, 0, 2, 0]),
+    ("APIAKEYLO_EL1", [3, 0, 2, 1, 0]),
+    ("APIAKEYHI_EL1", [3, 0, 2, 1, 1]),
+    ("APIBKEYLO_EL1", [3, 0, 2, 1, 2]),
+    ("APIBKEYHI_EL1", [3, 0, 2, 1, 3]),
+    ("APDAKEYLO_EL1", [3, 0, 2, 2, 0]),
+    ("APDAKEYHI_EL1", [3, 0, 2, 2, 1]),
+    ("APDBKEYLO_EL1", [3, 0, 2, 2, 2]),
+    ("APDBKEYHI_EL1", [3, 0, 2, 2, 3]),
+    ("APGAKEYLO_EL1", [3, 0, 2, 3, 0]),
+    ("APGAKEYHI_EL1", [3, 0, 2, 3, 1]),
+    ("MPIDR_EL1", [3, 0, 0, 0, 5]),
+    ("SCXTNUM_EL0", [3, 3, 13, 0, 7]),
+    ("SCXTNUM_EL1", [3, 0, 13, 0, 7]),
+    ("TPIDR2_EL0", [3, 3, 13, 0, 5]),
+    ("SMCR_EL1", [3, 0, 1, 2, 6]),
+    ("SMPRI_EL1", [3, 0, 1, 2, 4]),
+    ("DBGBVR0_EL1", [2, 0, 0, 0, 4]),
+    ("DBGBCR0_EL1", [2, 0, 0, 0, 5]),
+    ("DBGWVR0_EL1", [2, 0, 0, 0, 6]),
+    ("DBGWCR0_EL1", [2, 0, 0, 0, 7]),
+    ("DBGBVR1_EL1", [2, 0, 0, 1, 4]),
+    ("DBGBCR1_EL1", [2, 0, 0, 1, 5]),
+    ("DBGWVR1_EL1", [2, 0, 0, 1, 6]),
+    ("DBGWCR1_EL1", [2, 0, 0, 1, 7]),
+    ("DBGBVR2_EL1", [2, 0, 0, 2, 4]),
+    ("DBGBCR2_EL1", [2, 0, 0, 2, 5]),
+    ("DBGWVR2_EL1", [2, 0, 0, 2, 6]),
+    ("DBGWCR2_EL1", [2, 0, 0, 2, 7]),
+    ("DBGBVR3_EL1", [2, 0, 0, 3, 4]),
+    ("DBGBCR3_EL1", [2, 0, 0, 3, 5]),
+    ("DBGWVR3_EL1", [2, 0, 0, 3, 6]),
+    ("DBGWCR3_EL1", [2, 0, 0, 3, 7]),
+    ("DBGBVR4_EL1", [2, 0, 0, 4, 4]),
+    ("DBGBCR4_EL1", [2, 0, 0, 4, 5]),
+    ("DBGWVR4_EL1", [2, 0, 0, 4, 6]),
+    ("DBGWCR4_EL1", [2, 0, 0, 4, 7]),
+    ("DBGBVR5_EL1", [2, 0, 0, 5, 4]),
+    ("DBGBCR5_EL1", [2, 0, 0, 5, 5]),
+    ("DBGWVR5_EL1", [2, 0, 0, 5, 6]),
+    ("DBGWCR5_EL1", [2, 0, 0, 5, 7]),
+    ("DBGBVR6_EL1", [2, 0, 0, 6, 4]),
+    ("DBGBCR6_EL1", [2, 0, 0, 6, 5]),
+    ("DBGWVR6_EL1", [2, 0, 0, 6, 6]),
+    ("DBGWCR6_EL1", [2, 0, 0, 6, 7]),
+    ("DBGBVR7_EL1", [2, 0, 0, 7, 4]),
+    ("DBGBCR7_EL1", [2, 0, 0, 7, 5]),
+    ("DBGWVR7_EL1", [2, 0, 0, 7, 6]),
+    ("DBGWCR7_EL1", [2, 0, 0, 7, 7]),
+    ("DBGBVR8_EL1", [2, 0, 0, 8, 4]),
+    ("DBGBCR8_EL1", [2, 0, 0, 8, 5]),
+    ("DBGWVR8_EL1", [2, 0, 0, 8, 6]),
+    ("DBGWCR8_EL1", [2, 0, 0, 8, 7]),
+    ("DBGBVR9_EL1", [2, 0, 0, 9, 4]),
+    ("DBGBCR9_EL1", [2, 0, 0, 9, 5]),
+    ("DBGWVR9_EL1", [2, 0, 0, 9, 6]),
+    ("DBGWCR9_EL1", [2, 0, 0, 9, 7]),
+    ("DBGBVR10_EL1", [2, 0, 0, 10, 4]),
+    ("DBGBCR10_EL1", [2, 0, 0, 10, 5]),
+    ("DBGWVR10_EL1", [2, 0, 0, 10, 6]),
+    ("DBGWCR10_EL1", [2, 0, 0, 10, 7]),
+    ("DBGBVR11_EL1", [2, 0, 0, 11, 4]),
+    ("DBGBCR11_EL1", [2, 0, 0, 11, 5]),
+    ("DBGWVR11_EL1", [2, 0, 0, 11, 6]),
+    ("DBGWCR11_EL1", [2, 0, 0, 11, 7]),
+    ("DBGBVR12_EL1", [2, 0, 0, 12, 4]),
+    ("DBGBCR12_EL1", [2, 0, 0, 12, 5]),
+    ("DBGWVR12_EL1", [2, 0, 0, 12, 6]),
+    ("DBGWCR12_EL1", [2, 0, 0, 12, 7]),
+    ("DBGBVR13_EL1", [2, 0, 0, 13, 4]),
+    ("DBGBCR13_EL1", [2, 0, 0, 13, 5]),
+    ("DBGWVR13_EL1", [2, 0, 0, 13, 6]),
+    ("DBGWCR13_EL1", [2, 0, 0, 13, 7]),
+    ("DBGBVR14_EL1", [2, 0, 0, 14, 4]),
+    ("DBGBCR14_EL1", [2, 0, 0, 14, 5]),
+    ("DBGWVR14_EL1", [2, 0, 0, 14, 6]),
+    ("DBGWCR14_EL1", [2, 0, 0, 14, 7]),
+    ("DBGBVR15_EL1", [2, 0, 0, 15, 4]),
+    ("DBGBCR15_EL1", [2, 0, 0, 15, 5]),
+    ("DBGWVR15_EL1", [2, 0, 0, 15, 6]),
+    ("DBGWCR15_EL1", [2, 0, 0, 15, 7]),
+];
+
+/// Returns the encoding of the system register `name` of
+/// [`AARCH64_SYSREGS`].
+#[must_use]
+pub fn sysreg_encoding(name: &str) -> Option<[u8; 5]> {
+    AARCH64_SYSREG_ENCODINGS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, enc)| *enc)
+}
+
+/// Returns the name in [`AARCH64_SYSREGS`] of the system register with
+/// encoding `enc`.
+#[must_use]
+pub fn sysreg_named(enc: [u8; 5]) -> Option<&'static str> {
+    AARCH64_SYSREG_ENCODINGS
+        .iter()
+        .find(|(_, known)| *known == enc)
+        .map(|(name, _)| *name)
+}
+
 /// The general registers `regs` holds for a vCPU that runs, in the order a
 /// backend writes them: `x0`..`x30`, then the stack pointers, `pc`, `pstate`
 /// and the floating-point control and status.
@@ -288,6 +427,21 @@ pub struct Aarch64Vcpu {
     /// KVM registers this build has no name for, by id, both as hex.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub kvm_extra: BTreeMap<String, String>,
+    /// KVM's firmware registers by name (`PSCI_VERSION`, the SMCCC
+    /// workarounds, the feature bitmaps): what the guest's firmware
+    /// answers. A restore compares them with the destination's; see
+    /// `checkpoint::kvm_regs`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub firmware: BTreeMap<String, Hex64>,
+    /// Registers only KVM has whose value a guest keeps fixed, by name. A
+    /// restore compares them rather than loads them; see
+    /// `checkpoint::kvm_regs`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fixed: BTreeMap<String, Hex64>,
+    /// An SError or external abort KVM holds pending for the vCPU, from
+    /// `KVM_GET_VCPU_EVENTS`; absent when nothing is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Arm64Events>,
     /// Registers the backend could not read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable: Vec<String>,
@@ -320,6 +474,20 @@ impl Aarch64Vcpu {
                 "{} KVM register(s) this build has no name for",
                 self.kvm_extra.len()
             ));
+        }
+        if let Some(name) = self
+            .firmware
+            .keys()
+            .find(|n| !crate::checkpoint::kvm_regs::is_firmware(n))
+        {
+            return refuse(format!("unknown firmware register {name:?}"));
+        }
+        if let Some(name) = self
+            .fixed
+            .keys()
+            .find(|n| crate::checkpoint::kvm_regs::fixed_named(n).is_none())
+        {
+            return refuse(format!("unknown fixed register {name:?}"));
         }
         if self.power != Power::On {
             if !self.regs.is_empty() || !self.simd.is_empty() || !self.sysregs.is_empty() {
@@ -387,6 +555,29 @@ impl Aarch64Vcpu {
             return refuse("the virtual timer is missing".to_string());
         }
         Ok(())
+    }
+}
+
+/// The exceptions KVM holds pending for an arm64 vCPU, `struct
+/// kvm_vcpu_events`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Arm64Events {
+    /// An SError is pending.
+    pub serror_pending: bool,
+    /// The pending SError has the syndrome `serror_esr`.
+    pub serror_has_esr: bool,
+    /// An external data abort is pending.
+    pub ext_dabt_pending: bool,
+    /// The pending SError's syndrome.
+    pub serror_esr: Hex64,
+}
+
+impl Arm64Events {
+    /// Returns whether anything is pending.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.serror_pending || self.ext_dabt_pending
     }
 }
 
@@ -494,6 +685,9 @@ impl VcpuState {
                 timer: None,
                 backend: backend.to_string(),
                 kvm_extra: BTreeMap::new(),
+                firmware: BTreeMap::new(),
+                fixed: BTreeMap::new(),
+                events: None,
                 unavailable: Vec::new(),
                 partial: true,
             }),
@@ -554,6 +748,9 @@ impl VcpuState {
                 timer: None,
                 backend: backend.to_string(),
                 kvm_extra: BTreeMap::new(),
+                firmware: BTreeMap::new(),
+                fixed: BTreeMap::new(),
+                events: None,
                 unavailable: Vec::new(),
                 partial: false,
             }),
@@ -830,6 +1027,9 @@ pub(crate) mod tests {
             }),
             backend: "hvf".to_string(),
             kvm_extra: BTreeMap::new(),
+            firmware: BTreeMap::new(),
+            fixed: BTreeMap::new(),
+            events: None,
             unavailable: Vec::new(),
             partial: false,
         }
@@ -854,6 +1054,9 @@ pub(crate) mod tests {
             }),
             backend: "hvf".to_string(),
             kvm_extra: BTreeMap::new(),
+            firmware: BTreeMap::new(),
+            fixed: BTreeMap::new(),
+            events: None,
             unavailable: vec!["TPIDR2_EL0".to_string()],
             partial: false,
         });
@@ -951,6 +1154,34 @@ pub(crate) mod tests {
             "KVM register",
         );
         refused(&|s| s.power = Power::Off, "not on holds registers");
+        refused(
+            &|s| {
+                s.firmware.insert("PSCI_VERSIONS".into(), Hex64(0));
+            },
+            "unknown firmware register \"PSCI_VERSIONS\"",
+        );
+        refused(
+            &|s| {
+                s.fixed.insert("OSLAR_EL1".into(), Hex64(0));
+            },
+            "unknown fixed register \"OSLAR_EL1\"",
+        );
+        // What KVM records beside the registers reads back and is whole.
+        let mut state = whole(0);
+        state
+            .firmware
+            .insert("PSCI_VERSION".into(), Hex64(0x1_0001));
+        state.fixed.insert("OSLSR_EL1".into(), Hex64(8));
+        state.events = Some(Arm64Events {
+            serror_pending: true,
+            serror_has_esr: true,
+            ext_dabt_pending: false,
+            serror_esr: Hex64(0x96),
+        });
+        state.check_restorable().unwrap();
+        let doc = CpuState::new(GuestArch::Aarch64, vec![VcpuState::Aarch64(state)]);
+        let json = serde_json::to_vec(&doc).unwrap();
+        assert_eq!(CpuState::from_json(&json).unwrap(), doc);
         // An optional register the host did not have is fine when listed.
         let mut state = whole(0);
         state.sysregs.remove("SCXTNUM_EL1");
