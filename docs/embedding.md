@@ -103,6 +103,7 @@ let cfg = BootConfig {
     agent_sock: None,
     profile_out: None,
     control_sock: None,
+    checkpoint_root: None,
     plugin: None,
     sandbox: true,
     stop: None,
@@ -144,6 +145,7 @@ cargo build --release --example watch_guest
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
 | `profile_out` | `Option<String>` | Where the machine profile is written. Created before confinement. See [cli.md](cli.md#the-control-socket). |
 | `control_sock` | `Option<String>` | The control socket's path. Bound before confinement. See [cli.md](cli.md#the-control-socket). |
+| `checkpoint_root` | `Option<String>` | The directory a `checkpoint` may write bundles under; `None` refuses every checkpoint. Resolved before confinement, which grants writes below it. Needs `control_sock`. See [checkpoint.md](checkpoint.md). |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
