@@ -20,12 +20,16 @@
 
 use crate::arch::aarch64::fdt::{self, VirtioDevices};
 use crate::arch::aarch64::layout::{
-    GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GicLayout, GicVersion, GuestLayout, HVI_TIME_PAGE_BASE, HVI_TIME_TIMERS_BASE, UART_BASE,
+    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SPI, VIRTIO_VSOCK_BASE,
+    VIRTIO_VSOCK_SPI,
 };
+use crate::arch::aarch64::portable;
 use crate::checkpoint::profile::{
-    counter_freq_hz, device, sha256_hex, Device, Gic, MachineProfile, RamRegion,
+    counter_freq_hz, device, hex, sha256_hex, Device, Gic, Irq, MachineProfile, RamRegion, Time,
 };
+use crate::config::MachineProfileKind;
+use crate::devices::hvitime;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
@@ -46,6 +50,8 @@ pub(crate) struct Arm64Machine<'a> {
     pub(crate) net_mode: Option<&'a str>,
     /// Guest RAM.
     pub(crate) ram_regions: Vec<crate::memory::RamRegion>,
+    /// The machine profile the guest was given.
+    pub(crate) profile: MachineProfileKind,
 }
 
 /// Returns the profile of an arm64 guest on `backend`, with everything but
@@ -66,6 +72,26 @@ pub(crate) fn profile(backend: &str, machine: &Arm64Machine<'_>) -> MachineProfi
         ram_regions,
     );
     p.firmware.dtb_sha256 = dtb_sha256(machine);
+    if machine.profile == MachineProfileKind::PortableArm64V1 {
+        p.profile = machine.profile.name().to_string();
+        p.baseline = Some(
+            portable::BASELINE
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), hex(*value)))
+                .collect(),
+        );
+        p.irq = p.gic.clone().map(|layout| Irq {
+            kind: "gicv2".into(),
+            layout,
+        });
+        p.time = Some(Time {
+            kind: "hvi-time".into(),
+            counter_freq_hz: p.counter_freq_hz,
+            page_base: HVI_TIME_PAGE_BASE,
+            timers_base: HVI_TIME_TIMERS_BASE,
+            intid: hvitime::INTID,
+        });
+    }
     p
 }
 
@@ -160,6 +186,15 @@ fn devices(present: VirtioDevices, net_mode: Option<&str>) -> Vec<Device> {
             Some(VirtioVsock::FEATURES),
         ));
     }
+    if present.hvi_time {
+        devices.push(device("hvi-time-page", HVI_TIME_PAGE_BASE, None, None));
+        devices.push(device(
+            "hvi-time",
+            HVI_TIME_TIMERS_BASE,
+            Some(hvitime::INTID),
+            None,
+        ));
+    }
     devices
 }
 
@@ -198,6 +233,7 @@ mod tests {
                 vsock: false,
                 fs_count: 0,
                 timer: fdt::ArchTimer::Interrupts,
+                hvi_time: false,
             },
             net_mode: Some("stub"),
             ram_regions: vec![crate::memory::RamRegion {
@@ -205,6 +241,7 @@ mod tests {
                 size: 512 << 20,
                 file_offset: 0,
             }],
+            profile: MachineProfileKind::Native,
         }
     }
 
@@ -225,6 +262,114 @@ mod tests {
         other.cmdline = "console=ttyAMA0 quiet";
         let c = profile("kvm", &other);
         assert_ne!(a.firmware.dtb_sha256, c.firmware.dtb_sha256);
+    }
+
+    /// The portable profile's devicetree and its digest do not depend on
+    /// the backend's name or its network mode: `portable::devicetree` given
+    /// one configuration, under either name, yields one digest, and the
+    /// profile records the same baseline, GIC and `hvi-time` windows.
+    ///
+    /// This feeds both names the same layout through the shared helper, so
+    /// it cannot catch a backend that hands the loader other inputs (the
+    /// command line, the vCPU count, the devices). The evidence for that
+    /// is the boots: a 1-vCPU guest on this Mac and on rp2 records the same
+    /// `dtb_sha256`, and so does a 2-vCPU guest.
+    #[test]
+    fn portable_devicetree_inputs_do_not_depend_on_the_backend() {
+        use crate::config::BootConfig;
+        let cfg = |cmdline: &str, timer: Option<bool>| BootConfig {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 512 << 20,
+            cmdline: cmdline.into(),
+            disk: None,
+            fs_shares: Vec::new(),
+            fs: Vec::new(),
+            net: true,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: String::new(),
+            vcpus: 2,
+            agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
+            plugin: None,
+            sandbox: false,
+            profile: MachineProfileKind::PortableArm64V1,
+            arch_timer_irq: timer,
+            stop: None,
+        };
+        let layout = layout();
+        let digest = |backend: &str, cfg: &BootConfig| {
+            let dt = portable::devicetree(cfg, 2, true, true, false).unwrap();
+            let machine = Arm64Machine {
+                gic: &dt.gic,
+                layout: &layout,
+                vcpus: 2,
+                cmdline: &dt.cmdline,
+                devices: dt.devices,
+                net_mode: Some(if backend == "kvm" { "tap" } else { "stub" }),
+                ram_regions: vec![crate::memory::RamRegion {
+                    gpa: 0x4000_0000,
+                    size: 512 << 20,
+                    file_offset: 0,
+                }],
+                profile: cfg.profile,
+            };
+            profile(backend, &machine)
+        };
+        let base = cfg("console=ttyAMA0", None);
+        let (hvf, kvm) = (digest("hvf", &base), digest("kvm", &base));
+        assert!(hvf.firmware.dtb_sha256.is_some());
+        assert_eq!(hvf.firmware.dtb_sha256, kvm.firmware.dtb_sha256);
+        assert_eq!(hvf.profile, "portable-arm64-v1");
+        assert_eq!(hvf.baseline, kvm.baseline);
+        assert_eq!(hvf.irq, kvm.irq);
+        assert_eq!(hvf.irq.as_ref().map(|i| i.layout.version), Some(2));
+        let time = hvf.time.as_ref().unwrap();
+        assert_eq!(
+            (time.page_base, time.timers_base, time.intid),
+            (0x0d10_0000, 0x0d11_0000, 20)
+        );
+        let kinds: Vec<_> = hvf.devices.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "pl011",
+                "virtio-blk",
+                "virtio-net",
+                "hvi-time-page",
+                "hvi-time"
+            ]
+        );
+        // The tree is the portable one: hvi-time, the prefixed command line
+        // and a timer without interrupts. Each change moves the digest.
+        let tree = |cfg: &BootConfig| {
+            let dt = portable::devicetree(cfg, 2, true, true, false).unwrap();
+            fdt::build(
+                &layout,
+                &dt.gic,
+                2,
+                &dt.cmdline,
+                dt.devices,
+                &[0; fdt::RNG_SEED_LEN],
+                0,
+            )
+            .unwrap()
+        };
+        let blob = tree(&base);
+        let has = |needle: &str| blob.windows(needle.len()).any(|w| w == needle.as_bytes());
+        assert!(has("hvi,time-v1"));
+        assert!(has(
+            "arm64.nopauth arm64.nobti arm64.nosve arm64.nosme arm64.nomte console=ttyAMA0"
+        ));
+        assert!(fdt::tests::prop(&blob, "timer", "interrupts").is_none());
+        assert_eq!(sha256_hex(&blob), hvf.firmware.dtb_sha256.clone().unwrap());
+        let debug = digest("kvm", &cfg("console=ttyAMA0", Some(true)));
+        assert_ne!(debug.firmware.dtb_sha256, hvf.firmware.dtb_sha256);
     }
 
     #[test]
