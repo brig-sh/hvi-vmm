@@ -253,7 +253,10 @@ authentication.
 
 The GIC version is not a choice. KVM offers the vGIC that matches the host, so
 a GIC-400 host gets v2 and refuses more than 8 vCPUs, and a GICv3 host gets
-v3. The macOS backend is always v3, because Apple's `hv_gic` is one.
+v3. The macOS backend is v3, because Apple's `hv_gic` is one, unless the boot
+asks for `--profile portable-arm64-v1`. That profile creates no `hv_gic` and
+gives the guest hvi's software GICv2 at the v2 addresses (see
+[portable-profile.md](portable-profile.md)).
 
 A v3 guest on KVM takes at most 507 vCPUs, since each vCPU adds a redistributor
 frame from a fixed base and the frames must end below the UART.
@@ -341,6 +344,9 @@ thing that differs by backend:
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
   line that rises on an I/O thread also kicks the vCPUs. The console UART's line
   never kicks.
+- **macOS/arm64, portable profile**: the line is set in the software GICv2
+  (`devices/gicv2.rs`), and every vCPU the GIC routes it to, other than the
+  calling thread's own, is woken. See [The software GICv2](#the-software-gicv2).
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
   vGICv2 and vGICv3.
 - **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7.
@@ -371,6 +377,32 @@ the wrapper tracks THR-empty itself and answers IIR reads. Both write guest
 output to stdout through `terminal::ConsoleFilter`, which drops the escape
 sequences that change host state or make the terminal answer (see
 [security.md](security.md#what-the-guest-can-reach)).
+
+### The software GICv2
+
+`devices/gicv2.rs` is a GICv2 distributor and CPU interface in software, for
+the portable profile on Hypervisor.framework, which has no GIC without
+`hv_gic`. It mirrors what a guest reads from KVM's vGICv2 on a Raspberry Pi 5:
+the identification registers, five priority bits, fixed SGI and PPI
+configuration, and banked read-only targets for interrupts 0-31. It keeps each
+interrupt's enable, line level, software latch and active state apart, so a
+checkpoint can carry all four (`Gicv2::state`, `Gicv2::restore`). It knows
+nothing of the hypervisor:
+
+- The backend routes guest accesses to `GICD` and the first 4 KiB of `GICC` to
+  it. The rest of the `GICC` window reads as zero.
+- Before every guest entry the vCPU thread sets the vCPU's IRQ line from
+  `Gicv2::irq_pending`. Hypervisor.framework drops that line after each run,
+  and only the vCPU's own thread can set it.
+- A change that gives another vCPU an interrupt returns it to be woken: a
+  notify for one asleep in an emulated WFI, and `hv_vcpus_exit` for one in a
+  run.
+- Without `hv_gic` a guest WFI exits at once, so the vCPU thread steps past it
+  and sleeps until the GIC has an interrupt for it, the guest's virtual timer
+  is due, a pause asks it to park, or the VM stops.
+- The virtual timer reaches the guest only as a `VTIMER_ACTIVATED` exit. hvi
+  raises PPI 27 and keeps the timer masked until the guest's `GICC_EOIR` for
+  it. It then lowers the line and unmasks, unless the timer still fires.
 
 ### Used-ring ordering
 
