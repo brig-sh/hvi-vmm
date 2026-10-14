@@ -17,10 +17,10 @@
 //! `loader` places the kernel `Image`, the initramfs and the devicetree in
 //! guest RAM, `fdt` builds the devicetree, and `layout` holds the
 //! guest-physical address map both work from. `kvm` runs the guest on Linux and
-//! `hvf` on macOS. `esr` decodes the exception syndrome that
-//! Hypervisor.framework reports on a guest exit, and `smoke` checks
-//! Hypervisor.framework without a kernel. `profile` fills the parts of the
-//! machine profile both backends share.
+//! `hvf` on macOS, which `hvf_state` reads into a checkpoint. `esr` decodes the
+//! exception syndrome that Hypervisor.framework reports on a guest exit, and
+//! `smoke` checks Hypervisor.framework without a kernel. `profile` fills the
+//! parts of the machine profile both backends share.
 
 pub mod esr;
 pub mod fdt;
@@ -30,6 +30,8 @@ pub(crate) mod profile;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod hvf;
+#[cfg(target_os = "macos")]
+pub(crate) mod hvf_state;
 #[cfg(target_os = "linux")]
 pub(crate) mod kvm;
 #[cfg(target_os = "macos")]

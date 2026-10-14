@@ -51,7 +51,8 @@ use crate::checkpoint::control::{
     format_response, parse_request, CheckpointStats, Error, ErrorCode, Request, Response, Then,
     VmState, MAX_LINE,
 };
-use crate::checkpoint::cpu::VcpuState;
+use crate::checkpoint::cpu::{Output, VcpuState};
+use crate::checkpoint::platform::PlatformState;
 use crate::checkpoint::profile::{MachineProfile, ProfileCell};
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
@@ -504,8 +505,8 @@ impl<K: Kick> Machine<'_, K> {
                 return Response::Error(e);
             }
         }
-        let vcpus = match self.export_vcpus(started + self.timeout) {
-            Ok(vcpus) => vcpus,
+        let exported = match self.export(started + self.timeout) {
+            Ok(exported) => exported,
             Err(e) => {
                 self.back_to(was_paused);
                 return Response::Error(e);
@@ -518,7 +519,7 @@ impl<K: Kick> Machine<'_, K> {
         let sealed = match &self.capture {
             Some((capture, _)) => {
                 let vcpus_of = self.vcpus;
-                capture.write(writer, &profile, vcpus, &request, &|| {
+                capture.write(writer, &profile, exported, &request, &|| {
                     !vcpus_of.is_running()
                 })
             }
@@ -557,47 +558,114 @@ impl<K: Kick> Machine<'_, K> {
         }
     }
 
-    /// Asks every parked vCPU for its state and returns them by index, a
-    /// vCPU the guest never started as powered off.
-    fn export_vcpus(&mut self, deadline: Instant) -> Result<Vec<VcpuState>, Error> {
+    /// Asks every parked vCPU for its state, then vCPU 0 for the platform,
+    /// and returns the states by index with the platform they make up.
+    ///
+    /// A vCPU the guest never started is powered off, or waits for the
+    /// `CPU_ON` the guest sent it. The platform is read in a request of its
+    /// own, after every vCPU's export, so the interrupt controller vCPU 0
+    /// reads is the one the others left; the wait between the two requests
+    /// is the barrier. A backend that does not read the platform leaves it
+    /// marked as not captured.
+    fn export(&mut self, deadline: Instant) -> Result<capture::Exported, Error> {
         let Some((capture, _)) = &self.capture else {
             return Err(Error::new(ErrorCode::Refused, "no capture"));
         };
         let (arch, backend) = (capture.arch, capture.backend);
-        self.vcpus.request_export();
+        let failed = |why: String| Error::new(ErrorCode::CaptureFailed, why);
+        let results = self.work(deadline, "exported their state", Vcpus::request_export)?;
+        let mut vcpus = Vec::with_capacity(results.len());
+        let mut irq_cpus = Vec::new();
+        let mut exported = 0;
+        for (cpu, result) in (0u32..).zip(results) {
+            match result {
+                WorkResult::Done(Some(out)) => match *out {
+                    Output::Vcpu { state, irq } if state.id() == cpu => {
+                        exported += 1;
+                        vcpus.push(state);
+                        irq_cpus.extend(irq);
+                    }
+                    _ => return Err(failed(format!("vCPU {cpu} exported no state of its own"))),
+                },
+                WorkResult::Done(None) => {
+                    return Err(failed(format!("vCPU {cpu} exported no state of its own")))
+                }
+                WorkResult::Failed(why) => {
+                    return Err(failed(format!(
+                        "vCPU {cpu} could not export its state: {why}"
+                    )))
+                }
+                WorkResult::NotStarted => {
+                    vcpus.push(match self.vcpus.kicker().pending_start(cpu) {
+                        Some((entry, ctx)) => VcpuState::pending_on(arch, backend, cpu, entry, ctx),
+                        None => VcpuState::powered_off(arch, backend, cpu),
+                    });
+                }
+            }
+        }
+        // A vCPU that started after the wait ended has no export and is no
+        // longer off. Writing it as either would lose it.
+        if self.vcpus.started() != exported {
+            return Err(failed(format!(
+                "a vCPU started during the capture ({} started, {exported} exported); \
+                 try again",
+                self.vcpus.started()
+            )));
+        }
+        let results = self.work(deadline, "read the platform", Vcpus::request_platform)?;
+        let mut platform = None;
+        for (cpu, result) in results.into_iter().enumerate() {
+            match result {
+                WorkResult::Done(None) | WorkResult::NotStarted => {}
+                WorkResult::Done(Some(out)) => match *out {
+                    Output::Platform {
+                        platform: read,
+                        capabilities,
+                    } if cpu == 0 => platform = Some((read, capabilities)),
+                    _ => return Err(failed(format!("vCPU {cpu} handed back no platform"))),
+                },
+                WorkResult::Failed(why) => {
+                    return Err(failed(format!(
+                        "vCPU {cpu} could not read the platform: {why}"
+                    )))
+                }
+            }
+        }
+        let (mut platform, capabilities) =
+            platform.unwrap_or_else(|| (PlatformState::not_captured(arch, backend), Vec::new()));
+        platform.add_cpus(irq_cpus).map_err(failed)?;
+        Ok(capture::Exported {
+            vcpus,
+            platform,
+            capabilities,
+        })
+    }
+
+    /// Posts work to the vCPUs with `post`, waits for every started one by
+    /// `deadline`, and returns what each one handed back.
+    fn work(
+        &mut self,
+        deadline: Instant,
+        what: &str,
+        post: impl FnOnce(&Vcpus<K>),
+    ) -> Result<Vec<WorkResult>, Error> {
+        post(self.vcpus);
         let waited = self
             .vcpus
             .wait_work(deadline.saturating_duration_since(Instant::now()));
         let results = self.vcpus.end_work();
-        if let Err(e) = waited {
-            return Err(match e {
-                PauseError::Stopped => {
-                    self.state = VmState::Stopping;
-                    Error::new(ErrorCode::Stopped, "the run is ending")
-                }
-                PauseError::Timeout { parked, expected } => Error::new(
-                    ErrorCode::Timeout,
-                    format!("{parked} of {expected} vCPUs exported their state in time"),
-                ),
-                other => Error::new(ErrorCode::CaptureFailed, other.to_string()),
-            });
+        match waited {
+            Ok(()) => Ok(results),
+            Err(PauseError::Stopped) => {
+                self.state = VmState::Stopping;
+                Err(Error::new(ErrorCode::Stopped, "the run is ending"))
+            }
+            Err(PauseError::Timeout { parked, expected }) => Err(Error::new(
+                ErrorCode::Timeout,
+                format!("{parked} of {expected} vCPUs {what} in time"),
+            )),
+            Err(other) => Err(Error::new(ErrorCode::CaptureFailed, other.to_string())),
         }
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(cpu, result)| match result {
-                WorkResult::Done(Some(state)) if state.id() as usize == cpu => Ok(*state),
-                WorkResult::Done(_) => Err(Error::new(
-                    ErrorCode::CaptureFailed,
-                    format!("vCPU {cpu} exported no state of its own"),
-                )),
-                WorkResult::Failed(why) => Err(Error::new(
-                    ErrorCode::CaptureFailed,
-                    format!("vCPU {cpu} could not export its state: {why}"),
-                )),
-                WorkResult::NotStarted => Ok(VcpuState::powered_off(arch, backend, cpu as u32)),
-            })
-            .collect()
     }
 
     /// Returns the VM to where a checkpoint found it: paused, or running.
@@ -720,11 +788,22 @@ mod tests {
     use std::time::Instant;
 
     /// A kicker that reaches no thread; the fake vCPUs below poll instead.
-    struct NoKick;
+    ///
+    /// It reports `pending` as the `CPU_ON` waiting for a vCPU that has not
+    /// started, as an HVF secondary's mailbox would.
+    #[derive(Default)]
+    struct NoKick {
+        pending: Option<(u32, u64, u64)>,
+    }
 
     impl Kick for NoKick {
         fn kick(&self, _cpu: u32) {}
         fn kick_all(&self) {}
+        fn pending_start(&self, cpu: u32) -> Option<(u64, u64)> {
+            self.pending
+                .filter(|(at, _, _)| *at == cpu)
+                .map(|(_, entry, ctx)| (entry, ctx))
+        }
     }
 
     /// What a [`Fixture`] serves.
@@ -736,6 +815,8 @@ mod tests {
         stuck: u32,
         /// vCPUs the guest never starts, as an HVF secondary before CPU_ON.
         unstarted: u32,
+        /// A `CPU_ON` waiting for one of those, as (vCPU, entry, context).
+        pending: Option<(u32, u64, u64)>,
         /// Whether the run has a checkpoint root and what to capture.
         capture: bool,
         /// A virtio-net device the capture holds.
@@ -792,7 +873,13 @@ mod tests {
             std::fs::create_dir(&root).unwrap();
             let source = StopSource::new().unwrap();
             let count = spec.parking + spec.stuck + spec.unstarted;
-            let vcpus = Arc::new(Vcpus::new(count, NoKick, StopHandle::new_pair().unwrap().0));
+            let vcpus = Arc::new(Vcpus::new(
+                count,
+                NoKick {
+                    pending: spec.pending,
+                },
+                StopHandle::new_pair().unwrap().0,
+            ));
             let fake_vcpus = (0..spec.parking)
                 .map(|cpu| {
                     vcpus.mark_started(vcpus.started());
@@ -800,13 +887,16 @@ mod tests {
                     std::thread::spawn(move || {
                         while vcpus.is_running() {
                             let _ = vcpus.checkpoint_with(cpu, |work| match work {
-                                Work::Export => Ok(Some(VcpuState::from_regs_view(
-                                    GuestArch::Aarch64,
-                                    "hvf",
-                                    cpu,
-                                    &RegsView::default(),
-                                ))),
-                                Work::Import(_) => Ok(None),
+                                Work::Export => Ok(Some(Output::Vcpu {
+                                    state: VcpuState::from_regs_view(
+                                        GuestArch::Aarch64,
+                                        "hvf",
+                                        cpu,
+                                        &RegsView::default(),
+                                    ),
+                                    irq: None,
+                                })),
+                                Work::ExportPlatform | Work::Import(..) => Ok(None),
                             });
                             std::thread::sleep(Duration::from_millis(1));
                         }
@@ -1301,6 +1391,37 @@ mod tests {
         let again = reply(&f.checkpoint("ck", "continue"));
         assert_eq!(again["code"], "refused", "{again}");
         f.assert_running();
+    }
+
+    // A secondary the guest asked to start, whose thread had not taken the
+    // request, is neither off nor running: the restore must start it as the
+    // request would have.
+    #[test]
+    fn a_secondary_waiting_for_its_start_is_written_pending_on() {
+        let mut f = Fixture::with(
+            "ck-pending",
+            Spec {
+                parking: 1,
+                unstarted: 2,
+                pending: Some((2, 0x4008_0000, 0x77)),
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let line = f.checkpoint("ck", "fence");
+        assert_eq!(reply(&line)["ok"], true, "{line}");
+        let bundle = crate::checkpoint::bundle::Bundle::open(&f.root.join("ck")).unwrap();
+        let cpu = serde_json::to_value(bundle.cpu().unwrap()).unwrap();
+        assert_eq!(cpu["vcpus"][1]["power"], "off", "{cpu}");
+        assert_eq!(
+            cpu["vcpus"][2]["power"],
+            serde_json::json!({"pending_on": {"entry": "0x40080000", "ctx": "0x77"}}),
+            "{cpu}"
+        );
+        // The fixture's vCPUs read no platform, as the KVM backends do.
+        let platform = bundle.platform().unwrap();
+        assert!(platform.is_partial());
+        assert!(bundle.manifest().capabilities.is_empty());
     }
 
     // The source's half of a move: once captured it must never run again,

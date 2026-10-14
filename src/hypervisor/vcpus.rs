@@ -46,7 +46,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::checkpoint::cpu::{VcpuState, Work};
+use crate::checkpoint::cpu::{ImportPlan, ImportStep, Output, Work};
 use crate::config::Stop;
 use crate::hypervisor::quiesce::Quiesce;
 use crate::run::StopHandle;
@@ -63,6 +63,16 @@ pub(crate) trait Kick: Send + Sync {
 
     /// Ends the current or next run of every vCPU but the caller's own.
     fn kick_all(&self);
+
+    /// Returns the start a vCPU that has not started was asked for and has
+    /// not taken, as its entry point and context argument.
+    ///
+    /// An arm64 secondary waits outside the hypervisor for the guest's PSCI
+    /// `CPU_ON`, and the request waits in a mailbox until its thread takes it.
+    /// A backend whose vCPUs all start at once has no such request.
+    fn pending_start(&self, _cpu: u32) -> Option<(u64, u64)> {
+        None
+    }
 
     /// Wakes the vCPUs that wait outside the hypervisor for the guest to start
     /// them.
@@ -120,18 +130,22 @@ struct WorkTable {
 
 /// What the control thread asks of every vCPU.
 #[derive(Clone)]
+// `hvi restore` posts `Import`; until it exists, only the tests do.
+#[allow(dead_code)]
 enum WorkRequest {
     /// Each vCPU writes its state.
     Export,
-    /// Each vCPU loads its own state from the list, by index.
-    Import(Arc<Vec<VcpuState>>),
+    /// vCPU 0 reads the platform, once every vCPU has exported.
+    ExportPlatform,
+    /// Each vCPU carries out one step of a restore from the plan.
+    Import(ImportStep, Arc<ImportPlan>),
 }
 
 /// What one vCPU made of a work request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkResult {
-    /// It did the work, and this is the state it exported, if it exported one.
-    Done(Option<Box<VcpuState>>),
+    /// It did the work, and this is what it handed back, if anything.
+    Done(Option<Box<Output>>),
     /// It could not, and this says why.
     Failed(String),
     /// It never took the request: the guest has not started it, so it has no
@@ -230,7 +244,7 @@ impl<K: Kick> Vcpus<K> {
     pub(crate) fn checkpoint_with(
         &self,
         cpu: u32,
-        mut serve: impl FnMut(Work<'_>) -> io::Result<Option<VcpuState>>,
+        mut serve: impl FnMut(Work<'_>) -> io::Result<Option<Output>>,
     ) -> Duration {
         let Some(due) = self.work_due.get(cpu as usize) else {
             return self.quiesce.checkpoint();
@@ -246,7 +260,7 @@ impl<K: Kick> Vcpus<K> {
         &self,
         cpu: u32,
         due: &AtomicBool,
-        serve: &mut impl FnMut(Work<'_>) -> io::Result<Option<VcpuState>>,
+        serve: &mut impl FnMut(Work<'_>) -> io::Result<Option<Output>>,
     ) {
         if !due.swap(false, Ordering::SeqCst) {
             return;
@@ -258,13 +272,17 @@ impl<K: Kick> Vcpus<K> {
         let outcome = match &request {
             None => return,
             Some(WorkRequest::Export) => serve(Work::Export),
-            Some(WorkRequest::Import(states)) => match states.get(cpu as usize) {
-                Some(state) => serve(Work::Import(state)),
-                None => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("no state for vCPU {cpu}"),
-                )),
-            },
+            Some(WorkRequest::ExportPlatform) => serve(Work::ExportPlatform),
+            Some(WorkRequest::Import(step, plan)) => {
+                if plan.vcpus.get(cpu as usize).is_some() {
+                    serve(Work::Import(*step, plan))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("no state for vCPU {cpu}"),
+                    ))
+                }
+            }
         };
         let result = match outcome {
             Ok(state) => WorkResult::Done(state.map(Box::new)),
@@ -289,12 +307,22 @@ impl<K: Kick> Vcpus<K> {
         self.post(WorkRequest::Export);
     }
 
-    /// Asks every vCPU to load its own state from `states`, by index, at its
-    /// checkpoint, and wakes the ones parked already.
+    /// Asks vCPU 0 to read the platform at its checkpoint, and every other
+    /// vCPU to report that it has nothing to add.
+    ///
+    /// The caller posts it once every vCPU has exported, so the interrupt
+    /// controller vCPU 0 reads holds what the others' exports left in it.
+    pub(crate) fn request_platform(&self) {
+        self.post(WorkRequest::ExportPlatform);
+    }
+
+    /// Asks every vCPU to carry out `step` of a restore from `plan`, its
+    /// own state by index, at its checkpoint, and wakes the ones parked
+    /// already.
     // `hvi restore` is the caller; until it exists, only the tests are.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn request_import(&self, states: Vec<VcpuState>) {
-        self.post(WorkRequest::Import(Arc::new(states)));
+    pub(crate) fn request_import(&self, step: ImportStep, plan: Arc<ImportPlan>) {
+        self.post(WorkRequest::Import(step, plan));
     }
 
     /// Posts `request` to every vCPU and wakes the parked ones.
@@ -810,6 +838,8 @@ impl VcpuThreads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::cpu::VcpuState;
+    use crate::checkpoint::platform::PlatformState;
     use std::os::unix::thread::JoinHandleExt;
 
     use crate::signal::{install_kick_handler, kick_signal};
@@ -1190,7 +1220,7 @@ mod tests {
     fn serving_vcpu(
         vcpus: &Arc<Vcpus<CountingKicker>>,
         cpu: u32,
-        serve: fn(u32, Work<'_>) -> io::Result<Option<VcpuState>>,
+        serve: fn(u32, Work<'_>) -> io::Result<Option<Output>>,
     ) -> JoinHandle<()> {
         vcpus.mark_started(vcpus.started());
         let vcpus = Arc::clone(vcpus);
@@ -1202,23 +1232,26 @@ mod tests {
         })
     }
 
-    fn export(cpu: u32, work: Work<'_>) -> io::Result<Option<VcpuState>> {
+    fn export(cpu: u32, work: Work<'_>) -> io::Result<Option<Output>> {
         use crate::plugin::{GuestArch, RegsView};
         let view = RegsView {
             pc: 0x1000 + u64::from(cpu),
             ..RegsView::default()
         };
         match work {
-            Work::Export => Ok(Some(VcpuState::from_regs_view(
-                GuestArch::Aarch64,
-                "test",
-                cpu,
-                &view,
-            ))),
-            Work::Import(state) if state.id() == cpu => Ok(None),
-            Work::Import(state) => Err(io::Error::other(format!(
+            Work::Export => Ok(Some(Output::Vcpu {
+                state: VcpuState::from_regs_view(GuestArch::Aarch64, "test", cpu, &view),
+                irq: None,
+            })),
+            Work::ExportPlatform if cpu == 0 => Ok(Some(Output::Platform {
+                platform: PlatformState::not_captured(GuestArch::Aarch64, "test"),
+                capabilities: vec!["test-v1".into()],
+            })),
+            Work::ExportPlatform => Ok(None),
+            Work::Import(_, plan) if plan.vcpus[cpu as usize].id() == cpu => Ok(None),
+            Work::Import(_, plan) => Err(io::Error::other(format!(
                 "vCPU {cpu} was handed the state of vCPU {}",
-                state.id()
+                plan.vcpus[cpu as usize].id()
             ))),
         }
     }
@@ -1227,13 +1260,43 @@ mod tests {
         results
             .iter()
             .map(|r| match r {
-                WorkResult::Done(Some(state)) => state.id(),
+                WorkResult::Done(Some(out)) => match &**out {
+                    Output::Vcpu { state, .. } => state.id(),
+                    other => panic!("not a vCPU export: {other:?}"),
+                },
                 other => panic!("not an export: {other:?}"),
             })
             .collect()
     }
 
-    // The vCPUs are parked before the export is asked for, as when a client
+    // The platform is read by vCPU 0 alone, in a request of its own, so the
+    // vCPUs' exports are all done by then.
+    #[test]
+    fn only_vcpu_0_reads_the_platform() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let threads = [
+            serving_vcpu(&vcpus, 0, export),
+            serving_vcpu(&vcpus, 1, export),
+        ];
+        vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
+        vcpus.request_export();
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        assert_eq!(exported(&vcpus.end_work()), [0, 1]);
+        vcpus.request_platform();
+        vcpus.wait_work(Duration::from_secs(5)).unwrap();
+        let results = vcpus.end_work();
+        assert!(
+            matches!(&results[0], WorkResult::Done(Some(out))
+                if matches!(&**out, Output::Platform { capabilities, .. } if capabilities == &["test-v1"])),
+            "{results:?}"
+        );
+        assert_eq!(results[1], WorkResult::Done(None));
+        vcpus.stop();
+        for thread in threads {
+            assert!(exits(&thread));
+        }
+    }
+
     // pauses and then checkpoints. Work checked only on the way into a park
     // would never reach them.
     #[test]
@@ -1285,7 +1348,7 @@ mod tests {
         vcpus.request_export();
         vcpus.wait_work(Duration::from_secs(5)).unwrap();
         let results = vcpus.end_work();
-        assert!(matches!(&results[0], WorkResult::Done(Some(s)) if s.id() == 0));
+        assert_eq!(exported(&results[..1]), [0]);
         assert_eq!(results[1], WorkResult::NotStarted);
         vcpus.stop();
         assert!(exits(&first));
@@ -1300,9 +1363,13 @@ mod tests {
         ];
         vcpus.pause_from_control(Duration::from_secs(5)).unwrap();
         let states = (0..2)
-            .map(|cpu| export(cpu, Work::Export).unwrap().unwrap())
+            .map(|cpu| VcpuState::powered_off(crate::plugin::GuestArch::Aarch64, "test", cpu))
             .collect();
-        vcpus.request_import(states);
+        let plan = Arc::new(ImportPlan {
+            vcpus: states,
+            platform: PlatformState::not_captured(crate::plugin::GuestArch::Aarch64, "test"),
+        });
+        vcpus.request_import(ImportStep::Vcpu, plan);
         vcpus.wait_work(Duration::from_secs(5)).unwrap();
         assert_eq!(
             vcpus.end_work(),
@@ -1316,7 +1383,7 @@ mod tests {
 
     #[test]
     fn a_failed_export_is_reported_with_its_reason() {
-        fn refuse(_: u32, _: Work<'_>) -> io::Result<Option<VcpuState>> {
+        fn refuse(_: u32, _: Work<'_>) -> io::Result<Option<Output>> {
             Err(io::Error::other("register read failed"))
         }
         let vcpus = Arc::new(test_vcpus(1, CountingKicker::default()));

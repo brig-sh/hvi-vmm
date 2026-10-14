@@ -38,6 +38,7 @@ use applevisor::prelude::{
 
 use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt;
+use crate::arch::aarch64::hvf_state;
 use crate::arch::aarch64::layout::{
     mpidr_affinity, place_virtio_fs, vcpu_index, virtio_blk_base, virtio_blk_spi, GicLayout,
     GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE,
@@ -46,7 +47,6 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::checkpoint::capture::Console;
-use crate::checkpoint::cpu;
 use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, Stop};
@@ -215,6 +215,14 @@ impl Kick for Kicker {
         let _ = self.vm.vcpus_exit(&others);
     }
 
+    fn pending_start(&self, cpu: u32) -> Option<(u64, u64)> {
+        // Read under the lock its thread takes the request under, so a
+        // request is either still here or taken by a vCPU that has started.
+        self.secondaries
+            .get(cpu as usize)
+            .and_then(|sec| *lock_or_recover(&sec.mbox))
+    }
+
     fn kick_halted(&self) {
         for sec in self.secondaries.iter() {
             // The lock is taken so a secondary cannot be between its check of
@@ -300,10 +308,52 @@ impl FsWake {
 /// queued deeply still gets serviced off the vCPU.
 const FS_INLINE_BUDGET: u16 = 8;
 
+/// Has the vCPU threads create their vCPUs one at a time, in index order.
+///
+/// The framework numbers vCPUs in the order they are created, and the
+/// `hv_gic_state` blob a checkpoint carries may hold each one's GIC state by
+/// that number. Created in index order, the number is the index on every
+/// boot and every restore, which the export checks.
+#[derive(Default)]
+struct CreateOrder {
+    /// The index of the vCPU whose turn it is.
+    next: Mutex<u32>,
+    /// Signals the end of a turn.
+    turn: Condvar,
+}
+
+impl CreateOrder {
+    /// Waits until it is vCPU `cpu`'s turn, and returns false instead when
+    /// `running` turns false first.
+    fn wait_turn(&self, cpu: u32, running: impl Fn() -> bool) -> bool {
+        let mut next = lock_or_recover(&self.next);
+        while *next != cpu {
+            if !running() {
+                return false;
+            }
+            // The stop does not signal this condition variable, so the wait
+            // is cut into slices.
+            next = self
+                .turn
+                .wait_timeout(next, std::time::Duration::from_millis(50))
+                .map_or_else(|e| e.into_inner().0, |(next, _)| next);
+        }
+        true
+    }
+
+    /// Ends the turn of the vCPU whose turn it is, created or not.
+    fn done(&self) {
+        *lock_or_recover(&self.next) += 1;
+        self.turn.notify_all();
+    }
+}
+
 /// State shared across all vCPU threads.
 #[derive(Clone)]
 struct Shared {
     vm: VmGic,
+    /// The order the vCPU threads create their vCPUs in.
+    create_order: Arc<CreateOrder>,
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     pl011: Arc<Mutex<Pl011>>,
@@ -635,6 +685,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     let shared = Shared {
         vm: vm.clone(),
+        create_order: Arc::default(),
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
             sandbox_id: cfg.sandbox_id.clone(),
@@ -851,7 +902,15 @@ fn last_exit() -> Option<ExitReason> {
 /// A single vCPU: create it, position it (boot entry, or wait for CPU_ON), and
 /// run its exit loop until the VM stops.
 fn run_cpu(cpu_id: u32, sh: Shared) {
-    let vcpu = match sh.vm.vcpu_create() {
+    if !sh
+        .create_order
+        .wait_turn(cpu_id, || sh.guest.vcpus.is_running())
+    {
+        return;
+    }
+    let created = sh.vm.vcpu_create();
+    sh.create_order.done();
+    let vcpu = match created {
         Ok(v) => v,
         Err(e) => {
             sh.guest.vcpus.report(Outcome::Failed(format!(
@@ -888,18 +947,23 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         while mbox.is_none() && sh.guest.vcpus.is_running() {
             mbox = sec.cv.wait(mbox).unwrap();
         }
-        match mbox.take() {
-            Some((entry, ctx)) => {
-                drop(mbox);
-                stderrln!("{LOG_PREFIX} vcpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
-                let _ = vcpu.set_reg(Reg::PC, entry);
-                let _ = vcpu.set_reg(Reg::X0, ctx);
-                let _ = vcpu.set_reg(Reg::CPSR, 0x3c5);
-            }
-            None => return, // stopped while waiting
-        }
+        let Some((entry, ctx)) = *mbox else {
+            return; // stopped while waiting
+        };
+        let _ = vcpu.set_reg(Reg::PC, entry);
+        let _ = vcpu.set_reg(Reg::X0, ctx);
+        let _ = vcpu.set_reg(Reg::CPSR, 0x3c5);
+        // Taken and started under the mailbox lock, which a checkpoint
+        // reads it under: the request is in the mailbox or this vCPU counts
+        // as started, never neither.
+        *mbox = None;
+        sh.guest.vcpus.mark_started(cpu_id);
+        drop(mbox);
+        stderrln!("{LOG_PREFIX} vcpu{cpu_id}: PSCI CPU_ON -> {entry:#x}");
     }
-    sh.guest.vcpus.mark_started(cpu_id);
+    if cpu_id == 0 {
+        sh.guest.vcpus.mark_started(cpu_id);
+    }
 
     // The plugin runs on vcpu0, between guest entries, because only this thread
     // can read this vCPU's registers.
@@ -913,7 +977,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // look at the guest, or the control socket captures it, doing
             // on this thread the work only it can.
             sh.guest.pass_safepoint(&vcpu, cpu_id, plugin, |work| {
-                cpu::serve_from_regs_view(GuestArch::Aarch64, "hvf", cpu_id, &vcpu, work)
+                hvf_state::serve(cpu_id, &vcpu, &sh.vm, work)
             });
 
             let flow = match vcpu.run() {
