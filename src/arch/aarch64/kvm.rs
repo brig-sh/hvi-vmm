@@ -197,6 +197,7 @@ struct Shared {
 
 /// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    cfg.validate()?;
     cfg.require_native_profile("KVM")?;
     if !cfg.fs_shares.is_empty() {
         return Err(

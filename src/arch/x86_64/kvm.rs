@@ -58,7 +58,7 @@ use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::{mptable, MAX_VCPUS};
 use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::{
-    device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform, UNKNOWN,
+    device, hex, sha256_hex, MachineProfile, ProfileCell, UNKNOWN, X86Platform,
 };
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};
@@ -340,6 +340,7 @@ fn boot_profile(
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    cfg.validate()?;
     cfg.require_native_profile("KVM")?;
     if !cfg.fs_shares.is_empty() {
         return Err(

@@ -114,16 +114,28 @@ are three behaviours, not two.
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | `--profile portable-arm64-v1`, `--no-arch-timer-irq` | acted on | **refused**, boot fails | **refused**, boot fails |
+| `--share-ro`, `--share-rw` with `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
+| `--no-arch-timer-irq` without `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
 | everything else | acted on | acted on | acted on |
 
-Three of those errors appear **after** `booting <kernel> with <N> MiB ...` has
-printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` on macOS, and the shares and a portable profile on either Linux
-backend.
+Every refusal in that table appears **after** `booting <kernel> with <N> MiB
+...` has printed, because it is raised inside the backend rather than at parse
+time. The last two are checked by every backend, so a program that embeds hvi
+gets them too:
 
 ```text
 booting Image with 512 MiB ...
 hvi: --net-tap tap0: no /dev/net/tun on macOS; use --net-gateway
+```
+
+```text
+booting Image with 512 MiB ...
+hvi: --share-ro/--share-rw are not part of --profile portable-arm64-v1: a portable guest keeps its storage on virtio-blk
+```
+
+```text
+booting Image with 512 MiB ...
+hvi: --no-arch-timer-irq needs --profile portable-arm64-v1
 ```
 
 Unknown flags are the one class caught before anything prints.
@@ -147,7 +159,6 @@ hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>
 hvi: unknown machine profile "portable"; expected native or portable-arm64-v1
-hvi: --no-arch-timer-irq needs --profile portable-arm64-v1
 hvi: unknown boot arg "--nope"
 ```
 
