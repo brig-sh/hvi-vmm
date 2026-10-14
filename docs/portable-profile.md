@@ -282,7 +282,15 @@ vCPU index, which is `MPIDR_EL1.Aff0`:
 | 0x18 | `CTRL` | Read/write. Bit 0 `ENABLE`. |
 
 64-bit accesses and 32-bit accesses to either half work. Anything else reads
-as zero and ignores writes.
+as zero and ignores writes. A 32-bit `DEADLINE_NS` write goes low half
+first: hvi holds the low half and disarms the timer (the register reads
+`u64::MAX`) until the high half arrives, then arms both halves together.
+Merged into the deadline still armed, a low half alone could make a time
+already past, and the timer would fire early. A high half written alone
+keeps the deadline's low half. A checkpoint taken between the two writes
+loses the held low half, and the high half then arms the last nanosecond
+of its 2^32 ns window: late, never early. The guest driver writes the
+deadline with one 64-bit store.
 
 A vCPU's line, PPI 20, is high while its timer is enabled and `STATUS` is not
 zero, so the guest's write that clears `STATUS` lowers it. With `ENABLE`
