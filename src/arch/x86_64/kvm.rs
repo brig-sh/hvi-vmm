@@ -500,6 +500,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
+            write_log: None,
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
