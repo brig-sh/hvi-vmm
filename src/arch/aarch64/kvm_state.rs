@@ -26,9 +26,6 @@
 //! The registers are reached through [`OneReg`], so the conversion is tested
 //! without KVM.
 
-// The KVM restore, which loads states with `import`, comes later.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeMap;
 use std::io;
 

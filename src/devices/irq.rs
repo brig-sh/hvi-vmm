@@ -71,8 +71,8 @@ impl Irq {
     /// A restore calls it once the interrupt controller has been loaded:
     /// loading it sets every line to the captured level behind the device's
     /// back, so the level recorded here may no longer be the line's.
-    // Only the HVF restore calls it so far.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    // The x86-64 restore does not exist yet.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn redrive(&mut self, level: bool) {
         let Some(line) = &self.line else { return };
         if line.set_level(level).is_ok() {
