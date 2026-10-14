@@ -70,7 +70,7 @@ use crate::devices::legacy::pl011::Pl011State;
 use crate::devices::legacy::rtc_cmos::RtcState;
 use crate::devices::legacy::uart16550::UartState;
 use crate::devices::state::DeviceStates;
-use crate::devices::virtio::block::BlkState;
+use crate::devices::virtio::block::{BlkState, DirtyBlocks, DiskRound, DIRTY_BLOCK_BYTES};
 use crate::devices::virtio::net::NetState;
 use crate::devices::virtio::vsock::VsockState;
 use crate::memory::{GuestRam, GuestRamView};
@@ -174,7 +174,10 @@ impl Component {
             Component::RamBin => MAX_COMPONENT_BYTES,
             Component::Cpu | Component::Platform => 16 << 20,
             Component::Devices => 256 << 20,
-            Component::Disk | Component::Session => 64 << 10,
+            // The bitmap of blocks written since boot, as base64: 8 MiB is
+            // a disk of 3 TiB.
+            Component::Disk => 8 << 20,
+            Component::Session => 64 << 10,
         }
     }
 
@@ -359,6 +362,107 @@ pub struct DiskState {
     pub generation: u64,
     /// Whether the disk was synced to stable storage before the capture.
     pub synced: bool,
+    /// The SHA-256 of the image the guest booted from, as the profile
+    /// records it (`disk_base_sha256`), or `null`.
+    #[serde(default)]
+    pub base_sha256: Option<String>,
+    /// The size of a block in `dirty_since_boot_b64`, 65536, or `null` with
+    /// no bitmap.
+    #[serde(default)]
+    pub block_size: Option<u64>,
+    /// The blocks written since boot, over every restore of the guest, as
+    /// standard base64 of the bitmap `disk-dirty` reports. A restore goes
+    /// on from it, so a later move still sends every block that differs
+    /// from the image the guest booted from.
+    #[serde(default)]
+    pub dirty_since_boot_b64: Option<String>,
+    /// The rounds of `disk-dirty` read since the last round 0, in order.
+    #[serde(default)]
+    pub rounds: Vec<DiskRound>,
+}
+
+impl DiskState {
+    /// Refuses a `disk.json` that contradicts itself or `profile`, the
+    /// bundle's profile: a base digest that is not one or is not the
+    /// profile's, rounds out of order or of a generation past the disk's,
+    /// or a bitmap that is not one of a disk this size.
+    ///
+    /// The writer cannot produce any of these, since the digest and the
+    /// disk come from the profile and the device it writes from.
+    ///
+    /// # Errors
+    ///
+    /// Errors with a sentence naming the first field that does not hold.
+    pub fn check(&self, profile: &MachineProfile) -> Result<(), String> {
+        if let Some(base) = &self.base_sha256 {
+            if base.len() != 64 || !base.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err("base_sha256 is not 64 lowercase hex digits".into());
+            }
+        }
+        if self.base_sha256 != profile.disk_base_sha256 {
+            return Err(format!(
+                "base_sha256 is {}, and profile.json records {}",
+                self.base_sha256.as_deref().unwrap_or("null"),
+                profile.disk_base_sha256.as_deref().unwrap_or("null")
+            ));
+        }
+        let mut generation = 0;
+        for (index, round) in (0u32..).zip(&self.rounds) {
+            if round.round != index {
+                return Err(format!(
+                    "rounds[{index}] is round {}, not {index}",
+                    round.round
+                ));
+            }
+            if round.generation < generation || round.generation > self.generation {
+                return Err(format!(
+                    "round {index} is of generation {}, out of order with the rounds before \
+                     it or past the disk's {}",
+                    round.generation, self.generation
+                ));
+            }
+            generation = round.generation;
+        }
+        match (self.block_size, &self.dirty_since_boot_b64) {
+            (None, None) => {}
+            (Some(DIRTY_BLOCK_BYTES), Some(_)) => {
+                self.dirty_since_boot()?;
+            }
+            _ => {
+                return Err(format!(
+                    "dirty_since_boot_b64 needs block_size {DIRTY_BLOCK_BYTES}, and the one \
+                     the other"
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the blocks written since boot, when the document has them.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the bitmap is not base64 of the bitmap of a disk of
+    /// `size_bytes`. Its length is checked before it is decoded.
+    pub fn dirty_since_boot(&self) -> Result<Option<DirtyBlocks>, String> {
+        let Some(text) = &self.dirty_since_boot_b64 else {
+            return Ok(None);
+        };
+        let want = DirtyBlocks::len_for(self.size_bytes.div_ceil(DIRTY_BLOCK_BYTES));
+        if text.len() != want.div_ceil(3) * 4 {
+            return Err(format!(
+                "dirty_since_boot_b64 is {} characters, the bitmap of a disk of {} bytes takes {}",
+                text.len(),
+                self.size_bytes,
+                want.div_ceil(3) * 4
+            ));
+        }
+        let bits = crate::checkpoint::platform::base64_decode(text)
+            .ok_or("dirty_since_boot_b64 is not base64")?;
+        DirtyBlocks::from_bytes(bits, self.size_bytes)
+            .map(Some)
+            .map_err(|e| format!("dirty_since_boot_b64: {e}"))
+    }
 }
 
 /// The whole of `session.json`.
@@ -976,7 +1080,10 @@ impl Bundle {
         if self.entry(Component::Disk).is_none() {
             return Ok(None);
         }
-        parse_disk(&self.read(Component::Disk)?).map(Some)
+        let disk = parse_disk(&self.read(Component::Disk)?)?;
+        disk.check(self.profile())
+            .map_err(|e| bad("disk.json", e))?;
+        Ok(Some(disk))
     }
 
     /// Returns `session.json`.
@@ -1540,6 +1647,10 @@ mod tests {
                     sha256_sparse: None,
                     generation: 7,
                     synced: true,
+                    base_sha256: None,
+                    block_size: None,
+                    dirty_since_boot_b64: None,
+                    rounds: Vec::new(),
                 },
             )
             .unwrap();
@@ -1952,6 +2063,7 @@ mod tests {
         let err = w.write_bytes(Component::Session, &big).unwrap_err();
         assert!(err.to_string().contains("session.json: would be"), "{err}");
         // A component written through a stream is refused once it is over.
+        let big = vec![b' '; Component::Disk.limit() as usize + 1];
         let err = w
             .write_with(Component::Disk, |out| out.write_all(&big))
             .unwrap_err();
@@ -2044,5 +2156,114 @@ mod tests {
             .unwrap()
             .replace("\"uart\":false", "\"uart\":false,\"fs\":true");
         assert!(DevicesDoc::from_json(extra.as_bytes()).is_err());
+    }
+
+    /// A `disk.json` of a 10-block disk with a base, two rounds and blocks
+    /// 1 and 9 written since boot.
+    fn moved_disk(base: &str) -> DiskState {
+        DiskState {
+            version: DOC_VERSION,
+            path_hint: "/disk.img".into(),
+            size_bytes: 10 * DIRTY_BLOCK_BYTES,
+            sha256_sparse: None,
+            generation: 9,
+            synced: true,
+            base_sha256: Some(base.into()),
+            block_size: Some(DIRTY_BLOCK_BYTES),
+            dirty_since_boot_b64: Some(crate::checkpoint::platform::base64_encode(&[0b10, 0b10])),
+            rounds: vec![
+                DiskRound {
+                    round: 0,
+                    generation: 4,
+                    blocks: 1,
+                },
+                DiskRound {
+                    round: 1,
+                    generation: 9,
+                    blocks: 1,
+                },
+            ],
+        }
+    }
+
+    // A disk.json written before the move fields existed still reads, with
+    // no base, no bitmap and no rounds.
+    #[test]
+    fn a_disk_json_without_the_move_fields_still_reads() {
+        let old = br#"{"version":1,"path_hint":"/d","size_bytes":65536,"sha256_sparse":null,"generation":3,"synced":true}"#;
+        let disk: DiskState = serde_json::from_slice(old).unwrap();
+        assert_eq!(
+            (
+                &disk.base_sha256,
+                disk.block_size,
+                &disk.dirty_since_boot_b64
+            ),
+            (&None, None, &None)
+        );
+        assert!(disk.rounds.is_empty());
+        assert_eq!(disk.check(&profile()), Ok(()));
+        assert_eq!(disk.dirty_since_boot(), Ok(None));
+    }
+
+    #[test]
+    fn a_moved_disk_json_round_trips_and_passes_its_check() {
+        let base = "ab".repeat(32);
+        let mut p = profile();
+        p.disk_base_sha256 = Some(base.clone());
+        let disk = moved_disk(&base);
+        assert_eq!(disk.check(&p), Ok(()));
+        let bits = disk.dirty_since_boot().unwrap().unwrap();
+        assert_eq!(bits.iter().collect::<Vec<_>>(), [1, 9]);
+        let json = serde_json::to_string(&disk).unwrap();
+        let tail = format!(
+            r#""base_sha256":"{base}","block_size":65536,"dirty_since_boot_b64":"AgI=","#
+        ) + r#""rounds":[{"round":0,"generation":4,"blocks":1},{"round":1,"generation":9,"blocks":1}]}"#;
+        assert!(json.ends_with(&tail), "{json}");
+        assert_eq!(serde_json::from_str::<DiskState>(&json).unwrap(), disk);
+    }
+
+    #[test]
+    fn a_disk_json_that_contradicts_itself_or_the_profile_is_refused() {
+        let base = "ab".repeat(32);
+        let mut p = profile();
+        p.disk_base_sha256 = Some(base.clone());
+        let refused = |change: &dyn Fn(&mut DiskState), profile: &MachineProfile| {
+            let mut disk = moved_disk(&base);
+            change(&mut disk);
+            disk.check(profile).unwrap_err()
+        };
+        let e = refused(&|_| {}, &profile());
+        assert!(e.contains("profile.json records null"), "{e}");
+        let e = refused(&|d| d.base_sha256 = Some("AB".repeat(32)), &p);
+        assert!(e.contains("not 64 lowercase hex"), "{e}");
+        let e = refused(&|d| d.base_sha256 = Some("cd".repeat(32)), &p);
+        assert!(
+            e.contains(&format!("and profile.json records {base}")),
+            "{e}"
+        );
+        let e = refused(&|d| d.rounds[1].round = 2, &p);
+        assert_eq!(e, "rounds[1] is round 2, not 1");
+        let e = refused(&|d| d.rounds[0].generation = 10, &p);
+        assert!(e.contains("round 0 is of generation 10"), "{e}");
+        let e = refused(&|d| d.rounds[1].generation = 3, &p);
+        assert!(e.contains("round 1 is of generation 3"), "{e}");
+        let e = refused(&|d| d.block_size = None, &p);
+        assert!(e.contains("needs block_size"), "{e}");
+        let e = refused(&|d| d.block_size = Some(4096), &p);
+        assert!(e.contains("needs block_size"), "{e}");
+        // A bitmap of another disk, refused by its length before it is
+        // decoded, and one with a block past the disk.
+        let e = refused(&|d| d.dirty_since_boot_b64 = Some("A".repeat(1 << 20)), &p);
+        assert!(e.contains("takes 4"), "{e}");
+        let e = refused(
+            &|d| {
+                d.dirty_since_boot_b64 =
+                    Some(crate::checkpoint::platform::base64_encode(&[0, 0b100]))
+            },
+            &p,
+        );
+        assert!(e.contains("past the 10 blocks"), "{e}");
+        let e = refused(&|d| d.dirty_since_boot_b64 = Some("!!!!".into()), &p);
+        assert!(e.contains("not base64"), "{e}");
     }
 }

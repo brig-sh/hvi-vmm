@@ -1007,7 +1007,7 @@ impl<K: Kick> Machine<'_, K> {
         };
         let sealed = (|| -> std::io::Result<_> {
             let devices = capture.device_states()?;
-            let disk = capture.disk_state()?;
+            let disk = capture.disk_state(&profile)?;
             let last = migrate::final_round(&mut stream, &ram, &tracker, &mut precopy, &stopping)?;
             stream.write_doc(
                 "cpu.json",
@@ -3122,6 +3122,23 @@ mod tests {
         );
 
         assert_eq!(reply(&f.checkpoint("ck", "fence"))["state"], "fenced");
+        // The bundle records the rounds, the last read inside the pause at
+        // the disk's generation, and every block written since boot.
+        let disk_json = crate::checkpoint::bundle::Bundle::open(&f.root.join("ck"))
+            .unwrap()
+            .disk()
+            .unwrap()
+            .unwrap();
+        assert_eq!(disk_json.generation, 5);
+        assert_eq!(disk_json.base_sha256, None);
+        let rounds: Vec<(u32, u64, u64)> = disk_json
+            .rounds
+            .iter()
+            .map(|r| (r.round, r.generation, r.blocks))
+            .collect();
+        assert_eq!(rounds, [(0, 4, 4), (1, 5, 1)]);
+        let since_boot = disk_json.dirty_since_boot().unwrap().unwrap();
+        assert_eq!(since_boot.iter().collect::<Vec<_>>(), [1, 2, 3, 7, 40]);
         let r2 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
         assert_eq!((&r2["round"], &r2["dirty"]), (&2.into(), &0.into()), "{r2}");
     }
