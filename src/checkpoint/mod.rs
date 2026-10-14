@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Checkpoint support: the machine profile a guest was built against, and the
-//! control socket that pauses and resumes it.
+//! Checkpoint support: the machine profile a guest was built against, the
+//! control socket that pauses and resumes it, and the bundle a capture writes.
 //!
 //! [`profile`] describes the machine in a form two hosts can compare before a
 //! guest moves between them. [`control`] is the line protocol of the
-//! `--control-sock` socket, and `server` the I/O thread that serves it. The
-//! bundle that holds a captured guest comes later and builds on both.
+//! `--control-sock` socket, and `server` the I/O thread that serves it.
+//! [`bundle`] is the directory a capture writes and a restore reads, with
+//! guest RAM in [`ram`], the vCPUs in [`cpu`] and the interrupt controller and
+//! counter in [`platform`].
 
+pub mod bundle;
 pub mod control;
+pub mod cpu;
+pub mod platform;
 pub mod profile;
 pub mod ram;
 pub(crate) mod server;
