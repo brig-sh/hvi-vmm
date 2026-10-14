@@ -979,16 +979,11 @@ impl HviTime {
             }
             // Guest nanoseconds run at the host's rate, to the page's
             // rounding, so the remainder is the host time to sleep.
-            let mut sleep = earliest
+            let until_deadline = earliest
                 .filter(|_| !g.frozen)
                 .map(|deadline| Duration::from_nanos(deadline.saturating_sub(now)));
-            if let Some(at) = next_report {
-                let until_report = at.saturating_duration_since(Instant::now());
-                sleep = Some(sleep.map_or(until_report, |s| s.min(until_report)));
-            }
-            // Never longer than a second, so a host sleep is seen soon after
-            // the wake even when no deadline is armed.
-            let d = sleep.map_or(SLEEP_CHECK_EVERY, |s| s.min(SLEEP_CHECK_EVERY));
+            let until_report = next_report.map(|at| at.saturating_duration_since(Instant::now()));
+            let d = timer_wait(until_deadline, until_report);
             g = match self.changed.wait_timeout(g, d) {
                 Ok((g, _)) => g,
                 Err(poisoned) => poisoned.into_inner().0,
@@ -1194,6 +1189,17 @@ impl HviTime {
         }
         Ok(())
     }
+}
+
+/// Returns how long the timer thread waits: until the earlier of the next
+/// deadline and the next trace report, and never longer than
+/// [`SLEEP_CHECK_EVERY`], so a host sleep is seen soon after the wake even
+/// when no deadline is armed.
+fn timer_wait(until_deadline: Option<Duration>, until_report: Option<Duration>) -> Duration {
+    [until_deadline, until_report]
+        .into_iter()
+        .flatten()
+        .fold(SLEEP_CHECK_EVERY, Duration::min)
 }
 
 /// What [`HviTime::republish_if_host_slept`] did.
@@ -2434,8 +2440,26 @@ mod tests {
         assert_eq!(dev.page().read().host_sleeps, 1);
     }
 
-    // The timer thread looks at the sleep clock at least once a second,
-    // even with no deadline armed.
+    // The timer thread's wait is capped at a second whatever is armed, so it
+    // looks at the sleep clock at least once a second.
+    #[test]
+    fn the_timer_thread_waits_a_second_at_most() {
+        let second = Duration::from_secs(1);
+        assert_eq!(SLEEP_CHECK_EVERY, second);
+        assert_eq!(timer_wait(None, None), second);
+        assert_eq!(timer_wait(Some(Duration::from_secs(3600)), None), second);
+        assert_eq!(timer_wait(None, Some(Duration::from_secs(5))), second);
+        let ms = Duration::from_millis;
+        assert_eq!(timer_wait(Some(ms(4)), None), ms(4));
+        assert_eq!(timer_wait(Some(ms(400)), Some(ms(300))), ms(300));
+        assert_eq!(timer_wait(Some(ms(200)), Some(ms(300))), ms(200));
+        assert_eq!(timer_wait(Some(Duration::ZERO), None), Duration::ZERO);
+    }
+
+    // The timer thread acts on a sleep it finds when its wait times out:
+    // nothing notifies it, no deadline is armed, and it publishes within
+    // its one-second cap. The 3 s limit leaves room for a loaded host and
+    // still fails a cap of 3 s or more.
     #[test]
     fn the_timer_thread_publishes_after_a_host_sleep() {
         let (counter, lines, host) = (Counter::default(), Lines::default(), Host::new());
@@ -2445,7 +2469,7 @@ mod tests {
         let thread = spawn_timer(&dev, || {}).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         host.sleep(5_000_000_000);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(3);
         while dev.page().read().generation == generation {
             assert!(Instant::now() < deadline, "no publish after the sleep");
             std::thread::sleep(Duration::from_millis(10));
