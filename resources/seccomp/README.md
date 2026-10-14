@@ -54,6 +54,40 @@ The musl build shares the lists. musl can reach a different syscall than glibc
 for the same library call, so `hvi seccomp-selftest` run on the musl binary is
 the check for that.
 
+## No `openat`, and the files glibc opens by itself
+
+`vmm` and `vcpu` carry no `openat`. Every file hvi needs is open before the
+filters go in, so a compromised device model cannot open one. The unit tests
+hold both lists to that.
+
+glibc's malloc does open two files on its own, from whichever thread is
+allocating or freeing at the time:
+
+- `/sys/devices/system/cpu/online`, to size its arena limit the first time a
+  thread needs a new arena while more than eight exist. Upstream glibc 2.36
+  asks `sched_getaffinity` instead. The 2.36 in Debian 12 carries a
+  release-branch change to `__get_nprocs`, which reads this file
+  (`malloc/arena.c`, `arena_get2`).
+- `/proc/sys/vm/overcommit_memory`, the first time the heap of an arena other
+  than the main one shrinks (`check_may_shrink_heap`, called from
+  `shrink_heap`).
+
+Both reads were found on a Raspberry Pi 5 running Debian 12. A guest with heavy
+agent traffic kept enough vsock bridge threads allocating at once to reach
+them, and the VMM died of `SIGSYS`. Allowing `openat` would undo the point of
+the lists, so hvi keeps glibc's malloc to its main arena instead.
+`mallopt(M_ARENA_MAX, 1)` is the first thing `main` does, while the process has
+one thread. With the limit set, glibc never counts CPUs, and with no other
+arena there is no other heap to shrink. `MALLOC_ARENA_MAX=4` in the
+environment avoids the first read and not the second, so it is not a
+workaround.
+
+The cost is one malloc lock for the process, which is how the musl build
+always runs. musl has no `mallopt` and its malloc opens no file, so on musl
+there is nothing to set. Two selftest probes, `allocate on many threads at
+once` and `free a thread's heap memory`, each reach one of these reads under
+`vmm`. A new read in a later glibc would need a probe of its own.
+
 ## Changing a list
 
 Adding a syscall is granting a right to a process that parses guest-controlled

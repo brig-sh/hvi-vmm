@@ -107,6 +107,7 @@ three things a reader should not have to guess between:
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
 | A thread a plugin starts in `attach` is unfiltered on Linux. | It starts before the filters are armed and stays unfiltered. The `--dump-after` timer thread is one. It ends when it fires, `--dump-after` seconds after the boot starts. See [#92](https://github.com/brig-sh/hvi-vmm/issues/92). | Defect |
+| On Linux with glibc, malloc runs on one arena. | Every thread shares one malloc lock, as in the musl build. More arenas would make glibc open files from filtered threads (see [the allowlists' README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself)). | Design |
 | No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |
