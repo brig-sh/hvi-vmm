@@ -148,8 +148,10 @@ pub trait CpuHandle {
     /// On macOS a secondary vCPU still waiting for the guest's PSCI `CPU_ON`
     /// has not started, and is not waited for.
     ///
-    /// Returns `false` if they did not all park, in which case the quiesce has
-    /// already been released and the caller owes nothing. On `true` the caller
+    /// Returns `false` if they did not all park, or if another requester, such
+    /// as the control socket's `pause`, holds the vCPUs. Either way the caller
+    /// has nothing to release and owes nothing, and a [`CpuHandle::resume`]
+    /// would do nothing. On `true` the caller
     /// owes exactly one [`CpuHandle::resume`] — including on any early return
     /// between the two, or the VM stays parked forever.
     fn pause(&self) -> bool;

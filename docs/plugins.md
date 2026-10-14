@@ -43,9 +43,10 @@ started and returns `true` once they are all there. You then owe exactly one
 `resume()`, on every path out, including early returns and error paths. Miss one
 and the VM stays parked forever.
 
-`false` means they did not all park within 500 ms. The quiesce has already
-been released, and you owe nothing. Returning without a `resume()` on that
-path is correct.
+`false` means they did not all park within 500 ms, or that the control socket
+holds them, from its `pause` until its `resume`. Either way you hold nothing and
+owe nothing. Returning without a `resume()` on
+that path is correct, and a `resume()` there would do nothing.
 
 ```rust
 if !cpu.pause() {
