@@ -646,9 +646,16 @@ each, the range given. Each stat is defined in the script:
 The fence reply to the resume reply is the restore's time plus well under a
 millisecond: the script starts `hvi restore` as soon as the fence replies.
 
-The restore's time is mostly reading the bundle twice: `Bundle::open` hashes
-every component, and the copy of RAM hashes `ram.bin` again as it reads it.
-`resume` replies in under a millisecond.
+Those figures were taken while the restore still read the bundle twice:
+`Bundle::open` hashed every component, and the copy of RAM hashed
+`ram.bin` again as it read it. A restore now opens the bundle with
+`Bundle::open_for_restore`, which checks only the size of `ram.bin`, and
+the copy is its one read and its hash check; a changed byte is refused
+there, before any device, disk or socket exists, with the same
+`SHA-256 does not match the manifest`. `hvi bundle verify` still hashes
+everything. On the same Mac, 2 vCPUs and 512 MiB, one run each: restore to
+restored-paused 196.0 ms native and 199.6 ms portable, against 525.7 and
+538.9 ms before the change. `resume` replies in under a millisecond.
 
 ## Clock policy
 
@@ -696,6 +703,11 @@ The guest's clock is `hvi-time`, and its restore republishes the page
   `counter_at_capture` scaled to the destination's rate, rounded up. It runs
   on while the guest waits restored-paused. The guest reads it only through
   `hvi-time`, and EL0 reads trap to the synthetic counter.
+- **The driver counts each publish once**, however many vCPUs take
+  `GEN_CHANGED`, with the portable kernel's third patch: `migrations` is 1
+  after a move on 2 or 4 vCPUs. hvi also publishes the page after a host
+  sleep ([portable-profile.md](portable-profile.md#host-sleep)), which the
+  driver counts the same way.
 
 Measured with `tools/checkpoint-e2e.sh --portable`, one run on each host,
 1 vCPU, 512 MiB:

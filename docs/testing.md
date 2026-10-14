@@ -309,9 +309,10 @@ Results and the exact commands are in
 [portable-profile.md](portable-profile.md#measured-results).
 
 A Mac that sleeps stops its guest's clocks, since Hypervisor.framework's
-counter does not run in sleep, and nothing sets the guest's wall clock
-again on wake. Keep the Mac awake through a run (`caffeinate -i`, and the
-lid open on battery), or its drift figures measure the sleep.
+counter does not run in sleep. hvi publishes `hvi-time` again after the
+sleep, which steps the guest's wall clock forward, but that is a publish
+the script counts and a gap in its drift window. Keep the Mac awake through
+a run (`caffeinate -i`, and the lid open on battery).
 
 ## Toolchain versions
 
