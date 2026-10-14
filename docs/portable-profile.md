@@ -309,7 +309,7 @@ little-endian:
 | 0x18 | `u64 base_ns` | Guest nanoseconds at the publish. |
 | 0x20 | `u32 mult`, 0x24 `u32 shift` | `ns = base_ns + ((cnt - base_counter) * mult) >> shift`, 96-bit product. |
 | 0x28 | `u64 wall_ns` | The host's `CLOCK_REALTIME` at the publish. |
-| 0x30 | `u64 downtime_total_ns` | Time the guest spent stopped across restores. |
+| 0x30 | `u64 downtime_total_ns` | Time the guest spent stopped across restores and host sleeps. |
 | 0x38 | `u64 flags` | 0. |
 
 `shift` is 24 and `mult` the nearest integer to `(10^9 << 24) / freq`:
@@ -322,7 +322,8 @@ generation even, with release fences between. The guest reads under that
 sequence count and retries.
 
 hvi publishes the page at the boot vCPU's first entry (guest nanoseconds
-start at 0 there) and at every restore, and never otherwise.
+start at 0 there), at every restore and after a host sleep (see
+[Host sleep](#host-sleep)), and never otherwise.
 
 The counter the page maps is the guest's virtual counter, and hvi must know
 it exactly:
@@ -445,13 +446,80 @@ counter rate needs two hosts. On KVM it also round-trips the vGIC while the
 guest is held, which logs `vGICv2 round trip while held: 231 registers read
 back as written`.
 
+Every vCPU takes `GEN_CHANGED` and schedules the driver's work item, which
+can then run more than once for one publish. The driver handles each
+generation once: it keeps the generation it last handled, starting from the
+boot page's, and counts the publishes since in `migrations`. An Image
+before the third patch of the series ran the work once per vCPU that took
+the bit. `tools/checkpoint-e2e.sh --portable --cpus 4` on rp2, three runs
+of each Image: the old one logged and counted the move 2, 3 and 3 times,
+the current one once each time. On the Mac one run of each counted 1: the
+recount is a race, and the Mac did not hit it.
+
+### Host sleep
+
+The guest's counter does not run while a Mac sleeps: it is
+`mach_absolute_time()`, less an offset. Guest nanoseconds stop with it, and
+so does the wall clock the guest derives from the page, which then trails
+the host's by the sleep. hvi publishes the page again after a sleep:
+
+- The timer thread wakes at least once a second and reads a clock that runs
+  only while the host sleeps: on macOS `CLOCK_MONOTONIC_RAW` (continuous)
+  less `CLOCK_UPTIME_RAW`, on Linux `CLOCK_BOOTTIME` less `CLOCK_MONOTONIC`.
+  The two clocks of a pair share their rate and their adjustments, so the
+  difference moves with nothing else.
+- When it grew by 50 ms or more since the last publish, the page is
+  published again on the same counter and rate: `base_counter` and
+  `base_ns` are now, `wall_ns` is the host's clock, `downtime_total_ns`
+  grows by how far the guest's wall clock was behind, and the generation
+  goes up by 2. Every vCPU gets `GEN_CHANGED`; deadlines stay as they are,
+  since guest nanoseconds did not jump. The driver then moves REALTIME and
+  BOOTTIME on as after a restore, and MONOTONIC carries on. hvi logs
+  `hvi-time: the host slept 30.000 s; published generation 4, the guest's
+  wall clock was 30.000 s behind`.
+- Nothing is published while a capture holds the device frozen, or before
+  a restored VM's first publish; each publish reads the sleep clock again,
+  so a sleep while restored-paused is not counted twice.
+- A process stopped with `SIGSTOP` is not a sleep: the guest's counter runs
+  on with the host's wall clock, so the guest's REALTIME stays right, the
+  sleep clock does not move, and nothing is published.
+- On a host whose counter runs through a sleep, as a Pi's might in a
+  suspend, the same publish happens with the guest's wall clock 0 behind.
+  No Pi was suspended to see which it is.
+
+`HVI_TIME_TEST_SLEEP=<at>,<secs>` simulates a sleep without one: `<at>`
+seconds after the device is made, the host wall clock and sleep clock as
+hvi reads them move `<secs>` ahead. To hvi that is a sleep of `<secs>` with
+the guest's counter stopped; the guest's REALTIME then moves `<secs>` ahead
+of the real host's. It cannot stop the guest's counter, which a real sleep
+does. Measured on 2026-10-14 with a scratch driver that boots the
+portable guest with 2 vCPUs, 512 MiB and `/clk 50` (a `CLK` line every
+50 ms), and stamps each console line with the host's wall clock on
+receipt. `HVI_TIME_TEST_SLEEP=25,30` and, separately, a `SIGSTOP` of the
+hvi process for 10 s:
+
+| | Mac | Pi |
+| --- | --- | --- |
+| First `CLK` line within 100 ms of host + 30 s | 14.5 ms after the republish | 7.6 ms after |
+| Guest REALTIME minus (host + 30 s), from then on | -0.40 to -0.18 ms | median -0.30 ms, 2 of 157 lines below -5 ms (worst -73.6 ms) |
+| Driver | `generation 4: … wall clock moved 30000021115 ns`, `migrations=1` | `30000031493 ns`, `migrations=1` |
+| `downtime_total_ns` | 30000058489 | 30000031586 |
+| `SIGSTOP` 10 s: generation, REALTIME after | 2, unchanged; -2.29 to -0.15 ms | 2, unchanged; -0.3 ms once the console drained |
+
+Every offset is negative: a line is stamped after the guest printed it.
+The Pi's worst lines are the console's delay, not the clock's: right after
+`SIGCONT`, `clk` printed the 200 lines it had missed at once, and they
+reached the host up to 686 ms late; from 0.96 s after it, every line read
+-0.3 ms.
+
 ### Clock policy
 
 - **MONOTONIC** runs on guest nanoseconds, which start at the boot vCPU's
   first entry. It does not advance while the guest is stopped across a
   restore.
 - **REALTIME** follows the host's clock at boot (the driver sets it from
-  `wall_ns` when the guest's clock still reads 1970) and after each restore.
+  `wall_ns` when the guest's clock still reads 1970), after each restore
+  and after each host sleep.
   The boot set is an `fs_initcall_sync`, after timekeeping has switched to
   `hvi-time`: set earlier, while timekeeping still reads the jiffies
   clocksource, the switch carries the time over in whole jiffies, and
@@ -554,7 +622,7 @@ on both hosts: `TICK 19` at `date=57`, `sleep 5` from `uptime` 60.22 to
 The tables above are from the first portable Image. Its driver set the
 wall clock before the clocksource switch, and the restore then moved the
 clock by about 1 ms more than the downtime (5001383267 ns against
-5000096767 ns on the Pi). The current Image (sha256 `32725b9b…`, Linux
+5000096767 ns on the Pi). The Image `32725b9b…` (Linux
 `6.12.95-00002-g4cfd86639cc9`) sets it after the switch, and was booted
 again on both hosts, with the console stamped to the microsecond, with hvi
 built at the commit that adds the vGICv2 import:
@@ -571,6 +639,12 @@ built at the commit that adds the vGICv2 import:
 No line has the guest ahead of the host. Each stamp is taken after the
 guest printed its line, so a correct clock reads at or before it, and the
 console path's latency makes the guest look further behind than it is.
+
+The current Image adds a third patch, which handles each page generation
+once (see [Restore](#restore)): sha256
+`4b2e8c5ce382a2635efe1b1b198e35b081d2f0cd4d39d9689b026fbc7d8f21b7`, Linux
+`6.12.95-00003-g51cdb81da818`. The runs in the next section used
+`32725b9b…`, with 1 vCPU, where the recount does not happen.
 
 ## Measured results
 
@@ -735,11 +809,12 @@ delay. That clock does not run in sleep either, so the guest fell behind
 the host's wall clock by each sleep: 146.9 s after the first, 7158.6 s at
 the end. No `clk` line was
 lost and MONOTONIC never stepped back; the check of REALTIME at the end
-failed, as it should. hvi does not republish `hvi-time` on wake, so a
-guest on a Mac that slept keeps a wall clock behind by the sleep until
-it is restored again or sets its own. The native profile's guest counter
-is the same host clock, so it should behave the same; that was not
-measured. The figures above are from a run with the Mac kept awake.
+failed, as it should. hvi then did not publish `hvi-time` again on
+wake; it does now (see [Host sleep](#host-sleep)), but that was measured
+with `HVI_TIME_TEST_SLEEP`, not a real sleep. The native profile's guest
+counter is the same host clock and it has no `hvi-time`, so it should
+fall behind the same way; that was not measured. The figures above are
+from a run with the Mac kept awake.
 
 ## Limits
 
@@ -752,9 +827,10 @@ measured. The figures above are from a run with the Mac kept awake.
 - A move between a Mac and a Pi is run by hand with
   `tools/migrate-e2e.sh`; no CI job runs it. Only stopped moves exist: the
   guest is paused from the capture until the copy is done.
-- A Mac that sleeps stops a guest's clocks with it, and nothing sets the
-  guest's wall clock again on wake (see
-  [Measured results](#measured-results)).
+- A Mac that sleeps stops a guest's clocks with it. hvi publishes the
+  page again after the sleep and the guest's REALTIME catches up (see
+  [Host sleep](#host-sleep)); that path was tested with a simulated sleep,
+  not a real one.
 - A guest booted with `--arch-timer-irq` is checkpointed like any other,
   but its architected timer's line is not carried by the restore; that
   debugging flag is not tested with checkpoints.
@@ -774,7 +850,8 @@ measured. The figures above are from a run with the Mac kept awake.
   then its clock runs at the host's counter rate.
 - REALTIME runs on the host's counter between publishes, so it drifts from
   the host's NTP-disciplined clock by the counter's error (up to about
-  30 ppm measured on rp2). Nothing resynchronises it until a restore.
+  30 ppm measured on rp2). Nothing resynchronises it until a restore or a
+  host sleep.
 - `clock_gettime` of a high-resolution clock is a system call in the guest.
 - On KVM the vCPUs' MMIO exits for `hvi-time` are served in user space,
   three per guest tick.
