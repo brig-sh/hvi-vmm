@@ -146,7 +146,7 @@ cargo build --release --example watch_guest
 
 ## Stopping a run from the host
 
-Create a pair with `hvi::stop::StopHandle::new_pair()` before `boot`, keep the
+Create a pair with `hvi::run::StopHandle::new_pair()` before `boot`, keep the
 `StopHandle` and pass the `StopRegistration` in `BootConfig::stop`. `boot` takes
 the registration by value, so it serves one run. `StopHandle::request_stop` from
 any thread stops the run: the VM stops, the threads are joined and the ledger is

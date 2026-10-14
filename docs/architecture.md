@@ -59,8 +59,8 @@ flowchart TB
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable / acpi"]
             dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos / acpi_pm"]
             obs["plugin: the seam<br/>plugin::builtin · events ledger"]
-            vm["hypervisor: vcpus / guest / kvm / run / quiesce"]
-            rt["io_threads · signal · stop<br/>terminal: filter / raw / input"]
+            vm["hypervisor: vcpus / guest / kvm / quiesce"]
+            rt["run: spawn / stop / supervisor<br/>io_threads · signal<br/>terminal: filter / raw / input"]
             conf["sandbox: seatbelt (macOS)<br/>seccomp (Linux, bpf)"]
             gm["memory: GuestRam over vm-memory<br/>SharedRam: memfd / POSIX shm"]
         end
@@ -376,7 +376,7 @@ secondary the guest has not brought up waits for `CPU_ON` outside the hypervisor
 and is not waited for.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU
-threads are spawned it waits in `hypervisor/run.rs` on a pipe. A guard held by
+threads are spawned it waits in `run/supervisor.rs` on a pipe. A guard held by
 each vCPU thread writes it when the thread exits, whatever ended the loop: a
 guest-requested stop, a failed entry, an unhandled exit, a failed run, or a
 panic. Each of these is reported to `Vcpus` as the run's outcome. A thread
@@ -446,7 +446,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `hypervisor/run.rs`, `stop.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

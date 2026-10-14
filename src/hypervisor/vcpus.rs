@@ -19,7 +19,7 @@
 //! how many there are and how many have exited. Each vCPU thread checks the
 //! first two at the top of its run loop, between guest entries. A vCPU thread
 //! that exits reports it and wakes the loop in
-//! [`run_to_stop`](super::run::run_to_stop), which calls [`stop`](Vcpus::stop).
+//! [`run_to_stop`](crate::run::run_to_stop), which calls [`stop`](Vcpus::stop).
 //! The stop clears the running flag, kicks every vCPU out of the hypervisor and
 //! then releases the quiesce, so each one sees the stop at its next check.
 //!
@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Stop;
 use crate::hypervisor::quiesce::Quiesce;
-use crate::stop::StopHandle;
+use crate::run::StopHandle;
 use crate::sync::lock_or_recover;
 use crate::LOG_PREFIX;
 
@@ -287,7 +287,7 @@ impl<K: Kick> Vcpus<K> {
     /// Each thread is named after its vCPU, so a panic report says which one
     /// panicked. Each holds an [`ExitGuard`] for its whole run, so every way
     /// out of it, a panic included, reports the exit and wakes the loop in
-    /// [`run_to_stop`](super::run::run_to_stop). A panic that leaves `run` is
+    /// [`run_to_stop`](crate::run::run_to_stop). A panic that leaves `run` is
     /// reported first, as that vCPU's failure with its message. A failed spawn
     /// stops the VM and spawns no further thread. The threads spawned before it
     /// are returned beside the error, so the caller can join them. `per_vcpu`
@@ -372,7 +372,7 @@ impl Outcome {
 /// [`Vcpus::spawn`] starts.
 ///
 /// The drop marks the thread exited, counts the exit and wakes the loop in
-/// [`run_to_stop`](super::run::run_to_stop). It takes no lock, so it cannot
+/// [`run_to_stop`](crate::run::run_to_stop). It takes no lock, so it cannot
 /// block on one the thread left held.
 struct ExitGuard<K: Kick> {
     /// The vCPUs of the exiting thread's VM.

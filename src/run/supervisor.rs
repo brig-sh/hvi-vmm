@@ -20,7 +20,7 @@
 //! down. Only this loop stops the VM after the spawn, so the order of the stop
 //! and the reason it reports are decided in one place.
 //!
-//! [`StopHandle`]: crate::stop::StopHandle
+//! [`StopHandle`]: crate::run::StopHandle
 
 use std::fmt;
 use std::io;
@@ -359,7 +359,7 @@ mod tests {
     use crate::hypervisor::vcpus::Vcpus;
     use crate::memory::{GuestRam, RamRegion, SharedRam};
     use crate::plugin::GuestArch;
-    use crate::stop::StopHandle;
+    use crate::run::StopHandle;
 
     /// A kicker that reaches no thread.
     struct NoopKicker;

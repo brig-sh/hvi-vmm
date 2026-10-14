@@ -21,7 +21,7 @@ use std::io;
 use std::thread::JoinHandle;
 
 use crate::config::{BootConfig, BootError, Stop};
-use crate::stop::StopHandle;
+use crate::run::StopHandle;
 
 /// A guest that [`spawn`] booted on a thread of its own.
 ///
@@ -111,7 +111,7 @@ pub fn spawn(mut cfg: BootConfig) -> io::Result<Run> {
 mod tests {
     use super::spawn;
     use crate::config::BootConfig;
-    use crate::stop::StopHandle;
+    use crate::run::StopHandle;
 
     // Every backend refuses an empty kernel before a guest runs, so this run
     // ends at once with an error.

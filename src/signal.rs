@@ -36,7 +36,7 @@ use std::time::Instant;
 use signal_hook::iterator::{Handle, Signals};
 
 use crate::config::{BootError, Stop};
-use crate::stop::{StopHandle, StopRegistration};
+use crate::run::{StopHandle, StopRegistration};
 use crate::sync::lock_or_recover;
 use crate::teardown::STOP_TIMEOUT;
 
