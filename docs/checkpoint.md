@@ -37,7 +37,7 @@ Then ask the socket:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `dir` | yes | The bundle directory. It must be absolute and below the checkpoint root. It must not exist, or be an empty directory. Its parent must exist. No directory on the way may be a link. |
+| `dir` | yes | The bundle directory. It must be absolute and below the checkpoint root, spelled as given at boot or resolved; the bundle is written below the resolved root either way. It must not exist, or be an empty directory. Its parent must exist. No directory on the way may be a link. |
 | `then` | no, default `continue` | `continue`: the VM goes back to the state it was in. `fence`: the VM stays paused for good. |
 | `txid` | no | The caller's transaction id, at most 256 bytes. Recorded in `session.json`. |
 | `epoch` | no, default 0 | The caller's epoch for the sandbox. Recorded in `session.json`. |

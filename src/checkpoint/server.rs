@@ -75,11 +75,38 @@ pub(crate) struct ControlSocket {
     listener: UnixListener,
     /// The profile `profile` answers with.
     profile: Arc<ProfileCell>,
-    /// The resolved directory a `checkpoint` may write under, when the run
-    /// has one.
-    checkpoint_root: Option<std::path::PathBuf>,
+    /// The directory a `checkpoint` may write under, when the run has one.
+    checkpoint_root: Option<CheckpointRoot>,
     /// What only the backend knows of a capture, once it has said.
     parts: Option<CaptureParts>,
+}
+
+/// The checkpoint root, resolved, and as the operator spelled it.
+#[derive(Clone)]
+struct CheckpointRoot {
+    /// The resolved path, which confinement grants and every bundle is
+    /// written below.
+    resolved: std::path::PathBuf,
+    /// The path as given, made absolute. A caller that names the root one
+    /// way at boot names its bundles the same way, and on macOS `/tmp` and
+    /// `/var` are links to `/private`.
+    given: std::path::PathBuf,
+}
+
+impl CheckpointRoot {
+    /// Returns the bundle directory `dir` names, below the resolved root.
+    ///
+    /// A `dir` spelled from the root as given is first respelled from the
+    /// resolved root, so the writes land in the tree the confinement grants
+    /// and a later change to a link on the given path cannot move them.
+    fn bundle_dir(&self, dir: &str) -> std::io::Result<std::path::PathBuf> {
+        let respelled = std::path::Path::new(dir)
+            .strip_prefix(&self.given)
+            .ok()
+            .filter(|_| self.given != self.resolved)
+            .map(|rest| self.resolved.join(rest).to_string_lossy().into_owned());
+        resolve_in_root(&self.resolved, respelled.as_deref().unwrap_or(dir))
+    }
 }
 
 /// What only the backend knows of a capture, beside what [`Guest`] holds.
@@ -126,7 +153,8 @@ impl ControlSocket {
                         format!("--checkpoint-root {root}: not a directory"),
                     ));
                 }
-                Ok(resolved)
+                let given = std::env::current_dir()?.join(root).components().collect();
+                Ok(CheckpointRoot { resolved, given })
             })
             .transpose()?;
         match std::fs::symlink_metadata(path) {
@@ -196,7 +224,9 @@ impl ControlSocket {
 
     /// Returns the resolved checkpoint root, when the run has one.
     pub(crate) fn checkpoint_root(&self) -> Option<&std::path::Path> {
-        self.checkpoint_root.as_deref()
+        self.checkpoint_root
+            .as_ref()
+            .map(|root| root.resolved.as_path())
     }
 
     /// Serves connections until `stop` is requested.
@@ -367,7 +397,7 @@ struct Machine<'a, K> {
     /// The profile `profile` reports.
     profile: &'a ProfileCell,
     /// What a `checkpoint` captures, and the root it writes under.
-    capture: Option<(Capture, std::path::PathBuf)>,
+    capture: Option<(Capture, CheckpointRoot)>,
     /// The deadline of each wait, [`CONTROL_TIMEOUT`] outside the tests.
     timeout: Duration,
 }
@@ -433,7 +463,7 @@ impl<K: Kick> Machine<'_, K> {
                 "this run has no checkpoint root; boot it with --checkpoint-root",
             );
         };
-        let dir = match resolve_in_root(root, dir) {
+        let dir = match root.bundle_dir(dir) {
             Ok(dir) => dir,
             Err(e) => return refuse(ErrorCode::Refused, e.to_string()),
         };
@@ -712,8 +742,10 @@ mod tests {
         client: UnixStream,
         replies: std::io::BufReader<UnixStream>,
         path: std::path::PathBuf,
-        /// The checkpoint root, removed with the fixture.
+        /// The checkpoint root, resolved, removed with the fixture.
         root: std::path::PathBuf,
+        /// The checkpoint root as the fixture named it at bind, unresolved.
+        given_root: std::path::PathBuf,
     }
 
     impl Fixture {
@@ -822,6 +854,7 @@ mod tests {
                 client,
                 replies,
                 path,
+                given_root: root.clone(),
                 root: std::fs::canonicalize(&root).unwrap(),
             }
         }
@@ -1260,6 +1293,31 @@ mod tests {
             r#"{"v":1,"ok":true,"state":"stopping"}"#
         );
         assert_stops(&f.vcpus, "the fenced VM did not stop");
+        crate::checkpoint::bundle::verify(&f.root.join("ck")).unwrap();
+    }
+
+    // The temp dir is behind a link on macOS (/var is /private/var). A caller
+    // that names its bundles the way it named the root at boot must not be
+    // told they are outside it, and the bundle must land in the resolved
+    // tree the confinement grants.
+    #[test]
+    fn a_bundle_named_from_the_root_as_given_is_written_below_it() {
+        let mut f = Fixture::with(
+            "ck-spelling",
+            Spec {
+                parking: 1,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let dir = f.given_root.join("ck");
+        let line = f.ask(&format!(
+            r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#,
+            dir.display()
+        ));
+        let r = reply(&line);
+        assert_eq!(r["ok"], true, "{line}");
+        assert_eq!(r["dir"], f.root.join("ck").display().to_string());
         crate::checkpoint::bundle::verify(&f.root.join("ck")).unwrap();
     }
 
