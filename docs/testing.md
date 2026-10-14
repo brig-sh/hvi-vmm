@@ -219,6 +219,107 @@ expected failure that does not fail the run, and lists it under
 `hvi-time` moves on by the downtime, so the continuity checks take the
 downtime the restore logged off.
 
+## The migration end-to-end test
+
+`tools/migrate-e2e.sh` moves a running portable guest from one host to
+another, stopped, and checks that it carried on rather than rebooting. It
+was written for a Mac and a Raspberry Pi 5, in either direction, but takes
+any two hosts that run the portable profile, and one host as both. Run it
+from a machine that can reach both hosts over ssh without a password; a
+host given as `local` is that machine. No CI job runs it.
+
+Each host needs hvi built from one commit with no uncommitted changes, or
+the restore refuses the bundle (on macOS, signed), plus python3 and rsync.
+The source needs `mke2fs`, the destination `e2fsck` and `debugfs`. The
+guest is the portable kernel and the checkpoint workload with three static
+helpers: `el0check` (see above), `tfd` (`tools/guest/tfd.c`) and `clk`
+(`tools/guest/clk.c`), which prints the guest's `CLOCK_REALTIME`,
+`CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` in nanoseconds every 250 ms. Build
+the helpers with `gcc -O2 -static` on an arm64 Linux host, and copy one
+initramfs to both hosts:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --add clk --out target/initramfs-migrate.cpio
+tools/migrate-e2e.sh --src local --dst rp2 \
+    --src-hvi target/release/hvi --dst-hvi /home/pi/hvi/target/release/hvi \
+    --kernel Image-portable --initramfs target/initramfs-migrate.cpio \
+    --src-dir /tmp/mig-src --dst-dir /home/pi/mig --out /tmp/mig-out
+```
+
+`--kernel`, `--initramfs`, `--src-hvi` and `--src-dir` are paths on the
+source host, and `--dst-hvi` and `--dst-dir` on the destination. The script
+empties both directories first. Each host runs its own half of the test, a
+driver the script copies there, so that every console line is stamped
+with the clock of the host whose hvi printed it, never across ssh. The
+script:
+
+1. measures each host's wall clock against its own, over one ssh session;
+2. boots the guest on the source with an ext4 disk and the stub network,
+   starts `clk`, turns off the console's echo, and records the guest's
+   `Features` line and `/proc/interrupts`;
+3. arms a 6 s `timerfd` and a 6 s `sleep`, checkpoints the guest with
+   `then: "fence"`, checks that both timers were still pending, and stops
+   the source;
+4. copies the bundle and the disk with `rsync -S -a --stats`;
+5. restores the bundle on the destination, onto the copied disk, and
+   resumes it.
+
+It then checks on the destination:
+
+- the count goes on by one, the `awk` sums stay exact, and no boot banner
+  appears;
+- the guest driver logs generation 4 at the destination's counter rate, and
+  counts the move once (`migrations=1`);
+- both timers fire after the resume, 6 s of guest time after they were
+  armed;
+- the workload's request: fd 3, the file written before the move, a write
+  after it, `el0check`, the clocksource, and a `sleep 5` against the host;
+- the `Features` line is the source's, and the `hvi-time`, PL011 and
+  virtio-blk interrupt counts go on from the source's and grow;
+- `clk` printed every line across the move, `CLOCK_MONOTONIC` never stepped
+  back, and its gap over the move is one period: the downtime does not
+  show on it;
+- `CLOCK_REALTIME` is within 100 ms of the destination host's clock, over
+  the first 10 s after the driver's fix-up, and again after `--drift-secs`
+  (600 by default), from which it gives the drift in ppm;
+- after the guest unmounts its disk and stops, `e2fsck -fn` finds the image
+  clean and `debugfs` reads the file written after the move.
+
+`summary.json` in `--out` holds the timings: `pause_ms` and `capture_ms`
+from the fence, the copy's time, bytes and rate, the restore's time to
+`restored-paused`, and the downtime three ways (on the script's clock from
+the fence request to the resume reply, from the two hosts' wall clocks, and
+as `hvi-time` moved the guest's wall clock). It exits 1 when a check failed.
+
+`--recapture` checkpoints the restored guest again before it resumes, with
+`then: "continue"`, and checks that its vCPU and platform state equal the
+bundle's. Across backends the registers only HVF has must be 0 there. That
+capture is inside the downtime, so take the timings from a run without it.
+
+`--negative` runs the refusals instead, on the destination, against the
+bundle a run without it left in `--dst-dir`:
+
+- a native bundle of the source, booted with `--profile native`;
+- copies of the portable bundle with the vCPU count or the RAM size changed
+  in `profile.json` and the manifest sealed again, so that the check of
+  the machine fires and not the digest; with one byte of `ram.bin`
+  changed; and with `cpu.json` cut short. Each goes to `checkpoint-verify`
+  and to `restore`;
+- a restore without `--disk`;
+- on a KVM destination, a restore and a portable boot on a host whose KVM
+  offers no vGICv2. An `LD_PRELOAD` shim, built there with `cc`, fails
+  `KVM_CREATE_DEVICE` for `KVM_DEV_TYPE_ARM_VGIC_V2` with `ENODEV`, as a
+  GICv3-only host does.
+
+Results and the exact commands are in
+[portable-profile.md](portable-profile.md#measured-results).
+
+A Mac that sleeps stops its guest's clocks, since Hypervisor.framework's
+counter does not run in sleep, and nothing sets the guest's wall clock
+again on wake. Keep the Mac awake through a run (`caffeinate -i`, and the
+lid open on battery), or its drift figures measure the sleep.
+
 ## Toolchain versions
 
 Four places declare a Rust version. The first two hold the build pin, and the
