@@ -101,6 +101,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("seccomp-selftest") => {
             #[cfg(target_os = "linux")]
             {
+                // The allocation probes check the setting a confined run
+                // uses, so the selftest takes it too, before any thread.
+                hvi::sandbox::seccomp::one_malloc_arena()?;
                 let bad = hvi::sandbox::seccomp::selftest()?;
                 if bad > 0 {
                     return Err(format!(
@@ -436,6 +439,12 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if checkpoint_root.is_some() && control_sock.is_none() {
         return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
     }
+    // A confined run keeps glibc's malloc to one arena, set while this is still
+    // the only thread. `--no-sandbox` keeps glibc's defaults.
+    #[cfg(target_os = "linux")]
+    if sandbox {
+        hvi::sandbox::seccomp::one_malloc_arena()?;
+    }
     // A stop signal asks the run to stop, and `finish` ends the process by it.
     let (signals, stop_registration) = StopOnSignals::new()?;
     // A fatal signal restores the terminal before it ends the process.
@@ -543,6 +552,12 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if stream_keep.is_some() && from_stream.is_none() {
         return Err("--stream-keep goes with --from-stream".into());
     }
+    // As in `boot_guest`: one malloc arena for a confined run, set while this
+    // is still the only thread.
+    #[cfg(target_os = "linux")]
+    if sandbox {
+        hvi::sandbox::seccomp::one_malloc_arena()?;
+    }
     let cfg = config::RestoreConfig {
         from,
         from_stream,
@@ -581,13 +596,6 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
-    // First, while this is the only thread: glibc's malloc would otherwise open
-    // files from threads the seccomp filters forbid it.
-    #[cfg(target_os = "linux")]
-    if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
-        eprintln!("hvi: {e}");
-        std::process::exit(1);
-    }
     if let Err(e) = run() {
         // stderr can be a closed pipe, where `eprintln!` would panic, so a
         // failed write is ignored.
