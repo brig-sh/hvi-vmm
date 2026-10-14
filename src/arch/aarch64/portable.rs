@@ -118,17 +118,22 @@ pub fn excess_fields(name: &str, baseline: u64, host: u64) -> Vec<String> {
 /// `DC ZVA` blocks.
 pub const DCZID_EL0: u64 = 0x4;
 
-/// Kernel arguments a portable boot appends, so the guest stays off the
+/// Kernel arguments a portable boot adds, so the guest stays off the
 /// features the baseline already hides even if a register slipped through.
 pub const KERNEL_ARGS: &str = "arm64.nopauth arm64.nobti arm64.nosve arm64.nosme arm64.nomte";
 
-/// Returns `cmdline` with [`KERNEL_ARGS`] appended.
+/// Returns `cmdline` with [`KERNEL_ARGS`] in front.
+///
+/// In front, because Linux hands everything after a standalone `--` to
+/// init, and its early `arm64.*` parser stops there too
+/// (`arch/arm64/kernel/pi/idreg-override.c`, 6.12). Appended, the arguments
+/// would be lost on a command line that has one.
 #[must_use]
 pub fn cmdline(cmdline: &str) -> String {
     if cmdline.is_empty() {
         KERNEL_ARGS.to_string()
     } else {
-        format!("{cmdline} {KERNEL_ARGS}")
+        format!("{KERNEL_ARGS} {cmdline}")
     }
 }
 
@@ -273,12 +278,23 @@ mod tests {
     }
 
     #[test]
-    fn kernel_arguments_are_appended() {
+    fn kernel_arguments_come_before_the_command_line() {
         assert_eq!(cmdline(""), KERNEL_ARGS);
         assert_eq!(
             cmdline("console=ttyAMA0"),
-            format!("console=ttyAMA0 {KERNEL_ARGS}")
+            format!("{KERNEL_ARGS} console=ttyAMA0")
         );
+        // Everything after `--` is init's, so the arguments must precede it.
+        for line in ["console=ttyAMA0 -- foo", "console=ttyAMA0 --", "-- foo"] {
+            let full = cmdline(line);
+            let dashes = full.split_whitespace().position(|t| t == "--").unwrap();
+            let nomte = full
+                .split_whitespace()
+                .position(|t| t == "arm64.nomte")
+                .unwrap();
+            assert!(nomte < dashes, "{full}");
+            assert!(full.ends_with(line), "{full}");
+        }
     }
 
     /// The default guest ID registers of an Apple M5 Pro under
