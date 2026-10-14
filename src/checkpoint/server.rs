@@ -138,7 +138,9 @@ fn serve<K: Kick>(
             return Ok(());
         }
         let n = match conn.read(&mut chunk) {
-            Ok(0) => return Ok(()),
+            // A client that half-closes after its last request without a
+            // newline still means it.
+            Ok(0) => return answer(&mut conn, stop, machine, &pending),
             Ok(n) => n,
             Err(e) if retry_read(&e) => continue,
             Err(e) => return Err(e),
@@ -146,18 +148,7 @@ fn serve<K: Kick>(
         pending.extend_from_slice(&chunk[..n]);
         while let Some(end) = pending.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
-            let line = String::from_utf8_lossy(&line[..end]);
-            if line.trim().is_empty() {
-                continue;
-            }
-            let (response, then) = match parse_request(&line) {
-                Ok(request) => machine.handle(request),
-                Err(e) => (Response::Error(e), None),
-            };
-            send(&mut conn, stop, &response)?;
-            if let Some(after) = then {
-                after.run(machine.vcpus);
-            }
+            answer(&mut conn, stop, machine, &line[..end])?;
         }
         if pending.len() > MAX_LINE {
             let e = Error::new(
@@ -168,6 +159,34 @@ fn serve<K: Kick>(
             return Ok(());
         }
     }
+}
+
+/// Serves the request `line`, without its newline, and replies on `conn`.
+/// A blank line is skipped.
+///
+/// The request's follow-up runs whether or not the reply could be sent. Its
+/// state change is already made, so a `stop` whose client hung up before the
+/// reply would otherwise leave the VM running while every later `stop` is
+/// answered `stopping` and does nothing.
+fn answer<K: Kick>(
+    conn: &mut UnixStream,
+    stop: &StopToken,
+    machine: &mut Machine<'_, K>,
+    line: &[u8],
+) -> std::io::Result<()> {
+    let line = String::from_utf8_lossy(line);
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let (response, then) = match parse_request(&line) {
+        Ok(request) => machine.handle(request),
+        Err(e) => (Response::Error(e), None),
+    };
+    let sent = send(conn, stop, &response);
+    if let Some(after) = then {
+        after.run(machine.vcpus);
+    }
+    sent
 }
 
 /// Writes `response` and its newline to `conn`, waiting for room beside the
@@ -602,6 +621,45 @@ mod tests {
             .read_line(&mut reply)
             .unwrap();
         assert!(reply.contains(r#""state":"paused""#), "{reply}");
+    }
+
+    /// Waits up to 5 s for the VM to stop, failing with `why` if it does not.
+    /// The Fixture stops the vCPUs itself when dropped, so a test asks before.
+    fn assert_stops(vcpus: &Vcpus<NoKick>, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vcpus.is_running() {
+            assert!(Instant::now() < deadline, "{why}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // A fire-and-forget client writes stop and hangs up before the reply. The
+    // stop is already recorded by then, so if it were not carried out every
+    // later stop would be answered `stopping` and do nothing.
+    #[test]
+    fn a_stop_whose_client_hung_up_still_stops() {
+        let f = Fixture::new("hangup", 1, 0);
+        // The server serves one connection at a time.
+        f.client.shutdown(std::net::Shutdown::Both).unwrap();
+        let mut c = UnixStream::connect(&f.path).unwrap();
+        c.write_all(b"{\"v\":1,\"op\":\"stop\"}\n").unwrap();
+        c.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(c);
+        assert_stops(&f.vcpus, "a stop whose client hung up never stopped the VM");
+        assert!(matches!(f.vcpus.stop_reason(), Stop::Requested));
+    }
+
+    // A last request without its newline, before the client half-closes, is
+    // served like any other.
+    #[test]
+    fn an_unterminated_last_line_is_served() {
+        let mut f = Fixture::new("eof", 1, 0);
+        f.client.write_all(br#"{"v":1,"op":"stop"}"#).unwrap();
+        f.client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        f.replies.read_line(&mut reply).unwrap();
+        assert_eq!(reply, "{\"v\":1,\"ok\":true,\"state\":\"stopping\"}\n");
+        assert_stops(&f.vcpus, "the unterminated stop was dropped");
     }
 
     #[test]
