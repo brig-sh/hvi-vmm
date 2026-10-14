@@ -440,7 +440,17 @@ fn device_lines(sh: &Shared, ncpu: usize) -> Lines {
     }
     let mut ppis = vec![0u32; ncpu];
     if let Some(device) = &sh.hvitime {
-        for (cpu, high) in device.lines().into_iter().enumerate().take(ncpu) {
+        // A restored guest that has not run since: its lines are the
+        // restored state's, which the device gets only at the resume.
+        let lines = match sh
+            .restoring
+            .as_deref()
+            .and_then(PendingPublish::unpublished)
+        {
+            Some(state) => state.lines(),
+            None => device.lines(),
+        };
+        for (cpu, high) in lines.into_iter().enumerate().take(ncpu) {
             if high {
                 ppis[cpu] |= vgicv2::OWNED_PPIS;
             }
@@ -1520,8 +1530,19 @@ fn serve(sh: &Shared, cpu: u32, vcpu: &VcpuFd, work: Work<'_>) -> std::io::Resul
             let Some(device) = &sh.hvitime else {
                 return Ok(None);
             };
-            device.freeze();
-            let timer = device.state();
+            // A restored guest that has not run since holds the restored
+            // state, which the device gets only at the resume.
+            let timer = match sh
+                .restoring
+                .as_deref()
+                .and_then(PendingPublish::unpublished)
+            {
+                Some(state) => state.clone(),
+                None => {
+                    device.freeze();
+                    device.state()
+                }
+            };
             let ncpu = device.vcpus();
             let vgic = KvmVgic {
                 gic: &sh.gic,
