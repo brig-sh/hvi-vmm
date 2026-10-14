@@ -19,8 +19,10 @@
 #    file, writes and syncs another, and a `sleep 5` takes 5 s of host
 #    time. Its wall clock goes on from the captured time.
 # 5. Move it once more, into a third process. Hold that one restored-paused
-#    for a second and check the guest did not run, then resume it and check
-#    it counts on. Stop both, check the disk generation grew over the
+#    for a second and check the guest did not run. Checkpoint it there with
+#    then=continue and check that its vCPU and platform state equal the
+#    bundle's: the restore loaded every register it was given. Then resume
+#    it and check it counts on. Stop both, check the disk generation grew over the
 #    moves, and read the file the guest wrote from the image on the host.
 #
 # With --portable the guest boots the portable profile
@@ -224,6 +226,36 @@ def fp_goes_on(before, after, where):
           f"first after {fp(first[1])[0] if first else None}, every sum exact: {exact}")
 
 
+def state_differences(a, b):
+    """Returns where bundle b's vCPU and platform state differ from bundle
+    a's, by vCPU and key, and by platform part and key."""
+    def load(d, name):
+        with open(os.path.join(d, name)) as f:
+            return json.load(f)
+
+    def keys(where, x, y):
+        return [f"{where}.{k}" for k in sorted(set(x) | set(y)) if x.get(k) != y.get(k)]
+
+    ca, cb = load(a, "cpu.json")["vcpus"], load(b, "cpu.json")["vcpus"]
+    why = [] if len(ca) == len(cb) else [f"vCPU count {len(ca)} then {len(cb)}"]
+    for va, vb in zip(ca, cb):
+        why += keys(f"vcpu{va.get('id')}", va, vb)
+        for part in ("regs", "sysregs"):
+            if isinstance(va.get(part), dict) and isinstance(vb.get(part), dict):
+                why += keys(f"vcpu{va.get('id')}.{part}", va[part], vb[part])
+        if va.get("simd") != vb.get("simd"):
+            why += [f"vcpu{va.get('id')}.q{n}" for n, (x, y)
+                    in enumerate(zip(va.get("simd") or [], vb.get("simd") or [])) if x != y]
+    pa, pb = load(a, "platform.json"), load(b, "platform.json")
+    why += keys("platform.irq", pa.get("irq") or {}, pb.get("irq") or {})
+    ta, tb = dict(pa.get("timer") or {}), dict(pb.get("timer") or {})
+    # The host's own clock at the capture, which a later capture reads later.
+    ta.pop("host_monotonic_at_capture_ns", None)
+    tb.pop("host_monotonic_at_capture_ns", None)
+    why += keys("platform.timer", ta, tb)
+    return why
+
+
 common = ["--net-stub"] + (["--disk", image] if image else [])
 profile = ["--profile", "portable-arm64-v1"] if portable else []
 src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs,
@@ -416,6 +448,20 @@ time.sleep(0.1)
 check(held.get("state") == "restored-paused" and held.get("vcpus_parked") == int(cpus)
       and not third.outputs(r"TICK |FP "),
       f"the guest did not run while restored-paused for 1 s ({held})")
+# Capture it again before it resumes: a restore must load every register
+# and the platform state it was given, and a guest that has not run since
+# holds them still. The awk's sums cannot show this, because a task that is
+# off the CPU keeps its registers in guest RAM.
+recapture = os.path.join(root, "paused-recapture")
+again, _ = tctl.ask(op="checkpoint", dir=recapture, then="continue", txid="e2e-3", epoch=3)
+still, _ = tctl.ask(op="status")
+check(again.get("ok") is True and still.get("state") == "restored-paused"
+      and still.get("vcpus_parked") == int(cpus),
+      f"a checkpoint while restored-paused keeps the guest restored-paused ({still})")
+if again.get("ok") is True:
+    loaded = state_differences(os.path.join(root, "move-again"), recapture)
+    check(not loaded, "the restore loaded the vCPU and platform state it was given"
+          + (": differs in " + ", ".join(loaded) if loaded else ""))
 tctl.ask(op="resume")
 last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
 # The guest's last uptime reading before the second fence: the last tick,
