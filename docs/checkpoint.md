@@ -127,6 +127,11 @@ The fence holds only while this hvi process lives. It is not written
 anywhere. A caller that must survive a crash of the source records the fence
 itself.
 
+A fenced source also releases the lock it holds on its disk (see
+[The disk lock](#the-disk-lock)). Its guest never runs again, so it never
+writes the disk again, and the restore can open the disk before the source
+is stopped.
+
 ## Checking a bundle
 
 ```sh
@@ -371,6 +376,34 @@ had: `--disk` when it had a disk, the network mode it ran on, and
 paused. `status` reports `restored-paused`, and the guest runs once a client
 sends `resume`. `stop` ends it without it ever running. A checkpoint of a
 restored guest works as of any other, so a guest can move again.
+
+hvi does not consume a bundle. It restores a sealed bundle as often as it
+is asked to, a `then: "continue"` snapshot as well as a fenced one, and it
+records nothing in the bundle. The caller makes sure a guest runs in one
+place only: it restores a bundle once, and only once the source is fenced or
+stopped.
+
+### The disk lock
+
+Two guests that write one disk image corrupt its filesystem. hvi locks each
+image while it is open, exclusive for a writable disk and shared for a
+read-only one (see [storage-and-sharing.md](storage-and-sharing.md)), so a
+boot or restore whose disk another hvi holds fails with `the image is open
+elsewhere`. A restore reports it as its own refusal, `--disk PATH: the image
+is open elsewhere`. So a second restore of one bundle onto the disk a
+restored guest runs on fails, and so does a restore of a `then: "continue"`
+snapshot while its source still runs.
+
+What a move adds is the release. A fenced source releases its writable
+disk's lock once its capture is sealed, so a restore on the same host can
+open the disk before the source stops. The lock is held on an open of the
+image of its own, so the fence releases it by closing that open, which needs
+no call the sandbox would have to allow. A writable block device is also
+opened `O_EXCL` on Linux, and that claim stays until the source stops: a
+restore onto the same block device on the same host fails with `the device is
+claimed elsewhere` until then, and waits for no release.
+
+### The steps
 
 A restore runs these steps, in this order:
 
