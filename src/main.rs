@@ -293,9 +293,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
-            // The digest of the disk as it was before this boot, which the
-            // caller computed and keeps a copy of, so a move sends only
-            // what the guest wrote. hvi records it and does not check it.
+            // The digest of the disk as this boot opens it, before this hvi
+            // writes it, which the caller computed and keeps a copy of, so
+            // a move sends only what the guest wrote. hvi records it and
+            // does not check it.
             "--disk-base-sha256" => {
                 let v = it.next().ok_or("--disk-base-sha256 needs a value")?;
                 if v.len() != 64 || !v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {

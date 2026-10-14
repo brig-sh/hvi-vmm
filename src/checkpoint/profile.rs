@@ -111,11 +111,12 @@ pub struct MachineProfile {
     /// native profile, whose guest uses the architected timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<Time>,
-    /// The SHA-256 of the disk image the guest booted from, as lowercase
-    /// hex, when whoever started it computed it (`--disk-base-sha256`). A
-    /// mover that holds that image sends only the blocks the guest wrote,
-    /// see `disk-dirty`. It describes the disk's history, not the machine,
-    /// so no compatibility check reads it. Not written when unknown.
+    /// The SHA-256 of the disk as the boot given `--disk-base-sha256`
+    /// opened it, before that hvi wrote it, as lowercase hex. A restore
+    /// carries it on. A mover that holds that image sends only the blocks
+    /// the guest wrote, see `disk-dirty`. It describes the disk's history,
+    /// not the machine, so no compatibility check reads it. Not written
+    /// when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_base_sha256: Option<String>,
 }

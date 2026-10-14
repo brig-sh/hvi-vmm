@@ -666,9 +666,12 @@ from and the guest changed a few MB of it. hvi tracks which blocks the guest
 wrote, so a mover that keeps a copy of that base image can send only them,
 and send most of them while the guest still runs.
 
-**The base.** Whoever makes the image hashes it before the guest first
-boots from it, keeps a copy, and passes the digest with
-`--disk-base-sha256`. hvi does not read the image to check it. The machine
+**The base.** Whoever starts hvi hashes the disk as this boot opens it,
+before this hvi writes it, keeps a copy, and passes the digest with
+`--disk-base-sha256`. hvi tracks only the writes it serves from this boot
+on, so a disk that an earlier boot wrote needs a new digest, or no flag:
+the earlier boot's writes are in no bitmap, and a move by blocks would
+leave them out. hvi does not read the image to check it. The machine
 profile records it as `disk_base_sha256`, no compatibility check reads it,
 and a restore carries it to the restored guest's profile. A disk with a
 base must be at most 4 TiB, whose bitmap (8 MiB, 11,184,812 characters of
