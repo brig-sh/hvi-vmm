@@ -129,9 +129,9 @@ also upload the event ledger. `boot-x86` and `boot-unikraft-hvf` do not pass
 ## The checkpoint end-to-end test
 
 `tools/checkpoint-e2e.sh` moves a running guest from one hvi process to
-another on a Mac, and checks that it carried on rather than rebooting. No CI
-job runs it yet; run it by hand on Apple silicon, with a signed release
-build:
+another on the same host, and checks that it carried on rather than
+rebooting. No CI job runs it yet; run it by hand on Apple silicon, with a
+signed release build, or with `--portable` on an arm64 KVM host too:
 
 ```sh
 python3 tools/mk-initramfs.py --checkpoint-workload \
@@ -149,11 +149,11 @@ The workload is a loop that keeps a count in a shell variable, prints it every
 200 ms with the guest's uptime and wall clock, and holds a file open on fd 3
 after unlinking it. It also writes and syncs a file on `/dev/vda`. Beside it,
 a CPU-bound `awk` at the lowest priority sums 0.25 into a double and prints
-the count and the sum every 500000 additions. It is on a vCPU most of the
-time, so a capture most likely finds its floating-point registers and its
-thread pointer live in the vCPU, and a wrong restore of them shows as a sum
-that is not exact or a count that does not go on. That is a likely catch,
-not a certain one. The script:
+the count and the sum every 500000 additions. Its sums show that the guest's
+floating-point work goes on after a move, but not that a restore loaded the
+registers: busybox `awk` keeps its sum in memory, and a task off the CPU
+keeps its registers in guest RAM, so a restore that lost every SIMD register
+still gave exact sums. Step 5 checks the registers instead. The script:
 
 1. boots the guest with a control socket, a checkpoint root, the disk, the
    stub network and an agent socket, and gives it the host's wall clock;
@@ -170,7 +170,11 @@ not a certain one. The script:
    host;
 5. moves the guest once more, into a third process, holds it
    `restored-paused` for a second and checks that it printed nothing and its
-   clock did not move, then resumes it and checks it counts on;
+   clock did not move. It checkpoints it there with `then: "continue"` and
+   checks that every vCPU register in `cpu.json` and the interrupt
+   controller and timer state in `platform.json` equal the bundle's, less
+   the host's monotonic clock at the capture, and that the guest is still
+   `restored-paused`. Then it resumes it and checks it counts on;
 6. stops every process, checks that the disk generation in `disk.json` grew
    from the first move to the second, and reads the post-restore file from
    the image on the host with `debugfs`.
@@ -180,6 +184,40 @@ It prints each check and writes `summary.json` with `pause_ms`,
 `restored-paused` reply, and the downtime from the checkpoint request, and
 from its reply, to the `resume` reply. It exits 1 when a check failed.
 [checkpoint.md](checkpoint.md#timings) has the figures.
+
+`--portable` boots the portable profile instead, on the Mac or on a Pi 5,
+with the portable kernel and an initramfs that also holds `el0check` and
+`tfd` (`tools/guest/tfd.c`), both static arm64 binaries. `el0check.c` is not
+in this repository: it is the acceptance test of the portable kernel's EL0
+counter patch, GPL-2.0, and is kept with that kernel's two patches as
+`test/el0check.c`, beside `patches/`. Build each with
+`gcc -O2 -static`:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --out target/initramfs-portable.cpio
+tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-portable.cpio --out /tmp/e2e-p --cpus 1 \
+    --mem 512 --portable
+```
+
+Just before the capture it starts a 6 s `timerfd` and a 6 s `sleep`. Beside
+the checks above, it checks that the clocksource is `hvi-time` and
+`el0check` passes before and after the move, that both timers fire after
+the resume 6 s of guest time after they were armed, that the guest driver
+logged the move, generation 4, and counts it once (`migrations=1`), and that
+the guest's wall clock is the host's again.
+
+With more than one vCPU the count can come out higher, up to one per vCPU.
+That is a defect of the portable kernel's `hvi-time` driver: it runs its
+migration work for each vCPU that takes `GEN_CHANGED`, so it logs one
+move more than once and moves the wall clock again each time, by about
+1 µs. The fix is for the driver to remember the last generation it
+handled. Until then the script reports such a count as `xfail`, an
+expected failure that does not fail the run, and lists it under
+`expected_failures` in `summary.json`. The uptime the ticks carry is `CLOCK_BOOTTIME`, which
+`hvi-time` moves on by the downtime, so the continuity checks take the
+downtime the restore logged off.
 
 ## Toolchain versions
 

@@ -19,14 +19,29 @@
 #    file, writes and syncs another, and a `sleep 5` takes 5 s of host
 #    time. Its wall clock goes on from the captured time.
 # 5. Move it once more, into a third process. Hold that one restored-paused
-#    for a second and check the guest did not run, then resume it and check
-#    it counts on. Stop both, check the disk generation grew over the
+#    for a second and check the guest did not run. Checkpoint it there with
+#    then=continue and check that its vCPU and platform state equal the
+#    bundle's: the restore loaded every register it was given. Then resume
+#    it and check it counts on. Stop both, check the disk generation grew over the
 #    moves, and read the file the guest wrote from the image on the host.
+#
+# With --portable the guest boots the portable profile
+# (--profile portable-arm64-v1) and the kernel must be the portable one,
+# with hvi-time. The initramfs must then hold /el0check and /tfd
+# (tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd;
+# el0check is test/el0check.c, kept with the portable kernel's patches
+# and not in this repository, and tfd is tools/guest/tfd.c, both built
+# static). Just before the capture the
+# script starts a 6 s timerfd and a 6 s sleep, and checks after the
+# restore: the clocksource is hvi-time, el0check passes, the guest driver
+# logged the migration (generation 4) and counts it, both timers fire
+# after the resume 6 s of guest time after they were armed, and the
+# guest's wall clock is the host's again.
 #
 # Usage:
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs target/initramfs-workload.cpio --out DIR \
-#       [--cpus 2] [--mem 512] [--no-disk]
+#       [--cpus 2] [--mem 512] [--no-disk] [--portable]
 #
 # DIR receives the checkpoint root (with the bundle), the disk image, both
 # processes' consoles, their profiles and summary.json with the timings.
@@ -36,7 +51,7 @@
 # is limited to 104 bytes on macOS. Exits 0 when every check passed.
 set -euo pipefail
 
-hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes
+hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no
 while [ $# -gt 0 ]; do
     case "$1" in
         --hvi) hvi="$2"; shift 2 ;;
@@ -46,7 +61,8 @@ while [ $# -gt 0 ]; do
         --cpus) cpus="$2"; shift 2 ;;
         --mem) mem="$2"; shift 2 ;;
         --no-disk) disk=no; shift ;;
-        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk]" >&2; exit 2 ;;
+        --portable) portable=yes; shift ;;
+        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable]" >&2; exit 2 ;;
     esac
 done
 for v in hvi kernel initramfs out; do
@@ -63,8 +79,10 @@ rm -rf "$root"
 mkdir -m 700 "$root"
 image="" debugfs=""
 if [ "$disk" = yes ]; then
-    mke2fs="$(command -v mke2fs || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)"
-    debugfs="$(command -v debugfs || echo /opt/homebrew/opt/e2fsprogs/sbin/debugfs)"
+    sbin=/opt/homebrew/opt/e2fsprogs/sbin
+    [ -x "$sbin/mke2fs" ] || sbin=/sbin
+    mke2fs="$(command -v mke2fs || echo "$sbin/mke2fs")"
+    debugfs="$(command -v debugfs || echo "$sbin/debugfs")"
     for tool in "$mke2fs" "$debugfs"; do
         if [ ! -x "$tool" ]; then
             echo "$0: $(basename "$tool") not found; install e2fsprogs or pass --no-disk" >&2
@@ -79,12 +97,17 @@ socks="$(mktemp -d /tmp/hvi-e2e.XXXXXX)"
 trap 'rm -rf "$socks"' EXIT
 
 python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" \
-    "$debugfs" <<'PY'
+    "$debugfs" "$portable" <<'PY'
 import json, os, re, socket, subprocess, sys, threading, time
 
-hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs = sys.argv[1:]
+hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs, portable = sys.argv[1:]
+portable = portable == "yes"
 t0 = time.monotonic()
+# Host wall-clock time at monotonic time t0, to read a line's host time.
+wall_t0 = time.time() - (time.monotonic() - t0)
 failures = []
+# Checks that fail for a known defect outside hvi, by name and defect.
+expected_failures = []
 
 
 def now():
@@ -160,10 +183,28 @@ class Control:
         return json.loads(reply), got
 
 
+def downtime(guest, before=0.0):
+    """Returns how far hvi-time moved the portable guest's wall clock and
+    CLOCK_BOOTTIME at its restore, less `before`, in seconds; 0 for a
+    native guest, whose clocks do not move."""
+    if not portable:
+        return 0.0
+    got = guest.wait_for(r"hvi-time: published generation .* downtime total \d+ ns", 10)
+    total = int(re.search(r"downtime total (\d+) ns", got[1]).group(1)) if got else 0
+    return total / 1e9 - before
+
+
 def check(ok, what):
     print(("  ok   " if ok else "  FAIL ") + what, flush=True)
     if not ok:
         failures.append(what)
+
+
+def xfail(what, defect):
+    """Reports a check that fails for a known defect outside hvi. It does
+    not fail the run, and summary.json lists it."""
+    print(f"  xfail {what} (expected: {defect})", flush=True)
+    expected_failures.append({"check": what, "defect": defect})
 
 
 def tick(s):
@@ -195,24 +236,69 @@ def fp_goes_on(before, after, where):
           f"first after {fp(first[1])[0] if first else None}, every sum exact: {exact}")
 
 
+def state_differences(a, b):
+    """Returns where bundle b's vCPU and platform state differ from bundle
+    a's, by vCPU and key, and by platform part and key."""
+    def load(d, name):
+        with open(os.path.join(d, name)) as f:
+            return json.load(f)
+
+    def keys(where, x, y):
+        return [f"{where}.{k}" for k in sorted(set(x) | set(y)) if x.get(k) != y.get(k)]
+
+    ca, cb = load(a, "cpu.json")["vcpus"], load(b, "cpu.json")["vcpus"]
+    why = [] if len(ca) == len(cb) else [f"vCPU count {len(ca)} then {len(cb)}"]
+    for va, vb in zip(ca, cb):
+        why += keys(f"vcpu{va.get('id')}", va, vb)
+        for part in ("regs", "sysregs"):
+            if isinstance(va.get(part), dict) and isinstance(vb.get(part), dict):
+                why += keys(f"vcpu{va.get('id')}.{part}", va[part], vb[part])
+        if va.get("simd") != vb.get("simd"):
+            why += [f"vcpu{va.get('id')}.q{n}" for n, (x, y)
+                    in enumerate(zip(va.get("simd") or [], vb.get("simd") or [])) if x != y]
+    pa, pb = load(a, "platform.json"), load(b, "platform.json")
+    why += keys("platform.irq", pa.get("irq") or {}, pb.get("irq") or {})
+    ta, tb = dict(pa.get("timer") or {}), dict(pb.get("timer") or {})
+    # The host's own clock at the capture, which a later capture reads later.
+    ta.pop("host_monotonic_at_capture_ns", None)
+    tb.pop("host_monotonic_at_capture_ns", None)
+    why += keys("platform.timer", ta, tb)
+    return why
+
+
 common = ["--net-stub"] + (["--disk", image] if image else [])
+profile = ["--profile", "portable-arm64-v1"] if portable else []
 src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs,
-                       "--cpus", cpus, "--mem-mib", mem,
+                       "--cpus", cpus, "--mem-mib", mem] + profile + [
                        "--control-sock", f"{socks}/src.sock", "--checkpoint-root", root,
                        "--agent-sock", f"{socks}/src-agent.sock",
                        "--profile-out", os.path.join(out, "source-profile.json")] + common)
-print(f"checkpoint e2e: {cpus} vCPU(s), {mem} MiB, disk {'yes' if image else 'no'}", flush=True)
-# The guest has no RTC, so its wall clock starts at 0. Give it this host's,
-# so its drift over the move can be read against the host's.
-if src.wait_for(r"TICK 3 ", 120):
+print(f"checkpoint e2e: {cpus} vCPU(s), {mem} MiB, disk {'yes' if image else 'no'}, "
+      f"profile {'portable-arm64-v1' if portable else 'native'}", flush=True)
+# The native guest has no RTC, so its wall clock starts at 0. Give it this
+# host's, so its drift over the move can be read against the host's. The
+# portable guest's hvi-time gives it the host's at boot.
+if src.wait_for(r"TICK 3 ", 120) and not portable:
     src.type(f"date -s @{int(time.time())} >/dev/null\n")
 ready = src.wait_for(r"TICK 15 ", 120)
 check(ready is not None, "the source guest booted and counts")
 if image:
     check(bool(src.outputs(r"DISK-READY written-before ")), "the source wrote and synced /mnt/before")
+if portable:
+    check(bool(src.outputs(r"EL0CHECK PASS")), "the source guest's EL0 reads the synthetic counter")
+    check(bool(src.outputs(r"^CLOCKSOURCE hvi-time$")), "the source guest's clocksource is hvi-time")
 if not ready:
     src.p.kill()
     sys.exit(1)
+if portable:
+    # Two timers armed just before the capture, which must fire after the
+    # resume, 6 s of guest time after they were armed.
+    src.type("/tfd 6 &\n")
+    src.type("/bin/busybox echo \"NANOSLEEP-START $(/bin/busybox cut -d' ' -f1 /proc/uptime)\"; "
+             "( /bin/busybox sleep 6; /bin/busybox echo \"NANOSLEEP-END "
+             "$(/bin/busybox cut -d' ' -f1 /proc/uptime)\" ) &\n")
+    armed = src.wait_for(r"TIMERFD-ARMED ", 10) and src.wait_for(r"^NANOSLEEP-START [0-9]", 10)
+    check(bool(armed), "a timerfd and a sleep are armed before the capture")
 
 # The move itself runs straight through, as a caller would run it, so its
 # timings are the move's: the checks that need a pause come afterwards.
@@ -257,17 +343,52 @@ if first:
     n, uptime, wall = tick(line)
     check(n == last_n + 1, f"the count goes on: last before the fence {last_n}, first after {n}")
     host_gap = first_at - last_tick_at
-    check(uptime - last_uptime < 0.5,
+    # The ticks carry /proc/uptime, CLOCK_BOOTTIME, which on the portable
+    # profile moves on by the downtime; its monotonic clock does not.
+    moved = downtime(dst)
+    check(uptime - last_uptime - moved < 0.5,
           f"the guest's monotonic clock goes on from the capture: {uptime - last_uptime:.2f} s "
-          f"between the two ticks in the guest, {host_gap:.3f} s on the host")
-    check(0 <= wall - last_wall <= 1,
-          f"the guest's wall clock goes on from the captured time: {last_wall} then {wall}")
-    # The policy: no realtime correction without a guest agent, so the
-    # guest's wall clock now lags the host's by the time it was away.
+          f"between the two ticks in the guest ({moved:.3f} s of it the downtime its clock "
+          f"was moved by), {host_gap:.3f} s on the host")
+    if portable:
+        # hvi-time moved the guest's wall clock by the downtime. `date +%s`
+        # is whole seconds, so it reads up to 1 s behind the host.
+        host_wall = wall_t0 + first_at
+        check(-0.2 <= host_wall - wall <= 1.5,
+              f"the guest's wall clock is the host's again: guest {wall}, host {host_wall:.3f}")
+    else:
+        check(0 <= wall - last_wall <= 1,
+              f"the guest's wall clock goes on from the captured time: {last_wall} then {wall}")
+    # The native guest gets no realtime correction without a guest agent,
+    # so its wall clock now lags the host's by the time it was away.
     wall_lag = time.time() - wall
 check(not dst.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT|ARM64 guest on hvi|DISK-READY"),
       "no boot banner in the restored guest: it did not reboot")
 fp_goes_on(src, dst, "over the move")
+
+timers = {}
+if portable:
+    fired = dst.wait_for(r"TIMERFD-FIRED ", 15)
+    if fired:
+        elapsed = float(fired[1].split()[2])
+        timers["timerfd_guest_s"] = elapsed
+        check(fired[0] > resume_at and 5.99 <= elapsed <= 6.3,
+              f"the timerfd armed before the capture fired after the resume, {elapsed:.3f} s "
+              f"of guest time after it was armed")
+    else:
+        check(False, "the timerfd armed before the capture fired")
+    end = dst.wait_for(r"^NANOSLEEP-END [0-9]", 15)
+    start = src.outputs(r"^NANOSLEEP-START [0-9]")
+    if end and start:
+        # /proc/uptime is CLOCK_BOOTTIME, which hvi-time moves on by the
+        # downtime, as it does the wall clock.
+        slept = float(end[1].split()[1]) - float(start[0][1].split()[1]) - downtime(dst)
+        timers["nanosleep_guest_s"] = round(slept, 3)
+        check(end[0] > resume_at and 5.97 <= slept <= 6.3,
+              f"the sleep armed before the capture ended after the resume, {slept:.2f} s of "
+              f"guest monotonic time after it began")
+    else:
+        check(False, "the sleep armed before the capture ended")
 
 if image:
     # hvi does not consume a bundle, so the disk lock is what keeps a second
@@ -282,18 +403,38 @@ if image:
           f"a second restore onto the running guest's disk is refused (exit {dup.returncode})")
 
 dst.type("touch /tmp/go\n")
-got = dst.wait_for(r"SLEEP-END ", 30)
+got = dst.wait_for(r"(?<!NANO)SLEEP-END ", 30)
 check(got is not None, "the workload answered the request")
 counter = dst.outputs(r"COUNTER ")
 check(bool(counter) and int(counter[0][1].split()[1]) > last_n, f"the count after the restore: {counter[:1]}")
 check(bool(dst.outputs(r"FD3 kept open after unlink$")), "the unlinked file is still readable on fd 3")
+if portable:
+    go = counter[0][0] if counter else 0.0
+    check(bool(dst.outputs(r"EL0CHECK PASS", after=go)),
+          "after the restore, EL0 still reads the synthetic counter")
+    check(bool(dst.outputs(r"^CLOCKSOURCE hvi-time$", after=go)),
+          "after the restore, the clocksource is still hvi-time")
+    moves = dst.outputs(r"^MIGRATION .*hvi-time: generation \d+:", after=go)
+    generations = {re.search(r"generation (\d+):", s).group(1) for _, s in moves}
+    check(generations == {"4"}, f"the guest driver logged the move, generation 4: {sorted(generations)}")
+    snap = dst.outputs(r"EL0CHECK snapshot1: .* migrations=", after=go)
+    count = int(snap[0][1].split("migrations=")[1]) if snap else None
+    counted = f"the guest driver counts the move once: migrations={count} on {cpus} vCPU(s)"
+    if count is not None and int(cpus) > 1 and 1 < count <= int(cpus):
+        # A defect of the portable kernel's hvi-time driver: it runs its
+        # migration work once for each vCPU that takes GEN_CHANGED, so it
+        # logs and counts one move up to once per vCPU, and moves the wall
+        # clock again each time.
+        xfail(counted, "the hvi-time driver handles one generation once per vCPU")
+    else:
+        check(count == 1, counted)
 after_n = None
 if image:
     check(bool(dst.outputs(r"DISK-BEFORE written-before ")), "the file written before the move is on the disk")
     written = dst.outputs(r"DISK-AFTER written-after \d+")
     check(bool(written), "a write after the restore works")
     after_n = written[0][1].split()[-1] if written else None
-start, end = dst.outputs(r"SLEEP-START "), dst.outputs(r"SLEEP-END ")
+start, end = dst.outputs(r"(?<!NANO)SLEEP-START "), dst.outputs(r"(?<!NANO)SLEEP-END ")
 if start and end:
     host_sleep = end[0][0] - start[0][0]
     guest_sleep = float(end[0][1].split()[1]) - float(start[0][1].split()[1])
@@ -321,14 +462,30 @@ time.sleep(0.1)
 check(held.get("state") == "restored-paused" and held.get("vcpus_parked") == int(cpus)
       and not third.outputs(r"TICK |FP "),
       f"the guest did not run while restored-paused for 1 s ({held})")
+# Capture it again before it resumes: a restore must load every register
+# and the platform state it was given, and a guest that has not run since
+# holds them still. The awk's sums cannot show this, because a task that is
+# off the CPU keeps its registers in guest RAM.
+recapture = os.path.join(root, "paused-recapture")
+again, _ = tctl.ask(op="checkpoint", dir=recapture, then="continue", txid="e2e-3", epoch=3)
+still, _ = tctl.ask(op="status")
+check(again.get("ok") is True and still.get("state") == "restored-paused"
+      and still.get("vcpus_parked") == int(cpus),
+      f"a checkpoint while restored-paused keeps the guest restored-paused ({still})")
+if again.get("ok") is True:
+    loaded = state_differences(os.path.join(root, "move-again"), recapture)
+    check(not loaded, "the restore loaded the vCPU and platform state it was given"
+          + (": differs in " + ", ".join(loaded) if loaded else ""))
 tctl.ask(op="resume")
 last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
 # The guest's last uptime reading before the second fence: the last tick,
 # or the end of the sleep that came after it.
 uptime2 = max([tick(s)[1] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
-              + [float(s.split()[1]) for t, s in dst.outputs(r"SLEEP-END ")], default=None)
+              + [float(s.split()[1]) for t, s in dst.outputs(r"(?<!NANO)SLEEP-END ")], default=None)
 moved = third.wait_for(r"TICK ", 10)
 on = tick(moved[1])[1] - uptime2 if moved and uptime2 is not None else None
+if on is not None:
+    on -= downtime(third, downtime(dst))
 check(status3.get("state") == "restored-paused" and moved is not None
       and tick(moved[1])[0] == last2[-1] + 1 and on is not None and on < 0.5,
       f"it resumes in a third process and counts on from {last2[-1] if last2 else None}, "
@@ -375,7 +532,9 @@ summary = {
     "last_count_before": last_n, "host_sleep_s": host_sleep, "guest_sleep_s": guest_sleep,
     "guest_wall_clock_lag_s": wall_lag,
     "disk_generations": generations,
+    "portable": portable, **timers,
     "failures": failures,
+    "expected_failures": expected_failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)

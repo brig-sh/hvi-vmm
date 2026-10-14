@@ -110,9 +110,6 @@ pub(crate) const LOG_PREFIX: &str = "[hvi]";
 // compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use arch::aarch64::hvf as backend;
-// Only HVF restores a checkpoint so far; see `checkpoint::restore`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use arch::aarch64::hvf::restore;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use arch::aarch64::kvm as backend;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -162,6 +159,38 @@ pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> 
         .map_err(|e| config::BootError::new(e.into()))?;
     sandbox::check_run(cfg.sandbox).map_err(|e| config::BootError::new(e.into()))?;
     let result = backend::boot(cfg).map_err(|e| {
+        if e.is::<run::LeftRunning>() {
+            claim.keep();
+        }
+        config::BootError::new(e)
+    });
+    run::wait_for_panic_abort();
+    result
+}
+
+/// Resumes the checkpoint bundle `cfg` names in this process and runs the
+/// guest until it powers off, resets, or the host requests a stop, as
+/// [`boot`](fn@boot) runs a booted one.
+///
+/// The guest waits restored-paused until a client sends `resume` on the
+/// control socket. Only the arm64 backends restore; `docs/checkpoint.md`
+/// describes the restore.
+///
+/// A restore is a run like a boot: it takes the run slot, it is the current
+/// run from its `vmm.start` record on, so a panic hook writes its `vmm.stop`
+/// record, and the sandbox it turns on stays on, as [`boot`](fn@boot) says.
+///
+/// # Errors
+///
+/// Errors as [`boot`](fn@boot) does, and when the bundle cannot be restored on
+/// this host.
+#[cfg(target_arch = "aarch64")]
+pub fn restore(cfg: config::RestoreConfig) -> Result<config::Stop, config::BootError> {
+    let mut claim = run::RUN_SLOT
+        .claim()
+        .map_err(|e| config::BootError::new(e.into()))?;
+    sandbox::check_run(cfg.sandbox).map_err(|e| config::BootError::new(e.into()))?;
+    let result = backend::restore(cfg).map_err(|e| {
         if e.is::<run::LeftRunning>() {
             claim.keep();
         }

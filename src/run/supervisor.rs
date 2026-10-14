@@ -862,6 +862,55 @@ mod tests {
         assert_eq!(last["source"], "vmm.stop");
     }
 
+    // A restored run waits restored-paused, with its vCPUs parked from the
+    // control socket before any of them ran. A panic then ends it with a
+    // `vmm.stop` record of reason `failed`, though no parked vCPU exits. The
+    // host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This test reads the
+    // ledger file it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn failure_record_ends_a_restored_paused_run() {
+        let path =
+            std::env::temp_dir().join(format!("hvi-run-restored-{}.ndjson", std::process::id()));
+        let mut guest = guest(1);
+        guest.ledger = Arc::new(Ledger::new(path.to_str(), "test").unwrap());
+        // As a restore holds them, before any vCPU thread exists.
+        guest
+            .vcpus
+            .pause_from_control(Duration::ZERO)
+            .expect("the control socket holds the vCPUs");
+        let vcpus = Arc::clone(&guest.vcpus);
+        let body: Body = Box::new(move || {
+            vcpus.mark_started(0);
+            while vcpus.is_running() {
+                let _ = vcpus.checkpoint();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let (threads, spawned) = guest.vcpus.spawn(vec![body], |_, body| body());
+        spawned.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while guest.vcpus.parked() == 0 {
+            assert!(Instant::now() < deadline, "the vCPU never parked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let current = CurrentRun::new();
+        let _entered = current.enter(&guest.ledger, Arc::clone(&guest.vcpus) as _, || {});
+        assert!(current.record_failure("vcpu0: panicked (boom)"));
+        // The release a panic leaves out, so the parked vCPU can exit.
+        guest.vcpus.stop();
+        threads
+            .join_timeout(&guest.vcpus, Duration::from_secs(5))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["source"], "vmm.stop");
+        assert_eq!(last["payload"]["reason"], "failed");
+        assert_eq!(last["payload"]["error"], "vcpu0: panicked (boom)");
+    }
+
     // A panic on a thread the stop does not wait for, such as an embedder's,
     // stops the vCPUs, and their exits end the run with the panic's failure.
     #[test]

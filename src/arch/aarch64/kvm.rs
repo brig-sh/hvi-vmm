@@ -66,18 +66,21 @@ use crate::arch::aarch64::layout::{
     mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
     GIC_NUM_IRQS, HVI_TIME_PAGE_BASE, HVI_TIME_TIMERS_BASE, MPIDR_AFFINITY_MASK, RAM_BASE,
     RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI,
-    VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::portable::{self, KvmHost};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::arch::aarch64::rebuild;
 use crate::arch::aarch64::vgicv2::{self, Bank, Lines, VgicV2};
 use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu::Power;
 use crate::checkpoint::cpu::{Output, VcpuState, Work};
 use crate::checkpoint::platform::{IrqState, PlatformState, TimerState, PLATFORM_STATE_VERSION};
 use crate::checkpoint::profile::{hex, host_page_size, MachineProfile, ProfileCell, UNKNOWN};
-use crate::config::{BootConfig, MachineProfileKind, Stop};
-use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, TimerLine};
+use crate::checkpoint::restore::{self, Refused, Restorer};
+use crate::config::{BootConfig, MachineProfileKind, RestoreConfig, Stop};
+use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, PendingPublish, TimerLine};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::legacy::rtc_pl031::Pl031;
 use crate::devices::virtio::block::{self, VirtioBlk};
@@ -88,12 +91,14 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
-    kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
+    kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, IoConfig, Kicker,
+    KvmIrqLine,
 };
-use crate::hypervisor::vcpus::Vcpus;
+use crate::hypervisor::vcpus::{Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
+use crate::run::StopHandle;
 use crate::sandbox::seccomp;
 use crate::signal::install_kick_handler;
 use crate::LOG_PREFIX;
@@ -308,6 +313,9 @@ struct Shared {
     vm: Arc<VmFd>,
     /// The in-kernel vGIC, whose state a portable checkpoint reads.
     gic: Arc<DeviceFd>,
+    /// The `hvi-time` state a restore publishes at the guest's resume,
+    /// when this VM is one.
+    restoring: Option<Arc<PendingPublish>>,
 }
 
 /// The portable guest's counter: the host's virtual counter less the VM's
@@ -448,7 +456,17 @@ fn device_lines(sh: &Shared, ncpu: usize) -> Lines {
     }
     let mut ppis = vec![0u32; ncpu];
     if let Some(device) = &sh.hvitime {
-        for (cpu, high) in device.lines().into_iter().enumerate().take(ncpu) {
+        // A restored guest that has not run since: its lines are the
+        // restored state's, which the device gets only at the resume.
+        let lines = match sh
+            .restoring
+            .as_deref()
+            .and_then(PendingPublish::unpublished)
+        {
+            Some(state) => state.lines(),
+            None => device.lines(),
+        };
+        for (cpu, high) in lines.into_iter().enumerate().take(ncpu) {
             if high {
                 ppis[cpu] |= vgicv2::OWNED_PPIS;
             }
@@ -778,7 +796,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             }
         );
         set_baseline(&vcpus)?;
-        let offset = set_counter_offset(&kvm, &vm, &vcpus[0])?;
+        let offset = set_counter_offset(&kvm, &vm, &vcpus[0], 0)?;
         let device = Arc::new(HviTime::new(
             num_cpus as usize,
             crate::checkpoint::profile::counter_freq_hz(),
@@ -882,6 +900,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         hvitime,
         vm: Arc::clone(&vm),
         gic: Arc::clone(&gicfd),
+        restoring: None,
     };
 
     // Each device sets its own interrupt line, from the methods that change its
@@ -909,7 +928,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // filters need. Each polls its stop token beside its own descriptor and is
     // joined after the vCPUs; `teardown` describes the stop.
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
-        &cfg,
+        &(&cfg).into(),
         &shared.guest,
         {
             let pl011 = Arc::clone(&shared.pl011);
@@ -940,6 +959,354 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             });
         }
     }
+    // The run closes the ledger from here on.
+    ledger_guard.disarm();
+
+    run_guest(
+        &shared.guest,
+        &shared,
+        vcpus,
+        kick_handles,
+        run_cpu,
+        filters,
+        io_threads,
+    )
+}
+
+/// What the KVM restore loads: a portable guest, from either backend.
+const RESTORER: Restorer = restore::portable("kvm");
+
+/// Resumes the checkpoint bundle `cfg` names in this process, and runs it
+/// until the guest powers off or a client stops it.
+///
+/// Only the portable profile restores on KVM: its interrupt controller is
+/// a vGICv2 here, loaded from the canonical state, and its clock is
+/// `hvi-time`. The native machine's vGICv3 is not captured, and its bundle
+/// is refused with that reason.
+///
+/// It refuses with every reason it finds before it creates anything: a
+/// bundle that does not hold all a restore loads, flags that do not match
+/// the guest's devices, and a machine profile this host does not match.
+/// It then builds the VM as a portable boot does: the vGICv2, guest RAM
+/// copied from the bundle, the devices from their state, every vCPU
+/// created and initialised in index order (one that was off powered off),
+/// the CPU baseline and firmware, and the counter offset set so the guest's
+/// counter reads no less than at the capture, scaled to this host's rate.
+/// The host check of a portable boot runs first. Then, before any vCPU has
+/// run, each vCPU loads its state by name (`kvm_state::import`), the vGIC
+/// loads the canonical state and each device's line is driven to its level.
+/// The guest waits restored-paused on the control socket, and the first
+/// vCPU to enter it after `resume` publishes `hvi-time`'s page.
+///
+/// # Errors
+///
+/// Errors on any refusal, on a host resource that cannot be opened, and on
+/// a state KVM does not take, after stopping whatever had started.
+// One function so the order of the steps, which KVM and the seccomp
+// filters constrain, reads top to bottom.
+#[allow(clippy::too_many_lines)]
+pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    let opened =
+        restore::open(std::path::Path::new(&cfg.from)).map_err(|e| format!("{}: {e}", cfg.from))?;
+    let source = opened.profile();
+    let mut why = restore::refusals(&opened, &cfg, &RESTORER);
+    if !RESTORER.profiles.contains(&source.profile.as_str()) {
+        why.push(
+            "the KVM restore rebuilds the portable machine only; the native machine's vGICv3 \
+             is not captured"
+                .to_string(),
+        );
+        return Err(Box::new(Refused(why)));
+    }
+    let ram_size = match source.ram_regions.as_slice() {
+        [region] if region.gpa == RAM_BASE => Some(region.size),
+        _ => {
+            why.push(format!(
+                "profile.json: the guest has one RAM region at {RAM_BASE:#x}, not {:?}",
+                source.ram_regions
+            ));
+            None
+        }
+    };
+    let num_cpus = source.vcpus;
+    let gic = match GicLayout::for_vcpus(GicVersion::V2, num_cpus.max(1)) {
+        Ok(gic) => gic,
+        Err(e) => {
+            why.push(format!("profile.json: {e}"));
+            return Err(Box::new(Refused(why)));
+        }
+    };
+    let present = fdt::VirtioDevices {
+        blk_count: usize::from(cfg.disk.is_some()),
+        net: cfg.net || cfg.net_gateway.is_some(),
+        vsock: cfg.agent_sock.is_some(),
+        fs_count: 0,
+        timer: fdt::ArchTimer::NoInterrupts {
+            clock_frequency: fdt::ArchTimer::PORTABLE_HZ,
+        },
+        hvi_time: true,
+    };
+    let net_mode = if cfg.net_gateway.is_some() {
+        Some("gateway")
+    } else if cfg.net {
+        Some("stub")
+    } else {
+        None
+    };
+    let mut local = arm64_profile::restored(
+        "kvm",
+        &gic,
+        present,
+        net_mode,
+        source,
+        MachineProfileKind::PortableArm64V1,
+    );
+    local.agent_sock = cfg.agent_sock.is_some();
+    // set_baseline gives the guest PSCI 1.1, as a portable boot does.
+    local.firmware.psci_version = Some("1.1".to_string());
+    local.cpu.ident.clone_from(&source.cpu.ident);
+    why.extend(restore::profile_refusals(source, &local));
+    let TimerState::HviTime(clock) = &opened.plan.platform.timer else {
+        why.push("platform.json: the counter is not hvi-time".to_string());
+        return Err(Box::new(Refused(why)));
+    };
+    let IrqState::Gicv2(gic_state) = &opened.plan.platform.irq else {
+        why.push("platform.json: the interrupt controller is not a GICv2".to_string());
+        return Err(Box::new(Refused(why)));
+    };
+    let Some(ram_size) = ram_size.filter(|_| why.is_empty()) else {
+        return Err(Box::new(Refused(why)));
+    };
+    eprintln!(
+        "{LOG_PREFIX} restoring {} ({num_cpus} vCPU(s), {} MiB, captured by {} on {} at epoch {})",
+        cfg.from,
+        ram_size >> 20,
+        opened.session.sandbox_id,
+        source.backend,
+        opened.session.epoch
+    );
+    install_kick_handler();
+
+    let kvm = Kvm::new()?;
+    if !kvm.check_extension(Cap::ImmediateExit) {
+        return Err("hvi needs KVM_CAP_IMMEDIATE_EXIT, which Linux 4.11 added".into());
+    }
+    if !kvm.check_extension(Cap::ReadonlyMem) {
+        return Err("a portable guest needs KVM_CAP_READONLY_MEM for the hvi-time page".into());
+    }
+    let vm = Arc::new(kvm.create_vm()?);
+    let gicfd = vm
+        .create_device(&mut kvm_create_device {
+            type_: kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
+            fd: 0,
+            flags: 0,
+        })
+        .map_err(|e| {
+            format!(
+                "the portable guest needs a vGICv2, and KVM offers none on this host ({e}): \
+                 a GICv3-only host serves vGICv3 alone"
+            )
+        })?;
+    eprintln!(
+        "{LOG_PREFIX} {num_cpus} vCPU(s)  V2  GICD {:#x}+{:#x}  GICC {:#x}+{:#x}  profile {}",
+        gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, source.profile
+    );
+
+    set_gic_addr(&gicfd, KVM_VGIC_V2_ADDR_TYPE_DIST, gic.gicd_base)?;
+    set_gic_addr(&gicfd, KVM_VGIC_V2_ADDR_TYPE_CPU, gic.gicr_base)?;
+
+    // Every vCPU, in index order, as the boot creates them; one that was
+    // off powered off, as it was.
+    let mut kvi = kvm_vcpu_init::default();
+    vm.get_preferred_target(&mut kvi)?;
+    kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+    let mut vcpus = Vec::with_capacity(num_cpus as usize);
+    let mut kick_handles = Vec::with_capacity(num_cpus as usize);
+    for (id, state) in (0..num_cpus).zip(&opened.plan.vcpus) {
+        let vcpu = vm.create_vcpu(u64::from(id))?;
+        let mut kvi_cpu = kvi;
+        if matches!(state, VcpuState::Aarch64(v) if v.power == Power::Off) {
+            kvi_cpu.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
+        }
+        vcpu.vcpu_init(&kvi_cpu)?;
+        kick_handles.push(kick_handle(&vm, &vcpu)?);
+        vcpus.push(vcpu);
+    }
+
+    // The host check of a portable boot, before guest RAM is copied and the
+    // disk is opened, and the baseline and firmware, before any vCPU runs.
+    let host = kvm_host(&kvm, &vm, &vcpus[0]);
+    let problems = portable::kvm_host_problems(&host);
+    if !problems.is_empty() {
+        return Err(Box::new(Refused(
+            problems.into_iter().map(|p| format!("host: {p}")).collect(),
+        )));
+    }
+    set_baseline(&vcpus)?;
+
+    let shared_ram = SharedRam::new(usize::try_from(ram_size)?)?;
+    let ram = Arc::new(GuestRam::new(
+        &shared_ram,
+        &[shared_ram.region_at(RAM_BASE)],
+    )?);
+    ram.register_kvm_slots(&vm)?;
+    opened.bundle.load_ram(&ram)?;
+    let rebuild::Devices {
+        block,
+        net,
+        net_reader,
+        vsock,
+        pl011,
+        pl031,
+    } = rebuild::devices(&opened, &cfg, &ram)?;
+
+    // The counter, which KVM takes only before a vCPU has run.
+    let start = clock.counter_target(crate::checkpoint::profile::counter_freq_hz());
+    let offset = set_counter_offset(&kvm, &vm, &vcpus[0], start)?;
+    let device = Arc::new(HviTime::new(
+        num_cpus as usize,
+        crate::checkpoint::profile::counter_freq_hz(),
+        Box::new(KvmCounter { offset }),
+        Box::new(KvmTimerLine {
+            vm: Arc::clone(&vm),
+        }),
+    )?);
+    let slot = kvm_userspace_memory_region {
+        slot: u32::try_from(ram.regions().len()).unwrap_or(u32::MAX),
+        flags: KVM_MEM_READONLY,
+        guest_phys_addr: HVI_TIME_PAGE_BASE,
+        memory_size: hvitime::PAGE_SIZE,
+        userspace_addr: device.page().host_ptr() as u64,
+    };
+    // SAFETY: the page is a live mapping of `PAGE_SIZE` bytes that lives as
+    // long as `device`, which outlives the VM.
+    unsafe { vm.set_user_memory_region(slot) }
+        .map_err(|e| format!("the hvi-time page's read-only memory slot: {e}"))?;
+    eprintln!(
+        "{LOG_PREFIX} hvi-time: page {HVI_TIME_PAGE_BASE:#x}+{:#x} (read-only slot), counter {} Hz \
+         (the capture's {} Hz), guest counter from {start}, offset {offset:#x}",
+        hvitime::PAGE_SIZE,
+        device.counter_freq_hz(),
+        clock.page.counter_freq_hz
+    );
+    let nr_irqs: u32 = 256;
+    set_gic_attr_u32(&gicfd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &nr_irqs)?;
+    gicfd.set_device_attr(&kvm_device_attr {
+        flags: 0,
+        group: KVM_DEV_ARM_VGIC_GRP_CTRL,
+        attr: u64::from(KVM_DEV_ARM_VGIC_CTRL_INIT),
+        addr: 0,
+    })?;
+    let gicfd = Arc::new(gicfd);
+
+    // The state, before any vCPU has run, then the lines: loading the vGIC
+    // set every line to its captured level behind the devices' backs, so
+    // each device's line goes to the device's level once it is connected,
+    // and the device's record of it with it.
+    let pl011 = Arc::new(Mutex::new(pl011));
+    let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
+    let checked = kvm_state::load_portable(
+        &vcpus,
+        &opened.plan.vcpus,
+        &KvmVgic {
+            gic: &gicfd,
+            vm: &vm,
+            ncpu: num_cpus as usize,
+        },
+        gic_state,
+        || {
+            let mut uart = pl011.lock().unwrap();
+            uart.connect_irq(line(UART_SPI));
+            uart.redrive_irq();
+            drop(uart);
+            if let Some(dev) = &block {
+                let mut dev = dev.lock().unwrap();
+                dev.connect_irq(line(VIRTIO_SPI));
+                dev.redrive_irq();
+            }
+            if let Some(dev) = &net {
+                let mut dev = dev.lock().unwrap();
+                dev.connect_irq(line(VIRTIO_NET_SPI));
+                dev.redrive_irq();
+            }
+            if let Some(dev) = &vsock {
+                let mut dev = dev.lock().unwrap();
+                dev.connect_irq(line(VIRTIO_VSOCK_SPI));
+                dev.redrive_irq();
+            }
+        },
+    )?;
+    eprintln!("{LOG_PREFIX} vGICv2: {checked} registers loaded and read back");
+    let midr = read_u64(&vcpus[0], REG_MIDR_EL1);
+
+    let stop_source_profile = Arc::new(ProfileCell::new(local, cfg.profile_out.as_deref())?);
+    stop_source_profile.complete(|p| p.cpu.ident = midr.map(hex))?;
+    let sandbox_id = cfg
+        .sandbox_id
+        .clone()
+        .unwrap_or_else(|| opened.session.sandbox_id.clone());
+    let ledger = Ledger::new(cfg.events.as_deref(), &sandbox_id)?;
+    let shared = Shared {
+        guest: Arc::new(Guest {
+            arch: GuestArch::Aarch64,
+            sandbox_id,
+            ram,
+            shared_ram,
+            ledger: Arc::new(ledger),
+            disks: Disk::place(block.iter().cloned().collect(), virtio_blk_base),
+            net,
+            vsock,
+            vcpus: Arc::new(Vcpus::new(
+                num_cpus,
+                Kicker::new(num_cpus),
+                StopHandle::new_pair()?.0,
+            )),
+            plugin_threads: PluginThreads::new(),
+        }),
+        pl011,
+        // None: the portable machine has no PL031, which the rebuild checked.
+        rtc: pl031.map(|rtc| Arc::new(Mutex::new(rtc))),
+        // A profile with a virtio-fs export never moves, so a restored guest
+        // has none.
+        fs: Arc::new(Vec::new()),
+        plugin: None,
+        hvitime: Some(Arc::clone(&device)),
+        vm: Arc::clone(&vm),
+        gic: Arc::clone(&gicfd),
+        restoring: Some(Arc::new(PendingPublish::new((**clock).clone()))),
+    };
+
+    // Held from the control socket before any vCPU thread exists, so each
+    // parks before its first entry until a client resumes the guest.
+    shared
+        .guest
+        .vcpus
+        .pause_from_control(std::time::Duration::ZERO)
+        .map_err(|e| format!("holding the vCPUs for the restore: {e}"))?;
+    let io = IoConfig {
+        plugin: None,
+        sandbox: cfg.sandbox,
+        agent_sock: cfg.agent_sock.as_deref(),
+        control_sock: Some(&cfg.control_sock),
+        checkpoint_root: cfg.checkpoint_root.as_deref(),
+        disk: cfg.disk.as_ref().map(|disk| disk.path.clone()),
+        restored: true,
+    };
+    let (filters, mut io_threads, ledger_guard) = start_io_threads(
+        &io,
+        &shared.guest,
+        {
+            let pl011 = Arc::clone(&shared.pl011);
+            move |byte| pl011.lock().unwrap().push_rx(byte)
+        },
+        net_reader.map(NetSource::Gateway),
+        stop_source_profile,
+        Console::Pl011 {
+            uart: Arc::clone(&shared.pl011),
+            rtc: shared.rtc.clone(),
+        },
+    )?;
+    spawn_timer(&mut io_threads, &device);
     // The run closes the ledger from here on.
     ledger_guard.disarm();
 
@@ -1101,8 +1468,9 @@ fn set_baseline(vcpus: &[VcpuFd]) -> Result<(), String> {
     Ok(())
 }
 
-/// Sets the guest's counter so that it starts near 0, and returns the
-/// offset hvi subtracts from the host's counter to read it.
+/// Sets the guest's counter so that it starts near `start` (0 at a boot,
+/// and at a restore the captured counter scaled to this host's rate), and
+/// returns the offset hvi subtracts from the host's counter to read it.
 ///
 /// With `KVM_CAP_COUNTER_OFFSET` the offset is set exactly, VM-wide, and
 /// moves the guest's physical counter with the virtual one, as on the Mac,
@@ -1117,9 +1485,9 @@ fn set_baseline(vcpus: &[VcpuFd]) -> Result<(), String> {
 ///
 /// Errors when KVM refuses the offset or the counter, and when the guest's
 /// counter is not where hvi computes it.
-fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd) -> Result<u64, String> {
+fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd, start: u64) -> Result<u64, String> {
     let (offset, how) = if kvm.check_extension(Cap::CounterOffset) {
-        let offset = host_counter();
+        let offset = host_counter().wrapping_sub(start);
         let arg = kvm_arm_counter_offset {
             counter_offset: offset,
             reserved: 0,
@@ -1140,7 +1508,7 @@ fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd) -> Result<u64, String
         }
         (offset, "KVM_ARM_SET_COUNTER_OFFSET")
     } else {
-        vcpu.set_one_reg(REG_TIMER_CNT, &0u64.to_le_bytes())
+        vcpu.set_one_reg(REG_TIMER_CNT, &start.to_le_bytes())
             .map_err(|e| format!("KVM_REG_ARM_TIMER_CNT cannot be set: {e}"))?;
         let before = host_counter();
         let guest = read_u64(vcpu, REG_TIMER_CNT).ok_or("KVM_REG_ARM_TIMER_CNT does not read")?;
@@ -1167,12 +1535,15 @@ fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd) -> Result<u64, String
 /// Runs one vCPU until the VM stops, servicing its MMIO exits.
 fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     let read_platform = std::cell::Cell::new(false);
-    if cpu_id == 0 {
+    if cpu_id == 0 && sh.restoring.is_none() {
         // Guest nanoseconds start at 0 at the boot vCPU's first entry.
         if let Some(device) = &sh.hvitime {
             device.publish_boot();
         }
     }
+    // A restored guest's clock is published before its first entry after
+    // `resume`, which is the first call of the run below.
+    let mut published = sh.restoring.is_none();
     run_vcpu(
         cpu_id,
         vcpu,
@@ -1190,6 +1561,14 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 if let Some(device) = &sh.hvitime {
                     device.thaw();
                 }
+            }
+            if !published {
+                if let (Some(pending), Some(device)) = (&sh.restoring, &sh.hvitime) {
+                    if let Err(e) = pending.publish(device) {
+                        return ControlFlow::Break(Outcome::Failed(format!("vcpu{cpu_id}: {e}")));
+                    }
+                }
+                published = true;
             }
             ControlFlow::Continue(())
         },
@@ -1232,8 +1611,19 @@ fn serve(sh: &Shared, cpu: u32, vcpu: &VcpuFd, work: Work<'_>) -> std::io::Resul
             let Some(device) = &sh.hvitime else {
                 return Ok(None);
             };
-            device.freeze();
-            let timer = device.state();
+            // A restored guest that has not run since holds the restored
+            // state, which the device gets only at the resume.
+            let timer = match sh
+                .restoring
+                .as_deref()
+                .and_then(PendingPublish::unpublished)
+            {
+                Some(state) => state.clone(),
+                None => {
+                    device.freeze();
+                    device.state()
+                }
+            };
             let ncpu = device.vcpus();
             let vgic = KvmVgic {
                 gic: &sh.gic,
