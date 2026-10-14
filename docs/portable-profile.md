@@ -584,8 +584,14 @@ console path's latency makes the guest look further behind than it is.
 - A guest booted with `--arch-timer-irq` is checkpointed like any other,
   but its architected timer's line is not carried by the restore; that
   debugging flag is not tested with checkpoints.
-- A `CPU_ON` that KVM had not served at a capture is not seen: the vCPU is
-  written as it was (v1 portable guests have 1 vCPU).
+- On KVM, a capture that finds a vCPU turned on by a `CPU_ON` that KVM has
+  not served yet fails, and the guest stays paused: the vCPU still holds
+  the registers of its initialisation, and KVM sets its start registers
+  only when it next runs. Resume the guest and checkpoint again. A vCPU
+  that was turned off and is being turned on again holds the registers
+  it had when it went off, and the capture cannot tell that apart from a
+  vCPU that is on; it would restore past its `CPU_OFF`. Linux turns
+  vCPUs off and on only for CPU hotplug.
 - At most 8 vCPUs, the GICv2 limit.
 - No virtio-fs: `--share-ro` and `--share-rw` are refused, because a guest
   meant to move keeps its storage on virtio-blk, which every host offers.

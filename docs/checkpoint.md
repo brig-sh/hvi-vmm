@@ -395,7 +395,7 @@ written from a `vmm` thread (Linux), is refused.
 | Device state | Whole: virtio-blk, virtio-net and virtio-vsock queues and registers, and the PL011. | The same, with the 16550 and the CMOS RTC on x86-64. |
 | Disk | Synced, with its size and generation. The image itself is not in the bundle; whoever moves the sandbox moves the disk. | The same. |
 | vCPU registers | Whole. See [The vCPU state](#the-vcpu-state). | arm64: whole, by the same names, with the firmware and fixed registers and `mp_state`. x86-64: **partial**, the plugin register view. |
-| A secondary the guest never started | `off`, or `pending_on` with the entry and context of the `CPU_ON` it had not taken. | `off` when KVM reports it stopped. Every KVM vCPU starts at once, and PSCI is KVM's, so a `CPU_ON` KVM had not served yet is not seen. |
+| A secondary the guest never started | `off`, or `pending_on` with the entry and context of the `CPU_ON` it had not taken. | `off` when KVM reports it stopped. PSCI is KVM's: a vCPU whose `CPU_ON` KVM has not served yet still holds its initialisation registers (pc 0), and the capture fails until the guest has run again. One turned off and being turned on again is not seen (`portable-profile.md`, Limits). |
 | Interrupt controller | Native: the `hv_gic_state` blob, and the GICv3 registers in canonical form. Portable: the software GICv2's state. | Portable: the vGICv2 in canonical form. Native: **not captured**. |
 | Guest counter | Native: the counter at the capture. Portable: `hvi-time`'s state and the raw counter. | Portable: the same. Native: **not captured**. |
 
