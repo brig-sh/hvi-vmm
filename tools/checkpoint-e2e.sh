@@ -105,8 +105,6 @@ t0 = time.monotonic()
 # Host wall-clock time at monotonic time t0, to read a line's host time.
 wall_t0 = time.time() - (time.monotonic() - t0)
 failures = []
-# Checks that fail for a known defect outside hvi, by name and defect.
-expected_failures = []
 
 
 def now():
@@ -197,13 +195,6 @@ def check(ok, what):
     print(("  ok   " if ok else "  FAIL ") + what, flush=True)
     if not ok:
         failures.append(what)
-
-
-def xfail(what, defect):
-    """Reports a check that fails for a known defect outside hvi. It does
-    not fail the run, and summary.json lists it."""
-    print(f"  xfail {what} (expected: {defect})", flush=True)
-    expected_failures.append({"check": what, "defect": defect})
 
 
 def tick(s):
@@ -415,18 +406,12 @@ if portable:
           "after the restore, the clocksource is still hvi-time")
     moves = dst.outputs(r"^MIGRATION .*hvi-time: generation \d+:", after=go)
     generations = {re.search(r"generation (\d+):", s).group(1) for _, s in moves}
-    check(generations == {"4"}, f"the guest driver logged the move, generation 4: {sorted(generations)}")
+    check(len(moves) == 1 and generations == {"4"},
+          f"the guest driver logged the move once, generation 4: {len(moves)} line(s), "
+          f"generations {sorted(generations)}")
     snap = dst.outputs(r"EL0CHECK snapshot1: .* migrations=", after=go)
     count = int(snap[0][1].split("migrations=")[1]) if snap else None
-    counted = f"the guest driver counts the move once: migrations={count} on {cpus} vCPU(s)"
-    if count is not None and int(cpus) > 1 and 1 < count <= int(cpus):
-        # A defect of the portable kernel's hvi-time driver: it runs its
-        # migration work once for each vCPU that takes GEN_CHANGED, so it
-        # logs and counts one move up to once per vCPU, and moves the wall
-        # clock again each time.
-        xfail(counted, "the hvi-time driver handles one generation once per vCPU")
-    else:
-        check(count == 1, counted)
+    check(count == 1, f"the guest driver counts the move once: migrations={count} on {cpus} vCPU(s)")
 after_n = None
 if image:
     check(bool(dst.outputs(r"DISK-BEFORE written-before ")), "the file written before the move is on the disk")
@@ -533,7 +518,6 @@ summary = {
     "disk_generations": generations,
     "portable": portable, **timers,
     "failures": failures,
-    "expected_failures": expected_failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
