@@ -885,7 +885,10 @@ and send most of them while the guest still runs.
 boots from it, keeps a copy, and passes the digest with
 `--disk-base-sha256`. hvi does not read the image to check it. The machine
 profile records it as `disk_base_sha256`, no compatibility check reads it,
-and a restore carries it to the restored guest's profile.
+and a restore carries it to the restored guest's profile. A disk with a
+base must be at most 4 TiB, whose bitmap (8 MiB, 11,184,812 characters of
+base64) still fits `disk.json`'s 12 MiB limit; the boot refuses a larger
+one. A disk over 4 TiB without a base is checkpointed without the bitmap.
 
 **The bitmaps.** virtio-blk keeps two bitmaps of the disk's 64 KiB blocks
 (a 16 GiB disk takes 32 KiB each): the blocks written since the guest
@@ -907,7 +910,9 @@ short when the disk is not a whole number of blocks.
    it starts the rounds over, and it clears the second bitmap, since round 0
    holds those writes already.
 2. `{"since":"round"}` returns the blocks written since the last read and
-   clears them: round 1, 2 and on. It is refused before a round 0.
+   clears them: round 1, 2 and on. It is refused before a round 0, and
+   after round 1024, so the list of rounds `disk.json` records stays
+   small; reading since boot again starts over.
 
 Each read records the device's generation, under the lock the guest's
 writes take, so a write after a read is in the next round. Read with the
