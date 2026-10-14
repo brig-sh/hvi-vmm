@@ -42,7 +42,7 @@ fn config(sandbox: bool) -> BootConfig {
         plugin: None,
         sandbox,
         profile: hvi::config::MachineProfileKind::Native,
-        arch_timer_irq: false,
+        arch_timer_irq: None,
         stop: None,
     }
 }

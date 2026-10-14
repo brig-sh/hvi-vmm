@@ -577,6 +577,10 @@ mod tests {
             fs_shares: 0,
             extra_disks: 0,
             disk_read_only: false,
+            profile: crate::checkpoint::profile::NATIVE.into(),
+            baseline: None,
+            irq: None,
+            time: None,
         };
         let line = format_response(&Response::Profile(Box::new(profile.clone())));
         let expected = format!(r#"{{"v":1,"ok":true,"profile":{}}}"#, profile.to_json());

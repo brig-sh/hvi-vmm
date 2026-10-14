@@ -68,7 +68,7 @@ including a typo, silently runs the plain test.
 | `--trace-io <path>` | none | Attach the I/O tracer. |
 | `--no-sandbox` | off | Boot unconfined. For debugging the profile or the filters. |
 | `--profile <name>` | `native` | The machine the guest gets: `native` or `portable-arm64-v1`. See [portable-profile.md](portable-profile.md). |
-| `--no-arch-timer-irq` | off | Give the devicetree's `/timer` a fixed `clock-frequency` of 54 MHz and no interrupts. Needs `--profile portable-arm64-v1`. A stock kernel then has no clock event and stops at its first timed sleep. |
+| `--arch-timer-irq` | off | A debugging aid for `--profile portable-arm64-v1`, whose `/timer` otherwise has a fixed `clock-frequency` of 54 MHz and no interrupts. Gives `/timer` its four PPIs back, so a kernel without the `hvi-time` driver still ticks. It changes the devicetree and the profile's `dtb_sha256`. |
 
 ### Parsing behaviour
 
@@ -118,9 +118,9 @@ are three behaviours, not two.
 | `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
-| `--profile portable-arm64-v1`, `--no-arch-timer-irq` | acted on | **refused**, boot fails | **refused**, boot fails |
+| `--profile portable-arm64-v1`, `--arch-timer-irq` | acted on | acted on, on a host that can present the profile | **refused**, boot fails |
 | `--fs`, `--share-ro`, `--share-rw` with `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
-| `--no-arch-timer-irq` without `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
+| `--arch-timer-irq` without `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
 | everything else | acted on | acted on | acted on |
 
 Every refusal in that table appears **after** `booting <kernel> with <N> MiB
@@ -140,8 +140,17 @@ hvi: --fs/--share-ro/--share-rw are not part of --profile portable-arm64-v1: a p
 
 ```text
 booting Image with 512 MiB ...
-hvi: --no-arch-timer-irq needs --profile portable-arm64-v1
+hvi: --arch-timer-irq needs --profile portable-arm64-v1
 ```
+
+On Linux/arm64 the portable profile also needs a host that can present it:
+a vGICv2, a Cortex-A76 r4p1 `MIDR_EL1`, ID register fields KVM can lower to
+the baseline, a 40-bit guest address space, `KVM_CAP_READONLY_MEM`, and 4 KiB
+or 16 KiB pages. Otherwise the boot fails, naming each problem, as in
+`this host cannot present --profile portable-arm64-v1: …`.
+
+`--no-arch-timer-irq` no longer exists: no interrupts on `/timer` is the
+portable profile's default. It is now an unknown flag.
 
 Unknown flags are the one class caught before anything prints.
 
@@ -411,12 +420,39 @@ booting Image with 1024 MiB ...
 ```
 
 Under `--profile portable-arm64-v1` the GIC line names the software GICv2,
-and the boot vCPU logs the CPU baseline it gave every vCPU:
+`hvi-time` reports its windows and its timer thread, and the boot vCPU logs
+the CPU baseline it gave every vCPU:
 
 ```text
 [hvi] 1 vCPU(s)  profile portable-arm64-v1  software GICv2: GICD 0x8000000+0x10000  GICC 0x8010000+0x10000  UART 0xc000000
+[hvi] hvi-time: page 0xd100000+0x10000 (read-only), timers 0xd110000+0x10000, PPI 4 (INTID 20), counter 24000000 Hz
+[hvi] seatbelt sandbox: on (deny default)
+[hvi] hvi-time: timer thread on time-constraint policy
 [hvi] portable-arm64-v1 CPU baseline: MIDR_EL1=0x414fd0b1 ID_AA64PFR0_EL1=0x1100000010110011 ... (host CTR_EL0=0x99444c004 DCZID_EL0=0x4, not settable)
 ```
+
+On Linux/arm64 the same profile logs the baseline it wrote, the counter
+offset and its check, and the read-only memory slot:
+
+```text
+[hvi] 1 vCPU(s)  V2  GICD 0x8000000+0x10000  GICC 0x8010000+0x10000  profile portable-arm64-v1
+[hvi] portable-arm64-v1 CPU baseline: MIDR_EL1=0x414fd0b1 ... ID_AA64ISAR2_EL1=0x0 (host CTR_EL0=0x9444c004 DCZID_EL0=0x4, not lowered); firmware bitmaps 0, PSCI 1.1
+[hvi] hvi-time: guest counter set with KVM_ARM_SET_COUNTER_OFFSET; check: KVM_REG_ARM_TIMER_CNT 115 within hvi's [81, 125]: yes
+[hvi] hvi-time: page 0xd100000+0x10000 (read-only slot), timers 0xd110000+0x10000, PPI 4 (INTID 20), counter 54000000 Hz, counter offset 0x…
+[hvi] seccomp: on (vmm 47 syscalls, vcpu 37, trap on mismatch)
+[hvi] hvi-time: timer thread on timer slack 1 ns
+```
+
+`HVI_TIME_TRACE=1` in the environment adds one line a second with the exits
+hvi handled and how late the timers fired, for measuring the profile's cost:
+
+```text
+[hvi] hvi-time trace: exits/s 1750 (gic 750, hvi-time 750, kicked 250) fires/s 250 late avg 8 us max 18 us
+```
+
+`HVI_TIME_TEST_RESTORE=<at>,<downtime>` is a test hook, not a feature: it
+captures and restores `hvi-time` in the same process while the vCPUs are
+paused. See [portable-profile.md](portable-profile.md#restore).
 
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
 share is configured, because the limit is raised while the first share is set
@@ -432,8 +468,8 @@ guest stopped: SystemOff
 ## vCPU limits
 
 hvi has three caps. The GICv2 one takes at most 8 vCPUs: on Linux/arm64 when the
-host offers only a vGICv2, and on macOS under `--profile portable-arm64-v1`,
-whose software GICv2 addresses at most 8 CPUs:
+host offers only a vGICv2 or the boot asks for `--profile portable-arm64-v1`,
+and on macOS under that profile, whose software GICv2 addresses at most 8 CPUs:
 
 ```text
 this host offers only vGICv2, which supports at most 8 vCPUs (asked for 16)

@@ -134,7 +134,7 @@ let cfg = BootConfig {
     plugin: None,
     sandbox: true,
     profile: MachineProfileKind::Native,
-    arch_timer_irq: true,
+    arch_timer_irq: None,
     stop: None,
 };
 
@@ -177,8 +177,8 @@ cargo build --release --example watch_guest
 | `checkpoint_root` | `Option<String>` | The directory a `checkpoint` may write bundles under; `None` refuses every checkpoint. Resolved before confinement. Seatbelt holds writes to it on macOS; on Linux only hvi's own path check does. One private root (mode 0700) per sandbox: bundles hold guest RAM in clear. Needs `control_sock`. See [checkpoint.md](checkpoint.md#confinement). |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
-| `profile` | `MachineProfileKind` | `Native`, or `PortableArm64V1` for one machine on every host. macOS only for now. See [portable-profile.md](portable-profile.md). |
-| `arch_timer_irq` | `bool` | Leave it `true`. `false` gives `/timer` no interrupts, and only `PortableArm64V1` accepts it. |
+| `profile` | `MachineProfileKind` | `Native`, or `PortableArm64V1` for one machine on every host: macOS and arm64 KVM. See [portable-profile.md](portable-profile.md). |
+| `arch_timer_irq` | `Option<bool>` | Leave it `None`, the profile's default: interrupts on the native profile, none on the portable one, whose clock is `hvi-time`. `Some(true)` is the `--arch-timer-irq` debugging aid, and only `PortableArm64V1` accepts a value. |
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
 
 `FsShare` carries a `path`, a `tag`, a `ShareMode`, a `CachePolicy` and the

@@ -26,6 +26,7 @@ three things a reader should not have to guess between:
 | --- | --- | --- |
 | At most four virtio-blk disks. | No hotplug, no PCI at all. | Design |
 | The PL031 has no alarm, and ignores writes. | vm-superio does not implement the match register. The devicetree gives the RTC no interrupt, so the guest's driver offers no alarm: there is no `wakealarm` file, and `rtcwake` fails with EINVAL. The host's clock is authoritative, so `hwclock -w` does not move the RTC. | Design |
+| A portable guest has no PL031. | `portable-arm64-v1` keeps the devicetree and the device set it was published with, and `hvi-time` gives its guest the wall clock (`CLOCK_REALTIME`), so its devicetree has no PL031 node and its bus no PL031: the guest has no `/dev/rtc0`. Adding the device would take a new profile version. See [portable-profile.md](portable-profile.md). | Design |
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |
@@ -58,6 +59,10 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
+| A portable guest's REALTIME drifts from the host between restores. | `hvi-time` runs REALTIME on the host's counter, not on its NTP-disciplined clock, so it moves away by the counter's error, up to about 30 ppm measured on rp2. Nothing resynchronises it until a restore. Run NTP in the guest if that matters. | Design |
+| A portable guest's high-resolution `clock_gettime` is a system call. | The vDSO has no `hvi-time` mode, so it falls back to the syscall. Coarse clocks stay in the vDSO. | Design |
+| The portable profile has no checkpoint yet. | `hvi-time` has its canonical state and restore, tested in one process (`HVI_TIME_TEST_RESTORE`). Moving a guest between hosts needs the checkpoint itself and the vGICv2 import and export, which do not exist yet. | Defect |
+| On KVM the `hvi-time` timer thread is an ordinary thread. | A few timer fires a minute land 0.5 to 3.5 ms late on a busy Pi 5. hvi does not ask for a real-time policy, which needs privileges. A late fire is never early. | Design |
 | 254 vCPUs on x86-64. | The MP table and the ACPI tables give each vCPU a one-byte local APIC id and the IOAPIC the next one, so more vCPUs would share ids. x2APIC ids would lift the cap. | Design |
 | 8 vCPUs on a GICv2 arm64 host. | GICv2 addresses at most 8 CPU interfaces. The guest's controller follows the host's, so this is not a choice. | Platform |
 | 507 vCPUs on a GICv3 arm64 Linux host. | Each vCPU adds a redistributor frame from a fixed base, and the frames must end below the UART. Moving the UART or the redistributors higher would lift the cap. | Design |

@@ -1170,7 +1170,7 @@ mod vcpu_cap_tests {
             plugin: None,
             sandbox: false,
             profile: crate::config::MachineProfileKind::Native,
-            arch_timer_irq: true,
+            arch_timer_irq: None,
             stop: None,
         };
         let error = boot(cfg).unwrap_err().to_string();

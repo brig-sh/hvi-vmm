@@ -19,9 +19,11 @@
 //! devices its guest needs: the PL011 and the PL031 RTC on arm64, the 16550 and
 //! the CMOS RTC on x86-64. `irq` holds the interrupt line each device sets
 //! itself, `state` the checks each device's checkpoint state passes on restore,
-//! and `gicv2` the software interrupt controller of the portable profile.
+//! `gicv2` the software interrupt controller of the portable profile and
+//! `hvitime` its clock and timer device.
 
 pub mod gicv2;
+pub mod hvitime;
 pub(crate) mod irq;
 pub mod legacy;
 pub mod state;
