@@ -37,7 +37,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -55,7 +55,7 @@ use crate::arch::aarch64::layout::{
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
-use crate::arch::aarch64::portable;
+use crate::arch::aarch64::portable::{self, fw};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::checkpoint::bundle::IrqLevels;
 use crate::checkpoint::capture::Console;
@@ -216,6 +216,9 @@ struct Portable {
     layout: GicLayout,
     /// Host counter ticks to nanoseconds, as `(numer, denom)`.
     timebase: (u64, u64),
+    /// Which vCPUs PSCI reports on: cpu0 from the start, a secondary from
+    /// its `CPU_ON`.
+    on: Vec<AtomicBool>,
     /// Why the boot was refused, when a vCPU thread refused it.
     refused: Mutex<Option<String>>,
 }
@@ -572,6 +575,8 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -
         for (name, value) in portable::BASELINE.into_iter().skip(1) {
             p.cpu.id_regs.insert(name.to_string(), hex(value));
         }
+        // `service_firmware` answers PSCI_VERSION with 1.1.
+        p.firmware.psci_version = Some("1.1".to_string());
     }
     for (fs, share) in fs.iter().zip(&cfg.fs_shares) {
         let mut entry = device("virtio-fs", fs.base, Some(fs.intid), None);
@@ -910,6 +915,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             gic: Mutex::new(Gicv2::new(num_cpus)),
             layout: gic,
             timebase: host_timebase(),
+            on: (0..num_cpus).map(|cpu| AtomicBool::new(cpu == 0)).collect(),
             refused: Mutex::new(None),
         })
     });
@@ -1815,8 +1821,20 @@ fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32, vtimer: &mut Vtimer) -> Co
             let syn = exit.exception.syndrome;
             match Ec::from_syndrome(syn) {
                 Ec::Hvc | Ec::Smc => {
-                    service_psci(vcpu, sh)?;
                     // Not restartable: the saved PC is already past HVC/SMC.
+                    if let Some(p) = portable {
+                        match service_firmware(vcpu, sh, p) {
+                            Firmware::Continue => {}
+                            Firmware::Stop(stop) => {
+                                return ControlFlow::Break(Outcome::Stopped(stop))
+                            }
+                            Firmware::Suspend => {
+                                wait_for_interrupt(vcpu, sh, p, cpu_id, vtimer);
+                            }
+                        }
+                    } else {
+                        service_psci(vcpu, sh)?;
+                    }
                 }
                 Ec::DataAbort => {
                     let ipa = exit.exception.physical_address;
@@ -2261,6 +2279,112 @@ fn set_baseline(vcpu: &Vcpu, log: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// How a firmware call of the portable profile ended.
+enum Firmware {
+    /// The guest goes on after its HVC.
+    Continue,
+    /// `SYSTEM_OFF` or a reset: the VM stops, as the guest asked.
+    Stop(Stop),
+    /// `CPU_SUSPEND`: the vCPU waits as for a WFI, then goes on.
+    Suspend,
+}
+
+/// Answers a PSCI or SMCCC call as KVM on a Pi 5 does, so a portable guest
+/// sees one firmware on every host.
+///
+/// The answers were measured on rp2 with the firmware bitmaps lowered, as
+/// the portable profile sets them on KVM (`portable::psci_features`,
+/// `portable::smccc_arch_features`). As there, the function ID is 32 bits
+/// and an SMC32 call's arguments are too.
+fn service_firmware(vcpu: &Vcpu, sh: &Shared, p: &Portable) -> Firmware {
+    let fid = vcpu.get_reg(Reg::X0).unwrap_or(0) as u32;
+    let narrow = fid & 0x4000_0000 == 0;
+    let arg = |reg| {
+        let v = vcpu.get_reg(reg).unwrap_or(0);
+        if narrow {
+            v & 0xffff_ffff
+        } else {
+            v
+        }
+    };
+    let ret = match fid {
+        fw::SMCCC_VERSION | fw::PSCI_VERSION => fw::VERSION_1_1,
+        fw::SMCCC_ARCH_FEATURES => portable::smccc_arch_features(arg(Reg::X1) as u32),
+        fw::SMCCC_ARCH_WORKAROUND_1 | fw::SMCCC_ARCH_WORKAROUND_3 => fw::SUCCESS,
+        fw::PSCI_FEATURES => portable::psci_features(arg(Reg::X1) as u32),
+        fw::CPU_SUSPEND_32 | fw::CPU_SUSPEND_64 => {
+            // KVM treats every power state as a standby, a WFI.
+            let _ = vcpu.set_reg(Reg::X0, fw::SUCCESS);
+            return Firmware::Suspend;
+        }
+        // As on the native machine, the vCPU goes on running.
+        fw::CPU_OFF => fw::SUCCESS,
+        fw::CPU_ON_32 | fw::CPU_ON_64 => cpu_on(sh, p, arg(Reg::X1), arg(Reg::X2), arg(Reg::X3)),
+        fw::AFFINITY_INFO_32 | fw::AFFINITY_INFO_64 => affinity_info(p, arg(Reg::X1), arg(Reg::X2)),
+        fw::MIGRATE_INFO_TYPE => fw::MIGRATE_NOT_REQUIRED,
+        fw::SYSTEM_OFF => return Firmware::Stop(Stop::SystemOff),
+        fw::SYSTEM_RESET => return Firmware::Stop(Stop::SystemReset),
+        fw::SYSTEM_RESET2_32 | fw::SYSTEM_RESET2_64 => {
+            // The architectural warm reset (0) or a vendor reset.
+            let kind = arg(Reg::X1);
+            if kind == 0 || kind >= 0x8000_0000 {
+                return Firmware::Stop(Stop::SystemReset);
+            }
+            fw::INVALID_PARAMETERS
+        }
+        _ => fw::NOT_SUPPORTED,
+    };
+    let _ = vcpu.set_reg(Reg::X0, ret);
+    Firmware::Continue
+}
+
+/// The affinity bits of an MPIDR.
+const MPIDR_HWID: u64 = 0xff_00ff_ffff;
+
+/// `CPU_ON`: starts the secondary whose MPIDR is `target`.
+fn cpu_on(sh: &Shared, p: &Portable, target: u64, entry: u64, ctx: u64) -> u64 {
+    if target & !MPIDR_HWID != 0 {
+        return fw::INVALID_PARAMETERS;
+    }
+    // Each vCPU's affinity is its index in aff0.
+    let idx = target as usize;
+    let Some(on) = p.on.get(idx) else {
+        return fw::INVALID_PARAMETERS;
+    };
+    if on.swap(true, Ordering::SeqCst) {
+        return fw::ALREADY_ON;
+    }
+    let sec = &sh.guest.vcpus.kicker().secondaries[idx];
+    *lock_or_recover(&sec.mbox) = Some((entry, ctx));
+    sec.cv.notify_all();
+    fw::SUCCESS
+}
+
+/// `AFFINITY_INFO`: whether any vCPU whose MPIDR matches `target` from
+/// affinity level `level` up is on, as KVM's `kvm_psci_vcpu_affinity_info`
+/// answers it.
+fn affinity_info(p: &Portable, target: u64, level: u64) -> u64 {
+    if level > 3 || target & !MPIDR_HWID != 0 {
+        return fw::INVALID_PARAMETERS;
+    }
+    // Levels 0-2 are bytes 0-2 of the MPIDR, level 3 is byte 4.
+    let shift = ((1u64 << level) >> 1) << 3;
+    let mask = MPIDR_HWID & !((1u64 << shift) - 1);
+    let matching: Vec<&AtomicBool> =
+        p.on.iter()
+            .enumerate()
+            .filter(|(cpu, _)| (*cpu as u64 & mask) == (target & mask))
+            .map(|(_, on)| on)
+            .collect();
+    if matching.is_empty() {
+        fw::INVALID_PARAMETERS
+    } else if matching.iter().any(|on| on.load(Ordering::SeqCst)) {
+        fw::AFFINITY_ON
+    } else {
+        fw::AFFINITY_OFF
+    }
+}
+
 /// Services a PL011 MMIO access.
 fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);
@@ -2536,19 +2660,21 @@ mod tests {
         }
     }
 
-    /// A portable machine with `cpus` vCPUs.
-    fn machine(cpus: u32) -> Portable {
+    /// A portable machine with one vCPU per entry of `on`, which says
+    /// whether PSCI reports it on.
+    fn machine(on: &[bool]) -> Portable {
         Portable {
-            gic: Mutex::new(Gicv2::new(cpus)),
+            gic: Mutex::new(Gicv2::new(on.len() as u32)),
             layout: GicLayout::QEMU_VIRT_V2,
             timebase: (125, 3),
+            on: on.iter().map(|&b| AtomicBool::new(b)).collect(),
             refused: Mutex::new(None),
         }
     }
 
     #[test]
     fn the_gic_window_covers_the_distributor_and_the_cpu_interface() {
-        let p = machine(1);
+        let p = machine(&[true]);
         assert!(p.in_gic(0x0800_0000) && p.in_gic(0x0801_ffff));
         assert!(!p.in_gic(0x0802_0000) && !p.in_gic(0x07ff_fffc));
     }
@@ -2593,5 +2719,18 @@ mod tests {
         report.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(finished, "the report waited for the device");
+    }
+
+    #[test]
+    fn affinity_info_follows_the_affinity_level() {
+        let p = machine(&[true, false]);
+        assert_eq!(affinity_info(&p, 0, 0), fw::AFFINITY_ON);
+        assert_eq!(affinity_info(&p, 1, 0), fw::AFFINITY_OFF);
+        // At level 1 the target names the whole cluster, which cpu0 is in.
+        assert_eq!(affinity_info(&p, 1, 1), fw::AFFINITY_ON);
+        assert_eq!(affinity_info(&p, 0, 4), fw::INVALID_PARAMETERS);
+        // No vCPU has that affinity, or the target has bits outside it.
+        assert_eq!(affinity_info(&p, 5, 0), fw::INVALID_PARAMETERS);
+        assert_eq!(affinity_info(&p, 0x8000_0000, 0), fw::INVALID_PARAMETERS);
     }
 }
