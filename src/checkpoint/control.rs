@@ -25,7 +25,7 @@
 //! | `resume` | releases the vCPUs, then the I/O threads | `state` |
 //! | `status` | none | `state`, `vcpus`, `vcpus_parked` |
 //! | `stop` | ends the run, as a guest power-off would | `state` |
-//! | `checkpoint` | reserved: answers `not_implemented` | |
+//! | `checkpoint` | captures the VM into a bundle directory | `state`, `dir`, `manifest_sha256`, `stats` |
 //!
 //! A refusal is `{"v":1,"ok":false,"code":...,"error":...}`, where `code` is
 //! one of the [`ErrorCode`] spellings and `error` is prose for a person.
@@ -57,12 +57,16 @@ pub enum Request {
     Status,
     /// End the run.
     Stop,
-    /// Capture the VM into `dir`. Reserved: the socket refuses it for now.
+    /// Capture the VM into `dir`.
     Checkpoint {
         /// The directory the bundle is written to.
         dir: String,
         /// What the VM does after a capture that succeeded.
         then: Then,
+        /// The caller's transaction id, recorded in `session.json`.
+        txid: Option<String>,
+        /// The caller's epoch for the sandbox, recorded in `session.json`.
+        epoch: u64,
     },
 }
 
@@ -114,6 +118,13 @@ pub enum ErrorCode {
     Fenced,
     /// The profile is not complete yet: the boot vCPU has not started.
     NotReady,
+    /// The checkpoint cannot be taken as asked: no checkpoint root, a
+    /// directory outside it or in use, or a guest with virtio-fs shares. The
+    /// VM was not paused.
+    Refused,
+    /// The capture failed after the VM was paused; the VM runs on, or stays
+    /// paused if it was paused before.
+    CaptureFailed,
 }
 
 impl ErrorCode {
@@ -131,6 +142,8 @@ impl ErrorCode {
             Self::Stopped => "stopped",
             Self::Fenced => "fenced",
             Self::NotReady => "not_ready",
+            Self::Refused => "refused",
+            Self::CaptureFailed => "capture_failed",
         }
     }
 }
@@ -171,8 +184,35 @@ pub enum Response {
         /// The vCPUs parked at a checkpoint right now.
         vcpus_parked: u32,
     },
+    /// The answer to a `checkpoint` that sealed its bundle.
+    Checkpoint {
+        /// The state the VM is in now: as before, or `fenced`.
+        state: VmState,
+        /// The bundle directory.
+        dir: String,
+        /// The SHA-256 of the bundle's `manifest.json`.
+        manifest_sha256: String,
+        /// What the capture took.
+        stats: CheckpointStats,
+    },
     /// A refusal.
     Error(Error),
+}
+
+/// What a checkpoint took, as its reply reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CheckpointStats {
+    /// From the request to every vCPU parked with its state exported.
+    pub pause_ms: u64,
+    /// From then to the bundle sealed: device states, disk sync, RAM and
+    /// the files.
+    pub capture_ms: u64,
+    /// The bytes of guest RAM the bundle holds, the pages that are not zero.
+    pub ram_present_bytes: u64,
+    /// The size of guest RAM.
+    pub ram_total_bytes: u64,
+    /// The size of the bundle's files, the manifest included.
+    pub bundle_bytes: u64,
 }
 
 /// Parses one request line, without its newline.
@@ -220,9 +260,30 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
                     ))
                 }
             };
+            let txid = match fields.get("txid") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(txid)) if txid.len() <= 256 => Some(txid.clone()),
+                Some(_) => {
+                    return Err(Error::new(
+                        ErrorCode::BadRequest,
+                        "\"txid\" must be a string of at most 256 bytes",
+                    ))
+                }
+            };
+            let epoch = match fields.get("epoch") {
+                None => 0,
+                Some(epoch) => epoch.as_u64().ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::BadRequest,
+                        "\"epoch\" must be an unsigned integer",
+                    )
+                })?,
+            };
             Request::Checkpoint {
                 dir: dir.to_string(),
                 then,
+                txid,
+                epoch,
             }
         }
         other => {
@@ -260,6 +321,15 @@ pub fn format_response(response: &Response) -> String {
         vcpus_parked: u32,
     }
     #[derive(Serialize)]
+    struct CheckpointReply<'a> {
+        v: u64,
+        ok: bool,
+        state: VmState,
+        dir: &'a str,
+        manifest_sha256: &'a str,
+        stats: CheckpointStats,
+    }
+    #[derive(Serialize)]
     struct ErrorReply<'a> {
         v: u64,
         ok: bool,
@@ -288,6 +358,19 @@ pub fn format_response(response: &Response) -> String {
             state: *state,
             vcpus: *vcpus,
             vcpus_parked: *vcpus_parked,
+        }),
+        Response::Checkpoint {
+            state,
+            dir,
+            manifest_sha256,
+            stats,
+        } => serde_json::to_string(&CheckpointReply {
+            v,
+            ok: true,
+            state: *state,
+            dir,
+            manifest_sha256,
+            stats: *stats,
         }),
         Response::Error(e) => serde_json::to_string(&ErrorReply {
             v,
@@ -323,13 +406,17 @@ mod tests {
                 Request::Checkpoint {
                     dir: "/tmp/ck".into(),
                     then: Then::Continue,
+                    txid: None,
+                    epoch: 0,
                 },
             ),
             (
-                r#"{"v":1,"op":"checkpoint","dir":"/tmp/ck","then":"fence"}"#,
+                r#"{"v":1,"op":"checkpoint","dir":"/tmp/ck","then":"fence","txid":"t1","epoch":7}"#,
                 Request::Checkpoint {
                     dir: "/tmp/ck".into(),
                     then: Then::Fence,
+                    txid: Some("t1".into()),
+                    epoch: 7,
                 },
             ),
         ] {
@@ -386,6 +473,14 @@ mod tests {
             refused(r#"{"v":1,"op":"checkpoint","dir":"/d","then":"wait"}"#).0,
             ErrorCode::BadRequest
         );
+        assert_eq!(
+            refused(r#"{"v":1,"op":"checkpoint","dir":"/d","txid":7}"#).0,
+            ErrorCode::BadRequest
+        );
+        assert_eq!(
+            refused(r#"{"v":1,"op":"checkpoint","dir":"/d","epoch":-1}"#).0,
+            ErrorCode::BadRequest
+        );
     }
 
     // The replies are the wire format hull parses, pinned byte for byte so a
@@ -422,6 +517,25 @@ mod tests {
                 "checkpoint is not implemented"
             ))),
             r#"{"v":1,"ok":false,"code":"not_implemented","error":"checkpoint is not implemented"}"#
+        );
+        assert_eq!(
+            format_response(&Response::Checkpoint {
+                state: VmState::Fenced,
+                dir: "/ck/1".into(),
+                manifest_sha256: "ab".into(),
+                stats: CheckpointStats {
+                    pause_ms: 3,
+                    capture_ms: 900,
+                    ram_present_bytes: 4096,
+                    ram_total_bytes: 8192,
+                    bundle_bytes: 5000,
+                },
+            }),
+            concat!(
+                r#"{"v":1,"ok":true,"state":"fenced","dir":"/ck/1","manifest_sha256":"ab","#,
+                r#""stats":{"pause_ms":3,"capture_ms":900,"ram_present_bytes":4096,"#,
+                r#""ram_total_bytes":8192,"bundle_bytes":5000}}"#
+            )
         );
     }
 
@@ -488,6 +602,8 @@ mod tests {
             ErrorCode::Stopped,
             ErrorCode::Fenced,
             ErrorCode::NotReady,
+            ErrorCode::Refused,
+            ErrorCode::CaptureFailed,
         ];
         let spellings: std::collections::BTreeSet<_> = codes.iter().map(|c| c.as_str()).collect();
         assert_eq!(spellings.len(), codes.len());
