@@ -73,6 +73,18 @@ impl Quiesce {
     /// registers and the memory it has written are stable for the plugin.
     #[must_use]
     pub fn checkpoint(&self) -> Duration {
+        self.checkpoint_serving(|| false, || {});
+    }
+
+    /// [`checkpoint`](Self::checkpoint), for a vCPU that also carries out work
+    /// its requester posts while it is parked.
+    ///
+    /// Whenever `due` returns true the vCPU runs `serve`, without the lock and
+    /// still counted as parked, since it is out of guest context. `due` is
+    /// asked under the lock, before every wait, and a requester posts work
+    /// and then calls [`wake`](Self::wake), which takes the lock, so a post
+    /// made while the vCPU is between its check and its wait still wakes it.
+    pub(crate) fn checkpoint_serving(&self, due: impl Fn() -> bool, mut serve: impl FnMut()) {
         // Fast path: no quiesce pending, no lock taken. The load is
         // sequentially consistent to pair with the store in `request`.
         if !self.requested.load(Ordering::SeqCst) {
@@ -84,10 +96,22 @@ impl Quiesce {
         // Wake a requester that is waiting for this thread to park.
         self.cv.notify_all();
         while self.requested.load(Ordering::Acquire) {
+            if due() {
+                drop(parked);
+                serve();
+                parked = self.parked.lock().unwrap();
+                continue;
+            }
             parked = self.cv.wait(parked).unwrap();
         }
         *parked -= 1;
         start.elapsed()
+    }
+
+    /// Wakes every parked vCPU to look for work, without releasing them.
+    pub(crate) fn wake(&self) {
+        let _guard = self.parked.lock().unwrap();
+        self.cv.notify_all();
     }
 
     /// Raises the request. The caller must then kick the vCPUs so they leave
@@ -212,6 +236,52 @@ mod tests {
         }
         assert!(done.load(Ordering::SeqCst));
         assert_eq!(*q.parked.lock().unwrap(), 0, "parked count did not unwind");
+    }
+
+    // Work posted to a vCPU that is already parked must reach it, and it must
+    // stay parked afterwards.
+    #[test]
+    fn a_parked_worker_serves_work_and_stays_parked() {
+        let q = Arc::new(Quiesce::new());
+        let due = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        q.request();
+        let worker = {
+            let (q, due, served, released) = (
+                Arc::clone(&q),
+                Arc::clone(&due),
+                Arc::clone(&served),
+                Arc::clone(&released),
+            );
+            std::thread::spawn(move || {
+                q.checkpoint_serving(
+                    || due.load(Ordering::SeqCst),
+                    || {
+                        due.store(false, Ordering::SeqCst);
+                        served.fetch_add(1, Ordering::SeqCst);
+                    },
+                );
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        assert!(q.wait_for(1), "the worker did not park");
+        due.store(true, Ordering::SeqCst);
+        q.wake();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while served.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the work was not served");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "serving released the worker"
+        );
+        assert_eq!(q.parked(), 1);
+        q.release();
+        worker.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 1);
     }
 
     /// A requester must not hang forever when a vCPU never reaches its
