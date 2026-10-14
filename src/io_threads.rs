@@ -182,8 +182,8 @@ impl IoThreads {
     /// Adds a thread the backend started that watches no stop token, with
     /// `end`, which ends it. [`stop`](Self::stop) calls `end` before it
     /// joins.
-    // Only the macOS backend starts such a thread so far, for `hvi-time`.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    // Only the arm64 backends start such a thread, for `hvi-time`.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn push_ended_by(
         &mut self,
         name: &'static str,
