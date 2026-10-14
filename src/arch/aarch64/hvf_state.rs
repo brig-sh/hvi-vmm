@@ -22,6 +22,11 @@
 //! [`Work::ExportPlatform`], on vCPU 0 once every vCPU has exported, reads the
 //! distributor, the `hv_gic_state` blob and the guest counter.
 //!
+//! A restore loads them back in the steps of `checkpoint::restore`: each
+//! vCPU's registers and timer mask, then the blob through `hv_gic_set_state`
+//! on vCPU 0, then each vCPU's CPU interface. The counter goes on from the
+//! captured value through [`RestoreClock`].
+//!
 //! Every register is named here by its `applevisor` variant, never by the
 //! framework's number, so the tables below are the only place the two
 //! meet. The tests check each name against the variant's own.
@@ -34,8 +39,8 @@ use applevisor::prelude::{
 };
 
 use crate::checkpoint::cpu::{
-    aarch64_reg_names, simd_hex, Aarch64Vcpu, Hex64, Need, Output, Power, VcpuState, VcpuTimer,
-    Work, AARCH64_SYSREGS,
+    aarch64_reg_names, parse_simd, simd_hex, Aarch64Vcpu, Hex64, ImportStep, Need, Output, Power,
+    VcpuState, VcpuTimer, Work, AARCH64_SYSREGS,
 };
 use crate::checkpoint::platform::{
     Adjunct, ArchTimerState, GicV3Dist, GicV3Icc, GicV3Redist, GicV3State, IrqCpuState, IrqState,
@@ -60,28 +65,194 @@ pub(crate) fn host_counter() -> u64 {
     unsafe { mach_absolute_time() }
 }
 
+/// The guest counter of a restored VM, which goes on from the value the
+/// capture left it at.
+///
+/// The counter stands still from the restore until the guest resumes: the
+/// vtimer offset every vCPU runs with is fixed when the first vCPU is about
+/// to enter the guest, so the guest's `CNTVCT_EL0` resumes at
+/// `counter_at_capture` however long the restore and the wait for `resume`
+/// took.
+pub(crate) struct RestoreClock {
+    /// The guest counter at the capture.
+    counter_at_capture: u64,
+    /// The vtimer offset, once a vCPU has asked for it.
+    offset: std::sync::OnceLock<u64>,
+}
+
+impl RestoreClock {
+    /// Returns the clock of a guest captured at `counter_at_capture`.
+    pub(crate) fn new(counter_at_capture: u64) -> Self {
+        Self {
+            counter_at_capture,
+            offset: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Returns the vtimer offset each vCPU sets before it first enters the
+    /// guest, fixed by the first to ask.
+    pub(crate) fn offset(&self) -> u64 {
+        *self
+            .offset
+            .get_or_init(|| host_counter().wrapping_sub(self.counter_at_capture))
+    }
+
+    /// Returns the guest counter now: `counter_at_capture` until the guest
+    /// has resumed.
+    fn counter(&self) -> u64 {
+        self.offset.get().map_or(self.counter_at_capture, |offset| {
+            host_counter().wrapping_sub(*offset)
+        })
+    }
+}
+
 /// Carries out `work` for vCPU `cpu`, whose thread this is, on `vm`.
+///
+/// `clock` is the counter of a restored VM, which a capture reads in place
+/// of the vtimer offset until the guest has resumed.
 ///
 /// # Errors
 ///
-/// Errors when a register a restore needs cannot be read, when the guest has
-/// SME state this build does not capture, or on an import, which this build
-/// does not do yet.
+/// Errors when a register a restore needs cannot be read or written, when
+/// the guest has SME state this build does not capture, or when a state to
+/// load is not this vCPU's or is not whole.
 pub(crate) fn serve(
     cpu: u32,
     vcpu: &Vcpu,
     vm: &VmGic,
+    clock: Option<&RestoreClock>,
     work: Work<'_>,
 ) -> io::Result<Option<Output>> {
+    // Only vCPU 0 reads and loads the platform; the others have nothing to
+    // add to those steps.
     match work {
         Work::Export => export_vcpu(cpu, vcpu).map(Some),
-        Work::ExportPlatform if cpu == 0 => export_platform(vcpu, vm).map(Some),
-        Work::ExportPlatform => Ok(None),
-        Work::Import(..) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("the hvf backend cannot load a vCPU state yet (vCPU {cpu})"),
-        )),
+        Work::ExportPlatform if cpu == 0 => export_platform(vcpu, vm, clock).map(Some),
+        Work::Import(ImportStep::Platform, plan) if cpu == 0 => import_gic(&plan.platform),
+        Work::ExportPlatform | Work::Import(ImportStep::Platform, _) => Ok(None),
+        Work::Import(ImportStep::Vcpu, plan) => import_vcpu(cpu, vcpu, &plan.vcpus[cpu as usize]),
+        Work::Import(ImportStep::IrqCpu, plan) => import_icc(cpu, vcpu, &plan.platform),
     }
+}
+
+/// Loads vCPU `cpu`'s registers and its timer mask from `state`.
+///
+/// A vCPU that was off, or waited for its `CPU_ON`, holds no register: the
+/// first starts as at boot, and the second from the mailbox the restore
+/// filled, so there is nothing to load. `MPIDR_EL1` is set when the vCPU is
+/// created and must be the one the state has.
+fn import_vcpu(cpu: u32, vcpu: &Vcpu, state: &VcpuState) -> io::Result<Option<Output>> {
+    let VcpuState::Aarch64(state) = state else {
+        return Err(io::Error::other(format!("vCPU {cpu}: not an arm64 state")));
+    };
+    if state.id != cpu {
+        return Err(io::Error::other(format!(
+            "vCPU {cpu} was handed the state of vCPU {}",
+            state.id
+        )));
+    }
+    state.check_restorable().map_err(io::Error::other)?;
+    if state.power != Power::On {
+        return Ok(None);
+    }
+    let get = |name: &str| {
+        state
+            .regs
+            .get(name)
+            .map(|v| v.0)
+            .ok_or_else(|| io::Error::other(format!("{name} is missing")))
+    };
+    for (name, reg) in aarch64_reg_names().iter().zip(REGS) {
+        let value = get(name)?;
+        match reg {
+            Gpr::Reg(reg) => vcpu.set_reg(reg, value),
+            Gpr::Sys(reg) => vcpu.set_sys_reg(reg, value),
+        }
+        .map_err(|e| failed(name, e))?;
+    }
+    for (n, (q, text)) in SIMD_REGS.iter().zip(&state.simd).enumerate() {
+        let value = parse_simd(text)
+            .ok_or_else(|| io::Error::other(format!("q{n} is not 32 hex digits")))?;
+        vcpu.set_simd_fp_reg(*q, value)
+            .map_err(|e| failed(&format!("q{n}"), e))?;
+    }
+    for (name, value) in &state.sysregs {
+        let reg =
+            sys_reg(name).ok_or_else(|| io::Error::other(format!("{name}: no hvf register")))?;
+        if name == "MPIDR_EL1" {
+            let have = vcpu.get_sys_reg(reg).map_err(|e| failed(name, e))?;
+            if have != value.0 {
+                return Err(io::Error::other(format!(
+                    "MPIDR_EL1 is {have:#x} here and {:#x} in the state",
+                    value.0
+                )));
+            }
+            continue;
+        }
+        vcpu.set_sys_reg(reg, value.0)
+            .map_err(|e| failed(name, e))?;
+    }
+    if let Some(timer) = state.timer {
+        vcpu.set_vtimer_mask(timer.vtimer_masked)
+            .map_err(|e| failed("the vtimer mask", e))?;
+    }
+    Ok(None)
+}
+
+/// Loads the GIC from the `hv_gic_state` blob, on vCPU 0's thread, once
+/// every vCPU exists and none has run.
+fn import_gic(platform: &PlatformState) -> io::Result<Option<Output>> {
+    let adjunct = platform
+        .backend_adjunct
+        .as_ref()
+        .filter(|a| a.kind == HVF_GIC_STATE)
+        .ok_or_else(|| io::Error::other("the bundle has no hv_gic_state blob"))?;
+    let blob = adjunct.data()?;
+    // SAFETY: `blob` is a live buffer of `blob.len()` bytes for the call,
+    // which only reads it.
+    let ret = unsafe {
+        applevisor_sys::hv_gic_set_state(blob.as_ptr().cast::<std::ffi::c_void>(), blob.len())
+    };
+    if ret != 0 {
+        return Err(io::Error::other(format!(
+            "hv_gic_set_state refused the {}-byte blob: {ret:#x} (a blob from another macOS \
+             build may not load)",
+            blob.len()
+        )));
+    }
+    Ok(None)
+}
+
+/// Loads vCPU `cpu`'s GIC CPU interface, which the blob does not hold, in an
+/// order that enables the system register interface first and the groups
+/// last.
+fn import_icc(cpu: u32, vcpu: &Vcpu, platform: &PlatformState) -> io::Result<Option<Output>> {
+    let IrqState::HvGicV3(gic) = &platform.irq else {
+        return Err(io::Error::other(format!(
+            "the interrupt controller is {}, not hv-gic-v3",
+            platform.irq.kind()
+        )));
+    };
+    // A vCPU that never ran at the capture has no saved interface; it comes
+    // up as the guest brings it up.
+    let Some(icc) = gic.icc.iter().find(|icc| icc.vcpu == cpu) else {
+        return Ok(None);
+    };
+    for (reg, value) in [
+        (GicIccReg::SRE_EL1, icc.sre_el1),
+        (GicIccReg::CTLR_EL1, icc.ctlr),
+        (GicIccReg::PMR_EL1, icc.pmr),
+        (GicIccReg::BPR0_EL1, icc.bpr0),
+        (GicIccReg::BPR1_EL1, icc.bpr1),
+        (GicIccReg::AP0R0_EL1, icc.ap0r0),
+        (GicIccReg::AP1R0_EL1, icc.ap1r0),
+        (GicIccReg::IGRPEN0_EL1, icc.igrpen0),
+        (GicIccReg::IGRPEN1_EL1, icc.igrpen1),
+    ] {
+        vcpu.set_icc_reg(reg, value)
+            .map_err(|e| failed(&format!("ICC {reg:?}"), e))?;
+    }
+    Ok(None)
 }
 
 /// Returns an error naming `what` for a failed Hypervisor.framework call.
@@ -206,13 +377,18 @@ fn export_gic_cpu(cpu: u32, vcpu: &Vcpu) -> io::Result<IrqCpuState> {
 
 /// Reads the distributor, the `hv_gic_state` blob and the guest counter, on
 /// vCPU 0's thread, `vcpu`, once every vCPU has exported and none runs.
-fn export_platform(vcpu: &Vcpu, vm: &VmGic) -> io::Result<Output> {
+fn export_platform(vcpu: &Vcpu, vm: &VmGic, clock: Option<&RestoreClock>) -> io::Result<Output> {
     // The counter first, so it is as close as it can be to the moment the
     // guest stopped seeing it move.
-    let offset = vcpu
-        .get_vtimer_offset()
-        .map_err(|e| failed("the vtimer offset", e))?;
-    let counter_at_capture = host_counter().wrapping_sub(offset);
+    let counter_at_capture = match clock {
+        Some(clock) => clock.counter(),
+        None => {
+            let offset = vcpu
+                .get_vtimer_offset()
+                .map_err(|e| failed("the vtimer offset", e))?;
+            host_counter().wrapping_sub(offset)
+        }
+    };
     let host_monotonic_at_capture_ns = monotonic_ns();
     let read_dist = |offset: u32| {
         let reg = dist_reg(offset).ok_or_else(|| {

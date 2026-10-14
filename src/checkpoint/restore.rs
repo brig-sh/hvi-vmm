@@ -35,8 +35,8 @@
 //! bundle's machine profile and its own, and refuses with all of them before
 //! it creates anything.
 
-// The HVF restore is the caller; until it exists, only the tests are.
-#![cfg_attr(not(test), allow(dead_code))]
+// Only the HVF restore calls it so far; the KVM backends cannot restore yet.
+#![cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 
 use std::path::Path;
 use std::sync::Arc;
