@@ -949,8 +949,9 @@ A block applied twice is harmless: a later round carries the newer bytes.
 ### The block stream
 
 `disk-blocks` names the blocks as a list, `{"blocks":[3,4,9]}`, ascending
-and each once, at most 8192 per request since a request line is at most
-64 KiB, or as `{"round":k}`, the round the last `disk-dirty` read. Every
+and each once, at most 4096 per request, which fit a request line of
+64 KiB, or as `{"round":k}`, the round the last `disk-dirty` read, which is
+the way to ask for a whole round. A longer list is `bad_request`. Every
 block number is checked before the first byte goes out. The blocks then
 come on the connection in batches, then the op's reply:
 
