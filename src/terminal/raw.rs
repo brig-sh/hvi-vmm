@@ -347,7 +347,7 @@ mod tests {
         let _raw = RawTerm::enable().expect("stdin is a terminal");
         match case.as_str() {
             "second-stop-signal" => {
-                let (handle, _registration) = crate::stop::StopHandle::new_pair().unwrap();
+                let (handle, _registration) = crate::run::StopHandle::new_pair().unwrap();
                 // SAFETY: the default action runs no handler.
                 unsafe { crate::signal::set_action(libc::SIGTERM, libc::SIG_DFL, 0) }.unwrap();
                 crate::signal::stop_on_signals(&handle).unwrap();

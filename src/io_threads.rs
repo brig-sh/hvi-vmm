@@ -378,7 +378,7 @@ impl IoThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stop::StopHandle;
+    use crate::run::StopHandle;
 
     /// A kicker that reaches no thread.
     struct NoopKicker;

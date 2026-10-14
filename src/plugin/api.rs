@@ -128,7 +128,7 @@ pub trait VmHandle: Send + Sync {
     /// plugin's own.
     fn kick(&self);
 
-    /// Asks the run to stop, as a [`StopHandle`](crate::stop::StopHandle) does.
+    /// Asks the run to stop, as a [`StopHandle`](crate::run::StopHandle) does.
     ///
     /// `boot` returns [`Stop::Requested`](crate::config::Stop::Requested),
     /// unless a thread reports a failure, or a vCPU a guest stop, before `boot`

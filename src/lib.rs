@@ -96,10 +96,9 @@ pub mod hypervisor;
 pub(crate) mod io_threads;
 pub mod memory;
 pub mod plugin;
+pub mod run;
 pub mod sandbox;
 pub mod signal;
-mod spawn;
-pub mod stop;
 pub mod sync;
 pub mod teardown;
 pub mod terminal;
@@ -147,18 +146,18 @@ compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux onl
 /// Seatbelt profile on the whole process. A later sandboxed `boot` on Linux
 /// starts from a thread of its own, as [`spawn`](fn@spawn) does.
 pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> {
-    let mut claim = hypervisor::run::RUN_SLOT
+    let mut claim = run::RUN_SLOT
         .claim()
         .map_err(|e| config::BootError::new(e.into()))?;
     backend::boot(cfg).map_err(|e| {
-        if e.is::<hypervisor::run::LeftRunning>() {
+        if e.is::<run::LeftRunning>() {
             claim.keep();
         }
         config::BootError::new(e)
     })
 }
 
-pub use spawn::{spawn, Run};
+pub use run::spawn::{spawn, Run};
 
 /// This crate's version, so a binary built against it can report which VMM core
 /// it carries. Two binaries reporting the same core ran the same VMM.

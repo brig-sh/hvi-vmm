@@ -12,20 +12,8 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-//! Stopping a run from outside the guest.
-//!
-//! A caller creates a [`StopHandle`] and its [`StopRegistration`] with
-//! [`StopHandle::new_pair`] before it calls `boot`, keeps the handle and passes
-//! the registration in [`BootConfig::stop`](crate::config::BootConfig::stop).
-//! `boot` takes the registration by value, so it serves one run. A request on
-//! the handle stops the run, and `boot` returns
-//! [`Stop::Requested`](crate::config::Stop::Requested) once the run is torn
-//! down. The two halves own both ends of the pipe for as long as either exists,
-//! so a request after `boot` has returned still writes to that pipe, where
-//! nothing reads it.
-//!
-//! [`stop_on_signals`](crate::signal::stop_on_signals) makes the stop signals
-//! request a stop on a handle.
+//! The stop request a caller makes on a run, over a pipe that wakes the loop
+//! that owns the stop.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -37,7 +25,7 @@ use crate::teardown::{poll, pollfd};
 
 /// A handle that asks a run to stop.
 ///
-/// Clones share one request. See the [module documentation](self).
+/// Clones share one request. See the [module documentation](crate::run).
 #[derive(Clone)]
 pub struct StopHandle(Arc<Inner>);
 

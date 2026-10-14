@@ -194,12 +194,12 @@ pub struct BootConfig {
     /// backend logs which one it installed, so this is never a silent
     /// "sandboxed" claim on a host that is not.
     pub sandbox: bool,
-    /// The registration of the [`StopHandle`](crate::stop::StopHandle) that
-    /// asks this run to stop from outside the guest, or `None` when the caller
-    /// keeps no handle.
+    /// The registration of the [`StopHandle`](crate::run::StopHandle) that asks
+    /// this run to stop from outside the guest, or `None` when the caller keeps
+    /// no handle.
     ///
-    /// See [`crate::stop`].
-    pub stop: Option<crate::stop::StopRegistration>,
+    /// See [`crate::run`].
+    pub stop: Option<crate::run::StopRegistration>,
 }
 
 impl BootConfig {
@@ -209,10 +209,10 @@ impl BootConfig {
     /// # Errors
     ///
     /// Errors if a new handle cannot be created.
-    pub(crate) fn take_stop_handle(&mut self) -> std::io::Result<crate::stop::StopHandle> {
+    pub(crate) fn take_stop_handle(&mut self) -> std::io::Result<crate::run::StopHandle> {
         match self.stop.take() {
             Some(registration) => Ok(registration.into_handle()),
-            None => Ok(crate::stop::StopHandle::new_pair()?.0),
+            None => Ok(crate::run::StopHandle::new_pair()?.0),
         }
     }
 }
@@ -226,7 +226,7 @@ pub enum Stop {
     /// A reset by the guest, which is not restarted.
     SystemReset,
     /// The host asked the run to stop, through a
-    /// [`StopHandle`](crate::stop::StopHandle).
+    /// [`StopHandle`](crate::run::StopHandle).
     Requested,
 }
 
@@ -252,7 +252,7 @@ impl BootError {
     /// The error of a run that left a thread running is taken apart, so the
     /// error that failed the run is the one carried.
     pub(crate) fn new(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        match error.downcast::<crate::hypervisor::run::LeftRunning>() {
+        match error.downcast::<crate::run::LeftRunning>() {
             Ok(left) => BootError {
                 error: left.error,
                 left_running: left.left.map(|left| left.to_string()),
@@ -468,7 +468,7 @@ mod tests {
     fn boot_error_keeps_the_failure_typed_beside_a_thread_left_running() {
         let failure = std::io::Error::from(std::io::ErrorKind::WouldBlock);
         let left = std::io::Error::other("vcpu1 did not stop within 1s");
-        let error = BootError::new(Box::new(crate::hypervisor::run::LeftRunning {
+        let error = BootError::new(Box::new(crate::run::LeftRunning {
             error: Box::new(failure),
             left: Some(left),
         }));
