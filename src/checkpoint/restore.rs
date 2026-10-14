@@ -37,8 +37,8 @@
 //! bundle's machine profile and its own, and refuses with all of them before
 //! it creates anything.
 
-// Only the HVF restore calls it so far; the KVM backends cannot restore yet.
-#![cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+// The x86-64 backend cannot restore yet.
+#![cfg_attr(target_arch = "x86_64", allow(dead_code))]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,12 +54,18 @@ use crate::hypervisor::vcpus::{Kick, Vcpus, WorkResult};
 use crate::plugin::GuestArch;
 
 /// The import steps, in the order [`import`] posts them.
+// Only HVF loads the vCPUs on their own threads; KVM loads them before
+// they run.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) const IMPORT_STEPS: [ImportStep; 3] =
     [ImportStep::Vcpu, ImportStep::Platform, ImportStep::IrqCpu];
 
 /// Returns whether `state` is of a vCPU that starts on its own at a restore,
 /// and so takes part in the import: one that ran, or one whose `CPU_ON` the
 /// guest had sent. One that is off waits for the guest, as at boot.
+// Only HVF loads the vCPUs on their own threads; KVM loads them before
+// they run.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn starts(state: &VcpuState) -> bool {
     match state {
         VcpuState::Aarch64(v) => v.power != Power::Off,
@@ -83,6 +89,9 @@ fn starts(state: &VcpuState) -> bool {
 /// Errors, naming the vCPU and the step, when a vCPU was not created or did
 /// not start, did not finish a step in time, or could not load its part; or
 /// when the VM stopped.
+// Only HVF loads the vCPUs on their own threads; KVM loads them before
+// they run.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) fn import<K: Kick>(
     vcpus: &Vcpus<K>,
     plan: &Arc<ImportPlan>,

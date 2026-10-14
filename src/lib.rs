@@ -111,9 +111,6 @@ pub(crate) const LOG_PREFIX: &str = "[hvi]";
 // compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use arch::aarch64::hvf as backend;
-// Only HVF restores a checkpoint so far; see `checkpoint::restore`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use arch::aarch64::hvf::restore;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use arch::aarch64::kvm as backend;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -154,6 +151,31 @@ pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> 
         .claim()
         .map_err(|e| config::BootError::new(e.into()))?;
     backend::boot(cfg).map_err(|e| {
+        if e.is::<run::LeftRunning>() {
+            claim.keep();
+        }
+        config::BootError::new(e)
+    })
+}
+
+/// Resumes the checkpoint bundle `cfg` names in this process and runs the
+/// guest until it powers off, resets, or the host requests a stop, as
+/// [`boot`](fn@boot) runs a booted one.
+///
+/// The guest waits restored-paused until a client sends `resume` on the
+/// control socket. Only the arm64 backends restore; `docs/checkpoint.md`
+/// describes the restore.
+///
+/// # Errors
+///
+/// Errors as [`boot`](fn@boot) does, and when the bundle cannot be restored on
+/// this host.
+#[cfg(target_arch = "aarch64")]
+pub fn restore(cfg: config::RestoreConfig) -> Result<config::Stop, config::BootError> {
+    let mut claim = run::RUN_SLOT
+        .claim()
+        .map_err(|e| config::BootError::new(e.into()))?;
+    backend::restore(cfg).map_err(|e| {
         if e.is::<run::LeftRunning>() {
             claim.keep();
         }
