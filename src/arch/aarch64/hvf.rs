@@ -1650,7 +1650,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     if let Some(p) = &sh.portable {
         // Before the profile reads MIDR_EL1 and before the guest's first
         // instruction.
-        if let Err(e) = set_baseline(&vcpu, cpu_id == 0) {
+        if let Err(e) = set_baseline(&vcpu, cpu_id, cpu_id == 0) {
             eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
             lock_or_recover(&p.refused).get_or_insert(e);
             return;
@@ -2256,7 +2256,8 @@ fn check_baseline_on_host() -> Result<(), String> {
     }
 }
 
-/// Gives `vcpu` the portable CPU baseline, and logs it when `log`.
+/// Gives `vcpu`, which is vCPU `cpu`, the portable CPU baseline and its
+/// `MPIDR_EL1`, and logs the baseline when `log`.
 ///
 /// `check_baseline_on_host` has already compared the baseline with the
 /// host, which is what catches a raised field. Each register is still read
@@ -2266,9 +2267,15 @@ fn check_baseline_on_host() -> Result<(), String> {
 ///
 /// Errors naming every register that does not read back as written, or a
 /// `DCZID_EL0` (which no backend can set) other than the profile's.
-fn set_baseline(vcpu: &Vcpu, log: bool) -> Result<(), String> {
+///
+/// `MPIDR_EL1` is checked as the baseline is: `CPU_ON` and `AFFINITY_INFO`
+/// find a vCPU by its affinity 0, and a write that did not take would leave
+/// every vCPU at Hypervisor.framework's default of 0x80000000.
+fn set_baseline(vcpu: &Vcpu, cpu: u32, log: bool) -> Result<(), String> {
     let mut wrong = Vec::new();
-    for ((name, value), reg) in portable::BASELINE.into_iter().zip(BASELINE_REGS) {
+    let mpidr = ("MPIDR_EL1", 0x8000_0000 | u64::from(cpu));
+    let regs = portable::BASELINE.into_iter().zip(BASELINE_REGS);
+    for ((name, value), reg) in regs.chain([(mpidr, SysReg::MPIDR_EL1)]) {
         if let Err(e) = vcpu.set_sys_reg(reg, value) {
             wrong.push(format!("{name} cannot be set ({e:?})"));
             continue;
