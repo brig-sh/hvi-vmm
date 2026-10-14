@@ -496,12 +496,12 @@ impl VirtioNet {
         self.queue_sel = 0;
     }
 
-    /// Services one MMIO access. On a transmit-queue notify, drains the guest's
-    /// TX frames (capturing them) and injects any replies into the RX queue.
     /// The device features this device offers, both words: what the machine
     /// profile records, since a restored driver has negotiated against them.
     pub const FEATURES: u64 = ((F_VERSION_1_HI as u64) << 32) | F_MAC_LO as u64;
 
+    /// Services one MMIO access. On a transmit-queue notify, drains the guest's
+    /// TX frames (capturing them) and injects any replies into the RX queue.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let read = self.serve_mmio(mem, offset, is_write, value);
         self.sync_irq();
@@ -1745,10 +1745,6 @@ mod tests {
         );
     }
 
-    /// After `set_mac`, the guest must read the override from config space
-    /// (bytes 0..6) -- and the device must offer VIRTIO_NET_F_MAC, or the
-    /// driver would never look at config space and would invent a random
-    /// address, dropping every redirected reply in tap mode.
     #[test]
     fn features_are_the_two_pages_the_window_offers() {
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
@@ -1760,6 +1756,10 @@ mod tests {
         assert_eq!((page(1) << 32) | page(0), VirtioNet::FEATURES);
     }
 
+    /// After `set_mac`, the guest must read the override from config space
+    /// (bytes 0..6) -- and the device must offer VIRTIO_NET_F_MAC, or the
+    /// driver would never look at config space and would invent a random
+    /// address, dropping every redirected reply in tap mode.
     #[test]
     fn config_space_reports_the_override_mac() {
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
