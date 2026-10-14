@@ -300,14 +300,17 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
 ///   its own. The first time one needs a new arena while more than `arena_test`
 ///   (eight on a 64-bit host) exist, `arena_get2` in `malloc/arena.c` fixes the
 ///   arena limit: to `M_ARENA_MAX` when it is set, and otherwise from the CPU
-///   count. Upstream 2.36 counts CPUs with `sched_getaffinity`, which the lists
-///   allow. The 2.36 that Debian 12 ships carries a release-branch change that
-///   calls `__get_nprocs` instead, which reads this file.
+///   count. It counts them with `__get_nprocs`, which reads this file, in every
+///   glibc except the 2.35 to 2.38 releases as first tagged. Those used
+///   `sched_getaffinity`, which the lists allow, until upstream went back to
+///   `__get_nprocs` (472894d2cfee, BZ 30945, in 2.39 and on the 2.35 to 2.38
+///   release branches, which Debian 12's 2.36 takes).
 /// - `/proc/sys/vm/overcommit_memory`. The first time a heap of an arena other
 ///   than the main one shrinks, `shrink_heap` reads it, through
-///   `check_may_shrink_heap` in `malloc-sysdep.h`. Capping the arenas at any
-///   number above one leaves this read in place: with a cap of four, a guest
-///   with heavy agent traffic still killed the VMM within a minute.
+///   `check_may_shrink_heap` in `malloc-sysdep.h`, in every glibc. Capping the
+///   arenas at any number above one leaves this read in place: with a cap of
+///   four, a guest with heavy agent traffic still killed the VMM within a
+///   minute.
 ///
 /// With `M_ARENA_MAX` at 1 before any thread allocates, `arena_get2` takes the
 /// limit from it without counting CPUs, and every thread shares the main
