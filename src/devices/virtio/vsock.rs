@@ -726,11 +726,11 @@ impl VirtioVsock {
         true
     }
 
-    /// Services one MMIO access.
     /// The device features this device offers, both words: what the machine
     /// profile records, since a restored driver has negotiated against them.
     pub const FEATURES: u64 = (F_VERSION_1_HI as u64) << 32;
 
+    /// Services one MMIO access.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let read = self.serve_mmio(mem, offset, is_write, value);
         self.sync_irq();

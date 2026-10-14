@@ -177,12 +177,12 @@ impl VirtioBlk {
         std::mem::take(&mut self.events)
     }
 
-    /// Services one MMIO access. Returns the read value (0 for writes). When
-    /// the driver notifies a queue, the virtqueue is processed inline.
     /// The device features this device offers, both words: what the machine
     /// profile records, since a restored driver has negotiated against them.
     pub const FEATURES: u64 = ((F_VERSION_1_HI as u64) << 32) | F_BLK_FLUSH_LO as u64;
 
+    /// Services one MMIO access. Returns the read value (0 for writes). When
+    /// the driver notifies a queue, the virtqueue is processed inline.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let read = self.serve_mmio(mem, offset, is_write, value);
         self.sync_irq();
