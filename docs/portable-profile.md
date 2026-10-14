@@ -16,9 +16,10 @@ its canonical form (the software model on the Mac, the vGICv2 on the Pi, see
 [Capture and restore on KVM](#capture-and-restore-on-kvm)) and `hvi-time`'s
 state ([Restore](#restore)). `hvi restore` takes a portable bundle of either
 backend on either (see [checkpoint.md](checkpoint.md#the-portable-restore)).
-A restore on the host that took the bundle has been run on both, and a
-guest has been moved from the Mac to a Pi and from a Pi to the Mac once
-each (see [checkpoint.md](checkpoint.md#moving-between-hosts)). The x86-64 KVM backend refuses the
+A restore on the host that took the bundle has been run on both, and
+`tools/migrate-e2e.sh` moves a running guest from the Mac to a Pi and from
+a Pi to the Mac, stopped, and checks it on the way (see
+[Measured results](#measured-results)). The x86-64 KVM backend refuses the
 profile.
 
 The default, `--profile native`, is unchanged: the host's own CPU features and,
@@ -571,6 +572,175 @@ No line has the guest ahead of the host. Each stamp is taken after the
 guest printed its line, so a correct clock reads at or before it, and the
 console path's latency makes the guest look further behind than it is.
 
+## Measured results
+
+`tools/migrate-e2e.sh` ([testing.md](testing.md#the-migration-end-to-end-test))
+was run on 2026-10-14 between the Apple M5 Pro (macOS 26.7, build 25G229)
+and rp2, a Raspberry Pi 5 (Linux 6.12.25, KVM with a vGICv2), each way, and
+on each host to itself:
+
+- hvi at `c580223`, built on each host from that commit with no
+  uncommitted changes, and signed on the Mac;
+- the portable `Image` (sha256 `32725b9b…`), and one initramfs on both
+  hosts (sha256 `b2855e38…`) from `tools/mk-initramfs.py
+  --checkpoint-workload --add el0check --add tfd --add clk`, with the
+  helpers built static on rp2;
+- 1 vCPU, 512 MiB, a 64 MiB ext4 disk, the stub network;
+- Tailscale between the hosts, a direct path: over the internet (15 ms
+  round trip) for the first Mac to Pi run, on one LAN (5 ms) for the rest.
+
+The commands, with `$S` the Mac's work directory and the paths after
+`--dst-hvi`, `--dst-dir` and on rp2 there:
+
+```sh
+# Mac to Pi
+tools/migrate-e2e.sh --src local --dst rp2 \
+    --src-hvi $S/bin/hvi-mac --dst-hvi /home/pmoust/p4c/hvi-pi \
+    --kernel $S/Image --initramfs $S/initramfs-migrate.cpio \
+    --src-dir $S/m2p/src --dst-dir /home/pmoust/p4c/m2p --out $S/m2p/out \
+    --drift-secs 600
+# Pi to Mac
+tools/migrate-e2e.sh --src rp2 --dst local \
+    --src-hvi /home/pmoust/p4c/hvi-pi --dst-hvi $S/bin/hvi-mac \
+    --kernel /home/pmoust/p4c/Image --initramfs /home/pmoust/p4c/initramfs-migrate.cpio \
+    --src-dir /home/pmoust/p4c/p2m --dst-dir $S/p2m/dst --out $S/p2m/out \
+    --drift-secs 600
+```
+
+The same with `--src local --dst local` and `--src rp2 --dst rp2`
+(`--drift-secs 60`) for the moves on one host. For the state comparison,
+the two commands above with `--recapture --drift-secs 30` in place of
+`--drift-secs 600`, and `m2p-recap` and `p2m-recap` in place of `m2p` and
+`p2m` in every directory. The refusals, against the bundles the two runs above
+left:
+
+```sh
+tools/migrate-e2e.sh --negative --src local --dst rp2 \
+    --src-hvi $S/bin/hvi-mac --dst-hvi /home/pmoust/p4c/hvi-pi \
+    --kernel $S/Image --initramfs $S/initramfs-migrate.cpio \
+    --dst-kernel /home/pmoust/p4c/Image \
+    --dst-initramfs /home/pmoust/p4c/initramfs-migrate.cpio \
+    --src-dir $S/neg-m2p/src --dst-dir /home/pmoust/p4c/m2p --out $S/neg-m2p/out
+tools/migrate-e2e.sh --negative --src rp2 --dst local \
+    --src-hvi /home/pmoust/p4c/hvi-pi --dst-hvi $S/bin/hvi-mac \
+    --kernel /home/pmoust/p4c/Image --initramfs /home/pmoust/p4c/initramfs-migrate.cpio \
+    --dst-kernel $S/Image --dst-initramfs $S/initramfs-migrate.cpio \
+    --src-dir /home/pmoust/p4c/neg-p2m --dst-dir $S/p2m/dst --out $S/neg-p2m/out
+```
+
+Every run in the table passed every check: 41, or 42 with `--recapture`. The internet
+run used an earlier version of the script, which typed on an echoing
+console and had no check that both timers were still pending at the
+capture, so it ran 40. The other runs used the script before its last
+changes, which touch only the refusals' boot, a copy on one remote host
+and a marker's name; the committed script then ran each way again with
+`--drift-secs 30` and passed all 41 checks, with a downtime of 5.9 s to
+the Pi and 4.2 s back. The timings, from `summary.json`:
+
+| | Mac to Pi, LAN | Pi to Mac, LAN | Mac to Pi, internet | Mac to Mac | Pi to Pi |
+| --- | --- | --- | --- | --- | --- |
+| `pause_ms`, `capture_ms` | 0, 375 | 0, 846 | 0, 377 | 0, 431 | 0, 844 |
+| Source stopped after the fence reply | 19 ms | 32 ms | 21 ms | 19 ms | 32 ms |
+| Bundle (present RAM) | 96.4 MB (96.4 MB) | 96.3 MB (96.2 MB) | 96.3 MB | 96.2 MB | 96.2 MB |
+| Copied: bundle, disk, record | 163.5 MB | 163.4 MB | 163.4 MB | 163.3 MB | 163.3 MB |
+| Copy time, rate | 3.36 s, 48.6 MB/s | 3.19 s, 51.3 MB/s | 168.1 s, 0.97 MB/s | 0.98 s | 0.52 s |
+| `hvi restore` to `restored-paused` | 873 ms | 540 ms | 1013 ms | 546 ms | 881 ms |
+| `resume` reply | 0.1 ms | 0.1 ms | 9.9 ms | 0.1 ms | 0.1 ms |
+| Downtime, fence request to resume reply | 4.65 s | 4.62 s | 169.5 s | 1.99 s | 2.29 s |
+| Wall clock moved by `hvi-time` | 4.750 s | 4.504 s | 169.554 s | 1.979 s | 2.284 s |
+
+The copy is most of the downtime. rsync sends the 64 MiB disk whole, zeros
+and all (`-S` only keeps the copy sparse: 380 KiB on rp2's disk), and the
+bundle holds the present RAM pages, of which 96 MB were present. The first
+Mac to Pi run is the same move over the Mac's uplink. The capture takes
+more than twice as long on the Pi, and the restore 0.3 s longer.
+
+`hvi-time` moves the guest's wall clock by the source's wall clock at the
+capture against the destination's at the resume, so the two hosts' clock
+difference is in it. During these runs the Mac's clock was 40 to 146 ms
+behind rp2's (measured by the script over one ssh session, round trip
+4 to 17 ms), and rp2's chrony had it within 0.2 ms of NTP. A move to the Pi
+moved the guest's clock by about 0.1 s more than the measured downtime, a
+move to the Mac by about 0.1 s less. Either way the guest ends on the destination's
+clock.
+
+The guest after the move, with "before" the source's values:
+
+| | Mac to Pi, LAN | Pi to Mac, LAN |
+| --- | --- | --- |
+| Count, `awk` sums, boot banner | 15 then 16; FP 5000000 then 5500000, exact; none | 15 then 16; FP 1500000 then 2000000; none |
+| Driver log | `generation 4: counter 54000000 Hz, lpj 216000`, `migrations=1` | `generation 4: counter 24000000 Hz, lpj 96000`, `migrations=1` |
+| 6 s `timerfd` and `sleep` armed before the capture, guest time | 6.000039 s, 6.00 s | 6.003720 s, 6.01 s |
+| `CLOCK_MONOTONIC` gap over the move (`clk` every 0.25 s) | 0.250038 s, while REALTIME moved 5.000 s | 0.250048 s, while REALTIME moved 4.754 s |
+| `CLOCK_REALTIME` less the host's, first 10 s after the fix-up | median 0.27 ms, worst 0.34 ms | median 0.17 ms, worst 0.40 ms |
+| The same after 611 s | 0.52 ms | -4.76 ms |
+| `hvi-time`, PL011, virtio-blk interrupts: before, after, after the workload's request | 761, 2333, 3658; 2, 5, 7; 83, 87, 93 | 780, 2352, 3672; 2, 5, 7; 51, 55, 62 |
+| `sleep 5` against the host | 5.002 s | 5.001 s |
+| `Features` line, before and after | `fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp` | the same |
+
+The `Features` line lacks the `evtstrm` of the Pi host's: the guest does
+not use the architected timer, so its event stream is not set up. fd 3,
+the file written before the move, a write after it, `el0check`, the
+clocksource, `e2fsck -fn` on the stopped image and the post-move file read
+with `debugfs` passed on every run. The worst 10 s offset of the internet
+run, 23.6 ms, is one `clk` line held back by the console while the workload
+printed its answer; its median was 0.3 ms.
+
+Against the destination host's wall clock the guest drifted -0.41 ppm on
+the Pi (LAN run), -2.88 ppm on the Pi (internet run) and +8.20 ppm on the
+Mac, over about 590 s, from the lines with the least console delay in the
+first and last 10 s. On the Mac most of that is the host clock's own
+movement: its wall clock ran 8.2 ppm slow against its monotonic clock,
+which is the counter the guest runs on, while the guest's REALTIME kept
+that counter's rate (+0.04 ppm). The log stamps host monotonic time to
+the millisecond, so those two figures are good to about 1.7 ppm. On Linux
+`CLOCK_MONOTONIC` is slewed with the wall clock, so the Pi's log cannot
+split its figure the same way.
+
+With `--recapture` the restored guest was checkpointed again before it
+resumed, and its vCPU and platform state equalled the bundle's, each way:
+the general, SIMD and system registers, the GICv2 and `hvi-time`. The 15
+registers only HVF has were 0. That capture took 843 ms on the Pi and
+386 ms on the Mac, inside the downtime.
+
+The refusals (`--negative`), each with exit 1 before anything ran:
+
+| Case | On the Pi | On the Mac |
+| --- | --- | --- |
+| The other host's native bundle | `profile.json: a native guest, which this hvi does not restore on kvm`; the interrupt controller `hv-gic-v3` and the counter `arch-timer` cannot be restored on kvm; `the bundle needs hvf-gic-state-v1`; `the KVM restore rebuilds the portable machine only` | `an aarch64 guest on kvm, and this hvi restores aarch64 guests from hvf on hvf (only the portable profile moves between backends)`; interrupt controller and counter `not-captured`; the blob missing; then every profile difference (backend, OS, 54 against 24 MHz, ID registers, GIC, PSCI 1.1 against 1.0) |
+| `profile.json` with 2 vCPUs, sealed again | `checkpoint-verify`: `cpu.json: 1 aarch64 vCPU(s), the profile has 2 aarch64`; `restore`: `cpu.json: 1 vCPUs, the profile has 2` and `platform.json: irq: GICv2 state has 1 CPUs, this machine 2` | the same |
+| `profile.json` with 1024 MiB, sealed again | `manifest.json: the RAM regions are not the profile's`, from both | the same |
+| One byte of `ram.bin` changed | `ram.bin: SHA-256 does not match the manifest`, from both | the same |
+| `cpu.json` cut to half | `cpu.json: is 2090 bytes, the manifest says 4180`, from both | the same, with its sizes |
+| No `--disk` | `the guest had a disk; give it with --disk`, and the device map then differs | the same |
+| KVM without a vGICv2 (shim) | restore: `the portable guest needs a vGICv2, and KVM offers none on this host (No such device (os error 19)): a GICv3-only host serves vGICv3 alone`; portable boot: `--profile portable-arm64-v1 needs a vGICv2, and KVM offers none on this host …` | not run: no KVM |
+
+A restore takes its machine from the bundle, so it has no vCPU count or
+RAM size of its own to compare. The two altered bundles check that hvi
+does not trust a `profile.json` that disagrees with the rest of the
+bundle; the digests were made to match, so the refusal is the machine
+check's, not the digest's.
+
+Each host also ran `tools/checkpoint-e2e.sh --portable --cpus 1 --mem 512`
+on itself with the same assets: 41 checks passed on each; `capture_ms` 373
+on the Mac and 849 on the Pi, checkpoint request to resume reply 917 ms and
+1817 ms, the `timerfd` 6.000049 s and 6.000048 s.
+
+**A Mac that sleeps stops the guest's clocks.** An earlier Pi to Mac run
+went through a clamshell sleep and two maintenance sleeps of the Mac
+during its 600 s window (`pmset -g log`: 149 s, then about 73 and 44
+minutes). The guest's `CLOCK_MONOTONIC` and `CLOCK_REALTIME` kept pace
+with the host's monotonic clock throughout, to within the console's
+delay. That clock does not run in sleep either, so the guest fell behind
+the host's wall clock by each sleep: 146.9 s after the first, 7158.6 s at
+the end. No `clk` line was
+lost and MONOTONIC never stepped back; the check of REALTIME at the end
+failed, as it should. hvi does not republish `hvi-time` on wake, so a
+guest on a Mac that slept keeps a wall clock behind by the sleep until
+it is restored again or sets its own. The native profile's guest counter
+is the same host clock, so it should behave the same; that was not
+measured. The figures above are from a run with the Mac kept awake.
+
 ## Limits
 
 - macOS and arm64 Linux with KVM. The x86-64 backend refuses the profile.
@@ -579,8 +749,12 @@ console path's latency makes the guest look further behind than it is.
   can be lowered to the baseline, a 40-bit guest address space,
   `KVM_CAP_READONLY_MEM`, and 4 KiB or 16 KiB pages. hvi refuses the boot and
   names each problem.
-- A move between a Mac and a Pi has been run once each way, by hand; the
-  end-to-end script runs on one host only.
+- A move between a Mac and a Pi is run by hand with
+  `tools/migrate-e2e.sh`; no CI job runs it. Only stopped moves exist: the
+  guest is paused from the capture until the copy is done.
+- A Mac that sleeps stops a guest's clocks with it, and nothing sets the
+  guest's wall clock again on wake (see
+  [Measured results](#measured-results)).
 - A guest booted with `--arch-timer-irq` is checkpointed like any other,
   but its architected timer's line is not carried by the restore; that
   debugging flag is not tested with checkpoints.
