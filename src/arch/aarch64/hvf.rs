@@ -611,6 +611,7 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -
     }
     p.agent_sock = cfg.agent_sock.is_some();
     p.fs_shares = u32::try_from(cfg.fs_shares.len()).unwrap_or(u32::MAX);
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 

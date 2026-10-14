@@ -263,6 +263,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disk = None;
+    let mut disk_base_sha256 = None;
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
@@ -292,6 +293,19 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
+            // The digest of the disk as it was before this boot, which the
+            // caller computed and keeps a copy of, so a move sends only
+            // what the guest wrote. hvi records it and does not check it.
+            "--disk-base-sha256" => {
+                let v = it.next().ok_or("--disk-base-sha256 needs a value")?;
+                if v.len() != 64 || !v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    return Err(format!(
+                        "--disk-base-sha256 must be 64 lowercase hex digits, not {v:?}"
+                    )
+                    .into());
+                }
+                disk_base_sha256 = Some(v.clone());
+            }
             // The uid and gid the host's files carry inside the guest. The
             // default is root, which suits a guest whose workload runs as root;
             // a guest running as another user needs its own uid here, or the
@@ -431,6 +445,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "macos"))]
     let _ = (fs_uid, fs_gid);
 
+    if disk_base_sha256.is_some() && disk.is_none() {
+        return Err("--disk-base-sha256 needs --disk, the disk it describes".into());
+    }
     if checkpoint_root.is_some() && control_sock.is_none() {
         return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
     }
@@ -440,6 +457,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: mem_mib << 20,
         cmdline,
         disk,
+        disk_base_sha256,
         fs_shares,
         net,
         net_gateway,
