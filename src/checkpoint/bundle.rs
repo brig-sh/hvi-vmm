@@ -397,10 +397,11 @@ impl DiskState {
     ///
     /// Errors with a sentence naming the first field that does not hold.
     pub fn check(&self, profile: &MachineProfile) -> Result<(), String> {
-        if let Some(base) = &self.base_sha256 {
-            if base.len() != 64 || !base.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                return Err("base_sha256 is not 64 lowercase hex digits".into());
-            }
+        let hex = |text: &str| {
+            text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        if self.base_sha256.as_deref().is_some_and(|base| !hex(base)) {
+            return Err("base_sha256 is not 64 lowercase hex digits".into());
         }
         if self.base_sha256 != profile.disk_base_sha256 {
             return Err(format!(
@@ -427,6 +428,16 @@ impl DiskState {
                     "rounds[{index}] is round {}, not {index}",
                     round.round
                 ));
+            }
+            for (name, digest) in [
+                ("bitmap_sha256", &round.bitmap_sha256),
+                ("sent_sha256", &round.sent_sha256),
+            ] {
+                if digest.as_deref().is_some_and(|d| !hex(d)) {
+                    return Err(format!(
+                        "round {index}'s {name} is not 64 lowercase hex digits"
+                    ));
+                }
             }
             if round.generation < generation || round.generation > self.generation {
                 return Err(format!(
@@ -2193,11 +2204,15 @@ mod tests {
                     round: 0,
                     generation: 4,
                     blocks: 1,
+                    bitmap_sha256: Some("01".repeat(32)),
+                    sent_sha256: Some("02".repeat(32)),
                 },
                 DiskRound {
                     round: 1,
                     generation: 9,
                     blocks: 1,
+                    bitmap_sha256: Some("03".repeat(32)),
+                    sent_sha256: None,
                 },
             ],
         }
@@ -2232,9 +2247,18 @@ mod tests {
         let bits = disk.dirty_since_boot().unwrap().unwrap();
         assert_eq!(bits.iter().collect::<Vec<_>>(), [1, 9]);
         let json = serde_json::to_string(&disk).unwrap();
-        let tail = format!(
-            r#""base_sha256":"{base}","block_size":65536,"dirty_since_boot_b64":"AgI=","#
-        ) + r#""rounds":[{"round":0,"generation":4,"blocks":1},{"round":1,"generation":9,"blocks":1}]}"#;
+        let tail =
+            format!(r#""base_sha256":"{base}","block_size":65536,"dirty_since_boot_b64":"AgI=","#)
+                + &format!(
+                    concat!(
+                        r#""rounds":[{{"round":0,"generation":4,"blocks":1,"bitmap_sha256":"{}","#,
+                        r#""sent_sha256":"{}"}},{{"round":1,"generation":9,"blocks":1,"#,
+                        r#""bitmap_sha256":"{}","sent_sha256":null}}]}}"#
+                    ),
+                    "01".repeat(32),
+                    "02".repeat(32),
+                    "03".repeat(32)
+                );
         assert!(json.ends_with(&tail), "{json}");
         assert_eq!(serde_json::from_str::<DiskState>(&json).unwrap(), disk);
     }
@@ -2298,12 +2322,18 @@ mod tests {
                         round,
                         generation: 9,
                         blocks: 0,
+                        bitmap_sha256: None,
+                        sent_sha256: None,
                     })
                     .collect();
             },
             &p,
         );
         assert!(e.contains("rounds lists 1026 rounds"), "{e}");
+        let e = refused(&|d| d.rounds[1].bitmap_sha256 = Some("AB".repeat(32)), &p);
+        assert_eq!(e, "round 1's bitmap_sha256 is not 64 lowercase hex digits");
+        let e = refused(&|d| d.rounds[0].sent_sha256 = Some("ab".into()), &p);
+        assert_eq!(e, "round 0's sent_sha256 is not 64 lowercase hex digits");
     }
 
     // The largest disk.json a capture writes: a 4 TiB disk with a base,
@@ -2334,6 +2364,8 @@ mod tests {
                     round,
                     generation: u64::MAX,
                     blocks,
+                    bitmap_sha256: Some("ef".repeat(32)),
+                    sent_sha256: Some("ef".repeat(32)),
                 })
                 .collect(),
         };
