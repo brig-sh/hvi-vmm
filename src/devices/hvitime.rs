@@ -760,6 +760,17 @@ impl HviTime {
         self.changed.notify_all();
     }
 
+    /// Returns the level hvi last gave each vCPU's line, for a capture of
+    /// the interrupt controller, which on KVM cannot read it.
+    #[must_use]
+    pub fn lines(&self) -> Vec<bool> {
+        lock_or_recover(&self.inner)
+            .timers
+            .iter()
+            .map(|t| t.line)
+            .collect()
+    }
+
     /// Holds every deadline until [`restore`](Self::restore), for a capture
     /// that the same process restores.
     pub fn freeze(&self) {
@@ -983,12 +994,15 @@ impl TestRestore {
     }
 
     /// Runs the test on a thread of its own, after `setup` (the backend's
-    /// seccomp filter on Linux). The thread ends early when the VM stops.
+    /// seccomp filter on Linux). `hold` runs while the vCPUs are held, after
+    /// the capture: the backend's own capture and restore of what else it
+    /// can, the KVM vGIC. The thread ends early when the VM stops.
     pub(crate) fn spawn<K: Kick + 'static>(
         self,
         device: Arc<HviTime>,
         vcpus: Arc<Vcpus<K>>,
         setup: impl FnOnce() + Send + 'static,
+        hold: impl FnOnce() + Send + 'static,
     ) -> io::Result<JoinHandle<()>> {
         std::thread::Builder::new()
             .name("hvi-time-test".into())
@@ -1011,6 +1025,7 @@ impl TestRestore {
                     state.guest_ns_at_capture,
                     self.downtime.as_secs_f64()
                 );
+                hold();
                 let held = sleep_while_running(&vcpus, self.downtime);
                 match device.restore(&state) {
                     Ok(()) => {
