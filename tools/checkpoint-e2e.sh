@@ -25,6 +25,21 @@
 #    it and check it counts on. Stop both, check the disk generation grew over the
 #    moves, and read the file the guest wrote from the image on the host.
 #
+# With --stream both moves are live moves instead: the source streams
+# itself with the control socket's `migrate` op while the guest runs, and
+# the script relays the stream through a Unix socket into the next process,
+# `hvi restore --from-stream` (tools/stream-e2e.sh runs this mode). The
+# checks are the same, but the second restore of the first bundle onto the
+# running guest's disk, which needs a bundle directory; the documents each
+# restore keeps (--stream-keep) stand in for the bundle where a check reads
+# one. The guest also prints its boot_id before and after, which must not
+# change. --dirty-mib N starts /dirty (tools/guest/dirty.c) in the guest
+# before the move, writing N MiB of pseudo-random pages over and over; it
+# must report no page that lost a write, and go on counting after each
+# move. summary.json then also holds each move's rounds, bytes, dirty
+# rates, compression, write faults and downtime: from the end of the last
+# round taken with the guest running to the resume reply.
+#
 # With --portable the guest boots the portable profile
 # (--profile portable-arm64-v1) and the kernel must be the portable one,
 # with hvi-time. The initramfs must then hold /el0check and /tfd
@@ -40,7 +55,8 @@
 # Usage:
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs target/initramfs-workload.cpio --out DIR \
-#       [--cpus 2] [--mem 512] [--no-disk] [--portable]
+#       [--cpus 2] [--mem 512] [--no-disk] [--portable] [--stream]
+#       [--dirty-mib N]
 #
 # DIR receives the checkpoint root (with the bundle), the disk image, both
 # processes' consoles, their profiles and summary.json with the timings.
@@ -50,7 +66,7 @@
 # is limited to 104 bytes on macOS. Exits 0 when every check passed.
 set -euo pipefail
 
-hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no
+hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no stream=no dirty=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --hvi) hvi="$2"; shift 2 ;;
@@ -61,7 +77,9 @@ while [ $# -gt 0 ]; do
         --mem) mem="$2"; shift 2 ;;
         --no-disk) disk=no; shift ;;
         --portable) portable=yes; shift ;;
-        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable]" >&2; exit 2 ;;
+        --stream) stream=yes; shift ;;
+        --dirty-mib) dirty="$2"; shift 2 ;;
+        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable] [--stream] [--dirty-mib N]" >&2; exit 2 ;;
     esac
 done
 for v in hvi kernel initramfs out; do
@@ -96,11 +114,17 @@ socks="$(mktemp -d /tmp/hvi-e2e.XXXXXX)"
 trap 'rm -rf "$socks"' EXIT
 
 python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" \
-    "$debugfs" "$portable" <<'PY'
+    "$debugfs" "$portable" "$stream" "$dirty" <<'PY'
 import json, os, re, socket, subprocess, sys, threading, time
 
-hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs, portable = sys.argv[1:]
+(hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs, portable, stream,
+ dirty) = sys.argv[1:]
 portable = portable == "yes"
+stream = stream == "yes"
+dirty = int(dirty)
+# A timer armed before a live move must still be pending when it ends:
+# with a busy guest the rounds can take several seconds.
+TIMER_S = 20 if dirty else 6
 t0 = time.monotonic()
 # Host wall-clock time at monotonic time t0, to read a line's host time.
 wall_t0 = time.time() - (time.monotonic() - t0)
@@ -203,6 +227,12 @@ def tick(s):
     return (int(m.group(1)), float(m.group(2)), int(m.group(3))) if m else None
 
 
+# The sleep's start and end lines, with the guest's uptime. The shell's
+# prompt may come first on the line when the output lands as it prints it.
+NANOSLEEP_START = r"(?:^|# )NANOSLEEP-START ([0-9.]+)"
+NANOSLEEP_END = r"(?:^|# )NANOSLEEP-END ([0-9.]+)"
+
+
 # The awk prints its count and sum every FP_STEP additions of 0.25.
 FP_STEP = 500000
 
@@ -256,6 +286,92 @@ def state_differences(a, b):
     return why
 
 
+def stream_move(name, ctl, keep, txid, epoch, args):
+    """Moves the guest behind the control connection `ctl` into a new
+    process `name` with a live move: starts `hvi restore --from-stream` on a
+    relay socket, asks the source to `migrate` with then=fence, and relays
+    each frame of the stream from the control connection to the restore, up
+    to the manifest. Returns the reply, the new process and the times the
+    request was sent, the manifest relayed and the reply read."""
+    relay = f"{socks}/{name}-relay.sock"
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(relay)
+    listener.listen(1)
+    listener.settimeout(60)
+    dst = Guest(name, [hvi, "restore", "--from-stream", relay, "--stream-keep", keep] + args)
+    conn, _ = listener.accept()
+    listener.close()
+    line = json.dumps(dict(v=1, op="migrate", then="fence", txid=txid, epoch=epoch))
+    sent = now()
+    ctl.f.write(line.encode() + b"\n")
+    ctl.f.flush()
+    frames, reply, manifest_at = {}, None, None
+    while True:
+        header = ctl.f.readline()
+        if not header:
+            break
+        h = json.loads(header)
+        if "component" not in h:
+            reply = h  # the source ended the stream early
+            break
+        body = b""
+        while len(body) < h["size"]:
+            more = ctl.f.read(h["size"] - len(body))
+            if not more:
+                break
+            body += more
+        conn.sendall(header)
+        conn.sendall(body)
+        frames[h["component"]] = frames.get(h["component"], 0) + 1
+        if h["component"] == "manifest.json":
+            manifest_at = now()
+            reply = json.loads(ctl.f.readline())
+            break
+    got = now()
+    conn.close()
+    ctl.guest.note(f"ctl: {line} -> {json.dumps(reply)} ({(got - sent) * 1000:.1f} ms), "
+                   f"frames relayed {frames}")
+    return reply or {}, dst, sent, manifest_at or got, got
+
+
+def stream_summary(reply, resume_wall=None):
+    """Returns what a live move's reply says about its rounds, with the
+    downtime from the end of the last round with the guest running to
+    `resume_wall`, the host time of the resume reply."""
+    st = reply.get("stats") or {}
+    raw, wire = st.get("ram_raw_bytes") or 0, st.get("ram_stream_bytes") or 0
+    keep = ("round", "in_pause", "pages", "data_pages", "bytes", "ms", "dirty_pages_per_s")
+    summary = {k: st.get(k) for k in (
+        "stop_reason", "threshold_bytes", "precopy_ms", "pause_ms", "paused_ms",
+        "final_round_bytes", "ram_present_bytes", "ram_raw_bytes", "ram_stream_bytes",
+        "stream_bytes", "write_granule", "write_faults", "write_fault_ns")}
+    summary["rounds"] = [{k: r.get(k) for k in keep} for r in st.get("rounds") or []]
+    summary["compression_ratio"] = round(raw / wire, 2) if wire else None
+    if resume_wall is not None and st.get("precopy_end_unix_ms"):
+        summary["downtime_precopy_end_to_resume_ms"] = round(
+            resume_wall * 1000 - st["precopy_end_unix_ms"], 1)
+    return summary
+
+
+def dirty_goes_on(guest, after, where):
+    """Checks that /dirty writes on in `guest` after `after` and that no
+    page it wrote lost a write."""
+    if not dirty:
+        return
+    got = guest.wait_for(r"DIRTY pass \d+ bad \d+", 20, after=after)
+    bad = [s for _, s in guest.outputs(r"DIRTY-BAD")]
+    check(got is not None and " bad 0 " in got[1] and not bad,
+          f"/dirty writes on {where} and every page held its last write: "
+          f"{got[1] if got else None}, {len(bad)} DIRTY-BAD line(s) {bad[:2]}")
+
+
+def boot_id(guest, after=0.0):
+    """Returns the guest's boot_id, read through its console."""
+    guest.type('echo "BOOTID $(cat /proc/sys/kernel/random/boot_id)"\n')
+    got = guest.wait_for(r"BOOTID ([0-9a-f-]{36})$", 10, after=after)
+    return re.search(r"BOOTID ([0-9a-f-]{36})$", got[1]).group(1) if got else None
+
+
 common = ["--net-stub"] + (["--disk", image] if image else [])
 profile = ["--profile", "portable-arm64-v1"] if portable else []
 src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs,
@@ -264,7 +380,9 @@ src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs
                        "--agent-sock", f"{socks}/src-agent.sock",
                        "--profile-out", os.path.join(out, "source-profile.json")] + common)
 print(f"checkpoint e2e: {cpus} vCPU(s), {mem} MiB, disk {'yes' if image else 'no'}, "
-      f"profile {'portable-arm64-v1' if portable else 'native'}", flush=True)
+      f"profile {'portable-arm64-v1' if portable else 'native'}, "
+      f"{'live moves (migrate)' if stream else 'checkpoint bundles'}"
+      f"{f', /dirty {dirty} MiB' if dirty else ''}", flush=True)
 # The native guest has no RTC, so its wall clock starts at 0. Give it this
 # host's, so its drift over the move can be read against the host's. The
 # portable guest's hvi-time gives it the host's at boot.
@@ -280,43 +398,73 @@ if portable:
 if not ready:
     src.p.kill()
     sys.exit(1)
+boot_before = boot_id(src)
+check(boot_before is not None, f"the source guest's boot_id: {boot_before}")
+if dirty:
+    src.type(f"/dirty {dirty} &\n")
+    check(src.wait_for(r"DIRTY-READY ", 60) is not None
+          and src.wait_for(r"DIRTY pass ", 30) is not None,
+          f"/dirty writes {dirty} MiB over and over in the source guest")
 if portable:
     # Two timers armed just before the capture, which must fire after the
     # resume, 6 s of guest time after they were armed.
-    src.type("/tfd 6 &\n")
+    src.type(f"/tfd {TIMER_S} &\n")
     src.type("/bin/busybox echo \"NANOSLEEP-START $(/bin/busybox cut -d' ' -f1 /proc/uptime)\"; "
-             "( /bin/busybox sleep 6; /bin/busybox echo \"NANOSLEEP-END "
+             f"( /bin/busybox sleep {TIMER_S}; /bin/busybox echo \"NANOSLEEP-END "
              "$(/bin/busybox cut -d' ' -f1 /proc/uptime)\" ) &\n")
-    armed = src.wait_for(r"TIMERFD-ARMED ", 10) and src.wait_for(r"^NANOSLEEP-START [0-9]", 10)
+    armed = src.wait_for(r"TIMERFD-ARMED ", 10) and src.wait_for(NANOSLEEP_START, 10)
     check(bool(armed), "a timerfd and a sleep are armed before the capture")
 
 # The move itself runs straight through, as a caller would run it, so its
 # timings are the move's: the checks that need a pause come afterwards.
 sctl = Control(src, f"{socks}/src.sock")
 bundle = os.path.join(root, "move")
-fence_sent = now()
-fence, fence_at = sctl.ask(op="checkpoint", dir=bundle, then="fence", txid="e2e-1", epoch=1)
-spawned_at = now()
-dst = Guest("restored", [hvi, "restore", "--from", bundle,
-                         "--control-sock", f"{socks}/dst.sock", "--checkpoint-root", root,
-                         "--agent-sock", f"{socks}/dst-agent.sock",
-                         "--profile-out", os.path.join(out, "restored-profile.json")] + common)
+dst_args = ["--control-sock", f"{socks}/dst.sock", "--checkpoint-root", root,
+            "--agent-sock", f"{socks}/dst-agent.sock",
+            "--profile-out", os.path.join(out, "restored-profile.json")] + common
+if stream:
+    # The restore builds the VM once the manifest is in; until then it
+    # applies the rounds as they come.
+    fence, dst, fence_sent, spawned_at, fence_at = stream_move(
+        "restored", sctl, bundle, "e2e-1", 1, dst_args)
+else:
+    fence_sent = now()
+    fence, fence_at = sctl.ask(op="checkpoint", dir=bundle, then="fence", txid="e2e-1", epoch=1)
+    spawned_at = now()
+    dst = Guest("restored", [hvi, "restore", "--from", bundle] + dst_args)
 dctl = Control(dst, f"{socks}/dst.sock")
 status, status_at = dctl.ask(op="status")
 resumed, resume_at = dctl.ask(op="resume")
+stream_moves = [stream_summary(fence, wall_t0 + resume_at)] if stream else []
 
-check(fence.get("ok") is True and fence.get("state") == "fenced", "checkpoint then=fence")
+check(fence.get("ok") is True and fence.get("state") == "fenced",
+      ("migrate" if stream else "checkpoint") + " then=fence"
+      + (f": {fence.get('code')}: {fence.get('error')}" if not fence.get("ok") else ""))
+if stream_moves:
+    rounds = stream_moves[0]["rounds"]
+    check(len(rounds) >= 2 and rounds[-1]["in_pause"] and not any(r["in_pause"] for r in rounds[:-1]),
+          f"the move took {len(rounds)} RAM round(s), the last one paused, "
+          f"stopping as {stream_moves[0]['stop_reason']}: "
+          + ", ".join(f"{r['pages']} pages / {r['bytes']} B" for r in rounds))
 stats = fence.get("stats", {})
 check(status.get("state") == "restored-paused", f"the restore reports restored-paused ({status})")
 check(resumed.get("state") == "running", "resume")
 restore_ms = (status_at - spawned_at) * 1000
 before = [(t, tick(s)) for t, s in src.outputs(r"TICK ") if t <= fence_at]
 last_tick_at, (last_n, last_uptime, last_wall) = before[-1]
-check(not src.outputs(r"TICK ", after=fence_sent + 0.1), "the fenced source printed nothing more")
-verify = subprocess.run([hvi, "checkpoint-verify", bundle], capture_output=True, text=True)
-src.note("verify: " + (verify.stdout + verify.stderr).replace("\n", " | "))
-check(verify.returncode == 0 and "complete: every part a restore needs is captured" in verify.stdout,
-      "checkpoint-verify: the bundle is complete")
+# A live move pauses the guest only after its rounds, just before the reply.
+check(not src.outputs(r"TICK ", after=(fence_at if stream else fence_sent) + 0.1),
+      "the fenced source printed nothing more")
+if stream:
+    kept = sorted(os.listdir(bundle)) if os.path.isdir(bundle) else []
+    want = sorted(["profile.json", "cpu.json", "platform.json", "devices.json", "session.json",
+                   "manifest.json"] + (["disk.json"] if image else []))
+    check(kept == want, f"the restore kept the stream's documents and no RAM: {kept}")
+else:
+    verify = subprocess.run([hvi, "checkpoint-verify", bundle], capture_output=True, text=True)
+    src.note("verify: " + (verify.stdout + verify.stderr).replace("\n", " | "))
+    check(verify.returncode == 0 and "complete: every part a restore needs is captured" in verify.stdout,
+          "checkpoint-verify: the bundle is complete")
 stopped, _ = sctl.ask(op="stop")
 try:
     src_rc = src.p.wait(timeout=20)
@@ -358,31 +506,36 @@ fp_goes_on(src, dst, "over the move")
 
 timers = {}
 if portable:
-    fired = dst.wait_for(r"TIMERFD-FIRED ", 15)
+    fired = dst.wait_for(r"TIMERFD-FIRED ", TIMER_S + 9)
     if fired:
         elapsed = float(fired[1].split()[2])
         timers["timerfd_guest_s"] = elapsed
-        check(fired[0] > resume_at and 5.99 <= elapsed <= 6.3,
+        check(fired[0] > resume_at and TIMER_S - 0.01 <= elapsed <= TIMER_S + 0.3,
               f"the timerfd armed before the capture fired after the resume, {elapsed:.3f} s "
               f"of guest time after it was armed")
     else:
         check(False, "the timerfd armed before the capture fired")
-    end = dst.wait_for(r"^NANOSLEEP-END [0-9]", 15)
-    start = src.outputs(r"^NANOSLEEP-START [0-9]")
+    end = dst.wait_for(NANOSLEEP_END, TIMER_S + 9)
+    start = src.outputs(NANOSLEEP_START)
     if end and start:
         # /proc/uptime is CLOCK_BOOTTIME, which hvi-time moves on by the
         # downtime, as it does the wall clock.
-        slept = float(end[1].split()[1]) - float(start[0][1].split()[1]) - downtime(dst)
+        slept = (float(re.search(NANOSLEEP_END, end[1]).group(1))
+                 - float(re.search(NANOSLEEP_START, start[0][1]).group(1)) - downtime(dst))
         timers["nanosleep_guest_s"] = round(slept, 3)
-        check(end[0] > resume_at and 5.97 <= slept <= 6.3,
+        check(end[0] > resume_at and TIMER_S - 0.03 <= slept <= TIMER_S + 0.3,
               f"the sleep armed before the capture ended after the resume, {slept:.2f} s of "
               f"guest monotonic time after it began")
     else:
         check(False, "the sleep armed before the capture ended")
 
-if image:
+dirty_goes_on(dst, resume_at, "after the move")
+boot_after = boot_id(dst, resume_at)
+check(boot_after is not None and boot_after == boot_before,
+      f"the guest's boot_id is the same after the move: {boot_before} then {boot_after}")
+if image and not stream:
     # hvi does not consume a bundle, so the disk lock is what keeps a second
-    # guest off the disk the restored one writes.
+    # guest off the disk the restored one writes. A stream is read once.
     dup = subprocess.run([hvi, "restore", "--from", bundle,
                           "--control-sock", f"{socks}/dup.sock", "--checkpoint-root", root,
                           "--agent-sock", f"{socks}/dup-agent.sock"] + common,
@@ -429,15 +582,24 @@ else:
 
 # A restored guest is a guest like any other: move it once more.
 again_at = now()
-fence2, _ = dctl.ask(op="checkpoint", dir=os.path.join(root, "move-again"), then="fence",
-                     txid="e2e-2", epoch=2)
-check(fence2.get("state") == "fenced", "the restored guest checkpoints again")
-third = Guest("restored-again", [hvi, "restore", "--from", os.path.join(root, "move-again"),
-                                 "--control-sock", f"{socks}/third.sock",
-                                 "--checkpoint-root", root,
-                                 "--agent-sock", f"{socks}/third-agent.sock"] + common)
+third_args = ["--control-sock", f"{socks}/third.sock", "--checkpoint-root", root,
+              "--agent-sock", f"{socks}/third-agent.sock"] + common
+if stream:
+    fence2, third, _, manifest2_at, fence2_at = stream_move(
+        "restored-again", dctl, os.path.join(root, "move-again"), "e2e-2", 2, third_args)
+else:
+    fence2, fence2_at = dctl.ask(op="checkpoint", dir=os.path.join(root, "move-again"),
+                                 then="fence", txid="e2e-2", epoch=2)
+    third = Guest("restored-again", [hvi, "restore", "--from", os.path.join(root, "move-again")]
+                  + third_args)
+check(fence2.get("state") == "fenced",
+      "the restored guest " + ("streams" if stream else "checkpoints") + " again")
 tctl = Control(third, f"{socks}/third.sock")
-status3, _ = tctl.ask(op="status")
+status3, status3_at = tctl.ask(op="status")
+if stream:
+    stream_moves.append(stream_summary(fence2))
+    stream_moves[-1]["manifest_to_restored_paused_ms"] = round(
+        (status3_at - manifest2_at) * 1000, 1)
 # Held restored-paused for five tick periods: a guest that ran in that time
 # would print, and its clock would have moved on by the time it resumes.
 time.sleep(1.0)
@@ -461,10 +623,13 @@ if again.get("ok") is True:
     check(not loaded, "the restore loaded the vCPU and platform state it was given"
           + (": differs in " + ", ".join(loaded) if loaded else ""))
 tctl.ask(op="resume")
-last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
+# A live move pauses the guest only at the end of its rounds, just before
+# its reply; a checkpoint, as soon as it is asked for.
+fenced2_at = fence2_at if stream else again_at
+last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= fenced2_at + 0.1]
 # The guest's last uptime reading before the second fence: the last tick,
 # or the end of the sleep that came after it.
-uptime2 = max([tick(s)[1] for t, s in dst.outputs(r"TICK ") if t <= again_at + 0.1]
+uptime2 = max([tick(s)[1] for t, s in dst.outputs(r"TICK ") if t <= fenced2_at + 0.1]
               + [float(s.split()[1]) for t, s in dst.outputs(r"(?<!NANO)SLEEP-END ")], default=None)
 moved = third.wait_for(r"TICK ", 10)
 on = tick(moved[1])[1] - uptime2 if moved and uptime2 is not None else None
@@ -476,6 +641,7 @@ check(status3.get("state") == "restored-paused" and moved is not None
       f"its uptime {on} s on from the last reading before the move")
 check(not third.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT"), "the third process did not reboot it")
 fp_goes_on(dst, third, "over the second move")
+dirty_goes_on(third, moved[0] if moved else 0.0, "after the second move")
 
 stop, _ = dctl.ask(op="stop")
 try:
@@ -517,6 +683,7 @@ summary = {
     "guest_wall_clock_lag_s": wall_lag,
     "disk_generations": generations,
     "portable": portable, **timers,
+    "stream": stream, "dirty_mib": dirty, "moves": stream_moves,
     "failures": failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
