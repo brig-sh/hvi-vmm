@@ -14,12 +14,16 @@
 
 //! The guest-visible contract of the `portable-arm64-v1` machine profile
 //! that does not depend on the hypervisor: the CPU baseline, the kernel
-//! arguments and the firmware's answers.
+//! arguments, the devicetree's inputs and the firmware's answers.
 //!
 //! The values come from measurements on a Raspberry Pi 5 (KVM, Linux
 //! 6.12.25) and an Apple M5 Pro (Hypervisor.framework, macOS 26.7). See
 //! `docs/portable-profile.md` for the contract and where each number comes
 //! from.
+
+use crate::arch::aarch64::fdt::{ArchTimer, VirtioDevices};
+use crate::arch::aarch64::layout::{GicLayout, GicVersion};
+use crate::config::BootConfig;
 
 /// The ID registers a portable guest reads, by name, in the order a backend
 /// writes them. Every field is at most what both hosts have, except where the
@@ -135,6 +139,60 @@ pub fn cmdline(cmdline: &str) -> String {
     } else {
         format!("{KERNEL_ARGS} {cmdline}")
     }
+}
+
+/// What the devicetree of a portable guest is built from.
+///
+/// Both backends take it from [`devicetree`], so a guest given the same
+/// configuration on a Mac and on a Pi gets the same tree, byte for byte,
+/// and the same `dtb_sha256` in its profile.
+// Only the macOS backend serves the profile so far.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct Devicetree {
+    /// The GICv2, at QEMU virt's v2 addresses.
+    pub(crate) gic: GicLayout,
+    /// The kernel command line, [`KERNEL_ARGS`] first.
+    pub(crate) cmdline: String,
+    /// The device nodes: the virtio devices the backend backs, `/timer`
+    /// without interrupts unless the configuration asks for them, and
+    /// `hvi-time`.
+    pub(crate) devices: VirtioDevices,
+}
+
+/// Returns the devicetree inputs of a portable guest of `cfg` with `vcpus`
+/// vCPUs and the virtio devices the backend backs.
+///
+/// # Errors
+///
+/// Errors when `vcpus` is more than a GICv2 reaches.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn devicetree(
+    cfg: &BootConfig,
+    vcpus: u32,
+    blk: bool,
+    net: bool,
+    vsock: bool,
+) -> Result<Devicetree, String> {
+    Ok(Devicetree {
+        gic: GicLayout::for_vcpus(GicVersion::V2, vcpus)?,
+        cmdline: cmdline(&cfg.cmdline),
+        devices: VirtioDevices {
+            blk,
+            net,
+            vsock,
+            // `BootConfig::validate` refuses shares under this profile.
+            fs_count: 0,
+            timer: if cfg.arch_timer_irq() {
+                ArchTimer::Interrupts
+            } else {
+                ArchTimer::NoInterrupts {
+                    clock_frequency: ArchTimer::PORTABLE_HZ,
+                }
+            },
+            hvi_time: true,
+        },
+    })
 }
 
 /// SMCCC and PSCI function IDs and return values the portable firmware

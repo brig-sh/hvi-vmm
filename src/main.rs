@@ -282,7 +282,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut trace_io = None;
     let mut sandbox = true;
     let mut profile = config::MachineProfileKind::Native;
-    let mut arch_timer_irq = true;
+    let mut arch_timer_irq = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -397,7 +397,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     it.next().ok_or("--profile needs a name")?,
                 )?;
             }
-            "--no-arch-timer-irq" => arch_timer_irq = false,
+            "--arch-timer-irq" => arch_timer_irq = Some(true),
             other => return Err(format!("unknown boot arg {other:?}").into()),
         }
     }

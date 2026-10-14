@@ -263,14 +263,18 @@ pub struct BootConfig {
     pub sandbox: bool,
     /// The machine the guest is given.
     pub profile: MachineProfileKind,
-    /// Whether the devicetree gives the architected timer its interrupts.
+    /// Whether the devicetree gives the architected timer its interrupts, or
+    /// `None` for the profile's default.
     ///
-    /// Only a portable profile may clear it. The `/timer` node then carries a
-    /// fixed `clock-frequency` and no interrupts, so the guest's arch-timer
-    /// driver takes its rate from the node and registers no clock event. That
-    /// is the shape the portable profile takes once hvi-time supplies the
-    /// clock.
-    pub arch_timer_irq: bool,
+    /// The native profile always does. The portable profile does not: its
+    /// `/timer` node carries a fixed `clock-frequency` and no interrupts, so
+    /// the guest's arch-timer driver takes its rate from the node and
+    /// registers no clock event, and the guest's clock and timers come from
+    /// `hvi-time`. `Some(true)` there is a debugging aid: the node gets its
+    /// four PPIs back, so a guest kernel without the `hvi-time` driver still
+    /// ticks. It changes the devicetree, and with it the profile's
+    /// `dtb_sha256`.
+    pub arch_timer_irq: Option<bool>,
 }
 
 impl BootConfig {
@@ -280,11 +284,11 @@ impl BootConfig {
     ///
     /// # Errors
     ///
-    /// Errors when `arch_timer_irq` is cleared on the native profile, or
-    /// when a portable profile is given virtio-fs shares.
+    /// Errors when `arch_timer_irq` is set on the native profile, or when a
+    /// portable profile is given virtio-fs shares.
     pub fn validate(&self) -> Result<(), String> {
-        if !self.arch_timer_irq && self.profile == MachineProfileKind::Native {
-            return Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into());
+        if self.arch_timer_irq.is_some() && self.profile == MachineProfileKind::Native {
+            return Err("--arch-timer-irq needs --profile portable-arm64-v1".into());
         }
         if self.profile != MachineProfileKind::Native && !self.fs_shares.is_empty() {
             return Err(format!(
@@ -293,6 +297,14 @@ impl BootConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Returns whether the devicetree gives the architected timer its
+    /// interrupts: `arch_timer_irq`, or the profile's default.
+    #[must_use]
+    pub fn arch_timer_irq(&self) -> bool {
+        self.arch_timer_irq
+            .unwrap_or(self.profile == MachineProfileKind::Native)
     }
 
     /// Refuses a portable profile on a backend that does not implement one
@@ -487,7 +499,7 @@ mod tests {
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
     }
 
-    fn boot_config(profile: MachineProfileKind, arch_timer_irq: bool) -> BootConfig {
+    fn boot_config(profile: MachineProfileKind, arch_timer_irq: Option<bool>) -> BootConfig {
         BootConfig {
             kernel: Vec::new(),
             initramfs: None,
@@ -516,33 +528,47 @@ mod tests {
     #[test]
     fn validate_refuses_what_no_backend_boots() {
         use MachineProfileKind::{Native, PortableArm64V1};
-        assert_eq!(boot_config(Native, true).validate(), Ok(()));
-        assert_eq!(boot_config(PortableArm64V1, true).validate(), Ok(()));
-        assert_eq!(boot_config(PortableArm64V1, false).validate(), Ok(()));
-        assert_eq!(
-            boot_config(Native, false).validate(),
-            Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into())
-        );
-        let mut cfg = boot_config(PortableArm64V1, true);
+        assert_eq!(boot_config(Native, None).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, None).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, Some(true)).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, Some(false)).validate(), Ok(()));
+        for timer in [Some(true), Some(false)] {
+            assert_eq!(
+                boot_config(Native, timer).validate(),
+                Err("--arch-timer-irq needs --profile portable-arm64-v1".into())
+            );
+        }
+        let mut cfg = boot_config(PortableArm64V1, None);
         cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
         assert!(cfg
             .validate()
             .unwrap_err()
             .contains("--share-ro/--share-rw"));
-        let mut cfg = boot_config(Native, true);
+        let mut cfg = boot_config(Native, None);
         cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
         assert_eq!(cfg.validate(), Ok(()));
     }
 
+    /// The portable profile's arch timer has no interrupts unless asked;
+    /// the native one always has them.
+    #[test]
+    fn the_arch_timer_interrupts_follow_the_profile() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        assert!(boot_config(Native, None).arch_timer_irq());
+        assert!(!boot_config(PortableArm64V1, None).arch_timer_irq());
+        assert!(boot_config(PortableArm64V1, Some(true)).arch_timer_irq());
+        assert!(!boot_config(PortableArm64V1, Some(false)).arch_timer_irq());
+    }
+
     #[test]
     fn a_backend_without_the_profile_names_the_profile() {
-        let cfg = boot_config(MachineProfileKind::PortableArm64V1, false);
+        let cfg = boot_config(MachineProfileKind::PortableArm64V1, None);
         assert_eq!(
             cfg.require_native_profile("KVM"),
             Err("--profile portable-arm64-v1 is not implemented on the KVM backend yet".into())
         );
         assert_eq!(
-            boot_config(MachineProfileKind::Native, true).require_native_profile("KVM"),
+            boot_config(MachineProfileKind::Native, None).require_native_profile("KVM"),
             Ok(())
         );
     }
