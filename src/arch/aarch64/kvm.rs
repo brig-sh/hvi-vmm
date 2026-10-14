@@ -732,6 +732,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         })?;
         let timer = Arc::clone(device);
         io_threads.push_ended_by("hvi-time timer", thread, move || timer.stop());
+        if let Some(test) = hvitime::TestRestore::from_env() {
+            io_threads.push(
+                "hvi-time test restore",
+                test.spawn(Arc::clone(device), Arc::clone(&shared.guest.vcpus), || {
+                    seccomp::install_thread(seccomp::Thread::Vmm);
+                })?,
+            );
+        }
     }
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the

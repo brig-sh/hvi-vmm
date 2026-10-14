@@ -1279,9 +1279,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
-    if let Some(obs) = &shared.plugin {
-        obs.attach(Arc::clone(&shared.guest) as Arc<dyn VmHandle>)?;
-    }
+    let plugin_threads = shared.guest.attach(shared.plugin.as_ref())?;
+
+    // A binary's stop signals get their handlers, and the thread that receives
+    // them starts, before the terminal goes into raw mode, so a first stop
+    // signal stops the run rather than ending the process with the terminal
+    // raw. The sandbox below confines the whole process, that thread included.
+    crate::signal::start_stop_signal_thread()?;
 
     let _raw = terminal::RawTerm::enable();
 
@@ -1502,8 +1506,8 @@ impl IoStart {
     ///
     /// # Errors
     ///
-    /// Errors when the timer thread cannot be started, which is started
-    /// first, so no thread is left to stop.
+    /// Errors when the timer thread or the restore test cannot be started.
+    /// Both start before the rest, so no thread is left running.
     fn start(self, shared: &Shared) -> std::io::Result<IoThreads<Kicker>> {
         // The hvi-time timer thread, on the scheduling that wakes it on
         // time.
@@ -1515,6 +1519,23 @@ impl IoStart {
                 );
             })?),
             None => None,
+        };
+        // The in-process restore test, when `HVI_TIME_TEST_RESTORE` asks for
+        // it. A failure to start it ends the timer thread again.
+        let test = match (&shared.hvitime, hvitime::TestRestore::from_env()) {
+            (Some(device), Some(test)) => {
+                match test.spawn(Arc::clone(device), Arc::clone(&shared.guest.vcpus), || {}) {
+                    Ok(thread) => Some(thread),
+                    Err(e) => {
+                        device.stop();
+                        if let Some(timer) = timer {
+                            let _ = timer.join();
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            _ => None,
         };
         let mut io_threads = IoThreads::start(
             self.stop_source,
@@ -1551,6 +1572,9 @@ impl IoStart {
         if let (Some(device), Some(thread)) = (&shared.hvitime, timer) {
             let timer = Arc::clone(device);
             io_threads.push_ended_by("hvi-time timer", thread, move || timer.stop());
+        }
+        if let Some(thread) = test {
+            io_threads.push("hvi-time test restore", thread);
         }
         Ok(io_threads)
     }
