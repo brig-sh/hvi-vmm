@@ -619,17 +619,33 @@ static PROBE_RAM: std::sync::OnceLock<crate::memory::GuestRam> = std::sync::Once
 static PROBE_PROFILE: std::sync::OnceLock<crate::checkpoint::profile::MachineProfile> =
     std::sync::OnceLock::new();
 
+/// The exit code of a bundle probe whose round trip failed without a trap.
+const BUNDLE_PROBE_FAILED: i32 = 96;
+
 /// Writes, verifies and removes a bundle of [`PROBE_RAM`] under the temp dir.
-/// Errors are ignored by the probes: only a trap is a finding.
+///
+/// A round trip that fails without a trap exits the child with
+/// [`BUNDLE_PROBE_FAILED`], which the runner counts as a mismatch either
+/// way. Ignoring the error let the `control` probe match when an early
+/// `mkdirat` or `openat` failed with `EEXIST` or `EACCES`, so the writer's
+/// later calls never ran and one missing from the filter went unseen.
 fn probe_bundle_round_trip() {
-    if let (Some(ram), Some(profile)) = (PROBE_RAM.get(), PROBE_PROFILE.get()) {
-        let name = format!("hvi-seccomp-bundle-{}", std::process::id());
-        let _ = crate::checkpoint::bundle::selftest_round_trip(
-            &std::env::temp_dir(),
-            &name,
-            ram,
-            profile,
-        );
+    let result = match (PROBE_RAM.get(), PROBE_PROFILE.get()) {
+        (Some(ram), Some(profile)) => {
+            let name = format!("hvi-seccomp-bundle-{}", std::process::id());
+            crate::checkpoint::bundle::selftest_round_trip(
+                &std::env::temp_dir(),
+                &name,
+                ram,
+                profile,
+            )
+        }
+        _ => Err(io::Error::other("no guest RAM or profile was made")),
+    };
+    if let Err(e) = result {
+        eprintln!("  (the bundle round trip failed: {e})");
+        // SAFETY: terminating the forked child without running destructors.
+        unsafe { libc::_exit(BUNDLE_PROBE_FAILED) };
     }
 }
 
@@ -750,6 +766,9 @@ pub fn selftest() -> io::Result<usize> {
         let actual = match outcome {
             Outcome::Allowed => "ran".to_string(),
             Outcome::Trapped => "killed by SIGSYS".to_string(),
+            Outcome::Other(s) if s == BUNDLE_PROBE_FAILED << 8 => {
+                "exited: the bundle round trip failed".to_string()
+            }
             Outcome::Other(s) => format!("unexpected wait status {s:#x}"),
         };
         println!(
