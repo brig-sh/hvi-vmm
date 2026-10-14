@@ -235,7 +235,8 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("cmdline: {cmdline}");
     if let Some(path) = out {
-        std::fs::write(&path, &dtb)?;
+        use std::io::Write;
+        hvi::private_file::create(std::path::Path::new(&path))?.write_all(&dtb)?;
         println!("wrote {} byte DTB to {path}", dtb.len());
     }
     Ok(())
