@@ -527,7 +527,7 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
