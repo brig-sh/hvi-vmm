@@ -347,6 +347,8 @@ fn boot_profile(
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    cfg.validate()?;
+    cfg.require_native_profile("KVM")?;
     // The Linux backends serve only exports a caller's vhost-user daemon
     // serves. Starting a daemon is the caller's job, as it is for every other
     // VMM.
@@ -1146,6 +1148,8 @@ mod vcpu_cap_tests {
             checkpoint_root: None,
             plugin: None,
             sandbox: false,
+            profile: crate::config::MachineProfileKind::Native,
+            arch_timer_irq: true,
             stop: None,
         };
         let error = boot(cfg).unwrap_err().to_string();

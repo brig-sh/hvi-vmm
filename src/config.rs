@@ -393,6 +393,47 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
+/// The machine a guest is given.
+///
+/// `Native` is the host's own machine: on macOS the in-kernel GICv3 of
+/// Hypervisor.framework and the host CPU's feature registers. A portable
+/// profile is one machine on every host that implements it, so a guest can
+/// move between them; see `docs/portable-profile.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MachineProfileKind {
+    /// The host's own machine.
+    #[default]
+    Native,
+    /// `portable-arm64-v1`: a GICv2, a Cortex-A76 identity with a reduced
+    /// feature set, PSCI 1.1 and SMCCC 1.1 as KVM on a Pi 5 answers them.
+    PortableArm64V1,
+}
+
+impl MachineProfileKind {
+    /// Returns the profile's name, as `--profile` takes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::PortableArm64V1 => "portable-arm64-v1",
+        }
+    }
+
+    /// Returns the profile called `name`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when no profile has that name.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        [Self::Native, Self::PortableArm64V1]
+            .into_iter()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| {
+                format!("unknown machine profile {name:?}; expected native or portable-arm64-v1")
+            })
+    }
+}
+
 /// Inputs for a boot, which [`boot`](crate::boot) takes.
 pub struct BootConfig {
     pub kernel: Vec<u8>,
@@ -471,6 +512,16 @@ pub struct BootConfig {
     /// backend logs which one it installed, so this is never a silent
     /// "sandboxed" claim on a host that is not.
     pub sandbox: bool,
+    /// The machine the guest is given.
+    pub profile: MachineProfileKind,
+    /// Whether the devicetree gives the architected timer its interrupts.
+    ///
+    /// Only a portable profile may clear it. The `/timer` node then carries a
+    /// fixed `clock-frequency` and no interrupts, so the guest's arch-timer
+    /// driver takes its rate from the node and registers no clock event. That
+    /// is the shape the portable profile takes once hvi-time supplies the
+    /// clock.
+    pub arch_timer_irq: bool,
     /// The registration of the [`StopHandle`](crate::run::StopHandle) that asks
     /// this run to stop from outside the guest, or `None` when the caller keeps
     /// no handle.
@@ -491,6 +542,45 @@ impl BootConfig {
             Some(registration) => Ok(registration.into_handle()),
             None => Ok(crate::run::StopHandle::new_pair()?.0),
         }
+    }
+
+    /// Refuses a combination of fields that no backend boots, whichever
+    /// one runs. Every backend's `boot` calls it first, so a library
+    /// caller gets the same answer as the CLI.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `arch_timer_irq` is cleared on the native profile, or
+    /// when a portable profile is given virtio-fs shares.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.arch_timer_irq && self.profile == MachineProfileKind::Native {
+            return Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into());
+        }
+        if self.profile != MachineProfileKind::Native
+            && !(self.fs_shares.is_empty() && self.fs.is_empty())
+        {
+            return Err(format!(
+                "--fs/--share-ro/--share-rw are not part of --profile {}: a portable guest keeps its storage on virtio-blk",
+                self.profile.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses a portable profile on a backend that does not implement one
+    /// yet.
+    ///
+    /// # Errors
+    ///
+    /// Errors naming `backend` when the profile is not native.
+    pub fn require_native_profile(&self, backend: &str) -> Result<(), String> {
+        if self.profile == MachineProfileKind::Native {
+            return Ok(());
+        }
+        Err(format!(
+            "--profile {} is not implemented on the {backend} backend yet",
+            self.profile.name()
+        ))
     }
 }
 
@@ -613,8 +703,8 @@ impl std::error::Error for BootError {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        check_export_overlap, check_fs, BootError, CachePolicy, FsConfig, FsShare, FsSpec,
-        ShareMode,
+        check_export_overlap, check_fs, BootConfig, BootError, CachePolicy, FsConfig, FsShare,
+        FsSpec, MachineProfileKind, ShareMode,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -742,6 +832,86 @@ mod tests {
         ]))
         .expect("/srv/ab is a sibling of /srv/a, not a child");
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    fn boot_config(profile: MachineProfileKind, arch_timer_irq: bool) -> BootConfig {
+        BootConfig {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 0,
+            cmdline: String::new(),
+            disk: None,
+            fs_shares: Vec::new(),
+            fs: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: String::new(),
+            vcpus: 1,
+            agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
+            plugin: None,
+            sandbox: false,
+            stop: None,
+            profile,
+            arch_timer_irq,
+        }
+    }
+
+    #[test]
+    fn validate_refuses_what_no_backend_boots() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        assert_eq!(boot_config(Native, true).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, true).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, false).validate(), Ok(()));
+        assert_eq!(
+            boot_config(Native, false).validate(),
+            Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into())
+        );
+        let mut cfg = boot_config(PortableArm64V1, true);
+        cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("--share-ro/--share-rw"));
+        let mut cfg = boot_config(PortableArm64V1, true);
+        cfg.fs = vec![socket("tag=a,socket=/run/a.sock")];
+        assert!(cfg.validate().unwrap_err().contains("--fs"));
+        let mut cfg = boot_config(Native, true);
+        cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
+        assert_eq!(cfg.validate(), Ok(()));
+        let mut cfg = boot_config(Native, true);
+        cfg.fs = vec![socket("tag=a,socket=/run/a.sock")];
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_backend_without_the_profile_names_the_profile() {
+        let cfg = boot_config(MachineProfileKind::PortableArm64V1, false);
+        assert_eq!(
+            cfg.require_native_profile("KVM"),
+            Err("--profile portable-arm64-v1 is not implemented on the KVM backend yet".into())
+        );
+        assert_eq!(
+            boot_config(MachineProfileKind::Native, true).require_native_profile("KVM"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn profiles_are_found_by_their_names() {
+        for p in [
+            MachineProfileKind::Native,
+            MachineProfileKind::PortableArm64V1,
+        ] {
+            assert_eq!(MachineProfileKind::from_name(p.name()), Ok(p));
+        }
+        assert_eq!(MachineProfileKind::default(), MachineProfileKind::Native);
+        assert!(MachineProfileKind::from_name("portable").is_err());
     }
 
     #[test]

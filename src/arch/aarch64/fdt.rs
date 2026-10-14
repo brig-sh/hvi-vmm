@@ -46,13 +46,62 @@ const IRQ_LEVEL_HIGH: u32 = 4;
 /// the kernel needs before it calls its CRNG initialised.
 pub const RNG_SEED_LEN: usize = 64;
 
-/// The virtio-mmio nodes backed by this boot.
+/// The devicetree parts a boot chooses: the virtio-mmio nodes it backs and
+/// the shape of the architected timer's node.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VirtioDevices {
     pub blk: bool,
     pub net: bool,
     pub vsock: bool,
     pub fs_count: usize,
+    pub timer: ArchTimer,
+}
+
+/// How `/timer` describes the architected timer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ArchTimer {
+    /// The four timer PPIs, and the rate the CPU's `CNTFRQ_EL0` reports.
+    #[default]
+    Interrupts,
+    /// No interrupts and a fixed `clock-frequency`.
+    ///
+    /// Linux's arch-timer driver takes its rate from the property and then
+    /// gives up ("No interrupt available, giving up") before it registers a
+    /// clocksource, a clock event or `sched_clock`. Without any timer node
+    /// the kernel panics in `time_init`, so the portable profile keeps this
+    /// one and its clock comes from elsewhere.
+    NoInterrupts {
+        /// The rate the guest calibrates its delay loop with, in Hz.
+        clock_frequency: u32,
+    },
+}
+
+impl ArchTimer {
+    /// The rate the portable profile gives a timer without interrupts: the
+    /// Pi 5's 54 MHz, the highest counter rate of any host it runs on, so a
+    /// delay loop calibrated with it only ever runs long.
+    pub const PORTABLE_HZ: u32 = 54_000_000;
+}
+
+/// Writes the four architected-timer PPIs into the open `/timer` node.
+fn timer_interrupts(fdt: &mut FdtWriter) -> Result<(), Error> {
+    fdt.property_array_u32(
+        "interrupts",
+        &[
+            IRQ_PPI,
+            13,
+            IRQ_LEVEL_HIGH, // secure physical
+            IRQ_PPI,
+            14,
+            IRQ_LEVEL_HIGH, // non-secure physical
+            IRQ_PPI,
+            11,
+            IRQ_LEVEL_HIGH, // virtual
+            IRQ_PPI,
+            10,
+            IRQ_LEVEL_HIGH, // hypervisor physical
+        ],
+    )
 }
 
 /// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
@@ -144,23 +193,12 @@ pub fn build(
     // on — the canonical arm64 first-boot tuning knob.
     let timer = fdt.begin_node("timer")?;
     fdt.property_string("compatible", "arm,armv8-timer")?;
-    fdt.property_array_u32(
-        "interrupts",
-        &[
-            IRQ_PPI,
-            13,
-            IRQ_LEVEL_HIGH, // secure physical
-            IRQ_PPI,
-            14,
-            IRQ_LEVEL_HIGH, // non-secure physical
-            IRQ_PPI,
-            11,
-            IRQ_LEVEL_HIGH, // virtual
-            IRQ_PPI,
-            10,
-            IRQ_LEVEL_HIGH, // hypervisor physical
-        ],
-    )?;
+    match devices.timer {
+        ArchTimer::Interrupts => timer_interrupts(&mut fdt)?,
+        ArchTimer::NoInterrupts { clock_frequency } => {
+            fdt.property_u32("clock-frequency", clock_frequency)?;
+        }
+    }
     // The hypervisor keeps each vCPU's timer while the vCPU is out of the
     // guest. Without `always-on` the guest takes it for a timer that stops in
     // deep idle states.
@@ -451,6 +489,42 @@ pub(crate) mod tests {
                 _ => return None, // 9 = FDT_END
             }
         }
+    }
+
+    /// The default timer node lists the four PPIs and leaves the rate to
+    /// `CNTFRQ_EL0`. Without interrupts it carries the fixed rate instead,
+    /// which is what makes Linux's driver give up without a panic.
+    #[test]
+    fn timer_node_has_either_interrupts_or_a_fixed_rate() {
+        let build_with = |timer| {
+            build(
+                &sample_layout(0),
+                &GicLayout::QEMU_VIRT_V2,
+                1,
+                "",
+                VirtioDevices {
+                    timer,
+                    ..VirtioDevices::default()
+                },
+                &SEED,
+                KASLR_SEED,
+            )
+            .unwrap()
+        };
+        let with = build_with(ArchTimer::Interrupts);
+        assert_eq!(
+            prop(&with, "timer", "interrupts").map(|v| v.len()),
+            Some(48)
+        );
+        assert!(prop(&with, "timer", "clock-frequency").is_none());
+        let without = build_with(ArchTimer::NoInterrupts {
+            clock_frequency: ArchTimer::PORTABLE_HZ,
+        });
+        assert!(prop(&without, "timer", "interrupts").is_none());
+        assert_eq!(
+            prop(&without, "timer", "clock-frequency"),
+            Some(54_000_000u32.to_be_bytes().to_vec())
+        );
     }
 
     /// `/chosen` carries the seed it was given, all 64 bytes of it.
