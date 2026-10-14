@@ -68,7 +68,7 @@ pub(crate) fn devices(
             // The refusals made sure disk.json is there.
             let generation = opened.disk.as_ref().map_or(0, |d| d.generation);
             Some(Arc::new(Mutex::new(VirtioBlk::restore(
-                path, ram, state, generation,
+                path, ram, state, generation, None,
             )?)))
         }
         _ => None,
