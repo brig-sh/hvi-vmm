@@ -43,15 +43,23 @@
 //! soft pending state when level irqs have been acked"), so the two hosts
 //! agree on what an acknowledged, latched level interrupt does next.
 //!
-//! Only EOImode 0 is modelled: `GICC_EOIR` drops the priority and
-//! deactivates. There is no `GICC_DIR`, no virtualisation extension and no
-//! security extension; every interrupt is signalled as an IRQ.
+//! `GICC_CTLR` holds what a guest on the Pi can set there: EnableGrp0,
+//! EnableGrp1, AckCtl, FIQEn, CBPR and EOImode (0x21f; the bypass bits read
+//! as zero). With EOImode 0, `GICC_EOIR` drops the priority and deactivates
+//! the interrupt. With EOImode 1 it only drops the priority, and a write to
+//! `GICC_DIR` (offset 0x1000) deactivates. The priority drop clears the
+//! highest active priority whatever interrupt the write names, and only an
+//! active interrupt is deactivated; both measured on the Pi. CBPR makes
+//! `GICC_BPR` apply to group 1 too. AckCtl and FIQEn are held but change
+//! nothing: every interrupt is signalled as an IRQ and `GICC_IAR`
+//! acknowledges either group. There is no virtualisation extension and no
+//! security extension.
 //!
 //! The model knows nothing of the hypervisor. The backend routes guest MMIO
 //! here, drives device and timer lines, and asks [`Gicv2::irq_pending`]
 //! before each guest entry. A change that may give another vCPU an interrupt
-//! returns that vCPU in [`Outcome::wake`], and an end of interrupt returns
-//! the interrupt in [`Outcome::eoi`].
+//! returns that vCPU in [`Outcome::wake`], and a deactivation returns the
+//! interrupt in [`Outcome::deactivated`].
 
 use serde::{Deserialize, Serialize};
 
@@ -66,9 +74,10 @@ pub const SPURIOUS: u32 = 1023;
 pub const GICD_IIDR: u32 = 0x4b00_343b;
 /// `GICC_IIDR` as a guest on the Pi reads it.
 pub const GICC_IIDR: u32 = 0x0202_143b;
-/// The part of the CPU interface window that holds registers. The rest of
-/// the 64 KiB window reads as zero and ignores writes.
-pub const GICC_DECODED: u64 = 0x1000;
+/// The part of the CPU interface window that holds registers: the first
+/// 4 KiB and `GICC_DIR` at 0x1000, as on the Pi's GIC-400. The rest of the
+/// 64 KiB window reads as zero and ignores writes.
+pub const GICC_DECODED: u64 = 0x2000;
 
 /// Number of 32-interrupt words in a bit-per-interrupt register.
 const WORDS: usize = NR_IRQS / 32;
@@ -81,10 +90,17 @@ const CFG_EDGE_BITS: u32 = 0xaaaa_aaaa;
 const BPR_MIN: u32 = 2;
 /// The reset value of `GICC_ABPR`, also its minimum.
 const ABPR_MIN: u32 = 3;
-/// The `GICC_CTLR` bits that hold what is written: EnableGrp0, EnableGrp1
-/// and the four bypass-disable bits (5-8). AckCtl, FIQEn, CBPR and EOImode
-/// read as zero.
-const GICC_CTLR_MASK: u32 = 0x1e3;
+/// The `GICC_CTLR` bits that hold what is written: EnableGrp0 (0),
+/// EnableGrp1 (1), AckCtl (2), FIQEn (3), CBPR (4) and EOImode (9). A guest
+/// on the Pi that writes 0xffffffff reads 0x21f back, and so does KVM's
+/// userspace view (`scratchpad/portable/p1/review/gicc_probe.out`). The
+/// bypass bits 5-8 read as zero.
+const GICC_CTLR_MASK: u32 = 0x21f;
+/// `GICC_CTLR.CBPR`: `GICC_BPR` sets the group priority of both groups.
+const CTLR_CBPR: u32 = 1 << 4;
+/// `GICC_CTLR.EOImode`: `GICC_EOIR` only drops the priority, and
+/// `GICC_DIR` deactivates.
+const CTLR_EOIMODE: u32 = 1 << 9;
 /// The running priority of a CPU interface with nothing active.
 const IDLE_PRIORITY: u32 = 0xff;
 
@@ -122,6 +138,7 @@ mod gicc {
     pub const AHPPIR: u64 = 0x28;
     pub const APR: u64 = 0xd0;
     pub const IIDR: u64 = 0xfc;
+    pub const DIR: u64 = 0x1000;
 }
 
 /// What a guest access or a line change asks of the backend.
@@ -130,8 +147,9 @@ pub struct Outcome {
     /// The CPUs, one bit each, that now have an interrupt to take. The
     /// backend wakes each of them that is not the calling vCPU.
     pub wake: u8,
-    /// The interrupt a `GICC_EOIR` write just ended, if it ended one.
-    pub eoi: Option<u32>,
+    /// The interrupt a `GICC_EOIR` (EOImode 0) or `GICC_DIR` (EOImode 1)
+    /// write just deactivated, if it deactivated one.
+    pub deactivated: Option<u32>,
 }
 
 /// The distributor's state for the shared interrupts. Word 0 of each bit
@@ -296,7 +314,11 @@ impl Gicv2 {
     /// The group priority of `prio` for `irq` under `cpu`'s binary point.
     fn group_priority(&self, cpu: usize, irq: usize, prio: u8) -> u32 {
         let c = &self.cpus[cpu];
-        let bpr = if self.group(irq) == 0 { c.bpr } else { c.abpr };
+        let bpr = if self.group(irq) == 0 || c.ctlr & CTLR_CBPR != 0 {
+            c.bpr
+        } else {
+            c.abpr
+        };
         u32::from(prio) & (0xff << (bpr + 1)) & 0xff
     }
 
@@ -337,9 +359,10 @@ impl Gicv2 {
     }
 
     /// The highest-priority pending interrupt for `cpu` with its priority,
-    /// ignoring the priority mask and the running priority. Ties go to the
-    /// lowest ID.
+    /// among the groups `cpu`'s interface forwards, ignoring the priority
+    /// mask and the running priority. Ties go to the lowest ID.
     fn highest_pending(&self, cpu: usize) -> Option<(usize, u8)> {
+        let ctlr = self.cpus[cpu].ctlr;
         let mut best: Option<(usize, u8)> = None;
         for w in 0..WORDS {
             let mut bits = self.candidates(cpu, w);
@@ -347,6 +370,9 @@ impl Gicv2 {
                 let b = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let irq = w * 32 + b;
+                if ctlr & (1 << self.group(irq)) == 0 {
+                    continue;
+                }
                 let prio = self.priority(cpu, irq);
                 if best.map_or(true, |(_, p)| prio < p) {
                     best = Some((irq, prio));
@@ -356,19 +382,15 @@ impl Gicv2 {
         best
     }
 
-    /// The interrupt `cpu` would acknowledge now: the highest pending one,
-    /// when the distributor and the interface forward it and its priority
-    /// beats the priority mask and the running priority.
+    /// The interrupt `cpu` would acknowledge now: the highest pending one
+    /// the distributor and the interface forward, when its priority beats
+    /// the priority mask and the running priority.
     fn deliverable(&self, cpu: usize) -> Option<usize> {
         if self.dist.ctlr & 1 == 0 {
             return None;
         }
         let (irq, prio) = self.highest_pending(cpu)?;
         let c = &self.cpus[cpu];
-        let group_enable = 1 << self.group(irq);
-        if c.ctlr & group_enable == 0 {
-            return None;
-        }
         if u32::from(prio) >= c.pmr {
             return None;
         }
@@ -411,7 +433,7 @@ impl Gicv2 {
         }
         Outcome {
             wake: self.wake_of(self.dist.targets[irq]),
-            eoi: None,
+            deactivated: None,
         }
     }
 
@@ -433,7 +455,7 @@ impl Gicv2 {
         }
         Outcome {
             wake: self.wake_of(1 << cpu),
-            eoi: None,
+            deactivated: None,
         }
     }
 
@@ -572,7 +594,7 @@ impl Gicv2 {
         };
         Outcome {
             wake: self.wake_of(mask),
-            eoi: None,
+            deactivated: None,
         }
     }
 
@@ -629,14 +651,16 @@ impl Gicv2 {
                 if w >= 2 {
                     self.dist.icfgr[w] = value & CFG_EDGE_BITS;
                 }
-                0
+                // An edge interrupt made level whose line is high is now
+                // pending.
+                all
             }
             gicd::SGIR => self.send_sgi(cpu, value),
             _ => 0,
         };
         Outcome {
             wake: self.wake_of(mask),
-            eoi: None,
+            deactivated: None,
         }
     }
 
@@ -694,7 +718,7 @@ impl Gicv2 {
     /// Reads `width` bytes at `offset` of `cpu`'s interface.
     ///
     /// Reading `GICC_IAR` acknowledges an interrupt, so this takes the model
-    /// mutably.
+    /// mutably. `GICC_DIR` is write-only and reads as zero.
     pub fn cpu_read(&mut self, cpu: usize, offset: u64, _width: u8) -> u32 {
         if cpu >= self.cpus.len() || offset >= GICC_DECODED {
             return 0;
@@ -729,6 +753,14 @@ impl Gicv2 {
             gicc::BPR => c.bpr = (value & 7).max(BPR_MIN),
             gicc::ABPR => c.abpr = (value & 7).max(ABPR_MIN),
             gicc::EOIR => return self.end_of_interrupt(cpu, value),
+            gicc::DIR => {
+                // Deactivation is EOIR's job in EOImode 0, and a DIR write
+                // is then unpredictable; the model ignores it.
+                if c.ctlr & CTLR_EOIMODE == 0 {
+                    return Outcome::default();
+                }
+                return self.deactivate(cpu, value);
+            }
             o if (gicc::APR..gicc::APR + 0x10).contains(&o) => {
                 c.apr[((o - gicc::APR) / 4) as usize] = value;
             }
@@ -736,7 +768,7 @@ impl Gicv2 {
         }
         Outcome {
             wake: self.wake_of(1 << cpu),
-            eoi: None,
+            deactivated: None,
         }
     }
 
@@ -772,18 +804,42 @@ impl Gicv2 {
         value
     }
 
-    /// `GICC_EOIR`: drops the running priority and deactivates the
-    /// interrupt.
+    /// `GICC_EOIR`: drops the running priority and, in EOImode 0,
+    /// deactivates the interrupt.
+    ///
+    /// The drop clears the highest active priority, whichever interrupt the
+    /// write names and whether or not it is active. A guest on the Pi
+    /// measured that: an EOIR of an interrupt that was not active cleared
+    /// the active one's priority, and an EOIR of the lower of two nested
+    /// interrupts cleared the higher one's priority and deactivated the
+    /// lower (`scratchpad/portable/p1/review/eoi_probe.out`,
+    /// `eoi2_probe.out`).
     fn end_of_interrupt(&mut self, cpu: usize, value: u32) -> Outcome {
-        let irq = (value & 0x3ff) as usize;
-        if irq >= NR_IRQS {
-            return Outcome::default();
-        }
-        // The priority drop clears the highest active priority, which is
-        // the interrupt's own when the guest ends interrupts in order.
         let c = &mut self.cpus[cpu];
         if c.apr[0] != 0 {
             c.apr[0] &= c.apr[0] - 1;
+        }
+        if c.ctlr & CTLR_EOIMODE != 0 {
+            return Outcome {
+                wake: self.wake_of(1 << cpu),
+                deactivated: None,
+            };
+        }
+        self.deactivate(cpu, value)
+    }
+
+    /// Deactivates the interrupt `value` names on `cpu`, if it is active.
+    ///
+    /// A level interrupt's latch ends with it. An interrupt that is not
+    /// active is left as it is: on the Pi, an EOIR naming one changed
+    /// nothing but the priority.
+    fn deactivate(&mut self, cpu: usize, value: u32) -> Outcome {
+        let irq = (value & 0x3ff) as usize;
+        if irq >= NR_IRQS || !self.is_active(cpu, irq as u32) {
+            return Outcome {
+                wake: self.wake_of(1 << cpu),
+                deactivated: None,
+            };
         }
         let level = !self.is_edge(irq);
         let mut mask = 1 << cpu;
@@ -802,7 +858,19 @@ impl Gicv2 {
         }
         Outcome {
             wake: self.wake_of(mask),
-            eoi: Some(irq as u32),
+            deactivated: Some(irq as u32),
+        }
+    }
+
+    /// Returns whether interrupt `intid` is active on `cpu`: banked for
+    /// SGIs and PPIs, shared for SPIs.
+    #[must_use]
+    pub fn is_active(&self, cpu: usize, intid: u32) -> bool {
+        let irq = intid as usize;
+        match self.cpus.get(cpu) {
+            Some(c) if irq < 32 => c.active0 & (1 << irq) != 0,
+            Some(_) if irq < NR_IRQS => bit(&self.dist.active, irq),
+            _ => false,
         }
     }
 
@@ -1144,10 +1212,159 @@ mod tests {
         assert_eq!(gic.cpu_read(0, gicc::BPR, 4), 2);
         gic.cpu_write(0, gicc::PMR, 4, 0xff);
         assert_eq!(gic.cpu_read(0, gicc::PMR, 4), 0xf8);
+        // A guest on the Pi reads 0x21f after writing all ones
+        // (review/gicc_probe.out): no bypass bits, EOImode kept.
         gic.cpu_write(0, gicc::CTLR, 4, 0xffff_ffff);
-        assert_eq!(gic.cpu_read(0, gicc::CTLR, 4), 0x1e3);
+        assert_eq!(gic.cpu_read(0, gicc::CTLR, 4), 0x21f);
         assert_eq!(gic.cpu_read(0, gicc::RPR, 4), 0xff);
-        assert_eq!(gic.cpu_read(0, 0x1000, 4), 0);
+        // GICC_DIR is write-only; past it the window is empty.
+        assert_eq!(gic.cpu_read(0, gicc::DIR, 4), 0);
+        assert_eq!(gic.cpu_read(0, 0x2000, 4), 0);
+    }
+
+    /// EOImode 1 as a guest on the Pi saw it (review/gicc_probe.out): EOIR
+    /// drops the priority and leaves the interrupt active, DIR deactivates.
+    #[test]
+    fn eoimode_1_splits_priority_drop_from_deactivation() {
+        let mut gic = Gicv2::new(1);
+        linux_init(&mut gic);
+        gic.cpu_write(0, gicc::PMR, 4, 0xf8);
+        gic.cpu_write(0, gicc::CTLR, 4, 0x201);
+        assert_eq!(gic.cpu_read(0, gicc::CTLR, 4), 0x201);
+        make_edge(&mut gic, 40);
+        enable(&mut gic, 0, 40);
+        gic.set_spi_line(40, true);
+        gic.set_spi_line(40, false);
+        assert_eq!(iar(&mut gic, 0), 40);
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0x0010_0000);
+        let out = eoi(&mut gic, 0, 40);
+        assert_eq!(out.deactivated, None);
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0);
+        assert_eq!(gic.cpu_read(0, gicc::RPR, 4), 0xff);
+        assert!(gic.is_active(0, 40));
+        let out = gic.cpu_write(0, gicc::DIR, 4, 40);
+        assert_eq!(out.deactivated, Some(40));
+        assert!(!gic.is_active(0, 40));
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0);
+    }
+
+    #[test]
+    fn dir_does_nothing_in_eoimode_0() {
+        let mut gic = Gicv2::new(1);
+        linux_init(&mut gic);
+        enable(&mut gic, 0, 40);
+        gic.set_spi_line(40, true);
+        assert_eq!(iar(&mut gic, 0), 40);
+        let out = gic.cpu_write(0, gicc::DIR, 4, 40);
+        assert_eq!(out, Outcome::default());
+        assert!(gic.is_active(0, 40));
+    }
+
+    /// An EOIR naming an interrupt that is not active drops the running
+    /// priority anyway and deactivates nothing (review/eoi_probe.out).
+    #[test]
+    fn eoir_of_an_inactive_interrupt_drops_the_priority_only() {
+        let mut gic = Gicv2::new(1);
+        linux_init(&mut gic);
+        gic.cpu_write(0, gicc::PMR, 4, 0xf8);
+        make_edge(&mut gic, 40);
+        enable(&mut gic, 0, 40);
+        enable(&mut gic, 0, 41);
+        // A level SPI with a software latch: an EOIR naming it while it is
+        // not active must not clear the latch.
+        gic.dist_write(0, gicd::ISPENDR + 4, 4, 1 << 9);
+        set_prio(&mut gic, 0, 41, 0xc0);
+        gic.set_spi_line(40, true);
+        assert_eq!(iar(&mut gic, 0), 40);
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0x0010_0000);
+        let out = eoi(&mut gic, 0, 41);
+        assert_eq!(out.deactivated, None);
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0);
+        assert!(gic.is_active(0, 40));
+        assert_eq!(gic.dist_read(0, gicd::ISPENDR + 4, 4), 1 << 9);
+    }
+
+    /// Ending the lower of two nested interrupts first clears the higher
+    /// one's priority and deactivates the lower (review/eoi2_probe.out).
+    #[test]
+    fn out_of_order_eoir_drops_the_highest_priority() {
+        let mut gic = Gicv2::new(1);
+        linux_init(&mut gic);
+        gic.cpu_write(0, gicc::PMR, 4, 0xf8);
+        make_edge(&mut gic, 40);
+        make_edge(&mut gic, 41);
+        enable(&mut gic, 0, 40);
+        enable(&mut gic, 0, 41);
+        set_prio(&mut gic, 0, 41, 0x80);
+        gic.set_spi_line(40, true);
+        assert_eq!(iar(&mut gic, 0), 40);
+        gic.set_spi_line(41, true);
+        assert_eq!(iar(&mut gic, 0), 41);
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0x0011_0000);
+        let out = eoi(&mut gic, 0, 40);
+        assert_eq!(out.deactivated, Some(40));
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0x0010_0000);
+        assert_eq!(gic.cpu_read(0, gicc::RPR, 4), 0xa0);
+        assert!(!gic.is_active(0, 40));
+        assert!(gic.is_active(0, 41));
+        eoi(&mut gic, 0, 41);
+        assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0);
+        assert!(!gic.is_active(0, 41));
+    }
+
+    /// A pending interrupt in a group the interface does not forward hides
+    /// no lower-priority interrupt of a group it does.
+    #[test]
+    fn a_disabled_group_does_not_hide_an_enabled_one() {
+        let mut gic = Gicv2::new(1);
+        linux_init(&mut gic);
+        enable(&mut gic, 0, 40);
+        enable(&mut gic, 0, 41);
+        // SPI 40 in group 1 at the highest priority; only group 0 is on.
+        gic.dist_write(0, gicd::IGROUPR + 4, 4, 1 << 8);
+        set_prio(&mut gic, 0, 40, 0x00);
+        gic.set_spi_line(40, true);
+        gic.set_spi_line(41, true);
+        assert!(gic.irq_pending(0));
+        assert_eq!(gic.cpu_read(0, gicc::HPPIR, 4), 41);
+        assert_eq!(iar(&mut gic, 0), 41);
+        eoi(&mut gic, 0, 41);
+        gic.set_spi_line(41, false);
+        // Group 1 on: SPI 40 is taken.
+        gic.cpu_write(0, gicc::CTLR, 4, 0b11);
+        assert_eq!(iar(&mut gic, 0), 40);
+    }
+
+    /// With CBPR set, `GICC_BPR` gives group 1 its group priority.
+    #[test]
+    fn cbpr_applies_the_binary_point_to_group_1() {
+        let mut gic = Gicv2::new(1);
+        linux_init(&mut gic);
+        gic.dist_write(0, gicd::IGROUPR + 4, 4, 1 << 8);
+        gic.cpu_write(0, gicc::CTLR, 4, 0b11);
+        // ABPR 3 keeps priority bits 7:4 for group 1: 0x88 is group 0x80.
+        assert_eq!(gic.group_priority(0, 40, 0x88), 0x80);
+        gic.cpu_write(0, gicc::CTLR, 4, 0b11 | CTLR_CBPR);
+        // BPR 2 keeps bits 7:3.
+        assert_eq!(gic.group_priority(0, 40, 0x88), 0x88);
+    }
+
+    /// An SPI whose line is high and that becomes level-triggered is
+    /// pending at once, and its target is woken.
+    #[test]
+    fn making_a_high_line_level_wakes_its_target() {
+        let mut gic = Gicv2::new(2);
+        linux_init(&mut gic);
+        gic.dist_write(0, gicd::ITARGETSR + 40, 1, 0b10);
+        enable(&mut gic, 0, 40);
+        make_edge(&mut gic, 40);
+        gic.set_spi_line(40, true);
+        assert_eq!(iar(&mut gic, 1), 40);
+        eoi(&mut gic, 1, 40);
+        assert!(!gic.irq_pending(1));
+        // The line is still high; edge to level makes it pending again.
+        let out = gic.dist_write(0, gicd::ICFGR + 8, 4, 0);
+        assert_eq!(out.wake, 0b10);
     }
 
     #[test]
@@ -1173,7 +1390,7 @@ mod tests {
         assert_eq!(gic.cpu_read(0, gicc::RPR, 4), 0xa0);
         assert_eq!(gic.cpu_read(0, gicc::APR, 4), 1 << (0xa0 >> 3));
         let out = eoi(&mut gic, 0, 34);
-        assert_eq!(out.eoi, Some(34));
+        assert_eq!(out.deactivated, Some(34));
         assert_eq!(gic.cpu_read(0, gicc::APR, 4), 0);
         assert!(gic.irq_pending(0));
         gic.set_spi_line(34, false);
@@ -1361,7 +1578,7 @@ mod tests {
         assert!(!gic.irq_pending(0));
         assert_eq!(iar(&mut gic, 1), 27);
         let out = eoi(&mut gic, 1, 27);
-        assert_eq!(out.eoi, Some(27));
+        assert_eq!(out.deactivated, Some(27));
         // Level: still high, so pending again.
         assert!(gic.irq_pending(1));
         gic.set_ppi_line(1, 27, false);

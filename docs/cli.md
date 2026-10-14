@@ -67,6 +67,8 @@ including a typo, silently runs the plain test.
 | `--dump-after <secs>` | none | Dump automatically after this long. Needs `--dump-memory`. `0` becomes 1. |
 | `--trace-io <path>` | none | Attach the I/O tracer. |
 | `--no-sandbox` | off | Boot unconfined. For debugging the profile or the filters. |
+| `--profile <name>` | `native` | The machine the guest gets: `native` or `portable-arm64-v1`. See [portable-profile.md](portable-profile.md). |
+| `--no-arch-timer-irq` | off | Give the devicetree's `/timer` a fixed `clock-frequency` of 54 MHz and no interrupts. Needs `--profile portable-arm64-v1`. A stock kernel then has no clock event and stops at its first timed sleep. |
 
 ### Parsing behaviour
 
@@ -116,16 +118,29 @@ are three behaviours, not two.
 | `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
+| `--profile portable-arm64-v1`, `--no-arch-timer-irq` | acted on | **refused**, boot fails | **refused**, boot fails |
+| `--fs`, `--share-ro`, `--share-rw` with `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
+| `--no-arch-timer-irq` without `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
 | everything else | acted on | acted on | acted on |
 
-Two of those errors appear **after** `booting <kernel> with <N> MiB ...` has
-printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` and `--fs socket=` on macOS, and `--fs path=`, `--share-ro` and
-`--share-rw` on either Linux backend.
+Every refusal in that table appears **after** `booting <kernel> with <N> MiB
+...` has printed, because it is raised inside the backend rather than at parse
+time. The last two are checked by every backend, so a program that embeds hvi
+gets them too:
 
 ```text
 booting Image with 512 MiB ...
 hvi: --net-tap tap0: no /dev/net/tun on macOS; use --net-gateway
+```
+
+```text
+booting Image with 512 MiB ...
+hvi: --fs/--share-ro/--share-rw are not part of --profile portable-arm64-v1: a portable guest keeps its storage on virtio-blk
+```
+
+```text
+booting Image with 512 MiB ...
+hvi: --no-arch-timer-irq needs --profile portable-arm64-v1
 ```
 
 Unknown flags are the one class caught before anything prints.
@@ -149,6 +164,7 @@ hvi: virtio-fs export /path/to/missing: No such file or directory (os error 2)
 hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>
+hvi: unknown machine profile "portable"; expected native or portable-arm64-v1
 hvi: unknown boot arg "--nope"
 ```
 
@@ -371,6 +387,14 @@ booting Image with 1024 MiB ...
 [hvi] seatbelt sandbox: on (deny default)
 ```
 
+Under `--profile portable-arm64-v1` the GIC line names the software GICv2,
+and the boot vCPU logs the CPU baseline it gave every vCPU:
+
+```text
+[hvi] 1 vCPU(s)  profile portable-arm64-v1  software GICv2: GICD 0x8000000+0x10000  GICC 0x8010000+0x10000  UART 0xc000000
+[hvi] portable-arm64-v1 CPU baseline: MIDR_EL1=0x414fd0b1 ID_AA64PFR0_EL1=0x1100000010110011 ... (host CTR_EL0=0x99444c004 DCZID_EL0=0x4, not settable)
+```
+
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
 share is configured, because the limit is raised while the first share is set
 up.
@@ -384,7 +408,9 @@ guest stopped: SystemOff
 
 ## vCPU limits
 
-hvi has three caps. On Linux/arm64 a vGICv2 host takes at most 8 vCPUs:
+hvi has three caps. The GICv2 one takes at most 8 vCPUs: on Linux/arm64 when the
+host offers only a vGICv2, and on macOS under `--profile portable-arm64-v1`,
+whose software GICv2 addresses at most 8 CPUs:
 
 ```text
 this host offers only vGICv2, which supports at most 8 vCPUs (asked for 16)

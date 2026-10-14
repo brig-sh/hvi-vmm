@@ -22,3 +22,6 @@ wronly = "wronly"
 sme = "sme"
 # mke2fs, the e2fsprogs tool that makes the ext4 disk the checkpoint e2e uses.
 mke = "mke"
+# numer, the numerator field of macOS's mach_timebase_info_data_t, which the
+# portable profile's virtual timer converts counter ticks with.
+numer = "numer"

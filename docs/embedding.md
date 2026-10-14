@@ -98,7 +98,7 @@ KVM restore yet.
 ## A minimal caller
 
 ```rust
-use hvi::config::BootConfig;
+use hvi::config::{BootConfig, MachineProfileKind};
 
 let cfg = BootConfig {
     kernel: std::fs::read("Image")?,
@@ -121,6 +121,8 @@ let cfg = BootConfig {
     checkpoint_root: None,
     plugin: None,
     sandbox: true,
+    profile: MachineProfileKind::Native,
+    arch_timer_irq: true,
     stop: None,
 };
 
@@ -147,9 +149,9 @@ cargo build --release --example watch_guest
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
-| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
-| `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
-| `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
+| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. More than one **fails the boot** under `PortableArm64V1`, and a checkpoint or a move takes a guest of exactly one writable disk. |
+| `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. A non-empty vector **fails the boot** under `PortableArm64V1`. |
+| `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. A non-empty vector **fails the boot** under `PortableArm64V1`. |
 | `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |
@@ -163,6 +165,8 @@ cargo build --release --example watch_guest
 | `checkpoint_root` | `Option<String>` | The directory a `checkpoint` may write bundles under; `None` refuses every checkpoint. Resolved before confinement. Seatbelt holds writes to it on macOS; on Linux only hvi's own path check does. One private root (mode 0700) per sandbox: bundles hold guest RAM in clear. Needs `control_sock`. See [checkpoint.md](checkpoint.md#confinement). |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
+| `profile` | `MachineProfileKind` | `Native`, or `PortableArm64V1` for one machine on every host. macOS only for now. See [portable-profile.md](portable-profile.md). |
+| `arch_timer_irq` | `bool` | Leave it `true`. `false` gives `/timer` no interrupts, and only `PortableArm64V1` accepts it. |
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
 
 `FsShare` carries a `path`, a `tag`, a `ShareMode`, a `CachePolicy` and the
