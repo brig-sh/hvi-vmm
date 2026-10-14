@@ -51,6 +51,10 @@ pub const MAX_PROFILE_BYTES: usize = 64 * 1024;
 /// The value of a build or host identifier that could not be read.
 pub const UNKNOWN: &str = "unknown";
 
+/// The suffix of the commit of an hvi built from a tree with uncommitted
+/// changes. No profile check accepts it.
+pub const DIRTY: &str = "-dirty";
+
 /// What a guest was built against. See the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineProfile {
@@ -97,8 +101,8 @@ pub struct MachineProfile {
 pub struct HviBuild {
     /// The crate version.
     pub version: String,
-    /// The commit, with `-dirty` for a tree with uncommitted changes, or
-    /// [`UNKNOWN`].
+    /// The commit, with [`DIRTY`] appended for a tree with uncommitted
+    /// changes, or [`UNKNOWN`].
     pub git_sha: String,
 }
 
@@ -289,6 +293,14 @@ impl MachineProfile {
             if p.hvi_build.git_sha == UNKNOWN {
                 why.push(format!(
                     "hvi_build.git_sha: the {side}'s hvi does not know its commit"
+                ));
+            }
+            // Two different sets of uncommitted changes on one commit record
+            // the same sha, and device state is only defined by the code that
+            // wrote it.
+            if p.hvi_build.git_sha.ends_with(DIRTY) {
+                why.push(format!(
+                    "hvi_build.git_sha: the {side}'s hvi was built with uncommitted changes"
                 ));
             }
             if p.cpu.ident.is_none() {
@@ -947,6 +959,22 @@ mod tests {
         assert!(reasons(&a, &a)
             .iter()
             .any(|w| w.starts_with("firmware.boot_params_sha256: the source")));
+    }
+
+    // The suffix says only that the tree had changes, not which, so two
+    // builds that both carry it are not known to be the same code.
+    #[test]
+    fn a_build_with_uncommitted_changes_never_matches() {
+        let mut dirty = sample();
+        dirty.hvi_build.git_sha += DIRTY;
+        let why = reasons(&dirty, &dirty);
+        assert_eq!(
+            why,
+            [
+                "hvi_build.git_sha: the source's hvi was built with uncommitted changes",
+                "hvi_build.git_sha: the destination's hvi was built with uncommitted changes",
+            ]
+        );
     }
 
     #[test]
