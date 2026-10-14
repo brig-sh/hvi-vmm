@@ -82,6 +82,19 @@ pub const BLK_STATE_VERSION: u32 = 1;
 /// a 32 KiB bitmap and a block is 128 sectors.
 pub const DIRTY_BLOCK_BYTES: u64 = 64 << 10;
 
+/// The largest disk whose blocks written since boot a checkpoint records,
+/// 4 TiB. Its bitmap is 8 MiB, 11,184,812 characters of base64, which the
+/// 12 MiB limit on `disk.json` holds with room for the rest of the document.
+/// A disk with a base digest (`--disk-base-sha256`) must be no larger, so a
+/// move by its blocks always carries the bitmap on; a larger disk without
+/// one is checkpointed without it.
+pub const MAX_BITMAP_DISK_BYTES: u64 = 4 << 40;
+
+/// The most rounds [`VirtioBlk::read_dirty`] reads after a round 0, so the
+/// list of rounds a device keeps, and `disk.json` records, stays small. A
+/// move takes a handful; a mover that needs more starts over at round 0.
+pub const MAX_ROUNDS: usize = 1024;
+
 /// A bitmap of a disk's [`DIRTY_BLOCK_BYTES`] blocks.
 ///
 /// Bit `i` is bit `i % 8` of byte `i / 8`, as in a checkpoint's `ram.map`,
@@ -465,6 +478,30 @@ impl VirtioBlk {
         Ok(dev)
     }
 
+    /// Opens `path` as [`open`](Self::open) does, for a boot that was given
+    /// the digest of the disk's base image when `has_base`.
+    ///
+    /// # Errors
+    ///
+    /// Errors as [`open`](Self::open) does, and when `has_base` and the disk
+    /// is larger than [`MAX_BITMAP_DISK_BYTES`]: a checkpoint could not
+    /// record the blocks it wrote since boot, which a move by its blocks
+    /// needs.
+    pub fn open_with_base(path: &str, has_base: bool) -> std::io::Result<Self> {
+        let dev = Self::open(path)?;
+        if has_base && dev.size_bytes() > MAX_BITMAP_DISK_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "--disk-base-sha256: {path} is {} bytes, and a move by its blocks takes a \
+                     disk of at most 4 TiB",
+                    dev.size_bytes()
+                ),
+            ));
+        }
+        Ok(dev)
+    }
+
     /// Releases the disk's lock, so another hvi may open the disk while
     /// this one still has it open. Returns whether there was a lock.
     ///
@@ -578,7 +615,8 @@ impl VirtioBlk {
     ///
     /// # Errors
     ///
-    /// Errors when a round is asked for before round 0, or past the 2^32nd.
+    /// Errors when a round is asked for before round 0, or past the
+    /// [`MAX_ROUNDS`]th after it.
     pub fn read_dirty(&mut self, since: DirtySince) -> std::io::Result<DirtyRead> {
         let (round, dirty) = match since {
             DirtySince::Boot => {
@@ -592,10 +630,13 @@ impl VirtioBlk {
                         "no round 0 yet: read the blocks since boot first"
                     )));
                 };
-                let round = last
-                    .round
-                    .checked_add(1)
-                    .ok_or_else(|| invalid(format_args!("too many rounds")))?;
+                if self.dirty.rounds.len() > MAX_ROUNDS {
+                    return Err(invalid(format_args!(
+                        "{MAX_ROUNDS} rounds were read after round 0: read the blocks since \
+                         boot to start over"
+                    )));
+                }
+                let round = last.round + 1;
                 (round, self.dirty.since_read.take())
             }
         };
@@ -2087,5 +2128,43 @@ mod dirty_tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("covers 5 blocks"), "{err}");
+    }
+
+    // A mover that keeps reading rounds cannot grow the list without
+    // bound: past the cap it starts over at round 0.
+    #[test]
+    fn rounds_stop_at_the_cap_until_round_0_is_read_again() {
+        let disk = Disk::new("cap");
+        let mut blk = VirtioBlk::open(disk.path()).unwrap();
+        blk.read_dirty(DirtySince::Boot).unwrap();
+        for want in 1..=MAX_ROUNDS as u32 {
+            assert_eq!(blk.read_dirty(DirtySince::Round).unwrap().round, want);
+        }
+        let err = blk.read_dirty(DirtySince::Round).unwrap_err();
+        assert!(err.to_string().contains("start over"), "{err}");
+        assert_eq!(blk.rounds().len(), MAX_ROUNDS + 1);
+        assert_eq!(blk.read_dirty(DirtySince::Boot).unwrap().round, 0);
+        assert_eq!(blk.read_dirty(DirtySince::Round).unwrap().round, 1);
+    }
+
+    // A disk with a base must be one whose bitmap a checkpoint can hold.
+    #[test]
+    fn a_disk_over_4_tib_takes_no_base() {
+        let path = std::env::temp_dir().join(format!("hvi-blk-4tib-{}.img", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let sized = |len: u64| {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(len).unwrap();
+        };
+        sized(MAX_BITMAP_DISK_BYTES);
+        let blk = VirtioBlk::open_with_base(&path, true).unwrap();
+        assert_eq!(blk.dirty_since_boot().blocks(), 1 << 26);
+        drop(blk);
+        sized(MAX_BITMAP_DISK_BYTES + DIRTY_BLOCK_BYTES);
+        let err = VirtioBlk::open_with_base(&path, true).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("at most 4 TiB"), "{err}");
+        assert!(VirtioBlk::open_with_base(&path, false).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 }

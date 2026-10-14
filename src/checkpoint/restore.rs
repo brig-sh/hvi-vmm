@@ -1160,11 +1160,15 @@ pub(crate) mod tests {
     /// Makes `parts` a guest booted from a base image, whose source read
     /// rounds at the generations `rounds` and was captured at `generation`.
     fn moved(parts: &mut Parts, rounds: &[u64], generation: u64) {
-        use crate::devices::virtio::block::DiskRound;
+        use crate::devices::virtio::block::{DirtyBlocks, DiskRound, DIRTY_BLOCK_BYTES};
         let base = "ab".repeat(32);
         parts.profile.disk_base_sha256 = Some(base.clone());
         let disk = parts.disk.as_mut().unwrap();
         disk.base_sha256 = Some(base);
+        disk.block_size = Some(DIRTY_BLOCK_BYTES);
+        disk.dirty_since_boot_b64 = Some(crate::checkpoint::platform::base64_encode(
+            DirtyBlocks::for_size(disk.size_bytes).as_bytes(),
+        ));
         disk.generation = generation;
         disk.rounds = (0u32..)
             .zip(rounds)
