@@ -55,6 +55,7 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::{hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
@@ -511,6 +512,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         },
         net_source,
         profile,
+        Console::Pl011 {
+            uart: Arc::clone(&shared.pl011),
+            rtc: Some(Arc::clone(&shared.rtc)),
+        },
     )?;
     vhost_user::start_interrupt_threads(&shared.fs, &mut io_threads);
 

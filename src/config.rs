@@ -636,9 +636,13 @@ pub struct BootConfig {
     /// The directory a `checkpoint` on the control socket may write its
     /// bundle under, or `None` to refuse every `checkpoint`.
     ///
-    /// It must exist. It is resolved before confinement, and the confinement
-    /// grants writes below it and nowhere else: Seatbelt with a subtree rule,
-    /// seccomp with a filter of its own for the control socket's thread. It
+    /// It must exist, and should be private to this sandbox: mode 0700, never
+    /// shared, since a bundle holds guest RAM in clear. It is resolved before
+    /// confinement. On macOS a Seatbelt subtree rule holds every write to it
+    /// and the writable shares. On Linux the control socket's thread gets a
+    /// seccomp filter of its own with the file calls a bundle needs, but
+    /// seccomp cannot filter paths: that thread can write wherever the uid
+    /// can, and only hvi's own path check keeps bundles below the root. It
     /// needs `control_sock`.
     pub checkpoint_root: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.

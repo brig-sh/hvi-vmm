@@ -167,6 +167,11 @@ pub struct VirtioBlk {
     /// synchronous stderr write per request — ruinous under fio). Enable with
     /// `HVI_BLK_TRACE=1`; the structured ledger still records every request.
     trace: bool,
+    /// The writes and flushes served since the device was built.
+    ///
+    /// A checkpoint records it, so two captures of one run can tell whether
+    /// the guest changed the disk between them without reading the image.
+    generation: u64,
 }
 
 /// Size in bytes of whatever is behind `file`.
@@ -358,6 +363,7 @@ impl VirtioBlk {
             serial: id,
             serial_text: Arc::from(serial),
             trace: std::env::var_os("HVI_BLK_TRACE").is_some(),
+            generation: 0,
         })
     }
 
@@ -389,6 +395,30 @@ impl VirtioBlk {
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
         self.sync_irq();
+    }
+
+    /// Returns the number of writes and flushes the device has served.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the size of the disk in bytes, as the guest was told it.
+    #[must_use]
+    pub fn size_bytes(&self) -> u64 {
+        self.capacity_sectors * SECTOR
+    }
+
+    /// Writes the disk's data to stable storage, as a guest flush does.
+    ///
+    /// A checkpoint calls it with the guest parked, so the image another host
+    /// reads holds every write the guest was told had completed.
+    ///
+    /// # Errors
+    ///
+    /// Errors as `fdatasync` does.
+    pub fn sync_data(&self) -> std::io::Result<()> {
+        self.file.sync_data()
     }
 
     /// Returns what a checkpoint keeps of the device.
@@ -695,11 +725,13 @@ impl VirtioBlk {
                 }
                 self.file.write_all_at(&buf, base).map_err(other)?;
                 data_bytes = total as u64;
+                self.generation += 1;
                 VIRTIO_BLK_S_OK
             }
             VIRTIO_BLK_T_FLUSH => {
                 // Honour the guest's cache flush (durability for fsync).
                 self.file.sync_data().map_err(other)?;
+                self.generation += 1;
                 VIRTIO_BLK_S_OK
             }
             VIRTIO_BLK_T_GET_ID => {
@@ -1358,6 +1390,36 @@ mod capacity_tests {
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, u64::MAX / 256, 16);
         assert_eq!(st, VIRTIO_BLK_S_IOERR);
         assert_eq!(std::fs::metadata(&r.path).unwrap().len(), 512);
+    }
+
+    // A checkpoint compares the counter across captures to tell whether the
+    // disk changed, so a read or a refused write must not move it.
+    #[test]
+    fn writes_and_flushes_advance_the_generation() {
+        let (_r, mut blk) = rig("gen");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        assert_eq!(blk.generation(), 0);
+        assert_eq!(blk.size_bytes(), 512);
+        assert_eq!(
+            submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 0, 16),
+            VIRTIO_BLK_S_OK
+        );
+        assert_eq!(
+            submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 16),
+            VIRTIO_BLK_S_OK
+        );
+        assert_eq!(blk.generation(), 1);
+        assert_eq!(
+            submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, 131_072, 16),
+            VIRTIO_BLK_S_IOERR
+        );
+        assert_eq!(blk.generation(), 1);
+        assert_eq!(
+            submit(&mut blk, &mem, VIRTIO_BLK_T_FLUSH, 0, 16),
+            VIRTIO_BLK_S_OK
+        );
+        assert_eq!(blk.generation(), 2);
+        blk.sync_data().unwrap();
     }
 
     /// The last sector inside the capacity still works, so the bound is not

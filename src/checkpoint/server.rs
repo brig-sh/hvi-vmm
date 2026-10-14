@@ -28,6 +28,15 @@
 //! some thread running would be no pause. `resume` releases them in the other
 //! order, so a released I/O thread never meets a parked guest that cannot
 //! take its interrupt.
+//!
+//! `checkpoint` pauses the same way, or finds the VM paused already, then
+//! asks every vCPU to export its state on its own thread and waits for all of
+//! them within the same deadline. With everything still it writes the
+//! bundle (see [`capture`]) and seals it. A failure at any
+//! step before the seal leaves the VM as the request found it: running, or
+//! paused if a client had paused it. After the seal, `then: "continue"`
+//! does the same, and `then: "fence"` leaves the VM paused for good: `status`
+//! says `fenced`, `resume` is refused, and only `stop` ends it.
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -36,12 +45,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::bundle::{resolve_in_root, BundleWriter};
+use crate::checkpoint::capture::{self, Capture, Console};
 use crate::checkpoint::control::{
-    format_response, parse_request, Error, ErrorCode, Request, Response, VmState, MAX_LINE,
+    format_response, parse_request, CheckpointStats, Error, ErrorCode, Request, Response, Then,
+    VmState, MAX_LINE,
 };
-use crate::checkpoint::profile::ProfileCell;
+use crate::checkpoint::cpu::VcpuState;
+use crate::checkpoint::profile::{MachineProfile, ProfileCell};
 use crate::devices::virtio::vsock::retry_read;
-use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus};
+use crate::hypervisor::guest::Guest;
+use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus, WorkResult};
 use crate::teardown::{PauseGate, StopToken};
 use crate::LOG_PREFIX;
 
@@ -60,9 +74,48 @@ pub(crate) struct ControlSocket {
     listener: UnixListener,
     /// The profile `profile` answers with.
     profile: Arc<ProfileCell>,
-    /// The resolved directory a `checkpoint` may write under, when the run
-    /// has one.
-    checkpoint_root: Option<std::path::PathBuf>,
+    /// The directory a `checkpoint` may write under, when the run has one.
+    checkpoint_root: Option<CheckpointRoot>,
+    /// What only the backend knows of a capture, once it has said.
+    parts: Option<CaptureParts>,
+}
+
+/// The checkpoint root, resolved, and as the operator spelled it.
+#[derive(Clone)]
+struct CheckpointRoot {
+    /// The resolved path, which confinement grants and every bundle is
+    /// written below.
+    resolved: std::path::PathBuf,
+    /// The path as given, made absolute. A caller that names the root one
+    /// way at boot names its bundles the same way, and on macOS `/tmp` and
+    /// `/var` are links to `/private`.
+    given: std::path::PathBuf,
+}
+
+impl CheckpointRoot {
+    /// Returns the bundle directory `dir` names, below the resolved root.
+    ///
+    /// A `dir` spelled from the root as given is first respelled from the
+    /// resolved root, so the writes land in the tree the confinement grants
+    /// and a later change to a link on the given path cannot move them.
+    fn bundle_dir(&self, dir: &str) -> std::io::Result<std::path::PathBuf> {
+        let respelled = std::path::Path::new(dir)
+            .strip_prefix(&self.given)
+            .ok()
+            .filter(|_| self.given != self.resolved)
+            .map(|rest| self.resolved.join(rest).to_string_lossy().into_owned());
+        resolve_in_root(&self.resolved, respelled.as_deref().unwrap_or(dir))
+    }
+}
+
+/// What only the backend knows of a capture, beside what [`Guest`] holds.
+struct CaptureParts {
+    /// `hvf` or `kvm`.
+    backend: &'static str,
+    /// The path the disk was opened at.
+    disk_path: Option<String>,
+    /// The console devices.
+    console: Console,
 }
 
 impl ControlSocket {
@@ -99,7 +152,8 @@ impl ControlSocket {
                         format!("--checkpoint-root {root}: not a directory"),
                     ));
                 }
-                Ok(resolved)
+                let given = std::env::current_dir()?.join(root).components().collect();
+                Ok(CheckpointRoot { resolved, given })
             })
             .transpose()?;
         match std::fs::symlink_metadata(path) {
@@ -126,19 +180,74 @@ impl ControlSocket {
             listener,
             profile,
             checkpoint_root,
+            parts: None,
+        })
+    }
+
+    /// Gives the socket what it needs to capture the guest beside what the
+    /// guest holds: the backend's name, the disk's path and the console.
+    #[must_use]
+    pub(crate) fn capturing(
+        mut self,
+        backend: &'static str,
+        disk_path: Option<String>,
+        console: Console,
+    ) -> Self {
+        self.parts = Some(CaptureParts {
+            backend,
+            disk_path,
+            console,
+        });
+        self
+    }
+
+    /// Returns what a `checkpoint` captures of `guest`, when the run has a
+    /// checkpoint root and the backend said how.
+    pub(crate) fn capture_of<K>(&self, guest: &Guest<K>) -> Option<Capture> {
+        self.checkpoint_root.as_ref()?;
+        let parts = self.parts.as_ref()?;
+        Some(Capture {
+            arch: guest.arch,
+            backend: parts.backend,
+            sandbox_id: guest.sandbox_id.clone(),
+            ram: Arc::clone(&guest.ram),
+            // A checkpoint carries disk 0, the guest's only disk whenever
+            // the profile lets it be captured.
+            block: guest.disks.first().map(|disk| {
+                (
+                    Arc::clone(&disk.dev),
+                    parts.disk_path.clone().unwrap_or_default(),
+                )
+            }),
+            net: guest.net.clone(),
+            vsock: guest.vsock.clone(),
+            console: parts.console.clone(),
+            #[cfg(test)]
+            after_component: None,
         })
     }
 
     /// Returns the resolved checkpoint root, when the run has one.
     pub(crate) fn checkpoint_root(&self) -> Option<&std::path::Path> {
-        self.checkpoint_root.as_deref()
+        self.checkpoint_root
+            .as_ref()
+            .map(|root| root.resolved.as_path())
     }
 
     /// Serves connections until `stop` is requested.
     ///
     /// `gate` is the I/O threads' pause gate and `vcpus` the VM's vCPUs.
-    pub(crate) fn run<K: Kick>(self, stop: &StopToken, gate: &PauseGate, vcpus: &Vcpus<K>) {
-        self.run_with(stop, gate, vcpus, CONTROL_TIMEOUT);
+    /// `capture` is what a `checkpoint` writes, from
+    /// [`capture_of`](Self::capture_of); without it every `checkpoint` is
+    /// refused.
+    pub(crate) fn run<K: Kick>(
+        self,
+        stop: &StopToken,
+        gate: &PauseGate,
+        vcpus: &Vcpus<K>,
+        capture: Option<Capture>,
+    ) {
+        self.run_with(stop, gate, vcpus, capture, CONTROL_TIMEOUT);
     }
 
     /// [`run`](Self::run), with `timeout` for each wait.
@@ -147,6 +256,7 @@ impl ControlSocket {
         stop: &StopToken,
         gate: &PauseGate,
         vcpus: &Vcpus<K>,
+        capture: Option<Capture>,
         timeout: Duration,
     ) {
         let mut machine = Machine {
@@ -154,6 +264,7 @@ impl ControlSocket {
             gate,
             vcpus,
             profile: &self.profile,
+            capture: capture.zip(self.checkpoint_root.clone()),
             timeout,
         };
         loop {
@@ -293,6 +404,8 @@ struct Machine<'a, K> {
     vcpus: &'a Vcpus<K>,
     /// The profile `profile` reports.
     profile: &'a ProfileCell,
+    /// What a `checkpoint` captures, and the root it writes under.
+    capture: Option<(Capture, CheckpointRoot)>,
     /// The deadline of each wait, [`CONTROL_TIMEOUT`] outside the tests.
     timeout: Duration,
 }
@@ -319,12 +432,183 @@ impl<K: Kick> Machine<'_, K> {
                 self.state = VmState::Stopping;
                 return (Response::State(VmState::Stopping), Some(After::Stop));
             }
-            Request::Checkpoint { .. } => refuse(
-                ErrorCode::NotImplemented,
-                "checkpoint is not implemented by this hvi",
-            ),
+            Request::Checkpoint {
+                dir,
+                then,
+                txid,
+                epoch,
+            } => self.checkpoint(&dir, then, txid.as_deref(), epoch),
         };
         (response, None)
+    }
+
+    /// Returns the profile once it is complete, or the refusal to send.
+    fn complete_profile(&self) -> Result<MachineProfile, Response> {
+        match self.profile() {
+            Response::Profile(profile) => Ok(*profile),
+            other => Err(other),
+        }
+    }
+
+    /// Captures the VM into the bundle directory `dir`, then continues it or
+    /// fences it.
+    ///
+    /// Everything that can be refused without pausing is checked first: the
+    /// state, the checkpoint root, the directory, the profile and its shares.
+    /// The pause and the vCPU export then share one deadline. A failure from
+    /// there to the seal returns the VM to the state the request found it in.
+    fn checkpoint(&mut self, dir: &str, then: Then, txid: Option<&str>, epoch: u64) -> Response {
+        match self.state {
+            VmState::Fenced => {
+                return refuse(ErrorCode::Fenced, "the VM was fenced after a checkpoint")
+            }
+            VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
+            VmState::Running | VmState::Paused => {}
+        }
+        let Some((_, root)) = &self.capture else {
+            return refuse(
+                ErrorCode::Refused,
+                "this run has no checkpoint root; boot it with --checkpoint-root",
+            );
+        };
+        let dir = match root.bundle_dir(dir) {
+            Ok(dir) => dir,
+            Err(e) => return refuse(ErrorCode::Refused, e.to_string()),
+        };
+        let profile = match self.complete_profile() {
+            Ok(profile) => profile,
+            Err(refusal) => return refusal,
+        };
+        if profile.fs_shares > 0 {
+            return refuse(
+                ErrorCode::Refused,
+                format!(
+                    "the guest has {} virtio-fs share(s), whose state is host files that do \
+                     not move",
+                    profile.fs_shares
+                ),
+            );
+        }
+        if let Err(why) = profile.one_writable_disk() {
+            return refuse(ErrorCode::Refused, why);
+        }
+        let writer = match BundleWriter::create(&dir) {
+            Ok(writer) => writer,
+            Err(e) => return refuse(ErrorCode::Refused, e.to_string()),
+        };
+
+        let started = Instant::now();
+        let was_paused = self.state == VmState::Paused;
+        if !was_paused {
+            if let Response::Error(e) = self.pause() {
+                return Response::Error(e);
+            }
+        }
+        let vcpus = match self.export_vcpus(started + self.timeout) {
+            Ok(vcpus) => vcpus,
+            Err(e) => {
+                self.back_to(was_paused);
+                return Response::Error(e);
+            }
+        };
+        let pause_ms = started.elapsed().as_millis() as u64;
+
+        let captured_at = Instant::now();
+        let request = capture::Request { then, txid, epoch };
+        let sealed = match &self.capture {
+            Some((capture, _)) => {
+                let vcpus_of = self.vcpus;
+                capture.write(writer, &profile, vcpus, &request, &|| {
+                    !vcpus_of.is_running()
+                })
+            }
+            None => Err(std::io::Error::other("no capture")),
+        };
+        let capture_ms = captured_at.elapsed().as_millis() as u64;
+        let sealed = match sealed {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                if !self.vcpus.is_running() {
+                    self.state = VmState::Stopping;
+                    return refuse(ErrorCode::Stopped, format!("the run is ending: {e}"));
+                }
+                self.back_to(was_paused);
+                return refuse(
+                    ErrorCode::CaptureFailed,
+                    format!("{e}; nothing was kept, and the VM is as it was"),
+                );
+            }
+        };
+        match then {
+            Then::Continue => self.back_to(was_paused),
+            Then::Fence => self.state = VmState::Fenced,
+        }
+        Response::Checkpoint {
+            state: self.state,
+            dir: dir.display().to_string(),
+            manifest_sha256: sealed.manifest_sha256,
+            stats: CheckpointStats {
+                pause_ms,
+                capture_ms,
+                ram_present_bytes: sealed.ram_present_bytes,
+                ram_total_bytes: sealed.ram_total_bytes,
+                bundle_bytes: sealed.bundle_bytes,
+            },
+        }
+    }
+
+    /// Asks every parked vCPU for its state and returns them by index, a
+    /// vCPU the guest never started as powered off.
+    fn export_vcpus(&mut self, deadline: Instant) -> Result<Vec<VcpuState>, Error> {
+        let Some((capture, _)) = &self.capture else {
+            return Err(Error::new(ErrorCode::Refused, "no capture"));
+        };
+        let (arch, backend) = (capture.arch, capture.backend);
+        self.vcpus.request_export();
+        let waited = self
+            .vcpus
+            .wait_work(deadline.saturating_duration_since(Instant::now()));
+        let results = self.vcpus.end_work();
+        if let Err(e) = waited {
+            return Err(match e {
+                PauseError::Stopped => {
+                    self.state = VmState::Stopping;
+                    Error::new(ErrorCode::Stopped, "the run is ending")
+                }
+                PauseError::Timeout { parked, expected } => Error::new(
+                    ErrorCode::Timeout,
+                    format!("{parked} of {expected} vCPUs exported their state in time"),
+                ),
+                other => Error::new(ErrorCode::CaptureFailed, other.to_string()),
+            });
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(cpu, result)| match result {
+                WorkResult::Done(Some(state)) if state.id() as usize == cpu => Ok(*state),
+                WorkResult::Done(_) => Err(Error::new(
+                    ErrorCode::CaptureFailed,
+                    format!("vCPU {cpu} exported no state of its own"),
+                )),
+                WorkResult::Failed(why) => Err(Error::new(
+                    ErrorCode::CaptureFailed,
+                    format!("vCPU {cpu} could not export its state: {why}"),
+                )),
+                WorkResult::NotStarted => Ok(VcpuState::powered_off(arch, backend, cpu as u32)),
+            })
+            .collect()
+    }
+
+    /// Returns the VM to where a checkpoint found it: paused, or running.
+    fn back_to(&mut self, paused: bool) {
+        if paused {
+            self.state = VmState::Paused;
+        } else {
+            let _ = self.vcpus.resume_from_control();
+            self.gate.unpause();
+            self.state = VmState::Running;
+        }
     }
 
     /// Returns the profile once it is complete.
@@ -422,9 +706,12 @@ fn refuse(code: ErrorCode, message: impl Into<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::profile::MachineProfile;
+    use crate::checkpoint::bundle::Component;
+    use crate::checkpoint::cpu::Work;
     use crate::config::Stop;
     use crate::hypervisor::vcpus::Outcome;
+    use crate::memory::GuestRam;
+    use crate::plugin::{GuestArch, RegsView};
     use crate::run::StopHandle;
     use crate::teardown::StopSource;
     use std::io::BufRead;
@@ -443,6 +730,30 @@ mod tests {
         }
     }
 
+    /// What a [`Fixture`] serves.
+    #[derive(Default)]
+    struct Spec {
+        /// vCPUs that park at their checkpoints and export their state.
+        parking: u32,
+        /// Started vCPUs that never reach a checkpoint.
+        stuck: u32,
+        /// vCPUs the guest never starts, as an HVF secondary before CPU_ON.
+        unstarted: u32,
+        /// Whether the run has a checkpoint root and what to capture.
+        capture: bool,
+        /// A virtio-net device the capture holds.
+        net: Option<Arc<std::sync::Mutex<crate::devices::virtio::net::VirtioNet>>>,
+        /// The profile's virtio-fs share count.
+        fs_shares: u32,
+        /// The component after which the capture fails.
+        fail_after: Option<Component>,
+        /// The component after which the run is stopped.
+        stop_after: Option<Component>,
+    }
+
+    /// Where the fixture's guest RAM starts, 1 MiB of it.
+    const GPA: u64 = 0x4000_0000;
+
     /// A served control socket over fake vCPUs, with a client connected.
     struct Fixture {
         source: StopSource,
@@ -453,40 +764,109 @@ mod tests {
         client: UnixStream,
         replies: std::io::BufReader<UnixStream>,
         path: std::path::PathBuf,
+        /// The checkpoint root, resolved, removed with the fixture.
+        root: std::path::PathBuf,
+        /// The checkpoint root as the fixture named it at bind, unresolved.
+        given_root: std::path::PathBuf,
     }
 
     impl Fixture {
         /// Serves a VM of `parking` vCPUs that park at their checkpoints and
         /// `stuck` started ones that never do.
         fn new(name: &str, parking: u32, stuck: u32) -> Self {
+            Self::with(
+                name,
+                Spec {
+                    parking,
+                    stuck,
+                    ..Spec::default()
+                },
+            )
+        }
+
+        /// Serves the VM `spec` describes.
+        #[allow(clippy::disallowed_methods)]
+        fn with(name: &str, spec: Spec) -> Self {
             let path =
                 std::env::temp_dir().join(format!("hvi-ctl-{}-{name}.sock", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("hvi-ctl-{}-{name}.root", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir(&root).unwrap();
             let source = StopSource::new().unwrap();
-            let vcpus = Arc::new(Vcpus::new(
-                parking + stuck,
-                NoKick,
-                StopHandle::new_pair().unwrap().0,
-            ));
-            let fake_vcpus = (0..parking)
-                .map(|_| {
+            let count = spec.parking + spec.stuck + spec.unstarted;
+            let vcpus = Arc::new(Vcpus::new(count, NoKick, StopHandle::new_pair().unwrap().0));
+            let fake_vcpus = (0..spec.parking)
+                .map(|cpu| {
                     vcpus.mark_started(vcpus.started());
                     let vcpus = Arc::clone(&vcpus);
                     std::thread::spawn(move || {
                         while vcpus.is_running() {
-                            let _ = vcpus.checkpoint();
+                            let _ = vcpus.checkpoint_with(cpu, |work| match work {
+                                Work::Export => Ok(Some(VcpuState::from_regs_view(
+                                    GuestArch::Aarch64,
+                                    "hvf",
+                                    cpu,
+                                    &RegsView::default(),
+                                ))),
+                                Work::Import(_) => Ok(None),
+                            });
                             std::thread::sleep(Duration::from_millis(1));
                         }
                     })
                 })
                 .collect();
-            for _ in 0..stuck {
+            for _ in 0..spec.stuck {
                 vcpus.mark_started(vcpus.started());
             }
             let cell = Arc::new(
                 ProfileCell::new(MachineProfile::for_this_host("aarch64", "hvf"), None).unwrap(),
             );
-            let socket =
-                ControlSocket::bind(path.to_str().unwrap(), Arc::clone(&cell), None).unwrap();
+            let ram = Arc::new(GuestRam::from_ranges(&[(GPA, 1 << 20)]));
+            ram.write(GPA + 0x3000, b"guest data").unwrap();
+            if spec.capture {
+                let regions = ram.regions();
+                cell.complete(|p| {
+                    p.cpu.ident = Some("0x61".into());
+                    p.vcpus = count;
+                    p.fs_shares = spec.fs_shares;
+                    p.ram_regions = regions.into_iter().map(Into::into).collect();
+                })
+                .unwrap();
+            }
+            let root_arg = spec.capture.then(|| root.to_str().unwrap().to_string());
+            let socket = ControlSocket::bind(
+                path.to_str().unwrap(),
+                Arc::clone(&cell),
+                root_arg.as_deref(),
+            )
+            .unwrap();
+            let capture = spec.capture.then(|| Capture {
+                arch: GuestArch::Aarch64,
+                backend: "hvf",
+                sandbox_id: "fixture".into(),
+                ram,
+                block: None,
+                net: spec.net.clone(),
+                vsock: None,
+                console: Console::None,
+                after_component: Some({
+                    let (fail, stop, vcpus) =
+                        (spec.fail_after, spec.stop_after, Arc::clone(&vcpus));
+                    Arc::new(move |component| {
+                        if stop == Some(component) {
+                            vcpus.stop();
+                        }
+                        if fail == Some(component) {
+                            return Err(std::io::Error::other(format!(
+                                "a test failed the write after {}",
+                                component.file()
+                            )));
+                        }
+                        Ok(())
+                    })
+                }),
+            });
             let server = {
                 let (stop, gate, vcpus) = (
                     source.token(),
@@ -495,12 +875,12 @@ mod tests {
                 );
                 // A short deadline, so a test of a timeout is quick.
                 std::thread::spawn(move || {
-                    socket.run_with(&stop, &gate, &vcpus, Duration::from_millis(200));
+                    socket.run_with(&stop, &gate, &vcpus, capture, Duration::from_millis(200));
                 })
             };
             let client = UnixStream::connect(&path).unwrap();
             client
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
             let replies = std::io::BufReader::new(client.try_clone().unwrap());
             Self {
@@ -512,6 +892,8 @@ mod tests {
                 client,
                 replies,
                 path,
+                given_root: root.clone(),
+                root: std::fs::canonicalize(&root).unwrap(),
             }
         }
 
@@ -522,6 +904,25 @@ mod tests {
             let mut reply = String::new();
             self.replies.read_line(&mut reply).unwrap();
             reply.trim_end().to_string()
+        }
+
+        /// Asks for a checkpoint into `name` below the root, then `then`.
+        fn checkpoint(&mut self, name: &str, then: &str) -> String {
+            let dir = self.root.join(name);
+            self.ask(&format!(
+                r#"{{"v":1,"op":"checkpoint","dir":"{}","then":"{then}","txid":"t-{name}","epoch":2}}"#,
+                dir.display()
+            ))
+        }
+
+        /// Waits up to 5 s for no vCPU to be parked.
+        fn assert_running(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.vcpus.parked() != 0 {
+                assert!(Instant::now() < deadline, "a vCPU stayed parked");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!self.source.gate().is_paused(), "the gate stayed closed");
         }
     }
 
@@ -537,6 +938,8 @@ mod tests {
             }
             #[allow(clippy::disallowed_methods)]
             let _ = std::fs::remove_file(&self.path);
+            #[allow(clippy::disallowed_methods)]
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -624,7 +1027,7 @@ mod tests {
         let mut f = Fixture::new("refusals", 1, 0);
         assert_eq!(
             f.ask(r#"{"v":1,"op":"checkpoint","dir":"/tmp/ck"}"#),
-            r#"{"v":1,"ok":false,"code":"not_implemented","error":"checkpoint is not implemented by this hvi"}"#
+            r#"{"v":1,"ok":false,"code":"refused","error":"this run has no checkpoint root; boot it with --checkpoint-root"}"#
         );
         assert!(f
             .ask("nonsense")
@@ -845,6 +1248,382 @@ mod tests {
         assert!(err.to_string().contains("is not a socket"), "{err}");
         assert_eq!(std::fs::read(&file).unwrap(), b"guest disk");
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Parses a reply line.
+    fn reply(line: &str) -> serde_json::Value {
+        serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"))
+    }
+
+    #[test]
+    fn a_checkpoint_then_continue_resumes_the_vm() {
+        let mut f = Fixture::with(
+            "ck-continue",
+            Spec {
+                parking: 2,
+                unstarted: 1,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let line = f.checkpoint("ck", "continue");
+        let r = reply(&line);
+        assert_eq!(r["ok"], true, "{line}");
+        assert_eq!(r["state"], "running");
+        let dir = f.root.join("ck");
+        assert_eq!(r["dir"], dir.display().to_string());
+        assert_eq!(r["stats"]["ram_total_bytes"], 1 << 20);
+        assert_eq!(r["stats"]["ram_present_bytes"], 4096);
+        assert!(r["stats"]["bundle_bytes"].as_u64().unwrap() > 4096);
+        for key in ["pause_ms", "capture_ms"] {
+            assert!(r["stats"][key].is_u64(), "{key}: {line}");
+        }
+        f.assert_running();
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"running","vcpus":2,"vcpus_parked":0}"#
+        );
+        let verified = crate::checkpoint::bundle::verify(&dir).unwrap();
+        assert_eq!(verified.manifest_sha256, r["manifest_sha256"]);
+        let bundle = crate::checkpoint::bundle::Bundle::open(&dir).unwrap();
+        let cpu = bundle.cpu().unwrap();
+        assert_eq!(cpu.vcpus.len(), 3);
+        // The secondary the guest never started is recorded as off.
+        let off = serde_json::to_value(&cpu.vcpus[2]).unwrap();
+        assert_eq!(off["power"], "off", "{off}");
+        let session = bundle.session().unwrap();
+        assert_eq!(
+            (
+                session.sandbox_id.as_str(),
+                session.txid.as_deref(),
+                session.epoch
+            ),
+            ("fixture", Some("t-ck"), 2)
+        );
+        // A second capture into the same directory is refused, VM untouched.
+        let again = reply(&f.checkpoint("ck", "continue"));
+        assert_eq!(again["code"], "refused", "{again}");
+        f.assert_running();
+    }
+
+    // The source's half of a move: once captured it must never run again,
+    // whatever a client asks, until it is stopped.
+    #[test]
+    fn a_checkpoint_then_fence_keeps_the_vm_parked_for_good() {
+        let mut f = Fixture::with(
+            "ck-fence",
+            Spec {
+                parking: 2,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let line = f.checkpoint("ck", "fence");
+        assert_eq!(reply(&line)["state"], "fenced", "{line}");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"fenced","vcpus":2,"vcpus_parked":2}"#
+        );
+        assert!(f.source.gate().is_paused());
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"resume"}"#),
+            r#"{"v":1,"ok":false,"code":"fenced","error":"the VM was fenced after a checkpoint"}"#
+        );
+        assert_eq!(reply(&f.checkpoint("ck2", "continue"))["code"], "fenced");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(f.vcpus.parked(), 2, "a vCPU ran after the fence");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"stop"}"#),
+            r#"{"v":1,"ok":true,"state":"stopping"}"#
+        );
+        assert_stops(&f.vcpus, "the fenced VM did not stop");
+        crate::checkpoint::bundle::verify(&f.root.join("ck")).unwrap();
+    }
+
+    // The temp dir is behind a link on macOS (/var is /private/var). A caller
+    // that names its bundles the way it named the root at boot must not be
+    // told they are outside it, and the bundle must land in the resolved
+    // tree the confinement grants.
+    #[test]
+    fn a_bundle_named_from_the_root_as_given_is_written_below_it() {
+        let mut f = Fixture::with(
+            "ck-spelling",
+            Spec {
+                parking: 1,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let dir = f.given_root.join("ck");
+        let line = f.ask(&format!(
+            r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#,
+            dir.display()
+        ));
+        let r = reply(&line);
+        assert_eq!(r["ok"], true, "{line}");
+        assert_eq!(r["dir"], f.root.join("ck").display().to_string());
+        crate::checkpoint::bundle::verify(&f.root.join("ck")).unwrap();
+    }
+
+    // A client that paused first finds the VM still paused after a capture
+    // with then=continue: the capture does not resume what it did not pause.
+    #[test]
+    fn a_checkpoint_of_a_paused_vm_leaves_it_paused() {
+        let mut f = Fixture::with(
+            "ck-paused",
+            Spec {
+                parking: 2,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        f.ask(r#"{"v":1,"op":"pause"}"#);
+        let line = f.checkpoint("ck", "continue");
+        assert_eq!(reply(&line)["state"], "paused", "{line}");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"paused","vcpus":2,"vcpus_parked":2}"#
+        );
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"resume"}"#),
+            r#"{"v":1,"ok":true,"state":"running"}"#
+        );
+        f.assert_running();
+        crate::checkpoint::bundle::verify(&f.root.join("ck")).unwrap();
+    }
+
+    // Each of these is refused before anything is paused, and leaves nothing
+    // on disk.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn refused_checkpoints_never_pause_the_vm() {
+        let mut f = Fixture::with(
+            "ck-refused",
+            Spec {
+                parking: 1,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let refused = |f: &mut Fixture, line: &str, want: &str| {
+            let r = reply(&f.ask(line));
+            assert_eq!(r["code"], "refused", "{r}");
+            assert!(r["error"].as_str().unwrap().contains(want), "{r}");
+            assert_eq!(f.vcpus.parked(), 0);
+            assert!(!f.source.gate().is_paused());
+        };
+        refused(
+            &mut f,
+            r#"{"v":1,"op":"checkpoint","dir":"/etc/ck"}"#,
+            "not below the checkpoint root",
+        );
+        refused(
+            &mut f,
+            r#"{"v":1,"op":"checkpoint","dir":"ck"}"#,
+            "absolute",
+        );
+        let busy = f.root.join("busy");
+        std::fs::create_dir(&busy).unwrap();
+        std::fs::write(busy.join("x"), b"x").unwrap();
+        refused(
+            &mut f,
+            &format!(r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#, busy.display()),
+            "not empty",
+        );
+
+        let mut shares = Fixture::with(
+            "ck-shares",
+            Spec {
+                parking: 1,
+                capture: true,
+                fs_shares: 1,
+                ..Spec::default()
+            },
+        );
+        let dir = shares.root.join("ck");
+        refused(
+            &mut shares,
+            &format!(r#"{{"v":1,"op":"checkpoint","dir":"{}"}}"#, dir.display()),
+            "virtio-fs share",
+        );
+        assert!(
+            std::fs::symlink_metadata(&dir).is_err(),
+            "a refusal left a directory"
+        );
+    }
+
+    // A vCPU that never parks fails the capture in time, and the VM runs on.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_checkpoint_that_times_out_leaves_the_vm_running() {
+        let mut f = Fixture::with(
+            "ck-timeout",
+            Spec {
+                parking: 1,
+                stuck: 1,
+                capture: true,
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.checkpoint("ck", "fence"));
+        assert_eq!(r["code"], "timeout", "{r}");
+        f.assert_running();
+        assert!(
+            std::fs::symlink_metadata(f.root.join("ck")).is_err(),
+            "the failed capture left its directory"
+        );
+        assert!(f
+            .ask(r#"{"v":1,"op":"status"}"#)
+            .contains(r#""state":"running""#));
+    }
+
+    // A device state a restore would refuse must fail the capture while the
+    // guest can still run on: here a net queue whose rings lie outside the
+    // RAM the capture holds.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_device_state_a_restore_would_refuse_leaves_the_vm_running() {
+        use crate::devices::virtio::mmio;
+        use crate::devices::virtio::net::VirtioNet;
+        let elsewhere = GuestRam::from_ranges(&[(0x8000_0000, 1 << 20)]);
+        let mut net = VirtioNet::new();
+        let base = 0x8000_0000u64;
+        net.mmio(&elsewhere, mmio::QUEUE_SEL, true, 0);
+        net.mmio(&elsewhere, mmio::QUEUE_NUM, true, 16);
+        net.mmio(&elsewhere, mmio::QUEUE_DESC_LOW, true, base);
+        net.mmio(&elsewhere, mmio::QUEUE_DRIVER_LOW, true, base + 0x1000);
+        net.mmio(&elsewhere, mmio::QUEUE_DEVICE_LOW, true, base + 0x2000);
+        net.mmio(&elsewhere, mmio::QUEUE_READY, true, 1);
+        assert!(
+            net.state().check(&elsewhere).is_ok(),
+            "the state is good over the RAM its rings are in"
+        );
+        let mut f = Fixture::with(
+            "ck-device",
+            Spec {
+                parking: 2,
+                capture: true,
+                net: Some(Arc::new(std::sync::Mutex::new(net))),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.checkpoint("ck", "fence"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .contains("a restore would refuse the device state"),
+            "{r}"
+        );
+        f.assert_running();
+        assert!(f
+            .ask(r#"{"v":1,"op":"status"}"#)
+            .contains(r#""state":"running""#));
+        assert!(
+            std::fs::symlink_metadata(f.root.join("ck")).is_err(),
+            "the refused capture left its directory"
+        );
+    }
+
+    /// Lists what is in `dir`, or `None` when it is gone.
+    #[allow(clippy::disallowed_methods)]
+    fn listing(dir: &std::path::Path) -> Option<Vec<std::ffi::OsString>> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        Some(entries.map(|e| e.unwrap().file_name()).collect())
+    }
+
+    // A write that fails part way, on a running VM, leaves it running and
+    // leaves no file behind: the directory the capture created goes, and one
+    // the caller made stays, empty.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_failed_write_leaves_the_vm_running_and_nothing_on_disk() {
+        let mut f = Fixture::with(
+            "ck-write",
+            Spec {
+                parking: 2,
+                capture: true,
+                fail_after: Some(Component::Cpu),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.checkpoint("ck", "fence"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("after cpu.json"),
+            "{r}"
+        );
+        f.assert_running();
+        assert!(f
+            .ask(r#"{"v":1,"op":"status"}"#)
+            .contains(r#""state":"running""#));
+        assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
+
+        std::fs::create_dir(f.root.join("made")).unwrap();
+        let r = reply(&f.checkpoint("made", "continue"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        f.assert_running();
+        assert_eq!(listing(&f.root.join("made")), Some(Vec::new()));
+    }
+
+    // A capture that fails after a client paused the VM must leave it
+    // paused, every vCPU parked, not resume what it did not pause.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_failed_capture_of_a_paused_vm_leaves_it_paused() {
+        let mut f = Fixture::with(
+            "ck-paused-fail",
+            Spec {
+                parking: 2,
+                capture: true,
+                fail_after: Some(Component::Devices),
+                ..Spec::default()
+            },
+        );
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"pause"}"#),
+            r#"{"v":1,"ok":true,"state":"paused"}"#
+        );
+        let r = reply(&f.checkpoint("ck", "continue"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"paused","vcpus":2,"vcpus_parked":2}"#
+        );
+        assert!(f.source.gate().is_paused(), "the gate was opened");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(f.vcpus.parked(), 2, "a vCPU ran after the failed capture");
+        assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"resume"}"#),
+            r#"{"v":1,"ok":true,"state":"running"}"#
+        );
+        f.assert_running();
+    }
+
+    // A stop of the run during the capture ends it with `stopped`, and the
+    // half-written bundle is removed.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_stop_during_the_capture_ends_it_and_removes_the_bundle() {
+        let mut f = Fixture::with(
+            "ck-stop",
+            Spec {
+                parking: 2,
+                capture: true,
+                stop_after: Some(Component::Profile),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.checkpoint("ck", "continue"));
+        assert_eq!(r["code"], "stopped", "{r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("the run is stopping"),
+            "{r}"
+        );
+        assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
+        assert_stops(&f.vcpus, "the run did not stop");
     }
 
     #[test]

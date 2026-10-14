@@ -45,6 +45,8 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu;
 use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, Stop};
@@ -723,6 +725,17 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 Arc::clone(&shared.profile),
                 cfg.checkpoint_root.as_deref(),
             )
+            .map(|control| {
+                let console = Console::Pl011 {
+                    uart: Arc::clone(&shared.pl011),
+                    rtc: Some(Arc::clone(&shared.rtc)),
+                };
+                control.capturing(
+                    "hvf",
+                    cfg.disks.first().map(|disk| disk.path.clone()),
+                    console,
+                )
+            })
         })
         .transpose()?;
 
@@ -950,8 +963,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         while sh.guest.vcpus.is_running() {
             // Safe point for every vCPU: park here while vcpu0 lets a plugin
-            // look at the guest.
-            sh.guest.pass_safepoint(&*vcpu, plugin);
+            // look at the guest, or the control socket captures it, doing
+            // on this thread the work only it can.
+            sh.guest.pass_safepoint(&*vcpu, cpu_id, plugin, |work| {
+                cpu::serve_from_regs_view(GuestArch::Aarch64, "hvf", cpu_id, &*vcpu, work)
+            });
 
             let flow = match vcpu.run() {
                 Ok(()) => {

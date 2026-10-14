@@ -175,7 +175,7 @@ impl DeviceStates {
     }
 
     /// Refuses a document or a device state of another version.
-    fn check_versions(&self) -> io::Result<()> {
+    pub(crate) fn check_versions(&self) -> io::Result<()> {
         check_version("device", self.version, DEVICE_STATES_VERSION)?;
         let versions = [
             (

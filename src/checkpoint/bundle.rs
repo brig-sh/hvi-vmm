@@ -26,12 +26,14 @@
 //! | `session.json` | who captured it and when, see [`Session`] |
 //! | `manifest.json` | every other file's size and SHA-256, written last |
 //!
-//! The writer, [`BundleWriter`], writes each component to a new file and
-//! syncs it, then writes the manifest to a temporary name, syncs it, renames
-//! it into place and syncs the directory. A directory without
-//! `manifest.json` is therefore not a bundle, whatever else is in it, and a
-//! writer that fails or is dropped before [`BundleWriter::seal`] removes what
-//! it wrote.
+//! The writer, [`BundleWriter`], syncs the parent of a directory it creates,
+//! writes each component to a new file and syncs it, then writes the
+//! manifest to a temporary name, syncs it, renames it into place and syncs
+//! the directory. The bundle is sealed once that last sync returns. A
+//! directory without `manifest.json` is therefore not a bundle, whatever
+//! else is in it, and a writer that fails or is dropped before
+//! [`BundleWriter::seal`] succeeds removes what it wrote, the manifest
+//! included.
 //!
 //! The reader, [`Bundle::open`], trusts nothing in the directory. It reads the
 //! manifest within a size limit, checks every count, name and size in it
@@ -61,7 +63,14 @@ use crate::checkpoint::profile::{
     this_build, HviBuild, MachineProfile, CHECKPOINT_FORMAT, MAX_PROFILE_BYTES,
 };
 use crate::checkpoint::ram::{self, RamImage, RegionImage, PAGE_SIZE};
+use crate::devices::legacy::pl011::Pl011State;
+use crate::devices::legacy::rtc_cmos::RtcState;
+use crate::devices::legacy::rtc_pl031::Pl031State;
+use crate::devices::legacy::uart16550::UartState;
 use crate::devices::state::DeviceStates;
+use crate::devices::virtio::block::BlkState;
+use crate::devices::virtio::net::NetState;
+use crate::devices::virtio::vsock::VsockState;
 use crate::memory::{GuestRam, GuestRamView};
 
 /// The manifest's file name.
@@ -247,6 +256,44 @@ pub struct DevicesDoc {
     pub irq_levels: IrqLevels,
 }
 
+/// `devices.json` as the writer writes it, borrowing the states.
+#[derive(Serialize)]
+struct DevicesOut<'a> {
+    #[serde(flatten)]
+    states: &'a DeviceStates,
+    irq_levels: IrqLevels,
+}
+
+/// `devices.json` as the reader decodes it: the [`DeviceStates`] fields and
+/// `irq_levels` in one struct, so the document is decoded in one pass.
+///
+/// Going through `serde_json::Value` first cost about 32 bytes per JSON
+/// number, and the vsock buffers are lists of numbers: a crafted 32 MiB
+/// document took 608 MiB before it was refused. `flatten` cannot be used
+/// here, since it does not refuse unknown fields. Building the
+/// [`DeviceStates`] below names every field, so a field added there and not
+/// here does not compile.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevicesIn {
+    version: u32,
+    #[serde(deserialize_with = "Option::deserialize")]
+    blk: Option<BlkState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    net: Option<NetState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    vsock: Option<VsockState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pl011: Option<Pl011State>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pl031: Option<Pl031State>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    uart: Option<UartState>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    rtc: Option<RtcState>,
+    irq_levels: IrqLevels,
+}
+
 impl DevicesDoc {
     /// Encodes the document.
     ///
@@ -254,12 +301,11 @@ impl DevicesDoc {
     ///
     /// Errors as `serde_json` does, which for these types it does not.
     pub fn to_json(&self) -> io::Result<Vec<u8>> {
-        let mut doc = serde_json::to_value(&self.states).map_err(io::Error::other)?;
-        let levels = serde_json::to_value(self.irq_levels).map_err(io::Error::other)?;
-        doc.as_object_mut()
-            .ok_or_else(|| io::Error::other("device states are not a JSON object"))?
-            .insert("irq_levels".to_string(), levels);
-        serde_json::to_vec(&doc).map_err(io::Error::other)
+        serde_json::to_vec(&DevicesOut {
+            states: &self.states,
+            irq_levels: self.irq_levels,
+        })
+        .map_err(io::Error::other)
     }
 
     /// Decodes the document, refusing one without `irq_levels` and every
@@ -269,16 +315,23 @@ impl DevicesDoc {
     ///
     /// Errors, as `InvalidData`, on any of those.
     pub fn from_json(json: &[u8]) -> io::Result<Self> {
-        let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
-        let mut doc: serde_json::Value =
-            serde_json::from_slice(json).map_err(|e| invalid(e.to_string()))?;
-        let levels = doc
-            .as_object_mut()
-            .and_then(|fields| fields.remove("irq_levels"))
-            .ok_or_else(|| invalid("no irq_levels".to_string()))?;
-        let irq_levels = serde_json::from_value(levels).map_err(|e| invalid(e.to_string()))?;
-        let states = DeviceStates::from_json(&serde_json::to_vec(&doc).map_err(io::Error::other)?)?;
-        Ok(Self { states, irq_levels })
+        let doc: DevicesIn = serde_json::from_slice(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let states = DeviceStates {
+            version: doc.version,
+            blk: doc.blk,
+            net: doc.net,
+            vsock: doc.vsock,
+            pl011: doc.pl011,
+            pl031: doc.pl031,
+            uart: doc.uart,
+            rtc: doc.rtc,
+        };
+        states.check_versions()?;
+        Ok(Self {
+            states,
+            irq_levels: doc.irq_levels,
+        })
     }
 }
 
@@ -397,8 +450,8 @@ pub struct Sealed {
 
 /// Writes a bundle, component by component, and seals it.
 ///
-/// Dropping it before [`seal`](Self::seal) removes every file it wrote, and
-/// the directory when it created it.
+/// Dropping it before [`seal`](Self::seal) succeeds removes every file it
+/// wrote, the manifest included, and the directory when it created it.
 pub struct BundleWriter {
     /// The bundle directory.
     dir: PathBuf,
@@ -457,13 +510,27 @@ impl BundleWriter {
                 false
             }
         };
-        Ok(Self {
+        let writer = Self {
             dir: dir.to_path_buf(),
             created_dir,
             written: Vec::new(),
             ram: None,
             sealed: false,
-        })
+        };
+        // The new directory's entry is in its parent. Without this sync a
+        // host crash can lose a bundle that was reported sealed, and with it
+        // the only copy of a fenced guest. A failure drops the writer, which
+        // removes the directory.
+        if created_dir {
+            if let Some(parent) = dir.parent() {
+                File::open(parent)
+                    .and_then(|parent| parent.sync_all())
+                    .map_err(|e| {
+                        io::Error::new(e.kind(), format!("{}: cannot sync: {e}", parent.display()))
+                    })?;
+            }
+        }
+        Ok(writer)
     }
 
     /// Returns the bundle directory.
@@ -476,7 +543,8 @@ impl BundleWriter {
     ///
     /// # Errors
     ///
-    /// Errors when the component was written already or the file fails.
+    /// Errors when the component was written already, is larger than
+    /// [`Component::limit`], or the file fails.
     pub fn write_json<T: Serialize>(&mut self, component: Component, doc: &T) -> io::Result<()> {
         let bytes = serde_json::to_vec(doc).map_err(io::Error::other)?;
         self.write_bytes(component, &bytes)
@@ -486,8 +554,10 @@ impl BundleWriter {
     ///
     /// # Errors
     ///
-    /// Errors when the component was written already or the file fails.
+    /// Errors when the component was written already, is larger than
+    /// [`Component::limit`], or the file fails.
     pub fn write_bytes(&mut self, component: Component, bytes: &[u8]) -> io::Result<()> {
+        check_size(component, bytes.len() as u64)?;
         self.write_with(component, |out| out.write_all(bytes))
     }
 
@@ -516,7 +586,8 @@ impl BundleWriter {
     }
 
     /// Writes `component` through `fill`, syncs it and records its size and
-    /// hash.
+    /// hash. A component larger than the reader takes is refused, and
+    /// removed with the rest when the writer is dropped.
     fn write_with(
         &mut self,
         component: Component,
@@ -550,6 +621,7 @@ impl BundleWriter {
         fill(&mut out)?;
         out.flush()?;
         let (buffered, sha256, size) = out.finish();
+        check_size(component, size)?;
         let file = buffered
             .into_inner()
             .map_err(io::IntoInnerError::into_error)?;
@@ -568,8 +640,9 @@ impl BundleWriter {
     ///
     /// # Errors
     ///
-    /// Errors when a required component or the RAM image is missing, or a
-    /// file or the directory sync fails. The bundle is then removed.
+    /// Errors when a required component or the RAM image is missing, the
+    /// manifest is one [`Bundle::open`] would refuse, or a file or the
+    /// directory sync fails. The bundle is then removed.
     pub fn seal(mut self, capabilities: Vec<String>) -> io::Result<Sealed> {
         for component in Component::ALL {
             if component.required() && !self.written.iter().any(|(c, _)| *c == component) {
@@ -602,7 +675,13 @@ impl BundleWriter {
             capabilities,
             sealed_at_unix_ms: unix_ms(),
         };
+        // The reader's own checks, run before the manifest exists: a bundle
+        // its reader refuses is lost the moment it is sealed, since a fenced
+        // source never runs again. Failing here leaves the VM free to run on.
+        check_manifest(&manifest)
+            .map_err(|e| io::Error::new(e.kind(), format!("the reader would refuse it: {e}")))?;
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+        check_size_of(MANIFEST, bytes.len() as u64, MAX_MANIFEST_BYTES)?;
         let tmp = self.dir.join(MANIFEST_TMP);
         let mut file = OpenOptions::new()
             .write(true)
@@ -614,11 +693,13 @@ impl BundleWriter {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, self.dir.join(MANIFEST))?;
-        self.sealed = true;
-        // The rename is durable once the directory is. A failure here leaves
-        // a sealed bundle whose seal may not survive a crash, which is
-        // reported rather than undone.
+        // The rename is durable once the directory is. Until then the bundle
+        // is not sealed: a failure drops the writer, which removes the
+        // manifest with the rest, so a capture that replies capture_failed
+        // and resumes the source leaves no bundle a later restore could run
+        // beside it.
         File::open(&self.dir)?.sync_all()?;
+        self.sealed = true;
         let bundle_bytes =
             self.written.iter().map(|(_, e)| e.size).sum::<u64>() + bytes.len() as u64;
         Ok(Sealed {
@@ -639,10 +720,31 @@ impl Drop for BundleWriter {
             let _ = std::fs::remove_file(self.dir.join(component.file()));
         }
         let _ = std::fs::remove_file(self.dir.join(MANIFEST_TMP));
+        // Only this writer can have put a manifest here: create refuses a
+        // directory that is not empty.
+        let _ = std::fs::remove_file(self.dir.join(MANIFEST));
         if self.created_dir {
             let _ = std::fs::remove_dir(&self.dir);
         }
     }
+}
+
+/// Refuses `component` at `size` bytes when the reader would refuse it, so
+/// the capture fails before the seal rather than seal a bundle that no
+/// reader opens.
+fn check_size(component: Component, size: u64) -> io::Result<()> {
+    check_size_of(component.file(), size, component.limit())
+}
+
+/// Refuses the file `name` at `size` bytes when it is over `limit`.
+fn check_size_of(name: &str, size: u64, limit: u64) -> io::Result<()> {
+    if size > limit {
+        return Err(bad(
+            name,
+            format!("would be {size} bytes, the reader takes at most {limit}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Opens `name` in `dir` for reading: a regular file, not through a link,
@@ -1738,6 +1840,8 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let mut w = BundleWriter::create(&dir).unwrap();
         w.write_bytes(Component::Profile, b"{}").unwrap();
+        // As a seal whose directory sync failed after the rename leaves it.
+        std::fs::write(dir.join(MANIFEST), b"{}").unwrap();
         drop(w);
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
@@ -1747,6 +1851,55 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(&dir).is_ok(),
             "the drop removed a directory it did not create"
+        );
+    }
+
+    // The writer must refuse what the reader would, before the seal: a
+    // sealed bundle the reader refuses is a lost session once the source is
+    // fenced.
+    #[test]
+    fn the_writer_refuses_what_the_reader_would() {
+        let scratch = Scratch::new("writer-limits");
+        let dir = scratch.bundle();
+        let mut w = BundleWriter::create(&dir).unwrap();
+        let big = vec![b' '; Component::Session.limit() as usize + 1];
+        let err = w.write_bytes(Component::Session, &big).unwrap_err();
+        assert!(err.to_string().contains("session.json: would be"), "{err}");
+        // A component written through a stream is refused once it is over.
+        let err = w
+            .write_with(Component::Disk, |out| out.write_all(&big))
+            .unwrap_err();
+        assert!(err.to_string().contains("disk.json: would be"), "{err}");
+        drop(w);
+        assert!(
+            std::fs::symlink_metadata(&dir).is_err(),
+            "the refused writer left its directory"
+        );
+
+        // The seal runs the reader's manifest checks, so a writer that drifts
+        // from the reader fails the capture instead of sealing. The drift is
+        // made by hand here: a hash the reader would not take.
+        let mut w = BundleWriter::create(&dir).unwrap();
+        w.write_bytes(Component::Profile, profile().to_json().as_bytes())
+            .unwrap();
+        w.write_ram(&guest(), &|| false).unwrap();
+        for component in [
+            Component::Cpu,
+            Component::Platform,
+            Component::Devices,
+            Component::Session,
+        ] {
+            w.write_bytes(component, b"{}").unwrap();
+        }
+        w.written[3].1.sha256 = "not hex".into();
+        let err = w.seal(Vec::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("the reader would refuse it"),
+            "{err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dir).is_err(),
+            "the refused seal left its directory"
         );
     }
 
@@ -1789,10 +1942,20 @@ mod tests {
         let json = doc.to_json().unwrap();
         assert_eq!(
             String::from_utf8(json.clone()).unwrap(),
-            r#"{"blk":null,"irq_levels":{"blk":true,"net":false,"uart":false,"vsock":false},"net":null,"pl011":null,"rtc":null,"uart":null,"version":1,"vsock":null}"#
+            r#"{"version":2,"blk":null,"net":null,"vsock":null,"pl011":null,"pl031":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#
         );
         assert_eq!(DevicesDoc::from_json(&json).unwrap(), doc);
-        let without = br#"{"version":1,"blk":null,"net":null,"vsock":null,"pl011":null,"uart":null,"rtc":null}"#;
+        // Earlier builds wrote the keys in sorted order, which reads the same.
+        let sorted = br#"{"blk":null,"irq_levels":{"blk":true,"net":false,"uart":false,"vsock":false},"net":null,"pl011":null,"pl031":null,"rtc":null,"uart":null,"version":2,"vsock":null}"#;
+        assert_eq!(DevicesDoc::from_json(sorted).unwrap(), doc);
+        let no_net = br#"{"version":2,"blk":null,"vsock":null,"pl011":null,"pl031":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#;
+        assert!(DevicesDoc::from_json(no_net).is_err());
+        let other = br#"{"version":3,"blk":null,"net":null,"vsock":null,"pl011":null,"pl031":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#;
+        assert!(DevicesDoc::from_json(other).is_err());
+        // Version 1 has no PL031.
+        let old = br#"{"version":1,"blk":null,"net":null,"vsock":null,"pl011":null,"uart":null,"rtc":null,"irq_levels":{"blk":true,"net":false,"vsock":false,"uart":false}}"#;
+        assert!(DevicesDoc::from_json(old).is_err());
+        let without = br#"{"version":2,"blk":null,"net":null,"vsock":null,"pl011":null,"pl031":null,"uart":null,"rtc":null}"#;
         assert!(DevicesDoc::from_json(without).is_err());
         let extra = String::from_utf8(json)
             .unwrap()
