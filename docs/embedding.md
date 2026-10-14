@@ -290,6 +290,15 @@ hvi::devices::virtio::fs::set_guest_ids(0, 0);
 Setting it after a share is already answering hands the guest a home it cannot
 write.
 
+**glibc's malloc on Linux.** The `hvi` binary calls
+`hvi::sandbox::seccomp::one_malloc_arena()` first in `main`, while it has one
+thread. An embedder that boots with `sandbox: true` on a glibc build must do the
+same in its own `main`, before it starts any thread. Without it, glibc's malloc
+can open a file from a filtered thread, and the seccomp filter kills the process
+with `SIGSYS`. The setting is process-wide, so the embedder's own threads share
+the one arena too. See [the allowlists'
+README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself).
+
 **Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE` and `HVI_X86_TRACE`
 are read from the process environment, not from `BootConfig`. An embedder that
 wants them off must make sure they are unset in the process it runs in. See

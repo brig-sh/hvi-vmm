@@ -581,6 +581,13 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // First, while this is the only thread: glibc's malloc would otherwise open
+    // files from threads the seccomp filters forbid it.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
+        eprintln!("hvi: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = run() {
         // stderr can be a closed pipe, where `eprintln!` would panic, so a
         // failed write is ignored.
