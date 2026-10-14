@@ -43,6 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("boot") => boot_guest(&args[2..]),
+        Some("restore") => restore_guest(&args[2..]),
         Some("--version" | "-V" | "version") => {
             print_version();
             Ok(())
@@ -148,14 +149,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             eprintln!(
-                "hvi — a microVMM\n\nusage: hvi <boot|checkpoint-verify|dump-fdt|smoke|\
-                 sandbox-selftest|seccomp-selftest|--version> [args]"
+                "hvi — a microVMM\n\nusage: hvi <boot|restore|checkpoint-verify|dump-fdt|\
+                 smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
             );
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected `boot`, `checkpoint-verify`, `dump-fdt`, \
-             `smoke`, `sandbox-selftest`, `seccomp-selftest` or `--version`"
+            "unknown subcommand {other:?}; expected `boot`, `restore`, `checkpoint-verify`, \
+             `dump-fdt`, `smoke`, `sandbox-selftest`, `seccomp-selftest` or `--version`"
         )
         .into()),
     }
@@ -456,6 +457,91 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let stop = hvi::boot(cfg)?;
     eprintln!("guest stopped: {stop:?}");
     Ok(())
+}
+
+/// Runs `restore`, which resumes a checkpoint bundle in this process.
+///
+/// `restore --from <bundle> --control-sock <path> --checkpoint-root <dir>
+/// [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac <mac>]
+/// [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
+/// [--profile-out <path>] [--no-sandbox]`. The guest waits restored-paused
+/// until a client sends `resume` on the control socket.
+fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut from = None;
+    let mut control_sock = None;
+    let mut checkpoint_root = None;
+    let mut disk = None;
+    let mut net = false;
+    let mut net_gateway = None;
+    let mut net_mac = None;
+    let mut agent_sock = None;
+    let mut sandbox_id = None;
+    let mut events = None;
+    let mut profile_out = None;
+    let mut sandbox = true;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match a.as_str() {
+            "--from" => from = Some(value("--from")?),
+            "--control-sock" => control_sock = Some(value("--control-sock")?),
+            "--checkpoint-root" => checkpoint_root = Some(value("--checkpoint-root")?),
+            "--disk" => disk = Some(value("--disk")?),
+            "--net-stub" => net = true,
+            "--net-gateway" => net_gateway = Some(value("--net-gateway")?),
+            "--net-mac" => {
+                let v = value("--net-mac")?;
+                net_mac = Some(
+                    tap::parse_mac(&v)
+                        .ok_or_else(|| format!("--net-mac is not a MAC address: {v}"))?,
+                );
+            }
+            "--agent-sock" => agent_sock = Some(value("--agent-sock")?),
+            "--sandbox-id" => sandbox_id = Some(value("--sandbox-id")?),
+            "--events" => events = Some(value("--events")?),
+            "--profile-out" => profile_out = Some(value("--profile-out")?),
+            "--no-sandbox" => sandbox = false,
+            other => return Err(format!("unknown restore arg {other:?}").into()),
+        }
+    }
+    let cfg = config::RestoreConfig {
+        from: from.ok_or("restore needs --from <bundle directory>")?,
+        // The guest waits for `resume` on it, so a restore without one could
+        // never run.
+        control_sock: control_sock.ok_or("restore needs --control-sock, which resumes it")?,
+        checkpoint_root: Some(
+            checkpoint_root.ok_or("restore needs --checkpoint-root, as the next move does")?,
+        ),
+        disk,
+        net,
+        net_gateway,
+        net_mac,
+        agent_sock,
+        sandbox_id,
+        events,
+        profile_out,
+        sandbox,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("restoring {} ...", cfg.from);
+        let stop = hvi::restore(cfg)?;
+        eprintln!("guest stopped: {stop:?}");
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cfg;
+        Err(
+            "`restore` resumes Hypervisor.framework bundles only so far; the KVM restore \
+             is not built yet"
+                .into(),
+        )
+    }
 }
 
 fn main() {

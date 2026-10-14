@@ -63,6 +63,9 @@ pub(crate) const LOG_PREFIX: &str = "[hvi]";
 // `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use arch::aarch64::hvf::boot;
+// Only HVF restores a checkpoint so far; see `checkpoint::restore`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use arch::aarch64::hvf::restore;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub use arch::aarch64::kvm::boot;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

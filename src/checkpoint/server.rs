@@ -210,8 +210,8 @@ impl ControlSocket {
     /// Starts the VM as `hvi restore` hands it over: restored-paused, with the
     /// I/O threads held and the control socket holding the vCPUs parked.
     #[must_use]
-    // The HVF restore is the caller; until it exists, only the tests are.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Only the HVF restore calls it so far.
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
     pub(crate) fn restored(mut self) -> Self {
         self.initial = VmState::RestoredPaused;
         self
