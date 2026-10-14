@@ -31,6 +31,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,17 +67,35 @@ impl ControlSocket {
     /// Binds the control socket at `path`, first removing a stale socket a
     /// previous run left.
     ///
+    /// Only a socket is removed. Anything else at the path is an error, so a
+    /// mistyped path such as `--control-sock disk.img` cannot delete a file.
     /// It must be bound before confinement, which allows accepting on a
     /// listener already held but not creating one.
     ///
     /// # Errors
     ///
-    /// Errors if the socket cannot be bound.
+    /// Errors if something other than a socket is at `path`, or the socket
+    /// cannot be bound.
     // The host-path ban in clippy.toml is aimed at the virtio-fs device. This
     // path is the operator's.
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn bind(path: &str, profile: Arc<ProfileCell>) -> std::io::Result<Self> {
-        let _ = std::fs::remove_file(path);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)?,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("cannot bind control socket {path}: it exists and is not a socket"),
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("cannot bind control socket {path}: {e}"),
+                ))
+            }
+        }
         let listener = UnixListener::bind(path).map_err(|e| {
             std::io::Error::new(e.kind(), format!("cannot bind control socket {path}: {e}"))
         })?;
@@ -749,6 +768,32 @@ mod tests {
             reply.starts_with(r#"{"v":1,"ok":false,"code":"stopped""#),
             "{reply}"
         );
+    }
+
+    // A stale socket from an earlier run is replaced; a file that happens to
+    // be at a mistyped path is left alone.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn bind_replaces_only_a_socket() {
+        let dir = std::env::temp_dir();
+        let cell = || {
+            Arc::new(
+                ProfileCell::new(MachineProfile::for_this_host("aarch64", "hvf"), None).unwrap(),
+            )
+        };
+        let stale = dir.join(format!("hvi-ctl-{}-stale.sock", std::process::id()));
+        drop(UnixListener::bind(&stale).unwrap());
+        drop(ControlSocket::bind(stale.to_str().unwrap(), cell()).expect("a stale socket"));
+        let _ = std::fs::remove_file(&stale);
+
+        let file = dir.join(format!("hvi-ctl-{}-disk.img", std::process::id()));
+        std::fs::write(&file, b"guest disk").unwrap();
+        let err = ControlSocket::bind(file.to_str().unwrap(), cell())
+            .err()
+            .expect("a regular file");
+        assert!(err.to_string().contains("is not a socket"), "{err}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"guest disk");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
