@@ -18,3 +18,7 @@ controllen = "controllen"
 fter = "fter"
 # O_WRONLY, the Linux open(2) access mode the virtio-fs backend translates.
 wronly = "wronly"
+# SME, the Arm Scalable Matrix Extension, whose state a checkpoint refuses.
+sme = "sme"
+# mke2fs, the e2fsprogs tool that makes the ext4 disk the checkpoint e2e uses.
+mke = "mke"

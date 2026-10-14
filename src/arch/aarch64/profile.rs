@@ -51,27 +51,82 @@ pub(crate) struct Arm64Machine<'a> {
 /// Returns the profile of an arm64 guest on `backend`, with everything but
 /// the CPU's identity, its ID registers and the PSCI version filled.
 pub(crate) fn profile(backend: &str, machine: &Arm64Machine<'_>) -> MachineProfile {
-    let mut p = MachineProfile::for_this_host("aarch64", backend);
-    p.counter_freq_hz = counter_freq_hz();
-    p.gic = Some(Gic {
-        version: match machine.gic.version {
-            GicVersion::V2 => 2,
-            GicVersion::V3 => 3,
-        },
-        gicd_base: machine.gic.gicd_base,
-        gicd_size: machine.gic.gicd_size,
-        gicr_base: machine.gic.gicr_base,
-        gicr_size: machine.gic.gicr_size,
-    });
-    p.ram_regions = machine
+    let ram_regions = machine
         .ram_regions
         .iter()
         .copied()
         .map(RamRegion::from)
         .collect();
-    p.vcpus = machine.vcpus;
-    p.devices = devices(machine.devices, machine.net_mode);
+    let mut p = base(
+        backend,
+        machine.gic,
+        machine.vcpus,
+        machine.devices,
+        machine.net_mode,
+        ram_regions,
+    );
     p.firmware.dtb_sha256 = dtb_sha256(machine);
+    p
+}
+
+/// Returns the profile of an arm64 guest a restore builds on `backend`, as
+/// [`profile`] does for a boot, from what the restore has instead of a
+/// loaded kernel.
+///
+/// The machine is this host's: its counter, the GIC the backend placed, the
+/// devices the restore's flags give the guest. The RAM, the vCPU count and
+/// the devicetree's digest are the bundle's, `source`'s. A restore loads no
+/// kernel and builds no devicetree, since guest RAM already holds both, so
+/// there is no layout here to hash; the restore makes the RAM and the vCPUs
+/// exactly as the bundle has them.
+// Only the HVF restore calls it so far.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn restored(
+    backend: &str,
+    gic: &GicLayout,
+    devices: VirtioDevices,
+    net_mode: Option<&str>,
+    source: &MachineProfile,
+) -> MachineProfile {
+    let mut p = base(
+        backend,
+        gic,
+        source.vcpus,
+        devices,
+        net_mode,
+        source.ram_regions.clone(),
+    );
+    p.firmware
+        .dtb_sha256
+        .clone_from(&source.firmware.dtb_sha256);
+    p
+}
+
+/// Returns the parts of an arm64 profile a boot and a restore fill the same
+/// way.
+fn base(
+    backend: &str,
+    gic: &GicLayout,
+    vcpus: u32,
+    present: VirtioDevices,
+    net_mode: Option<&str>,
+    ram_regions: Vec<RamRegion>,
+) -> MachineProfile {
+    let mut p = MachineProfile::for_this_host("aarch64", backend);
+    p.counter_freq_hz = counter_freq_hz();
+    p.gic = Some(Gic {
+        version: match gic.version {
+            GicVersion::V2 => 2,
+            GicVersion::V3 => 3,
+        },
+        gicd_base: gic.gicd_base,
+        gicd_size: gic.gicd_size,
+        gicr_base: gic.gicr_base,
+        gicr_size: gic.gicr_size,
+    });
+    p.ram_regions = ram_regions;
+    p.vcpus = vcpus;
+    p.devices = devices(present, net_mode);
     p
 }
 

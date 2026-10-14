@@ -669,9 +669,8 @@ pub fn arch_name(arch: GuestArch) -> &'static str {
 }
 
 /// A request a vCPU carries out on its own thread, outside the guest.
-// The HVF restore is the only caller of `Import`, and the HVF export the only
-// backend that hands back a platform; until both exist, only the tests do.
-#[allow(dead_code)]
+// Only HVF hands back a platform or loads a state so far.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) enum Work<'a> {
     /// Write this vCPU's state, and its own part of the interrupt
     /// controller.
@@ -687,7 +686,7 @@ pub(crate) enum Work<'a> {
 /// vCPU to finish one before it posts the next, so each is a barrier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // See `Work`.
-#[allow(dead_code)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) enum ImportStep {
     /// Each vCPU loads its registers and its timer.
     Vcpu,
@@ -711,7 +710,7 @@ pub(crate) struct ImportPlan {
 /// What a vCPU hands back from its work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 // See `Work`.
-#[allow(dead_code)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) enum Output {
     /// From [`Work::Export`]: its state, and its part of the interrupt
     /// controller when the backend reads one.
@@ -764,7 +763,7 @@ pub(crate) fn serve_from_regs_view<V: SafepointVcpu>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn view() -> RegsView {

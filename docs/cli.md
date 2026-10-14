@@ -17,6 +17,7 @@ not apply returns a named error rather than "unknown subcommand".
 | Subcommand | Where it works | What it does |
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
+| `restore` | macOS, Apple silicon | Resume a checkpoint bundle in this process. See [`restore`](#restore). On Linux it returns an error: the KVM restore is not built yet. |
 | `checkpoint-verify <dir>` | everywhere | Check a checkpoint bundle whole and print what it holds. Exits 1, naming the file, on the first mismatch. See [checkpoint.md](checkpoint.md#checking-a-bundle). |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
 | `smoke` | macOS, Apple silicon | The Hypervisor.framework smoke test. `--shm` runs it over shared guest RAM. |
@@ -169,7 +170,7 @@ and each reply is one line:
 | `profile` | Replies with the machine profile under `profile`, waiting up to 2 s for it on macOS, where the boot vCPU completes it. |
 | `pause` | Holds the host I/O threads, then parks every started vCPU. If both have not happened within 2 s in all, the pause is undone and the reply is `timeout`. |
 | `resume` | Releases the vCPUs, then the I/O threads. |
-| `status` | Replies with `state` (`running`, `paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. |
+| `status` | Replies with `state` (`running`, `paused`, `restored-paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. `restored-paused` is a guest `hvi restore` loaded that has not run yet; `resume` runs it, as from `paused`. |
 | `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
 | `checkpoint` | Captures the VM into a new bundle directory below `--checkpoint-root`, then resumes it or fences it. See [checkpoint.md](checkpoint.md#taking-a-checkpoint). |
 
@@ -193,6 +194,35 @@ uncommitted changes. The file is created before confinement. On Linux it
 is written before the guest starts. On macOS the boot vCPU writes it just
 before the guest's first instruction, since only that thread can read
 `MIDR_EL1`, so a reader that finds it empty waits or asks the socket.
+
+## `restore`
+
+`restore --from <dir> --control-sock <path> --checkpoint-root <dir> [flags]`
+resumes the checkpoint bundle in `<dir>` in this process, on a host whose
+machine profile matches the bundle's. It refuses with every reason it finds
+before it creates anything, and otherwise brings the guest up
+`restored-paused` on the control socket. The guest runs once a client sends
+`resume`. See [checkpoint.md](checkpoint.md#restoring-a-bundle).
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--from <dir>` | required | The bundle directory. |
+| `--control-sock <path>` | required | The control socket, as for `boot`. The guest waits on it for `resume`, so a restore without one could never run. |
+| `--checkpoint-root <dir>` | required | The directory a later `checkpoint` of the restored guest writes below, as for `boot`. |
+| `--disk <path>` or `--disk path=<path>[,readonly=on\|off][,serial=<id>]` | none | The disk to reopen for the guest's virtio-blk, in `boot`'s syntax, once. Required when the guest had a disk, refused when it had none. The restored disk answers `GET_ID` with the serial the bundle records, so a `serial=` that differs from it is refused, and so is `readonly=on`, since a checkpoint carries a writable disk; both refusals name the bundle's values. It must be the size the guest was given. |
+| `--net-stub` | off | The built-in stack, for a guest that ran on it. |
+| `--net-gateway <socket>` | none | The gateway, for a guest that ran on one. Unlike `boot`, a gateway that cannot be reached is an error, not a fallback to the stub. |
+| `--net-mac <mac>` | none | Optional: the bundle holds the MAC. One given here must be that MAC. |
+| `--agent-sock <path>` | none | The agent socket. Required when the guest had a vsock device, refused when it had none. The guest's earlier connections are reset. |
+| `--sandbox-id <string>` | the bundle's | Written into every ledger record. |
+| `--events <path>` | none | The `RawEvent` ledger, as for `boot`. |
+| `--profile-out <path>` | none | This machine's profile, as for `boot`. |
+| `--no-sandbox` | off | Run unconfined. |
+
+Each flag needs exactly what the guest had: the network mode and the
+devices are part of the machine it was built against. `--net-tap` is not
+taken. The kernel, initramfs, command line, vCPU count and RAM size come
+from the bundle.
 
 ## `dump-fdt`
 

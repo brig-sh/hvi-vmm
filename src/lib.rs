@@ -110,6 +110,9 @@ pub(crate) const LOG_PREFIX: &str = "[hvi]";
 // compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use arch::aarch64::hvf as backend;
+// Only HVF restores a checkpoint so far; see `checkpoint::restore`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use arch::aarch64::hvf::restore;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use arch::aarch64::kvm as backend;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
