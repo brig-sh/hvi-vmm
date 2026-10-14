@@ -913,6 +913,60 @@ impl HviTime {
     }
 }
 
+/// A captured `hvi-time` state that a restored VM publishes once, before
+/// any vCPU first enters the guest after `resume`.
+///
+/// Publishing it then rather than when the VM is built means guest
+/// nanoseconds go on from the capture however long the VM waited
+/// restored-paused. Every vCPU calls [`publish`](Self::publish) before its
+/// first entry: the first to call it publishes, and the others wait for it
+/// and get its result, so none reads the device's empty page.
+pub(crate) struct PendingPublish {
+    /// The state at the capture.
+    state: HviTimeState,
+    /// How the publish went, once it has been made.
+    done: std::sync::OnceLock<Result<(), String>>,
+}
+
+// Only the arm64 backends restore.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+impl PendingPublish {
+    /// Returns the publish of `state`, not made yet.
+    pub(crate) fn new(state: HviTimeState) -> Self {
+        Self {
+            state,
+            done: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Restores the state into `device`, once, and logs the page it
+    /// published.
+    ///
+    /// # Errors
+    ///
+    /// Errors, for every caller, when the device refused the state.
+    pub(crate) fn publish(&self, device: &HviTime) -> Result<(), String> {
+        self.done
+            .get_or_init(|| {
+                device
+                    .restore(&self.state)
+                    .map_err(|e| format!("hvi-time: {e}"))?;
+                let page = device.page().read();
+                eprintln!(
+                    "{} hvi-time: published generation {} at guest {} ns, counter {} Hz, \
+                     downtime total {} ns",
+                    crate::LOG_PREFIX,
+                    page.generation,
+                    page.base_ns,
+                    page.counter_freq_hz,
+                    page.downtime_total_ns
+                );
+                Ok(())
+            })
+            .clone()
+    }
+}
+
 /// Returns the host's `CLOCK_REALTIME` in nanoseconds.
 fn realtime_ns() -> u64 {
     SystemTime::now()
@@ -1756,5 +1810,44 @@ mod tests {
         state.page.counter_freq_hz = 54_000_000;
         state.counter_at_capture = 54_000_000;
         assert_eq!(state.counter_target(24_000_000), 24_000_000);
+    }
+
+    // Every vCPU of a restored VM asks for the publish before it first
+    // enters the guest; the page is published once, and a refusal reaches
+    // each of them.
+    #[test]
+    fn a_pending_publish_is_made_once_for_every_vcpu() {
+        let (counter, lines) = (Counter::default(), Lines::default());
+        let source = device(&counter, &lines);
+        let state = source.state();
+        let dest = Arc::new(
+            HviTime::new(
+                2,
+                24_000_000,
+                Box::new(counter.clone()),
+                Box::new(lines.clone()),
+            )
+            .unwrap(),
+        );
+        let pending = Arc::new(PendingPublish::new(state.clone()));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (pending, dest) = (Arc::clone(&pending), Arc::clone(&dest));
+                std::thread::spawn(move || pending.publish(&dest))
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        assert_eq!(dest.page().read().generation, state.page.generation + 2);
+        assert_eq!(dest.page().read().base_ns, state.guest_ns_at_capture);
+        let mut three = state;
+        three.cpus.push(three.cpus[0]);
+        let refused = PendingPublish::new(three);
+        assert!(refused.publish(&dest).is_err());
+        assert!(refused
+            .publish(&dest)
+            .unwrap_err()
+            .contains("3 vCPU timers"));
     }
 }

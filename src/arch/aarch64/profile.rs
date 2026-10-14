@@ -112,8 +112,6 @@ fn fill_profile_kind(p: &mut MachineProfile, kind: MachineProfileKind) {
 /// kernel and builds no devicetree, since guest RAM already holds both, so
 /// there is no layout here to hash; the restore makes the RAM and the vCPUs
 /// exactly as the bundle has them.
-// Only the HVF restore calls it so far.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn restored(
     backend: &str,
     gic: &GicLayout,

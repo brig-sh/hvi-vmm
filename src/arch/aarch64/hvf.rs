@@ -61,6 +61,7 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::portable::{self, fw};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::arch::aarch64::rebuild;
 use crate::checkpoint::bundle::IrqLevels;
 use crate::checkpoint::capture::Console;
 use crate::checkpoint::cpu::{Aarch64Vcpu, ImportPlan, Power, VcpuState, Work};
@@ -70,14 +71,14 @@ use crate::checkpoint::restore::{self, import, Refused, Restorer};
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, MachineProfileKind, RestoreConfig, Stop};
 use crate::devices::gicv2::Gicv2;
-use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, HviTimeState, TimerLine};
+use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, PendingPublish, TimerLine};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
-use crate::devices::virtio::net::{self, NetBackend, VirtioNet};
+use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Guest, PluginThread, PluginThreads, SafepointVcpu};
@@ -563,42 +564,8 @@ struct Restoring {
     /// Why a vCPU thread ended the restore, when one did.
     failure: Mutex<Option<String>>,
     /// The portable guest's `hvi-time` at the capture, which the first
-    /// vCPU to enter the guest after `resume` publishes, through
-    /// [`publish`](Self::publish).
-    hvitime: Option<HviTimeState>,
-    /// How the publish went, once one vCPU has made it.
-    published: std::sync::OnceLock<Result<(), String>>,
-}
-
-impl Restoring {
-    /// Publishes the portable guest's clock on `device`, once, before the
-    /// first guest entry after `resume`: guest nanoseconds go on from the
-    /// capture from now, so the time the VM waited restored-paused is not
-    /// seen on the guest's clock. Every vCPU calls it before it first
-    /// enters the guest, and waits for the one that publishes.
-    ///
-    /// # Errors
-    ///
-    /// Errors when the device refused the state.
-    fn publish(&self, device: Option<&HviTime>) -> Result<(), String> {
-        let (Some(state), Some(device)) = (&self.hvitime, device) else {
-            return Ok(());
-        };
-        self.published
-            .get_or_init(|| {
-                device
-                    .restore(state)
-                    .map_err(|e| format!("hvi-time: {e}"))?;
-                let page = device.page().read();
-                eprintln!(
-                    "{LOG_PREFIX} hvi-time: published generation {} at guest {} ns, \
-                     counter {} Hz, downtime total {} ns",
-                    page.generation, page.base_ns, page.counter_freq_hz, page.downtime_total_ns
-                );
-                Ok(())
-            })
-            .clone()
-    }
+    /// vCPU to enter the guest after `resume` publishes.
+    hvitime: Option<PendingPublish>,
 }
 
 /// State shared across all vCPU threads.
@@ -882,87 +849,15 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
     let (shared_ram, ram) = map_ram(ram_size)?;
     opened.bundle.load_ram(&ram)?;
 
-    // The devices, from their state, over this host's resources. Nothing is
-    // written to guest RAM until every one is built, so a device that is
-    // refused here leaves RAM as the bundle has it.
-    let states = &opened.devices.states;
-    let virtio = match (&cfg.disk, &states.blk) {
-        (Some(path), Some(state)) => {
-            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            // The refusals made sure disk.json is there.
-            let generation = opened.disk.as_ref().map_or(0, |d| d.generation);
-            Some(Arc::new(Mutex::new(VirtioBlk::restore(
-                path, &ram, state, generation,
-            )?)))
-        }
-        _ => None,
-    };
-    let mut net_reader = None;
-    let net_dev = match &states.net {
-        Some(state) => {
-            let backend = match &cfg.net_gateway {
-                Some(sock) => {
-                    // No fallback to the stub, as a boot has: the guest holds
-                    // an address on the gateway's network.
-                    let stream = std::os::unix::net::UnixStream::connect(sock)
-                        .map_err(|e| format!("--net-gateway {sock}: {e}"))?;
-                    net_reader = Some(stream.try_clone()?);
-                    eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock}");
-                    NetBackend::Gateway(stream)
-                }
-                None => {
-                    eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
-                    NetBackend::Stub
-                }
-            };
-            Some(VirtioNet::restore(backend, &ram, state)?)
-        }
-        None => None,
-    };
-    let net = net::share(net_dev, None);
-    let vsock = match &states.vsock {
-        Some(state) => Some(Arc::new(Mutex::new(VirtioVsock::restore(&ram, state)?))),
-        None => None,
-    };
-    let pl011 = Pl011::restore(states.pl011.as_ref().ok_or("devices.json: no PL011")?)?;
-    // A device's level follows its registers. Each must be the level the
-    // capture recorded, or the bundle contradicts itself.
+    // The devices, from their state, over this host's resources.
+    let rebuild::Devices {
+        block: virtio,
+        net,
+        net_reader,
+        vsock,
+        pl011,
+    } = rebuild::devices(&opened, &cfg, &ram)?;
     let levels = opened.devices.irq_levels;
-    for (name, saved, now) in [
-        ("uart", levels.uart, Some(pl011.irq_level())),
-        (
-            "virtio-blk",
-            levels.blk,
-            virtio.as_ref().map(|d| lock_or_recover(d).irq_level()),
-        ),
-        (
-            "virtio-net",
-            levels.net,
-            net.as_ref().map(|d| lock_or_recover(d).irq_level()),
-        ),
-        (
-            "virtio-vsock",
-            levels.vsock,
-            vsock.as_ref().map(|d| lock_or_recover(d).irq_level()),
-        ),
-    ] {
-        if let Some(now) = now.filter(|now| *now != saved) {
-            return Err(format!(
-                "devices.json: the {name} line was {saved} at the capture, and its state \
-                 drives it {now}"
-            )
-            .into());
-        }
-    }
-    // Nothing is left to refuse the bundle, so the connections whose host
-    // end stayed on the source can end now, before the lines are connected.
-    if let Some(dev) = &vsock {
-        lock_or_recover(dev).end_restored_conns(&ram);
-        eprintln!(
-            "{LOG_PREFIX} virtio-vsock: agent bridge on {} (guest cid 3, port 1024)",
-            cfg.agent_sock.as_deref().unwrap_or("")
-        );
-    }
     let bridge = match (&cfg.agent_sock, &vsock) {
         (Some(path), Some(dev)) => {
             Some(VsockBridge::bind(path, Arc::clone(dev), Arc::clone(&ram))?)
@@ -1007,8 +902,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
             clock,
             midr,
             failure: Mutex::new(None),
-            hvitime: hvitime_state,
-            published: std::sync::OnceLock::new(),
+            hvitime: hvitime_state.map(PendingPublish::new),
         })),
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -2087,8 +1981,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 }
             }
             if !published {
-                if let Some(restoring) = &sh.restoring {
-                    if let Err(e) = restoring.publish(sh.hvitime.as_deref()) {
+                let pending = sh.restoring.as_ref().and_then(|r| r.hvitime.as_ref());
+                if let (Some(pending), Some(device)) = (pending, &sh.hvitime) {
+                    if let Err(e) = pending.publish(device) {
                         eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
                         if let Some(p) = portable {
                             lock_or_recover(&p.refused).get_or_insert(e);
