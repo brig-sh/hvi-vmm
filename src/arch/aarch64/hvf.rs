@@ -64,7 +64,7 @@ use crate::arch::aarch64::portable::{self, fw};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::checkpoint::bundle::IrqLevels;
 use crate::checkpoint::capture::Console;
-use crate::checkpoint::cpu::{Aarch64Vcpu, ImportPlan, Power, VcpuState};
+use crate::checkpoint::cpu::{Aarch64Vcpu, ImportPlan, Power, VcpuState, Work};
 use crate::checkpoint::platform::{TimerState, HVF_GIC_STATE, HVF_GIC_STATE_CAPABILITY};
 use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::checkpoint::restore::{self, import, Refused, Restorer};
@@ -662,6 +662,7 @@ fn fill_hvf(p: &mut MachineProfile) {
 const RESTORER: Restorer = Restorer {
     arch: GuestArch::Aarch64,
     backend: "hvf",
+    profiles: &["native"],
     irq_kinds: &["hv-gic-v3"],
     timer_kinds: &["arch-timer"],
     adjunct: Some(HVF_GIC_STATE),
@@ -694,6 +695,12 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
         restore::open(std::path::Path::new(&cfg.from)).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source = opened.profile();
     let mut why = restore::refusals(&opened, &cfg, &RESTORER);
+    // A machine this restore does not rebuild is refused for that alone:
+    // set against the native machine below, every part of its profile
+    // would read as a difference.
+    if !RESTORER.profiles.contains(&source.profile.as_str()) {
+        return Err(Box::new(Refused(why)));
+    }
     let ram_size = match source.ram_regions.as_slice() {
         [region] if region.gpa == RAM_BASE => Some(region.size),
         _ => {
@@ -1589,12 +1596,6 @@ struct RestoreRun {
     irq_levels: IrqLevels,
 }
 
-/// Why a portable vCPU refuses the work of a checkpoint: nothing captures
-/// the software GIC or reloads it yet, so the VM stays paused and
-/// resumable instead.
-const PORTABLE_CAPTURE: &str = "a checkpoint of --profile portable-arm64-v1 is not \
-                                implemented yet: its software GIC is not captured";
-
 /// How long a restore waits for the vCPUs to start and for each import step.
 const IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1931,13 +1932,28 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // Safe point for every vCPU: park here while vcpu0 lets a plugin
             // look at the guest, or the control socket captures it, doing
             // on this thread the work only it can.
-            sh.guest
-                .pass_safepoint(&vcpu, cpu_id, plugin, |work| match &sh.irqchip {
-                    Irqchip::InKernel(vm_gic) => {
+            let mut read_platform = false;
+            sh.guest.pass_safepoint(&vcpu, cpu_id, plugin, |work| {
+                match (&sh.irqchip, &sh.hvitime) {
+                    (Irqchip::InKernel(vm_gic), _) => {
                         hvf_state::serve(cpu_id, &vcpu, vm_gic, clock, work)
                     }
-                    Irqchip::Soft(_) => Err(std::io::Error::other(PORTABLE_CAPTURE)),
-                });
+                    (Irqchip::Soft(p), Some(device)) => {
+                        read_platform |= matches!(work, Work::ExportPlatform);
+                        hvf_state::serve_portable(cpu_id, &vcpu, &p.gic, device, work)
+                    }
+                    (Irqchip::Soft(_), None) => {
+                        Err(std::io::Error::other("the portable guest has no hvi-time"))
+                    }
+                }
+            });
+            // A capture froze hvi-time to read it. A guest that goes on
+            // after it, as `then: "continue"` has it, gets its timers back.
+            if read_platform {
+                if let Some(device) = &sh.hvitime {
+                    device.thaw();
+                }
+            }
             if !clock_set {
                 if let Some(clock) = clock {
                     if let Err(e) = vcpu.set_vtimer_offset(clock.offset()) {
