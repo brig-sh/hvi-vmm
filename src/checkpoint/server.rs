@@ -2306,4 +2306,71 @@ mod tests {
         let r2 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
         assert_eq!((&r2["round"], &r2["dirty"]), (&2.into(), &0.into()), "{r2}");
     }
+
+    // hull's order: the pre-copy rounds while the guest runs, the fence,
+    // then the final round on a new connection. disk.json was written
+    // before that read, so it cannot list it; the read is at the captured
+    // generation, since a fenced guest writes nothing more, and that is
+    // what a restore with --disk-generation checks.
+    #[test]
+    fn a_final_round_read_after_the_fence_ends_with_the_disk() {
+        let disk = TestDisk::new("disk-fence-final", 20);
+        let mut image = disk.bytes();
+        let mut f = Fixture::with(
+            "disk-fence-final",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                ..Spec::default()
+            },
+        );
+        disk.write(2, 0xa1);
+        let r0 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"boot"}"#));
+        assert_eq!(bitmap(&r0), [2], "{r0}");
+        let (done, _) = f.stream(r#"{"v":1,"op":"disk-blocks","round":0}"#, &mut image);
+        assert_eq!(done["blocks"], 1, "{done}");
+        disk.write(5, 0xb2);
+        let r1 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
+        assert_eq!(bitmap(&r1), [5], "{r1}");
+        // Written after round 1 was read, before the fence.
+        disk.write(9, 0xc3);
+        disk.write(20, 0xc3);
+        let (done, _) = f.stream(r#"{"v":1,"op":"disk-blocks","round":1}"#, &mut image);
+        assert_eq!(done["blocks"], 1, "{done}");
+        assert!(
+            image != disk.bytes(),
+            "the pre-copy rounds miss the last writes"
+        );
+
+        assert_eq!(reply(&f.checkpoint("ck", "fence"))["state"], "fenced");
+        let disk_json = crate::checkpoint::bundle::Bundle::open(&f.root.join("ck"))
+            .unwrap()
+            .disk()
+            .unwrap()
+            .unwrap();
+        let rounds: Vec<(u32, u64)> = disk_json
+            .rounds
+            .iter()
+            .map(|r| (r.round, r.generation))
+            .collect();
+        assert_eq!(rounds, [(0, 1), (1, 2)]);
+        assert_eq!(disk_json.generation, 4);
+
+        let r2 = reply(&f.ask(r#"{"v":1,"op":"disk-dirty","since":"round"}"#));
+        assert_eq!(
+            (&r2["round"], &r2["generation"]),
+            (&2.into(), &4.into()),
+            "{r2}"
+        );
+        assert_eq!(bitmap(&r2), [9, 20]);
+        let (done, headers) = f.stream(r#"{"v":1,"op":"disk-blocks","round":2}"#, &mut image);
+        assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(headers.len(), 2);
+        assert!(
+            image == disk.bytes(),
+            "the base and the rounds are not the disk"
+        );
+        assert_eq!(r2["generation"].as_u64(), Some(disk_json.generation));
+    }
 }

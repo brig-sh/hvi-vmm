@@ -339,36 +339,34 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
     why
 }
 
-/// Returns why a disk made from the guest's base image and `applied` rounds
-/// of its blocks is not the disk `disk` describes, or `None` when it is.
+/// Returns why a disk made from the guest's base image and the rounds of
+/// its blocks a mover applied is not the disk `disk` describes, or `None`
+/// when it is.
 ///
-/// The rounds must be the ones the source read, all of them, and the last
-/// must have been read at the disk's final generation: inside the pause the
-/// capture was taken in, after the guest's last write.
-fn rounds_refusal(disk: &DiskState, applied: u32) -> Option<String> {
-    if applied == 0 {
-        return Some("--disk-rounds 0: a move applies at least round 0".to_string());
-    }
+/// `applied` is the `generation` of the `disk-dirty` reply that started the
+/// last round the mover applied. That round holds every write up to it, so
+/// the disk holds every write the guest made only when it is the disk's
+/// generation at the capture. The read may come before the capture, in the
+/// pause the capture is taken in, or after a fence: a fenced guest never
+/// writes again, so its next read is at the captured generation.
+fn final_round_refusal(disk: &DiskState, applied: u64) -> Option<String> {
     if disk.base_sha256.is_none() {
         return Some(
-            "--disk-rounds: disk.json names no base image the rounds apply to".to_string(),
+            "--disk-generation: disk.json names no base image the rounds apply to".to_string(),
         );
     }
-    let read = disk.rounds.len();
-    if read != applied as usize {
-        return Some(format!(
-            "--disk-rounds {applied}: the source read {read} round(s) of disk blocks"
-        ));
-    }
-    match disk.rounds.last() {
-        None => None,
-        Some(last) if last.generation == disk.generation => None,
-        Some(last) => Some(format!(
-            "--disk-rounds {applied}: the last round, {}, was read at disk generation {}, \
-             and the guest wrote on to generation {}; the disk lacks those writes",
-            last.round, last.generation, disk.generation
-        )),
-    }
+    (applied != disk.generation).then(|| {
+        format!(
+            "--disk-generation {applied}: the last round applied was read at disk generation \
+             {applied}, and disk.json was captured at generation {}; {}",
+            disk.generation,
+            if applied < disk.generation {
+                "the disk lacks the guest's writes after that round"
+            } else {
+                "that round is not of this capture"
+            }
+        )
+    })
 }
 
 /// Returns every reason the host resources `cfg` names do not match the
@@ -397,8 +395,8 @@ fn device_refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> Vec<
                     disk.size_bytes
                 ));
             }
-            if let Some(applied) = cfg.disk_rounds {
-                why.extend(rounds_refusal(disk, applied));
+            if let Some(applied) = cfg.disk_generation {
+                why.extend(final_round_refusal(disk, applied));
             }
         }
         (Some(_), None, _) => {
@@ -407,8 +405,8 @@ fn device_refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> Vec<
         (None, Some(path), _) => {
             why.push(format!("--disk {path}: the guest had no disk"));
         }
-        (_, None, _) if cfg.disk_rounds.is_some() => {
-            why.push("--disk-rounds describes --disk; give both".to_string());
+        (_, None, _) if cfg.disk_generation.is_some() => {
+            why.push("--disk-generation describes --disk; give both".to_string());
         }
         (Some(_), Some(_), None) => why.push("disk.json is missing".to_string()),
         (None, None, _) => {}
@@ -789,7 +787,7 @@ pub(crate) mod tests {
             control_sock: "/unused".into(),
             checkpoint_root: None,
             disk: Some(scratch.disk()),
-            disk_rounds: None,
+            disk_generation: None,
             net: true,
             net_gateway: None,
             net_mac: None,
@@ -905,48 +903,48 @@ pub(crate) mod tests {
     }
 
     // Only the mover knows whether it made the disk from rounds, so only
-    // its --disk-rounds asks for the check: rounds left from a move that
+    // its --disk-generation asks for the check: rounds left from a move that
     // was given up do not refuse a bundle whose disk was copied whole.
     #[test]
     fn a_disk_made_from_rounds_must_hold_the_guest_s_last_write() {
         let none = refused("rounds-stale", |p| moved(p, &[3], 5), |_| {});
         assert_eq!(none, Vec::<String>::new());
+        // The last round read before the capture, in its pause.
+        let ok = refused(
+            "rounds-final",
+            |p| moved(p, &[3, 5], 5),
+            |cfg| cfg.disk_generation = Some(5),
+        );
+        assert_eq!(ok, Vec::<String>::new());
+        // hull's order: rounds 0 and 1 while the guest ran, the fence, then
+        // the final round, which disk.json cannot list. Its read is at the
+        // captured generation, since a fenced guest writes nothing more.
+        let ok = refused(
+            "rounds-after-fence",
+            |p| moved(p, &[3, 4], 5),
+            |cfg| cfg.disk_generation = Some(5),
+        );
+        assert_eq!(ok, Vec::<String>::new());
+        // A mover that skipped that final round has only round 1's read.
         let reasons = refused(
-            "rounds-short",
-            |p| moved(p, &[3], 5),
-            |cfg| cfg.disk_rounds = Some(1),
+            "rounds-skipped",
+            |p| moved(p, &[3, 4], 5),
+            |cfg| cfg.disk_generation = Some(4),
         );
         has(
             &reasons,
             &[
-                "the last round, 0, was read at disk generation 3, and the guest wrote on to \
-               generation 5",
+                "--disk-generation 4: the last round applied was read at disk generation 4, \
+                 and disk.json was captured at generation 5; the disk lacks the guest's writes",
             ],
         );
-        let ok = refused(
-            "rounds-final",
-            |p| moved(p, &[3, 5], 5),
-            |cfg| cfg.disk_rounds = Some(2),
-        );
-        assert_eq!(ok, Vec::<String>::new());
         let reasons = refused(
-            "rounds-count",
-            |p| moved(p, &[3, 5], 5),
-            |cfg| cfg.disk_rounds = Some(3),
+            "rounds-other",
+            |p| moved(p, &[3, 4], 5),
+            |cfg| cfg.disk_generation = Some(9),
         );
-        has(&reasons, &["--disk-rounds 3: the source read 2 round(s)"]);
-        let reasons = refused(
-            "rounds-zero",
-            |p| moved(p, &[3, 5], 5),
-            |cfg| {
-                cfg.disk_rounds = Some(0);
-            },
-        );
-        has(
-            &reasons,
-            &["--disk-rounds 0: a move applies at least round 0"],
-        );
-        let reasons = refused("rounds-nobase", |_| {}, |cfg| cfg.disk_rounds = Some(1));
+        has(&reasons, &["that round is not of this capture"]);
+        let reasons = refused("rounds-nobase", |_| {}, |cfg| cfg.disk_generation = Some(0));
         has(&reasons, &["disk.json names no base image"]);
         let reasons = refused(
             "rounds-nodisk",
@@ -956,10 +954,10 @@ pub(crate) mod tests {
             },
             |cfg| {
                 cfg.disk = None;
-                cfg.disk_rounds = Some(1);
+                cfg.disk_generation = Some(1);
             },
         );
-        has(&reasons, &["--disk-rounds describes --disk; give both"]);
+        has(&reasons, &["--disk-generation describes --disk; give both"]);
     }
 
     #[test]
