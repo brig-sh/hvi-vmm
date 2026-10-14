@@ -207,7 +207,8 @@ logged the move once, generation 4, and counts it once (`migrations=1`) on
 any number of vCPUs, and that the guest's wall clock is the host's again.
 Every vCPU takes `GEN_CHANGED`; a portable kernel whose driver handled a
 generation once per vCPU logged and counted the move up to once per vCPU,
-and fails these two checks. Its third patch fixes that. The uptime the
+and fails these two checks. Its third patch fixes that; the series is in
+[tools/guest/kernel](../tools/guest/kernel/README.md). The uptime the
 ticks carry is `CLOCK_BOOTTIME`, which
 `hvi-time` moves on by the downtime, so the continuity checks take the
 downtime the restore logged off.
@@ -305,14 +306,43 @@ bundle a run without it left in `--dst-dir`:
   `KVM_CREATE_DEVICE` for `KVM_DEV_TYPE_ARM_VGIC_V2` with `ENODEV`, as a
   GICv3-only host does.
 
+`--negative` needs `--cpus 1`: its altered bundle sets the vCPU count to
+2, which is no change for a 2-vCPU bundle.
+
 Results and the exact commands are in
 [portable-profile.md](portable-profile.md#measured-results).
 
 A Mac that sleeps stops its guest's clocks, since Hypervisor.framework's
 counter does not run in sleep. hvi publishes `hvi-time` again after the
-sleep, which steps the guest's wall clock forward, but that is a publish
-the script counts and a gap in its drift window. Keep the Mac awake through
+sleep, which sets the guest's wall clock to the host's again. The driver
+counts that publish in `host_sleeps`, not in `migrations`, but it is still
+a gap in the drift window. Keep the Mac awake through
 a run (`caffeinate -i`, and the lid open on battery).
+
+## The host-sleep test
+
+`tools/sleep-e2e.py` checks `hvi-time`'s publish after a host sleep on a
+running portable guest, on either host. It boots the portable kernel with
+the initramfs of the migration test, starts `/clk 50`, and stamps each
+console line with the host's wall clock:
+
+```sh
+tools/sleep-e2e.py --mode hook --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-migrate.cpio --out /tmp/sleep-hook
+tools/sleep-e2e.py --mode sigstop --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-migrate.cpio --out /tmp/sleep-stop
+```
+
+`--mode hook` simulates a sleep with `HVI_TIME_TEST_SLEEP` (by default
+`25,30`) and checks that hvi publishes once, that the guest driver logs it
+once and counts it in `host_sleeps` and not in `migrations`, that the
+guest's REALTIME reads the host's plus the simulated sleep within a second
+of the publish and stays there, and that MONOTONIC never goes back.
+`--mode sigstop` stops hvi for 10 s and checks that nothing is published
+and that REALTIME is the host's again. It exits 1 when a check fails;
+`summary.json` in `--out` has the offsets. A real sleep is not tested: no
+automation puts the Mac to sleep. Results are in
+[portable-profile.md](portable-profile.md#host-sleep).
 
 ## Toolchain versions
 
