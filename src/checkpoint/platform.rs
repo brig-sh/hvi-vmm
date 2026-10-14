@@ -340,6 +340,31 @@ impl PlatformState {
         Ok(state)
     }
 
+    /// Adds each vCPU's part of the interrupt controller, which each read on
+    /// its own thread, to the controller vCPU 0 read.
+    ///
+    /// # Errors
+    ///
+    /// Errors when a part is of another kind than the controller.
+    pub fn add_cpus(&mut self, cpus: Vec<IrqCpuState>) -> Result<(), String> {
+        for cpu in cpus {
+            match (&mut self.irq, cpu) {
+                (IrqState::HvGicV3(gic), IrqCpuState::GicV3(redist, icc)) => {
+                    gic.redist.push(redist);
+                    gic.icc.push(icc);
+                }
+                (other, IrqCpuState::GicV3(redist, _)) => {
+                    return Err(format!(
+                        "vCPU {} read a GICv3 interface, and the controller is {}",
+                        redist.vcpu,
+                        other.kind()
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Checks the canonical state against a machine of `vcpus` vCPUs and
     /// `spi_count` SPIs, before a restore allocates or loads anything by it.
     ///
