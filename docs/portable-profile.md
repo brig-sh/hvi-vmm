@@ -79,9 +79,10 @@ Some registers cannot be set on one host or the other:
 - `CNTFRQ_EL0`: settable on neither host. It reads 24 MHz on the Mac and
   54 MHz on the Pi.
 
-The profile also appends `arm64.nopauth arm64.nobti arm64.nosve arm64.nosme
-arm64.nomte` to the kernel command line, so the guest stays off those
-features even if a register slipped through.
+The profile also puts `arm64.nopauth arm64.nobti arm64.nosve arm64.nosme
+arm64.nomte` at the front of the kernel command line, so the guest stays off
+those features even if a register slipped through. They go in front because
+Linux passes everything after a standalone `--` to init.
 
 Because the guest sees a Cortex-A76 on the Mac too, Linux applies the A76's
 errata workarounds there ("Broken broadcast TLBI completion", "SSBS not fully
