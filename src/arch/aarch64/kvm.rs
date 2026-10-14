@@ -605,7 +605,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let offset = set_counter_offset(&kvm, &vm, &vcpus[0])?;
         let device = Arc::new(HviTime::new(
             num_cpus as usize,
-            u32::try_from(crate::checkpoint::profile::counter_freq_hz()).unwrap_or(0),
+            crate::checkpoint::profile::counter_freq_hz(),
             Box::new(KvmCounter { offset }),
             Box::new(KvmTimerLine {
                 vm: Arc::clone(&vm),
