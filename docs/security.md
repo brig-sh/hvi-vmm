@@ -143,8 +143,8 @@ vulnerability report.
 ## The selftests
 
 ```sh
-hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 20 probes, 9 expect a SIGSYS trap, 11 expect success
+hvi sandbox-selftest    # macOS: 27 probes, 16 expect denial, 11 expect success
+hvi seccomp-selftest    # Linux: 23 probes, 11 expect a SIGSYS trap, 12 expect success
 ```
 
 Both install the profile or the filters that actually ship and check both
