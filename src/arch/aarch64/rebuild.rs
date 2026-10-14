@@ -77,7 +77,7 @@ pub(crate) fn devices(
             // that; a disk another guest holds stays refused.
             let deadline = std::time::Instant::now() + DISK_LOCK_WAIT;
             let dev = loop {
-                match VirtioBlk::restore(path, ram, state, generation) {
+                match VirtioBlk::restore(path, ram, state, generation, None) {
                     Err(e)
                         if opened.streamed()
                             && e.kind() == std::io::ErrorKind::WouldBlock
