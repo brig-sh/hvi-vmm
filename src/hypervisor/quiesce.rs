@@ -119,6 +119,14 @@ impl Quiesce {
         self.requested.store(true, Ordering::SeqCst);
     }
 
+    /// Returns whether a quiesce is in effect.
+    ///
+    /// A vCPU that waits outside the hypervisor, such as one in an emulated
+    /// WFI, checks it so it can leave the wait and park at its checkpoint.
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
     /// Waits until `n` vCPUs have parked, for at most `PARK_TIMEOUT`.
     ///
     /// Returns `false` on timeout, meaning the guest is *not* fully quiesced

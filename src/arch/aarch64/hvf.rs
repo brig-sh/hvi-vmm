@@ -23,6 +23,14 @@
 //!
 //! The exit-loop's timer/WFI/PC handling and the SMP hand-off are the
 //! boot-debug frontier.
+//!
+//! Two machines run here. The native one creates Apple's in-kernel GICv3
+//! (`hv_gic`), which also waits out a guest WFI. The portable profile
+//! (`--profile portable-arm64-v1`, see `docs/portable-profile.md`) creates
+//! no GIC: the guest gets the software GICv2 of [`crate::devices::gicv2`],
+//! each vCPU thread sets the vCPU's IRQ line from it before every guest
+//! entry, and a guest WFI exits to hvi, which sleeps the thread until the
+//! GIC has an interrupt for it or the guest's virtual timer is due.
 
 // Resolved once while the VM is built, before any guest request; see
 // clippy.toml.
@@ -31,10 +39,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use applevisor::prelude::{
-    ExitReason, FeatureReg, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuConfig, VcpuHandle,
-    VirtualMachine, VirtualMachineConfig, VirtualMachineInstance,
+    ExitReason, FeatureReg, GicConfig, GicDisabled, GicEnabled, InterruptType, Reg, SysReg, Vcpu,
+    VcpuConfig, VcpuHandle, VirtualMachine, VirtualMachineConfig, VirtualMachineInstance,
 };
 
 use crate::arch::aarch64::esr::{DataAbort, Ec};
@@ -54,7 +63,8 @@ use crate::checkpoint::platform::{TimerState, HVF_GIC_STATE, HVF_GIC_STATE_CAPAB
 use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::checkpoint::restore::{self, import, Refused, Restorer};
 use crate::checkpoint::server::ControlSocket;
-use crate::config::{check_export_overlap, BootConfig, RestoreConfig, Stop};
+use crate::config::{check_export_overlap, BootConfig, MachineProfileKind, RestoreConfig, Stop};
+use crate::devices::gicv2::Gicv2;
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
@@ -80,11 +90,26 @@ use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
 type VmGic = VirtualMachineInstance<GicEnabled>;
 
+/// The VM handle the vCPU threads and the kicks use, with or without the
+/// in-kernel GIC.
+type Vm = VirtualMachineInstance<GicDisabled>;
+
 /// GIC INTIDs: SPIs start at 32.
 const UART_INTID: u32 = 32 + UART_SPI;
 const VIRTIO_INTID: u32 = 32 + VIRTIO_SPI;
 const VIRTIO_NET_INTID: u32 = 32 + VIRTIO_NET_SPI;
 const VIRTIO_VSOCK_INTID: u32 = 32 + VIRTIO_VSOCK_SPI;
+/// The virtual timer's PPI (PPI 11 in the devicetree).
+const VTIMER_INTID: u32 = 27;
+
+/// The vCPU's IRQ line for `hv_vcpu_set_pending_interrupt`:
+/// `HV_INTERRUPT_TYPE_IRQ`, value 0 in the SDK's `hv_vcpu_types.h`.
+///
+/// applevisor-sys 1.0.0 declares the enum's two values in the other order,
+/// so its `FIQ` variant is the one with the SDK's IRQ value. Its `IRQ` would
+/// raise an FIQ, which Linux panics on ("FIQ taken without a root FIQ
+/// handler").
+const IRQ_LINE: InterruptType = InterruptType::FIQ;
 
 /// PSCI function IDs (SMC64/HVC calling convention) we recognise.
 mod psci {
@@ -135,29 +160,98 @@ impl IrqLine for HvfIrqLine {
     }
 }
 
+/// A portable vCPU's emulated WFI: the thread sleeps on `cv` with `asleep`
+/// set.
+struct Idle {
+    /// Whether the vCPU's thread is in [`wait_for_interrupt`]. Whoever wakes
+    /// it takes this lock to notify, so a wake cannot land between the
+    /// thread's last check and its wait.
+    asleep: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// A guest interrupt line on the portable profile's software GICv2.
+///
+/// Unlike [`HvfIrqLine`], every rise wakes the vCPUs the GIC routes it to,
+/// from whichever thread it comes: the GIC model is not in the hypervisor,
+/// so nothing else would tell a vCPU in an emulated WFI, or one in a run.
+struct SoftIrqLine {
+    /// The machine whose GIC has the line.
+    portable: Arc<Portable>,
+    /// The line's interrupt ID, an SPI.
+    intid: u32,
+    /// The vCPUs to wake.
+    vcpus: Arc<Vcpus<Kicker>>,
+}
+
+impl IrqLine for SoftIrqLine {
+    fn set_level(&self, level: bool) -> std::io::Result<()> {
+        // The GIC lock is released before any vCPU is woken: a vCPU going
+        // to sleep takes its `Idle` lock and then the GIC's.
+        let out = lock_or_recover(&self.portable.gic).set_spi_line(self.intid, level);
+        if out.wake != 0 && self.vcpus.is_running() {
+            self.vcpus.kicker().wake_mask(out.wake);
+        }
+        Ok(())
+    }
+}
+
+/// Where the guest's device lines go.
+#[derive(Clone)]
+enum Irqchip {
+    /// Apple's in-kernel GICv3, on the native machine.
+    InKernel(VmGic),
+    /// The software GICv2, on the portable one.
+    Soft(Arc<Portable>),
+}
+
+/// The portable profile's machine on this host: the software GICv2 and what
+/// the vCPU threads share to drive it.
+struct Portable {
+    /// The guest's interrupt controller.
+    gic: Mutex<Gicv2>,
+    /// Where the guest finds the distributor and the CPU interface.
+    layout: GicLayout,
+    /// Host counter ticks to nanoseconds, as `(numer, denom)`.
+    timebase: (u64, u64),
+}
+
 /// The [`Kick`] implementation for Hypervisor.framework vCPUs.
 ///
 /// It holds each vCPU's handle and the secondaries' `CPU_ON` mailboxes. A kick
 /// is `hv_vcpus_exit`. It ends a run in progress, and one that reaches a vCPU
 /// outside its run stays pending and ends its next run at once. A secondary
 /// that waits for `CPU_ON` is in no run, so the stop also wakes its mailbox.
+/// Under the portable profile a vCPU can also sleep in an emulated WFI, in no
+/// run either, so every kick also wakes its [`Idle`].
 struct Kicker {
     /// The VM the vCPUs belong to.
-    vm: VmGic,
+    vm: Vm,
     /// Each vCPU's handle indexed by vCPU id, `None` until its thread has
     /// created the vCPU.
     handles: Mutex<Vec<Option<VcpuHandle>>>,
     /// The `CPU_ON` mailboxes of the secondaries.
     secondaries: Vec<Secondary>,
+    /// Each vCPU's emulated WFI under the portable profile; empty on the
+    /// native machine, whose WFI waits inside the hypervisor.
+    idle: Vec<Idle>,
 }
 
 impl Kicker {
-    /// Returns a table for `count` vCPUs of `vm`, none of them registered.
-    fn new(vm: VmGic, count: u32, secondaries: Vec<Secondary>) -> Self {
+    /// Returns a table for `count` vCPUs of `vm`, none of them registered,
+    /// with an [`Idle`] for each when `emulated_wfi`.
+    fn new(vm: Vm, count: u32, secondaries: Vec<Secondary>, emulated_wfi: bool) -> Self {
+        let idle = if emulated_wfi { count } else { 0 };
         Self {
             vm,
             handles: Mutex::new((0..count).map(|_| None).collect()),
             secondaries,
+            idle: (0..idle)
+                .map(|_| Idle {
+                    asleep: Mutex::new(false),
+                    cv: Condvar::new(),
+                })
+                .collect(),
         }
     }
 
@@ -167,14 +261,47 @@ impl Kicker {
     /// this thread leaves it out.
     fn register(&self, cpu: u32, vcpu: &Vcpu) {
         OWN_VCPU.with(|own| own.set(Some(vcpu.id())));
+        OWN_CPU.with(|own| own.set(Some(cpu)));
         if let Some(slot) = lock_or_recover(&self.handles).get_mut(cpu as usize) {
             *slot = Some(vcpu.get_handle());
+        }
+    }
+
+    /// Wakes vCPU `cpu` from an emulated WFI, if it sleeps in one.
+    fn notify_idle(&self, cpu: usize) -> bool {
+        let Some(idle) = self.idle.get(cpu) else {
+            return false;
+        };
+        let asleep = lock_or_recover(&idle.asleep);
+        if *asleep {
+            idle.cv.notify_all();
+        }
+        *asleep
+    }
+
+    /// Makes every vCPU in `mask` but the calling thread's own see the
+    /// interrupt the software GIC now has for it.
+    ///
+    /// One asleep in an emulated WFI is woken. Any other is kicked out of
+    /// its run, or its next run ends at once; it then sets its IRQ line from
+    /// the GIC at its next entry. The calling thread's own vCPU does that
+    /// anyway.
+    fn wake_mask(&self, mask: u8) {
+        let own = OWN_CPU.with(std::cell::Cell::get);
+        for cpu in 0..self.idle.len() {
+            if mask & (1 << cpu) == 0 || own == Some(cpu as u32) || self.notify_idle(cpu) {
+                continue;
+            }
+            if let Some(Some(handle)) = lock_or_recover(&self.handles).get(cpu) {
+                let _ = self.vm.vcpus_exit(std::slice::from_ref(handle));
+            }
         }
     }
 }
 
 impl Kick for Kicker {
     fn kick(&self, cpu: u32) {
+        self.notify_idle(cpu as usize);
         let own = OWN_VCPU.with(std::cell::Cell::get);
         if let Some(Some(handle)) = lock_or_recover(&self.handles).get(cpu as usize) {
             if Some(handle.id()) != own {
@@ -184,6 +311,9 @@ impl Kick for Kicker {
     }
 
     fn kick_all(&self) {
+        for cpu in 0..self.idle.len() {
+            self.notify_idle(cpu);
+        }
         // A cancel a vCPU sends itself stays pending and ends its next run
         // before the guest ran, so a plugin that kicked from `safepoint` would
         // run again at once.
@@ -360,7 +490,10 @@ struct Restoring {
 /// State shared across all vCPU threads.
 #[derive(Clone)]
 struct Shared {
-    vm: VmGic,
+    vm: Vm,
+    /// Where the device lines go, and on the native machine the GIC whose
+    /// state a checkpoint reads.
+    irqchip: Irqchip,
     /// The order the vCPU threads create their vCPUs in.
     create_order: Arc<CreateOrder>,
     /// What a restore needs of the vCPU threads, when this VM is one.
@@ -375,6 +508,8 @@ struct Shared {
     plugin: Option<Arc<dyn Plugin>>,
     /// The machine profile, which the boot vCPU completes with `MIDR_EL1`.
     profile: Arc<ProfileCell>,
+    /// The portable profile's machine, or `None` on the native one.
+    portable: Option<Arc<Portable>>,
 }
 
 /// The feature registers the profile records, by the name it records them
@@ -492,7 +627,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     if runs.first() != Some(&true) {
         why.push("cpu.json: vCPU 0 is not on".to_string());
     }
-    let gic = gic_layout()?;
+    let gic = gic_layout(false, source.vcpus)?;
     let present = fdt::VirtioDevices {
         blk: cfg.disk.is_some(),
         net: cfg.net || cfg.net_gateway.is_some(),
@@ -535,7 +670,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         opened.session.epoch
     );
 
-    let vm = create_vm(&gic)?;
+    let (vm, irqchip) = create_vm(&gic, None)?;
     let (shared_ram, ram) = map_ram(ram_size)?;
     opened.bundle.load_ram(&ram)?;
 
@@ -649,9 +784,10 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             cv: Condvar::new(),
         })
         .collect();
-    let kicker = Kicker::new(vm.clone(), num_cpus, secondaries);
+    let kicker = Kicker::new(vm.clone(), num_cpus, secondaries, false);
     let shared = Shared {
         vm: vm.clone(),
+        irqchip,
         create_order: Arc::default(),
         restoring: Some(Arc::new(Restoring {
             runs,
@@ -676,6 +812,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         dtb_addr: 0,
         plugin: None,
         profile,
+        portable: None,
     };
     connect_lines(&shared);
     let control = bind_control(
@@ -715,13 +852,35 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // statement about the configuration, decidable before anything is built.
     check_export_overlap(&cfg.fs_shares)?;
     let num_cpus = cfg.vcpus.max(1);
+    let is_portable = cfg.profile == MachineProfileKind::PortableArm64V1;
 
-    let gic = gic_layout()?;
-    eprintln!(
-        "{LOG_PREFIX} {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
-        gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
-    );
-    let vm = create_vm(&gic)?;
+    let gic = gic_layout(is_portable, num_cpus)?;
+    if is_portable {
+        eprintln!(
+            "{LOG_PREFIX} {num_cpus} vCPU(s)  profile {}  software GICv2: GICD {:#x}+{:#x}  GICC {:#x}+{:#x}  UART {:#x}",
+            cfg.profile.name(),
+            gic.gicd_base,
+            gic.gicd_size,
+            gic.gicr_base,
+            gic.gicr_size,
+            UART_BASE
+        );
+    } else {
+        eprintln!(
+            "{LOG_PREFIX} {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
+            gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
+        );
+    }
+    // The native machine's lines go to the in-kernel GIC. The portable one
+    // creates none: its GIC is the model in `portable`.
+    let portable = is_portable.then(|| {
+        Arc::new(Portable {
+            gic: Mutex::new(Gicv2::new(num_cpus)),
+            layout: gic,
+            timebase: host_timebase(),
+        })
+    });
+    let (vm, irqchip) = create_vm(&gic, portable.clone())?;
     let (shared_ram, ram) = map_ram(cfg.mem_bytes)?;
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
 
@@ -910,10 +1069,11 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             cv: Condvar::new(),
         })
         .collect();
-    let kicker = Kicker::new(vm.clone(), num_cpus, secondaries);
+    let kicker = Kicker::new(vm.clone(), num_cpus, secondaries, is_portable);
 
     let shared = Shared {
         vm: vm.clone(),
+        irqchip,
         create_order: Arc::default(),
         restoring: None,
         guest: Arc::new(Guest {
@@ -933,6 +1093,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         dtb_addr: layout.dtb_addr,
         plugin: cfg.plugin.clone(),
         profile,
+        portable,
     };
 
     connect_lines(&shared);
@@ -964,19 +1125,25 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     run(shared, num_cpus, io, None)
 }
 
-/// Returns the in-kernel GICv3's placement, with sizes from the framework so
-/// the devicetree matches `hv_gic`, once every fixed device window is checked
-/// to clear it.
-fn gic_layout() -> Result<GicLayout, Box<dyn std::error::Error>> {
-    let gicd_align = GicConfig::get_distributor_base_alignment()? as u64;
-    let gicr_align = GicConfig::get_redistributor_base_alignment()? as u64;
-    let gic = GicLayout {
-        // Apple's hv_gic is a GICv3; unlike KVM there is nothing to negotiate.
-        version: GicVersion::V3,
-        gicd_base: align_down(GicLayout::QEMU_VIRT.gicd_base, gicd_align),
-        gicd_size: GicConfig::get_distributor_size()? as u64,
-        gicr_base: align_down(GicLayout::QEMU_VIRT.gicr_base, gicr_align),
-        gicr_size: GicConfig::get_redistributor_region_size()? as u64,
+/// Returns the GIC's placement once every fixed device window is checked to
+/// clear it: on the native machine the in-kernel GICv3's, with sizes from
+/// the framework so the devicetree matches `hv_gic`, and under the portable
+/// profile the software GICv2's, at QEMU virt's v2 addresses.
+fn gic_layout(portable: bool, num_cpus: u32) -> Result<GicLayout, Box<dyn std::error::Error>> {
+    let gic = if portable {
+        GicLayout::for_vcpus(GicVersion::V2, num_cpus)?
+    } else {
+        let gicd_align = GicConfig::get_distributor_base_alignment()? as u64;
+        let gicr_align = GicConfig::get_redistributor_base_alignment()? as u64;
+        GicLayout {
+            // Apple's hv_gic is a GICv3; unlike KVM there is nothing to
+            // negotiate.
+            version: GicVersion::V3,
+            gicd_base: align_down(GicLayout::QEMU_VIRT.gicd_base, gicd_align),
+            gicd_size: GicConfig::get_distributor_size()? as u64,
+            gicr_base: align_down(GicLayout::QEMU_VIRT.gicr_base, gicr_align),
+            gicr_size: GicConfig::get_redistributor_region_size()? as u64,
+        }
     };
     // Every device window has to clear the GIC, and only here is it known how
     // much GIC there is: the framework sizes the redistributor region, and it
@@ -1002,15 +1169,20 @@ fn gic_layout() -> Result<GicLayout, Box<dyn std::error::Error>> {
     Ok(gic)
 }
 
-/// Creates the VM with its GICv3 at `gic`.
-fn create_vm(gic: &GicLayout) -> Result<VmGic, Box<dyn std::error::Error>> {
+/// Creates the VM: on the native machine with its GICv3 at `gic`, and with
+/// no GIC when `portable` is given, whose model is then the guest's.
+fn create_vm(
+    gic: &GicLayout,
+    portable: Option<Arc<Portable>>,
+) -> Result<(Vm, Irqchip), Box<dyn std::error::Error>> {
+    if let Some(portable) = portable {
+        return Ok((VirtualMachine::new()?, Irqchip::Soft(portable)));
+    }
     let mut gic_config = GicConfig::new();
     gic_config.set_distributor_base(gic.gicd_base)?;
     gic_config.set_redistributor_base(gic.gicr_base)?;
-    Ok(VirtualMachine::with_gic(
-        VirtualMachineConfig::new(),
-        gic_config,
-    )?)
+    let vm_gic = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config)?;
+    Ok((Vm::from(vm_gic.clone()), Irqchip::InKernel(vm_gic)))
 }
 
 /// Allocates `mem_bytes` of guest RAM and maps it at `RAM_BASE`.
@@ -1053,12 +1225,21 @@ fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::er
 fn connect_lines(shared: &Shared) {
     // Each device sets its own interrupt line, from the methods that change its
     // level and so under the lock that decides it.
+    // On the portable machine every line wakes the vCPUs it reaches, the
+    // console's included: there is no in-kernel GIC to do it.
     let line = |intid, kick: bool| -> Arc<dyn IrqLine> {
-        Arc::new(HvfIrqLine {
-            vm: shared.vm.clone(),
-            intid,
-            kick: kick.then(|| Arc::clone(&shared.guest.vcpus)),
-        })
+        match &shared.irqchip {
+            Irqchip::InKernel(vm_gic) => Arc::new(HvfIrqLine {
+                vm: vm_gic.clone(),
+                intid,
+                kick: kick.then(|| Arc::clone(&shared.guest.vcpus)),
+            }),
+            Irqchip::Soft(portable) => Arc::new(SoftIrqLine {
+                portable: Arc::clone(portable),
+                intid,
+                vcpus: Arc::clone(&shared.guest.vcpus),
+            }),
+        }
     };
     lock_or_recover(&shared.pl011).connect_irq(line(UART_INTID, false));
     shared.guest.connect_irqs(
@@ -1180,6 +1361,12 @@ struct RestoreRun {
     /// Each device's line level at the capture.
     irq_levels: IrqLevels,
 }
+
+/// Why a portable vCPU refuses the work of a checkpoint: nothing captures
+/// the software GIC or reloads it yet, so the VM stays paused and
+/// resumable instead.
+const PORTABLE_CAPTURE: &str = "a checkpoint of --profile portable-arm64-v1 is not \
+                                implemented yet: its software GIC is not captured";
 
 /// How long a restore waits for the vCPUs to start and for each import step.
 const IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1306,6 +1493,9 @@ fn run(
 /// level each restored device holds, which is the captured one except where
 /// ending the vsock connections queued packets for the guest.
 fn load(shared: &Shared, restore: &RestoreRun) -> Result<(), String> {
+    let Irqchip::InKernel(vm_gic) = &shared.irqchip else {
+        return Err("a restore loads the in-kernel GIC, which this VM does not have".to_string());
+    };
     import(&shared.guest.vcpus, &restore.plan, IMPORT_TIMEOUT, || {
         shared.create_order.created()
     })?;
@@ -1350,8 +1540,7 @@ fn load(shared: &Shared, restore: &RestoreRun) -> Result<(), String> {
     ];
     for (name, intid, saved, now) in lines {
         let Some(now) = now else { continue };
-        shared
-            .vm
+        vm_gic
             .gic_set_spi(intid, saved || now)
             .map_err(|e| format!("driving the {name} line: {e:?}"))?;
     }
@@ -1369,6 +1558,10 @@ thread_local! {
 
     /// The handle id of this thread's vCPU, so a kick can leave it out.
     static OWN_VCPU: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+
+    /// The index of this thread's vCPU, so a wake from the software GIC can
+    /// leave it out.
+    static OWN_CPU: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// What this thread's vCPU last exited for, if it has run at all.
@@ -1405,7 +1598,8 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let _stop = sh.guest.vcpus.stop_on_drop();
     let _ = vcpu.set_trap_debug_exceptions(false);
     let _ = vcpu.set_trap_debug_reg_accesses(false);
-    // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
+    // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set. A GICv2 reads the
+    // same aff0.
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
     sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
     // A restore loads the GIC only once every vCPU, the ones that were off
@@ -1476,6 +1670,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let mut clock_set = clock.is_none();
 
     let is_boot = cpu_id == 0;
+    let portable = sh.portable.as_deref();
+    let mut vtimer = Vtimer {
+        offset: vcpu.get_vtimer_offset().unwrap_or(0),
+        raised: false,
+    };
     // The loop runs inside `catch_unwind` only for the report. A panic is
     // reported with where the guest was and what it last did, and the guard
     // ends the VM on the way out.
@@ -1484,9 +1683,14 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // Safe point for every vCPU: park here while cpu0 lets a plugin
             // look at the guest, or the control socket captures it, doing
             // on this thread the work only it can.
-            sh.guest.vcpus.checkpoint_with(cpu_id, |work| {
-                hvf_state::serve(cpu_id, &vcpu, &sh.vm, clock, work)
-            });
+            sh.guest
+                .vcpus
+                .checkpoint_with(cpu_id, |work| match &sh.irqchip {
+                    Irqchip::InKernel(vm_gic) => {
+                        hvf_state::serve(cpu_id, &vcpu, vm_gic, clock, work)
+                    }
+                    Irqchip::Soft(_) => Err(std::io::Error::other(PORTABLE_CAPTURE)),
+                });
             if !clock_set {
                 if let Some(clock) = clock {
                     if let Err(e) = vcpu.set_vtimer_offset(clock.offset()) {
@@ -1506,6 +1710,14 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         guest: &sh.guest,
                     });
                 }
+            }
+
+            // The software GIC's verdict for this vCPU. Hypervisor.framework
+            // drops the pending IRQ after every run, so it is set before each
+            // one.
+            if let Some(p) = portable {
+                let pending = lock_or_recover(&p.gic).irq_pending(cpu_id as usize);
+                let _ = vcpu.set_pending_interrupt(IRQ_LINE, pending);
             }
 
             if let Err(e) = vcpu.run() {
@@ -1556,6 +1768,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             {
                                 service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
                                 advance_pc(&vcpu);
+                            } else if let Some(p) = portable.filter(|p| p.in_gic(ipa)) {
+                                service_gic(&vcpu, &sh, p, cpu_id, ipa, syn, &mut vtimer);
+                                advance_pc(&vcpu);
                             } else {
                                 eprintln!(
                                     "{LOG_PREFIX} cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
@@ -1565,14 +1780,30 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                             }
                         }
                         Ec::SysReg => {
-                            // RAZ/WI: unmodeled system register.
+                            // RAZ/WI: unmodeled system register. Without
+                            // hv_gic the physical counter traps too, and reads
+                            // the guest's counter.
                             let iss = syn & 0x1ff_ffff;
                             if iss & 1 == 1 {
-                                write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, 0);
+                                let value = match portable {
+                                    Some(_) if is_physical_counter(iss) => vtimer.counter(),
+                                    _ => 0,
+                                };
+                                write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, value);
                             }
                             advance_pc(&vcpu);
                         }
-                        Ec::Other(0x01) => {} // WFx: hvf handled the wait.
+                        // WFx. The native machine's hv_gic handled the wait.
+                        // Without it a WFI exits at once with the PC on it, so
+                        // hvi steps past it and waits here.
+                        Ec::Other(0x01) => {
+                            if let Some(p) = portable {
+                                advance_pc(&vcpu);
+                                if syn & 0b11 == 0 {
+                                    wait_for_interrupt(&vcpu, &sh, p, cpu_id, &vtimer);
+                                }
+                            }
+                        }
                         other => {
                             eprintln!(
                                 "{LOG_PREFIX} cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
@@ -1584,6 +1815,13 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 }
                 ExitReason::VTIMER_ACTIVATED => {
                     let _ = vcpu.set_vtimer_mask(true);
+                    // Without hv_gic the timer reaches the guest only as this
+                    // exit. The line stays high, and the timer masked, until
+                    // the guest ends the interrupt (`end_vtimer_interrupt`).
+                    if let Some(p) = portable {
+                        vtimer.raised = true;
+                        lock_or_recover(&p.gic).set_ppi_line(cpu_id as usize, VTIMER_INTID, true);
+                    }
                 }
                 ExitReason::CANCELED => {} // kicked for a snapshot or a stop
                 ExitReason::UNKNOWN => {
@@ -1697,6 +1935,210 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> bool {
             false
         }
     }
+}
+
+// ----- The portable machine ------------------------------------------------
+
+impl Portable {
+    /// Returns whether `ipa` is in the distributor or CPU interface window.
+    fn in_gic(&self, ipa: u64) -> bool {
+        let l = &self.layout;
+        (l.gicd_base..l.gicd_base + l.gicd_size).contains(&ipa)
+            || (l.gicr_base..l.gicr_base + l.gicr_size).contains(&ipa)
+    }
+}
+
+/// The host's `mach_absolute_time`, which runs at the rate guest counters
+/// read, and its conversion to nanoseconds. libc marks its declarations
+/// deprecated in favour of another crate, so they are declared here.
+#[repr(C)]
+struct MachTimebase {
+    numer: u32,
+    denom: u32,
+}
+
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
+}
+
+/// Returns host counter ticks to nanoseconds as `(numer, denom)`; 125/3 on
+/// a 24 MHz Apple counter.
+fn host_timebase() -> (u64, u64) {
+    let mut tb = MachTimebase { numer: 0, denom: 0 };
+    // SAFETY: `tb` is a valid out-pointer for the call.
+    let ok = unsafe { mach_timebase_info(&mut tb) } == 0 && tb.denom != 0;
+    if ok {
+        (u64::from(tb.numer), u64::from(tb.denom))
+    } else {
+        (125, 3)
+    }
+}
+
+/// One portable vCPU's virtual timer, as its thread drives it.
+///
+/// Without hv_gic the timer reaches the guest only as a `VTIMER_ACTIVATED`
+/// exit, which also masks it. hvi then raises PPI 27 and keeps the timer
+/// masked until the guest ends that interrupt.
+struct Vtimer {
+    /// The vCPU's `CNTVCT_EL0` offset from `mach_absolute_time`.
+    offset: u64,
+    /// Whether hvi raised the timer's line and masked the timer.
+    raised: bool,
+}
+
+impl Vtimer {
+    /// The guest's counter now: `CNTVCT_EL0`, which `CNTPCT_EL0` reads too.
+    fn counter(&self) -> u64 {
+        // SAFETY: `mach_absolute_time` takes no arguments and cannot fail.
+        unsafe { mach_absolute_time() }.wrapping_sub(self.offset)
+    }
+
+    /// When the guest's timer fires, if it is armed and not masked by the
+    /// guest; now if it has fired already.
+    fn deadline(&self, vcpu: &Vcpu, (numer, denom): (u64, u64)) -> Option<Instant> {
+        let ctl = vcpu.get_sys_reg(SysReg::CNTV_CTL_EL0).ok()?;
+        // ENABLE set and IMASK clear.
+        if ctl & 0b11 != 0b01 {
+            return None;
+        }
+        let now = Instant::now();
+        if ctl & 0b100 != 0 {
+            return Some(now);
+        }
+        let cval = vcpu.get_sys_reg(SysReg::CNTV_CVAL_EL0).ok()?;
+        let ticks = cval.saturating_sub(self.counter());
+        let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom.max(1));
+        now.checked_add(Duration::from_nanos(u64::try_from(ns).ok()?))
+    }
+}
+
+/// Sleeps a portable vCPU's thread after a guest WFI.
+///
+/// It returns once the software GIC has an interrupt for the vCPU, the
+/// guest's timer is due, a pause asks the vCPU to park, or the VM stops. The
+/// guest then resumes after its WFI, which may always complete early.
+fn wait_for_interrupt(vcpu: &Vcpu, sh: &Shared, p: &Portable, cpu: u32, vtimer: &Vtimer) {
+    let vcpus = &sh.guest.vcpus;
+    let Some(idle) = vcpus.kicker().idle.get(cpu as usize) else {
+        return;
+    };
+    // A raised timer line is the GIC's to report.
+    let deadline = if vtimer.raised {
+        None
+    } else {
+        vtimer.deadline(vcpu, p.timebase)
+    };
+    let mut asleep = lock_or_recover(&idle.asleep);
+    *asleep = true;
+    loop {
+        // Lock order: `Idle`, then the GIC. A waker releases the GIC first.
+        if !vcpus.is_running()
+            || vcpus.quiesce_requested()
+            || lock_or_recover(&p.gic).irq_pending(cpu as usize)
+        {
+            break;
+        }
+        asleep = match deadline {
+            None => idle
+                .cv
+                .wait(asleep)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(at) => {
+                let now = Instant::now();
+                if now >= at {
+                    break;
+                }
+                match idle.cv.wait_timeout(asleep, at - now) {
+                    Ok((guard, _)) => guard,
+                    Err(poisoned) => poisoned.into_inner().0,
+                }
+            }
+        };
+    }
+    *asleep = false;
+}
+
+/// Services a guest access to the software GIC.
+fn service_gic(
+    vcpu: &Vcpu,
+    sh: &Shared,
+    p: &Portable,
+    cpu: u32,
+    ipa: u64,
+    syndrome: u64,
+    vtimer: &mut Vtimer,
+) {
+    let da = DataAbort::from_syndrome(syndrome);
+    if !da.isv {
+        return;
+    }
+    let c = cpu as usize;
+    let l = &p.layout;
+    let dist = ipa < l.gicr_base;
+    let offset = if dist {
+        ipa - l.gicd_base
+    } else {
+        ipa - l.gicr_base
+    };
+    if !da.is_write {
+        let v = {
+            let mut gic = lock_or_recover(&p.gic);
+            if dist {
+                gic.dist_read(c, offset, da.width)
+            } else {
+                gic.cpu_read(c, offset, da.width)
+            }
+        };
+        write_gpr(vcpu, da.reg, u64::from(v) & width_mask(da.width));
+        return;
+    }
+    // The registers are 32 bits wide.
+    let value = read_gpr(vcpu, da.reg) as u32;
+    let out = {
+        let mut gic = lock_or_recover(&p.gic);
+        if dist {
+            gic.dist_write(c, offset, da.width, value)
+        } else {
+            gic.cpu_write(c, offset, da.width, value)
+        }
+    };
+    if out.wake != 0 {
+        sh.guest.vcpus.kicker().wake_mask(out.wake);
+    }
+    if out.eoi == Some(VTIMER_INTID) {
+        end_vtimer_interrupt(vcpu, p, cpu, vtimer);
+    }
+}
+
+/// Handles the guest's end of the timer interrupt hvi raised.
+///
+/// The line stays high while the timer still fires: enabled, its condition
+/// met and not masked by the guest. Otherwise it drops and the timer is
+/// unmasked, so its next expiry exits again.
+fn end_vtimer_interrupt(vcpu: &Vcpu, p: &Portable, cpu: u32, vtimer: &mut Vtimer) {
+    if !vtimer.raised {
+        return;
+    }
+    let ctl = vcpu.get_sys_reg(SysReg::CNTV_CTL_EL0).unwrap_or(0);
+    // ENABLE and ISTATUS set, IMASK clear.
+    if ctl & 0b111 == 0b101 {
+        return;
+    }
+    vtimer.raised = false;
+    lock_or_recover(&p.gic).set_ppi_line(cpu as usize, VTIMER_INTID, false);
+    let _ = vcpu.set_vtimer_mask(false);
+}
+
+/// Returns whether a trapped system-register access (its ISS) is a read of
+/// `CNTPCT_EL0` or `CNTPCTSS_EL0`, which trap without hv_gic.
+fn is_physical_counter(iss: u64) -> bool {
+    let op0 = (iss >> 20) & 3;
+    let op2 = (iss >> 17) & 7;
+    let op1 = (iss >> 14) & 7;
+    let crn = (iss >> 10) & 0xf;
+    let crm = (iss >> 1) & 0xf;
+    (op0, op1, crn, crm) == (3, 3, 14, 0) && (op2 == 1 || op2 == 5) && iss & 1 == 1
 }
 
 /// Services a PL011 MMIO access.
@@ -1943,4 +2385,50 @@ fn gpr(idx: u8) -> Option<Reg> {
         30 => Reg::X30,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ISS of a guest `mrs x3, cntpct_el0` without hv_gic, as measured on
+    /// an M5 (`S3_3_C14_C0_1`, Rt 3, read).
+    const CNTPCT_READ_X3: u64 = 0x032_f861;
+
+    #[test]
+    fn physical_counter_reads_are_recognised() {
+        assert!(is_physical_counter(CNTPCT_READ_X3));
+        // CNTPCTSS_EL0 is op2 5.
+        let cntpctss = (CNTPCT_READ_X3 & !(7 << 17)) | (5 << 17);
+        assert!(is_physical_counter(cntpctss));
+        // CNTVCT_EL0 (op2 2) and a write are not.
+        assert!(!is_physical_counter(
+            (CNTPCT_READ_X3 & !(7 << 17)) | (2 << 17)
+        ));
+        assert!(!is_physical_counter(CNTPCT_READ_X3 & !1));
+        assert_eq!((CNTPCT_READ_X3 >> 5) & 0x1f, 3);
+    }
+
+    /// The SDK's `HV_INTERRUPT_TYPE_IRQ` is 0. If applevisor-sys ever fixes
+    /// its order, this fails before a guest gets an FIQ for every interrupt.
+    #[test]
+    fn the_irq_line_has_the_sdk_value_of_irq() {
+        assert_eq!(IRQ_LINE as u32, 0);
+    }
+
+    /// A portable machine with `cpus` vCPUs.
+    fn machine(cpus: u32) -> Portable {
+        Portable {
+            gic: Mutex::new(Gicv2::new(cpus)),
+            layout: GicLayout::QEMU_VIRT_V2,
+            timebase: (125, 3),
+        }
+    }
+
+    #[test]
+    fn the_gic_window_covers_the_distributor_and_the_cpu_interface() {
+        let p = machine(1);
+        assert!(p.in_gic(0x0800_0000) && p.in_gic(0x0801_ffff));
+        assert!(!p.in_gic(0x0802_0000) && !p.in_gic(0x07ff_fffc));
+    }
 }

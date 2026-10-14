@@ -339,6 +339,16 @@ impl<K: Kick> Vcpus<K> {
             .collect()
     }
 
+    /// Returns whether a pause asks the vCPUs to park at their checkpoint.
+    ///
+    /// The request is raised before the vCPUs are kicked, so a vCPU that
+    /// waits outside the hypervisor and checks it under the lock its kick
+    /// takes cannot miss it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn quiesce_requested(&self) -> bool {
+        self.quiesce.is_requested()
+    }
+
     /// Parks every started vCPU but the calling one at its next checkpoint.
     ///
     /// The caller is a vCPU thread and does not park itself. Only the vCPUs
