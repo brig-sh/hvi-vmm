@@ -1059,6 +1059,16 @@ restored-paused, reported the source's 1923 blocks since boot, and its
 guest answered after `resume`. The rates include the Python reader's
 hashing; scattered single blocks cost one batch each.
 
+The same check with the final round read after the fence, as hull does
+it: rounds 0 to 2 while the guest wrote (514, 376 and 543 blocks), then
+`checkpoint` with `then: "fence"`, then round 3 (252 blocks, 15.8 MiB,
+applied in 81 ms). The base with rounds 0 to 3 had the live disk's
+SHA-256. `disk.json` listed rounds 0 to 2 and generation 28357, the
+generation of round 3's `disk-dirty` reply. A restore with
+`--disk-generation 24022`, round 2's read, as a mover that skipped the
+final round would pass, was refused; with `--disk-generation 28357` it
+came up restored-paused and its guest answered after `resume`.
+
 ## Clock policy
 
 ### The native profile
