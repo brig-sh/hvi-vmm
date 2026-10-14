@@ -1377,6 +1377,40 @@ mod tests {
         (vm, gic, vcpus)
     }
 
+    /// Prints `KVM_GET_REG_LIST` of a vCPU set up as the boot sets it up,
+    /// with each register's value: `native` as it is, `portable` once the
+    /// portable baseline and firmware are written. The output is the
+    /// fixture the classification test reads
+    /// (`src/checkpoint/testdata/kvm-reg-list-rp2-*.txt`). Needs /dev/kvm
+    /// on a Pi 5.
+    #[test]
+    #[ignore]
+    fn print_the_register_lists() {
+        for portable in [false, true] {
+            let (_vm, _gic, vcpus) = vgic_vm(1);
+            if portable {
+                set_baseline(&vcpus).unwrap();
+            }
+            let mut list = kvm_bindings::RegList::new(500).unwrap();
+            vcpus[0].get_reg_list(&mut list).unwrap();
+            let name = if portable { "portable" } else { "native" };
+            println!("# {name}: {} registers", list.as_slice().len());
+            for id in list.as_slice() {
+                let size = 1usize << ((id >> 52) & 0xf);
+                let mut buf = vec![0u8; size];
+                let value = match vcpus[0].get_one_reg(*id, &mut buf) {
+                    Ok(_) => buf
+                        .iter()
+                        .rev()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    Err(e) => format!("error:{}", e.errno()),
+                };
+                println!("{name} {id:#018x} {value}");
+            }
+        }
+    }
+
     /// The software model's state, with pending, active, SGI-source and
     /// line state on both CPUs, goes into KVM's vGICv2, reads back register
     /// for register, and comes out as it went in. Needs /dev/kvm on a host
