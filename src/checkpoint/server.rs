@@ -60,25 +60,48 @@ pub(crate) struct ControlSocket {
     listener: UnixListener,
     /// The profile `profile` answers with.
     profile: Arc<ProfileCell>,
+    /// The resolved directory a `checkpoint` may write under, when the run
+    /// has one.
+    checkpoint_root: Option<std::path::PathBuf>,
 }
 
 impl ControlSocket {
     /// Binds the control socket at `path`, first removing a stale socket a
-    /// previous run left.
+    /// previous run left, and resolves `checkpoint_root`, the directory a
+    /// `checkpoint` may write under.
     ///
     /// Only a socket is removed. Anything else at the path is an error, so a
     /// mistyped path such as `--control-sock disk.img` cannot delete a file.
     /// It must be bound before confinement, which allows accepting on a
-    /// listener already held but not creating one.
+    /// listener already held but not creating one. The root is resolved here
+    /// for the same reason: confinement names it by its resolved path.
     ///
     /// # Errors
     ///
-    /// Errors if something other than a socket is at `path`, or the socket
-    /// cannot be bound.
+    /// Errors if something other than a socket is at `path`, the socket
+    /// cannot be bound, or the root is not a directory.
     // The host-path ban in clippy.toml is aimed at the virtio-fs device. This
     // path is the operator's.
     #[allow(clippy::disallowed_methods)]
-    pub(crate) fn bind(path: &str, profile: Arc<ProfileCell>) -> std::io::Result<Self> {
+    pub(crate) fn bind(
+        path: &str,
+        profile: Arc<ProfileCell>,
+        checkpoint_root: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let checkpoint_root = checkpoint_root
+            .map(|root| {
+                let resolved = std::fs::canonicalize(root).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("--checkpoint-root {root}: {e}"))
+                })?;
+                if !std::fs::metadata(&resolved)?.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("--checkpoint-root {root}: not a directory"),
+                    ));
+                }
+                Ok(resolved)
+            })
+            .transpose()?;
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)?,
             Ok(_) => {
@@ -99,7 +122,16 @@ impl ControlSocket {
             std::io::Error::new(e.kind(), format!("cannot bind control socket {path}: {e}"))
         })?;
         listener.set_nonblocking(true)?;
-        Ok(Self { listener, profile })
+        Ok(Self {
+            listener,
+            profile,
+            checkpoint_root,
+        })
+    }
+
+    /// Returns the resolved checkpoint root, when the run has one.
+    pub(crate) fn checkpoint_root(&self) -> Option<&std::path::Path> {
+        self.checkpoint_root.as_deref()
     }
 
     /// Serves connections until `stop` is requested.
@@ -450,7 +482,8 @@ mod tests {
             let cell = Arc::new(
                 ProfileCell::new(MachineProfile::for_this_host("aarch64", "hvf"), None).unwrap(),
             );
-            let socket = ControlSocket::bind(path.to_str().unwrap(), Arc::clone(&cell)).unwrap();
+            let socket =
+                ControlSocket::bind(path.to_str().unwrap(), Arc::clone(&cell), None).unwrap();
             let server = {
                 let (stop, gate, vcpus) = (
                     source.token(),
@@ -798,12 +831,12 @@ mod tests {
         };
         let stale = dir.join(format!("hvi-ctl-{}-stale.sock", std::process::id()));
         drop(UnixListener::bind(&stale).unwrap());
-        drop(ControlSocket::bind(stale.to_str().unwrap(), cell()).expect("a stale socket"));
+        drop(ControlSocket::bind(stale.to_str().unwrap(), cell(), None).expect("a stale socket"));
         let _ = std::fs::remove_file(&stale);
 
         let file = dir.join(format!("hvi-ctl-{}-disk.img", std::process::id()));
         std::fs::write(&file, b"guest disk").unwrap();
-        let err = ControlSocket::bind(file.to_str().unwrap(), cell())
+        let err = ControlSocket::bind(file.to_str().unwrap(), cell(), None)
             .err()
             .expect("a regular file");
         assert!(err.to_string().contains("is not a socket"), "{err}");

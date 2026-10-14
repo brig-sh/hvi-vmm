@@ -281,6 +281,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut agent_sock = None;
     let mut profile_out = None;
     let mut control_sock = None;
+    let mut checkpoint_root = None;
     let mut dump_memory = None;
     let mut dump_after = None;
     let mut trace_io = None;
@@ -432,6 +433,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--control-sock" => {
                 control_sock = Some(it.next().ok_or("--control-sock needs a path")?.clone());
             }
+            "--checkpoint-root" => {
+                checkpoint_root = Some(
+                    it.next()
+                        .ok_or("--checkpoint-root needs a directory")?
+                        .clone(),
+                );
+            }
             "--dump-memory" => dump_memory = it.next().cloned(),
             "--dump-after" => {
                 dump_after = Some(it.next().ok_or("--dump-after needs seconds")?.parse()?);
@@ -464,6 +472,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fs_shares[index].gid = fs_gid;
     }
 
+    if checkpoint_root.is_some() && control_sock.is_none() {
+        return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
+    }
     // A stop signal asks the run to stop, and `finish` ends the process by it.
     let (signals, stop_registration) = StopOnSignals::new()?;
     // A fatal signal restores the terminal before it ends the process.
@@ -488,6 +499,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         agent_sock,
         profile_out,
         control_sock,
+        checkpoint_root,
         sandbox,
         // `None` rather than an empty chain, so without tools the hooks stay a
         // null check.
