@@ -145,6 +145,47 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
+/// The machine a guest is given.
+///
+/// `Native` is the host's own machine: on macOS the in-kernel GICv3 of
+/// Hypervisor.framework and the host CPU's feature registers. A portable
+/// profile is one machine on every host that implements it, so a guest can
+/// move between them; see `docs/portable-profile.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MachineProfileKind {
+    /// The host's own machine.
+    #[default]
+    Native,
+    /// `portable-arm64-v1`: a GICv2, a Cortex-A76 identity with a reduced
+    /// feature set, PSCI 1.1 and SMCCC 1.1 as KVM on a Pi 5 answers them.
+    PortableArm64V1,
+}
+
+impl MachineProfileKind {
+    /// Returns the profile's name, as `--profile` takes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::PortableArm64V1 => "portable-arm64-v1",
+        }
+    }
+
+    /// Returns the profile called `name`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when no profile has that name.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        [Self::Native, Self::PortableArm64V1]
+            .into_iter()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| {
+                format!("unknown machine profile {name:?}; expected native or portable-arm64-v1")
+            })
+    }
+}
+
 /// Inputs for a boot, which [`boot`](crate::boot) takes.
 pub struct BootConfig {
     pub kernel: Vec<u8>,
@@ -220,6 +261,8 @@ pub struct BootConfig {
     /// backend logs which one it installed, so this is never a silent
     /// "sandboxed" claim on a host that is not.
     pub sandbox: bool,
+    /// The machine the guest is given.
+    pub profile: MachineProfileKind,
     /// The registration of the [`StopHandle`](crate::run::StopHandle) that asks
     /// this run to stop from outside the guest, or `None` when the caller keeps
     /// no handle.
@@ -240,6 +283,22 @@ impl BootConfig {
             Some(registration) => Ok(registration.into_handle()),
             None => Ok(crate::run::StopHandle::new_pair()?.0),
         }
+    }
+
+    /// Refuses a portable profile on a backend that does not implement one
+    /// yet.
+    ///
+    /// # Errors
+    ///
+    /// Errors naming `backend` when the profile is not native.
+    pub fn require_native_profile(&self, backend: &str) -> Result<(), String> {
+        if self.profile == MachineProfileKind::Native {
+            return Ok(());
+        }
+        Err(format!(
+            "--profile {} is not implemented on the {backend} backend yet",
+            self.profile.name()
+        ))
     }
 }
 
@@ -361,7 +420,9 @@ impl std::error::Error for BootError {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, BootError, CachePolicy, FsShare, ShareMode};
+    use super::{
+        check_export_overlap, BootError, CachePolicy, FsShare, MachineProfileKind, ShareMode,
+    };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
 
@@ -482,6 +543,18 @@ mod tests {
         ]))
         .expect("/srv/ab is a sibling of /srv/a, not a child");
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    #[test]
+    fn profiles_are_found_by_their_names() {
+        for p in [
+            MachineProfileKind::Native,
+            MachineProfileKind::PortableArm64V1,
+        ] {
+            assert_eq!(MachineProfileKind::from_name(p.name()), Ok(p));
+        }
+        assert_eq!(MachineProfileKind::default(), MachineProfileKind::Native);
+        assert!(MachineProfileKind::from_name("portable").is_err());
     }
 
     #[test]

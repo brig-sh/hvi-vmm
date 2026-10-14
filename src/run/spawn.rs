@@ -138,6 +138,7 @@ mod tests {
             checkpoint_root: None,
             plugin: None,
             sandbox: false,
+            profile: crate::config::MachineProfileKind::Native,
             stop: Some(registration),
         };
         let run = spawn(cfg).unwrap();
