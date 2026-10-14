@@ -49,13 +49,14 @@ use kvm_bindings::{
     kvm_arm_counter_offset, kvm_create_device, kvm_device_attr,
     kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
     kvm_userspace_memory_region, kvm_vcpu_init, KVM_ARM_IRQ_TYPE_PPI, KVM_ARM_IRQ_TYPE_SHIFT,
-    KVM_ARM_IRQ_VCPU_SHIFT, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2,
-    KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
+    KVM_ARM_IRQ_TYPE_SPI, KVM_ARM_IRQ_VCPU_SHIFT, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2,
+    KVM_DEV_ARM_VGIC_CPUID_SHIFT, KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR,
+    KVM_DEV_ARM_VGIC_GRP_CPU_REGS, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
     KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_EXIT_INTR, KVM_MEM_READONLY, KVM_SYSTEM_EVENT_RESET,
     KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST,
     KVM_VGIC_V3_ADDR_TYPE_REDIST,
 };
-use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
@@ -66,6 +67,7 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::portable::{self, KvmHost};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::arch::aarch64::vgicv2::{self, Bank, Lines, VgicV2};
 use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::{hex, host_page_size, MachineProfile, ProfileCell, UNKNOWN};
 use crate::config::{BootConfig, MachineProfileKind, Stop};
@@ -343,6 +345,136 @@ impl TimerLine for KvmTimerLine {
             );
         }
         0
+    }
+}
+
+/// A vGICv2 as [`vgicv2`] reaches it: its register views through the
+/// device's attributes, and its lines through `KVM_IRQ_LINE`.
+struct KvmVgic<'a> {
+    gic: &'a DeviceFd,
+    vm: &'a VmFd,
+    ncpu: usize,
+}
+
+impl KvmVgic<'_> {
+    /// The attribute of register `offset` of `bank` as vCPU `cpu` sees it,
+    /// moving the 32 bits at `addr`.
+    fn attr(bank: Bank, cpu: usize, offset: u64, addr: u64) -> kvm_device_attr {
+        kvm_device_attr {
+            flags: 0,
+            group: match bank {
+                Bank::Dist => KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+                Bank::Cpu => KVM_DEV_ARM_VGIC_GRP_CPU_REGS,
+            },
+            attr: ((cpu as u64) << KVM_DEV_ARM_VGIC_CPUID_SHIFT) | offset,
+            addr,
+        }
+    }
+}
+
+impl VgicV2 for KvmVgic<'_> {
+    fn ncpu(&self) -> usize {
+        self.ncpu
+    }
+
+    fn read(&self, bank: Bank, cpu: usize, offset: u64) -> Result<u32, String> {
+        let mut value = 0u32;
+        let mut attr = Self::attr(bank, cpu, offset, std::ptr::addr_of_mut!(value) as u64);
+        // SAFETY: `addr` is `value`, a u32 that outlives the call, and a
+        // vGICv2 register access moves 32 bits.
+        unsafe { self.gic.get_device_attr(&mut attr) }.map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    fn write(&self, bank: Bank, cpu: usize, offset: u64, value: u32) -> Result<(), String> {
+        let attr = Self::attr(bank, cpu, offset, std::ptr::addr_of!(value) as u64);
+        self.gic.set_device_attr(&attr).map_err(|e| e.to_string())
+    }
+
+    fn set_line(&self, cpu: usize, intid: u32, level: bool) -> Result<(), String> {
+        let irq = if intid >= 32 {
+            (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | intid
+        } else {
+            (KVM_ARM_IRQ_TYPE_PPI << KVM_ARM_IRQ_TYPE_SHIFT)
+                | ((cpu as u32) << KVM_ARM_IRQ_VCPU_SHIFT)
+                | intid
+        };
+        self.vm.set_irq_line(irq, level).map_err(|e| e.to_string())
+    }
+}
+
+/// The line levels hvi's devices hold, which KVM's vGICv2 view cannot
+/// give back.
+fn device_lines(sh: &Shared, ncpu: usize) -> Lines {
+    let mut spis = vec![0u32; crate::devices::gicv2::WORDS];
+    let mut set = |spi: u32, high: bool| {
+        let intid = 32 + spi as usize;
+        if high {
+            spis[intid / 32] |= 1 << (intid % 32);
+        }
+    };
+    set(UART_SPI, lock_or_recover(&sh.pl011).irq_level());
+    if let Some(d) = &sh.guest.block {
+        set(VIRTIO_SPI, lock_or_recover(d).irq_level());
+    }
+    if let Some(d) = &sh.guest.net {
+        set(VIRTIO_NET_SPI, lock_or_recover(d).irq_level());
+    }
+    if let Some(d) = &sh.guest.vsock {
+        set(VIRTIO_VSOCK_SPI, lock_or_recover(d).irq_level());
+    }
+    let mut ppis = vec![0u32; ncpu];
+    if let Some(device) = &sh.hvitime {
+        for (cpu, high) in device.lines().into_iter().enumerate().take(ncpu) {
+            if high {
+                ppis[cpu] |= vgicv2::OWNED_PPIS;
+            }
+        }
+    }
+    Lines { spis, ppis }
+}
+
+/// Exports the vGIC of a held guest, imports the export back, and exports
+/// again, for `HVI_TIME_TEST_RESTORE`: the capture and restore a
+/// checkpoint will make, on the live guest's interrupt state.
+fn vgic_round_trip(gic: &DeviceFd, vm: &VmFd, ncpu: usize, sh: &Shared) {
+    let vgic = KvmVgic { gic, vm, ncpu };
+    let lines = device_lines(sh, ncpu);
+    let result = vgicv2::export(&vgic, &lines).and_then(|state| {
+        let checked = vgicv2::import(&vgic, &state)?;
+        let again = vgicv2::export(&vgic, &lines)?;
+        if again != state {
+            return Err(format!(
+                "the second export differs from the first: {again:?} against {state:?}"
+            ));
+        }
+        let active: u32 = state
+            .cpus
+            .iter()
+            .map(|c| c.isactiver0.count_ones())
+            .sum::<u32>()
+            + state
+                .dist
+                .isactiver
+                .iter()
+                .map(|w| w.count_ones())
+                .sum::<u32>();
+        let pending: u32 = state
+            .cpus
+            .iter()
+            .map(|c| c.latch0.count_ones())
+            .sum::<u32>()
+            + state.dist.latch.iter().map(|w| w.count_ones()).sum::<u32>();
+        Ok(format!(
+            "{checked} registers read back as written; {active} active, {pending} latched, \
+             GICC_APR0 {:x?}, PPI 20 lines {:x?}",
+            state.cpus.iter().map(|c| c.apr[0]).collect::<Vec<_>>(),
+            lines.ppis
+        ))
+    });
+    match result {
+        Ok(summary) => eprintln!("{LOG_PREFIX} vGICv2 round trip while held: {summary}"),
+        Err(e) => eprintln!("{LOG_PREFIX} vGICv2 round trip while held FAILED: {e}"),
     }
 }
 
@@ -651,6 +783,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         addr: 0,
     };
     gicfd.set_device_attr(&init_attr)?;
+    let gicfd = Arc::new(gicfd);
 
     // The profile is complete now, so its file is written before any filter
     // goes in.
@@ -734,11 +867,18 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         let timer = Arc::clone(device);
         io_threads.push_ended_by("hvi-time timer", thread, move || timer.stop());
         if let Some(test) = hvitime::TestRestore::from_env() {
+            let hold = {
+                let (gicfd, vm, sh) = (Arc::clone(&gicfd), Arc::clone(&vm), shared.clone());
+                move || vgic_round_trip(&gicfd, &vm, num_cpus as usize, &sh)
+            };
             io_threads.push(
                 "hvi-time test restore",
-                test.spawn(Arc::clone(device), Arc::clone(&shared.guest.vcpus), || {
-                    seccomp::install_thread(seccomp::Thread::Vmm);
-                })?,
+                test.spawn(
+                    Arc::clone(device),
+                    Arc::clone(&shared.guest.vcpus),
+                    || seccomp::install_thread(seccomp::Thread::Vmm),
+                    hold,
+                )?,
             );
         }
     }
@@ -1196,4 +1336,117 @@ fn set_gic_attr_u32(
     };
     gic.set_device_attr(&a)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::aarch64::vgicv2::tests::busy_state;
+
+    /// A VM with a vGICv2 and `ncpu` vCPUs, set up as the boot sets them up
+    /// and never run.
+    fn vgic_vm(ncpu: u32) -> (VmFd, DeviceFd, Vec<VcpuFd>) {
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let gic = vm
+            .create_device(&mut kvm_create_device {
+                type_: kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
+                fd: 0,
+                flags: 0,
+            })
+            .unwrap();
+        let layout = GicLayout::for_vcpus(GicVersion::V2, ncpu).unwrap();
+        set_gic_addr(&gic, KVM_VGIC_V2_ADDR_TYPE_DIST, layout.gicd_base).unwrap();
+        set_gic_addr(&gic, KVM_VGIC_V2_ADDR_TYPE_CPU, layout.gicr_base).unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+        let vcpus = (0..ncpu)
+            .map(|id| {
+                let vcpu = vm.create_vcpu(u64::from(id)).unwrap();
+                vcpu.vcpu_init(&kvi).unwrap();
+                vcpu
+            })
+            .collect();
+        set_gic_attr_u32(&gic, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &256).unwrap();
+        gic.set_device_attr(&kvm_device_attr {
+            flags: 0,
+            group: KVM_DEV_ARM_VGIC_GRP_CTRL,
+            attr: u64::from(KVM_DEV_ARM_VGIC_CTRL_INIT),
+            addr: 0,
+        })
+        .unwrap();
+        (vm, gic, vcpus)
+    }
+
+    /// The software model's state, with pending, active, SGI-source and
+    /// line state on both CPUs, goes into KVM's vGICv2, reads back register
+    /// for register, and comes out as it went in. Needs /dev/kvm on a host
+    /// with a vGICv2 (a Pi 5).
+    #[test]
+    #[ignore]
+    fn a_gicv2_state_round_trips_through_kvm() {
+        let (vm, gic, _vcpus) = vgic_vm(2);
+        let vgic = KvmVgic {
+            gic: &gic,
+            vm: &vm,
+            ncpu: 2,
+        };
+        let quiet = Lines {
+            spis: vec![0; crate::devices::gicv2::WORDS],
+            ppis: vec![0; 2],
+        };
+        let fresh = vgicv2::export(&vgic, &quiet).unwrap();
+        let c = &fresh.cpus[0];
+        // KVM reads 0 for both binary points of a fresh vCPU; the guest
+        // reads the minimums, which the export gives.
+        assert_eq!(
+            vgic.read(Bank::Cpu, 0, crate::devices::gicv2::gicc::BPR),
+            Ok(0)
+        );
+        assert_eq!((c.bpr, c.abpr), (2, 3));
+        eprintln!(
+            "fresh vGICv2: GICD_CTLR {:#x}, cpu0 GICC_CTLR {:#x} PMR {:#x} BPR {} ABPR {} \
+             APR {:x?}, ISENABLER0 {:#x}, IGROUPR0 {:#x}, ICFGR2 {:#x}, IPRIORITYR32 {:#x}, \
+             ITARGETSR32 {:#x}",
+            fresh.dist.ctlr,
+            c.ctlr,
+            c.pmr,
+            c.bpr,
+            c.abpr,
+            c.apr,
+            c.isenabler0,
+            fresh.dist.igroupr[0],
+            fresh.dist.icfgr[2],
+            fresh.dist.ipriorityr[32],
+            fresh.dist.itargetsr[32]
+        );
+
+        let s = busy_state();
+        let checked = vgicv2::import(&vgic, &s).unwrap();
+        let back = vgicv2::export(&vgic, &Lines::of(&s)).unwrap();
+        assert_eq!(back, s);
+        eprintln!("{checked} registers read back as written; the export equals the state");
+
+        // A second import over a vGIC that holds state is exact too: the
+        // latches, sources and lines the first one set are gone.
+        let mut calm = s.clone();
+        calm.dist.latch[1] = 0;
+        calm.dist.line_level[1] = 0;
+        calm.cpus[1].line0 = 0;
+        calm.cpus[1].sgi_sources = vec![0; 16];
+        calm.cpus[1].latch0 &= !0xffff;
+        calm.cpus[0].isactiver0 = 0;
+        calm.dist.isactiver[1] = 0;
+        calm.cpus[0].apr[0] = 0;
+        vgicv2::import(&vgic, &calm).unwrap();
+        assert_eq!(vgicv2::export(&vgic, &Lines::of(&calm)).unwrap(), calm);
+
+        // What KVM cannot hold is refused.
+        let mut apr = s.clone();
+        apr.cpus[0].apr[1] = 1;
+        assert!(vgicv2::import(&vgic, &apr)
+            .unwrap_err()
+            .contains("GICC_APR1-3"));
+    }
 }
