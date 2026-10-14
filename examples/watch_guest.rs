@@ -195,6 +195,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         agent_sock: None,
         profile_out: None,
         control_sock: None,
+        checkpoint_root: None,
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,
     };

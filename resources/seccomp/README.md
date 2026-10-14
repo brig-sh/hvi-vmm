@@ -20,10 +20,14 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-Two threads. `vcpu` is the tight one and the one that matters most, because
+Three filters. `vcpu` is the tight one and the one that matters most, because
 MMIO exits are serviced inline on the vCPU thread -- the virtio device models,
 the code that parses guest descriptors, run there. `vmm` covers the main thread
-and the host-side I/O threads.
+and the host-side I/O threads. `control` is `vmm` plus the file calls a
+checkpoint bundle needs, and only the control socket's thread installs it, and
+only in a run started with `--checkpoint-root`. That thread parses the control
+protocol, never guest data; a unit test holds `control` to `vmm` plus those
+file calls.
 
 ## Why these are not Firecracker's lists
 

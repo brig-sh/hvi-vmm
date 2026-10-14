@@ -275,6 +275,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut agent_sock = None;
     let mut profile_out = None;
     let mut control_sock = None;
+    let mut checkpoint_root = None;
     let mut dump_memory = None;
     let mut dump_after = None;
     let mut trace_io = None;
@@ -375,6 +376,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--control-sock" => {
                 control_sock = Some(it.next().ok_or("--control-sock needs a path")?.clone());
             }
+            "--checkpoint-root" => {
+                checkpoint_root = Some(
+                    it.next()
+                        .ok_or("--checkpoint-root needs a directory")?
+                        .clone(),
+                );
+            }
             "--dump-memory" => dump_memory = it.next().cloned(),
             "--dump-after" => {
                 dump_after = Some(it.next().ok_or("--dump-after needs seconds")?.parse()?);
@@ -414,6 +422,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "macos"))]
     let _ = (fs_uid, fs_gid);
 
+    if checkpoint_root.is_some() && control_sock.is_none() {
+        return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
+    }
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
         initramfs: initramfs.map(std::fs::read).transpose()?,
@@ -431,6 +442,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         agent_sock,
         profile_out,
         control_sock,
+        checkpoint_root,
         sandbox,
         // `None` rather than an empty chain, so without tools the hooks stay a
         // null check.
