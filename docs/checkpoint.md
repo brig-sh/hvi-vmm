@@ -102,7 +102,7 @@ A refusal is `{"v":1,"ok":false,"code":...,"error":...}`.
 
 | `code` | When | The VM afterwards |
 | --- | --- | --- |
-| `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, or a guest with virtio-fs shares. | Untouched: nothing was paused. |
+| `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, a guest with virtio-fs shares, or a guest of the portable profile, which no backend checkpoints yet. | Untouched: nothing was paused. |
 | `not_ready` | The machine profile is not complete yet. | Untouched. |
 | `timeout` | The I/O threads or the vCPUs did not park, or the vCPUs did not export their state, within 2 s. | As the request found it. |
 | `capture_failed` | Anything after the pause: a device state that a restore would refuse, a failed disk sync, a failed write or sync, a bundle the reader would refuse. | As the request found it. Every file the capture wrote is removed, the manifest included, and the directory too when the capture created it. |
