@@ -54,7 +54,7 @@ use crate::arch::x86_64::layout::{
 use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::mptable;
 use crate::checkpoint::profile::{
-    device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform,
+    device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform, UNKNOWN,
 };
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
@@ -212,21 +212,26 @@ fn boot_profile(
     let mut p = MachineProfile::for_this_host("x86_64", "kvm");
     p.cpu.ident = cpu_ident(cpuid);
     for (function, index) in PROFILE_LEAVES {
-        if let Some(e) = cpuid
+        // A leaf KVM does not serve is recorded as unread, which the
+        // compatibility check refuses on either side.
+        let value = cpuid
             .iter()
             .find(|e| e.function == function && e.index == index)
-        {
-            p.cpu.id_regs.insert(
-                format!("cpuid.{function:#010x}.{index}"),
-                format!(
-                    "eax={},ebx={},ecx={},edx={}",
-                    hex(u64::from(e.eax)),
-                    hex(u64::from(e.ebx)),
-                    hex(u64::from(e.ecx)),
-                    hex(u64::from(e.edx))
-                ),
+            .map_or_else(
+                || UNKNOWN.to_string(),
+                |e| {
+                    format!(
+                        "eax={},ebx={},ecx={},edx={}",
+                        hex(u64::from(e.eax)),
+                        hex(u64::from(e.ebx)),
+                        hex(u64::from(e.ecx)),
+                        hex(u64::from(e.edx))
+                    )
+                },
             );
-        }
+        p.cpu
+            .id_regs
+            .insert(format!("cpuid.{function:#010x}.{index}"), value);
     }
     p.counter_freq_hz = boot.get_tsc_khz().map_or(0, |khz| u64::from(khz) * 1000);
     p.x86 = Some(X86Platform {
