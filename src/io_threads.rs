@@ -41,7 +41,7 @@ use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Guest, PluginThread};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
-use crate::sandbox::confine_io_thread;
+use crate::sandbox::{confine_control_thread, confine_io_thread};
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
 use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
@@ -209,7 +209,13 @@ impl<K: Kick> IoThreads<K> {
             io_threads.push(
                 "control socket",
                 std::thread::spawn(move || {
-                    confine_io_thread();
+                    // Only a run that may write checkpoints gives the thread
+                    // the file calls a bundle needs.
+                    if control.checkpoint_root().is_some() {
+                        confine_control_thread();
+                    } else {
+                        confine_io_thread();
+                    }
                     control.run(&stop, &gate, &vcpus);
                 }),
             );
