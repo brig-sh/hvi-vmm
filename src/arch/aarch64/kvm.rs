@@ -61,6 +61,7 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuExit, VcpuFd, VmFd};
 
 use crate::arch::aarch64::fdt;
+use crate::arch::aarch64::kvm_state;
 use crate::arch::aarch64::layout::{
     mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
     GIC_NUM_IRQS, HVI_TIME_PAGE_BASE, HVI_TIME_TIMERS_BASE, MPIDR_AFFINITY_MASK, RAM_BASE,
@@ -72,6 +73,7 @@ use crate::arch::aarch64::portable::{self, KvmHost};
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
 use crate::arch::aarch64::vgicv2::{self, Bank, Lines, VgicV2};
 use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu::{Output, VcpuState, Work};
 use crate::checkpoint::profile::{hex, host_page_size, MachineProfile, ProfileCell, UNKNOWN};
 use crate::config::{BootConfig, MachineProfileKind, Stop};
 use crate::devices::hvitime::{self, trace, GuestCounter, HviTime, TimerLine};
@@ -1169,6 +1171,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         kick_handle,
         &sh.guest,
         sh.plugin.as_deref(),
+        |vcpu, work| serve(&sh, cpu_id, vcpu, work),
         |exit| {
             match exit {
                 VcpuExit::MmioRead(addr, data) => on_mmio(&sh, addr, true, data),
@@ -1186,6 +1189,25 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
             ControlFlow::Continue(())
         },
     );
+}
+
+/// Carries out the control socket's `work` for vCPU `cpu`, parked on its
+/// own thread: its whole state by name (see `kvm_state`).
+///
+/// A KVM restore loads every vCPU before any thread runs, so there is no
+/// import here.
+fn serve(_sh: &Shared, cpu: u32, vcpu: &VcpuFd, work: Work<'_>) -> std::io::Result<Option<Output>> {
+    match work {
+        Work::Export => Ok(Some(Output::Vcpu {
+            state: VcpuState::Aarch64(kvm_state::export(cpu, vcpu)?),
+            irq: None,
+        })),
+        Work::ExportPlatform => Ok(None),
+        Work::Import(..) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("vCPU {cpu}: a KVM restore loads the vCPUs before they run"),
+        )),
+    }
 }
 
 impl SafepointVcpu for VcpuFd {
@@ -1388,6 +1410,16 @@ mod tests {
     use super::*;
     use crate::arch::aarch64::vgicv2::tests::busy_state;
 
+    /// The two raw requests are the numbers the kernel's headers give.
+    #[test]
+    fn the_raw_ioctl_requests_are_the_kernels() {
+        assert_eq!(u64::from(KVM_ARM_SET_COUNTER_OFFSET as u32), 0x4010_aeb5);
+        assert_eq!(
+            u64::from(KVM_ARM_GET_REG_WRITABLE_MASKS as u32),
+            0x8040_aeb6
+        );
+    }
+
     /// A VM with a vGICv2 and `ncpu` vCPUs, set up as the boot sets them up
     /// and never run.
     fn vgic_vm(ncpu: u32) -> (VmFd, DeviceFd, Vec<VcpuFd>) {
@@ -1422,6 +1454,40 @@ mod tests {
         })
         .unwrap();
         (vm, gic, vcpus)
+    }
+
+    /// Prints `KVM_GET_REG_LIST` of a vCPU set up as the boot sets it up,
+    /// with each register's value: `native` as it is, `portable` once the
+    /// portable baseline and firmware are written. The output is the
+    /// fixture the classification test reads
+    /// (`src/checkpoint/testdata/kvm-reg-list-rp2-*.txt`). Needs /dev/kvm
+    /// on a Pi 5.
+    #[test]
+    #[ignore]
+    fn print_the_register_lists() {
+        for portable in [false, true] {
+            let (_vm, _gic, vcpus) = vgic_vm(1);
+            if portable {
+                set_baseline(&vcpus).unwrap();
+            }
+            let mut list = kvm_bindings::RegList::new(500).unwrap();
+            vcpus[0].get_reg_list(&mut list).unwrap();
+            let name = if portable { "portable" } else { "native" };
+            println!("# {name}: {} registers", list.as_slice().len());
+            for id in list.as_slice() {
+                let size = 1usize << ((id >> 52) & 0xf);
+                let mut buf = vec![0u8; size];
+                let value = match vcpus[0].get_one_reg(*id, &mut buf) {
+                    Ok(_) => buf
+                        .iter()
+                        .rev()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    Err(e) => format!("error:{}", e.errno()),
+                };
+                println!("{name} {id:#018x} {value}");
+            }
+        }
     }
 
     /// The software model's state, with pending, active, SGI-source and
