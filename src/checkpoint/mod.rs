@@ -27,6 +27,7 @@ pub mod bundle;
 pub(crate) mod capture;
 pub mod control;
 pub mod cpu;
+pub mod kvm_regs;
 pub mod platform;
 pub mod profile;
 pub mod ram;
