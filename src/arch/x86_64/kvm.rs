@@ -287,6 +287,7 @@ fn boot_profile(
 /// [`crate::teardown::STOP_TIMEOUT`]. What remains of the VM is a `VmHandle` a
 /// plugin kept, in a field or on a thread it started from `attach`.
 pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+    cfg.validate()?;
     cfg.require_native_profile("KVM")?;
     if !cfg.fs_shares.is_empty() {
         return Err(

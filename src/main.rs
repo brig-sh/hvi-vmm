@@ -402,9 +402,6 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !arch_timer_irq && profile == config::MachineProfileKind::Native {
-        return Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into());
-    }
     if dump_after.is_some() && dump_memory.is_none() {
         return Err("--dump-after needs --dump-memory <path>".into());
     }

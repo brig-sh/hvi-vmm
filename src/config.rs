@@ -274,6 +274,27 @@ pub struct BootConfig {
 }
 
 impl BootConfig {
+    /// Refuses a combination of fields that no backend boots, whichever
+    /// one runs. Every backend's `boot` calls it first, so a library
+    /// caller gets the same answer as the CLI.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `arch_timer_irq` is cleared on the native profile, or
+    /// when a portable profile is given virtio-fs shares.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.arch_timer_irq && self.profile == MachineProfileKind::Native {
+            return Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into());
+        }
+        if self.profile != MachineProfileKind::Native && !self.fs_shares.is_empty() {
+            return Err(format!(
+                "--share-ro/--share-rw are not part of --profile {}: a portable guest keeps its storage on virtio-blk",
+                self.profile.name()
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuses a portable profile on a backend that does not implement one
     /// yet.
     ///
@@ -281,7 +302,7 @@ impl BootConfig {
     ///
     /// Errors naming `backend` when the profile is not native.
     pub fn require_native_profile(&self, backend: &str) -> Result<(), String> {
-        if self.profile == MachineProfileKind::Native && self.arch_timer_irq {
+        if self.profile == MachineProfileKind::Native {
             return Ok(());
         }
         Err(format!(
@@ -342,7 +363,9 @@ pub enum Stop {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, CachePolicy, FsShare, MachineProfileKind, ShareMode};
+    use super::{
+        check_export_overlap, BootConfig, CachePolicy, FsShare, MachineProfileKind, ShareMode,
+    };
     use std::path::{Path, PathBuf};
 
     fn shares(pairs: &[(&str, ShareMode)]) -> Vec<FsShare> {
@@ -462,6 +485,66 @@ mod tests {
         ]))
         .expect("/srv/ab is a sibling of /srv/a, not a child");
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    fn boot_config(profile: MachineProfileKind, arch_timer_irq: bool) -> BootConfig {
+        BootConfig {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 0,
+            cmdline: String::new(),
+            disk: None,
+            fs_shares: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: String::new(),
+            vcpus: 1,
+            agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
+            plugin: None,
+            sandbox: false,
+            profile,
+            arch_timer_irq,
+        }
+    }
+
+    #[test]
+    fn validate_refuses_what_no_backend_boots() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        assert_eq!(boot_config(Native, true).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, true).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, false).validate(), Ok(()));
+        assert_eq!(
+            boot_config(Native, false).validate(),
+            Err("--no-arch-timer-irq needs --profile portable-arm64-v1".into())
+        );
+        let mut cfg = boot_config(PortableArm64V1, true);
+        cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("--share-ro/--share-rw"));
+        let mut cfg = boot_config(Native, true);
+        cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_backend_without_the_profile_names_the_profile() {
+        let cfg = boot_config(MachineProfileKind::PortableArm64V1, false);
+        assert_eq!(
+            cfg.require_native_profile("KVM"),
+            Err("--profile portable-arm64-v1 is not implemented on the KVM backend yet".into())
+        );
+        assert_eq!(
+            boot_config(MachineProfileKind::Native, true).require_native_profile("KVM"),
+            Ok(())
+        );
     }
 
     #[test]
