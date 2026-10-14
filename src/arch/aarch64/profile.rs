@@ -197,6 +197,7 @@ mod tests {
                 net: true,
                 vsock: false,
                 fs_count: 0,
+                timer: fdt::ArchTimer::Interrupts,
             },
             net_mode: Some("stub"),
             ram_regions: vec![crate::memory::RamRegion {

@@ -263,6 +263,14 @@ pub struct BootConfig {
     pub sandbox: bool,
     /// The machine the guest is given.
     pub profile: MachineProfileKind,
+    /// Whether the devicetree gives the architected timer its interrupts.
+    ///
+    /// Only a portable profile may clear it. The `/timer` node then carries a
+    /// fixed `clock-frequency` and no interrupts, so the guest's arch-timer
+    /// driver takes its rate from the node and registers no clock event. That
+    /// is the shape the portable profile takes once hvi-time supplies the
+    /// clock.
+    pub arch_timer_irq: bool,
     /// The registration of the [`StopHandle`](crate::run::StopHandle) that asks
     /// this run to stop from outside the guest, or `None` when the caller keeps
     /// no handle.
@@ -292,7 +300,7 @@ impl BootConfig {
     ///
     /// Errors naming `backend` when the profile is not native.
     pub fn require_native_profile(&self, backend: &str) -> Result<(), String> {
-        if self.profile == MachineProfileKind::Native {
+        if self.profile == MachineProfileKind::Native && self.arch_timer_irq {
             return Ok(());
         }
         Err(format!(
