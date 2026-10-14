@@ -83,7 +83,15 @@ pub(crate) struct Capture {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The console UART, and the RTC on x86-64.
     pub(crate) console: Console,
+    /// Run after each component is written, so a test can fail or stop a
+    /// capture part way.
+    #[cfg(test)]
+    pub(crate) after_component: Option<AfterComponent>,
 }
+
+/// A test's hook into [`Capture::write`], see [`Capture::after_component`].
+#[cfg(test)]
+pub(crate) type AfterComponent = Arc<dyn Fn(Component) -> io::Result<()> + Send + Sync>;
 
 /// What the caller of [`Capture::write`] supplies about the request.
 pub(crate) struct Request<'a> {
@@ -96,6 +104,21 @@ pub(crate) struct Request<'a> {
 }
 
 impl Capture {
+    /// Runs the test hook, when there is one, after `component` is written.
+    #[cfg(test)]
+    fn after(&self, component: Component) -> io::Result<()> {
+        self.after_component
+            .as_ref()
+            .map_or(Ok(()), |hook| hook(component))
+    }
+
+    /// Does nothing: only the tests hook into the write.
+    #[cfg(not(test))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn after(&self, _component: Component) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Gathers every device's state and line level, with every device mutex
     /// held at once, and refuses a state a restore would refuse.
     ///
@@ -197,17 +220,23 @@ impl Capture {
             }
         };
         writer.write_bytes(Component::Profile, profile.to_json().as_bytes())?;
+        self.after(Component::Profile)?;
         check()?;
         writer.write_ram(&self.ram, stopping)?;
+        self.after(Component::RamMap)?;
         check()?;
         writer.write_json(Component::Cpu, &CpuState::new(self.arch, vcpus))?;
+        self.after(Component::Cpu)?;
         writer.write_json(
             Component::Platform,
             &PlatformState::not_captured(self.arch, self.backend),
         )?;
+        self.after(Component::Platform)?;
         writer.write_bytes(Component::Devices, &devices.to_json()?)?;
+        self.after(Component::Devices)?;
         if let Some(disk) = &disk {
             writer.write_json(Component::Disk, disk)?;
+            self.after(Component::Disk)?;
         }
         writer.write_json(
             Component::Session,
@@ -224,6 +253,7 @@ impl Capture {
                 .to_string(),
             },
         )?;
+        self.after(Component::Session)?;
         check()?;
         writer.seal(Vec::new())
     }

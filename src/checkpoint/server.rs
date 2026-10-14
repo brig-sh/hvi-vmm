@@ -218,6 +218,8 @@ impl ControlSocket {
             net: guest.net.clone(),
             vsock: guest.vsock.clone(),
             console: parts.console.clone(),
+            #[cfg(test)]
+            after_component: None,
         })
     }
 
@@ -697,6 +699,7 @@ fn refuse(code: ErrorCode, message: impl Into<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::bundle::Component;
     use crate::checkpoint::cpu::Work;
     use crate::config::Stop;
     use crate::hypervisor::vcpus::Outcome;
@@ -732,6 +735,10 @@ mod tests {
         net: Option<Arc<std::sync::Mutex<crate::devices::virtio::net::VirtioNet>>>,
         /// The profile's virtio-fs share count.
         fs_shares: u32,
+        /// The component after which the capture fails.
+        fail_after: Option<Component>,
+        /// The component after which the run is stopped.
+        stop_after: Option<Component>,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -833,6 +840,22 @@ mod tests {
                 net: spec.net.clone(),
                 vsock: None,
                 console: Console::None,
+                after_component: Some({
+                    let (fail, stop, vcpus) =
+                        (spec.fail_after, spec.stop_after, Arc::clone(&vcpus));
+                    Arc::new(move |component| {
+                        if stop == Some(component) {
+                            vcpus.stop();
+                        }
+                        if fail == Some(component) {
+                            return Err(std::io::Error::other(format!(
+                                "a test failed the write after {}",
+                                component.file()
+                            )));
+                        }
+                        Ok(())
+                    })
+                }),
             });
             let server = {
                 let (stop, gate, vcpus) = (
@@ -1491,6 +1514,106 @@ mod tests {
             std::fs::symlink_metadata(f.root.join("ck")).is_err(),
             "the refused capture left its directory"
         );
+    }
+
+    /// Lists what is in `dir`, or `None` when it is gone.
+    #[allow(clippy::disallowed_methods)]
+    fn listing(dir: &std::path::Path) -> Option<Vec<std::ffi::OsString>> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        Some(entries.map(|e| e.unwrap().file_name()).collect())
+    }
+
+    // A write that fails part way, on a running VM, leaves it running and
+    // leaves no file behind: the directory the capture created goes, and one
+    // the caller made stays, empty.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_failed_write_leaves_the_vm_running_and_nothing_on_disk() {
+        let mut f = Fixture::with(
+            "ck-write",
+            Spec {
+                parking: 2,
+                capture: true,
+                fail_after: Some(Component::Cpu),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.checkpoint("ck", "fence"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("after cpu.json"),
+            "{r}"
+        );
+        f.assert_running();
+        assert!(f
+            .ask(r#"{"v":1,"op":"status"}"#)
+            .contains(r#""state":"running""#));
+        assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
+
+        std::fs::create_dir(f.root.join("made")).unwrap();
+        let r = reply(&f.checkpoint("made", "continue"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        f.assert_running();
+        assert_eq!(listing(&f.root.join("made")), Some(Vec::new()));
+    }
+
+    // A capture that fails after a client paused the VM must leave it
+    // paused, every vCPU parked, not resume what it did not pause.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_failed_capture_of_a_paused_vm_leaves_it_paused() {
+        let mut f = Fixture::with(
+            "ck-paused-fail",
+            Spec {
+                parking: 2,
+                capture: true,
+                fail_after: Some(Component::Devices),
+                ..Spec::default()
+            },
+        );
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"pause"}"#),
+            r#"{"v":1,"ok":true,"state":"paused"}"#
+        );
+        let r = reply(&f.checkpoint("ck", "continue"));
+        assert_eq!(r["code"], "capture_failed", "{r}");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"status"}"#),
+            r#"{"v":1,"ok":true,"state":"paused","vcpus":2,"vcpus_parked":2}"#
+        );
+        assert!(f.source.gate().is_paused(), "the gate was opened");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(f.vcpus.parked(), 2, "a vCPU ran after the failed capture");
+        assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"resume"}"#),
+            r#"{"v":1,"ok":true,"state":"running"}"#
+        );
+        f.assert_running();
+    }
+
+    // A stop of the run during the capture ends it with `stopped`, and the
+    // half-written bundle is removed.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_stop_during_the_capture_ends_it_and_removes_the_bundle() {
+        let mut f = Fixture::with(
+            "ck-stop",
+            Spec {
+                parking: 2,
+                capture: true,
+                stop_after: Some(Component::Profile),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.checkpoint("ck", "continue"));
+        assert_eq!(r["code"], "stopped", "{r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("the run is stopping"),
+            "{r}"
+        );
+        assert_eq!(listing(&f.root.join("ck")), None, "the directory stayed");
+        assert_stops(&f.vcpus, "the run did not stop");
     }
 
     #[test]
