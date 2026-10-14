@@ -595,19 +595,18 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         profile_out,
         sandbox,
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(target_arch = "aarch64")]
     {
         eprintln!("restoring {} ...", cfg.from);
-        let stop = hvi::restore(cfg).map_err(|e| e as Box<dyn std::error::Error>)?;
+        let stop = hvi::restore(cfg)?;
         eprintln!("guest stopped: {stop:?}");
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = cfg;
         Err(
-            "`restore` resumes Hypervisor.framework bundles only so far; the KVM restore \
-             is not built yet"
+            "`restore` resumes arm64 guests only so far; the x86-64 restore is not built yet"
                 .into(),
         )
     }

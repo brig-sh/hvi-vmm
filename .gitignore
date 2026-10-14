@@ -8,7 +8,7 @@
 .claude/
 
 # Guest artifacts pulled for local boot tests.
-guest/
+/guest/
 ev.ndjson
 run.log
 smoke.log

@@ -9,13 +9,19 @@ This page says what works today and what does not.
 
 - **Works:** the bundle format, the capture on the control socket on all
   three backends, the fence that keeps a source from running again,
-  `hvi checkpoint-verify`, and on HVF (macOS) the whole capture and
-  `hvi restore`: a guest moves from one hvi process to another on the same
-  Mac and goes on where it was.
-- **Does not work yet:** a KVM bundle cannot be restored. On KVM each vCPU's
-  state is partial, and the interrupt controller and the guest counter are
-  not captured. A bundle moves only between hosts on the same macOS build,
-  CPU and hvi commit. [What is captured](#what-is-captured) has the details.
+  `hvi checkpoint-verify`, and `hvi restore`:
+  - on HVF (macOS), a native guest moves from one hvi process to another on
+    the same Mac and goes on where it was;
+  - a guest of the portable profile (`--profile portable-arm64-v1`, see
+    [portable-profile.md](portable-profile.md)) does the same on the Mac and
+    on arm64 KVM (a Raspberry Pi 5), and its bundle is the same on both, so
+    `hvi restore` takes a bundle of either backend on either. See
+    [Moving between hosts](#moving-between-hosts).
+- **Does not work yet:** a native KVM bundle cannot be restored: its vCPUs
+  are whole, but the vGICv3 and the counter are not captured. A native HVF
+  bundle moves only between hosts on the same macOS build, CPU and hvi
+  commit. x86-64 vCPUs are still partial. [What is captured](#what-is-captured)
+  has the details.
 
 ## Taking a checkpoint
 
@@ -102,7 +108,7 @@ A refusal is `{"v":1,"ok":false,"code":...,"error":...}`.
 
 | `code` | When | The VM afterwards |
 | --- | --- | --- |
-| `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, a guest with virtio-fs shares, a guest of the portable profile, which no backend checkpoints yet, or a guest with a second disk or a read-only one. | Untouched: nothing was paused. |
+| `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, a guest with virtio-fs shares, or a guest with a second disk or a read-only one. | Untouched: nothing was paused. |
 | `not_ready` | The machine profile is not complete yet. | Untouched. |
 | `timeout` | The I/O threads or the vCPUs did not park, or the vCPUs did not export their state, within 2 s. | As the request found it. |
 | `capture_failed` | Anything after the pause: a device state that a restore would refuse, a failed disk sync, a failed write or sync, a bundle the reader would refuse. | As the request found it. Every file the capture wrote is removed, the manifest included, and the directory too when the capture created it. |
@@ -159,9 +165,10 @@ RAM: 94359552 of 536870912 bytes present; 2 vCPU(s)
 complete: every part a restore needs is captured
 ```
 
-A bundle from a KVM host ends with `partial: vCPU registers, interrupt
+A native bundle from an arm64 KVM host ends with `partial: interrupt
 controller and timer not captured, so no restore can resume this bundle`
-instead.
+instead, and one from x86-64 with `partial: vCPU registers, interrupt
+controller and timer not captured, ...`.
 
 ```text
 hvi: /var/lib/sb1/checkpoints/tx-42: ram.bin: SHA-256 does not match the manifest
@@ -249,9 +256,52 @@ in the schema.
 A secondary the guest never started is `"power":"off"` with no registers.
 One the guest sent a `CPU_ON` that its thread had not taken yet is
 `{"pending_on":{"entry":"0x..","ctx":"0x.."}}`, and a restore starts it from
-there. The KVM backends still write `"partial": true` with PC, PSTATE, SP_EL0,
-SP_EL1, SCTLR_EL1, TCR_EL1, TTBR0_EL1 and TTBR1_EL1 on arm64, and RIP and
-CR3 on x86-64.
+there. The pointer-authentication keys are optional too: a KVM vCPU has
+them only with PAuth, which hvi does not give it.
+
+On arm64 KVM each vCPU writes the same document, by the same names. KVM
+names a register by a `KVM_GET_REG_LIST` id, and
+[The KVM registers](#the-kvm-registers) says what each id becomes. Beside the
+registers, a KVM vCPU records:
+
+```text
+ "mp_state":"runnable",
+ "firmware":{"PSCI_VERSION":"0x10001","SMCCC_ARCH_WORKAROUND_1":"0x2",...},
+ "fixed":{"OSLSR_EL1":"0x8","DISR_EL1":"0x0","CNTP_CTL_EL0":"0x4","CNTP_CVAL_EL0":"0x0"},
+ "events":{"serror_pending":false,...},   (only when one is pending)
+ "unavailable":["APIAKEYLO_EL1",...,"SMPRI_EL1"],
+ "timer":{"vtimer_masked":false},
+ "backend":"kvm"
+```
+
+A stopped KVM vCPU (`KVM_MP_STATE_STOPPED`) is written `"power":"off"`, as
+on HVF. A register KVM lists that hvi has no rule for fails the capture.
+The x86-64 backend still writes `"partial": true` with RIP and CR3.
+
+### The KVM registers
+
+Every id a Raspberry Pi 5's KVM lists (Linux 6.12.25, 259 ids, the same for
+a native and a portable vCPU; the fixture is
+`src/checkpoint/testdata/kvm-reg-list-rp2.txt`) is in one of four classes,
+which `src/checkpoint/kvm_regs.rs` encodes. An id outside every rule is
+refused, and a test checks that no id of the fixture is.
+
+| Class | Ids | In `cpu.json` | On import |
+| --- | --- | --- | --- |
+| shared (160) | core `x0`..`x30`, `sp` (`sp_el0`), `pc`, `pstate`, `sp_el1`, `elr_el1` and `spsr[0]` (`ELR_EL1`, `SPSR_EL1`), `vregs` (128-bit, `q0`..`q31`), `fpsr`, `fpcr`; system registers by encoding: `SCTLR`, `ACTLR`, `CPACR`, `TTBR0/1`, `TCR`, `AFSR0/1`, `ESR`, `FAR`, `PAR`, `MAIR`, `AMAIR`, `VBAR`, `CONTEXTIDR`, `TPIDR_EL1`, `CNTKCTL`, `CSSELR`, `TPIDR_EL0`, `TPIDRRO_EL0`, `MDSCR`, `MDCCINT`, `DBGBVR/BCR/WVR/WCR0..15`, `MPIDR_EL1`; the timer's `TIMER_CTL` (`CNTV_CTL_EL0`) and `TIMER_CVAL` (`CNTV_CVAL_EL0`, under the encoding of `CNTVCT_EL0`, which the UAPI swapped) | `regs`, `simd`, `sysregs` by name | Written by name. `MPIDR_EL1` is compared: KVM sets it from the vCPU index. |
+| set-by-baseline (88) | the ID registers `(3,0,0,*,*)`, `MIDR_EL1`, `REVIDR_EL1`, `AIDR_EL1`, `CLIDR_EL1`, `CTR_EL0`, the 14 `CCSIDR_EL1` demux ids; `TIMER_CNT` and `CNTPCT_EL0` (the counter); `TCR2_EL1`, `PIRE0_EL1`, `PIR_EL1` (features `ID_AA64MMFR3_EL1` hides); the AArch32 state `spsr[1..4]`, `DACR32_EL2`, `IFSR32_EL2`, `FPEXC32_EL2`, `DBGVCR32_EL2` (the baseline offers AArch64 only) | Not written | Not written: the portable baseline, the profile check or the counter offset gives them. |
+| checked-equal-on-import (11) | the firmware registers `PSCI_VERSION`, `SMCCC_ARCH_WORKAROUND_1/2/3`, `STD_BMAP`, `STD_HYP_BMAP`, `VENDOR_HYP_BMAP`; `OSLSR_EL1`, `DISR_EL1`, `CNTP_CTL_EL0` (ENABLE and IMASK), `CNTP_CVAL_EL0` | `firmware`, `fixed` | The destination's value must equal the recorded one, or, for a state from HVF, the value a guest there sees. Workaround 2 reads 0 natively and 3 (not required) once the baseline hides SSBS; hvi on the Mac answers as the latter. |
+| refused (0 on the Pi) | anything else, such as SVE or PMU registers | | The capture fails; a restore on a host that lists one refuses. |
+
+The other direction: `AARCH64_SYSREGS` names 15 registers a portable KVM
+vCPU does not have, the 10 pointer-authentication keys, `SCXTNUM_EL0/1`,
+`TPIDR2_EL0`, `SMCR_EL1` and `SMPRI_EL1`. A KVM export lists them under
+`unavailable`, and an HVF import leaves them at their reset value. A KVM
+import of an HVF state drops them only when they hold 0, as each does for a
+portable guest on HVF (measured on an M5 Pro), since the baseline hides
+their features; one that holds anything else is refused. A firmware
+answer, a fixed register or a pending SError from KVM that an HVF guest
+could not have is refused by the HVF import.
 
 ### The platform state
 
@@ -259,9 +309,9 @@ CR3 on x86-64.
 | --- | --- | --- | --- |
 | `irq` | `hv-gic-v3` | HVF | The GICv3 in canonical form: `dist` (`GICD_CTLR`, then `igroupr`, `isenabler`, `ispendr`, `isactiver`, `ipriorityr`, `icfgr` by register number from 0, and `irouter` by interrupt ID), `redist` and `icc` for each vCPU that ran, and `spi_count`. |
 | `timer` | `arch-timer` | HVF | `counter_freq_hz`, `counter_at_capture` (the guest's `CNTVCT_EL0` as vCPU 0 saw it) and `host_monotonic_at_capture_ns`. |
-| either | `not-captured` | KVM | `reason`. A restore refuses it. |
-| `irq` | `gicv2` | nothing yet | The portable profile's GICv2 in canonical form (`Gicv2State`, see [portable-profile.md](portable-profile.md#2-interrupt-controller)). A restore refuses it as not restorable yet. |
-| `timer` | `hvi-time` | nothing yet | The portable profile's `hvi-time` state (`HviTimeState`, see [portable-profile.md](portable-profile.md#restore)). A restore refuses it as not restorable yet. |
+| either | `not-captured` | KVM, native | `reason`. A restore refuses it. |
+| `irq` | `gicv2` | HVF and KVM, portable | The portable profile's GICv2 in canonical form (`Gicv2State`, see [portable-profile.md](portable-profile.md#2-interrupt-controller)): on HVF the software model's state, on KVM the vGICv2's with the line levels hvi's devices hold. |
+| `timer` | `hvi-time` | HVF and KVM, portable | The portable profile's `hvi-time` state (`HviTimeState`, see [portable-profile.md](portable-profile.md#restore)), with `counter_at_capture`, the guest's raw counter at the capture. |
 
 `backend_adjunct` carries HVF's own GIC state, the `hv_gic_state` blob,
 as `{"kind":"hvf_gic_state","data_b64":...,"sha256":...}`. A restore on
@@ -270,11 +320,10 @@ is sure to load it. The canonical part is for a later import on another
 backend. `GICR_CTLR` is not in `redist`: Hypervisor.framework has no call
 that reads it.
 
-A guest of the portable profile cannot be checkpointed yet: the
-`checkpoint` op refuses it before anything is paused, on either backend.
-`hvi restore` refuses a bundle whose profile is `portable-arm64-v1`, or
-whose sections are `gicv2` or `hvi-time`, and says that no backend
-restores them yet.
+For a portable guest vCPU 0 reads `hvi-time` frozen, so no timer fires
+between its state and the GIC's. A guest that goes on after the capture
+(`then: "continue"`, or a failed capture) thaws it: a deadline that came due
+meanwhile fires then, and nothing is published.
 
 ## How the capture works
 
@@ -293,8 +342,10 @@ restores them yet.
    request of its own. The wait between the two requests is the barrier:
    the framework gives the `hv_gic_state` blob only while every vCPU is
    stopped, and vCPU 0 reads it, the distributor and the counter after all
-   the others are done. A KVM vCPU 0 hands back nothing, and the platform
-   is written as `not-captured`.
+   the others are done. On the portable profile vCPU 0 reads the GICv2
+   (the software model on HVF, the vGICv2 on KVM) and `hvi-time`. On native
+   KVM vCPU 0 hands back nothing, and the platform is written as
+   `not-captured`.
 5. With everything still, it locks every device mutex and collects the device
    states. Then it checks them as a restore would. A state that a restore
    would refuse fails the capture here, before any file is written, while the
@@ -343,10 +394,10 @@ written from a `vmm` thread (Linux), is refused.
 | Guest RAM | Whole, without zero pages. | The same. |
 | Device state | Whole: virtio-blk, virtio-net and virtio-vsock queues and registers, and the PL011. | The same, with the 16550 and the CMOS RTC on x86-64. |
 | Disk | Synced, with its size and generation. The image itself is not in the bundle; whoever moves the sandbox moves the disk. | The same. |
-| vCPU registers | Whole. See [The vCPU state](#the-vcpu-state). | **Partial**: the plugin register view. A register the backend could not read is 0. |
-| A secondary the guest never started | `off`, or `pending_on` with the entry and context of the `CPU_ON` it had not taken. | Every KVM vCPU starts at once. |
-| Interrupt controller | The `hv_gic_state` blob, and the GICv3 registers in canonical form. | **Not captured.** |
-| Guest counter | The counter at the capture. | **Not captured.** |
+| vCPU registers | Whole. See [The vCPU state](#the-vcpu-state). | arm64: whole, by the same names, with the firmware and fixed registers and `mp_state`. x86-64: **partial**, the plugin register view. |
+| A secondary the guest never started | `off`, or `pending_on` with the entry and context of the `CPU_ON` it had not taken. | `off` when KVM reports it stopped. PSCI is KVM's: a vCPU whose `CPU_ON` KVM has not served yet still holds its initialisation registers (pc 0), and the capture fails until the guest has run again. One turned off and being turned on again is not seen (`portable-profile.md`, Limits). |
+| Interrupt controller | Native: the `hv_gic_state` blob, and the GICv3 registers in canonical form. Portable: the software GICv2's state. | Portable: the vGICv2 in canonical form. Native: **not captured**. |
+| Guest counter | Native: the counter at the capture. Portable: `hvi-time`'s state and the raw counter. | Portable: the same. Native: **not captured**. |
 
 A restore refuses a vCPU marked `partial` and a `not-captured` section.
 `hvi checkpoint-verify` reports both. Dirty tracking for pre-copy rounds and
@@ -413,7 +464,10 @@ claimed elsewhere` until then, and waits for no release.
 
 ### The steps
 
-A restore runs these steps, in this order:
+The steps below are the native HVF restore's. The portable profile's
+differ where its machine does, on HVF and on KVM: see
+[The portable restore](#the-portable-restore). A restore runs these steps,
+in this order:
 
 1. **Refuse or go on.** It opens the bundle and checks it as
    `checkpoint-verify` does. It then lists every reason this host cannot
@@ -470,6 +524,107 @@ A restore runs these steps, in this order:
 A failure after step 1 stops everything that started and exits 1 with the
 reason. Nothing is written to the bundle or the disk before the guest runs.
 
+### The portable restore
+
+A bundle of the portable profile restores on HVF and on arm64 KVM, from
+either. The refusals of step 1 are the same, and for a profile check
+`compatible_with` compares what the portable machine fixes instead of the
+host: the profile name, the hvi commit, the CPU baseline, the GICv2 and
+`hvi-time` (not the counter rate), the RAM, the vCPU count, the device map,
+the PSCI version, the devicetree digest and the agent socket. A restore
+loads no kernel, so its devicetree digest is the bundle's: equal digests
+across hosts are a check of the two boots, which give the same devicetree
+for the same inputs (`portable-profile.md`). Each backend then runs the host
+check of a portable boot: on HVF that the host can back the baseline,
+before any vCPU exists; on KVM `kvm_host_problems` (a vGICv2, 4 or 16 KiB
+pages, 40-bit IPA, the baseline within what KVM can lower), once the VM and
+its vCPUs exist and before any runs. A native bundle of the other backend
+is refused for its backend.
+
+- **HVF.** No `hv_gic`: the VM gets the software GICv2, `hvi-time`'s page
+  mapped read-only, and the baseline on every vCPU, as a portable boot does.
+  The guest's counter offset is fixed before the vCPUs are created (see
+  [Clock policy](#clock-policy)). Steps A to C run as above, but vCPU 0
+  loads the software GICv2 from the canonical state in step B, and step C
+  has nothing to load.
+- **KVM.** The VM and the vGICv2; every vCPU created and initialised in
+  index order, one that was off powered off; the host check and the
+  baseline and firmware registers, as at boot, before guest RAM is copied
+  and the disk opened; then RAM and the devices as above; the counter
+  offset and `hvi-time`'s read-only memory slot; the vGIC's `NR_IRQS` and
+  init. Before any vCPU thread starts, each vCPU loads its state with
+  `KVM_SET_ONE_REG` by name, its `mp_state` and any pending SError, and the
+  vGIC loads the canonical state, every register read back
+  (`kvm_state::load_portable`). KVM has no rule that a vCPU's own thread
+  load it, so the main thread does, before the seccomp filters go on.
+
+Then, on both, each device's line is driven to the device's level, and the
+device's record of its line with it: loading the interrupt controller sets
+every line behind the devices' backs. The vCPUs and the I/O threads are held
+before they start, and the control socket reports `restored-paused`. The
+first vCPU to enter the guest after `resume` publishes `hvi-time`'s page,
+and every other vCPU waits for it before its own first entry. A checkpoint
+of the guest before that writes the state waiting to be published, which is
+the guest's, since it has not run.
+
+### Moving between hosts
+
+The portable profile is the one that moves between hosts: the Mac and a
+Pi present the same machine, and the bundle holds only canonical state.
+Copy the bundle and the disk to the destination and run `hvi restore`
+there with the same flags. What carries over:
+
+- **The vCPUs**, by register name, with the classes of
+  [The KVM registers](#the-kvm-registers): what one backend has and the
+  other lacks is either set by the machine, compared, dropped at 0 under
+  the baseline, or refused.
+- **The interrupt controller**, through the canonical GICv2 state. Two
+  things are lost on the way through KVM's register view: a level interrupt
+  whose latch and line are both set comes out with the line only, and the
+  vGICv2's SGI active source is not carried.
+- **The clock**, through `hvi-time`: guest `CLOCK_MONOTONIC` goes on from
+  the capture at the destination's counter rate, and the wall clock moves to
+  the host's. The guest's raw counter is not continuous across rates, but
+  the destination's starts no lower than the capture's, scaled to its rate.
+
+The bundle's hvi commit must equal the destination's, so build both hosts
+from one commit, with no uncommitted changes: a build with them is refused
+on either side, as for the native machine.
+
+Run so far: a portable bundle restored on the host that took it, on the
+Mac and on a Pi 5 (`tools/checkpoint-e2e.sh --portable`), and moves each
+way between an Apple M5 Pro and a Pi 5 by hand: a 1-vCPU, 512 MiB guest
+with an ext4 disk and the stub network, fenced, copied with `rsync --sparse`
+(the bundle is 95 MB) and restored with the same flags, under Seatbelt and
+seccomp.
+
+The first pair of moves ran before a fix to the restore on the Mac, which
+loaded every SIMD register with whatever the host's `v0` held (fixed in
+`0c178e0`). The Pi to Mac move of that pair lost the guest's live SIMD
+registers. Its checks did not show it: the `awk` sum stayed exact, because
+the guest kept the sum in memory.
+
+Each move was run again on `9880f4d`. Before the resume, the restored guest
+was checkpointed again while restored-paused, and that state was compared
+with the bundle's. The general, SIMD and system registers were equal,
+including the non-zero `q` registers (`q0`-`q3` and `q9` from the Mac,
+`q1`-`q3` from the Pi). The 15 registers only HVF has read 0 on the Mac in
+both directions, and are not carried. The GICv2 and `hvi-time` state was equal too. After the
+resume, in both directions:
+
+- the guest's count went on by one, and no boot banner appeared;
+- a 6 s timerfd armed before the capture fired 6.00009 s (to the Pi) and
+  6.00007 s (to the Mac) of guest time after it was armed;
+- `el0check` passed, the clocksource stayed `hvi-time`, and the driver
+  logged generation 4 at the destination's rate (24 MHz to 54 MHz and back)
+  with `migrations=1`;
+- the file held open after its unlink stayed readable, the file written
+  before the move was on the disk, and a write after it worked.
+
+The downtime was mostly the copy: 174 s from the Mac to the Pi over the
+tailnet, and 19 s back. `tools/checkpoint-e2e.sh` runs on one host, so its
+own checks have not been run across hosts.
+
 ### Timings
 
 Measured with `tools/checkpoint-e2e.sh` on an Apple M5 Pro running macOS
@@ -489,6 +644,8 @@ every component, and the copy of RAM hashes `ram.bin` again as it reads it.
 `resume` replies in under a millisecond.
 
 ## Clock policy
+
+### The native profile
 
 The guest's counter continues from the captured value. On HVF, the capture
 records `CNTVCT_EL0` as vCPU 0 sees it, `mach_absolute_time()` less its
@@ -510,5 +667,33 @@ guest brings up later gets the same offset. The policy is:
 
 QEMU behaves the same way by default, when it is run without `-rtc
 clock=host` for the monotonic counter. A `pause` alone does not stop guest
-time: the counter runs on through it. The KVM backends do not capture the
-counter yet.
+time: the counter runs on through it. The native KVM backends do not capture
+the counter yet.
+
+### The portable profile
+
+The guest's clock is `hvi-time`, and its restore republishes the page
+([portable-profile.md](portable-profile.md#restore)):
+
+- **The monotonic clock continues.** The page is published when the first
+  vCPU enters the guest after `resume`, with guest nanoseconds going on from
+  the capture, so neither the time away nor the time restored-paused shows
+  on `CLOCK_MONOTONIC`. Deadlines that passed while away fire at once.
+- **The wall clock is corrected.** The page carries the host's wall clock,
+  and the guest driver moves `CLOCK_REALTIME` and `CLOCK_BOOTTIME` on by the
+  downtime when it sees the new generation. `/proc/uptime` is
+  `CLOCK_BOOTTIME`, so it moves on too.
+- **The raw counter does not go back.** The destination's counter offset is
+  set when its vCPUs are created (on KVM `KVM_ARM_SET_COUNTER_OFFSET` takes
+  it only before a vCPU has run), so that `CNTVCT_EL0` starts no lower than
+  `counter_at_capture` scaled to the destination's rate, rounded up. It runs
+  on while the guest waits restored-paused. The guest reads it only through
+  `hvi-time`, and EL0 reads trap to the synthetic counter.
+
+Measured with `tools/checkpoint-e2e.sh --portable`, one run on each host,
+1 vCPU, 512 MiB:
+
+| Host | `capture_ms` | Restore to restored-paused | Checkpoint request to resume reply | A 6 s timerfd armed before the capture |
+| --- | --- | --- | --- | --- |
+| Apple M5 Pro, macOS 26.7 | 406 | 576 ms | 987 ms | fired 6.000061 s of guest time after it was armed |
+| Raspberry Pi 5, Linux 6.12.25 | 914 | 881 ms | 1798 ms | fired 6.000051 s of guest time after it was armed |

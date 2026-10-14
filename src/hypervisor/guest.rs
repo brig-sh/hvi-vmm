@@ -178,6 +178,23 @@ impl<K> Guest<K> {
             .find(|disk| (disk.base..disk.base + size).contains(&addr))
             .map(|disk| (&disk.dev, addr - disk.base))
     }
+
+    /// Sets each virtio device's line to the device's level, once a restore
+    /// has loaded the interrupt controller. See `Irq::redrive`.
+    // The HVF restore, which connects the devices before it loads the GIC,
+    // calls it; the KVM one connects and drives each line itself.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn redrive_irqs(&self) {
+        for disk in &self.disks {
+            lock_or_recover(&disk.dev).redrive_irq();
+        }
+        if let Some(dev) = &self.net {
+            lock_or_recover(dev).redrive_irq();
+        }
+        if let Some(dev) = &self.vsock {
+            lock_or_recover(dev).redrive_irq();
+        }
+    }
 }
 
 impl<K: Kick> Guest<K> {

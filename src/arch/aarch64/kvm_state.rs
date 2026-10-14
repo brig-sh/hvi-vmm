@@ -26,9 +26,6 @@
 //! The registers are reached through [`OneReg`], so the conversion is tested
 //! without KVM.
 
-// The KVM restore, which loads states with `import`, comes later.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeMap;
 use std::io;
 
@@ -255,6 +252,19 @@ pub(crate) fn export(cpu: u32, vcpu: &impl OneReg) -> io::Result<Aarch64Vcpu> {
     {
         return Err(fail(format!("KVM does not list {name}")));
     }
+    // KVM serves PSCI `CPU_ON` in the kernel: it marks the target runnable
+    // and leaves the reset to the target's next `KVM_RUN`. A vCPU parked
+    // before that run is runnable with the registers of its initialisation,
+    // pc 0 at EL1h with DAIF masked, which no guest runs at. Written as on,
+    // it would start at pc 0. The VM stays paused, and once it has run on
+    // KVM has served the call.
+    if state.regs["pc"].0 == 0 && state.regs["pstate"].0 == CPU_ON_PSTATE {
+        return Err(fail(
+            "KVM has not yet served the CPU_ON that turned it on, so it holds no \
+             registers to capture; resume the guest and checkpoint again"
+                .to_string(),
+        ));
+    }
     for (name, need) in AARCH64_SYSREGS {
         if !state.sysregs.contains_key(name) {
             match need {
@@ -396,9 +406,7 @@ pub(crate) fn import(
                             })
                         });
                         match want {
-                            Some(want)
-                                if crate::checkpoint::kvm_regs::firmware_view(name, want)
-                                    == crate::checkpoint::kvm_regs::firmware_view(name, have) => {}
+                            Some(want) if want == have => {}
                             Some(want) => {
                                 return Err(fail(format!(
                                     "firmware register {name} is {have:#x} here and was \
@@ -461,6 +469,48 @@ pub(crate) fn import(
     Ok(())
 }
 
+/// Loads a portable guest's state into a KVM VM before any of its vCPUs
+/// has run: each vCPU's registers by name, in index order, then the vGIC
+/// from the canonical state, which holds every vCPU's CPU interface, then
+/// `redrive`, which connects the devices' lines and drives each to its
+/// device's level, since loading the vGIC set every line behind the
+/// devices' backs. Returns how many vGIC registers were read back.
+///
+/// The vCPUs must be created and initialised, the VM's baseline, firmware
+/// registers and counter offset set, and the vGIC initialised.
+///
+/// # Errors
+///
+/// Errors, before `redrive`, when a state is not an arm64 one for its
+/// vCPU, a vCPU refuses its state, or the vGIC refuses the canonical one.
+pub(crate) fn load_portable(
+    vcpus: &[impl OneReg],
+    states: &[crate::checkpoint::cpu::VcpuState],
+    vgic: &impl crate::arch::aarch64::vgicv2::VgicV2,
+    gic: &crate::devices::gicv2::Gicv2State,
+    redrive: impl FnOnce(),
+) -> io::Result<usize> {
+    if vcpus.len() != states.len() {
+        return Err(io::Error::other(format!(
+            "{} vCPUs for {} states",
+            vcpus.len(),
+            states.len()
+        )));
+    }
+    for (id, (vcpu, state)) in (0u32..).zip(vcpus.iter().zip(states)) {
+        let crate::checkpoint::cpu::VcpuState::Aarch64(state) = state else {
+            return Err(io::Error::other(format!(
+                "cpu.json: vCPU {id} is not an arm64 state"
+            )));
+        };
+        import(id, vcpu, state, true)?;
+    }
+    let checked = crate::arch::aarch64::vgicv2::import(vgic, gic)
+        .map_err(|e| io::Error::other(format!("the vGICv2: {e}")))?;
+    redrive();
+    Ok(checked)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -480,8 +530,14 @@ pub(crate) mod tests {
         pub(crate) set_state: RefCell<(Option<u32>, Option<Arm64Events>)>,
     }
 
+    /// The ids of the core registers `pc` and `pstate`.
+    const PC: u64 = 0x6030_0000_0010_0040;
+    const PSTATE: u64 = 0x6030_0000_0010_0042;
+
     impl FakeVcpu {
-        /// The portable vCPU of the fixture, with its measured values.
+        /// The portable vCPU of the fixture, with its measured values, but
+        /// at a kernel address: the fixture's vCPU never ran, so its pc is
+        /// 0.
         pub(crate) fn rp2() -> Self {
             let mut values = HashMap::new();
             let mut ids = Vec::new();
@@ -489,6 +545,7 @@ pub(crate) mod tests {
                 ids.push(id);
                 values.insert(id, u128::from_str_radix(value, 16).unwrap());
             }
+            values.insert(PC, 0xffff_8000_0801_0000);
             Self {
                 ids,
                 values: RefCell::new(values),
@@ -567,6 +624,22 @@ pub(crate) mod tests {
         assert!(state.unavailable.contains(&"APIAKEYLO_EL1".to_string()));
         assert!(state.events.is_none());
         assert!(state.kvm_extra.is_empty());
+    }
+
+    // A runnable vCPU still at its initialisation registers waits for KVM to
+    // serve its CPU_ON, and fails the capture rather than start at pc 0.
+    #[test]
+    fn a_vcpu_whose_cpu_on_kvm_has_not_served_fails_the_export() {
+        let vcpu = FakeVcpu::rp2();
+        vcpu.values.borrow_mut().insert(PC, 0);
+        let err = export(1, &vcpu).unwrap_err().to_string();
+        assert!(
+            err.starts_with("vCPU 1: KVM has not yet served the CPU_ON"),
+            "{err}"
+        );
+        // At pc 0 in another mode, it is a guest's.
+        vcpu.values.borrow_mut().insert(PSTATE, 0x5);
+        assert_eq!(export(1, &vcpu).unwrap().regs["pc"], Hex64(0));
     }
 
     #[test]
@@ -736,5 +809,123 @@ pub(crate) mod tests {
         assert_eq!(dest.set_state.borrow().0, Some(MP_RUNNABLE));
         let pc = crate::checkpoint::kvm_regs::id_of(Slot::Reg("pc")).unwrap();
         assert_eq!(dest.values.borrow()[&pc], 0x4008_0000);
+    }
+
+    /// The order of what a restore did, by kind.
+    type Order = RefCell<Vec<&'static str>>;
+
+    /// A vCPU that logs each write.
+    struct LoggedVcpu<'a>(FakeVcpu, &'a Order);
+
+    impl OneReg for LoggedVcpu<'_> {
+        fn reg_list(&self) -> io::Result<Vec<u64>> {
+            self.0.reg_list()
+        }
+        fn get(&self, id: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.0.get(id, buf)
+        }
+        fn set(&self, id: u64, buf: &[u8]) -> io::Result<()> {
+            self.1.borrow_mut().push("vcpu");
+            self.0.set(id, buf)
+        }
+        fn mp_state(&self) -> io::Result<u32> {
+            self.0.mp_state()
+        }
+        fn events(&self) -> io::Result<Arm64Events> {
+            self.0.events()
+        }
+        fn set_mp_state(&self, mp_state: u32) -> io::Result<()> {
+            self.1.borrow_mut().push("vcpu");
+            self.0.set_mp_state(mp_state)
+        }
+        fn set_events(&self, events: &Arm64Events) -> io::Result<()> {
+            self.0.set_events(events)
+        }
+    }
+
+    /// A vGIC that logs each write.
+    struct LoggedVgic<'a>(crate::arch::aarch64::vgicv2::tests::Fake, &'a Order);
+
+    impl crate::arch::aarch64::vgicv2::VgicV2 for LoggedVgic<'_> {
+        fn ncpu(&self) -> usize {
+            self.0.ncpu()
+        }
+        fn read(
+            &self,
+            bank: crate::arch::aarch64::vgicv2::Bank,
+            cpu: usize,
+            offset: u64,
+        ) -> Result<u32, String> {
+            self.0.read(bank, cpu, offset)
+        }
+        fn write(
+            &self,
+            bank: crate::arch::aarch64::vgicv2::Bank,
+            cpu: usize,
+            offset: u64,
+            value: u32,
+        ) -> Result<(), String> {
+            self.1.borrow_mut().push("vgic");
+            self.0.write(bank, cpu, offset, value)
+        }
+        fn set_line(&self, cpu: usize, intid: u32, level: bool) -> Result<(), String> {
+            self.1.borrow_mut().push("vgic");
+            self.0.set_line(cpu, intid, level)
+        }
+    }
+
+    // The restore's order before any vCPU runs: every vCPU's registers,
+    // then the vGIC, then the lines, which the vGIC load set behind the
+    // devices' backs. A vGIC that refuses the state stops it before the
+    // lines.
+    #[test]
+    fn a_kvm_restore_loads_the_vcpus_then_the_vgic_then_the_lines() {
+        use crate::arch::aarch64::vgicv2::tests::{busy_state, Fake};
+        let source = FakeVcpu::rp2();
+        let state = crate::checkpoint::cpu::VcpuState::Aarch64(export(0, &source).unwrap());
+        let mut gic = busy_state();
+        gic.cpus.truncate(1);
+        // busy_state has two CPUs; keep cpu0's SGIs to itself.
+        for s in &mut gic.cpus[0].sgi_sources {
+            *s &= 1;
+        }
+        for t in &mut gic.dist.itargetsr {
+            *t &= 1;
+        }
+        let order = Order::default();
+        let vcpus = [LoggedVcpu(FakeVcpu::rp2(), &order)];
+        let vgic = LoggedVgic(Fake::new(1), &order);
+        let checked = load_portable(&vcpus, std::slice::from_ref(&state), &vgic, &gic, || {
+            order.borrow_mut().push("redrive");
+        })
+        .unwrap();
+        assert!(checked > 0);
+        let mut runs: Vec<&str> = order.borrow().clone();
+        runs.dedup();
+        assert_eq!(runs, ["vcpu", "vgic", "redrive"]);
+
+        let order = Order::default();
+        let vcpus = [LoggedVcpu(FakeVcpu::rp2(), &order)];
+        let vgic = LoggedVgic(Fake::new(1), &order);
+        let mut refused = gic.clone();
+        refused.cpus[0].apr[2] = 1;
+        let err = load_portable(
+            &vcpus,
+            std::slice::from_ref(&state),
+            &vgic,
+            &refused,
+            || {
+                order.borrow_mut().push("redrive");
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("the vGICv2"), "{err}");
+        assert!(!order.borrow().contains(&"redrive"));
+        // A state for another number of vCPUs is refused before anything
+        // is written.
+        let order = Order::default();
+        let vcpus = [LoggedVcpu(FakeVcpu::rp2(), &order)];
+        assert!(load_portable(&vcpus, &[state.clone(), state], &vgic, &gic, || {}).is_err());
+        assert!(order.borrow().is_empty());
     }
 }

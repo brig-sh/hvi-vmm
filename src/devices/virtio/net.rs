@@ -559,6 +559,15 @@ impl VirtioNet {
         self.irq.set(self.irq_level());
     }
 
+    /// Sets the interrupt line to the device's level, whatever it was last
+    /// set to, after a restore loaded the interrupt controller. See
+    /// `Irq::redrive`.
+    // The x86-64 restore does not exist yet.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(crate) fn redrive_irq(&mut self) {
+        self.irq.redrive(self.irq_level());
+    }
+
     /// Returns which backend carries the device's frames.
     #[must_use]
     pub fn mode(&self) -> NetMode {

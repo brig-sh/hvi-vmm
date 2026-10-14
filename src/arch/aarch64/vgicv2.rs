@@ -572,7 +572,7 @@ pub(crate) mod tests {
     /// reading the latch or a level line, SGI sources, `GICC_PMR` shifted
     /// and `GICC_APR1-3` reading 0.
     #[derive(Default)]
-    struct Fake {
+    pub(crate) struct Fake {
         ncpu: usize,
         regs: RefCell<HashMap<(usize, u64), u32>>,
         cpu_regs: RefCell<HashMap<(usize, u64), u32>>,
@@ -584,7 +584,7 @@ pub(crate) mod tests {
     }
 
     impl Fake {
-        fn new(ncpu: usize) -> Self {
+        pub(crate) fn new(ncpu: usize) -> Self {
             let f = Self {
                 ncpu,
                 ..Self::default()
@@ -600,7 +600,7 @@ pub(crate) mod tests {
         /// of each bit array and the first 8 words of each byte array.
         fn key(&self, cpu: usize, offset: u64) -> (usize, u64) {
             let banked = match offset {
-                0x080..=0x3ff => offset % 0x80 == 0,
+                0x080..=0x3ff => offset.is_multiple_of(0x80),
                 0x400..=0xbff => offset % 0x400 < 0x20,
                 0xf10..=0xf2f => true,
                 _ => false,

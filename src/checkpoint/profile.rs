@@ -638,6 +638,13 @@ impl MachineProfile {
                     "hvi_build.git_sha: the {side}'s hvi does not know its commit"
                 ));
             }
+            // As for the native machine: device state is only defined by
+            // the code that wrote it.
+            if p.hvi_build.git_sha.ends_with(DIRTY) {
+                why.push(format!(
+                    "hvi_build.git_sha: the {side}'s hvi was built with uncommitted changes"
+                ));
+            }
             if p.fs_shares != 0 {
                 why.push(format!(
                     "fs_shares: the {side} has {} virtio-fs share(s), whose host file \
@@ -1189,6 +1196,28 @@ mod tests {
         let mut four_k = portable_pi();
         four_k.page_size = 0x1000;
         assert_eq!(portable_mac().compatible_with(&four_k), Ok(()));
+    }
+
+    #[test]
+    fn a_portable_build_with_uncommitted_changes_never_matches() {
+        let (mac, pi) = (portable_mac(), portable_pi());
+        for (dirty_mac, dirty_pi) in [(true, false), (false, true)] {
+            let (mut a, mut b) = (mac.clone(), pi.clone());
+            if dirty_mac {
+                a.hvi_build.git_sha += DIRTY;
+            }
+            if dirty_pi {
+                b.hvi_build.git_sha += DIRTY;
+            }
+            let why = a.portable_compatible_with(&b).unwrap_err();
+            let side = if dirty_mac { "source" } else { "destination" };
+            assert!(
+                why.contains(&format!(
+                    "hvi_build.git_sha: the {side}'s hvi was built with uncommitted changes"
+                )),
+                "{why:?}"
+            );
+        }
     }
 
     #[test]
