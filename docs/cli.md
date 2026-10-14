@@ -173,7 +173,9 @@ can reach.
 `--profile-out` writes the machine profile: what the guest was built against,
 such as the CPU's ID registers, the counter frequency, the interrupt
 controller, RAM, devices and the hvi commit. Two hosts compare profiles before
-a guest moves between them. The file is created before confinement. On Linux it
+a guest moves between them. A profile matches no other when a value in it could
+not be read, or when its hvi does not know its commit or was built with
+uncommitted changes. The file is created before confinement. On Linux it
 is written before the guest starts. On macOS the boot vCPU writes it just
 before the guest's first instruction, since only that thread can read
 `MIDR_EL1`, so a reader that finds it empty waits or asks the socket.
