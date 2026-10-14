@@ -31,9 +31,9 @@
 # tools/guest/tfd.c, both built static). Just before the capture the
 # script starts a 6 s timerfd and a 6 s sleep, and checks after the
 # restore: the clocksource is hvi-time, el0check passes, the guest driver
-# logged the migration and reads migrations=1, both timers fire after the
-# resume 6 s of guest time after they were armed, and the guest's wall
-# clock is the host's again.
+# logged the migration (generation 4) and counts it, both timers fire
+# after the resume 6 s of guest time after they were armed, and the
+# guest's wall clock is the host's again.
 #
 # Usage:
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
@@ -372,11 +372,16 @@ if portable:
           "after the restore, EL0 still reads the synthetic counter")
     check(bool(dst.outputs(r"^CLOCKSOURCE hvi-time$", after=go)),
           "after the restore, the clocksource is still hvi-time")
-    check(bool(dst.outputs(r"^MIGRATION .*hvi-time: generation 4:", after=go)),
-          "the guest driver logged the move")
+    moves = dst.outputs(r"^MIGRATION .*hvi-time: generation \d+:", after=go)
+    generations = {re.search(r"generation (\d+):", s).group(1) for _, s in moves}
+    check(generations == {"4"}, f"the guest driver logged the move, generation 4: {sorted(generations)}")
     snap = dst.outputs(r"EL0CHECK snapshot1: .* migrations=", after=go)
-    check(bool(snap) and snap[0][1].endswith(" migrations=1"),
-          f"the guest driver counts one move: {snap[0][1].split()[-1] if snap else None}")
+    count = int(snap[0][1].split("migrations=")[1]) if snap else None
+    # The driver runs its migration work on every vCPU that takes
+    # GEN_CHANGED once the work has run, so with more vCPUs it can count
+    # the one move more than once.
+    check(count is not None and 1 <= count <= int(cpus),
+          f"the guest driver counts the move: migrations={count} on {cpus} vCPU(s)")
 after_n = None
 if image:
     check(bool(dst.outputs(r"DISK-BEFORE written-before ")), "the file written before the move is on the disk")
