@@ -208,6 +208,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,
         profile: MachineProfileKind::Native,
+        arch_timer_irq: true,
         stop: None,
     };
 

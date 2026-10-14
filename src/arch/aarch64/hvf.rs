@@ -47,7 +47,7 @@ use applevisor::prelude::{
 };
 
 use crate::arch::aarch64::esr::{DataAbort, Ec};
-use crate::arch::aarch64::fdt;
+use crate::arch::aarch64::fdt::{self, ArchTimer};
 use crate::arch::aarch64::hvf_state;
 use crate::arch::aarch64::layout::{
     virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
@@ -672,6 +672,9 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         net: cfg.net || cfg.net_gateway.is_some(),
         vsock: cfg.agent_sock.is_some(),
         fs_count: 0,
+        // A restore rebuilds the native machine, whose guest has the timer's
+        // interrupts.
+        timer: ArchTimer::Interrupts,
     };
     let net_mode = if cfg.net_gateway.is_some() {
         Some("gateway")
@@ -1069,6 +1072,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         net: has_net,
         vsock: has_vsock,
         fs_count: fs.len(),
+        timer: if cfg.arch_timer_irq {
+            ArchTimer::Interrupts
+        } else {
+            ArchTimer::NoInterrupts {
+                clock_frequency: ArchTimer::PORTABLE_HZ,
+            }
+        },
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
