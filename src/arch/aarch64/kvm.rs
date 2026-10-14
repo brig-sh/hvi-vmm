@@ -886,11 +886,14 @@ fn set_baseline(vcpus: &[VcpuFd]) -> Result<(), String> {
 /// where the physical counter traps and reads the virtual one. Without it,
 /// `KVM_REG_ARM_TIMER_CNT` is written and the offset is measured around a
 /// read of it, to within the ioctl's time. Either way the result is checked
-/// against `KVM_REG_ARM_TIMER_CNT` once.
+/// against `KVM_REG_ARM_TIMER_CNT` once, and the boot refused when they
+/// disagree: every deadline, `NOW_NS` and the page's `base_counter` would
+/// then be wrong.
 ///
 /// # Errors
 ///
-/// Errors when KVM refuses the offset or the counter.
+/// Errors when KVM refuses the offset or the counter, and when the guest's
+/// counter is not where hvi computes it.
 fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd) -> Result<u64, String> {
     let (offset, how) = if kvm.check_extension(Cap::CounterOffset) {
         let offset = host_counter();
@@ -929,9 +932,11 @@ fn set_counter_offset(kvm: &Kvm, vm: &VmFd, vcpu: &VcpuFd) -> Result<u64, String
     let before = host_counter().wrapping_sub(offset);
     let guest = read_u64(vcpu, REG_TIMER_CNT).ok_or("KVM_REG_ARM_TIMER_CNT does not read")?;
     let after = host_counter().wrapping_sub(offset);
+    let slack = crate::checkpoint::profile::counter_freq_hz() / 1_000_000;
+    portable::check_guest_counter(guest, before, after, slack)
+        .map_err(|e| format!("the guest counter set with {how} is wrong: {e}"))?;
     eprintln!(
-        "{LOG_PREFIX} hvi-time: guest counter set with {how}; check: KVM_REG_ARM_TIMER_CNT {guest} within hvi's [{before}, {after}]: {}",
-        if (before..=after).contains(&guest) { "yes" } else { "NO" }
+        "{LOG_PREFIX} hvi-time: guest counter set with {how}; check: KVM_REG_ARM_TIMER_CNT {guest} within hvi's [{before}, {after}]: yes"
     );
     Ok(offset)
 }

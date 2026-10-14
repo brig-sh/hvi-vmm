@@ -266,6 +266,8 @@ it exactly:
   (`KVM_CAP_COUNTER_OFFSET`). The guest's counter is the host's `CNTVCT_EL0`
   less that offset. The boot checks it once against `KVM_REG_ARM_TIMER_CNT`
   (`0x603000000013df1a`); measured: `TIMER_CNT 115 within hvi's [81, 125]`.
+  A value more than 1 µs of ticks outside hvi's reads around it refuses the
+  boot, naming both, because every deadline and `NOW_NS` would be wrong.
   On a kernel without the capability, hvi writes `TIMER_CNT` and measures the
   offset around a read of it.
 
