@@ -53,6 +53,7 @@ use crate::arch::x86_64::layout::{
 };
 use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::mptable;
+use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::{
     device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform, UNKNOWN,
 };
@@ -525,6 +526,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         },
         net_source,
         profile,
+        Console::Com1 {
+            uart: Arc::clone(&shared.uart),
+            rtc: Arc::clone(&shared.rtc),
+        },
     )?;
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if std::env::var_os("HVI_X86_TRACE").is_some() {

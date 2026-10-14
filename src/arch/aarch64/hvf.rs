@@ -45,6 +45,8 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::arch::aarch64::profile::{self as arm64_profile, Arm64Machine};
+use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu;
 use crate::checkpoint::profile::{device, hex, MachineProfile, ProfileCell, UNKNOWN};
 use crate::checkpoint::server::ControlSocket;
 use crate::config::{check_export_overlap, BootConfig, Stop};
@@ -663,6 +665,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 Arc::clone(&shared.profile),
                 cfg.checkpoint_root.as_deref(),
             )
+            .map(|control| {
+                let console = Console::Pl011(Arc::clone(&shared.pl011));
+                control.capturing("hvf", cfg.disk.clone(), console)
+            })
         })
         .transpose()?;
 
@@ -879,8 +885,11 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         while sh.guest.vcpus.is_running() {
             // Safe point for every vCPU: park here while cpu0 lets a plugin
-            // look at the guest.
-            sh.guest.vcpus.checkpoint();
+            // look at the guest, or the control socket captures it, doing
+            // on this thread the work only it can.
+            sh.guest.vcpus.checkpoint_with(cpu_id, |work| {
+                cpu::serve_from_regs_view(GuestArch::Aarch64, "hvf", cpu_id, &vcpu, work)
+            });
             // The plugin runs on cpu0, between guest entries, because only this
             // thread can read this vCPU's registers. It is on the hot path:
             // with no plugin this is a null check.
