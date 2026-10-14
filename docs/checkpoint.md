@@ -411,8 +411,10 @@ A restore runs these steps, in this order:
    they are created, and the GIC blob may hold per-vCPU state by that
    number. Each one that ran parks at its first checkpoint. A secondary that
    was off waits for its `CPU_ON`, and one that was `pending_on` starts from
-   a refilled mailbox. The control thread then posts three import steps, and
-   waits for every vCPU between them:
+   a refilled mailbox. The control thread waits until every vCPU exists,
+   the ones that were off as well, and every one that ran or was
+   `pending_on` is parked. It then posts three import steps, and waits for
+   every vCPU between them:
    - **A.** Each vCPU loads its registers, SIMD registers, system
      registers and vtimer mask.
    - **B.** vCPU 0 loads the GIC from the blob with `hv_gic_set_state`. All
