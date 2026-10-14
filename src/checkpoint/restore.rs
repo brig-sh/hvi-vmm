@@ -213,7 +213,8 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
             profile.arch, profile.backend, can.backend
         ));
     }
-    if profile.vcpus == 0 || profile.vcpus as usize > MAX_VCPUS {
+    let vcpus_ok = profile.vcpus != 0 && profile.vcpus as usize <= MAX_VCPUS;
+    if !vcpus_ok {
         why.push(format!(
             "profile.json: {} vCPUs, a restore takes 1 to {MAX_VCPUS}",
             profile.vcpus
@@ -274,8 +275,12 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
             can.adjunct.unwrap_or_default()
         ));
     }
-    if let Err(e) = platform.check(profile.vcpus) {
-        why.push(format!("platform.json: {e}"));
+    // The check allocates by the count, so it runs only on one that is
+    // within bounds; the reason for one that is not is given above.
+    if vcpus_ok {
+        if let Err(e) = platform.check(profile.vcpus) {
+            why.push(format!("platform.json: {e}"));
+        }
     }
     for capability in &opened.bundle.manifest().capabilities {
         if !can.capabilities.contains(&capability.as_str()) {
@@ -880,6 +885,18 @@ pub(crate) mod tests {
             |_| {},
         );
         has(&reasons, &["65 vCPUs, a restore takes 1 to 64"]);
+        let reasons = refused(
+            "huge",
+            |p| {
+                p.profile.vcpus = u32::MAX;
+            },
+            |_| {},
+        );
+        has(&reasons, &["4294967295 vCPUs, a restore takes 1 to 64"]);
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("platform.json: irq")),
+            "the platform was checked against the count: {reasons:?}"
+        );
         let reasons = refused(
             "odd-region",
             |p| {
