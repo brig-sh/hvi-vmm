@@ -24,7 +24,7 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| At most four virtio-blk disks. | No hotplug, no PCI at all. | Design |
+| At most four virtio-blk disks. | No hotplug, no PCI at all. A checkpoint or a move carries one writable disk, see [Control socket](#control-socket). | Design |
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |
@@ -111,12 +111,14 @@ three things a reader should not have to guess between:
 | Writes through `GuestRam::memory()`, `host_ptr` or a mapping of the RAM's descriptor are not in guest RAM's dirty log. | Only the boot's loaders write through `memory()`, before any move. hvi's devices mark what they write through `host_ptr` with `mark_dirty`. A plugin gets the same `&GuestRam` from `VmHandle::ram` and `CpuHandle::ram`: its write accessors mark the log, but a plugin that writes through `host_ptr`, or maps `ram_fd`, must call `mark_dirty` after the write, or a live move misses it. | Design |
 | A live move's stream is not authenticated. | Each frame and the manifest carry SHA-256 hashes, which catch damage, not a forger who rewrites both. Send it over a channel that is, such as ssh. | Design |
 | A checkpoint needs `--checkpoint-root`. | Without it every `checkpoint` is refused. The bundle goes in a new or empty directory below the root, reached through no link. | Design |
+| A checkpoint or a move takes a guest of one writable disk. | The bundle, the dirty bitmap, `disk-dirty`, `disk-blocks`, the disk rounds, `--disk-base-sha256` and `restore --disk` all name one disk. `checkpoint`, `migrate`, `disk-dirty` and `disk-blocks` on a guest with a second disk, or whose only disk is read-only, are refused before anything pauses, and the profile check refuses either on either side. A guest with no disk moves as before. | Design |
+| A fenced source's block device stays claimed until it stops. | The fence releases the disk's lock, so a restore on the same host can open an image file at once, but a writable block device is also opened `O_EXCL`, which only the source's exit lets go. | Design |
 | A guest with virtio-fs shares cannot be checkpointed. | Its share is host descriptors and inode numbers that do not move. A `--fs socket=` export's state is in the caller's daemon, which writes guest RAM outside the dirty log. The checkpoint is refused before anything pauses. | Design |
 | The fence lives only as long as the process. | A fenced VM refuses `resume` until it stops. Nothing is written, so a caller that must survive a crash of the source records the fence itself. | Design |
 | A secondary that starts during a checkpoint fails it. | A secondary on HVF that takes its `CPU_ON` after the export's wait ended is neither off nor exported, so the capture replies `capture_failed` and the caller tries again. The window is the guest's own CPU bring-up, early in its boot. | Design |
 | A pause does not stop guest time. | The guest's counter keeps running while it is paused. On resume its clock has jumped by the pause, and timers that fell due fire at once. | Design |
 | One client at a time. | A connected client that sends nothing keeps the next one waiting in the backlog. | Design |
-| The socket has no authentication. | Anyone who can connect can pause or stop the VM. Its directory's permissions are the only control. | Design |
+| The socket has no authentication. | Anyone who can connect can pause or stop the VM, and, with a checkpoint root, read its disk with `disk-blocks`. Its directory's permissions are the only control. | Design |
 | A pause can find host input read but not yet delivered. | The console reader can hold one byte it read from the terminal, and the gateway relay the start of a frame whose rest has not arrived. Resume delivers both, so a pause loses nothing. A checkpoint taken then drops them: one keystroke, and one frame the guest's TCP sends again. | Design |
 | The virtio-fs readahead workers are not held by a pause. | They fill the share's read cache, not guest RAM. A guest with a share is never eligible to move anyway: its profile refuses every destination. | Design |
 | On macOS the profile file starts empty. | The boot vCPU writes it before the guest's first instruction, since only that thread can read `MIDR_EL1`. A reader that finds it empty waits, or asks the socket. | Platform |

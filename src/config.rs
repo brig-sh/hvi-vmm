@@ -579,6 +579,12 @@ fn check_serial(serial: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a boot with `--disk-base-sha256` must have exactly one disk, a writable
+/// one: the digest, the dirty bitmap and the disk rounds of a move all name
+/// one disk.
+pub const ONE_DISK_FOR_A_BASE: &str =
+    "--disk-base-sha256 needs exactly one --disk, a writable one: a move carries one disk";
+
 /// Refuses a disk list no backend can attach.
 ///
 /// Every caller's list passes here, the CLI's after it parsed the arguments and
@@ -628,6 +634,14 @@ pub struct BootConfig {
     /// them. The disk at index `N` answers `GET_ID` with its serial, or
     /// [`disk_serial`]`(N)` when it has none.
     pub disks: Vec<DiskConfig>,
+    /// The SHA-256 of the guest's one disk as this boot opens it, before
+    /// this hvi writes it, as 64 lowercase hex digits, which the machine
+    /// profile records (`disk_base_sha256`). hvi tracks only the writes it
+    /// serves from this boot on, so a disk that an earlier boot wrote needs a
+    /// new digest, or no flag. hvi does not hash the disk itself: whoever made
+    /// the image did, and keeps a copy, so a move can send only the blocks the
+    /// guest wrote. It needs exactly one disk in `disks`, a writable one.
+    pub disk_base_sha256: Option<String>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -763,6 +777,11 @@ impl BootConfig {
                 self.profile.name()
             ));
         }
+        if self.disk_base_sha256.is_some()
+            && !matches!(self.disks.as_slice(), [disk] if !disk.read_only)
+        {
+            return Err(ONE_DISK_FOR_A_BASE.into());
+        }
         Ok(())
     }
 
@@ -820,6 +839,13 @@ pub struct RestoreConfig {
     /// restored disk answers `GET_ID` with the serial the bundle records, so
     /// a `serial` here must be that one, and `read_only` is refused.
     pub disk: Option<DiskConfig>,
+    /// The `generation` of the `disk-dirty` reply that started the last
+    /// round of `disk-blocks` the mover applied onto its copy of the
+    /// guest's base image to make `disk`. `None` when the disk was copied
+    /// whole. With it, the restore refuses a disk.json with no base, or
+    /// captured at another generation: the guest wrote after that round,
+    /// and the disk lacks the write.
+    pub disk_generation: Option<u64>,
     /// The built-in network stack, for a guest that ran on it.
     pub net: bool,
     /// The gateway stream socket, for a guest that ran on a gateway.
@@ -1058,6 +1084,7 @@ mod tests {
             mem_bytes: 0,
             cmdline: String::new(),
             disks: Vec::new(),
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,

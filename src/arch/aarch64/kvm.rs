@@ -291,6 +291,7 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, boot: &VcpuFd) -> 
     // behind the dirty log, so a guest with one cannot move.
     p.fs_shares = u32::try_from(cfg.fs.len()).unwrap_or(u32::MAX);
     p.set_disks(&cfg.disks);
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 
@@ -630,7 +631,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     ram.register_kvm_slots(&vm)?;
 
     // Devices (same modules as the macOS backend).
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
+    let disks = Disk::place(
+        block::open_boot_disks(&cfg.disks, cfg.disk_base_sha256.is_some(), None)?,
+        virtio_blk_base,
+    );
     let mut net_source: Option<NetSource> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
         // urunc already created the tap and redirected the veth to it, so all

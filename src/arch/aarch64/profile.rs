@@ -131,6 +131,10 @@ pub(crate) fn restored(
     p.firmware
         .dtb_sha256
         .clone_from(&source.firmware.dtb_sha256);
+    // The disk the restore opens is the one the guest booted from with the
+    // guest's writes on it, and the restored device goes on from the
+    // blocks written since boot, so a later move needs the same base.
+    p.disk_base_sha256.clone_from(&source.disk_base_sha256);
     fill_profile_kind(&mut p, kind);
     p
 }
@@ -292,6 +296,7 @@ mod tests {
             mem_bytes: 512 << 20,
             cmdline: cmdline.into(),
             disks: Vec::new(),
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: true,

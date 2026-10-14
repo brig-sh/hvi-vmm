@@ -268,6 +268,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disks = Vec::new();
+    let mut disk_base_sha256 = None;
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares: Vec<config::FsShare> = Vec::new();
@@ -301,6 +302,20 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => push_disk(&mut disks, it.next())?,
+            // The digest of the disk as this boot opens it, before this hvi
+            // writes it, which the caller computed and keeps a copy of, so
+            // a move sends only what the guest wrote. hvi records it and
+            // does not check it.
+            "--disk-base-sha256" => {
+                let v = it.next().ok_or("--disk-base-sha256 needs a value")?;
+                if v.len() != 64 || !v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    return Err(format!(
+                        "--disk-base-sha256 must be 64 lowercase hex digits, not {v:?}"
+                    )
+                    .into());
+                }
+                disk_base_sha256 = Some(v.clone());
+            }
             // The old names of `uid=` and `gid=` on an `--fs path=` export.
             // They apply to every `--share-ro`/`--share-rw` export, which is
             // what they did when the identity was one per process. Kept
@@ -484,6 +499,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fs_shares[index].gid = fs_gid;
     }
 
+    if disk_base_sha256.is_some() && !matches!(disks.as_slice(), [disk] if !disk.read_only) {
+        return Err(config::ONE_DISK_FOR_A_BASE.into());
+    }
     if checkpoint_root.is_some() && control_sock.is_none() {
         return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
     }
@@ -505,6 +523,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: mem_mib << 20,
         cmdline,
         disks,
+        disk_base_sha256,
         fs_shares,
         fs,
         net,
@@ -536,10 +555,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Runs `restore`, which resumes a checkpoint bundle in this process.
 ///
-/// `restore (--from <bundle> | --from-stream <socket>|- [--stream-keep <dir>])
-/// --control-sock <path> --checkpoint-root <dir>
-/// [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac <mac>]
-/// [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
+/// `restore (--from <bundle> [--disk-generation <g>] | --from-stream
+/// <socket>|- [--stream-keep <dir>]) --control-sock <path> --checkpoint-root
+/// <dir> [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac
+/// <mac>] [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
 /// [--profile-out <path>] [--no-sandbox]`. The guest waits restored-paused
 /// until a client sends `resume` on the control socket.
 fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -549,6 +568,7 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut control_sock = None;
     let mut checkpoint_root = None;
     let mut disk = None;
+    let mut disk_generation = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_mac = None;
@@ -574,6 +594,13 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("restore takes one --disk: a checkpoint carries one disk".into());
             }
             "--disk" => disk = Some(config::DiskConfig::parse(&value("--disk")?)?),
+            "--disk-generation" => {
+                let v = value("--disk-generation")?;
+                disk_generation = Some(
+                    v.parse()
+                        .map_err(|_| format!("--disk-generation is not a generation: {v}"))?,
+                );
+            }
             "--net-stub" => net = true,
             "--net-gateway" => net_gateway = Some(value("--net-gateway")?),
             "--net-mac" => {
@@ -623,6 +650,7 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             checkpoint_root.ok_or("restore needs --checkpoint-root, as the next move does")?,
         ),
         disk,
+        disk_generation,
         net,
         net_gateway,
         net_mac,
