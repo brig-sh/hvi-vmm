@@ -96,6 +96,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "linux-loader",
+ "lz4_flex",
  "seccompiler",
  "serde",
  "serde_json",
@@ -147,6 +148,12 @@ checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
 dependencies = [
  "vm-memory",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "memchr"
