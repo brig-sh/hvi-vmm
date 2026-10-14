@@ -67,6 +67,11 @@ rule for `file-ioctl` on `/dev/tty`, plus one rule per virtio-fs export by
 resolved root path: `file-read*` for a read-only share, `file-read* file-write*`
 for a writable one.
 
+A run started with `--checkpoint-root` adds one more subtree rule,
+`file-read* file-write*` below the resolved root, so the control socket's
+thread can write checkpoint bundles there. The whole process gets it, as with an
+export. Nothing else outside the exports can be written.
+
 A writable export adds one more: `system-fsctl` for the single command
 `FSIOC_SYNC_VOLUME`, which is how SYNCFS writes out the export's volume
 (`sync_volume_np(3)`). It is a command filter, not a path filter, so the
@@ -80,13 +85,14 @@ touches guest data unconfined.
 
 ### Linux: seccomp-bpf
 
-Two allowlists per architecture, in `resources/seccomp/`, installed per
+Three allowlists per architecture, in `resources/seccomp/`, installed per
 thread as that thread's first act:
 
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
 | `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
+| `control` | the control socket's thread, in a run started with `--checkpoint-root` | 57 syscalls | 64 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -95,8 +101,12 @@ that first run has the sandbox off, the thread starts unfiltered, and installs
 the filter the first time a stop signal wakes it in a later run with the sandbox
 on.
 
-`vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
-action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
+`vcpu` is a strict subset of `vmm`, checked by a test. `control` is `vmm` plus
+the file calls a checkpoint bundle needs (`openat`, `mkdirat`, `renameat`,
+`unlinkat`, the `stat` family, `getdents64`, `readlinkat`), also checked by a
+test. That thread parses the control protocol, never guest data, and without a
+checkpoint root it installs `vmm` like the other I/O threads. All three use a
+default action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
 
 The two architecture files are not generated from one source. `poll` is the
