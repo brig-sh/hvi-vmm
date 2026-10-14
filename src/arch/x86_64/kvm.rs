@@ -520,7 +520,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // filters need. Each polls its stop token beside its own descriptor and is
     // joined after the vCPUs; `teardown` describes the stop.
     let (filters, mut io_threads) = start_io_threads(
-        &cfg,
+        &(&cfg).into(),
         &shared.guest,
         {
             let uart = Arc::clone(&shared.uart);

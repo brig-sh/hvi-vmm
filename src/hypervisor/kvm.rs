@@ -161,6 +161,41 @@ impl Drop for Registration<'_> {
     }
 }
 
+/// What [`start_io_threads`] needs of a boot's or a restore's
+/// configuration.
+pub(crate) struct IoConfig<'a> {
+    /// The plugin, which attaches before anything runs.
+    pub(crate) plugin: Option<Arc<dyn Plugin>>,
+    /// Whether to confine the threads.
+    pub(crate) sandbox: bool,
+    /// The agent socket to bind.
+    pub(crate) agent_sock: Option<&'a str>,
+    /// The control socket to bind.
+    pub(crate) control_sock: Option<&'a str>,
+    /// The checkpoint root of the control socket.
+    pub(crate) checkpoint_root: Option<&'a str>,
+    /// The disk path a capture records.
+    pub(crate) disk: Option<String>,
+    /// Whether the guest is one `hvi restore` built: the I/O threads start
+    /// held at the gate, and the control socket reports the VM
+    /// restored-paused until a client resumes it.
+    pub(crate) restored: bool,
+}
+
+impl<'a> From<&'a BootConfig> for IoConfig<'a> {
+    fn from(cfg: &'a BootConfig) -> Self {
+        Self {
+            plugin: cfg.plugin.clone(),
+            sandbox: cfg.sandbox,
+            agent_sock: cfg.agent_sock.as_deref(),
+            control_sock: cfg.control_sock.as_deref(),
+            checkpoint_root: cfg.checkpoint_root.as_deref(),
+            disk: cfg.disk.clone(),
+            restored: false,
+        }
+    }
+}
+
 /// Starts what runs beside a KVM backend's vCPUs, in the order its seccomp
 /// confinement needs.
 ///
@@ -177,7 +212,7 @@ impl Drop for Registration<'_> {
 /// Errors if the plugin refuses the guest, a filter does not compile, a socket
 /// cannot be bound or the stop source cannot be created.
 pub(crate) fn start_io_threads(
-    cfg: &BootConfig,
+    cfg: &IoConfig<'_>,
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
@@ -188,7 +223,7 @@ pub(crate) fn start_io_threads(
         plugin.attach(Arc::clone(guest) as Arc<dyn VmHandle>)?;
     }
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
-    let bridge = match (&cfg.agent_sock, &guest.vsock) {
+    let bridge = match (cfg.agent_sock, &guest.vsock) {
         (Some(path), Some(dev)) => Some(VsockBridge::bind(
             path,
             Arc::clone(dev),
@@ -198,13 +233,25 @@ pub(crate) fn start_io_threads(
     };
     let control = cfg
         .control_sock
-        .as_deref()
         .map(|path| {
-            ControlSocket::bind(path, profile, cfg.checkpoint_root.as_deref())
-                .map(|control| control.capturing("kvm", cfg.disk.clone(), console))
+            ControlSocket::bind(path, profile, cfg.checkpoint_root).map(|control| {
+                let control = control.capturing("kvm", cfg.disk.clone(), console);
+                if cfg.restored {
+                    control.restored()
+                } else {
+                    control
+                }
+            })
         })
         .transpose()?;
     let source = StopSource::new()?;
+    if cfg.restored {
+        // No I/O thread runs, so nothing is inside the gate.
+        source
+            .gate()
+            .pause(std::time::Duration::ZERO)
+            .map_err(|inside| format!("{inside} I/O thread(s) inside the gate before any ran"))?;
+    }
     let io_threads = IoThreads::start(
         source,
         guest,

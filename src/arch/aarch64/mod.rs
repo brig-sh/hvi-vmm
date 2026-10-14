@@ -29,6 +29,7 @@ pub mod layout;
 pub mod loader;
 pub mod portable;
 pub(crate) mod profile;
+pub(crate) mod rebuild;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod hvf;

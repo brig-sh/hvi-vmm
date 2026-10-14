@@ -63,11 +63,14 @@ pub(crate) const LOG_PREFIX: &str = "[hvi]";
 // `boot(config::BootConfig) -> Result<config::Stop, _>`, and only one compiles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use arch::aarch64::hvf::boot;
-// Only HVF restores a checkpoint so far; see `checkpoint::restore`.
+// Each arm64 backend also exposes `restore(config::RestoreConfig)`; the
+// x86-64 one has none yet. See `checkpoint::restore`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use arch::aarch64::hvf::restore;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub use arch::aarch64::kvm::boot;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub use arch::aarch64::kvm::restore;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use arch::x86_64::kvm::boot;
 #[cfg(not(any(
