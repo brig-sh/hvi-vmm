@@ -47,7 +47,7 @@ including a typo, silently runs the plain test.
 | `--mem-mib <N>` | 512 | Guest RAM. On x86-64 it is split around the MMIO hole. |
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
-| `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
+| `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot, and so does a disk another process holds locked: hvi holds an exclusive `flock` on its disk (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
 | `--fs tag=<tag>,path=<dir>[,readonly=on\|off][,cache=auto\|always\|none][,uid=<n>][,gid=<n>]` | none | virtio-fs export of `<dir>`, which hvi serves itself. Writable unless `readonly=on`; `cache` defaults to `auto`; `uid` and `gid` are the guest owner of the host user's files, 0 by default. Repeatable. macOS only. |
 | `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. Cloud Hypervisor's syntax and defaults: one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable. Linux only. |
 | `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
@@ -205,7 +205,7 @@ before it creates anything, and otherwise brings the guest up
 | `--from <dir>` | required | The bundle directory. |
 | `--control-sock <path>` | required | The control socket, as for `boot`. The guest waits on it for `resume`, so a restore without one could never run. |
 | `--checkpoint-root <dir>` | required | The directory a later `checkpoint` of the restored guest writes below, as for `boot`. |
-| `--disk <path>` | none | The disk to reopen for the guest's virtio-blk. Required when the guest had a disk, refused when it had none. It must be the size the guest was given. |
+| `--disk <path>` | none | The disk to reopen for the guest's virtio-blk. Required when the guest had a disk, refused when it had none. It must be the size the guest was given, and no other process may hold it locked: a second restore onto the disk of a running guest fails (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
 | `--net-stub` | off | The built-in stack, for a guest that ran on it. |
 | `--net-gateway <socket>` | none | The gateway, for a guest that ran on one. Unlike `boot`, a gateway that cannot be reached is an error, not a fallback to the stub. |
 | `--net-mac <mac>` | none | Optional: the bundle holds the MAC. One given here must be that MAC. |
