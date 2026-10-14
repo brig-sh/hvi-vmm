@@ -16,8 +16,9 @@ its canonical form (the software model on the Mac, the vGICv2 on the Pi, see
 [Capture and restore on KVM](#capture-and-restore-on-kvm)) and `hvi-time`'s
 state ([Restore](#restore)). `hvi restore` takes a portable bundle of either
 backend on either (see [checkpoint.md](checkpoint.md#the-portable-restore)).
-A restore on the host that took the bundle has been run on both; a move
-between the two has not been run yet. The x86-64 KVM backend refuses the
+A restore on the host that took the bundle has been run on both, and a
+guest has been moved from the Mac to a Pi and from a Pi to the Mac once
+each (see [checkpoint.md](checkpoint.md#moving-between-hosts)). The x86-64 KVM backend refuses the
 profile.
 
 The default, `--profile native`, is unchanged: the host's own CPU features and,
@@ -564,9 +565,8 @@ console path's latency makes the guest look further behind than it is.
   can be lowered to the baseline, a 40-bit guest address space,
   `KVM_CAP_READONLY_MEM`, and 4 KiB or 16 KiB pages. hvi refuses the boot and
   names each problem.
-- A restore has been run on the host that took the bundle, on the Mac and on
-  a Pi 5. A move between the two has not been run yet, so a change of
-  counter rate across a restore is tested only in unit tests.
+- A move between a Mac and a Pi has been run once each way, by hand; the
+  end-to-end script runs on one host only.
 - A guest booted with `--arch-timer-irq` is checkpointed like any other,
   but its architected timer's line is not carried by the restore; that
   debugging flag is not tested with checkpoints.
