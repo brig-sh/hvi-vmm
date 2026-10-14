@@ -546,7 +546,11 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let virtio = match (&cfg.disk, &states.blk) {
         (Some(path), Some(state)) => {
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::restore(path, &ram, state)?)))
+            // The refusals made sure disk.json is there.
+            let generation = opened.disk.as_ref().map_or(0, |d| d.generation);
+            Some(Arc::new(Mutex::new(VirtioBlk::restore(
+                path, &ram, state, generation,
+            )?)))
         }
         _ => None,
     };

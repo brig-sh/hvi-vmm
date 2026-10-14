@@ -345,8 +345,9 @@ pub struct DiskState {
     /// The SHA-256 of the whole image, when whoever moves the disk computed
     /// it; hvi writes `null`.
     pub sha256_sparse: Option<String>,
-    /// The writes and flushes the guest made since boot, so two captures of
-    /// one run can tell whether the disk changed between them.
+    /// The writes and flushes the guest made since boot, over every restore
+    /// of it, so two captures of one guest can tell whether the disk changed
+    /// between them.
     pub generation: u64,
     /// Whether the disk was synced to stable storage before the capture.
     pub synced: bool,
