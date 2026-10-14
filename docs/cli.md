@@ -17,7 +17,7 @@ not apply returns a named error rather than "unknown subcommand".
 | Subcommand | Where it works | What it does |
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
-| `restore` | macOS, Apple silicon; arm64 Linux with KVM | Resume a checkpoint bundle in this process. See [`restore`](#restore). On KVM it restores the portable profile only. On x86-64 Linux it returns an error: that restore is not built yet. |
+| `restore` | macOS, Apple silicon; arm64 Linux with KVM | Resume a checkpoint bundle, or the stream of a live move, in this process. See [`restore`](#restore). On KVM it restores the portable profile only. On x86-64 Linux it returns an error: that restore is not built yet. |
 | `checkpoint-verify <dir>` | everywhere | Check a checkpoint bundle whole and print what it holds. Exits 1, naming the file, on the first mismatch. See [checkpoint.md](checkpoint.md#checking-a-bundle). |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
 | `smoke` | macOS, Apple silicon | The Hypervisor.framework smoke test. `--shm` runs it over shared guest RAM. |
@@ -194,11 +194,15 @@ and each reply is one line:
 | `status` | Replies with `state` (`running`, `paused`, `restored-paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. `restored-paused` is a guest `hvi restore` loaded that has not run yet; `resume` runs it, as from `paused`. |
 | `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
 | `checkpoint` | Captures the VM into a new bundle directory below `--checkpoint-root`, then resumes it or fences it. See [checkpoint.md](checkpoint.md#taking-a-checkpoint). |
+| `migrate` | Streams the VM on this connection: its RAM in rounds while the guest runs, then the last round and its state paused, then resumes it or fences it. Takes `then`, `txid` and `epoch` as `checkpoint` does, and optionally `max_rounds` (1 to 16, default 5) and `max_secs` (0 to 3600, default 60). Needs no `--checkpoint-root`. See [checkpoint.md](checkpoint.md#live-moves). |
 
 `pause` and `resume` are idempotent. A pause outlives the connection that asked
-for it. Apart from `checkpoint`, no reply takes longer than about 2 s, so give a
-client a reply timeout of at least 3 s. A `checkpoint` replies once its bundle
-is written, which takes longer the more guest RAM is in use. A client that gives up on a `pause` before its reply cannot
+for it. Apart from `checkpoint` and `migrate`, no reply takes longer than about
+2 s, so give a client a reply timeout of at least 3 s. A `checkpoint` replies
+once its bundle is written, which takes longer the more guest RAM is in use. A
+`migrate` writes its stream before its reply, as fast as the client reads it,
+for up to `max_secs` with the guest running and then the paused part, so its
+client reads the frames and waits for the reply with no fixed timeout. A client that gives up on a `pause` before its reply cannot
 tell whether the VM paused: it should reconnect and ask `status`, or send
 `resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
 `code`; `error` is for a person. The codes are listed in
@@ -219,7 +223,9 @@ before the guest's first instruction, since only that thread can read
 ## `restore`
 
 `restore --from <dir> --control-sock <path> --checkpoint-root <dir> [flags]`
-resumes the checkpoint bundle in `<dir>` in this process, on a host whose
+resumes the checkpoint bundle in `<dir>` in this process, and
+`restore --from-stream <socket>|- [--stream-keep <dir>] --control-sock <path> --checkpoint-root <dir> [flags]`
+resumes the streamed bundle a `migrate` writes, on a host whose
 machine profile matches the bundle's. It refuses with every reason it finds
 before it creates anything, and otherwise brings the guest up
 `restored-paused` on the control socket. The guest runs once a client sends
@@ -227,7 +233,9 @@ before it creates anything, and otherwise brings the guest up
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--from <dir>` | required | The bundle directory. |
+| `--from <dir>` | one of the two | The bundle directory. |
+| `--from-stream <socket>\|-` | one of the two | The streamed bundle: `-` reads it from stdin, anything else is a Unix socket hvi connects to before confinement and reads it from. RAM is applied as it arrives and never reaches disk; the documents are checked once the manifest is in, before anything runs. Stdin that carried a stream is replaced with `/dev/null` afterwards, so the console reads nothing that followed it. See [checkpoint.md](checkpoint.md#restoring-a-stream). |
+| `--stream-keep <dir>` | none | With `--from-stream`: a new directory the stream's documents and manifest are written to as they came, without RAM, as the record of what was restored. They are not synced. |
 | `--control-sock <path>` | required | The control socket, as for `boot`. The guest waits on it for `resume`, so a restore without one could never run. |
 | `--checkpoint-root <dir>` | required | The directory a later `checkpoint` of the restored guest writes below, as for `boot`. |
 | `--disk <path>` | none | The disk to reopen for the guest's virtio-blk. Required when the guest had a disk, refused when it had none. It must be the size the guest was given, and no other process may hold it locked: a second restore onto the disk of a running guest fails (see [checkpoint.md](checkpoint.md#the-disk-lock)). |

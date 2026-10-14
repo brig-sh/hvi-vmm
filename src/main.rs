@@ -525,13 +525,16 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Runs `restore`, which resumes a checkpoint bundle in this process.
 ///
-/// `restore --from <bundle> --control-sock <path> --checkpoint-root <dir>
+/// `restore (--from <bundle> | --from-stream <socket>|- [--stream-keep <dir>])
+/// --control-sock <path> --checkpoint-root <dir>
 /// [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac <mac>]
 /// [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
 /// [--profile-out <path>] [--no-sandbox]`. The guest waits restored-paused
 /// until a client sends `resume` on the control socket.
 fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut from = None;
+    let mut from_stream = None;
+    let mut stream_keep = None;
     let mut control_sock = None;
     let mut checkpoint_root = None;
     let mut disk = None;
@@ -552,6 +555,8 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         };
         match a.as_str() {
             "--from" => from = Some(value("--from")?),
+            "--from-stream" => from_stream = Some(value("--from-stream")?),
+            "--stream-keep" => stream_keep = Some(value("--stream-keep")?),
             "--control-sock" => control_sock = Some(value("--control-sock")?),
             "--checkpoint-root" => checkpoint_root = Some(value("--checkpoint-root")?),
             "--disk" => disk = Some(value("--disk")?),
@@ -572,8 +577,25 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown restore arg {other:?}").into()),
         }
     }
+    let from = match (from, &from_stream) {
+        (Some(_), Some(_)) => {
+            return Err("restore takes --from or --from-stream, not both".into());
+        }
+        (Some(dir), None) => dir,
+        (None, Some(stream)) => format!("stream {stream}"),
+        (None, None) => {
+            return Err(
+                "restore needs --from <bundle directory> or --from-stream <socket>|-".into(),
+            )
+        }
+    };
+    if stream_keep.is_some() && from_stream.is_none() {
+        return Err("--stream-keep goes with --from-stream".into());
+    }
     let cfg = config::RestoreConfig {
-        from: from.ok_or("restore needs --from <bundle directory>")?,
+        from,
+        from_stream,
+        stream_keep,
         // The guest waits for `resume` on it, so a restore without one could
         // never run.
         control_sock: control_sock.ok_or("restore needs --control-sock, which resumes it")?,

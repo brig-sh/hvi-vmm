@@ -21,12 +21,17 @@
 //! memory. A tool that received the object's descriptor maps it read-only as a
 //! [`GuestRamView`]. A `GuestRam` dereferences to the view, so code written
 //! against the view runs on either. [`RamRegion`] describes one region: where
-//! it sits in the guest and in the object.
+//! it sits in the guest and in the object. [`DirtyLog`] and [`DirtyPages`]
+//! record which pages were written, for a move that copies RAM while the
+//! guest runs.
 
+mod dirty;
 mod guest;
 mod region;
 mod shared;
 
+pub(crate) use dirty::GuestWriteLog;
+pub use dirty::{DirtyLog, DirtyPages, DIRTY_PAGE};
 pub use guest::{GuestRam, GuestRamView};
 pub use region::RamRegion;
 pub use shared::SharedRam;
