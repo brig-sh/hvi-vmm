@@ -124,6 +124,7 @@ mod tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disk: None,
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,

@@ -336,6 +336,7 @@ fn boot_profile(
         p.firmware.boot_params_sha256 = Some(sha256_hex(&page));
     }
     p.agent_sock = cfg.agent_sock.is_some();
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 
@@ -1098,6 +1099,7 @@ mod vcpu_cap_tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disk: None,
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,

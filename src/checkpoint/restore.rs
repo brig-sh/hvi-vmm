@@ -953,6 +953,10 @@ pub(crate) mod tests {
                 sha256_sparse: None,
                 generation: 0,
                 synced: true,
+                base_sha256: None,
+                block_size: None,
+                dirty_since_boot_b64: None,
+                rounds: Vec::new(),
             }),
             states: DeviceStates {
                 blk: Some(blk),

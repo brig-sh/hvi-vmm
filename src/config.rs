@@ -193,6 +193,12 @@ pub struct BootConfig {
     pub mem_bytes: u64,
     pub cmdline: String,
     pub disk: Option<String>,
+    /// The SHA-256 of `disk` as it was before the guest first booted from
+    /// it, as 64 lowercase hex digits, which the machine profile records
+    /// (`disk_base_sha256`). hvi does not hash the disk itself: whoever
+    /// made the image did, and keeps a copy, so a move can send only the
+    /// blocks the guest wrote. It needs `disk`.
+    pub disk_base_sha256: Option<String>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -600,6 +606,7 @@ mod tests {
             mem_bytes: 0,
             cmdline: String::new(),
             disk: None,
+            disk_base_sha256: None,
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,
