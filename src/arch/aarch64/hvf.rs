@@ -2187,7 +2187,7 @@ fn service_gic(
     if out.wake != 0 {
         sh.guest.vcpus.kicker().wake_mask(out.wake);
     }
-    if out.eoi == Some(VTIMER_INTID) {
+    if out.deactivated == Some(VTIMER_INTID) {
         end_vtimer_interrupt(vcpu, p, cpu, vtimer);
     }
 }
