@@ -69,9 +69,10 @@ use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, Kicker, KvmIrqLine,
 };
+use crate::hypervisor::kvm_dirty::KvmWriteLog;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::NetSource;
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView};
 use crate::sandbox::confine_io_thread;
 use crate::signal::install_kick_handler;
@@ -486,6 +487,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     profile.complete(|_| {})?;
 
     let vm = Arc::new(vm);
+    // A live move reads KVM's dirty log of the RAM slots.
+    let write_log: Arc<dyn GuestWriteLog> =
+        Arc::new(KvmWriteLog::new(Arc::clone(&vm), Arc::clone(&ram)));
     let shared = Shared {
         guest: Arc::new(Guest {
             arch: GuestArch::X86_64,
@@ -500,7 +504,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
-            write_log: None,
+            write_log: Some(write_log),
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),

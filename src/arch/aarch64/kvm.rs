@@ -88,9 +88,10 @@ use crate::hypervisor::guest::{Guest, VcpuRegs};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, IoConfig, Kicker, KvmIrqLine,
 };
+use crate::hypervisor::kvm_dirty::KvmWriteLog;
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::NetSource;
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::sandbox::seccomp;
 use crate::signal::install_kick_handler;
@@ -836,6 +837,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     set_u64(&vcpus[0], REG_X0, layout.dtb_addr);
     set_u64(&vcpus[0], REG_PSTATE, PSTATE_EL1H_DAIF);
 
+    // A live move reads KVM's dirty log of the RAM slots.
+    let write_log: Arc<dyn GuestWriteLog> =
+        Arc::new(KvmWriteLog::new(Arc::clone(&vm), Arc::clone(&ram)));
     let shared = Shared {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -847,7 +851,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
-            write_log: None,
+            write_log: Some(write_log),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
         plugin: cfg.plugin.clone(),
@@ -1198,6 +1202,9 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| opened.session.sandbox_id.clone());
     let emitter = Emitter::new(cfg.events.as_deref(), &sandbox_id)?;
+    // A live move reads KVM's dirty log of the RAM slots.
+    let write_log: Arc<dyn GuestWriteLog> =
+        Arc::new(KvmWriteLog::new(Arc::clone(&vm), Arc::clone(&ram)));
     let shared = Shared {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -1209,7 +1216,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
-            write_log: None,
+            write_log: Some(write_log),
         }),
         pl011,
         plugin: None,
