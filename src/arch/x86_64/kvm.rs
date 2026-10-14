@@ -146,6 +146,24 @@ const PROFILE_LEAVES: [(u32, u32); 6] = [
     (0x8000_0001, 0),
 ];
 
+/// Writes `id` into `cpuid` as the CPU's APIC ID: bits 31:24 of leaf 1 EBX and
+/// the x2APIC ID in EDX of every subleaf of 0xb and 0x1f.
+///
+/// `KVM_GET_SUPPORTED_CPUID` passes through the APIC ID of whichever host CPU
+/// the calling thread happened to run on. Left as it is, every guest CPU reads
+/// the same foreign ID, not the one KVM's local APIC and the MP table give it,
+/// and two boots of one configuration record different profiles, so no x86
+/// guest could ever be restored, even on the host it came from.
+fn set_apic_id(cpuid: &mut [kvm_bindings::kvm_cpuid_entry2], id: u32) {
+    for e in cpuid {
+        match e.function {
+            1 => e.ebx = (e.ebx & 0x00ff_ffff) | ((id & 0xff) << 24),
+            0xb | 0x1f => e.edx = id,
+            _ => {}
+        }
+    }
+}
+
 /// Returns the CPU's identity from `cpuid` as the guest reads it: the vendor
 /// string and the display family, model and stepping.
 fn cpu_ident(cpuid: &[kvm_bindings::kvm_cpuid_entry2]) -> Option<String> {
@@ -180,8 +198,9 @@ fn cpu_ident(cpuid: &[kvm_bindings::kvm_cpuid_entry2]) -> Option<String> {
 
 /// Returns the machine profile of this boot.
 ///
-/// `cpuid` is the table every vCPU was given, the guest's view rather than the
-/// host's. The counter is the TSC, at the rate KVM gives the boot vCPU.
+/// `cpuid` is the table vCPU 0 was given, the guest's view rather than the
+/// host's. The others differ only in their APIC ID. The counter is the TSC, at
+/// the rate KVM gives the boot vCPU.
 fn boot_profile(
     cfg: &BootConfig,
     ram: &GuestRam,
@@ -411,7 +430,9 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     // detection — without it early boot faults). We ensure RDRAND (leaf 1 ECX
     // bit 30) and RDSEED (leaf 7 EBX bit 18) are advertised so the guest's
     // early KASLR/entropy path has a source (the host must support them).
-    // The BSP enters in long mode; APs wait for the guest's SIPI.
+    // Each vCPU's copy carries its own APIC ID, and `cpuid` is left as vCPU
+    // 0's for the profile. The BSP enters in long mode; APs wait for the
+    // guest's SIPI.
     let mut cpuid = kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?;
     for e in cpuid.as_mut_slice() {
         match e.function {
@@ -420,11 +441,14 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+    set_apic_id(cpuid.as_mut_slice(), 0);
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
     let mut kick_handles = Vec::with_capacity(num_cpus as usize);
     for id in 0..num_cpus {
         let vcpu = vm.create_vcpu(u64::from(id))?;
-        vcpu.set_cpuid2(&cpuid)?;
+        let mut own = cpuid.clone();
+        set_apic_id(own.as_mut_slice(), id);
+        vcpu.set_cpuid2(&own)?;
         if id == 0 {
             setup_long_mode(&vcpu, kernel.entry, kernel.zero_page_addr)?;
         }
@@ -1024,7 +1048,7 @@ mod pio_tests {
 
 #[cfg(test)]
 mod profile_tests {
-    use super::cpu_ident;
+    use super::{cpu_ident, set_apic_id};
     use kvm_bindings::kvm_cpuid_entry2;
 
     fn leaf(function: u32, eax: u32, ebx: u32, ecx: u32, edx: u32) -> kvm_cpuid_entry2 {
@@ -1038,9 +1062,6 @@ mod profile_tests {
         }
     }
 
-    // The display model folds in the extended model for families 6 and 15,
-    // and the display family the extended family for 15 alone. A Skylake
-    // server reports 0x50657: family 6, model 0x55, stepping 7.
     /// Returns leaf 0 for `vendor`, whose twelve bytes CPUID spreads over
     /// EBX, EDX and ECX in that order.
     fn vendor_leaf(vendor: &[u8; 12]) -> kvm_cpuid_entry2 {
@@ -1049,6 +1070,36 @@ mod profile_tests {
         leaf(0, 0x10, word(0), word(8), word(4))
     }
 
+    // KVM hands back the APIC ID of the host CPU the boot thread ran on. Two
+    // boots on different host CPUs must still give the guest, and the profile,
+    // the same table, and each vCPU must read its own ID.
+    #[test]
+    fn each_vcpu_reads_its_own_apic_id_whatever_host_cpu_booted_it() {
+        let host = |apic: u32| {
+            vec![
+                leaf(1, 0x0005_0657, (apic << 24) | 0x0040_0800, 0x7ffa_fbff, 0),
+                kvm_cpuid_entry2 {
+                    index: 1,
+                    ..leaf(0xb, 1, 2, 0x201, apic)
+                },
+                leaf(7, 0, 0x1234, 0, 0),
+            ]
+        };
+        let (mut a, mut b) = (host(0x55), host(0x72));
+        set_apic_id(&mut a, 0);
+        set_apic_id(&mut b, 0);
+        assert_eq!(a, b);
+        assert_eq!(a[0].ebx, 0x0040_0800, "only the APIC ID byte changes");
+        let mut cpu3 = host(0x55);
+        set_apic_id(&mut cpu3, 3);
+        assert_eq!(cpu3[0].ebx >> 24, 3);
+        assert_eq!(cpu3[1].edx, 3);
+        assert_eq!(cpu3[2], a[2]);
+    }
+
+    // The display model folds in the extended model for families 6 and 15,
+    // and the display family the extended family for 15 alone. A Skylake
+    // server reports 0x50657: family 6, model 0x55, stepping 7.
     #[test]
     fn the_identity_is_vendor_family_model_stepping() {
         let table = [vendor_leaf(b"GenuineIntel"), leaf(1, 0x0005_0657, 0, 0, 0)];
