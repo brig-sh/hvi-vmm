@@ -70,7 +70,9 @@ use crate::devices::legacy::pl011::Pl011State;
 use crate::devices::legacy::rtc_cmos::RtcState;
 use crate::devices::legacy::uart16550::UartState;
 use crate::devices::state::DeviceStates;
-use crate::devices::virtio::block::{BlkState, DirtyBlocks, DiskRound, DIRTY_BLOCK_BYTES};
+use crate::devices::virtio::block::{
+    BlkState, DirtyBlocks, DiskRound, DIRTY_BLOCK_BYTES, MAX_ROUNDS,
+};
 use crate::devices::virtio::net::NetState;
 use crate::devices::virtio::vsock::VsockState;
 use crate::memory::{GuestRam, GuestRamView};
@@ -169,9 +171,10 @@ impl Component {
             Component::RamBin => MAX_COMPONENT_BYTES,
             Component::Cpu | Component::Platform => 16 << 20,
             Component::Devices => 256 << 20,
-            // The bitmap of blocks written since boot, as base64: 8 MiB is
-            // a disk of 3 TiB.
-            Component::Disk => 8 << 20,
+            // The bitmap of blocks written since boot, as base64: the
+            // bitmap of a 4 TiB disk, MAX_BITMAP_DISK_BYTES, is 11,184,812
+            // characters, and MAX_ROUNDS rounds and the path take the rest.
+            Component::Disk => 12 << 20,
             Component::Session => 64 << 10,
         }
     }
@@ -399,6 +402,17 @@ impl DiskState {
                 "base_sha256 is {}, and profile.json records {}",
                 self.base_sha256.as_deref().unwrap_or("null"),
                 profile.disk_base_sha256.as_deref().unwrap_or("null")
+            ));
+        }
+        if self.base_sha256.is_some() && self.dirty_since_boot_b64.is_none() {
+            return Err(
+                "base_sha256 needs dirty_since_boot_b64, the blocks written since boot".into(),
+            );
+        }
+        if self.rounds.len() > MAX_ROUNDS + 1 {
+            return Err(format!(
+                "rounds lists {} rounds, at most round 0 and {MAX_ROUNDS} more",
+                self.rounds.len()
             ));
         }
         let mut generation = 0;
@@ -1593,9 +1607,27 @@ mod tests {
 
     /// Writes a whole bundle of [`guest`] to `dir`, with a disk when `disk`.
     fn write(dir: &Path, disk: bool) -> Sealed {
+        let disk = disk.then(|| DiskState {
+            version: DOC_VERSION,
+            path_hint: "/disk.img".into(),
+            size_bytes: 1 << 30,
+            sha256_sparse: None,
+            generation: 7,
+            synced: true,
+            base_sha256: None,
+            block_size: None,
+            dirty_since_boot_b64: None,
+            rounds: Vec::new(),
+        });
+        write_with(dir, &profile(), disk.as_ref())
+    }
+
+    /// Writes a whole bundle of [`guest`] to `dir` with `profile` and the
+    /// disk `disk`.
+    fn write_with(dir: &Path, profile: &MachineProfile, disk: Option<&DiskState>) -> Sealed {
         let ram = guest();
         let mut w = BundleWriter::create(dir).unwrap();
-        w.write_bytes(Component::Profile, profile().to_json().as_bytes())
+        w.write_bytes(Component::Profile, profile.to_json().as_bytes())
             .unwrap();
         w.write_ram(&ram, &|| false).unwrap();
         let vcpu = VcpuState::from_regs_view(GuestArch::Aarch64, "hvf", 0, &RegsView::default());
@@ -1615,23 +1647,8 @@ mod tests {
         };
         w.write_bytes(Component::Devices, &devices.to_json().unwrap())
             .unwrap();
-        if disk {
-            w.write_json(
-                Component::Disk,
-                &DiskState {
-                    version: DOC_VERSION,
-                    path_hint: "/disk.img".into(),
-                    size_bytes: 1 << 30,
-                    sha256_sparse: None,
-                    generation: 7,
-                    synced: true,
-                    base_sha256: None,
-                    block_size: None,
-                    dirty_since_boot_b64: None,
-                    rounds: Vec::new(),
-                },
-            )
-            .unwrap();
+        if let Some(disk) = disk {
+            w.write_json(Component::Disk, disk).unwrap();
         }
         w.write_json(
             Component::Session,
@@ -2243,5 +2260,75 @@ mod tests {
         assert!(e.contains("past the 10 blocks"), "{e}");
         let e = refused(&|d| d.dirty_since_boot_b64 = Some("!!!!".into()), &p);
         assert!(e.contains("not base64"), "{e}");
+        // A base the restored guest could not go on from: no bitmap.
+        let e = refused(
+            &|d| {
+                d.block_size = None;
+                d.dirty_since_boot_b64 = None;
+            },
+            &p,
+        );
+        assert!(e.contains("base_sha256 needs dirty_since_boot_b64"), "{e}");
+        let e = refused(
+            &|d| {
+                d.rounds = (0..=MAX_ROUNDS as u32 + 1)
+                    .map(|round| DiskRound {
+                        round,
+                        generation: 9,
+                        blocks: 0,
+                    })
+                    .collect();
+            },
+            &p,
+        );
+        assert!(e.contains("rounds lists 1026 rounds"), "{e}");
+    }
+
+    // The largest disk.json a capture writes: a 4 TiB disk with a base,
+    // every block written since boot, every round the device keeps, each
+    // field at its widest, and a long path. It fits the limit and reads
+    // back.
+    #[test]
+    fn the_largest_disk_json_fits_its_limit_and_reads_back() {
+        use crate::devices::virtio::block::MAX_BITMAP_DISK_BYTES;
+        let scratch = Scratch::new("disk-max");
+        let base = "ab".repeat(32);
+        let mut p = profile();
+        p.disk_base_sha256 = Some(base.clone());
+        let blocks = MAX_BITMAP_DISK_BYTES / DIRTY_BLOCK_BYTES;
+        let bitmap = vec![0xff; DirtyBlocks::len_for(blocks)];
+        let disk = DiskState {
+            version: DOC_VERSION,
+            path_hint: format!("/{}", "d".repeat(4095)),
+            size_bytes: MAX_BITMAP_DISK_BYTES,
+            sha256_sparse: Some("cd".repeat(32)),
+            generation: u64::MAX,
+            synced: true,
+            base_sha256: Some(base),
+            block_size: Some(DIRTY_BLOCK_BYTES),
+            dirty_since_boot_b64: Some(crate::checkpoint::platform::base64_encode(&bitmap)),
+            rounds: (0..=MAX_ROUNDS as u32)
+                .map(|round| DiskRound {
+                    round,
+                    generation: u64::MAX,
+                    blocks,
+                })
+                .collect(),
+        };
+        let json = serde_json::to_vec(&disk).unwrap();
+        assert_eq!(
+            disk.dirty_since_boot_b64.as_ref().unwrap().len(),
+            11_184_812
+        );
+        assert!(
+            (json.len() as u64) < Component::Disk.limit(),
+            "{} bytes",
+            json.len()
+        );
+        write_with(&scratch.bundle(), &p, Some(&disk));
+        let back = Bundle::open(&scratch.bundle()).unwrap().disk().unwrap();
+        assert_eq!(back.as_ref(), Some(&disk));
+        let since_boot = back.unwrap().dirty_since_boot().unwrap().unwrap();
+        assert_eq!(since_boot.count(), blocks);
     }
 }

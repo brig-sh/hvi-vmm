@@ -48,7 +48,7 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot, and so does a disk another process holds locked: hvi holds an exclusive `flock` on its disk (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
-| `--disk-base-sha256 <hex>` | none | The SHA-256 of `--disk` as it was before the guest first booted from it, 64 lowercase hex digits. hvi does not hash the disk: the caller did, and keeps a copy of that image. The machine profile records it as `disk_base_sha256`, and a move can then send only the blocks the guest wrote (see [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks)). Needs `--disk`. |
+| `--disk-base-sha256 <hex>` | none | The SHA-256 of `--disk` as it was before the guest first booted from it, 64 lowercase hex digits. hvi does not hash the disk: the caller did, and keeps a copy of that image. The machine profile records it as `disk_base_sha256`, and a move can then send only the blocks the guest wrote (see [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks)). Needs `--disk`. The boot refuses a disk over 4 TiB with it, when it opens the disk. |
 | `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. macOS only. |
 | `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
