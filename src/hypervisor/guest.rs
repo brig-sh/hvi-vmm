@@ -142,8 +142,9 @@ impl<K> Guest<K> {
 
     /// Sets each virtio device's line to the device's level, once a restore
     /// has loaded the interrupt controller. See `Irq::redrive`.
-    // The x86-64 restore does not exist yet.
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    // The HVF restore, which connects the devices before it loads the GIC,
+    // calls it; the KVM one connects and drives each line itself.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn redrive_irqs(&self) {
         if let Some(dev) = &self.block {
             lock_or_recover(dev).redrive_irq();
