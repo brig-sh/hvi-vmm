@@ -414,6 +414,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             (None, _) => None,
         },
         ram_regions: ram.regions(),
+        profile: cfg.profile,
     };
     let profile = Arc::new(ProfileCell::new(
         boot_profile(&cfg, &machine, &vcpus[0]),

@@ -20,12 +20,16 @@
 
 use crate::arch::aarch64::fdt::{self, VirtioDevices};
 use crate::arch::aarch64::layout::{
-    GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GicLayout, GicVersion, GuestLayout, HVI_TIME_PAGE_BASE, HVI_TIME_TIMERS_BASE, UART_BASE,
+    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SPI, VIRTIO_VSOCK_BASE,
+    VIRTIO_VSOCK_SPI,
 };
+use crate::arch::aarch64::portable;
 use crate::checkpoint::profile::{
-    counter_freq_hz, device, sha256_hex, Device, Gic, MachineProfile, RamRegion,
+    counter_freq_hz, device, hex, sha256_hex, Device, Gic, Irq, MachineProfile, RamRegion, Time,
 };
+use crate::config::MachineProfileKind;
+use crate::devices::hvitime;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
@@ -46,6 +50,8 @@ pub(crate) struct Arm64Machine<'a> {
     pub(crate) net_mode: Option<&'a str>,
     /// Guest RAM.
     pub(crate) ram_regions: Vec<crate::memory::RamRegion>,
+    /// The machine profile the guest was given.
+    pub(crate) profile: MachineProfileKind,
 }
 
 /// Returns the profile of an arm64 guest on `backend`, with everything but
@@ -66,6 +72,26 @@ pub(crate) fn profile(backend: &str, machine: &Arm64Machine<'_>) -> MachineProfi
         ram_regions,
     );
     p.firmware.dtb_sha256 = dtb_sha256(machine);
+    if machine.profile == MachineProfileKind::PortableArm64V1 {
+        p.profile = machine.profile.name().to_string();
+        p.baseline = Some(
+            portable::BASELINE
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), hex(*value)))
+                .collect(),
+        );
+        p.irq = p.gic.clone().map(|layout| Irq {
+            kind: "gicv2".into(),
+            layout,
+        });
+        p.time = Some(Time {
+            kind: "hvi-time".into(),
+            counter_freq_hz: p.counter_freq_hz,
+            page_base: HVI_TIME_PAGE_BASE,
+            timers_base: HVI_TIME_TIMERS_BASE,
+            intid: hvitime::INTID,
+        });
+    }
     p
 }
 
@@ -160,6 +186,15 @@ fn devices(present: VirtioDevices, net_mode: Option<&str>) -> Vec<Device> {
             Some(VirtioVsock::FEATURES),
         ));
     }
+    if present.hvi_time {
+        devices.push(device("hvi-time-page", HVI_TIME_PAGE_BASE, None, None));
+        devices.push(device(
+            "hvi-time",
+            HVI_TIME_TIMERS_BASE,
+            Some(hvitime::INTID),
+            None,
+        ));
+    }
     devices
 }
 
@@ -206,6 +241,7 @@ mod tests {
                 size: 512 << 20,
                 file_offset: 0,
             }],
+            profile: MachineProfileKind::Native,
         }
     }
 
