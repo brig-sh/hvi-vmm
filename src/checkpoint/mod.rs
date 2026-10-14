@@ -22,4 +22,5 @@
 
 pub mod control;
 pub mod profile;
+pub mod ram;
 pub(crate) mod server;
