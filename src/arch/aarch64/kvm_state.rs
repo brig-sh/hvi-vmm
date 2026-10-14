@@ -294,7 +294,8 @@ const CPU_ON_PSTATE: u64 = 0x3c5;
 /// recorded, or, for a state HVF wrote under `portable`, the value a guest
 /// on HVF sees; one the machine sets is left alone. A system register the
 /// state holds and this vCPU does not list is refused, but under `portable`
-/// for one whose feature the baseline hides (`kvm_regs::HIDDEN_BY_PORTABLE`).
+/// for one whose feature the baseline hides (`kvm_regs::HIDDEN_BY_PORTABLE`)
+/// and which holds 0.
 /// Then the `mp_state` and any pending SError or abort are set. A vCPU that
 /// was off is left stopped, and one whose `CPU_ON` was pending starts where
 /// the call would have started it.
@@ -429,15 +430,20 @@ pub(crate) fn import(
             }
         }
     }
-    let dropped =
-        |name: &str| portable && crate::checkpoint::kvm_regs::HIDDEN_BY_PORTABLE.contains(&name);
-    if let Some(name) = state
+    // A register of a feature the baseline hides is dropped only at 0, the
+    // value it has on HVF for a portable guest (measured), which never
+    // writes it.
+    let dropped = |name: &str, value: u64| {
+        portable && value == 0 && crate::checkpoint::kvm_regs::HIDDEN_BY_PORTABLE.contains(&name)
+    };
+    if let Some((name, value)) = state
         .sysregs
-        .keys()
-        .find(|n| !(listed.contains(n.as_str()) || dropped(n)))
+        .iter()
+        .find(|(n, v)| !(listed.contains(n.as_str()) || dropped(n, v.0)))
     {
         return Err(fail(format!(
-            "the state holds {name}, which this host's KVM vCPU does not have"
+            "the state holds {name} = {:#x}, which this host's KVM vCPU does not have",
+            value.0
         )));
     }
     let mp_state = match state.mp_state.as_deref() {
@@ -621,8 +627,19 @@ pub(crate) mod tests {
     fn a_portable_hvf_state_loads_into_a_kvm_vcpu() {
         let mut state = crate::checkpoint::cpu::tests::whole(0);
         state.sysregs.insert("MPIDR_EL1".into(), Hex64(0x8000_0000));
+        // A portable guest on HVF holds 0 in what the baseline hides.
+        for name in crate::checkpoint::kvm_regs::HIDDEN_BY_PORTABLE {
+            state.sysregs.insert(name.into(), Hex64(0));
+        }
         let dest = FakeVcpu::rp2();
         import(0, &dest, &state, true).unwrap();
+        // One it set is not dropped.
+        let mut keyed = state.clone();
+        keyed.sysregs.insert("APIAKEYLO_EL1".into(), Hex64(7));
+        let err = import(0, &FakeVcpu::rp2(), &keyed, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("APIAKEYLO_EL1 = 0x7"), "{err}");
         // The native machine has no such rules.
         let err = import(0, &FakeVcpu::rp2(), &state, false)
             .unwrap_err()
