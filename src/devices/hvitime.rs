@@ -267,8 +267,28 @@ pub struct HviTimeState {
     pub page: PageState,
     /// Guest nanoseconds at the capture.
     pub guest_ns_at_capture: u64,
+    /// The guest's architected counter, `CNTVCT_EL0`, at the same moment,
+    /// ticking at `page.counter_freq_hz`. A restore sets the destination's
+    /// counter so that it never reads less (see
+    /// [`counter_target`](Self::counter_target)).
+    #[serde(default)]
+    pub counter_at_capture: u64,
     /// Each vCPU's timer, in vCPU order.
     pub cpus: Vec<CpuTimerState>,
+}
+
+impl HviTimeState {
+    /// Returns the value the guest's counter must start from on a host
+    /// whose counter runs at `freq_hz`, so that a guest that reads the raw
+    /// counter never sees it go back: `counter_at_capture` scaled from the
+    /// source's rate to `freq_hz`, rounded up. On the same rate it is
+    /// `counter_at_capture` itself.
+    #[must_use]
+    pub fn counter_target(&self, freq_hz: u64) -> u64 {
+        let from = u128::from(self.page.counter_freq_hz.max(1));
+        let scaled = (u128::from(self.counter_at_capture) * u128::from(freq_hz)).div_ceil(from);
+        u64::try_from(scaled).unwrap_or(u64::MAX)
+    }
 }
 
 /// The pvclock page: a shareable object of [`PAGE_SIZE`] bytes and hvi's
@@ -774,20 +794,42 @@ impl HviTime {
             .collect()
     }
 
-    /// Holds every deadline until [`restore`](Self::restore), for a capture
-    /// that the same process restores.
+    /// Holds every deadline until [`restore`](Self::restore) or
+    /// [`thaw`](Self::thaw), so a capture reads timers and lines that do not
+    /// change under it.
     pub fn freeze(&self) {
         lock_or_recover(&self.inner).frozen = true;
         self.changed.notify_all();
+    }
+
+    /// Ends a [`freeze`](Self::freeze) without publishing anything: the
+    /// guest goes on as it was, and a deadline that came due while frozen
+    /// fires at once. For a capture after which the guest continues.
+    pub fn thaw(&self) {
+        let mut g = lock_or_recover(&self.inner);
+        if !g.frozen {
+            return;
+        }
+        g.frozen = false;
+        drop(g);
+        self.changed.notify_all();
+    }
+
+    /// Returns whether the device is frozen.
+    #[must_use]
+    pub fn is_frozen(&self) -> bool {
+        lock_or_recover(&self.inner).frozen
     }
 
     /// Returns the device's canonical checkpoint state.
     #[must_use]
     pub fn state(&self) -> HviTimeState {
         let g = lock_or_recover(&self.inner);
+        let counter = self.counter.now();
         HviTimeState {
             page: g.clock,
-            guest_ns_at_capture: g.clock.guest_ns(self.counter.now()),
+            guest_ns_at_capture: g.clock.guest_ns(counter),
+            counter_at_capture: counter,
             cpus: g
                 .timers
                 .iter()
@@ -1673,5 +1715,46 @@ mod tests {
         // The restore drops what was armed during the freeze.
         assert_eq!(dev.mmio_read(0x00, 8), DISARMED);
         assert_eq!(dev.mmio_read(0x10, 8), STATUS_GEN_CHANGED);
+    }
+
+    // A capture after which the guest continues thaws the device: what
+    // came due while it was frozen fires then, and nothing is published.
+    #[test]
+    fn a_thawed_device_fires_what_came_due_and_publishes_nothing() {
+        let (counter, lines) = (Counter::default(), Lines::default());
+        let dev = device(&counter, &lines);
+        dev.mmio_write(0x18, 8, CTRL_ENABLE);
+        dev.mmio_write(0x00, 8, 5_000);
+        dev.freeze();
+        assert!(dev.is_frozen());
+        let page = dev.page().read();
+        counter.set(1000 + ticks(10_000));
+        let state = dev.state();
+        assert_eq!(state.counter_at_capture, 1000 + ticks(10_000));
+        // Frozen, the due deadline waits.
+        dev.mmio_write(0x00, 8, 5_000);
+        assert_eq!(dev.mmio_read(0x10, 8), 0);
+        dev.thaw();
+        assert!(!dev.is_frozen());
+        assert_eq!(dev.page().read(), page);
+        // The timer thread's pass fires it; the next write does too.
+        dev.mmio_write(0x00, 8, 5_000);
+        assert_eq!(dev.mmio_read(0x10, 8), STATUS_EXPIRED);
+        dev.thaw();
+    }
+
+    #[test]
+    fn the_counter_target_never_goes_back() {
+        let (counter, lines) = (Counter::default(), Lines::default());
+        let mut state = device(&counter, &lines).state();
+        state.page.counter_freq_hz = 24_000_000;
+        state.counter_at_capture = 24_000_001;
+        // 24 MHz to 54 MHz: 1 s and one tick is 54 000 002.25 ticks, rounded
+        // up.
+        assert_eq!(state.counter_target(54_000_000), 54_000_003);
+        assert_eq!(state.counter_target(24_000_000), 24_000_001);
+        state.page.counter_freq_hz = 54_000_000;
+        state.counter_at_capture = 54_000_000;
+        assert_eq!(state.counter_target(24_000_000), 24_000_000);
     }
 }

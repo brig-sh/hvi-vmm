@@ -23,13 +23,15 @@
 //! | `irq` | `gicv2` | the portable profile's GICv2: [`Gicv2State`] |
 //! | `timer` | `arch-timer` | the architected counter: [`ArchTimerState`] |
 //! | `timer` | `hvi-time` | the portable profile's clock: [`HviTimeState`] |
-//! | either | `not-captured` | a backend that does not read it yet (KVM) |
+//! | either | `not-captured` | a backend that does not read it (KVM's vGICv3) |
 //!
-//! No backend writes `gicv2` or `hvi-time` yet, nor restores them: the
-//! kinds are named here so a restore can refuse such a bundle for what it
-//! is. A `not-captured` section is a marker with the reason, so a bundle
-//! says what it lacks instead of holding a default a restore could mistake
-//! for the real thing, and a restore refuses it.
+//! Both backends write `gicv2` and `hvi-time` for the portable profile: HVF
+//! from its software GICv2, KVM from its vGICv2 with the line levels hvi's
+//! devices hold (`arch::aarch64::vgicv2`), in the one canonical form, so a
+//! bundle from either loads on the other. KVM's native vGICv3 is not read,
+//! and is written `not-captured`. A `not-captured` section is a marker with
+//! the reason, so a bundle says what it lacks instead of holding a default
+//! a restore could mistake for the real thing, and a restore refuses it.
 //!
 //! The canonical GICv3 registers are what a later import on another backend
 //! would consume. HVF restores its own GIC from the opaque `hv_gic_state`
@@ -762,6 +764,7 @@ pub(crate) mod tests {
                 downtime_total_ns: 0,
             },
             guest_ns_at_capture: 5_000,
+            counter_at_capture: 280,
             cpus: (0..vcpus)
                 .map(|cpu| crate::devices::hvitime::CpuTimerState {
                     deadline_ns: (cpu == 0).then_some(9_000),
