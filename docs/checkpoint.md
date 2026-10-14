@@ -102,7 +102,7 @@ A refusal is `{"v":1,"ok":false,"code":...,"error":...}`.
 
 | `code` | When | The VM afterwards |
 | --- | --- | --- |
-| `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, or a guest with virtio-fs shares. | Untouched: nothing was paused. |
+| `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, a guest with virtio-fs shares, or a guest of the portable profile, which no backend checkpoints yet. | Untouched: nothing was paused. |
 | `not_ready` | The machine profile is not complete yet. | Untouched. |
 | `timeout` | The I/O threads or the vCPUs did not park, or the vCPUs did not export their state, within 2 s. | As the request found it. |
 | `capture_failed` | Anything after the pause: a device state that a restore would refuse, a failed disk sync, a failed write or sync, a bundle the reader would refuse. | As the request found it. Every file the capture wrote is removed, the manifest included, and the directory too when the capture created it. |
@@ -260,13 +260,21 @@ CR3 on x86-64.
 | `irq` | `hv-gic-v3` | HVF | The GICv3 in canonical form: `dist` (`GICD_CTLR`, then `igroupr`, `isenabler`, `ispendr`, `isactiver`, `ipriorityr`, `icfgr` by register number from 0, and `irouter` by interrupt ID), `redist` and `icc` for each vCPU that ran, and `spi_count`. |
 | `timer` | `arch-timer` | HVF | `counter_freq_hz`, `counter_at_capture` (the guest's `CNTVCT_EL0` as vCPU 0 saw it) and `host_monotonic_at_capture_ns`. |
 | either | `not-captured` | KVM | `reason`. A restore refuses it. |
+| `irq` | `gicv2` | nothing yet | The portable profile's GICv2 in canonical form (`Gicv2State`, see [portable-profile.md](portable-profile.md#2-interrupt-controller)). A restore refuses it as not restorable yet. |
+| `timer` | `hvi-time` | nothing yet | The portable profile's `hvi-time` state (`HviTimeState`, see [portable-profile.md](portable-profile.md#restore)). A restore refuses it as not restorable yet. |
 
 `backend_adjunct` carries HVF's own GIC state, the `hv_gic_state` blob,
 as `{"kind":"hvf_gic_state","data_b64":...,"sha256":...}`. A restore on
 HVF loads the blob, not the canonical registers, and only the same macOS build
 is sure to load it. The canonical part is for a later import on another
 backend. `GICR_CTLR` is not in `redist`: Hypervisor.framework has no call
-that reads it. The portable profile adds the kinds `gicv2` and `hvi-time`.
+that reads it.
+
+A guest of the portable profile cannot be checkpointed yet: the
+`checkpoint` op refuses it before anything is paused, on either backend.
+`hvi restore` refuses a bundle whose profile is `portable-arm64-v1`, or
+whose sections are `gicv2` or `hvi-time`, and says that no backend
+restores them yet.
 
 ## How the capture works
 

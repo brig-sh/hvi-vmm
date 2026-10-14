@@ -840,6 +840,8 @@ mod tests {
         net: Option<Arc<std::sync::Mutex<crate::devices::virtio::net::VirtioNet>>>,
         /// The profile's virtio-fs share count.
         fs_shares: u32,
+        /// The profile's machine profile, when not native.
+        machine: Option<&'static str>,
         /// The component after which the capture fails.
         fail_after: Option<Component>,
         /// The component after which the run is stopped.
@@ -959,6 +961,9 @@ mod tests {
                     p.cpu.ident = Some("0x61".into());
                     p.vcpus = count;
                     p.fs_shares = spec.fs_shares;
+                    if let Some(machine) = spec.machine {
+                        p.profile = machine.to_string();
+                    }
                     p.ram_regions = regions.into_iter().map(Into::into).collect();
                 })
                 .unwrap();
@@ -1735,6 +1740,26 @@ mod tests {
             std::fs::symlink_metadata(&dir).is_err(),
             "a refusal left a directory"
         );
+    }
+
+    // The portable machine is captured as the native one is: its profile is
+    // no reason to refuse.
+    #[test]
+    fn a_portable_guest_is_captured() {
+        let mut portable = Fixture::with(
+            "ck-portable",
+            Spec {
+                parking: 1,
+                capture: true,
+                machine: Some("portable-arm64-v1"),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&portable.checkpoint("ck", "continue"));
+        assert_eq!(r["ok"], true, "{r}");
+        portable.assert_running();
+        let bundle = crate::checkpoint::bundle::Bundle::open(&portable.root.join("ck")).unwrap();
+        assert_eq!(bundle.profile().profile, "portable-arm64-v1");
     }
 
     // A vCPU that never parks fails the capture in time, and the VM runs on.
