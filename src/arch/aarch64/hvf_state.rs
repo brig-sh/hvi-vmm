@@ -178,8 +178,7 @@ fn import_vcpu(cpu: u32, vcpu: &Vcpu, state: &VcpuState) -> io::Result<Option<Ou
     for (n, (q, text)) in SIMD_REGS.iter().zip(&state.simd).enumerate() {
         let value = parse_simd(text)
             .ok_or_else(|| io::Error::other(format!("q{n} is not 32 hex digits")))?;
-        vcpu.set_simd_fp_reg(*q, value)
-            .map_err(|e| failed(&format!("q{n}"), e))?;
+        set_simd_fp_reg(vcpu, *q, value).map_err(|e| io::Error::other(format!("q{n}: {e}")))?;
     }
     for (name, value) in &state.sysregs {
         let reg =
@@ -372,6 +371,41 @@ fn import_icc(cpu: u32, vcpu: &Vcpu, platform: &PlatformState) -> io::Result<Opt
 }
 
 /// Returns an error naming `what` for a failed Hypervisor.framework call.
+/// Sets SIMD register `reg` of `vcpu`, which must be this thread's, to
+/// `value`, its 16 bytes in little-endian order.
+///
+/// The framework takes the value as a `simd_uchar16`, which the arm64 C
+/// ABI passes in `v0`. Without its `simd-nightly` feature, `applevisor`
+/// declares it a `u128`, which Rust passes in `x2` and `x3`, so the
+/// framework would load whatever `v0` held. Stable Rust cannot name a
+/// vector type in an `extern "C"` signature, so this makes the call itself.
+fn set_simd_fp_reg(vcpu: &Vcpu, reg: SimdFpReg, value: u128) -> Result<(), String> {
+    let bytes = value.to_le_bytes();
+    let ret: u64;
+    // SAFETY: the call is the framework's, with the arguments where its C
+    // signature `hv_vcpu_set_simd_fp_reg(hv_vcpu_t, hv_simd_fp_reg_t,
+    // simd_uchar16)` has them: the vCPU in x0, the register in w1 and the
+    // value in q0, loaded from `bytes`, which lives across the call.
+    // `clobber_abi("C")` marks every register the callee may change, the
+    // link register among them, and the stack is the caller's, aligned.
+    unsafe {
+        std::arch::asm!(
+            "ldr q0, [{value}]",
+            "bl {set}",
+            value = in(reg) bytes.as_ptr(),
+            set = sym applevisor_sys::hv_vcpu_set_simd_fp_reg,
+            inlateout("x0") vcpu.id() => ret,
+            in("w1") reg as u32,
+            clobber_abi("C"),
+        );
+    }
+    // `hv_return_t` is 32 bits wide; the rest of x0 is not defined.
+    match ret as u32 {
+        0 => Ok(()),
+        code => Err(format!("hv_vcpu_set_simd_fp_reg returned {code:#x}")),
+    }
+}
+
 fn failed(what: &str, e: impl std::fmt::Debug) -> io::Error {
     io::Error::other(format!("{what}: {e:?}"))
 }
@@ -868,6 +902,29 @@ fn dist_reg(offset: u32) -> Option<GicDistributorReg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Needs the hypervisor entitlement: build the test binary with
+    // `cargo test --release --lib --no-run`, sign it with hvi.entitlements,
+    // and run it with `--ignored --test-threads=1`, since a process has one
+    // VM. Build it with --release: a debug build happens to move the value
+    // through v0 on its way to the call, so a call that passes it in x2 and
+    // x3 would pass there too.
+    #[test]
+    #[ignore]
+    fn every_simd_register_reads_back_what_was_set() {
+        let vm = applevisor::prelude::VirtualMachine::new().expect("hv_vm_create");
+        let vcpu = vm.vcpu_create().expect("hv_vcpu_create");
+        let value = |n: u32| {
+            (u128::from(0x1111_2222_3333_4444u64 ^ u64::from(n)) << 64)
+                | u128::from(0x3fd0_0000_0000_0000u64 | u64::from(n))
+        };
+        for (n, q) in (0u32..).zip(SIMD_REGS) {
+            set_simd_fp_reg(&vcpu, q, value(n)).unwrap();
+        }
+        for (n, q) in (0u32..).zip(SIMD_REGS) {
+            assert_eq!(vcpu.get_simd_fp_reg(q).unwrap(), value(n), "q{n}");
+        }
+    }
 
     // The table is the one place a canonical name meets the framework's
     // register, and the variant's own name is the check.
