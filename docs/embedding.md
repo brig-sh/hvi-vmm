@@ -151,7 +151,7 @@ cargo build --release --example watch_guest
 
 ## Configuration outside `BootConfig`
 
-Two things a caller sets are not in the struct. Both matter.
+Three things a caller sets are not in the struct. All three matter.
 
 **Guest file ownership.** `--fs-uid` and `--fs-gid` become two process-global
 atomics through `devices::virtio::fs::set_guest_ids(uid, gid)`, because every
@@ -165,13 +165,27 @@ hvi::devices::virtio::fs::set_guest_ids(0, 0);
 Setting it after a share is already answering hands the guest a home it cannot
 write.
 
-**glibc's malloc on Linux.** The `hvi` binary calls
-`hvi::sandbox::seccomp::one_malloc_arena()` before a confined run, while it
-has one thread. An embedder that boots with `sandbox: true` on a glibc build must do the
-same in its own `main`, before it starts any thread. Without it, glibc's malloc
-can open a file from a filtered thread, and the seccomp filter kills the process
-with `SIGSYS`. The setting is process-wide, so the embedder's own threads share
-the one arena too. See [the allowlists'
+**glibc's malloc on Linux.** An embedder that boots with `sandbox: true` must
+call `hvi::sandbox::seccomp::one_malloc_arena()` first in its own `main`, before
+it starts any thread:
+
+```rust
+#[cfg(target_os = "linux")]
+if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
+    eprintln!("{e}");
+    std::process::exit(1);
+}
+```
+
+The `seccomp` module exists on Linux only, hence the `cfg`. On musl the call
+does nothing. Without it, glibc's malloc can open a file from a filtered
+thread, and the seccomp filter kills the process with `SIGSYS`. A confined KVM
+boot sets the same thing before it starts a thread, but that is too late for
+an arena one of your threads already made: glibc keeps it and can hand it to a
+filtered thread. The setting is process-wide, so your own threads share the
+one arena too. The `hvi` binary and
+[`examples/watch_guest.rs`](../examples/watch_guest.rs) both make this call.
+See [the allowlists'
 README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself).
 
 **Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE` and `HVI_X86_TRACE`
