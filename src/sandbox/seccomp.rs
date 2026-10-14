@@ -287,10 +287,12 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
 /// say the run is confined (a boot or restore without `--no-sandbox`, or
 /// `seccomp-selftest`). An embedder that boots with `sandbox` set calls it
 /// first in its own `main`. A KVM boot or restore with `sandbox` set calls it
-/// again before it starts a thread, which covers threads from then on but not
-/// an arena an earlier thread made: glibc keeps that arena after its thread
-/// exits and hands it to a later one, which may be filtered. Calling it more
-/// than once is harmless.
+/// again before it starts a thread, but a late call does much less. Every arena
+/// that exists stays in use, and glibc hands an exited thread's arena to the
+/// next thread that needs one, which may be filtered. Nor does it stop new
+/// arenas once glibc has fixed its limit: `arena_get2` keeps the limit in a
+/// static that it sets once, the first time a thread needs a new arena while
+/// more than eight exist. Calling it more than once is harmless.
 ///
 /// glibc's malloc opens two files on its own, both from a thread that is
 /// allocating or freeing, and either is a `SIGSYS` under the `vmm` filter,

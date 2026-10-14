@@ -223,9 +223,9 @@ pub(crate) fn start_io_threads(
     console: Console,
 ) -> Result<(seccomp::Filters, IoThreads), Box<dyn std::error::Error>> {
     // Before `attach`, which may start a thread. The `hvi` binary has set this
-    // already; an embedder that has not still gets it for every thread from
-    // here on. An arena one of its own threads made earlier stays in glibc's
-    // pool, which is why the embedder must call it first in its `main`.
+    // already. For an embedder that has not, it is a partial fallback: arenas
+    // its own threads made stay in use, and glibc ignores the setting once it
+    // has fixed its arena limit. So the embedder must call it first in `main`.
     if cfg.sandbox {
         seccomp::one_malloc_arena()?;
     }
