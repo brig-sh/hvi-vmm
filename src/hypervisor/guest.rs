@@ -33,7 +33,7 @@ use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
 use crate::teardown::StopToken;
@@ -59,6 +59,9 @@ pub(crate) struct Guest<K> {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
+    /// The hypervisor's record of the guest's own writes to RAM, which a
+    /// live move reads beside guest RAM's log of hvi's.
+    pub(crate) write_log: Option<Arc<dyn GuestWriteLog>>,
     /// The threads a plugin asks for in `attach`, until the attach is over.
     pub(crate) plugin_threads: PluginThreads,
 }
@@ -394,6 +397,7 @@ pub(crate) mod tests {
                 NoopKicker,
                 StopHandle::new_pair().unwrap().0,
             )),
+            write_log: None,
         }
     }
 

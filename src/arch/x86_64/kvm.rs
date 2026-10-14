@@ -568,6 +568,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 cfg.take_stop_handle()?,
             )),
             plugin_threads: PluginThreads::new(),
+            write_log: None,
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
