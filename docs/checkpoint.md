@@ -625,8 +625,15 @@ resume, in both directions:
   before the move was on the disk, and a write after it worked.
 
 The downtime was mostly the copy: 174 s from the Mac to the Pi over the
-tailnet, and 19 s back. `tools/checkpoint-e2e.sh` runs on one host, so its
-own checks have not been run across hosts.
+tailnet, and 19 s back.
+
+`tools/migrate-e2e.sh` now runs these moves and their checks, each way and
+on one host, with the guest's clocks read against each host's, its
+interrupts and `Features` line compared, a 10-minute drift window and the
+refusals. On one LAN a move took 4.6 s from the fence request to the
+resume reply each way, 3.2 to 3.4 s of it the copy. See
+[portable-profile.md](portable-profile.md#measured-results) for the figures
+and [testing.md](testing.md#the-migration-end-to-end-test) for the script.
 
 ### Timings
 
