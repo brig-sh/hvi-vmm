@@ -250,7 +250,9 @@ The guest cannot keep time with the architected timer: its counter runs at
 the host's rate, and a guest moved from a Mac to a Pi would see it change
 from 24 MHz to 54 MHz. The profile gives it `hvi-time` instead
 (`devices/hvitime.rs`), and the portable guest kernel's `hvi,time-v1` driver
-(`drivers/clocksource/hvi-time.c`, Linux 6.12.95 plus two patches) builds the
+(`drivers/clocksource/hvi-time.c`, Linux 6.12.95 plus four patches, in
+[tools/guest/kernel](../tools/guest/kernel/README.md); the third is in
+[Restore](#restore), the fourth in [Host sleep](#host-sleep)) builds the
 kernel's clocksource, `sched_clock` and per-CPU clock event on it, all at
 1 GHz.
 
@@ -460,8 +462,11 @@ before the fourth patch of the series counted a host-sleep publish in
 `migrations`. An Image before the third patch of the series ran the work once per vCPU that took
 the bit. `tools/checkpoint-e2e.sh --portable --cpus 4` on rp2, three runs
 of each Image: the old one logged and counted the move 2, 3 and 3 times,
-the current one once each time. On the Mac one run of each counted 1: the
-recount is a race, and the Mac did not hit it.
+the one with the third patch once each time. On the Mac one run of each
+counted 1: the recount is a race, and the Mac did not hit it. The current
+Image, with the fourth patch too, counted 1 in three runs at `--cpus 4` and
+one at `--cpus 2` on rp1, and one run of each on the Mac, every check
+passing (hvi at `a586ec7`).
 
 ### Host sleep
 
@@ -483,11 +488,21 @@ the host's by the sleep. hvi publishes the page again after a sleep:
   current counter would round guest nanoseconds down by up to 1 ns
   between a read of the old page and one of the new.
   `downtime_total_ns` grows by how far the guest's wall clock was behind,
-  and the generation goes up by 2. Every vCPU gets `GEN_CHANGED`; deadlines stay as they are,
-  since guest nanoseconds did not jump. The driver then moves REALTIME and
-  BOOTTIME on as after a restore, and MONOTONIC carries on. hvi logs
-  `hvi-time: the host slept 30.000 s; published generation 4, the guest's
-  wall clock was 30.000 s behind`.
+  and the generation goes up by 2. `host_sleeps` goes up by 1. Every vCPU
+  gets `GEN_CHANGED`; deadlines stay as they are, since guest nanoseconds
+  did not jump. hvi logs `hvi-time: the host slept 30.000 s; published
+  generation 4, the guest's wall clock was 30.000 s behind`.
+- The driver then sets REALTIME to the host's, in either direction, as
+  after a restore. When the guest is behind, REALTIME and BOOTTIME move on
+  by the difference. When it is more than 1 ms ahead, REALTIME steps back
+  to the host's and BOOTTIME stays. That happens after a short sleep that
+  follows a long awake stretch, since REALTIME runs on the counter and
+  drifts from the host's clock (8.2 ppm on the Mac, about 0.7 s a day; see
+  [Measured results](#measured-results)), and on a host whose counter runs
+  through the sleep. `downtime_total_ns` grows only by how far the guest
+  was behind, never by how far it was ahead. MONOTONIC carries on in both
+  cases. The driver counts the publish in `host_sleeps`, not in
+  `migrations`.
 - Nothing is published while a capture holds the device frozen, or before
   a restored VM's first publish; each publish reads the sleep clock again,
   so a sleep while restored-paused is not counted twice.
@@ -503,25 +518,43 @@ seconds after the device is made, the host wall clock and sleep clock as
 hvi reads them move `<secs>` ahead. To hvi that is a sleep of `<secs>` with
 the guest's counter stopped; the guest's REALTIME then moves `<secs>` ahead
 of the real host's. It cannot stop the guest's counter, which a real sleep
-does. Measured on 2026-10-14 with a scratch driver that boots the
-portable guest with 2 vCPUs, 512 MiB and `/clk 50` (a `CLK` line every
-50 ms), and stamps each console line with the host's wall clock on
-receipt. `HVI_TIME_TEST_SLEEP=25,30` and, separately, a `SIGSTOP` of the
-hvi process for 10 s:
+does.
 
-| | Mac | Pi |
+`tools/sleep-e2e.py` ([testing.md](testing.md#the-host-sleep-test)) boots
+the portable guest with 2 vCPUs, 512 MiB and `/clk 50` (a `CLK` line every
+50 ms), stamps each console line with the host's wall clock on receipt, and
+checks the result. Run on 2026-10-14 on this Mac and on rp1 (a Pi 5, KVM),
+with hvi at `a586ec7`, the Image `e85e4338…` and the initramfs `b2855e38…`
+(the one in [Measured results](#measured-results)):
+
+```sh
+tools/sleep-e2e.py --mode hook --hvi target/release/hvi --kernel Image \
+    --initramfs initramfs-migrate.cpio --out /tmp/sleep-hook
+tools/sleep-e2e.py --mode sigstop --hvi target/release/hvi --kernel Image \
+    --initramfs initramfs-migrate.cpio --out /tmp/sleep-stop
+```
+
+`--mode hook` sets `HVI_TIME_TEST_SLEEP=25,30`; `--mode sigstop` stops the
+hvi process for 10 s. Every check passed on both hosts:
+
+| | Mac | Pi (rp1) |
 | --- | --- | --- |
-| First `CLK` line within 100 ms of host + 30 s | 14.5 ms after the republish | 7.6 ms after |
-| Guest REALTIME minus (host + 30 s), from then on | -0.40 to -0.18 ms | median -0.30 ms, 2 of 157 lines below -5 ms (worst -73.6 ms) |
-| Driver | `generation 4: … wall clock moved 30000021115 ns`, `migrations=1` | `30000031493 ns`, `migrations=1` |
-| `downtime_total_ns` | 30000058489 | 30000031586 |
-| `SIGSTOP` 10 s: generation, REALTIME after | 2, unchanged; -2.29 to -0.15 ms | 2, unchanged; -0.3 ms once the console drained |
+| hvi's publish after the simulated sleep | 0.19 s | 0.05 s |
+| First `CLK` line within 100 ms of host + 30 s | 20.9 ms after the publish | 7.5 ms after |
+| Guest REALTIME minus (host + 30 s) from then on: min, median, max | -0.37, -0.15, -0.13 ms | -1.05, -0.56, -0.26 ms |
+| Driver | `generation 4: … wall clock moved 30000065197 ns`; `host_sleeps=1 migrations=0` | `29999980911 ns`; the same counts |
+| `downtime_total_ns` | 30000065114 | 29999980633 |
+| `SIGSTOP` 10 s: generation, counts | 2, unchanged; `host_sleeps=0 migrations=0` | the same |
+| `SIGSTOP`: REALTIME minus host from 2 s after `SIGCONT`: min, median, max | -0.34, -0.18, -0.17 ms | -20.55, -0.58, -0.25 ms |
 
-Every offset is negative: a line is stamped after the guest printed it.
-The Pi's worst lines are the console's delay, not the clock's: right after
-`SIGCONT`, `clk` printed the 200 lines it had missed at once, and they
-reached the host up to 686 ms late; from 0.96 s after it, every line read
--0.3 ms.
+MONOTONIC never went back in any run. The publish comes within the timer
+thread's one-second wait. Every offset is negative: a line is stamped after
+the guest printed it. The Pi's worst `SIGSTOP` line is the console's delay,
+not the clock's: right after `SIGCONT`, `clk` prints the lines it missed at
+once. The Pi's wall clock moved 19 µs less than the 30 s: its REALTIME had
+run that far ahead of the host's on the counter since the boot. With the
+Image `4b2e8c5c…`, which lacks the fourth patch, the hook run on the Mac
+fails two checks: the snapshot has no `host_sleeps`, and `migrations=1`.
 
 ### Clock policy
 
@@ -652,10 +685,13 @@ guest printed its line, so a correct clock reads at or before it, and the
 console path's latency makes the guest look further behind than it is.
 
 The current Image adds a third patch, which handles each page generation
-once (see [Restore](#restore)): sha256
-`4b2e8c5ce382a2635efe1b1b198e35b081d2f0cd4d39d9689b026fbc7d8f21b7`, Linux
-`6.12.95-00003-g51cdb81da818`. The runs in the next section used
-`32725b9b…`, with 1 vCPU, where the recount does not happen.
+once (see [Restore](#restore)), and a fourth, which counts host-sleep
+publishes apart (see [Host sleep](#host-sleep)): sha256
+`e85e4338feeb361c5329b4105fa3bda5cd72a235c9ae16c3c4ff94728b12aa1f`, Linux
+`6.12.95-00004-gc61d393fb996`. [tools/guest/kernel](../tools/guest/kernel/README.md)
+holds the series and how to build it. The 1-vCPU runs in the next section
+used `32725b9b…`, where the recount does not happen; the 2-vCPU moves at
+its end used the current Image.
 
 ## Measured results
 
@@ -810,6 +846,46 @@ Each host also ran `tools/checkpoint-e2e.sh --portable --cpus 1 --mem 512`
 on itself with the same assets: 41 checks passed on each; `capture_ms` 373
 on the Mac and 849 on the Pi, checkpoint request to resume reply 917 ms and
 1817 ms, the `timerfd` 6.000049 s and 6.000048 s.
+
+**Moves with 2 vCPUs.** On 2026-10-14 the same script moved a 2-vCPU
+guest from this Mac to rp1 (a Pi 5 Model B, KVM) and back, with
+hvi at `a586ec7` built on each host, the current Image `e85e4338…`, the
+same initramfs, `--cpus 2 --drift-secs 60`, over the LAN. Each way passed
+all 41 checks, `migrations=1` among them:
+
+| | Mac to Pi | Pi to Mac |
+| --- | --- | --- |
+| `capture_ms` | 303 | 1135 |
+| Copy | 5.02 s | 3.94 s |
+| `hvi restore` to `restored-paused` | 529 ms | 200 ms |
+| Downtime, fence request to resume reply | 5.88 s | 5.41 s |
+| Driver log | `generation 4: counter 54000000 Hz, lpj 216000` | `generation 4: counter 24000000 Hz, lpj 96000` |
+| `CLOCK_MONOTONIC` gap over the move | 0.250117 s | 0.249853 s |
+| `CLOCK_REALTIME` less the host's, first 10 s: median, worst | 0.63 ms, 3.69 ms | 0.19 ms, 0.33 ms |
+| The same after 70 s | 0.31 ms | 0.28 ms |
+
+rp1 runs Linux `6.12.25+rpt-rpi-2712`; Tailscale had a direct LAN path to
+it, 5 ms round trip. With `$S` the Mac's work directory and `/home/pmoust/h6fix`
+rp1's:
+
+```sh
+# Mac to Pi
+tools/migrate-e2e.sh --src local --dst rp1 \
+    --src-hvi $S/hvi-mac --dst-hvi /home/pmoust/h6fix/hvi-pi \
+    --kernel $S/Image --initramfs $S/initramfs-migrate.cpio \
+    --src-dir $S/m2p/src --dst-dir /home/pmoust/h6fix/m2p --out $S/m2p/out \
+    --cpus 2 --drift-secs 60
+# Pi to Mac
+tools/migrate-e2e.sh --src rp1 --dst local \
+    --src-hvi /home/pmoust/h6fix/hvi-pi --dst-hvi $S/hvi-mac \
+    --kernel /home/pmoust/h6fix/Image \
+    --initramfs /home/pmoust/h6fix/initramfs-migrate.cpio \
+    --src-dir /home/pmoust/h6fix/p2m --dst-dir $S/p2m/dst --out $S/p2m/out \
+    --cpus 2 --drift-secs 60
+```
+
+`--negative` was not run with 2 vCPUs: its altered bundle sets the vCPU
+count to 2, which is then no change.
 
 **A Mac that sleeps stops the guest's clocks.** An earlier Pi to Mac run
 went through a clamshell sleep and two maintenance sleeps of the Mac
