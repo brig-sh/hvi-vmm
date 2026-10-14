@@ -73,6 +73,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::SharedRam;
 use crate::sync::lock_or_recover;
 
@@ -881,6 +882,104 @@ pub fn timer_thread_setup() -> String {
                 io::Error::last_os_error()
             )
         }
+    }
+}
+
+/// A test of the restore path in one process:
+/// `HVI_TIME_TEST_RESTORE=<at>,<downtime>`.
+///
+/// `at` seconds after the guest starts, the vCPUs are paused as the control
+/// socket pauses them, the device is frozen and its state captured, and
+/// `downtime` seconds later the state is restored and the vCPUs resumed. The
+/// guest then sees what it sees after a real restore on this host: a new
+/// page generation, `GEN_CHANGED` on every vCPU, guest nanoseconds that did
+/// not advance across the pause, and a wall clock that did. It cannot show a
+/// change of counter rate, which needs a second host.
+///
+/// Debugging only: it is read from the environment so that no CLI flag
+/// promises it.
+// The x86-64 guest has no `hvi-time`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub(crate) struct TestRestore {
+    at: Duration,
+    downtime: Duration,
+}
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+impl TestRestore {
+    /// Reads `HVI_TIME_TEST_RESTORE`, or `None` when it is unset or not two
+    /// numbers of seconds.
+    pub(crate) fn from_env() -> Option<Self> {
+        let value = std::env::var("HVI_TIME_TEST_RESTORE").ok()?;
+        let (at, downtime) = value.split_once(',')?;
+        Some(Self {
+            at: Duration::from_secs_f64(at.trim().parse().ok()?),
+            downtime: Duration::from_secs_f64(downtime.trim().parse().ok()?),
+        })
+    }
+
+    /// Runs the test on a thread of its own, after `setup` (the backend's
+    /// seccomp filter on Linux). The thread ends early when the VM stops.
+    pub(crate) fn spawn<K: Kick + 'static>(
+        self,
+        device: Arc<HviTime>,
+        vcpus: Arc<Vcpus<K>>,
+        setup: impl FnOnce() + Send + 'static,
+    ) -> io::Result<JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("hvi-time-test".into())
+            .spawn(move || {
+                setup();
+                let prefix = crate::LOG_PREFIX;
+                if !sleep_while_running(&vcpus, self.at) {
+                    return;
+                }
+                if let Err(e) = vcpus.pause_from_control(Duration::from_secs(5)) {
+                    eprintln!("{prefix} hvi-time test restore: the pause failed: {e:?}");
+                    return;
+                }
+                device.freeze();
+                let state = device.state();
+                eprintln!(
+                    "{prefix} hvi-time test restore: captured generation {} at guest {} ns, \
+                     holding the vCPUs for {:.3} s",
+                    state.page.generation,
+                    state.guest_ns_at_capture,
+                    self.downtime.as_secs_f64()
+                );
+                let held = sleep_while_running(&vcpus, self.downtime);
+                match device.restore(&state) {
+                    Ok(()) => {
+                        let page = device.page().read();
+                        eprintln!(
+                            "{prefix} hvi-time test restore: restored generation {} at guest {} ns, \
+                             downtime total {} ns",
+                            page.generation, page.base_ns, page.downtime_total_ns
+                        );
+                    }
+                    Err(e) => eprintln!("{prefix} hvi-time test restore: {e}"),
+                }
+                if held {
+                    let _ = vcpus.resume_from_control();
+                }
+            })
+    }
+}
+
+/// Sleeps for `d` in short steps, and returns `false` as soon as the VM
+/// stops.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn sleep_while_running<K: Kick>(vcpus: &Vcpus<K>, d: Duration) -> bool {
+    let end = Instant::now() + d;
+    loop {
+        if !vcpus.is_running() {
+            return false;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
     }
 }
 
