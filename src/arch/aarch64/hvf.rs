@@ -40,10 +40,10 @@
 // clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
-use std::ops::ControlFlow;
 
 use applevisor::prelude::{
     ExitReason, FeatureReg, GicConfig, GicDisabled, GicEnabled, InterruptType, Reg, SysReg, Vcpu,
@@ -81,13 +81,14 @@ use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
+use crate::devices::wake::Wake;
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
+use crate::hypervisor::guest::{Guest, PluginThread, PluginThreads, SafepointVcpu};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
-use crate::run::{record_start, run_to_stop};
+use crate::run::{record_start, run_to_stop, StopHandle};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
@@ -323,25 +324,6 @@ impl Kicker {
         }
         Registration { kicker: self, cpu }
     }
-}
-
-/// A vCPU's entry in a [`Kicker`], removed when dropped.
-///
-/// A kick sends `hv_vcpus_exit` one list of handles, so a handle to a destroyed
-/// vCPU in the table would fail the kick of every other vCPU in the list.
-struct Registration<'a> {
-    /// The table the entry is in.
-    kicker: &'a Kicker,
-    /// The vCPU id of the entry.
-    cpu: u32,
-}
-
-impl Drop for Registration<'_> {
-    fn drop(&mut self) {
-        if let Some(slot) = lock_or_recover(&self.kicker.handles).get_mut(self.cpu as usize) {
-            *slot = None;
-        }
-    }
 
     /// Wakes vCPU `cpu` from an emulated WFI, if it sleeps in one.
     fn notify_idle(&self, cpu: usize) -> bool {
@@ -371,6 +353,25 @@ impl Drop for Registration<'_> {
             if let Some(Some(handle)) = lock_or_recover(&self.handles).get(cpu) {
                 let _ = self.vm.vcpus_exit(std::slice::from_ref(handle));
             }
+        }
+    }
+}
+
+/// A vCPU's entry in a [`Kicker`], removed when dropped.
+///
+/// A kick sends `hv_vcpus_exit` one list of handles, so a handle to a destroyed
+/// vCPU in the table would fail the kick of every other vCPU in the list.
+struct Registration<'a> {
+    /// The table the entry is in.
+    kicker: &'a Kicker,
+    /// The vCPU id of the entry.
+    cpu: u32,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = lock_or_recover(&self.kicker.handles).get_mut(self.cpu as usize) {
+            *slot = None;
         }
     }
 }
@@ -430,66 +431,7 @@ struct SharedFs {
     base: u64,
     intid: u32,
     dev: Arc<Mutex<VirtioFs>>,
-    wake: Arc<FsWake>,
-}
-
-/// A virtio-fs device's coalescing wake signal, which its worker thread parks
-/// on.
-///
-/// `service_fs` calls [`FsWake::wake`] when its inline drain leaves work. The
-/// worker's [`FsWake::park`] checks a predicate under a `Condvar`, so a wake
-/// that lands between the worker's last drain and its park is seen rather than
-/// lost. `run_fs_worker` has the full argument.
-struct FsWake {
-    state: Mutex<FsWakeState>,
-    ready: Condvar,
-}
-
-/// The flags behind [`FsWake`].
-#[derive(Default)]
-struct FsWakeState {
-    /// A notify arrived since the worker last drained.
-    woken: bool,
-    /// The stop has been requested.
-    stopped: bool,
-}
-
-impl FsWake {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(FsWakeState::default()),
-            ready: Condvar::new(),
-        }
-    }
-
-    /// Signals the worker. Safe to call whether or not it is currently
-    /// parked -- a signal that arrives mid-drain is simply picked up on the
-    /// worker's next pass, never lost.
-    fn wake(&self) {
-        let mut state = lock_or_recover(&self.state);
-        state.woken = true;
-        self.ready.notify_one();
-    }
-
-    /// Requests that the worker exit at its next pass.
-    fn stop(&self) {
-        let mut state = lock_or_recover(&self.state);
-        state.stopped = true;
-        self.ready.notify_one();
-    }
-
-    /// Blocks until the next [`FsWake::wake`] or [`FsWake::stop`].
-    ///
-    /// Clears the wake flag on return and returns `false` once stopped. Must
-    /// not be called with the virtio-fs device mutex held.
-    fn park(&self) -> bool {
-        let mut state = lock_or_recover(&self.state);
-        while !state.woken && !state.stopped {
-            state = self.ready.wait(state).unwrap();
-        }
-        state.woken = false;
-        !state.stopped
-    }
+    wake: Arc<Wake>,
 }
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing
@@ -707,7 +649,9 @@ const RESTORER_PORTABLE: Restorer = restore::portable("hvf");
 // One function so the order of the steps, which the hypervisor and the
 // confinement constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
-pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+pub(crate) fn restore(
+    cfg: RestoreConfig,
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source_profile = opened.profile().clone();
     let source = &source_profile;
@@ -898,7 +842,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         })
         .collect();
     let kicker = Kicker::new(vm.clone(), num_cpus, secondaries, is_portable);
-    let vcpus = Arc::new(Vcpus::new(num_cpus, kicker));
+    let vcpus = Arc::new(Vcpus::new(num_cpus, kicker, StopHandle::new_pair()?.0));
     let hvitime = match &portable {
         Some(p) => Some(attach_hvitime(p, &vcpus, num_cpus, vtimer_offset)?),
         None => None,
@@ -926,6 +870,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             vsock,
             vcpus,
             write_log: Some(Arc::clone(&write_log) as Arc<dyn GuestWriteLog>),
+            plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(pl011)),
         fs: Vec::new(),
@@ -953,6 +898,8 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         bridge,
         net_reader,
         control,
+        plugin_threads: Vec::new(),
+        sandbox: cfg.sandbox,
     };
     let restore = RestoreRun {
         plan: Arc::clone(&opened.plan),
@@ -1154,7 +1101,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 share.mode.writable(),
                 share.cache,
             )?)),
-            wake: Arc::new(FsWake::new()),
+            wake: Arc::new(Wake::new()),
         });
     }
     let has_blk = virtio.is_some();
@@ -1221,7 +1168,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         })
         .collect();
     let kicker = Kicker::new(vm.clone(), num_cpus, secondaries, is_portable);
-    let vcpus = Arc::new(Vcpus::new(num_cpus, kicker));
+    let vcpus = Arc::new(Vcpus::new(num_cpus, kicker, cfg.take_stop_handle()?));
 
     // The portable guest's clock and timers.
     let hvitime = match &portable {
@@ -1289,7 +1236,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         bridge,
         net_reader,
         control,
+        plugin_threads,
+        sandbox: cfg.sandbox,
     };
+    // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
+    // error goes back as `run` returned it.
     run(shared, num_cpus, io, None)
 }
 
@@ -1306,7 +1257,7 @@ fn attach_hvitime(
     vcpus: &Arc<Vcpus<Kicker>>,
     num_cpus: u32,
     offset: u64,
-) -> Result<Arc<HviTime>, Box<dyn std::error::Error>> {
+) -> Result<Arc<HviTime>, Box<dyn std::error::Error + Send + Sync>> {
     let device = Arc::new(HviTime::new(
         num_cpus as usize,
         crate::checkpoint::profile::counter_freq_hz(),
@@ -1351,7 +1302,10 @@ fn attach_hvitime(
 /// clear it: on the native machine the in-kernel GICv3's, with sizes from
 /// the framework so the devicetree matches `hv_gic`, and under the portable
 /// profile the software GICv2's, at QEMU virt's v2 addresses.
-fn gic_layout(portable: bool, num_cpus: u32) -> Result<GicLayout, Box<dyn std::error::Error>> {
+fn gic_layout(
+    portable: bool,
+    num_cpus: u32,
+) -> Result<GicLayout, Box<dyn std::error::Error + Send + Sync>> {
     let gic = if portable {
         GicLayout::for_vcpus(GicVersion::V2, num_cpus)?
     } else {
@@ -1405,7 +1359,7 @@ fn gic_layout(portable: bool, num_cpus: u32) -> Result<GicLayout, Box<dyn std::e
 fn create_vm(
     gic: &GicLayout,
     portable: Option<Arc<Portable>>,
-) -> Result<(Vm, Irqchip), Box<dyn std::error::Error>> {
+) -> Result<(Vm, Irqchip), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(portable) = portable {
         return Ok((VirtualMachine::new()?, Irqchip::Soft(portable)));
     }
@@ -1417,7 +1371,9 @@ fn create_vm(
 }
 
 /// Allocates `mem_bytes` of guest RAM and maps it at `RAM_BASE`.
-fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::error::Error>> {
+fn map_ram(
+    mem_bytes: u64,
+) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::error::Error + Send + Sync>> {
     // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
     // rather than allocated by applevisor, so an out-of-process plugin can
     // map the same pages. applevisor's memory_create uses hv_vm_allocate,
@@ -1436,7 +1392,7 @@ fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::er
 
 /// Maps every region of `ram` into the VM at its address, read, write and
 /// execute.
-fn map_guest_ram(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error>> {
+fn map_guest_ram(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for region in ram.memory().iter() {
         let ipa = region.start_addr().raw_value();
         // SAFETY: the region is a live, page-aligned mapping of `len()` bytes
@@ -1525,7 +1481,7 @@ fn bind_control(
     checkpoint_root: Option<&str>,
     disk: Option<String>,
     shared: &Shared,
-) -> Result<Option<ControlSocket>, Box<dyn std::error::Error>> {
+) -> Result<Option<ControlSocket>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(path
         .map(|path| {
             ControlSocket::bind(path, Arc::clone(&shared.profile), checkpoint_root).map(|control| {
@@ -1536,18 +1492,18 @@ fn bind_control(
         .transpose()?)
 }
 
-/// Confines the process before the first helper thread exists, when `sandbox`
+/// Confines the process before the first I/O thread exists, when `sandbox`
 /// is set.
 fn confine(
     sandbox: bool,
     fs_access: &[(std::path::PathBuf, bool)],
     control: Option<&ControlSocket>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Everything before this acquires host authority (the VM, the guest-RAM
     // mapping, the block file, the ledger, the gateway connection, the
     // listeners, the terminal), and everything after only services guest I/O
-    // with what is already open. An error here returns before there is a
-    // thread to stop. See `sandbox::seatbelt`.
+    // with what is already open. An error here returns before there is an
+    // I/O thread to stop. See `sandbox::seatbelt`.
     //
     // Failing closed: a profile that will not install is a profile nobody has
     // tested, and continuing would hand a guest-facing process the host's full
@@ -1556,9 +1512,9 @@ fn confine(
         let checkpoint_root = control.and_then(ControlSocket::checkpoint_root);
         seatbelt::enter_for(fs_access, checkpoint_root)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
-        eprintln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
+        stderrln!("{LOG_PREFIX} seatbelt sandbox: on (deny default)");
     } else {
-        eprintln!(
+        stderrln!(
             "{LOG_PREFIX} seatbelt sandbox: OFF (--no-sandbox) — the VMM keeps full host authority"
         );
     }
@@ -1575,53 +1531,19 @@ struct IoStart {
     net_reader: Option<std::os::unix::net::UnixStream>,
     /// The control socket, bound before confinement.
     control: Option<ControlSocket>,
+    /// The threads the plugin asked for in `attach`.
+    plugin_threads: Vec<PluginThread>,
+    /// Whether the process is confined, which the run's start record says.
+    sandbox: bool,
 }
 
 impl IoStart {
     /// Starts the I/O threads, each virtio-fs device's worker and readahead
-    /// threads, whose stops it returns, and the portable guest's hvi-time
-    /// timer thread. Each polls its stop token beside its own descriptor,
-    /// or takes the stop through its `FsWake`, its `ReadaheadStop` or its
-    /// device, and is joined after the vCPUs.
-    ///
-    /// # Errors
-    ///
-    /// Errors when the timer thread or the restore test cannot be started.
-    /// Both start before the rest, so no thread is left running.
-    fn start(self, shared: &Shared) -> std::io::Result<(IoThreads, Vec<server::ReadaheadStop>)> {
-        // The hvi-time timer thread, on the scheduling that wakes it on
-        // time.
-        let timer = match &shared.hvitime {
-            Some(device) => Some(hvitime::spawn_timer(device, || {
-                eprintln!(
-                    "{LOG_PREFIX} hvi-time: timer thread on {}",
-                    hvitime::timer_thread_setup()
-                );
-            })?),
-            None => None,
-        };
-        // The in-process restore test, when `HVI_TIME_TEST_RESTORE` asks for
-        // it. A failure to start it ends the timer thread again.
-        let test = match (&shared.hvitime, hvitime::TestRestore::from_env()) {
-            (Some(device), Some(test)) => {
-                match test.spawn(
-                    Arc::clone(device),
-                    Arc::clone(&shared.guest.vcpus),
-                    || {},
-                    || {},
-                ) {
-                    Ok(thread) => Some(thread),
-                    Err(e) => {
-                        device.stop();
-                        if let Some(timer) = timer {
-                            let _ = timer.join();
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            _ => None,
-        };
+    /// threads, and the portable guest's hvi-time timer thread. Each polls its
+    /// stop token beside its own descriptor, or takes the stop through its
+    /// `Wake`, its `ReadaheadStop` or its device, and is joined after the
+    /// vCPUs.
+    fn start(self, shared: &Shared) -> IoThreads<Kicker> {
         let mut io_threads = IoThreads::start(
             self.stop_source,
             &shared.guest,
@@ -1633,35 +1555,50 @@ impl IoStart {
             self.bridge,
             self.net_reader.map(NetSource::Gateway),
             self.control,
+            self.plugin_threads,
         );
-        let mut readahead_stops = Vec::new();
         // Each virtio-fs device gets its own worker thread, which serves the
-        // requests a vCPU leaves past `FS_INLINE_BUDGET`. See
-        // `spawn_fs_worker`.
+        // requests a vCPU leaves past `FS_INLINE_BUDGET`. See `run_fs_worker`.
         for fs in &shared.fs {
-            io_threads.push(
-                "virtio-fs worker",
-                spawn_fs_worker(
-                    Arc::clone(&fs.dev),
-                    Arc::clone(&shared.guest.ram),
-                    Arc::clone(&fs.wake),
-                    io_threads.token(),
-                ),
+            let (dev, ram, wake) = (
+                Arc::clone(&fs.dev),
+                Arc::clone(&shared.guest.ram),
+                Arc::clone(&fs.wake),
             );
-            let (workers, stop) = lock_or_recover(&fs.dev).start_readahead();
+            io_threads.spawn("virtio-fs worker", move |stop| {
+                run_fs_worker(&dev, &ram, &wake, &stop);
+            });
+            let wake = Arc::clone(&fs.wake);
+            io_threads.on_stop(move || wake.stop());
+            let (workers, stop) = lock_or_recover(&fs.dev).readahead_workers();
             for worker in workers {
-                io_threads.push("virtio-fs readahead", worker);
+                io_threads.spawn("virtio-fs readahead", move |_| worker());
             }
-            readahead_stops.push(stop);
+            io_threads.on_stop(move || stop.stop());
         }
-        if let (Some(device), Some(thread)) = (&shared.hvitime, timer) {
+        if let Some(device) = &shared.hvitime {
+            // The hvi-time timer thread, on the scheduling that wakes it on
+            // time.
             let timer = Arc::clone(device);
-            io_threads.push_ended_by("hvi-time timer", thread, move || timer.stop());
+            io_threads.spawn("hvi-time timer", move |_| {
+                eprintln!(
+                    "{LOG_PREFIX} hvi-time: timer thread on {}",
+                    hvitime::timer_thread_setup()
+                );
+                timer.run_timer();
+            });
+            let timer = Arc::clone(device);
+            io_threads.on_stop(move || timer.stop());
+            // The in-process restore test, when `HVI_TIME_TEST_RESTORE` asks
+            // for it.
+            if let Some(test) = hvitime::TestRestore::from_env() {
+                let (device, vcpus) = (Arc::clone(device), Arc::clone(&shared.guest.vcpus));
+                io_threads.spawn("hvi-time test restore", move |_| {
+                    test.run(&device, &vcpus, || {});
+                });
+            }
         }
-        if let Some(thread) = test {
-            io_threads.push("hvi-time test restore", thread);
-        }
-        Ok((io_threads, readahead_stops))
+        io_threads
     }
 }
 
@@ -1690,7 +1627,7 @@ fn run(
     num_cpus: u32,
     io: IoStart,
     restore: Option<RestoreRun>,
-) -> Result<Stop, Box<dyn std::error::Error>> {
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     install_kick_handler();
     if restore.is_some() {
         io.stop_source
@@ -1703,12 +1640,13 @@ fn run(
             .pause_from_control(std::time::Duration::ZERO)
             .map_err(|e| format!("holding the vCPUs for the restore: {e}"))?;
     }
+    let sandbox = io.sandbox;
     let (mut io, mut started) = match restore {
-        None => (None, Some(io.start(&shared)?)),
+        None => (None, Some(io.start(&shared))),
         Some(_) => (Some(io), None),
     };
+    record_start(&shared.guest, sandbox);
 
-    record_start(&shared.guest, cfg.sandbox);
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
@@ -1720,12 +1658,7 @@ fn run(
         spawned.err().map(Into::into);
     if let (Some(restore), None) = (&restore, &failure) {
         match load(&shared, restore) {
-            Ok(()) => match io.take().map(|io| io.start(&shared)).transpose() {
-                Ok(io) => started = io,
-                Err(e) => {
-                    failure = Some(format!("starting the I/O threads: {e}").into());
-                }
-            },
+            Ok(()) => started = io.take().map(|io| io.start(&shared)),
             Err(e) => {
                 // What a vCPU found wrong is the cause; the import only saw
                 // the stop that followed.
@@ -1927,7 +1860,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         let set = set_baseline(&vcpu, cpu_id, cpu_id == 0)
             .and_then(|()| set_vtimer_offset(&vcpu, sh.vtimer_offset));
         if let Err(e) = set {
-            eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
+            stderrln!("{LOG_PREFIX} vcpu{cpu_id}: {e}");
             lock_or_recover(&p.refused).get_or_insert(e);
             return;
         }
@@ -1955,7 +1888,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             }
         }
         if let Err(e) = sh.profile.complete(|p| p.cpu.ident = midr.map(hex)) {
-            eprintln!("{LOG_PREFIX} {e}");
+            stderrln!("{LOG_PREFIX} {e}");
         }
     }
     let runs_at_once = sh
@@ -1964,7 +1897,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         .map_or(cpu_id == 0, |r| r.runs.get(cpu_id as usize) == Some(&true));
     if sh.restoring.is_some() && runs_at_once {
         // Its registers come from the bundle, in the import.
-        sh.guest.vcpus.mark_started();
+        sh.guest.vcpus.mark_started(cpu_id);
     } else if cpu_id == 0 {
         let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
         let _ = vcpu.set_reg(Reg::X0, sh.dtb_addr);
@@ -1972,7 +1905,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         let _ = vcpu.set_reg(Reg::X2, 0);
         let _ = vcpu.set_reg(Reg::X3, 0);
         let _ = vcpu.set_reg(Reg::CPSR, 0x3c5); // EL1h, DAIF masked
-        sh.guest.vcpus.mark_started();
+        sh.guest.vcpus.mark_started(cpu_id);
     } else {
         // Park until the guest brings this cpu up via PSCI CPU_ON. A restore
         // fills the mailbox of a secondary whose CPU_ON the capture found
@@ -2001,10 +1934,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // the guest, which is after `resume`. See `hvf_state::RestoreClock`.
     let mut clock_set = clock.is_none();
 
-    // The plugin runs on vcpu0, between guest entries, because only this thread
-    // can read this vCPU's registers.
-    let plugin = sh.plugin.as_deref().filter(|_| cpu_id == 0);
-    if is_boot && sh.restoring.is_none() {
+    if cpu_id == 0 && sh.restoring.is_none() {
         // Guest nanoseconds start at 0 at the boot vCPU's first entry.
         if let Some(device) = &sh.hvitime {
             device.publish_boot();
@@ -2013,6 +1943,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     // A restored portable guest's clock is published before its first
     // entry after `resume`.
     let mut published = sh.restoring.is_none();
+    // The plugin runs on vcpu0, between guest entries, because only this thread
+    // can read this vCPU's registers.
+    let plugin = sh.plugin.as_deref().filter(|_| cpu_id == 0);
     let portable = sh.portable.as_deref();
     let mut vtimer = Vtimer {
         offset: vcpu.get_vtimer_offset().unwrap_or(0),
@@ -2028,7 +1961,8 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // look at the guest, or the control socket captures it, doing
             // on this thread the work only it can.
             let mut read_platform = false;
-            sh.guest.pass_safepoint(&vcpu, cpu_id, plugin, |work| match (&sh.irqchip, &sh.hvitime) {
+            sh.guest.pass_safepoint(&vcpu, cpu_id, plugin, |work| {
+                match (&sh.irqchip, &sh.hvitime) {
                     (Irqchip::InKernel(vm_gic), _) => {
                         hvf_state::serve(cpu_id, &vcpu, vm_gic, clock, work)
                     }
@@ -2040,7 +1974,8 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                     (Irqchip::Soft(_), None) => {
                         Err(std::io::Error::other("the portable guest has no hvi-time"))
                     }
-                });
+                }
+            });
             // A capture froze hvi-time to read it. A guest that goes on
             // after it, as `then: "continue"` has it, gets its timers back.
             if read_platform {
@@ -2052,10 +1987,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 let pending = sh.restoring.as_ref().and_then(|r| r.hvitime.as_ref());
                 if let (Some(pending), Some(device)) = (pending, &sh.hvitime) {
                     if let Err(e) = pending.publish(device) {
-                        eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
-                        if let Some(p) = portable {
-                            lock_or_recover(&p.refused).get_or_insert(e);
-                        }
+                        sh.guest
+                            .vcpus
+                            .report(Outcome::Failed(format!("vcpu{cpu_id}: {e}")));
                         break;
                     }
                 }
@@ -2064,7 +1998,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             if !clock_set {
                 if let Some(clock) = clock {
                     if let Err(e) = vcpu.set_vtimer_offset(clock.offset()) {
-                        eprintln!("{LOG_PREFIX} cpu{cpu_id}: setting the vtimer offset: {e:?}");
+                        sh.guest.vcpus.report(Outcome::Failed(format!(
+                            "vcpu{cpu_id}: setting the vtimer offset: {e:?}"
+                        )));
                         break;
                     }
                 }
@@ -2080,154 +2016,117 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 let _ = vcpu.set_pending_interrupt(IRQ_LINE, pending);
             }
 
-            if let Err(e) = vcpu.run() {
-                eprintln!("{LOG_PREFIX} cpu{cpu_id}: vcpu run failed: {e:?}");
+            let flow = match vcpu.run() {
+                Ok(()) => handle_exit(&vcpu, &sh, cpu_id, &mut vtimer, &mut ram_faults),
+                Err(e) => ControlFlow::Break(Outcome::Failed(format!(
+                    "vcpu{cpu_id}: vcpu run failed: {e:?}"
+                ))),
+            };
+            if let ControlFlow::Break(outcome) = flow {
+                sh.guest.vcpus.report(outcome);
                 break;
             }
-            let exit = vcpu.get_exit_info();
-            LAST_EXIT.with(|last| last.set(Some(exit.reason)));
-            // Only RAM faults in a row count towards the repeat cap.
-            if !matches!(exit.reason, ExitReason::EXCEPTION)
-                || Ec::from_syndrome(exit.exception.syndrome) != Ec::DataAbort
-            {
-                ram_faults = RamFaults::default();
-            }
-            match exit.reason {
-                ExitReason::EXCEPTION => {
-                    let syn = exit.exception.syndrome;
-                    match Ec::from_syndrome(syn) {
-                        Ec::Hvc | Ec::Smc => {
-                            trace::exit(trace::Exit::Hvc);
-                            // Not restartable: the saved PC is already past
-                            // HVC/SMC.
-                            if let Some(p) = portable {
-                                match service_firmware(&vcpu, &sh, p) {
-                                    Firmware::Continue => {}
-                                    Firmware::Stop => break,
-                                    Firmware::Suspend => {
-                                        wait_for_interrupt(&vcpu, &sh, p, cpu_id, &mut vtimer);
-                                    }
-                                }
-                            } else if service_psci(&vcpu, &sh) {
-                                break; // SYSTEM_OFF/RESET
+        }
+    }));
+
+    if let Err(payload) = unwound {
+        // The report names where the guest was and what it last did, so it is
+        // usable without a debugger.
+        sh.guest.vcpus.report(Outcome::Failed(format!(
+            "vcpu{cpu_id}: panicked ({}); last exit {:?}, pc {:#x}",
+            crate::panic_message(payload.as_ref()),
+            last_exit(),
+            vcpu.get_reg(Reg::PC).unwrap_or(0)
+        )));
+    }
+}
+
+/// Services one exit of vCPU `cpu_id`.
+///
+/// Returns `ControlFlow::Break` with the run's outcome when the exit ends the
+/// run, and `ControlFlow::Continue` otherwise. The outcome is a guest-requested
+/// stop or a failure.
+// One match over the exits, as the hypervisor reports them.
+#[allow(clippy::too_many_lines)]
+fn handle_exit(
+    vcpu: &Vcpu,
+    sh: &Shared,
+    cpu_id: u32,
+    vtimer: &mut Vtimer,
+    ram_faults: &mut RamFaults,
+) -> ControlFlow<Outcome> {
+    let portable = sh.portable.as_deref();
+    let exit = vcpu.get_exit_info();
+    LAST_EXIT.with(|last| last.set(Some(exit.reason)));
+    // Only RAM faults in a row count towards the repeat cap.
+    if !matches!(exit.reason, ExitReason::EXCEPTION)
+        || Ec::from_syndrome(exit.exception.syndrome) != Ec::DataAbort
+    {
+        *ram_faults = RamFaults::default();
+    }
+    match exit.reason {
+        ExitReason::EXCEPTION => {
+            let syn = exit.exception.syndrome;
+            match Ec::from_syndrome(syn) {
+                Ec::Hvc | Ec::Smc => {
+                    trace::exit(trace::Exit::Hvc);
+                    // Not restartable: the saved PC is already past HVC/SMC.
+                    if let Some(p) = portable {
+                        match service_firmware(vcpu, sh, p) {
+                            Firmware::Continue => {}
+                            Firmware::Stop(stop) => {
+                                return ControlFlow::Break(Outcome::Stopped(stop))
+                            }
+                            Firmware::Suspend => {
+                                wait_for_interrupt(vcpu, sh, p, cpu_id, vtimer);
                             }
                         }
-                        Ec::DataAbort => {
-                            let ipa = exit.exception.physical_address;
-                            // A write to guest RAM a live move protected:
-                            // the log records it and makes the granule
-                            // writable again, and the store runs again,
-                            // with the PC where it was.
-                            let ram_write = match sh.write_log.fault(ipa) {
-                                Ok(served) => served,
-                                Err(e) => {
-                                    eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
-                                    break;
-                                }
-                            };
-                            if ram_write {
-                                ram_faults.note(ipa & !(sh.write_log.granule() - 1));
-                                if ram_faults.repeats > RAM_FAULT_REPEATS {
-                                    eprintln!(
-                                        "{LOG_PREFIX} cpu{cpu_id}: guest RAM at {ipa:#x} faults \
-                                         again after it was made writable (pc {:#x})",
-                                        vcpu.get_reg(Reg::PC).unwrap_or(0)
-                                    );
-                                    break;
-                                }
-                            } else if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
-                                trace::exit(trace::Exit::Mmio);
-                                service_uart(&vcpu, &sh, ipa - UART_BASE, syn);
-                                advance_pc(&vcpu);
-                            } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
-                                trace::exit(trace::Exit::Mmio);
-                                if let Some(dev) = &sh.guest.block {
-                                    service_dev(&vcpu, &sh, dev, ipa - VIRTIO_BASE, syn);
-                                }
-                                advance_pc(&vcpu);
-                            } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE)
-                                .contains(&ipa)
-                            {
-                                trace::exit(trace::Exit::Mmio);
-                                if let Some(dev) = &sh.guest.net {
-                                    service_net(&vcpu, &sh, dev, ipa - VIRTIO_NET_BASE, syn);
-                                }
-                                advance_pc(&vcpu);
-                            } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE)
-                                .contains(&ipa)
-                            {
-                                trace::exit(trace::Exit::Mmio);
-                                if let Some(dev) = &sh.guest.vsock {
-                                    service_vsock(&vcpu, &sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
-                                }
-                                advance_pc(&vcpu);
-                            } else if let Some(fs) = sh
-                                .fs
-                                .iter()
-                                .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
-                            {
-                                service_fs(&vcpu, &sh, fs, ipa - fs.base, syn);
-                                advance_pc(&vcpu);
-                            } else if let Some(p) = portable.filter(|p| p.in_gic(ipa)) {
-                                trace::exit(trace::Exit::Gic);
-                                service_gic(&vcpu, &sh, p, cpu_id, ipa, syn, &mut vtimer);
-                                advance_pc(&vcpu);
-                            } else if let Some(device) = sh.hvitime.as_deref().filter(|_| {
-                                (HVI_TIME_TIMERS_BASE..HVI_TIME_TIMERS_BASE + hvitime::TIMERS_SIZE)
-                                    .contains(&ipa)
-                            }) {
-                                trace::exit(trace::Exit::Timer);
-                                service_hvitime(&vcpu, device, ipa - HVI_TIME_TIMERS_BASE, syn);
-                                advance_pc(&vcpu);
-                            } else if sh.hvitime.is_some()
-                                && (HVI_TIME_PAGE_BASE..HVI_TIME_PAGE_BASE + hvitime::PAGE_SIZE)
-                                    .contains(&ipa)
-                            {
-                                // A write to the read-only page: dropped, as
-                                // KVM drops one to a read-only memory slot.
-                                trace::exit(trace::Exit::Mmio);
-                                advance_pc(&vcpu);
-                            } else {
-                                eprintln!(
-                                    "{LOG_PREFIX} cpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
-                                    vcpu.get_reg(Reg::PC).unwrap_or(0)
-                                );
-                                break;
-                            }
+                    } else {
+                        service_psci(vcpu, sh)?;
+                    }
+                }
+                Ec::DataAbort => {
+                    let ipa = exit.exception.physical_address;
+                    // A write to guest RAM a live move protected: the log
+                    // records it and makes the granule writable again, and the
+                    // store runs again, with the PC where it was.
+                    let ram_write = match sh.write_log.fault(ipa) {
+                        Ok(served) => served,
+                        Err(e) => {
+                            return ControlFlow::Break(Outcome::Failed(format!(
+                                "vcpu{cpu_id}: {e}"
+                            )));
                         }
-                        Ec::SysReg => {
-                            trace::exit(trace::Exit::SysReg);
-                            // RAZ/WI: unmodeled system register. Without
-                            // hv_gic the physical counter traps too, and reads
-                            // the guest's counter.
-                            let iss = syn & 0x1ff_ffff;
-                            if iss & 1 == 1 {
-                                let value = match portable {
-                                    Some(_) if is_physical_counter(iss) => vtimer.counter(),
-                                    _ => 0,
-                                };
-                                write_gpr(&vcpu, ((iss >> 5) & 0x1f) as u8, value);
-                            }
-                            advance_pc(&vcpu);
-                        }
-                        // WFx. The native machine's hv_gic handled the wait.
-                        // Without it a WFI exits at once with the PC on it, so
-                        // hvi steps past it and waits here.
-                        Ec::Other(0x01) => {
-                            trace::exit(trace::Exit::Wfi);
-                            if let Some(p) = portable {
-                                advance_pc(&vcpu);
-                                if syn & 0b11 == 0 {
-                                    wait_for_interrupt(&vcpu, &sh, p, cpu_id, &mut vtimer);
-                                }
-                            }
-                        }
-                        other => {
-                            eprintln!(
-                                "{LOG_PREFIX} cpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
+                    };
+                    if ram_write {
+                        ram_faults.note(ipa & !(sh.write_log.granule() - 1));
+                        if ram_faults.repeats > RAM_FAULT_REPEATS {
+                            return ControlFlow::Break(Outcome::Failed(format!(
+                                "vcpu{cpu_id}: guest RAM at {ipa:#x} faults again after it was \
+                                 made writable (pc {:#x})",
                                 vcpu.get_reg(Reg::PC).unwrap_or(0)
-                            );
-                            break;
+                            )));
+                        }
+                    } else if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
+                        trace::exit(trace::Exit::Mmio);
+                        service_uart(vcpu, sh, ipa - UART_BASE, syn);
+                        advance_pc(vcpu);
+                    } else if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_SIZE).contains(&ipa) {
+                        trace::exit(trace::Exit::Mmio);
+                        if let Some(dev) = &sh.guest.block {
+                            service_dev(vcpu, sh, dev, ipa - VIRTIO_BASE, syn);
+                        }
+                        advance_pc(vcpu);
+                    } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
+                        trace::exit(trace::Exit::Mmio);
+                        if let Some(dev) = &sh.guest.net {
+                            service_net(vcpu, sh, dev, ipa - VIRTIO_NET_BASE, syn);
+                        }
+                        advance_pc(vcpu);
+                    } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&ipa) {
+                        trace::exit(trace::Exit::Mmio);
+                        if let Some(dev) = &sh.guest.vsock {
+                            service_vsock(vcpu, sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
                         }
                         advance_pc(vcpu);
                     } else if let Some(fs) = sh
@@ -2237,6 +2136,25 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                     {
                         service_fs(vcpu, sh, fs, ipa - fs.base, syn);
                         advance_pc(vcpu);
+                    } else if let Some(p) = portable.filter(|p| p.in_gic(ipa)) {
+                        trace::exit(trace::Exit::Gic);
+                        service_gic(vcpu, sh, p, cpu_id, ipa, syn, vtimer);
+                        advance_pc(vcpu);
+                    } else if let Some(device) = sh.hvitime.as_deref().filter(|_| {
+                        (HVI_TIME_TIMERS_BASE..HVI_TIME_TIMERS_BASE + hvitime::TIMERS_SIZE)
+                            .contains(&ipa)
+                    }) {
+                        trace::exit(trace::Exit::Timer);
+                        service_hvitime(vcpu, device, ipa - HVI_TIME_TIMERS_BASE, syn);
+                        advance_pc(vcpu);
+                    } else if sh.hvitime.is_some()
+                        && (HVI_TIME_PAGE_BASE..HVI_TIME_PAGE_BASE + hvitime::PAGE_SIZE)
+                            .contains(&ipa)
+                    {
+                        // A write to the read-only page: dropped, as KVM drops
+                        // one to a read-only memory slot.
+                        trace::exit(trace::Exit::Mmio);
+                        advance_pc(vcpu);
                     } else {
                         return ControlFlow::Break(Outcome::Failed(format!(
                             "vcpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
@@ -2244,33 +2162,54 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                         )));
                     }
                 }
-                ExitReason::VTIMER_ACTIVATED => {
-                    trace::exit(trace::Exit::Vtimer);
-                    let _ = vcpu.set_vtimer_mask(true);
-                    // Without hv_gic the timer reaches the guest only as this
-                    // exit. The line stays high, and the timer masked, until
-                    // the guest ends the interrupt (`end_vtimer_interrupt`).
+                Ec::SysReg => {
+                    trace::exit(trace::Exit::SysReg);
+                    // RAZ/WI: unmodeled system register. Without hv_gic the
+                    // physical counter traps too, and reads the guest's
+                    // counter.
+                    let iss = syn & 0x1ff_ffff;
+                    if iss & 1 == 1 {
+                        let value = match portable {
+                            Some(_) if is_physical_counter(iss) => vtimer.counter(),
+                            _ => 0,
+                        };
+                        write_gpr(vcpu, ((iss >> 5) & 0x1f) as u8, value);
+                    }
+                    advance_pc(vcpu);
+                }
+                // WFx. The native machine's hv_gic handled the wait. Without
+                // it a WFI exits at once with the PC on it, so hvi steps past
+                // it and waits here.
+                Ec::Other(0x01) => {
+                    trace::exit(trace::Exit::Wfi);
                     if let Some(p) = portable {
-                        vtimer.raised = true;
-                        lock_or_recover(&p.gic).set_ppi_line(cpu_id as usize, VTIMER_INTID, true);
+                        advance_pc(vcpu);
+                        if syn & 0b11 == 0 {
+                            wait_for_interrupt(vcpu, sh, p, cpu_id, vtimer);
+                        }
                     }
                 }
-                // Kicked: for a snapshot, a stop or an interrupt.
-                ExitReason::CANCELED => trace::exit(trace::Exit::Kicked),
-                ExitReason::UNKNOWN => {
-                    // hvf could not say why it exited, so there is nothing to
-                    // resume into.
-                    eprintln!(
-                        "{LOG_PREFIX} cpu{cpu_id}: unknown exit reason (pc {:#x})",
+                other => {
+                    return ControlFlow::Break(Outcome::Failed(format!(
+                        "vcpu{cpu_id}: unhandled exception {other:?} (pc {:#x})",
                         vcpu.get_reg(Reg::PC).unwrap_or(0)
                     )));
                 }
             }
         }
         ExitReason::VTIMER_ACTIVATED => {
+            trace::exit(trace::Exit::Vtimer);
             let _ = vcpu.set_vtimer_mask(true);
+            // Without hv_gic the timer reaches the guest only as this exit. The
+            // line stays high, and the timer masked, until the guest ends the
+            // interrupt (`end_vtimer_interrupt`).
+            if let Some(p) = portable {
+                vtimer.raised = true;
+                lock_or_recover(&p.gic).set_ppi_line(cpu_id as usize, VTIMER_INTID, true);
+            }
         }
-        ExitReason::CANCELED => {} // kicked for a snapshot or a stop
+        // Kicked: for a snapshot, a stop or an interrupt.
+        ExitReason::CANCELED => trace::exit(trace::Exit::Kicked),
         ExitReason::UNKNOWN => {
             // hvf could not say why it exited, so there is nothing to resume
             // into.
@@ -2733,8 +2672,8 @@ fn set_baseline(vcpu: &Vcpu, cpu: u32, log: bool) -> Result<(), String> {
 enum Firmware {
     /// The guest goes on after its HVC.
     Continue,
-    /// `SYSTEM_OFF` or a reset: the VM stops.
-    Stop,
+    /// `SYSTEM_OFF` or a reset: the VM stops, as the guest asked.
+    Stop(Stop),
     /// `CPU_SUSPEND`: the vCPU waits as for a WFI, then goes on.
     Suspend,
 }
@@ -2772,20 +2711,13 @@ fn service_firmware(vcpu: &Vcpu, sh: &Shared, p: &Portable) -> Firmware {
         fw::CPU_ON_32 | fw::CPU_ON_64 => cpu_on(sh, p, arg(Reg::X1), arg(Reg::X2), arg(Reg::X3)),
         fw::AFFINITY_INFO_32 | fw::AFFINITY_INFO_64 => affinity_info(p, arg(Reg::X1), arg(Reg::X2)),
         fw::MIGRATE_INFO_TYPE => fw::MIGRATE_NOT_REQUIRED,
-        fw::SYSTEM_OFF => {
-            sh.guest.vcpus.set_stop_reason(Stop::SystemOff);
-            return Firmware::Stop;
-        }
-        fw::SYSTEM_RESET => {
-            sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
-            return Firmware::Stop;
-        }
+        fw::SYSTEM_OFF => return Firmware::Stop(Stop::SystemOff),
+        fw::SYSTEM_RESET => return Firmware::Stop(Stop::SystemReset),
         fw::SYSTEM_RESET2_32 | fw::SYSTEM_RESET2_64 => {
             // The architectural warm reset (0) or a vendor reset.
             let kind = arg(Reg::X1);
             if kind == 0 || kind >= 0x8000_0000 {
-                sh.guest.vcpus.set_stop_reason(Stop::SystemReset);
-                return Firmware::Stop;
+                return Firmware::Stop(Stop::SystemReset);
             }
             fw::INVALID_PARAMETERS
         }
@@ -2985,19 +2917,19 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// mutex, and the device sets its line at the end of the pass. So a pass raises
 /// the line and kicks the vCPUs at most once, however many requests it served.
 ///
-/// `wake.park()` waits on a predicate and a `Condvar` (see `FsWake`), and the
+/// `wake.park()` waits on a predicate and a `Condvar` (see `Wake`), and the
 /// vCPU thread signals whenever its inline drain leaves work. A notify that
 /// races the loop is either served by the drain in progress, since both sides
 /// take the device mutex, or seen by the next `park()`. The mutex is held only
 /// for the drain, never across `park()`.
 ///
-/// [`FsWake::stop`], which runs once the vCPUs have exited or been left
-/// running, ends the loop at the next `park`. The worker then drains the chains
+/// [`Wake::stop`], which runs once the vCPUs have exited or been left running,
+/// ends the loop at the next `park`. The worker then drains the chains
 /// announced by a wake that arrived with the stop.
 ///
 /// Each drain passes the pause gate of `stop` first, so a pause holds the
 /// worker back between drains. The worker parks outside the gate.
-fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake, stop: &StopToken) {
+fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &Wake, stop: &StopToken) {
     while wake.park() {
         let _in = stop.enter();
         lock_or_recover(dev).drain_notified(mem);
@@ -3084,6 +3016,46 @@ fn gpr(idx: u8) -> Option<Reg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CachePolicy;
+
+    // A worker stuck in a host call holds the device past the stop deadline.
+    // The report must not wait for it, or `boot` never returns the error that
+    // names the worker.
+    #[test]
+    fn report_fs_usage_skips_a_device_another_thread_holds() {
+        let dir = std::env::temp_dir().join(format!("hvi-fs-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let dev = Arc::new(Mutex::new(
+            VirtioFs::new(root, "share", false, CachePolicy::Auto).unwrap(),
+        ));
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || {
+                let _device = dev.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = released.recv();
+            })
+        };
+        holding.recv().unwrap();
+        let report = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || report_fs_usage(0, &dev))
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !report.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let finished = report.is_finished();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        report.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(finished, "the report waited for the device");
+    }
 
     /// The ISS of a guest `mrs x3, cntpct_el0` without hv_gic, as measured on
     /// an M5 (`S3_3_C14_C0_1`, Rt 3, read).
@@ -3147,47 +3119,5 @@ mod tests {
         // No vCPU has that affinity, or the target has bits outside it.
         assert_eq!(affinity_info(&p, 5, 0), fw::INVALID_PARAMETERS);
         assert_eq!(affinity_info(&p, 0x8000_0000, 0), fw::INVALID_PARAMETERS);
-    }
-
-    use crate::config::CachePolicy;
-    use std::time::{Duration, Instant};
-
-    // A worker stuck in a host call holds the device past the stop deadline.
-    // The report must not wait for it, or `boot` never returns the error that
-    // names the worker.
-    #[test]
-    fn report_fs_usage_skips_a_device_another_thread_holds() {
-        let dir = std::env::temp_dir().join(format!("hvi-fs-usage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = std::fs::canonicalize(&dir).unwrap();
-        let dev = Arc::new(Mutex::new(
-            VirtioFs::new(root, "share", false, CachePolicy::Auto).unwrap(),
-        ));
-        let (held, holding) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let worker = {
-            let dev = Arc::clone(&dev);
-            std::thread::spawn(move || {
-                let _device = dev.lock().unwrap();
-                held.send(()).unwrap();
-                let _ = released.recv();
-            })
-        };
-        holding.recv().unwrap();
-        let report = {
-            let dev = Arc::clone(&dev);
-            std::thread::spawn(move || report_fs_usage(0, &dev))
-        };
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !report.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let finished = report.is_finished();
-        release.send(()).unwrap();
-        worker.join().unwrap();
-        report.join().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(finished, "the report waited for the device");
     }
 }
