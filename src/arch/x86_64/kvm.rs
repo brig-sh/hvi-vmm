@@ -354,6 +354,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
                 path,
                 cfg.disk_base_sha256.is_some(),
+                cfg.disk_written.as_deref(),
             )?)))
         }
         None => None,

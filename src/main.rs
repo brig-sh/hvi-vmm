@@ -267,6 +267,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disk = None;
     let mut disk_base_sha256 = None;
+    let mut disk_written = None;
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares = Vec::new();
@@ -309,6 +310,13 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 disk_base_sha256 = Some(v.clone());
+            }
+            // The blocks where the disk already differs from that base, as
+            // a bitmap file: a launcher that wrote files into its copy of
+            // the base before the boot names them here, so a move by
+            // blocks sends them too.
+            "--disk-written" => {
+                disk_written = Some(it.next().ok_or("--disk-written needs a file")?.clone());
             }
             // The uid and gid the host's files carry inside the guest. The
             // default is root, which suits a guest whose workload runs as root;
@@ -452,6 +460,26 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if disk_base_sha256.is_some() && disk.is_none() {
         return Err("--disk-base-sha256 needs --disk, the disk it describes".into());
     }
+    if disk_written.is_some() && disk_base_sha256.is_none() {
+        return Err("--disk-written needs --disk-base-sha256, the base it differs from".into());
+    }
+    // A bitmap of the largest disk with a base, 4 TiB, is 8 MiB; read no
+    // more than one byte past that, so a wrong file is refused without
+    // reading it whole.
+    let disk_written = disk_written
+        .map(
+            |path: String| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                use std::io::Read as _;
+                let mut bits = Vec::new();
+                std::fs::File::open(&path)
+                    .map_err(|e| format!("--disk-written {path}: {e}"))?
+                    .take((8 << 20) + 1)
+                    .read_to_end(&mut bits)
+                    .map_err(|e| format!("--disk-written {path}: {e}"))?;
+                Ok(bits)
+            },
+        )
+        .transpose()?;
     if checkpoint_root.is_some() && control_sock.is_none() {
         return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
     }
@@ -468,6 +496,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cmdline,
         disk,
         disk_base_sha256,
+        disk_written,
         fs_shares,
         net,
         net_gateway,

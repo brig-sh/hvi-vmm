@@ -88,6 +88,7 @@ let cfg = BootConfig {
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
     disk: None,
     disk_base_sha256: None,
+    disk_written: None,
     fs_shares: Vec::new(),
     net: true,
     net_gateway: None,
