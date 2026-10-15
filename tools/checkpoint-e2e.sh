@@ -532,11 +532,19 @@ else:
     dst = Guest("restored", [hvi, "restore", "--from", bundle] + dst_args)
 dctl = Control(dst, f"{socks}/dst.sock")
 status, status_at = dctl.ask(op="status")
+disk_check_s = 0.0
 if by_blocks:
-    # Both still: the source fenced, the destination restored-paused.
+    # Both still: the source fenced, the destination restored-paused. The
+    # hashing delays the resume, so it is taken out of the downtime below.
+    hashed_at = now()
     disk_sums = (sha256_of(image), sha256_of(dst_disk))
+    disk_check_s = now() - hashed_at
 resumed, resume_at = dctl.ask(op="resume")
 stream_moves = [stream_summary(fence, wall_t0 + resume_at)] if stream else []
+if stream_moves and stream_moves[0].get("downtime_precopy_end_to_resume_ms") is not None:
+    stream_moves[0]["disk_check_ms"] = round(disk_check_s * 1000, 1)
+    stream_moves[0]["downtime_less_disk_check_ms"] = round(
+        stream_moves[0]["downtime_precopy_end_to_resume_ms"] - disk_check_s * 1000, 1)
 
 check(fence.get("ok") is True and fence.get("state") == "fenced",
       ("migrate" if stream else "checkpoint") + " then=fence"
