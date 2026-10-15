@@ -12,3 +12,6 @@
 ev.ndjson
 run.log
 smoke.log
+
+# Bytecode Python writes beside the tools it runs.
+__pycache__/
