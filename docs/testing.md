@@ -213,6 +213,15 @@ ticks carry is `CLOCK_BOOTTIME`, which
 `hvi-time` moves on by the downtime, so the continuity checks take the
 downtime the restore logged off.
 
+The two timer checks assume the move takes well under 6 s from the
+request. On a host disk that stalls it may not: on rp2 with its drive
+logging I/O timeouts, a `--stream` idle run spent 5611 ms in the sync
+before the pause and 2637 ms in the gate waiting for the guest's
+virtio-blk request in flight, so both timers fired on the source before
+the capture and the run failed those two checks, 48 of 50. Two runs
+right after passed 50 of 50. Read such a failure with the move's
+`disk_sync_ms` and `gate_ms` beside it.
+
 ## The live-move end-to-end test
 
 `tools/stream-e2e.sh` is `tools/checkpoint-e2e.sh --stream`: both moves are

@@ -332,7 +332,9 @@ thing that differs by backend:
   served on a worker thread of its own (`block::serve`), not in the vCPU's
   exit: a notify only wakes the worker, which takes each chain, makes the disk
   call with no device lock held, and returns the chain, in order and one at a
-  time. A flush or a write that waits seconds on a busy host disk then stops
+  time. A write's data is copied out of guest RAM when the chain is taken,
+  under the lock, so a driver that resets the device while the write is in
+  flight cannot change what lands on the disk. A flush or a write that waits seconds on a busy host disk then stops
   no vCPU. The worker starts with the I/O threads, runs under the `vmm`
   seccomp filter and raises the line from its thread, as the network relay
   does.
