@@ -351,6 +351,52 @@ impl StopToken {
         Ok(fds[1].revents == 0)
     }
 
+    /// Blocks until `fd` takes a write, the stop is requested, or `deadline`
+    /// passes.
+    ///
+    /// It reports [`Writable::Ready`] as [`wait_writable`](Self::wait_writable)
+    /// reports `true`: when `fd` is writable, or reports a hangup or an error.
+    /// The time left is measured again after every wake, a signal's included,
+    /// so the wait never outlasts `deadline` by more than a millisecond.
+    ///
+    /// # Errors
+    ///
+    /// Errors if `poll` fails for a reason other than a signal.
+    pub fn wait_writable_until(
+        &self,
+        fd: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> io::Result<Writable> {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(Writable::TimedOut);
+            }
+            // Rounded up, so a wait with less than a millisecond left does not
+            // spin on a zero timeout.
+            let millis =
+                libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
+            let mut out = pollfd(fd.as_raw_fd());
+            out.events = libc::POLLOUT;
+            let mut fds = [out, pollfd(self.read.as_raw_fd())];
+            // SAFETY: `fds` is a live array of `pollfd` and the length matches.
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if fds[1].revents != 0 {
+                return Ok(Writable::Stopped);
+            }
+            if ret > 0 {
+                return Ok(Writable::Ready);
+            }
+        }
+    }
+
     /// Returns whether a helper that waits on something other than `fd` should
     /// keep waiting.
     ///
@@ -381,6 +427,18 @@ impl StopToken {
         poll(&mut fds, millis)?;
         Ok(fds[0].revents == 0)
     }
+}
+
+/// How a [`StopToken::wait_writable_until`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writable {
+    /// The descriptor takes a write, or reports a hangup or an error that the
+    /// write will return.
+    Ready,
+    /// The stop was requested.
+    Stopped,
+    /// The deadline passed first.
+    TimedOut,
 }
 
 /// Builds a `pollfd` that waits for `fd` to become readable.
@@ -469,6 +527,45 @@ mod tests {
         assert!(token.wait_writable(ours.as_fd()).expect("poll"));
         source.request_stop();
         assert!(!token.wait_writable(ours.as_fd()).expect("poll"));
+    }
+
+    // A socket whose peer reads nothing fills up, and a wait for room ends at
+    // its deadline, not later; room or a stop ends it sooner.
+    #[test]
+    fn wait_writable_until_ends_at_the_deadline() {
+        let source = StopSource::new().expect("pair");
+        let token = source.token();
+        let (_peer, mut ours) = UnixStream::pair().expect("pair");
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            token.wait_writable_until(ours.as_fd(), soon).expect("poll"),
+            Writable::Ready
+        );
+        ours.set_nonblocking(true).expect("non-blocking");
+        while ours.write(&[0u8; 4096]).is_ok() {}
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
+        assert_eq!(
+            token
+                .wait_writable_until(ours.as_fd(), deadline)
+                .expect("poll"),
+            Writable::TimedOut
+        );
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert_eq!(
+            token
+                .wait_writable_until(ours.as_fd(), started)
+                .expect("poll"),
+            Writable::TimedOut,
+            "a deadline already past"
+        );
+        source.request_stop();
+        assert_eq!(
+            token.wait_writable_until(ours.as_fd(), soon).expect("poll"),
+            Writable::Stopped
+        );
     }
 
     // Dropping the source must stop the tokens, so `boot` unwinding past its
