@@ -784,9 +784,9 @@ the control socket and, in the final round, a paused guest:
 - Any write that waits 30 s for the reader to take a byte fails the move.
 - From the moment the vCPUs are parked with their state in hand, the rest
   of the stream must be written within 10 s plus twice the time the last
-  round with the guest running took. The final round holds what the guest
-  wrote during that round, so a reader that kept up with it keeps up with
-  this one. A slow park does not count against it, since nothing is
+  round with the guest running took, its disk round included. The final
+  round holds what the guest wrote during that round, to RAM and to the
+  disk, so a reader that kept up with it keeps up with this one. A slow park does not count against it, since nothing is
   written while the vCPUs park.
 
 Either failure leaves the VM as the request found it, as any failure before

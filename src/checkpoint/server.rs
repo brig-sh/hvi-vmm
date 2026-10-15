@@ -143,7 +143,8 @@ impl Default for StreamLimits {
 
 impl StreamLimits {
     /// Returns how long the stream may take from the pause to the manifest,
-    /// given how long the last round with the guest running took.
+    /// given how long the last round with the guest running took, its disk
+    /// round included.
     ///
     /// The final round holds what the guest wrote during that round, so it
     /// is at most about as large, and the reader took that round at the rate
@@ -1072,10 +1073,7 @@ impl<K: Kick> Machine<'_, K> {
         let precopy_end_unix_ms = unix_ms();
 
         let paused_at = Instant::now();
-        let last_round = precopy
-            .rounds
-            .last()
-            .map_or(Duration::ZERO, |r| Duration::from_millis(r.ms));
+        let last_round = precopy.last_round_time();
         let times = if found == VmState::Running {
             match self.pause_within(self.stream.park) {
                 Ok(times) => times,
