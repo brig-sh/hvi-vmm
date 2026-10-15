@@ -127,7 +127,7 @@ guest, the source must never run it again. After a fenced capture:
 - `status` reports `fenced`, with every vCPU parked.
 - `resume` is refused with `fenced`, on this connection and on any later one.
 - `pause` answers `fenced` and changes nothing.
-- A second `checkpoint` is refused with `fenced`.
+- A second `checkpoint`, or a `migrate`, is refused with `fenced`.
 - `stop` ends the run as usual.
 
 The fence holds only while this hvi process lives. It is not written
@@ -722,18 +722,33 @@ records, ORed into one set of 4 KiB pages:
 
 The rounds with the guest running stop when the pages written during the
 last one come to at most 8 MiB or 2% of the RAM round 0 found present,
-whichever is larger (`converged`), after 5 rounds (`round_cap`), or 60 s
-after the start (`time_cap`); `max_rounds` and `max_secs` on the request
-lower or change those two. Then the guest is paused as for a checkpoint,
-the disk is synced, and the final round sends the pages left and every page
-written since, with nothing running. A guest that writes faster than the
+whichever is larger (`converged`), after 5 rounds (`round_cap`), or when a
+round ends 60 s or more after the start (`time_cap`); `max_rounds` and
+`max_secs` on the request change those two. The time cap is checked only
+as each round ends, so a round under way runs to its end: a large round 0
+behind a slow reader can take longer than `max_secs` on its own. Then the
+guest is paused as for a checkpoint, the disk is synced, and the final
+round sends the pages left and every page written since, with nothing
+running. A guest that writes faster than the
 rounds copy never converges: the round cap ends it, and its final round is
 as large as what it writes in one round, so the pause lasts as long as
 that takes to send. The final round is always taken paused.
 
 Only the control thread writes the stream. A slow reader holds it up, and
 the guest runs on meanwhile; the pause starts once the last round with the
-guest running is written. A zero page in a later round is sent as a clear
+guest running is written. A reader that stops taking the stream without
+closing the connection is not waited for without end, since it would hold
+the control socket and, in the final round, a paused guest:
+
+- Any write that waits 30 s for the reader to take a byte fails the move.
+- From the pause, the rest of the stream must be written within 10 s plus
+  twice the time the last round with the guest running took. The final
+  round holds what the guest wrote during that round, so a reader that kept
+  up with it keeps up with this one.
+
+Either failure leaves the VM as the request found it, as any failure before
+the manifest does: running, and not fenced. The reply then waits at most
+2 s for room, and the connection is closed if it does not fit. A zero page in a later round is sent as a clear
 bit, and the destination zeroes it where an earlier round wrote it.
 
 ### The fence of a live move
@@ -743,9 +758,11 @@ the client reads it as a reply line where the next frame header was due.
 `then: "fence"` fences once the manifest is written to the connection,
 which is before the client has read it, and releases the disk's lock at
 once, since the destination may open the disk as soon as it has the
-manifest. A fenced VM can be streamed again with another `migrate`, which
-the caller does when its first stream did not arrive: the guest has not
-run since, so the stream is the same machine, and the VM stays fenced.
+manifest. A later `migrate` on the fenced VM is refused with `fenced`,
+whatever its `then`, `txid` or `epoch`: the destination may run the guest
+by then, and a second stream would be a second copy that can resume. A
+caller that must be able to send the stream again keeps its own copy as it
+reads it.
 
 ### The stream format
 

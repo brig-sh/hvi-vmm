@@ -3085,7 +3085,16 @@ impl VirtioFs {
         let want = requested.min(capacity).min(MAX_WRITE as usize);
         let (iov, _covered) = build_iov(mem, output, OUT_HEADER_LEN, want).ok()?;
 
-        let n = match preadv_retry(&handle.file, &iov, offset) {
+        let read = preadv_retry(&handle.file, &iov, offset);
+        // `preadv` wrote guest RAM through `host_ptr`, which the RAM's dirty
+        // log does not see. Mark every output descriptor, a superset of
+        // what it wrote, failure included, since a retried read may have
+        // written part before it failed. A live move refuses a guest with
+        // shares today; this keeps the log whole if that ever changes.
+        for &(addr, len) in output {
+            mem.mark_dirty(addr, u64::from(len));
+        }
+        let n = match read {
             Ok(n) => n,
             Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
         };
@@ -12572,7 +12581,16 @@ mod tests {
         // remaining 600 payload bytes in a second -- the payload spans both.
         write_desc(&mem, desc, 1, out1, 416, DESC_WRITE | DESC_NEXT, 2);
         write_desc(&mem, desc, 2, out2, 600, DESC_WRITE, 0);
+        mem.dirty_log().clear();
         notify_head(&mut dev, &mem, avail, 0);
+        // Only `preadv` wrote the second descriptor, through a raw pointer:
+        // a live move sees it only if the read marked it.
+        let mut written = crate::memory::DirtyPages::new(&mem.regions());
+        mem.dirty_log().take_into(&mut written).unwrap();
+        assert!(
+            written.contains(0, (out2 - base) / 4096),
+            "the direct read did not mark what it wrote"
+        );
 
         let mut got = vec![0u8; 1000];
         mem.read(out1 + OUT_HEADER_LEN as u64, &mut got[0..400])
