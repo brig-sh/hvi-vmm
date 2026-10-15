@@ -1137,12 +1137,13 @@ without the host's CPU loops, 30 moves per build, random gaps:
 
 | Build | Failed | `park_ms`: median, 90th percentile, longest; moves over 100 ms | `gate_ms`: median, longest | `paused_ms`: median, longest |
 | --- | --- | --- | --- | --- |
-| `c4131f5`, requests on the vCPU | 0 of 30 | 3, 540, 2237 ms; 14 | 0, 0 ms | 339, 5069 ms |
+| `c4131f5`, requests on the vCPU | 0 of 30 | 3, 540, 2237 ms; 13 | 0, 0 ms | 339, 5069 ms |
 | `ed47427`, requests on the worker | 0 of 30 | 0, 0, 0 ms; 0 | 0, 2120 ms | 326, 2475 ms, with the gate's wait |
 | `fca7c94`, the same, `paused_ms` without the gate | 0 of 30 | 0, 0, 0 ms; 0 | 0, 322 ms | 310, 11619 ms |
 
-The wait moved to the gate, where the vCPUs run on: 2 to 3 of 30 moves
-found a request in flight and waited 312 ms to 2120 ms for it. What the
+The wait moved to the gate, where the vCPUs run on: in each worker build
+2 of 30 moves found a request in flight and waited 312 ms to 2120 ms for
+it, and in `fca7c94` one more waited 3 ms. What the
 guest is stopped for now is the sync in the pause: `pause_sync_ms` had a
 median of 303 ms of the 310 ms, and the longest, 11610 ms, is the whole
 of the longest `paused_ms` (see [limitations.md](limitations.md)). A
