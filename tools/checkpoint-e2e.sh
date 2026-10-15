@@ -355,14 +355,38 @@ def stream_summary(reply, resume_wall=None):
 
 def dirty_goes_on(guest, after, where):
     """Checks that /dirty writes on in `guest` after `after` and that no
-    page it wrote lost a write."""
+    page it wrote lost a write.
+
+    The first pass reported after `after` may have begun before the move,
+    so it checked some pages before the move only; the pass after it
+    checks every page after the move."""
     if not dirty:
         return
-    got = guest.wait_for(r"DIRTY pass \d+ bad \d+", 20, after=after)
+    pass_line = r"DIRTY pass (\d+) bad \d+"
+    first = guest.wait_for(pass_line, 20, after=after)
+    got = None
+    if first:
+        n = int(re.search(pass_line, first[1]).group(1))
+        end = time.monotonic() + 20
+        while got is None and time.monotonic() < end:
+            got = next((line for line in guest.outputs(pass_line, after=first[0])
+                        if int(re.search(pass_line, line[1]).group(1)) > n), None)
+            time.sleep(0.05)
     bad = [s for _, s in guest.outputs(r"DIRTY-BAD")]
     check(got is not None and " bad 0 " in got[1] and not bad,
-          f"/dirty writes on {where} and every page held its last write: "
-          f"{got[1] if got else None}, {len(bad)} DIRTY-BAD line(s) {bad[:2]}")
+          f"/dirty writes on {where} and every page held its last write, through a pass "
+          f"begun after the move: {got[1] if got else None}, {len(bad)} DIRTY-BAD line(s) "
+          f"{bad[:2]}")
+
+
+def paused_from(reply, fallback):
+    """Returns this script's time of a live move's pause: the end of its
+    last round with the guest running, plus the time the pause took. A
+    checkpoint, or a reply without it, gives `fallback`."""
+    st = reply.get("stats") or {}
+    if not stream or not st.get("precopy_end_unix_ms"):
+        return fallback
+    return st["precopy_end_unix_ms"] / 1000 - wall_t0 + (st.get("pause_ms") or 0) / 1000
 
 
 def boot_id(guest, after=0.0):
@@ -452,9 +476,11 @@ check(resumed.get("state") == "running", "resume")
 restore_ms = (status_at - spawned_at) * 1000
 before = [(t, tick(s)) for t, s in src.outputs(r"TICK ") if t <= fence_at]
 last_tick_at, (last_n, last_uptime, last_wall) = before[-1]
-# A live move pauses the guest only after its rounds, just before the reply.
-check(not src.outputs(r"TICK ", after=(fence_at if stream else fence_sent) + 0.1),
-      "the fenced source printed nothing more")
+# A live move pauses the guest only after its rounds: from then on the
+# source must print nothing, though the reply comes later.
+paused_at = paused_from(fence, fence_sent)
+late = src.outputs(r"TICK ", after=paused_at + 0.1)
+check(not late, f"the fenced source printed nothing once paused: {late[:2]}")
 if stream:
     kept = sorted(os.listdir(bundle)) if os.path.isdir(bundle) else []
     want = sorted(["profile.json", "cpu.json", "platform.json", "devices.json", "session.json",
@@ -480,6 +506,9 @@ if first:
     first_at, line = first
     n, uptime, wall = tick(line)
     check(n == last_n + 1, f"the count goes on: last before the fence {last_n}, first after {n}")
+    counted_twice = sorted({c[0] for c in (tick(s) for _, s in src.outputs(r"TICK ")) if c}
+                           & {c[0] for c in (tick(s) for _, s in dst.outputs(r"TICK ")) if c})
+    check(not counted_twice, f"no count was printed by both guests: {counted_twice[:3]}")
     host_gap = first_at - last_tick_at
     # The ticks carry /proc/uptime, CLOCK_BOOTTIME, which on the portable
     # profile moves on by the downtime; its monotonic clock does not.
@@ -626,6 +655,9 @@ tctl.ask(op="resume")
 # A live move pauses the guest only at the end of its rounds, just before
 # its reply; a checkpoint, as soon as it is asked for.
 fenced2_at = fence2_at if stream else again_at
+if stream:
+    late2 = dst.outputs(r"TICK ", after=paused_from(fence2, fence2_at) + 0.1)
+    check(not late2, f"the second fenced source printed nothing once paused: {late2[:2]}")
 last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= fenced2_at + 0.1]
 # The guest's last uptime reading before the second fence: the last tick,
 # or the end of the sleep that came after it.
