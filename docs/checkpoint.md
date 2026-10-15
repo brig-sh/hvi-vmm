@@ -114,7 +114,7 @@ A refusal is `{"v":1,"ok":false,"code":...,"error":...}`.
 | --- | --- | --- |
 | `refused` | No checkpoint root, a `dir` outside it, a `dir` that is not empty or goes through a link, or a guest with virtio-fs shares. | Untouched: nothing was paused. |
 | `not_ready` | The machine profile is not complete yet. | Untouched. |
-| `timeout` | The I/O threads or the vCPUs did not park, or the vCPUs did not export their state, within 2 s. | As the request found it. |
+| `timeout` | The I/O threads did not stop within 10 s, the vCPUs did not park within 2 s after them, or the vCPUs did not export their state within 2 s after that. | As the request found it. |
 | `capture_failed` | Anything after the pause: a device state that a restore would refuse, a failed disk sync, a failed write or sync, a bundle the reader would refuse. | As the request found it. Every file the capture wrote is removed, the manifest included, and the directory too when the capture created it. |
 | `fenced` | The VM was fenced by an earlier checkpoint. | Still fenced. |
 | `stopped` | The run is ending. | Ending. |
@@ -365,7 +365,9 @@ meanwhile fires then, and nothing is published.
    and the session, then seals the manifest.
 8. It replies, then resumes the VM, or keeps it parked for `fence`.
 
-Steps 2 to 4 share one 2 s deadline. A vCPU that starts during the capture,
+Step 2 waits up to 10 s for the I/O threads, as a live move does, with the
+vCPUs running, then up to 2 s for the vCPUs to park. Steps 3 and 4 share one
+2 s deadline from there. A vCPU that starts during the capture,
 after the wait for the exports ended, fails it with `capture_failed`, since it
 is neither off nor exported; the caller can try again. A stop of the run during the capture
 ends it between components and between reads of RAM.
@@ -774,13 +776,13 @@ When the rounds with the guest running end, the source:
    carry what it wrote, so a long sync grows them; the pause comes right
    after it, as the contract for live moves has it, with no round between.
 2. Holds the I/O threads and parks the vCPUs, waiting up to 10 s for both,
-   and then up to 10 s for the vCPUs' state. A `pause` op waits 2 s. The
-   vCPUs park at once: a vCPU parks only between guest entries, and since
-   virtio-blk requests are served on the device's worker, none is in a
-   disk call. The gate instead waits for the worker's request in flight,
-   a flush's `fdatasync` among them, with the vCPUs still running; a move
-   waits longer than a `pause` for that. A move that still misses the
-   bound fails, and the VM runs on.
+   and then up to 10 s for the vCPUs' state. The vCPUs park at once: a
+   vCPU parks only between guest entries, and since virtio-blk requests
+   are served on the device's worker, none is in a disk call. The gate
+   instead waits for the worker's request in flight, a flush's
+   `fdatasync` among them, with the vCPUs still running. A `pause` op,
+   and so a `checkpoint`, waits as long for the gate, then 2 s for the
+   vCPUs. A move that still misses the bound fails, and the VM runs on.
 3. Sends the final disk round, the blocks written since the last one, then
    the final RAM round, the pages left and every page written since, then
    the documents, with nothing running. `disk.json` is captured after the
