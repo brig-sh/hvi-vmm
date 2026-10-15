@@ -428,9 +428,11 @@ mod tests {
         let dst = guest();
         let target = Arc::clone(&dst);
         let mut reader = StreamReader::new(io::BufReader::new(&out[..]));
-        receive(&mut reader, |_| {
-            Ok((PageSpace::new(&regions_of(&target))?, target))
-        })
+        receive(
+            &mut reader,
+            |_| Ok((PageSpace::new(&regions_of(&target))?, target)),
+            None,
+        )
         .unwrap();
         (pre, rounds, dst)
     }
