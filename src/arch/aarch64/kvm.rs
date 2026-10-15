@@ -87,17 +87,19 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
-    kick_handle, run_guest, run_vcpu, start_io_threads, IoConfig, Kicker, KvmIrqLine,
-    unhandled_exit,
+    kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, IoConfig, Kicker,
+    KvmIrqLine,
 };
 use crate::hypervisor::kvm_dirty::KvmWriteLog;
-use crate::hypervisor::vcpus::Vcpus;
-use crate::io_threads::NetSource;
+use crate::hypervisor::vcpus::{Outcome, Vcpus};
+use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
+use crate::run::StopHandle;
 use crate::sandbox::seccomp;
 use crate::signal::install_kick_handler;
 use crate::sync::lock_or_recover;
+use crate::teardown::STOP_TIMEOUT;
 use crate::LOG_PREFIX;
 
 // --- ONE_REG ids (architectural KVM ABI, aarch64). ---------------
@@ -618,6 +620,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
                 path,
                 cfg.disk_base_sha256.is_some(),
+                cfg.disk_written.as_deref(),
             )?)))
         }
         None => None,
@@ -906,27 +909,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // filters itself, since neither allowlist has `prctl`, and the main
     // thread, which it inherits from, is not filtered yet.
     if let Some(device) = &shared.hvitime {
-        let thread = hvitime::spawn_timer(device, || {
-            let how = hvitime::timer_thread_setup();
-            seccomp::install_thread(seccomp::Thread::Vmm);
-            eprintln!("{LOG_PREFIX} hvi-time: timer thread on {how}");
-        })?;
-        let timer = Arc::clone(device);
-        io_threads.push_ended_by("hvi-time timer", thread, move || timer.stop());
+        spawn_timer(&mut io_threads, device);
         if let Some(test) = hvitime::TestRestore::from_env() {
             let hold = {
                 let (gicfd, vm, sh) = (Arc::clone(&gicfd), Arc::clone(&vm), shared.clone());
                 move || vgic_round_trip(&gicfd, &vm, num_cpus as usize, &sh)
             };
-            io_threads.push(
-                "hvi-time test restore",
-                test.spawn(
-                    Arc::clone(device),
-                    Arc::clone(&shared.guest.vcpus),
-                    || seccomp::install_thread(seccomp::Thread::Vmm),
-                    hold,
-                )?,
-            );
+            let (device, vcpus) = (Arc::clone(device), Arc::clone(&shared.guest.vcpus));
+            io_threads.spawn("hvi-time test restore", move |_| {
+                test.run(&device, &vcpus, hold);
+            });
         }
     }
 
@@ -973,7 +965,9 @@ const RESTORER: Restorer = restore::portable("kvm");
 // One function so the order of the steps, which KVM and the seccomp
 // filters constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
-pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
+pub(crate) fn restore(
+    cfg: RestoreConfig,
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source_profile = opened.profile().clone();
     let source = &source_profile;
@@ -1228,8 +1222,13 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
             block,
             net,
             vsock,
-            vcpus: Arc::new(Vcpus::new(num_cpus, Kicker::new(num_cpus))),
+            vcpus: Arc::new(Vcpus::new(
+                num_cpus,
+                Kicker::new(num_cpus),
+                StopHandle::new_pair()?.0,
+            )),
             write_log: Some(write_log),
+            plugin_threads: PluginThreads::new(),
         }),
         pl011,
         plugin: None,
@@ -1266,12 +1265,7 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         stop_source_profile,
         Console::Pl011(Arc::clone(&shared.pl011)),
     )?;
-    let thread = hvitime::spawn_timer(&device, || {
-        let how = hvitime::timer_thread_setup();
-        seccomp::install_thread(seccomp::Thread::Vmm);
-        eprintln!("{LOG_PREFIX} hvi-time: timer thread on {how}");
-    })?;
-    io_threads.push_ended_by("hvi-time timer", thread, move || device.stop());
+    spawn_timer(&mut io_threads, &device);
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_guest` returned it.
@@ -1284,6 +1278,28 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>> {
         filters,
         io_threads,
     )
+}
+
+/// Starts `device`'s timer thread with the I/O threads, which the stop ends
+/// through the device.
+///
+/// The thread lowers its timer slack before it filters itself, since neither
+/// allowlist has `prctl`, so it confines itself rather than at its start.
+fn spawn_timer(io_threads: &mut IoThreads<Kicker>, device: &Arc<HviTime>) {
+    let timer = Arc::clone(device);
+    io_threads.spawn_with(
+        "hvi-time timer",
+        STOP_TIMEOUT,
+        || {},
+        move |_| {
+            let how = hvitime::timer_thread_setup();
+            seccomp::install_thread(seccomp::Thread::Vmm);
+            eprintln!("{LOG_PREFIX} hvi-time: timer thread on {how}");
+            timer.run_timer();
+        },
+    );
+    let timer = Arc::clone(device);
+    io_threads.on_stop(move || timer.stop());
 }
 
 /// Reads what this host's KVM offers a portable guest. `vcpu` is a vCPU

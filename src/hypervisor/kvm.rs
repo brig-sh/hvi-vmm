@@ -344,22 +344,24 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_to_stop` returned it.
-    run_to_stop(guest, threads, failure, io_threads)
+    run_to_stop(guest, threads, failure, Some(io_threads))
 }
 
 /// Runs vCPU `cpu` on the calling thread until the VM stops.
 ///
 /// Each pass clears the vCPU's `immediate_exit` byte, checks the running flag,
 /// parks at the quiesce checkpoint, lets `plugin` look at the guest from the
-/// boot vCPU, and then enters the guest once. The exits both KVM backends treat
-/// the same are serviced here: a PSCI system event is how the guest asked to
-/// stop, and an entry failure, an internal error and a `KVM_RUN` error are
-/// failures. Every other exit goes to `handle_exit`, which services it and
-/// returns `ControlFlow::Break` with the run's outcome to end the loop. A run a
-/// kick cut short reaches it as [`VcpuExit::Intr`]. A break reports its outcome
-/// through [`Vcpus::report`](crate::hypervisor::vcpus::Vcpus::report).
-/// `serve` does the work the control socket asks of a parked vCPU, on this
-/// thread.
+/// boot vCPU, runs `before_entry`, and then enters the guest once. The exits
+/// both KVM backends treat the same are serviced here: a PSCI system event is
+/// how the guest asked to stop, and an entry failure, an internal error and a
+/// `KVM_RUN` error are failures. Every other exit goes to `handle_exit`, which
+/// services it and returns `ControlFlow::Break` with the run's outcome to end
+/// the loop. A run a kick cut short reaches it as [`VcpuExit::Intr`]. A break,
+/// from `before_entry` as from `handle_exit`, reports its outcome through
+/// [`Vcpus::report`](crate::hypervisor::vcpus::Vcpus::report). `serve` does
+/// the work the control socket asks of a parked vCPU, on this thread.
+// The three closures are the backend's parts of the one loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_vcpu(
     cpu: u32,
     mut vcpu: VcpuFd,
@@ -367,6 +369,7 @@ pub(crate) fn run_vcpu(
     guest: &Guest<Kicker>,
     plugin: Option<&dyn Plugin>,
     mut serve: impl FnMut(&VcpuFd, Work<'_>) -> std::io::Result<Option<Output>>,
+    mut before_entry: impl FnMut() -> ControlFlow<Outcome>,
     mut handle_exit: impl FnMut(VcpuExit<'_>) -> ControlFlow<Outcome>,
 ) {
     // The vCPU filter goes in before this thread touches anything the guest
@@ -394,6 +397,10 @@ pub(crate) fn run_vcpu(
         // at the guest, or the control socket captures it, doing on this
         // thread the work only it can.
         guest.pass_safepoint(&vcpu, cpu, plugin, |work| serve(&vcpu, work));
+        if let ControlFlow::Break(outcome) = before_entry() {
+            guest.vcpus.report(outcome);
+            break;
+        }
         let flow = match vcpu.run() {
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
                 // A run that a kick cut short has completed the MMIO exit
@@ -582,6 +589,7 @@ mod stop_tests {
             cmdline: String::new(),
             disk: None,
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,

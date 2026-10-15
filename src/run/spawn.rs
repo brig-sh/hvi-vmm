@@ -124,6 +124,8 @@ mod tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disk: None,
+            disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,
@@ -133,8 +135,13 @@ mod tests {
             sandbox_id: "spawn-test".to_string(),
             vcpus: 1,
             agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
             plugin: None,
             sandbox: false,
+            profile: crate::config::MachineProfileKind::Native,
+            arch_timer_irq: None,
             stop: Some(registration),
         };
         let run = spawn(cfg).unwrap();

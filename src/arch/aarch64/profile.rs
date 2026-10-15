@@ -295,6 +295,7 @@ mod tests {
             cmdline: cmdline.into(),
             disk: None,
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             net: true,
             net_gateway: None,
@@ -311,6 +312,7 @@ mod tests {
             sandbox: false,
             profile: MachineProfileKind::PortableArm64V1,
             arch_timer_irq: timer,
+            stop: None,
         };
         let layout = layout();
         let digest = |backend: &str, cfg: &BootConfig| {
