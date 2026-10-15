@@ -48,8 +48,11 @@
 //! `checkpoint`'s does, and the client reads the failure as a reply line
 //! where a frame header was due. `then: "fence"` fences the VM once the
 //! manifest is written to the connection, which is before the client has
-//! read it. A fenced VM is never streamed again: the fence released its
-//! disk, and the destination may already run it.
+//! read it. The fence released its disk, and the destination may already
+//! run it, so a fenced VM is streamed again only for the move that fenced
+//! it, by its txid and epoch, and stays fenced: the mover that lost the
+//! stream after the seal recovers it so. Any other `migrate` of a fenced
+//! VM is refused with `fenced`.
 //!
 //! `disk-dirty` and `disk-blocks` read the disk for a move, in any state but
 //! stopping, and need a disk and the checkpoint root. `disk-blocks` streams
@@ -362,6 +365,7 @@ impl ControlSocket {
             root: self.checkpoint_root.clone(),
             timeout,
             stream,
+            fenced_by: None,
         };
         loop {
             match stop.wait(self.listener.as_fd()) {
@@ -609,6 +613,33 @@ struct Machine<'a, K> {
     timeout: Duration,
     /// How long a `migrate` waits on its reader.
     stream: StreamLimits,
+    /// What the `migrate` that fenced the VM sent, when it gave a txid.
+    fenced_by: Option<FenceRecord>,
+}
+
+/// What a `migrate` that fenced the VM sent, kept so that the move that
+/// fenced it, and only that one, can have the sealed state streamed again:
+/// hull's recovery when it died between hvi's seal and its own.
+struct FenceRecord {
+    /// The txid of the request that fenced the VM.
+    txid: String,
+    /// Its epoch.
+    epoch: u64,
+    /// The profile it sent.
+    profile: MachineProfile,
+    /// `profile.json` as it sent it.
+    profile_json: Vec<u8>,
+    /// The documents after RAM as it sent them, but disk.json when the
+    /// stream had disk rounds, which a stream sent again rewrites.
+    docs: Vec<(&'static str, Vec<u8>)>,
+    /// Whether the stream had disk rounds.
+    disk_rounds: bool,
+    /// The capabilities its manifest listed.
+    capabilities: Vec<String>,
+    /// Its manifest's SHA-256.
+    manifest_sha256: String,
+    /// Every component its manifest listed.
+    components: Vec<crate::checkpoint::stream::StreamComponent>,
 }
 
 impl<K: Kick> Machine<'_, K> {
@@ -936,11 +967,8 @@ impl<K: Kick> Machine<'_, K> {
         match self.state {
             // The fence released the disk, and the destination may run by
             // now. A second stream would hand out another copy that can
-            // resume, so a fenced VM is refused here as `checkpoint` refuses
-            // it.
-            VmState::Fenced => {
-                return refuse(ErrorCode::Fenced, "the VM was fenced after a checkpoint")
-            }
+            // resume, so only the move that fenced the VM may have it again.
+            VmState::Fenced => return self.restream(conn, stop, request),
             VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
             VmState::Running | VmState::Paused | VmState::RestoredPaused => {}
         }
@@ -982,7 +1010,8 @@ impl<K: Kick> Machine<'_, K> {
         let paused_deadline = Cell::new(None);
         let mut out = SocketOut::new(conn, stop, self.stream.stall, &paused_deadline);
         let mut stream = StreamWriter::new(&mut out);
-        if let Err(e) = stream.write_doc("profile.json", profile.to_json().as_bytes()) {
+        let profile_json = profile.to_json().into_bytes();
+        if let Err(e) = stream.write_doc("profile.json", &profile_json) {
             return refuse(
                 ErrorCode::CaptureFailed,
                 format!("{e}; the VM is as it was"),
@@ -1070,24 +1099,36 @@ impl<K: Kick> Machine<'_, K> {
             // After the final disk round, so disk.json lists it with its
             // digest, and its generation is the disk's.
             let disk = capture.disk_state(&profile)?;
-            stream.write_doc(
-                "cpu.json",
-                &json(&CpuState::new(capture.arch, exported.vcpus))?,
-            )?;
-            stream.write_doc("platform.json", &json(&exported.platform)?)?;
-            stream.write_doc("devices.json", &devices.to_json()?)?;
+            let mut docs = vec![
+                (
+                    "cpu.json",
+                    json(&CpuState::new(capture.arch, exported.vcpus))?,
+                ),
+                ("platform.json", json(&exported.platform)?),
+                ("devices.json", devices.to_json()?),
+            ];
             if let Some(disk) = &disk {
-                stream.write_doc("disk.json", &json(disk)?)?;
+                docs.push(("disk.json", json(disk)?));
             }
-            stream.write_doc("session.json", &json(&capture.session(&request_doc))?)?;
+            docs.push(("session.json", json(&capture.session(&request_doc))?));
+            for (name, bytes) in &docs {
+                stream.write_doc(name, bytes)?;
+            }
             let sealed_at = unix_ms();
-            let (_, manifest_sha256) = stream.seal(
+            let (manifest, manifest_sha256) = stream.seal(
                 this_build(),
                 migrate::regions_of(&ram),
-                exported.capabilities,
+                exported.capabilities.clone(),
                 sealed_at,
             )?;
-            Ok((last, manifest_sha256, sealed_at))
+            Ok((
+                last,
+                manifest_sha256,
+                sealed_at,
+                docs,
+                manifest.components,
+                exported.capabilities,
+            ))
         })();
         // The destination may open the disk as soon as it has read the
         // manifest, so a fence releases the lock first of all.
@@ -1097,6 +1138,28 @@ impl<K: Kick> Machine<'_, K> {
         }
         let faults = write_log.fault_stats();
         tracker.stop();
+        let sealed = match sealed {
+            Ok((last, manifest_sha256, sealed_at, mut docs, components, capabilities)) => {
+                if let (Then::Fence, Some(txid)) = (request.then, &request.txid) {
+                    if disk_rounds.is_some() {
+                        docs.retain(|(name, _)| *name != "disk.json");
+                    }
+                    self.fenced_by = Some(FenceRecord {
+                        txid: txid.clone(),
+                        epoch: request.epoch,
+                        profile: profile.clone(),
+                        profile_json,
+                        docs,
+                        disk_rounds: disk_rounds.is_some(),
+                        capabilities,
+                        manifest_sha256: manifest_sha256.clone(),
+                        components,
+                    });
+                }
+                Ok((last, manifest_sha256, sealed_at))
+            }
+            Err(e) => Err(e),
+        };
         let (last, manifest_sha256, sealed_at_unix_ms) = match sealed {
             Ok(sealed) => sealed,
             Err(e) => {
@@ -1145,6 +1208,136 @@ impl<K: Kick> Machine<'_, K> {
                 write_fault_ns: faults.map(|(n, ns)| ns / n.max(1)),
                 precopy_end_unix_ms,
                 sealed_at_unix_ms,
+                first_manifest_sha256: None,
+                same_as_first: None,
+            }),
+        }
+    }
+
+    /// Streams a fenced VM's sealed state again on `conn`, for the move
+    /// that fenced it: the same txid and epoch, and `then: "fence"`. Any
+    /// other request is refused with `fenced`, as is a VM a `checkpoint`
+    /// fenced, and the VM stays fenced either way.
+    ///
+    /// The stream is the final round alone: with disk rounds, one disk
+    /// round of every block written since boot, read from the disk; every
+    /// page of RAM, which has not changed since the seal; and the
+    /// documents as the first stream sent them, disk.json written again
+    /// for its one round. So profile.json, the vCPU, platform, device and
+    /// session documents, and disk.json without disk rounds, are the first
+    /// stream's bytes, and the reply names them. The pause is long over, so
+    /// only the stall bound applies to the reader.
+    fn restream(&mut self, conn: &mut UnixStream, stop: &StopToken, request: &Migrate) -> Response {
+        let Some(record) = &self.fenced_by else {
+            return refuse(
+                ErrorCode::Fenced,
+                "the VM was fenced after a checkpoint, or by a move that gave no txid",
+            );
+        };
+        if request.txid.as_deref() != Some(record.txid.as_str()) || request.epoch != record.epoch {
+            return refuse(
+                ErrorCode::Fenced,
+                "the VM is fenced; only the move that fenced it, by its txid and epoch, may \
+                 have its state streamed again",
+            );
+        }
+        if request.then != Then::Fence {
+            return refuse(
+                ErrorCode::Fenced,
+                "the VM is fenced and stays fenced; ask with then: fence",
+            );
+        }
+        let Some(capture) = self.capture.clone() else {
+            return refuse(ErrorCode::Refused, "this run cannot be captured");
+        };
+        let ram = Arc::clone(&capture.ram);
+        let vcpus = self.vcpus;
+        let stopping = || !vcpus.is_running();
+        let started = Instant::now();
+        let none = Cell::new(None);
+        let mut out = SocketOut::new(conn, stop, self.stream.stall, &none);
+        let mut stream = StreamWriter::new(&mut out);
+        let sent = (|| -> std::io::Result<_> {
+            stream.write_doc("profile.json", &record.profile_json)?;
+            let mut disk_rounds = Vec::new();
+            let mut disk = None;
+            if record.disk_rounds {
+                if let Some((dev, _)) = &capture.block {
+                    disk_rounds.push(migrate::send_disk(
+                        &mut stream,
+                        dev,
+                        DirtySince::Boot,
+                        true,
+                        &stopping,
+                    )?);
+                    disk = capture.disk_state(&record.profile)?;
+                }
+            }
+            let round = migrate::whole_round(&mut stream, &ram, &stopping)?;
+            for (name, bytes) in &record.docs {
+                if *name == "session.json" {
+                    if let Some(disk) = &disk {
+                        stream.write_doc("disk.json", &json(disk)?)?;
+                    }
+                }
+                stream.write_doc(name, bytes)?;
+            }
+            let sealed_at = unix_ms();
+            let (manifest, sha256) = stream.seal(
+                this_build(),
+                migrate::regions_of(&ram),
+                record.capabilities.clone(),
+                sealed_at,
+            )?;
+            Ok((round, disk_rounds, manifest, sha256, sealed_at))
+        })();
+        let (round, disk_rounds, manifest, manifest_sha256, sealed_at_unix_ms) = match sent {
+            Ok(sent) => sent,
+            Err(e) => {
+                if !self.vcpus.is_running() {
+                    self.state = VmState::Stopping;
+                    return refuse(ErrorCode::Stopped, format!("the run is ending: {e}"));
+                }
+                return refuse(
+                    ErrorCode::CaptureFailed,
+                    format!("{e}; the stream is not sealed, and the VM stays fenced"),
+                );
+            }
+        };
+        let same_as_first = manifest
+            .components
+            .iter()
+            .filter(|c| record.components.contains(c))
+            .map(|c| c.name.clone())
+            .collect();
+        let paused_ms = started.elapsed().as_millis() as u64;
+        Response::Migrate {
+            state: self.state,
+            manifest_sha256,
+            stats: Box::new(MigrateStats {
+                final_round_bytes: round.bytes,
+                ram_present_bytes: round.data_pages * crate::checkpoint::ram::PAGE_SIZE,
+                ram_raw_bytes: round.raw_bytes(),
+                ram_stream_bytes: round.bytes,
+                rounds: vec![round],
+                stop_reason: migrate::StopReason::Fenced,
+                threshold_bytes: 0,
+                precopy_ms: 0,
+                pause_ms: 0,
+                paused_ms,
+                ram_total_bytes: ram.regions().iter().map(|r| r.size).sum(),
+                stream_bytes: stream.written(),
+                disk_raw_bytes: disk_rounds.iter().map(|r| r.raw_bytes).sum(),
+                disk_stream_bytes: disk_rounds.iter().map(|r| r.bytes).sum(),
+                disk_rounds,
+                disk_sync_ms: 0,
+                write_granule: capture.write_log.as_ref().map_or(0, |l| l.granule()),
+                write_faults: None,
+                write_fault_ns: None,
+                precopy_end_unix_ms: sealed_at_unix_ms,
+                sealed_at_unix_ms,
+                first_manifest_sha256: Some(record.manifest_sha256.clone()),
+                same_as_first: Some(same_as_first),
             }),
         }
     }
@@ -3541,5 +3734,157 @@ mod tests {
         assert!(received.disk.is_empty() && received.manifest.disk.is_none());
         assert_eq!(r["stats"]["disk_rounds"], serde_json::json!([]), "{r}");
         assert!(received.doc("disk.json").is_some());
+    }
+
+    // hull's recovery after it died between hvi's seal and its own: the
+    // move that fenced the VM, by its txid and epoch, has the sealed state
+    // streamed again. The documents are the first stream's bytes, RAM is
+    // what it was, and the VM stays fenced.
+    #[test]
+    fn the_fence_owner_has_the_sealed_state_streamed_again() {
+        let mut f = Fixture::with(
+            "mig-restream",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        let line = r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-7","epoch":3}"#;
+        let (first, r1) = f.migrate(line);
+        let (first, _) = first.expect("the first stream reads whole");
+        assert_eq!(r1["state"], "fenced", "{r1}");
+        let (again, r2) = f.migrate(line);
+        let (again, ram) = again.expect("the stream sent again reads whole");
+        assert_eq!(r2["state"], "fenced", "{r2}");
+        assert_eq!(r2["manifest_sha256"], again.manifest_sha256.as_str());
+        let stats = &r2["stats"];
+        assert_eq!(
+            stats["first_manifest_sha256"], r1["manifest_sha256"],
+            "{r2}"
+        );
+        assert_eq!(stats["stop_reason"], "fenced", "{r2}");
+        assert_eq!(stats["rounds"].as_array().unwrap().len(), 1, "{r2}");
+        // The guest wrote nothing during the move, so even RAM round 0 is
+        // the first stream's: every page, the same chunks.
+        assert_eq!(
+            stats["same_as_first"],
+            serde_json::json!([
+                "profile.json",
+                "ram-round-0",
+                "cpu.json",
+                "platform.json",
+                "devices.json",
+                "session.json"
+            ]),
+            "{r2}"
+        );
+        for name in ["cpu.json", "platform.json", "devices.json", "session.json"] {
+            assert_eq!(first.doc(name), again.doc(name), "{name}");
+        }
+        let mut data = [0u8; 10];
+        ram.read(GPA + 0x3000, &mut data).unwrap();
+        assert_eq!(&data, b"guest data", "RAM came over again");
+        // And again: the record is kept until the run ends.
+        let (third, _) = f.migrate(line);
+        assert!(third.is_ok());
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"status"}"#))["state"], "fenced");
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"resume"}"#))["code"], "fenced");
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"stop"}"#))["state"], "stopping");
+    }
+
+    #[test]
+    fn only_the_fence_owner_may_have_the_state_again() {
+        let mut f = Fixture::with(
+            "mig-restream-other",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        let (first, _) =
+            f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-7","epoch":3}"#);
+        assert!(first.is_ok());
+        for line in [
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-8","epoch":3}"#,
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-7","epoch":4}"#,
+            r#"{"v":1,"op":"migrate","then":"fence","epoch":3}"#,
+            r#"{"v":1,"op":"migrate","then":"fence"}"#,
+            r#"{"v":1,"op":"migrate","then":"continue","txid":"tx-7","epoch":3}"#,
+        ] {
+            let (again, _) = f.migrate(line);
+            let err = again.err().expect("refused").to_string();
+            assert!(
+                err.contains("the source ended the stream: fenced:"),
+                "{line}: {err}"
+            );
+        }
+        assert_eq!(reply(&f.ask(r#"{"v":1,"op":"status"}"#))["state"], "fenced");
+        // A VM a checkpoint fenced has no stream to send again.
+        let mut f = Fixture::with(
+            "mig-restream-ck",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        assert_eq!(reply(&f.checkpoint("ck", "fence"))["state"], "fenced");
+        let (again, _) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"x","epoch":0}"#);
+        let err = again.err().expect("refused").to_string();
+        assert!(err.contains("fenced after a checkpoint"), "{err}");
+    }
+
+    // With disk rounds, the stream sent again has one disk round, every
+    // block written since boot, read from the disk the fence left; with
+    // the base it makes the source's disk, and disk.json lists that round.
+    #[test]
+    fn a_stream_sent_again_carries_the_whole_disk_delta() {
+        let disk = TestDisk::new("mig-restream-disk", 20);
+        let base = disk.bytes();
+        disk.write(2, 0xa1);
+        let log = Arc::new(DiskWritingLog {
+            disk: Arc::clone(&disk.dev),
+            writes: Mutex::new(vec![20, 9, 5]),
+        });
+        let mut f = Fixture::with(
+            "mig-restream-disk",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                base: Some("ab".repeat(32)),
+                noise_mib: 9,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                ..Spec::default()
+            },
+        );
+        let line = r#"{"v":1,"op":"migrate","then":"fence","txid":"d2","epoch":1,"max_rounds":3}"#;
+        let mut image = Image(base.clone());
+        let (first, _) = f.migrate_into(line, Some(&mut image));
+        first.expect("the first stream reads whole");
+        let mut image = Image(base);
+        let (again, r) = f.migrate_into(line, Some(&mut image));
+        let (again, _) = again.expect("the stream sent again reads whole");
+        assert!(
+            image.0 == disk.bytes(),
+            "the base and the one round are the disk"
+        );
+        let names: Vec<&str> = again.disk.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["disk-round-final"]);
+        assert_eq!(again.disk[0].blocks, 4);
+        assert_eq!(r["stats"]["disk_rounds"][0]["round"], 0, "{r}");
+        let disk_json =
+            crate::checkpoint::bundle::parse_disk(again.doc("disk.json").unwrap()).unwrap();
+        assert_eq!(disk_json.rounds.len(), 1);
+        assert_eq!(
+            disk_json.rounds[0].sent_sha256.as_deref(),
+            Some(again.disk[0].sha256.as_str())
+        );
+        assert_eq!(disk_json.rounds[0].generation, disk_json.generation);
     }
 }
