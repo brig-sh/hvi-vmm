@@ -706,11 +706,11 @@ manifest written: the source's part of the downtime. The rest is the
 transport and the destination's restore. `rounds_end_unix_ms` is when the
 last round with the guest running ended. `disk_sync_ms` is the sync of the
 disk after it and just before the pause, with the guest still running,
-and `precopy_end_unix_ms` is taken after that sync, at the pause; it
-included the sync from the build that added the sync on, so a consumer
-that took it as the end of the rounds now reads the end of the sync.
-`pause_sync_ms` is the second sync, in the pause before disk.json, and
-is part of `paused_ms`. A `migrate` needs no
+and `precopy_end_unix_ms` is taken after that sync, at the pause. Before
+that sync existed, `precopy_end_unix_ms` was the end of the rounds; a
+consumer that still reads it so now measures from the end of the sync,
+and should take `rounds_end_unix_ms` for that. `pause_sync_ms` is the
+second sync, in the pause before disk.json, and is part of `paused_ms`. A `migrate` needs no
 `--checkpoint-root`, since it writes no file. It refuses, before the first
 frame and with the VM untouched, what a `checkpoint` refuses, and a backend
 that keeps no record of the guest's writes.
@@ -766,9 +766,11 @@ judged by RAM alone.
 When the rounds with the guest running end, the source:
 
 1. Syncs the disk with `fdatasync` on a second handle to the device's
-   file, without the device's lock, while the guest still runs. The sync in
-   the pause then has only the writes since; with it inside the pause, a
-   busy Pi spent up to 4.9 s of downtime on it.
+   file, without the device's lock, while the guest still runs. With the
+   only sync inside the pause, a busy Pi spent up to 4.9 s of downtime on
+   it. The guest goes on writing during this sync, and the final rounds
+   carry what it wrote, so a long sync grows them; the pause comes right
+   after it, as the contract for live moves has it, with no round between.
 2. Holds the I/O threads and parks the vCPUs, waiting up to 10 s for both,
    and then up to 10 s for the vCPUs' state. A `pause` op waits 2 s; a
    move waits longer because a vCPU parks only between guest entries, and
@@ -777,7 +779,14 @@ When the rounds with the guest running end, the source:
    that still misses the bound fails, and the VM runs on.
 3. Sends the final disk round, the blocks written since the last one, then
    the final RAM round, the pages left and every page written since, then
-   the documents, with nothing running. `disk.json` is captured after the
+   the documents, with nothing running. disk.json's capture syncs the disk
+   once more, under the device's lock (`pause_sync_ms`): the source's disk
+   is durable when the move seals, as `disk.json` says with `synced`.
+   That sync is guest downtime. It took 0 to 3 ms on the Mac and on a
+   quiet Pi, but with an `O_DIRECT` writer beside it on the Pi a median of
+   300 ms, and up to 586 ms, of a `paused_ms` median of 643 ms (see [The
+   pause under load](#the-pause-under-load)): the first sync does not
+   leave it little to do on a disk that busy. `disk.json` is captured after the
    final disk round, so it lists every disk round with the digests of what
    the stream carried, and its last round's generation is the disk's.
 
@@ -1057,6 +1066,15 @@ sits between the restore and the resume.
 - The sync before the pause (`disk_sync_ms`) took 0 to 4 ms on a quiet
   host; with an `O_DIRECT` writer beside it on the Pi, a median of 234 to
   293 ms and once 10.2 s, all of it with the guest running.
+- A destination whose copy of the base was made just before the move
+  pays for that copy's writeback too, since the restore syncs `--disk`
+  before it goes on: on rp2, whose `fdatasync` of a fresh 64 MiB copy
+  took 6.1 to 8.5 s, two moves from the Mac whose copy was made seconds
+  earlier had 4.2 s and 20.3 s of downtime (`hvi-time`'s downtime total),
+  where the same move took 0.17 s before: the restore's line for the
+  stream, which it prints after that sync, came 3.9 s and 20 s after the
+  source fenced, for a stream that had left the Mac in about 1 s. A mover
+  makes and syncs its copy before the move.
 - The destination's part, manifest to restored-paused, includes the sync of
   the disk rounds it wrote: 13 to 16 ms on both hosts.
 - Mac to Pi, through `ssh` (rp2, 43 MB/s for round 0), with the base copied
@@ -1086,6 +1104,7 @@ with `then: "continue"` per pass:
 | `81da52d`, the 10 s bound | 3 | 0 of 90 | 3 to 5, 329 to 346, 754 to 1666 ms |
 | `9aae1a8`, random gaps between moves | 2 | 4 of 60 | 4 to 5, 677 to 688, 1519 to 1982 ms |
 | `169e200`, the 10 s bound, random gaps | 2 | 0 of 60 | 365 to 1492, 2168 to 2285, 2491 to 2545 ms; 13 moves parked in 2.0 to 2.5 s |
+| `dc99143`, the same | 1 | 0 of 30 | 314, 2194, 2497 ms |
 
 The first passes ran a move every 0.5 s and may have locked to the host
 writer's cycle; the last two wait 0.3 to 2 s at random between moves.
@@ -1097,6 +1116,16 @@ the vCPU thread that had not parked in `fdatasync` (syscall 83) in
 was serving the guest's flush, which the host's ext4 journal held up
 behind the `O_DIRECT` writer, and a vCPU parks only between guest
 entries. With the CPU loops alone, 30 of 30 parked within 321 ms.
+
+The guest is stopped for all of the park, so the 10 s bound trades a
+failed move for a long pause under such a writer: over the 60 moves of
+`169e200` the park took a median of 622 ms and up to 2546 ms, and the
+whole paused part (`paused_ms`) a median of 1176 ms and up to 3217 ms.
+In the `dc99143` pass the in-pause sync (`pause_sync_ms`) took a median of
+300 ms and up to 586 ms of a `paused_ms` median of 643 ms. Serving a
+virtio-blk flush off the vCPU's thread would let the vCPU park at once;
+that is the change that removes the long park (see
+[limitations.md](limitations.md)).
 
 ## Moving the disk by its blocks
 

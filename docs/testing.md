@@ -228,7 +228,8 @@ after each move.
 With a disk, the disk moves in the stream too. The source boots with
 `--disk-base-sha256` of the fresh image, a copy of which the script keeps
 as the base, and each restore gets a new copy of the base (an APFS clone
-on a Mac, a reflink or a copy elsewhere) as its `--disk`. After each fence,
+on a Mac, a reflink or a copy elsewhere) as its `--disk`, with the same
+`--disk-base-sha256`. After each fence,
 with the source fenced and the destination restored-paused, the script
 checks that the restored disk hashes as the source's does, and that the
 move took a disk round before each RAM round, the last one paused.
@@ -250,9 +251,15 @@ of SECS seconds instead, in a shuffled order, and check every page once a
 second, so a write lost in any round leaves a page that fails. Timers
 armed before the move then run 20 s, to outlast the rounds. `summary.json`
 gives each move's RAM and disk rounds, their bytes and compression, dirty
-rates, write faults, the sync before the pause, the time to hold the I/O
-threads and park the vCPUs, `paused_ms` and the downtime from the pause to
-the resume reply.
+rates, write faults, the sync before the pause and the one in it, the
+time to hold the I/O threads and park the vCPUs, `paused_ms` and the
+downtime to the resume reply twice: from the end of the last round with
+the guest running (`rounds_end_unix_ms`) and from the end of the sync
+after it, at the pause (`precopy_end_unix_ms`), each also less the time
+the script spent hashing the disks. Before the last check reads the
+third process's disk with `debugfs`, the script replays the disk's
+journal on a copy with `e2fsck -E journal_only`, repairing nothing, and
+requires `e2fsck -fn` to find it clean.
 
 ```sh
 python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
