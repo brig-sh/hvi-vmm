@@ -36,7 +36,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a requester waits for the vCPUs to park before giving up. A vCPU
 /// that is wedged in the hypervisor must not deadlock the whole VMM, so the
@@ -64,17 +64,21 @@ impl Quiesce {
         Self::default()
     }
 
-    /// Safe point for a vCPU thread. Returns immediately unless a quiesce is in
-    /// effect, in which case it parks until the requester releases it.
+    /// Parks the calling vCPU thread while a quiesce is in effect.
+    ///
+    /// Returns how long the thread stayed parked, zero when no quiesce is in
+    /// effect.
     ///
     /// Must be called where the calling vCPU is *out* of guest context, so its
     /// registers and the memory it has written are stable for the plugin.
-    pub fn checkpoint(&self) {
+    #[must_use]
+    pub fn checkpoint(&self) -> Duration {
         // Fast path: no quiesce pending, no lock taken. The load is
         // sequentially consistent to pair with the store in `request`.
         if !self.requested.load(Ordering::SeqCst) {
-            return;
+            return Duration::ZERO;
         }
+        let start = Instant::now();
         let mut parked = self.parked.lock().unwrap();
         *parked += 1;
         // Wake a requester that is waiting for this thread to park.
@@ -83,6 +87,7 @@ impl Quiesce {
             parked = self.cv.wait(parked).unwrap();
         }
         *parked -= 1;
+        start.elapsed()
     }
 
     /// Raises the request. The caller must then kick the vCPUs so they leave
@@ -158,8 +163,8 @@ mod tests {
     #[test]
     fn checkpoint_is_free_when_idle() {
         let q = Quiesce::new();
-        q.checkpoint();
-        q.checkpoint();
+        assert_eq!(q.checkpoint(), Duration::ZERO, "parked with no quiesce");
+        assert_eq!(q.checkpoint(), Duration::ZERO, "parked with no quiesce");
     }
 
     /// The real contract: worker threads park, the requester observes exactly
@@ -175,9 +180,10 @@ mod tests {
                 let q = Arc::clone(&q);
                 let done = Arc::clone(&done);
                 std::thread::spawn(move || {
-                    q.checkpoint();
+                    let parked = q.checkpoint();
                     // Only reachable once the requester released the quiesce.
                     done.store(true, Ordering::SeqCst);
+                    parked
                 })
             })
             .collect();
@@ -190,7 +196,10 @@ mod tests {
 
         q.release();
         for w in workers {
-            w.join().unwrap();
+            assert!(
+                !w.join().unwrap().is_zero(),
+                "a parked worker said it did not"
+            );
         }
         assert!(done.load(Ordering::SeqCst));
         assert_eq!(*q.parked.lock().unwrap(), 0, "parked count did not unwind");

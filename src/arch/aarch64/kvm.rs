@@ -57,7 +57,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Guest, PluginThreads, VcpuRegs};
+use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
@@ -401,7 +401,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     );
 }
 
-impl VcpuRegs for VcpuFd {
+impl SafepointVcpu for VcpuFd {
     fn regs(&self) -> RegsView {
         let ttbr1 = get_u64(self, REG_TTBR1_EL1);
         RegsView {

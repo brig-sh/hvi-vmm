@@ -32,7 +32,7 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
-use crate::hypervisor::guest::{Cpu, Guest};
+use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, Outcome};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::plugin::Plugin;
@@ -303,7 +303,9 @@ pub(crate) fn run_vcpu(
     // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
     // yet waits inside the run, where a kick reaches it.
     guest.vcpus.mark_started(cpu);
-    let is_boot = cpu == 0;
+    // The plugin runs on vcpu0, between guest entries, because only this thread
+    // can read this vCPU's registers.
+    let plugin = plugin.filter(|_| cpu == 0);
 
     loop {
         // The byte is cleared before the running flag is read, so a kick that
@@ -314,15 +316,7 @@ pub(crate) fn run_vcpu(
         }
         // Safe point for every vCPU: park here while vcpu0 lets a plugin look
         // at the guest.
-        guest.vcpus.checkpoint();
-        // The plugin runs on vcpu0, between guest entries, because only this
-        // thread can read this vCPU's registers. It is on the hot path: with no
-        // plugin this is a null check.
-        if is_boot {
-            if let Some(plugin) = plugin {
-                plugin.safepoint(&Cpu { vcpu: &vcpu, guest });
-            }
-        }
+        guest.pass_safepoint(&vcpu, plugin);
         let flow = match vcpu.run() {
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
                 // A run that a kick cut short has completed the MMIO exit

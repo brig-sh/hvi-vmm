@@ -355,46 +355,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::hypervisor::guest::PluginThreads;
-    use crate::hypervisor::vcpus::Vcpus;
-    use crate::memory::{GuestRam, RamRegion, SharedRam};
-    use crate::plugin::GuestArch;
+    use crate::hypervisor::guest::tests::{guest, NoopKicker};
     use crate::run::StopHandle;
-
-    /// A kicker that reaches no thread.
-    struct NoopKicker;
-
-    impl Kick for NoopKicker {
-        fn kick(&self, _cpu: u32) {}
-
-        fn kick_all(&self) {}
-    }
 
     /// The code a test vCPU thread runs.
     type Body = Box<dyn FnOnce() + Send>;
-
-    /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices and
-    /// a ledger that writes nowhere.
-    fn guest(count: u32) -> Guest<NoopKicker> {
-        let shared_ram = SharedRam::new(RamRegion::ALIGN as usize).unwrap();
-        let ram = GuestRam::new(&shared_ram, &[shared_ram.region_at(0)]).unwrap();
-        Guest {
-            arch: GuestArch::X86_64,
-            sandbox_id: String::new(),
-            ram: Arc::new(ram),
-            shared_ram,
-            ledger: Arc::new(Mutex::new(Emitter::new(None, "test").unwrap())),
-            block: None,
-            net: None,
-            vsock: None,
-            plugin_threads: PluginThreads::new(),
-            vcpus: Arc::new(Vcpus::new(
-                count,
-                NoopKicker,
-                StopHandle::new_pair().unwrap().0,
-            )),
-        }
-    }
 
     /// Runs `bodies` on the vCPU threads of `guest`, then runs the guest to its
     /// stop with `failure` as the caller's.
