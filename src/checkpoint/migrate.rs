@@ -268,6 +268,9 @@ pub enum StopReason {
     RoundCap,
     /// The time cap was reached.
     TimeCap,
+    /// None ran: the VM was fenced, and its sealed state was sent again in
+    /// one round.
+    Fenced,
 }
 
 /// The rounds sent with the guest running, and what the final round still
@@ -409,6 +412,23 @@ pub(crate) fn precopy<W: Write>(
         stats.dirty_pages_per_s = rate;
         rounds.push(stats);
     }
+}
+
+/// Sends every page of `ram` that is not zero as the only RAM round, taken
+/// paused: the RAM of a fenced VM, which is the RAM its sealed stream
+/// carried.
+///
+/// # Errors
+///
+/// Errors when the stream fails or `stopping` returns true.
+pub(crate) fn whole_round<W: Write>(
+    stream: &mut StreamWriter<W>,
+    ram: &GuestRam,
+    stopping: &dyn Fn() -> bool,
+) -> io::Result<RoundStats> {
+    let space = PageSpace::new(&regions_of(ram))?;
+    let all = DirtyPages::all(&ram.regions());
+    send(stream, ram, &space, &all, true, true, stopping)
 }
 
 /// Sends the final round, with the guest paused: with `disk`, the final

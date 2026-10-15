@@ -1552,7 +1552,9 @@ pub fn receive<R: BufRead>(
                 let k = applied.len() as u32;
                 let fits = match round {
                     DiskRound::Running(r) => !disk_final && r == k && r == running_disk,
-                    DiskRound::Final => !disk_final && running_disk == k && k > 0,
+                    // With no round before it, the stream is the final
+                    // round alone: a fenced VM's state sent again.
+                    DiskRound::Final => !disk_final && running_disk == k,
                 };
                 if !fits {
                     return Err(bad(
@@ -2465,6 +2467,18 @@ mod tests {
             why.contains("ram-round-3: came after the final RAM round"),
             "{why}"
         );
+    }
+
+    // A fenced VM's state sent again is the final round alone.
+    #[test]
+    fn the_final_disk_round_may_be_the_only_one() {
+        let (_, image) = three_rounds();
+        let bytes = disk_stream(&[(&image, &[0, 1, 2, 5, 20])]);
+        let mut disk = MemDisk::new(base_disk());
+        let got = read_disk(&bytes, &mut disk).unwrap();
+        assert!(disk.bytes == image);
+        assert_eq!(got.disk.len(), 1);
+        assert!(got.disk[0].in_pause && got.manifest.ram.rounds[0].in_pause);
     }
 
     #[test]
