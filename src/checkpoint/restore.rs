@@ -291,9 +291,187 @@ fn alloc_ram(regions: &[ProfileRegion]) -> std::io::Result<(SharedRam, Arc<Guest
 /// As [`open`] and [`open_stream`].
 pub(crate) fn open_config(cfg: &RestoreConfig) -> std::io::Result<Opened> {
     match &cfg.from_stream {
-        Some(from) => open_stream(from, cfg.stream_keep.as_deref()),
+        Some(from) => open_stream(from, cfg.stream_keep.as_deref(), cfg.disk.as_deref()),
         None => open(Path::new(&cfg.from)),
     }
+}
+
+/// The `--disk` of a stream restore, as the disk rounds' target: the
+/// destination's copy of the guest's base image.
+///
+/// It is opened when the first disk round arrives, before the VM exists
+/// and before the process is confined, and its lock is taken then: a disk
+/// another hvi holds is refused rather than waited for, since the blocks
+/// of the rounds the source sent with its guest running would overwrite
+/// newer writes in a disk that guest still runs on. The lock is let go once
+/// the stream is read, so the device can take it again as it opens the
+/// disk.
+struct StreamedDisk<'a> {
+    /// The path `--disk` gave.
+    path: &'a str,
+    /// The disk, once the first disk round opened it.
+    file: Option<Arc<std::fs::File>>,
+    /// Its lock, while the stream writes it.
+    lock: Option<crate::devices::virtio::block::DiskLock>,
+    /// The sync of what the rounds wrote so far, started as each round
+    /// ends, so it runs while the rest of the stream is read and the final
+    /// one has little left.
+    sync: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl<'a> StreamedDisk<'a> {
+    fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            file: None,
+            lock: None,
+            sync: None,
+        }
+    }
+
+    /// Waits for the sync under way, if any.
+    fn join_sync(&mut self) -> std::io::Result<()> {
+        if let Some(sync) = self.sync.take() {
+            sync.join()
+                .map_err(|_| std::io::Error::other("the disk's sync panicked"))?
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("--disk {}: sync: {e}", self.path))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Waits for the sync the final round started, then lets go of the
+    /// lock.
+    ///
+    /// The guest's first flush after the move would otherwise write back
+    /// every block the rounds wrote, on its vCPU's thread, with the guest
+    /// stalled on it: a loaded Pi showed an RCU stall of that kind after a
+    /// streamed restore whose disk the mover had left unsynced.
+    fn close(&mut self) -> std::io::Result<()> {
+        let synced = self.join_sync();
+        self.lock = None;
+        self.file = None;
+        synced
+    }
+}
+
+impl stream::DiskTarget for StreamedDisk<'_> {
+    fn begin(&mut self) -> std::io::Result<u64> {
+        let named =
+            |e: std::io::Error| std::io::Error::new(e.kind(), format!("--disk {}: {e}", self.path));
+        // The disk is the operator's, named on the command line.
+        #[allow(clippy::disallowed_methods)]
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.path)
+            .map_err(named)?;
+        let meta = file.metadata().map_err(named)?;
+        if !meta.is_file() {
+            return Err(stream_bad(
+                "stream",
+                format!(
+                    "--disk {}: the disk rounds are written into a copy of the base image, a \
+                     regular file",
+                    self.path
+                ),
+            ));
+        }
+        self.lock =
+            crate::devices::virtio::block::DiskLock::take(self.path, &file).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{e}; the stream carries the disk's blocks, which go into a copy of the \
+                         base image of the destination's own"
+                    ),
+                )
+            })?;
+        self.file = Some(Arc::new(file));
+        Ok(meta.len())
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("the disk is not open"))?;
+        file.write_all_at(bytes, offset)
+    }
+
+    fn round_end(&mut self, in_pause: bool) -> std::io::Result<()> {
+        // A running round's sync is started only when the last one is done,
+        // so they never pile up; the final round's always is, after it.
+        if self.sync.as_ref().is_some_and(|s| !s.is_finished()) && !in_pause {
+            return Ok(());
+        }
+        self.join_sync()?;
+        if let Some(file) = &self.file {
+            let file = Arc::clone(file);
+            self.sync = Some(
+                std::thread::Builder::new()
+                    .name("hvi-disk-sync".into())
+                    .spawn(move || file.sync_data())?,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Returns why the disk rounds a stream wrote into `--disk` do not make
+/// the disk `disk` describes, or `None` when they do.
+///
+/// The rounds must be the ones disk.json lists, one for one: the bitmap of
+/// the blocks each round wrote hashes to the round's `bitmap_sha256`, its
+/// component's SHA-256, which the manifest covers, is the round's
+/// `sent_sha256`, and the last one is the round taken paused, read at the
+/// generation disk.json was captured at. The disk then holds every write
+/// the guest made. This is the check `--disk-generation` asks for of a
+/// directory restore, with the generation taken from the stream itself.
+fn streamed_disk_refusal(
+    disk: Option<&DiskState>,
+    rounds: &[stream::AppliedDisk],
+) -> Option<String> {
+    let Some(disk) = disk else {
+        return Some("disk.json: the stream carries disk rounds and no disk.json".to_string());
+    };
+    if disk.base_sha256.is_none() {
+        return Some("disk.json names no base image the disk rounds apply to".to_string());
+    }
+    if disk.rounds.len() != rounds.len() {
+        return Some(format!(
+            "disk.json lists {} disk round(s), and the stream carried {}",
+            disk.rounds.len(),
+            rounds.len()
+        ));
+    }
+    for (listed, got) in disk.rounds.iter().zip(rounds) {
+        if listed.bitmap_sha256.as_deref() != Some(got.bitmap_sha256.as_str()) {
+            return Some(format!(
+                "{}: the blocks it wrote are not the ones disk.json's round {} read",
+                got.name, listed.round
+            ));
+        }
+        if listed.sent_sha256.as_deref() != Some(got.sha256.as_str()) {
+            return Some(format!(
+                "{}: its SHA-256 is not the sent_sha256 of disk.json's round {}",
+                got.name, listed.round
+            ));
+        }
+    }
+    let last = disk.rounds.last()?;
+    if !rounds.last().is_some_and(|r| r.in_pause) {
+        return Some("the last disk round was not taken paused".to_string());
+    }
+    (last.generation != disk.generation).then(|| {
+        format!(
+            "the final disk round was read at disk generation {}, and disk.json was captured \
+             at generation {}; the disk lacks the guest's writes after that round",
+            last.generation, disk.generation
+        )
+    })
 }
 
 /// Opens the bundle at `dir` and reads every document in it.
@@ -351,7 +529,11 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<Opened> {
 /// # Errors
 ///
 /// Errors, naming the component, on the first thing that does not hold.
-pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Opened> {
+pub(crate) fn open_stream(
+    from: &str,
+    keep: Option<&str>,
+    disk: Option<&str>,
+) -> std::io::Result<Opened> {
     // The stream is the operator's, named on the command line.
     #[allow(clippy::disallowed_methods)]
     let input: Box<dyn std::io::Read> = if from == "-" {
@@ -362,7 +544,7 @@ pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Ope
                 .map_err(|e| std::io::Error::new(e.kind(), format!("connecting to {from}: {e}")))?,
         )
     };
-    let opened = read_stream(input, from, keep)?;
+    let opened = read_stream(input, from, keep, disk)?;
     if from == "-" {
         // SAFETY: opens a path and moves the descriptor onto stdin; nothing
         // else holds stdin's lock now that the read is done.
@@ -385,37 +567,49 @@ fn read_stream(
     input: impl std::io::Read,
     from: &str,
     keep: Option<&str>,
+    disk: Option<&str>,
 ) -> std::io::Result<Opened> {
     let mut reader = stream::StreamReader::new(std::io::BufReader::with_capacity(1 << 20, input));
     let mut built = None;
-    let received = stream::receive(&mut reader, |bytes| {
-        let text = std::str::from_utf8(bytes).map_err(|e| stream_bad("profile.json", e))?;
-        let profile = MachineProfile::from_json(text).map_err(|e| stream_bad("profile.json", e))?;
-        let regions: Vec<stream::StreamRegion> = profile
-            .ram_regions
-            .iter()
-            .map(|r| stream::StreamRegion {
-                gpa: r.gpa,
-                size: r.size,
-            })
-            .collect();
-        // Checked before anything is allocated by them.
-        let space = stream::PageSpace::new(&regions)?;
-        let page = host_page_size();
-        if page == 0
-            || regions
+    let mut target = disk.map(StreamedDisk::new);
+    let received = stream::receive(
+        &mut reader,
+        |bytes| {
+            let text = std::str::from_utf8(bytes).map_err(|e| stream_bad("profile.json", e))?;
+            let profile =
+                MachineProfile::from_json(text).map_err(|e| stream_bad("profile.json", e))?;
+            let regions: Vec<stream::StreamRegion> = profile
+                .ram_regions
                 .iter()
-                .any(|r| r.gpa % page != 0 || r.size % page != 0)
-        {
-            return Err(stream_bad(
-                "profile.json",
-                format!("the RAM regions are not whole {page}-byte host pages"),
-            ));
-        }
-        let (shared, ram) = alloc_ram(&profile.ram_regions)?;
-        built = Some((profile, shared, Arc::clone(&ram)));
-        Ok((space, ram))
-    })?;
+                .map(|r| stream::StreamRegion {
+                    gpa: r.gpa,
+                    size: r.size,
+                })
+                .collect();
+            // Checked before anything is allocated by them.
+            let space = stream::PageSpace::new(&regions)?;
+            let page = host_page_size();
+            if page == 0
+                || regions
+                    .iter()
+                    .any(|r| r.gpa % page != 0 || r.size % page != 0)
+            {
+                return Err(stream_bad(
+                    "profile.json",
+                    format!("the RAM regions are not whole {page}-byte host pages"),
+                ));
+            }
+            let (shared, ram) = alloc_ram(&profile.ram_regions)?;
+            built = Some((profile, shared, Arc::clone(&ram)));
+            Ok((space, ram))
+        },
+        target.as_mut().map(|t| t as &mut dyn stream::DiskTarget),
+    );
+    // The sync the final disk round started, and the lock, end here
+    // whether the stream was whole or not.
+    let closed = target.as_mut().map_or(Ok(()), StreamedDisk::close);
+    let received = received?;
+    closed?;
     let (profile, shared, ram) =
         built.ok_or_else(|| std::io::Error::other("the stream built no RAM"))?;
     let listed: Vec<(u64, u64)> = received
@@ -453,14 +647,21 @@ fn read_stream(
         disk.check(&profile)
             .map_err(|e| stream_bad("disk.json", e))?;
     }
+    if !received.disk.is_empty() {
+        if let Some(why) = streamed_disk_refusal(disk.as_ref(), &received.disk) {
+            return Err(stream_bad("stream", why));
+        }
+    }
     let session = parse_session(doc("session.json")?)?;
     if let Some(dir) = keep {
         keep_documents(Path::new(dir), &received)?;
     }
     eprintln!(
-        "{} stream {from}: {} RAM round(s), {} bytes, manifest {}",
+        "{} stream {from}: {} RAM round(s), {} disk round(s) ({} blocks), {} bytes, manifest {}",
         crate::LOG_PREFIX,
         received.applied.len(),
+        received.disk.len(),
+        received.disk.iter().map(|d| d.blocks).sum::<u64>(),
         received.stream_bytes,
         received.manifest_sha256
     );
@@ -1065,18 +1266,72 @@ pub(crate) mod tests {
     impl Parts {
         /// Writes the bundle as a stream, with one RAM round, taken paused.
         fn stream(self) -> Vec<u8> {
-            use crate::checkpoint::stream::{ChunkEncoder, StreamRegion, StreamWriter};
+            self.stream_with_disk(&[], &[], |_| {})
+        }
+
+        /// Writes the bundle as a stream whose rounds each carry a disk
+        /// round, the last one paused: round `k` sends the blocks
+        /// `rounds[k].0` read from `image`, read at disk generation
+        /// `rounds[k].1`. disk.json lists them with their digests, and
+        /// `edit` may change it before it is written. With no rounds, one
+        /// RAM round, taken paused, and no disk round.
+        fn stream_with_disk(
+            mut self,
+            image: &[u8],
+            rounds: &[(&[u64], u64)],
+            edit: impl FnOnce(&mut DiskState),
+        ) -> Vec<u8> {
+            use crate::checkpoint::stream::{
+                ChunkEncoder, DiskEncoder, StreamRegion, StreamWriter,
+            };
+            use crate::devices::virtio::block::{DirtyBlocks, DiskRound, DIRTY_BLOCK_BYTES};
             let mut out = Vec::new();
             let mut w = StreamWriter::new(&mut out);
             w.write_doc("profile.json", self.profile.to_json().as_bytes())
                 .unwrap();
-            let mut round = w.round(true);
             let mut page = vec![0u8; 4096];
             page[..5].copy_from_slice(b"guest");
-            round
-                .chunk(&mut ChunkEncoder::default(), 2, &page, false)
-                .unwrap();
-            round.finish().unwrap();
+            let mut listed = Vec::new();
+            for (k, (blocks, generation)) in rounds.iter().enumerate() {
+                let in_pause = k + 1 == rounds.len();
+                let mut round = w.disk_round(in_pause);
+                let mut set = DirtyBlocks::for_size(image.len() as u64);
+                for &block in *blocks {
+                    let start = (block * DIRTY_BLOCK_BYTES) as usize;
+                    let end = (start + DIRTY_BLOCK_BYTES as usize).min(image.len());
+                    round
+                        .chunk(&mut DiskEncoder::default(), block, 1, &image[start..end])
+                        .unwrap();
+                    set.mark(block * DIRTY_BLOCK_BYTES, 1);
+                }
+                let (_, sent) = round.finish().unwrap();
+                listed.push(DiskRound {
+                    round: k as u32,
+                    generation: *generation,
+                    blocks: blocks.len() as u64,
+                    bitmap_sha256: Some(crate::checkpoint::bundle::hex(
+                        &<sha2::Sha256 as sha2::Digest>::digest(set.as_bytes()),
+                    )),
+                    sent_sha256: Some(sent),
+                });
+                let mut r = w.round(in_pause);
+                r.chunk(&mut ChunkEncoder::default(), 2, &page, false)
+                    .unwrap();
+                r.finish().unwrap();
+            }
+            if rounds.is_empty() {
+                let mut round = w.round(true);
+                round
+                    .chunk(&mut ChunkEncoder::default(), 2, &page, false)
+                    .unwrap();
+                round.finish().unwrap();
+            }
+            if let Some(disk) = self.disk.as_mut() {
+                if !rounds.is_empty() {
+                    disk.rounds = listed;
+                }
+                edit(disk);
+            }
             w.write_doc(
                 "cpu.json",
                 &json(&CpuState::new(GuestArch::Aarch64, self.vcpus)),
@@ -1134,7 +1389,7 @@ pub(crate) mod tests {
     fn a_stream_is_opened_as_its_directory_would_be() {
         let scratch = Scratch::new("stream-whole");
         let bytes = parts(&scratch).stream();
-        let opened = read_stream(&bytes[..], "test", None).unwrap();
+        let opened = read_stream(&bytes[..], "test", None, None).unwrap();
         assert!(opened.streamed());
         assert_eq!(
             refusals(&opened, &config(&scratch), &HVF),
@@ -1149,13 +1404,129 @@ pub(crate) mod tests {
         let scratch = Scratch::new("stream-disk");
         let mut parts = parts(&scratch);
         parts.disk.as_mut().unwrap().base_sha256 = Some("a".repeat(64));
-        let err = read_stream(&parts.stream()[..], "test", None)
+        let err = read_stream(&parts.stream()[..], "test", None, None)
             .err()
             .expect("refused");
         assert!(
             err.to_string().contains("disk.json: base_sha256 is aaaa"),
             "{err}"
         );
+    }
+
+    /// The source disk of the streamed-disk tests: [`Scratch`]'s zero disk
+    /// with blocks 0 to 2 written.
+    fn written_disk() -> Vec<u8> {
+        let mut image = vec![0u8; 1 << 20];
+        for (block, byte) in [(0usize, 0x11u8), (1, 0x22), (2, 0x33)] {
+            image[block * 65536..block * 65536 + 300].fill(byte);
+        }
+        image
+    }
+
+    /// [`parts`] with a disk whose base is the zero disk and whose writes
+    /// are [`written_disk`]'s, moved in two disk rounds: blocks 0 and 1
+    /// read at generation 3 while the guest ran, block 2 paused at 5.
+    fn disk_stream(scratch: &Scratch, edit: impl FnOnce(&mut DiskState)) -> Vec<u8> {
+        use crate::devices::virtio::block::DirtyBlocks;
+        let mut parts = parts(scratch);
+        let base = "0".repeat(64);
+        parts.profile.disk_base_sha256 = Some(base.clone());
+        let disk = parts.disk.as_mut().unwrap();
+        disk.base_sha256 = Some(base);
+        disk.block_size = Some(65536);
+        let mut since_boot = DirtyBlocks::for_size(disk.size_bytes);
+        since_boot.mark(0, 3 * 65536);
+        disk.dirty_since_boot_b64 = Some(crate::checkpoint::platform::base64_encode(
+            since_boot.as_bytes(),
+        ));
+        disk.generation = 5;
+        parts.stream_with_disk(&written_disk(), &[(&[0, 1], 3), (&[2], 5)], edit)
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn read_disk_back(scratch: &Scratch) -> Vec<u8> {
+        std::fs::read(scratch.disk()).unwrap()
+    }
+
+    // The stream's disk rounds go into --disk, the destination's copy of
+    // the base, as they arrive, and the restore checks them against
+    // disk.json itself: no --disk-generation.
+    #[test]
+    fn a_stream_writes_its_disk_rounds_into_the_disk() {
+        let scratch = Scratch::new("stream-disk-ok");
+        let bytes = disk_stream(&scratch, |_| {});
+        let opened = read_stream(&bytes[..], "test", None, Some(&scratch.disk())).unwrap();
+        assert!(read_disk_back(&scratch) == written_disk());
+        assert_eq!(
+            refusals(&opened, &config(&scratch), &HVF),
+            Vec::<String>::new()
+        );
+    }
+
+    fn disk_stream_refusal(name: &str, edit: impl FnOnce(&mut DiskState)) -> String {
+        let scratch = Scratch::new(name);
+        let bytes = disk_stream(&scratch, edit);
+        read_stream(&bytes[..], "test", None, Some(&scratch.disk()))
+            .err()
+            .expect("refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_stream_whose_disk_rounds_are_not_disk_json_s_is_refused() {
+        // The final round read before the guest's last write.
+        let why = disk_stream_refusal("stream-disk-gen", |d| d.generation = 6);
+        assert!(
+            why.contains("read at disk generation 5, and disk.json was captured at generation 6"),
+            "{why}"
+        );
+        let why = disk_stream_refusal("stream-disk-sent", |d| {
+            d.rounds[0].sent_sha256 = Some("1".repeat(64));
+        });
+        assert!(
+            why.contains("disk-round-0: its SHA-256 is not the sent_sha256"),
+            "{why}"
+        );
+        let why = disk_stream_refusal("stream-disk-bitmap", |d| {
+            d.rounds[1].bitmap_sha256 = Some("1".repeat(64));
+        });
+        assert!(
+            why.contains("disk-round-final: the blocks it wrote"),
+            "{why}"
+        );
+        let why = disk_stream_refusal("stream-disk-count", |d| {
+            let again = d.rounds[1].clone();
+            d.rounds.push(again);
+            d.rounds[2].round = 2;
+        });
+        assert!(
+            why.contains("lists 3 disk round(s), and the stream carried 2"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_stream_with_disk_rounds_needs_a_disk_of_its_own() {
+        let scratch = Scratch::new("stream-disk-none");
+        let bytes = disk_stream(&scratch, |_| {});
+        let why = read_stream(&bytes[..], "test", None, None)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(why.contains("was given no disk"), "{why}");
+        // A disk another hvi holds, as the source's own on this host, is
+        // refused before a block is written into it.
+        let held = VirtioBlk::open(&scratch.disk()).unwrap();
+        let why = read_stream(&bytes[..], "test", None, Some(&scratch.disk()))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(why.contains("locked by another process"), "{why}");
+        assert!(
+            read_disk_back(&scratch) == vec![0u8; 1 << 20],
+            "nothing written"
+        );
+        drop(held);
     }
 
     /// The flags that match [`parts`].

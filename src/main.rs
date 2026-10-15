@@ -628,6 +628,13 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if stream_keep.is_some() && from_stream.is_none() {
         return Err("--stream-keep goes with --from-stream".into());
     }
+    if disk_generation.is_some() && from_stream.is_some() {
+        return Err(
+            "--disk-generation goes with --from: a stream carries its disk rounds and \
+                    checks their generation itself"
+                .into(),
+        );
+    }
     // As in `boot_guest`: one malloc arena for a confined run, set while this
     // is still the only thread.
     #[cfg(target_os = "linux")]

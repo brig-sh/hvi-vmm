@@ -339,7 +339,9 @@ impl BlkState {
 
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
-    file: File,
+    /// The disk, shared with a mover that syncs it without the device's
+    /// lock (see [`data_file`](Self::data_file)).
+    file: Arc<File>,
     /// A second open of the disk, which holds an exclusive `flock` on it
     /// while this guest may still write it. See [`DiskLock`].
     lock: Option<DiskLock>,
@@ -424,7 +426,7 @@ fn backing_len(file: &File) -> std::io::Result<u64> {
 /// It is advisory: it keeps out another hvi, not a program that writes the
 /// image without asking.
 #[derive(Debug)]
-struct DiskLock {
+pub(crate) struct DiskLock {
     /// The open that holds the lock; closing it releases the lock.
     _file: File,
 }
@@ -440,7 +442,7 @@ impl DiskLock {
     ///
     /// Errors, as `WouldBlock`, when another open of the disk holds the
     /// lock, or when the path cannot be opened again.
-    fn take(path: &str, disk: &File) -> std::io::Result<Option<Self>> {
+    pub(crate) fn take(path: &str, disk: &File) -> std::io::Result<Option<Self>> {
         use std::os::unix::fs::FileTypeExt;
         use std::os::unix::io::AsRawFd;
 
@@ -535,7 +537,7 @@ impl VirtioBlk {
         // relative one, and the reader is given its own.
         let disk_id = file.metadata().map(|m| m.ino()).unwrap_or(0);
         Ok(VirtioBlk {
-            file,
+            file: Arc::new(file),
             lock: None,
             capacity_sectors,
             status: 0,
@@ -728,6 +730,20 @@ impl VirtioBlk {
     /// Errors as `fdatasync` does.
     pub fn sync_data(&self) -> std::io::Result<()> {
         self.file.sync_data()
+    }
+
+    /// Returns the disk's open file, to sync without holding the device's
+    /// lock.
+    ///
+    /// A live move syncs the disk right before it pauses the guest, while
+    /// the guest still runs, so the sync in the pause has only the last
+    /// writes left. Holding the lock for that first sync would stall the
+    /// guest's disk for as long as it takes, which was seconds on a busy
+    /// host. Cloning the `Arc` needs no system call, so a confined process
+    /// may do it.
+    #[must_use]
+    pub fn data_file(&self) -> Arc<File> {
+        Arc::clone(&self.file)
     }
 
     /// Returns what a checkpoint keeps of the device.
