@@ -16,7 +16,14 @@
 # Usage:
 #   tools/stream-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs INITRAMFS --out DIR [--cpus 2] [--mem 512] [--no-disk] \
-#       [--portable] [--dirty-mib 256 [--dirty-once SECS]]
+#       [--portable] [--dirty-mib 256 [--dirty-once SECS]] [--disk-whole] \
+#       [--disk-churn]
+#
+# The disk moves in the stream's disk rounds onto a copy of its base image
+# kept beside it, and each restored disk must hash as the source's did at
+# its fence; --disk-whole moves it the old way, the restore reopening the
+# source's image. --disk-churn keeps the guest writing its disk through the
+# moves.
 #
 # --dirty-mib N needs /dirty in the initramfs (tools/guest/dirty.c, built
 # static; tools/mk-initramfs.py --add): the guest then rewrites N MiB of
