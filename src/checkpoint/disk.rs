@@ -133,6 +133,38 @@ fn batches(blocks: &[u64]) -> Vec<(u64, u64)> {
     out
 }
 
+/// Appends the `count` adjacent blocks from `first` of the disk behind
+/// `dev` to `buf`, each read with the device's lock held for that block
+/// alone, and returns the longest hold in microseconds.
+///
+/// # Errors
+///
+/// Errors when a block is past the disk or its read fails.
+pub(crate) fn read_batch(
+    dev: &Mutex<VirtioBlk>,
+    first: u64,
+    count: u64,
+    buf: &mut Vec<u8>,
+) -> io::Result<u64> {
+    let mut longest = 0;
+    for block in first..first + count {
+        let dev = lock_or_recover(dev);
+        let held = Instant::now();
+        let len = dev.block_len(block).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("block {block} is past the disk"),
+            )
+        })? as usize;
+        let at = buf.len();
+        buf.resize(at + len, 0);
+        dev.read_block(block, &mut buf[at..])?;
+        drop(dev);
+        longest = longest.max(held.elapsed().as_micros() as u64);
+    }
+    Ok(longest)
+}
+
 /// Sends `blocks` of the disk behind `dev`, which [`check_blocks`] passed,
 /// to `out` in batches: each batch's header line, then its bytes.
 ///
@@ -151,21 +183,8 @@ pub(crate) fn export(
     let mut buf = Vec::with_capacity((BATCH_BLOCKS * DIRTY_BLOCK_BYTES) as usize);
     for (number, (first, count)) in (0u64..).zip(batches(blocks)) {
         buf.clear();
-        for block in first..first + count {
-            let dev = lock_or_recover(dev);
-            let held = Instant::now();
-            let len = dev.block_len(block).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("block {block} is past the disk"),
-                )
-            })? as usize;
-            let at = buf.len();
-            buf.resize(at + len, 0);
-            dev.read_block(block, &mut buf[at..])?;
-            drop(dev);
-            sent.max_lock_us = sent.max_lock_us.max(held.elapsed().as_micros() as u64);
-        }
+        let held = read_batch(dev, first, count, &mut buf)?;
+        sent.max_lock_us = sent.max_lock_us.max(held);
         let header = BatchHeader {
             component: BATCH_COMPONENT.to_string(),
             batch: number,
