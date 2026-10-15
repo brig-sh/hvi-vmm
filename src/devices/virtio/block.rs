@@ -1010,7 +1010,7 @@ impl VirtioBlk {
     #[cfg(test)]
     pub(crate) fn serve_now(&mut self, mem: &GuestRam) {
         while let Some(request) = self.take_request(mem) {
-            let done = request.run(mem);
+            let done = request.run();
             self.finish(mem, request, done);
         }
     }
@@ -1117,13 +1117,25 @@ impl VirtioBlk {
                 // guest memory: one syscall per request, not one per
                 // descriptor.
                 writable.pop();
-                Rw::new(sector, writable, status).map(Op::Read)
+                Rw::new(sector, writable, status).and_then(|rw| {
+                    self.byte_range(rw.sector, rw.len as u64)?;
+                    Ok(Op::Read(rw))
+                })
             }
             VIRTIO_BLK_T_OUT => {
                 // The data segments gathered into one buffer, then one
-                // positioned write.
+                // positioned write. The gather happens here, under the
+                // device's lock, and not in the run: a driver that resets
+                // the device or reprograms its queue while the request is
+                // in flight frees the buffers, and a gather after that
+                // would write whatever the guest has put in them since,
+                // bytes it never asked to write.
                 readable.remove(0);
-                Rw::new(sector, readable, status).map(Op::Write)
+                Rw::new(sector, readable, status).and_then(|rw| {
+                    self.byte_range(rw.sector, rw.len as u64)?;
+                    let data = rw.gather(mem)?;
+                    Ok(Op::Write(rw, data))
+                })
             }
             VIRTIO_BLK_T_FLUSH => Ok(Op::Flush { status }),
             // get-id / etc.: acknowledge without data.
@@ -1133,13 +1145,7 @@ impl VirtioBlk {
                 status,
             }),
         };
-        op.and_then(|op| {
-            if let Op::Read(rw) | Op::Write(rw) = &op {
-                self.byte_range(rw.sector, rw.len as u64)?;
-            }
-            Ok(op)
-        })
-        .unwrap_or_else(|error| Op::Refused { status, error })
+        op.unwrap_or_else(|error| Op::Refused { status, error })
     }
 
     /// Completes `request`, which `done` says how it ran: answers the driver
@@ -1152,7 +1158,7 @@ impl VirtioBlk {
     /// reset the queue since the request was taken gets nothing back, since
     /// its ring is gone.
     pub(crate) fn finish(&mut self, mem: &GuestRam, request: BlkRequest, done: Done) {
-        if let Op::Write(rw) = &request.op {
+        if let Op::Write(rw, _) = &request.op {
             self.dirty.mark(rw.base(), rw.len as u64);
         }
         if matches!(done, Done::Wrote(Ok(())) | Done::Flushed(Ok(()))) {
@@ -1187,7 +1193,7 @@ impl VirtioBlk {
                 read.and_then(|buf| rw.scatter(mem, &buf))
                     .map(|written| (written, (VIRTIO_BLK_T_IN, rw.sector, rw.len as u64))),
             ),
-            (Op::Write(rw), Done::Wrote(wrote)) => (
+            (Op::Write(rw, _), Done::Wrote(wrote)) => (
                 rw.status,
                 wrote.map(|()| (0, (VIRTIO_BLK_T_OUT, rw.sector, rw.len as u64))),
             ),
@@ -1289,8 +1295,9 @@ impl VirtioBlk {
 
 /// A request taken off the queue, which runs without the device's lock.
 ///
-/// [`VirtioBlk::take_request`] parses the chain under the lock,
-/// [`run`](Self::run) makes the disk call with no lock held, and
+/// [`VirtioBlk::take_request`] parses the chain under the lock, and copies
+/// a write's data out of guest RAM there, [`run`](Self::run) makes the
+/// disk call with no lock held and no guest RAM read, and
 /// [`VirtioBlk::finish`] completes it under the lock again.
 pub(crate) struct BlkRequest {
     /// The chain's head, which the used ring returns.
@@ -1322,8 +1329,9 @@ enum Op {
     },
     /// A read into the data segments.
     Read(Rw),
-    /// A write of the data segments.
-    Write(Rw),
+    /// A write of the data segments, with the bytes they held when the
+    /// chain was taken.
+    Write(Rw, Vec<u8>),
     /// A cache flush.
     Flush {
         /// The guest address of the status byte.
@@ -1346,7 +1354,7 @@ impl Op {
         match self {
             Op::Malformed => 0,
             Op::Refused { status, .. } | Op::Flush { status } | Op::Other { status, .. } => *status,
-            Op::Read(rw) | Op::Write(rw) => rw.status,
+            Op::Read(rw) | Op::Write(rw, _) => rw.status,
         }
     }
 }
@@ -1427,13 +1435,15 @@ pub(crate) enum Done {
 impl BlkRequest {
     /// Makes the disk call the request asks for, holding no lock: a
     /// positioned read, a positioned write of the data gathered from guest
-    /// RAM, or `fdatasync` for a flush.
-    pub(crate) fn run(&self, mem: &GuestRam) -> Done {
+    /// RAM when the chain was taken, or `fdatasync` for a flush. It reads
+    /// no guest RAM, since the driver may have reused the chain's buffers
+    /// by now.
+    pub(crate) fn run(&self) -> Done {
         #[cfg(test)]
         if let Some(hook) = &self.run_hook {
             hook(match self.op {
                 Op::Read(_) => "read",
-                Op::Write(_) => "write",
+                Op::Write(..) => "write",
                 Op::Flush { .. } => "flush",
                 Op::Malformed | Op::Refused { .. } | Op::Other { .. } => "other",
             });
@@ -1443,10 +1453,7 @@ impl BlkRequest {
                 let mut buf = vec![0u8; rw.len];
                 Done::Read(self.file.read_exact_at(&mut buf, rw.base()).map(|()| buf))
             }
-            Op::Write(rw) => Done::Wrote(
-                rw.gather(mem)
-                    .and_then(|buf| self.file.write_all_at(&buf, rw.base())),
-            ),
+            Op::Write(rw, data) => Done::Wrote(self.file.write_all_at(data, rw.base())),
             // Honour the guest's cache flush (durability for fsync).
             Op::Flush { .. } => Done::Flushed(self.file.sync_data()),
             Op::Malformed | Op::Refused { .. } | Op::Other { .. } => Done::Nothing,
@@ -1499,7 +1506,7 @@ pub(crate) fn serve(
             let Some(request) = lock_or_recover(dev).take_request(mem) else {
                 break;
             };
-            let done = request.run(mem);
+            let done = request.run();
             let events = {
                 let mut dev = lock_or_recover(dev);
                 dev.finish(mem, request, done);
@@ -2951,6 +2958,35 @@ mod worker_tests {
         assert_eq!(rig.used_heads(), heads, "returned in the order posted");
         assert_eq!(*lock_or_recover(&log), ["write", "write", "flush", "write"]);
         assert!((0..4).all(|slot| rig.status(slot) == VIRTIO_BLK_S_OK));
+        rig.stop();
+    }
+
+    /// A driver that resets the device while a write is in flight frees
+    /// its buffers, and may fill them again at once. The write still lands
+    /// with the bytes the chain held when it was taken, never with what the
+    /// guest put in the buffer after the reset, and the chain is not
+    /// returned on the ring the reset replaced.
+    #[test]
+    fn a_reset_during_a_write_writes_the_data_the_chain_held() {
+        let mut rig = rig("reset");
+        let hold = Hold::default();
+        lock_or_recover(&rig.dev).set_run_hook(hold.hook("write"));
+        rig.start();
+        rig.post(0, VIRTIO_BLK_T_OUT, 5, 0xc3);
+        rig.notify();
+        hold.wait_entered();
+        lock_or_recover(&rig.dev).mmio(&rig.mem, mmio::STATUS, true, 0);
+        let room = BASE + 0x1_0000;
+        rig.mem.write(room + 0x200, &[0xee; 512]).unwrap();
+        hold.release();
+        // The write is finished once the device's dirty blocks hold it.
+        let deadline = Instant::now() + PATIENCE;
+        while lock_or_recover(&rig.dev).dirty_since_boot().count() == 0 {
+            assert!(Instant::now() < deadline, "the write never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(rig.sector(5), vec![0xc3; 512], "the chain's own data");
+        assert_eq!(rig.used_idx(), 0, "not returned on the replaced ring");
         rig.stop();
     }
 
