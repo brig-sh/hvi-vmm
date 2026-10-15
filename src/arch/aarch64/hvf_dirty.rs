@@ -28,6 +28,11 @@
 //! vCPU that marks a granule makes it writable before a collect can take
 //! it, so no granule is ever writable without being in the record.
 //!
+//! That rests on `hv_vm_protect` taking effect on a vCPU running in the guest
+//! before it returns, which Apple does not document. The ignored test
+//! `no_store_lands_after_a_collect_returns` checks it: a store that landed
+//! after a collect's protect returned would be a write no round sends.
+//!
 //! The granule is the VM's IPA granule, 16 KiB on Apple silicon, which
 //! [`ipa_granule`] asks the framework for; it is never smaller than the host
 //! page `hv_vm_protect` works in.
@@ -317,6 +322,10 @@ mod tests {
     /// `str x0, [x1]; b .-4`: stores x0 at x1 for ever.
     const SPIN_STUB: [u32; 2] = [0xf900_0020, 0x17ff_ffff];
 
+    /// `str x0, [x1]; add x0, x0, #1; b .-8`: stores a rising count at x1
+    /// for ever.
+    const COUNT_STUB: [u32; 3] = [0xf900_0020, 0x9100_0400, 0x17ff_fffe];
+
     /// Anonymous host memory of `len` bytes, mapped at `BASE` for the guest.
     struct Ram {
         host: *mut u8,
@@ -509,5 +518,81 @@ mod tests {
         log.stop();
         drop(ram);
         drop(vm);
+    }
+
+    // The record holds every write only if `hv_vm_protect` stops a vCPU
+    // running in the guest before it returns. A vCPU stores a rising count;
+    // each pass collects (which protects the granule again), reads the word,
+    // then holds the vCPU at its next fault and reads it again. A store
+    // that landed after the collect returned shows as a changed word, and
+    // would be a write that no round sends. A macOS release that made the
+    // protect take effect later would fail here.
+    #[test]
+    #[ignore = "needs a signed test binary with the hypervisor entitlement"]
+    fn no_store_lands_after_a_collect_returns() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        const PASSES: u32 = 2000;
+        let granule = ipa_granule();
+        let vm = VirtualMachine::new().unwrap();
+        let ram = Ram::new((2 * granule) as usize, &COUNT_STUB);
+        let log = std::sync::Arc::new(HvfWriteLog::new(&[ram.region()]));
+        let held = std::sync::Arc::new(AtomicBool::new(false));
+        let target = BASE + granule + 8;
+        let (fault_tx, fault_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<bool>();
+        let (vcpu_log, vcpu_held, vcpu_vm) = (
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&held),
+            vm.clone(),
+        );
+        log.start().unwrap();
+        let runner = std::thread::spawn(move || {
+            let vcpu = vcpu_vm.vcpu_create().unwrap();
+            vcpu.set_reg(Reg::PC, BASE).unwrap();
+            vcpu.set_reg(Reg::CPSR, 0x3c5).unwrap();
+            vcpu.set_reg(Reg::X0, 1).unwrap();
+            vcpu.set_reg(Reg::X1, target).unwrap();
+            loop {
+                vcpu.run().unwrap();
+                let exit = vcpu.get_exit_info();
+                assert_eq!(Ec::from_syndrome(exit.exception.syndrome), Ec::DataAbort);
+                if vcpu_held.load(Ordering::SeqCst) {
+                    fault_tx.send(()).unwrap();
+                    if !go_rx.recv().unwrap() {
+                        return;
+                    }
+                }
+                assert!(vcpu_log.fault(exit.exception.physical_address).unwrap());
+            }
+        });
+        let (mut late, mut most) = (0u64, 0u64);
+        for pass in 0..PASSES {
+            let before = ram.word(granule + 8);
+            let started = Instant::now();
+            while ram.word(granule + 8) == before {
+                assert!(started.elapsed().as_secs() < 5, "the vCPU is not storing");
+            }
+            held.store(true, Ordering::SeqCst);
+            let mut set = DirtyPages::new(&[ram.region()]);
+            log.collect(&mut set).unwrap();
+            let at_return = ram.word(granule + 8);
+            fault_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the vCPU never faulted after the collect");
+            let at_fault = ram.word(granule + 8);
+            if at_fault != at_return {
+                late += 1;
+                most = most.max(at_fault.wrapping_sub(at_return));
+            }
+            held.store(false, Ordering::SeqCst);
+            go_tx.send(pass + 1 < PASSES).unwrap();
+        }
+        runner.join().unwrap();
+        log.stop();
+        println!(
+            "{PASSES} collects: {late} with stores after the collect returned, at most {most}"
+        );
+        assert_eq!(late, 0, "stores landed after the protect returned");
     }
 }
