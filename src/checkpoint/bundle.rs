@@ -97,8 +97,9 @@ pub const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 pub const DOC_VERSION: u32 = 1;
 
 /// The `checkpoint_format` of a bundle directory's manifest. The streamed
-/// bundle is format 2, see [`stream`](super::stream); the directory keeps
-/// format 1, and a profile in it may give either.
+/// bundle is format 2, or 3 with the disk's rounds, see
+/// [`stream`](super::stream); the directory keeps format 1, and a profile
+/// in it may give any of them.
 pub const DIRECTORY_FORMAT: u32 = 1;
 
 /// One file of a bundle.

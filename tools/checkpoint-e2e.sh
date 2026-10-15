@@ -37,8 +37,10 @@
 # before the move, writing N MiB of pseudo-random pages over and over; it
 # must report no page that lost a write, and go on counting after each
 # move. summary.json then also holds each move's rounds, bytes, dirty
-# rates, compression, write faults and downtime: from the end of the last
-# round taken with the guest running to the resume reply. --dirty-once SECS
+# rates, compression, write faults and downtime to the resume reply, twice:
+# from the end of the last round taken with the guest running
+# (rounds_end_unix_ms), and from the end of the disk's sync after it, at
+# the pause (precopy_end_unix_ms). --dirty-once SECS
 # makes /dirty write each page once per cycle of SECS seconds instead, in
 # a shuffled order, so that a write lost in any round, not only the final
 # one, leaves a page that fails its check.
@@ -46,7 +48,8 @@
 # With --stream and a disk, the disk moves in the stream too: the source
 # boots with --disk-base-sha256 of the fresh image, a copy of which is kept
 # as the base, and each restore gets a new copy of the base as its --disk,
-# which the stream's disk rounds make into the guest's disk. After each
+# with the same --disk-base-sha256, which the stream's disk rounds make into
+# the guest's disk. After each
 # fence the restored disk, held restored-paused, must hash as the source's
 # disk does. --disk-whole moves it the old way instead: no base, no disk
 # rounds, and the restore reopens the source's own image. --disk-churn
@@ -368,16 +371,28 @@ def stream_summary(reply, resume_wall=None):
         "stream_bytes", "write_granule", "write_faults", "write_fault_ns")}
     summary["rounds"] = [{k: r.get(k) for k in keep} for r in st.get("rounds") or []]
     summary["compression_ratio"] = round(raw / wire, 2) if wire else None
-    for k in ("disk_raw_bytes", "disk_stream_bytes", "disk_sync_ms", "gate_ms", "park_ms"):
+    for k in ("disk_raw_bytes", "disk_stream_bytes", "disk_sync_ms", "pause_sync_ms",
+              "gate_ms", "park_ms"):
         summary[k] = st.get(k)
     dkeep = ("name", "round", "in_pause", "blocks", "raw_bytes", "bytes", "ms", "max_lock_us")
     summary["disk_rounds"] = [{k: r.get(k) for k in dkeep} for r in st.get("disk_rounds") or []]
     draw, dwire = summary["disk_raw_bytes"] or 0, summary["disk_stream_bytes"] or 0
     summary["disk_compression_ratio"] = round(draw / dwire, 2) if dwire else None
-    if resume_wall is not None and st.get("precopy_end_unix_ms"):
-        summary["downtime_precopy_end_to_resume_ms"] = round(
-            resume_wall * 1000 - st["precopy_end_unix_ms"], 1)
+    for at in ("rounds_end", "precopy_end"):
+        if resume_wall is not None and st.get(f"{at}_unix_ms"):
+            summary[f"downtime_{at}_to_resume_ms"] = round(
+                resume_wall * 1000 - st[f"{at}_unix_ms"], 1)
     return summary
+
+
+def less_disk_check(move, disk_check_s):
+    """Adds to `move` its downtimes less `disk_check_s`, the time the
+    script spent hashing the disks with the destination restored-paused."""
+    move["disk_check_ms"] = round(disk_check_s * 1000, 1)
+    for at in ("rounds_end", "precopy_end"):
+        if move.get(f"downtime_{at}_to_resume_ms") is not None:
+            move[f"downtime_{at}_less_disk_check_ms"] = round(
+                move[f"downtime_{at}_to_resume_ms"] - disk_check_s * 1000, 1)
 
 
 def check_disk_rounds(move, where):
@@ -519,7 +534,7 @@ dst_disk = clone_base("disk-restored.img") if by_blocks else image
 dst_args = ["--control-sock", f"{socks}/dst.sock", "--checkpoint-root", root,
             "--agent-sock", f"{socks}/dst-agent.sock",
             "--profile-out", os.path.join(out, "restored-profile.json")] + net + (
-                ["--disk", dst_disk] if image else [])
+                ["--disk", dst_disk] if image else []) + base
 if stream:
     # The restore builds the VM once the manifest is in; until then it
     # applies the rounds as they come.
@@ -541,10 +556,8 @@ if by_blocks:
     disk_check_s = now() - hashed_at
 resumed, resume_at = dctl.ask(op="resume")
 stream_moves = [stream_summary(fence, wall_t0 + resume_at)] if stream else []
-if stream_moves and stream_moves[0].get("downtime_precopy_end_to_resume_ms") is not None:
-    stream_moves[0]["disk_check_ms"] = round(disk_check_s * 1000, 1)
-    stream_moves[0]["downtime_less_disk_check_ms"] = round(
-        stream_moves[0]["downtime_precopy_end_to_resume_ms"] - disk_check_s * 1000, 1)
+if stream_moves:
+    less_disk_check(stream_moves[0], disk_check_s)
 
 check(fence.get("ok") is True and fence.get("state") == "fenced",
       ("migrate" if stream else "checkpoint") + " then=fence"
@@ -705,7 +718,7 @@ again_at = now()
 third_disk = clone_base("disk-again.img") if by_blocks else image
 third_args = ["--control-sock", f"{socks}/third.sock", "--checkpoint-root", root,
               "--agent-sock", f"{socks}/third-agent.sock"] + net + (
-                  ["--disk", third_disk] if image else [])
+                  ["--disk", third_disk] if image else []) + base
 if stream:
     fence2, third, _, manifest2_at, fence2_at = stream_move(
         "restored-again", dctl, os.path.join(root, "move-again"), "e2e-2", 2, third_args)
@@ -792,12 +805,21 @@ if image:
     # The guest stopped without unmounting, so recent metadata may be in
     # the journal only, which debugfs does not replay: it may then refuse
     # the image or miss the file. Replay it on a copy first, as a mount
-    # would.
+    # would, and nothing more: a repair would hide damage the moves did to
+    # this disk, which nothing else compares. Then the filesystem must
+    # check clean, read-only.
     replayed = os.path.join(out, "replayed.img")
     shutil.copyfile(third_disk, replayed)
     e2fsck = os.path.join(os.path.dirname(debugfs), "e2fsck")
-    subprocess.run([e2fsck if os.path.exists(e2fsck) else "e2fsck", "-fy", replayed],
-                   capture_output=True)
+    e2fsck = e2fsck if os.path.exists(e2fsck) else "e2fsck"
+    replay = subprocess.run([e2fsck, "-E", "journal_only", "-y", replayed],
+                            capture_output=True, text=True)
+    fsck = subprocess.run([e2fsck, "-fn", replayed], capture_output=True, text=True)
+    check(replay.returncode <= 1 and fsck.returncode == 0,
+          f"the image replays its journal (e2fsck -E journal_only exit {replay.returncode}) "
+          f"and then checks clean (e2fsck -fn exit {fsck.returncode})"
+          + ("" if fsck.returncode == 0 else ": " + " | ".join(
+              (fsck.stdout + fsck.stderr).strip().splitlines()[-6:])))
     cat = subprocess.run([debugfs, "-R", "cat /after", replayed], capture_output=True,
                          text=True)
     os.remove(replayed)

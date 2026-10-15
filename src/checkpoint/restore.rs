@@ -296,6 +296,7 @@ pub(crate) fn open_config(cfg: &RestoreConfig) -> std::io::Result<Opened> {
             from,
             cfg.stream_keep.as_deref(),
             cfg.disk.as_ref().map(|disk| disk.path.as_str()),
+            cfg.disk_base_sha256.as_deref(),
         ),
         None => open(Path::new(&cfg.from)),
     }
@@ -427,6 +428,21 @@ impl stream::DiskTarget for StreamedDisk<'_> {
     }
 }
 
+/// Returns why a stream of `profile` cannot go onto a copy of the base
+/// image `base` (`--disk-base-sha256`), or `None` when it can.
+fn base_refusal(profile: &MachineProfile, base: &str) -> Option<String> {
+    match profile.disk_base_sha256.as_deref() {
+        Some(listed) if listed == base => None,
+        Some(listed) => Some(format!(
+            "the source's disk has base image {listed}, not --disk-base-sha256 {base}"
+        )),
+        None => Some(format!(
+            "the source's disk has no base image, so its disk moves whole and not onto a copy \
+             of --disk-base-sha256 {base}"
+        )),
+    }
+}
+
 /// Returns why the disk rounds a stream wrote into `--disk` do not make
 /// the disk `disk` describes, or `None` when they do.
 ///
@@ -533,6 +549,15 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<Opened> {
 /// new directory. Stdin that carried the stream is then replaced with
 /// `/dev/null`, so the console reads nothing that followed the stream.
 ///
+/// `disk` is `--disk`, which the disk rounds are written into, and `base`
+/// `--disk-base-sha256`, the base image `disk` is a copy of. With `base`,
+/// a stream whose profile names another base, or none, is refused at its
+/// first frame, before a block is written, and one that carried no disk
+/// rounds is refused at its end: `disk` would otherwise be taken as the
+/// guest's disk without any of the guest's writes. A stream whose
+/// disk.json names a base and that carried no disk rounds is refused
+/// either way.
+///
 /// # Errors
 ///
 /// Errors, naming the component, on the first thing that does not hold.
@@ -540,6 +565,7 @@ pub(crate) fn open_stream(
     from: &str,
     keep: Option<&str>,
     disk: Option<&str>,
+    base: Option<&str>,
 ) -> std::io::Result<Opened> {
     // The stream is the operator's, named on the command line.
     #[allow(clippy::disallowed_methods)]
@@ -551,7 +577,7 @@ pub(crate) fn open_stream(
                 .map_err(|e| std::io::Error::new(e.kind(), format!("connecting to {from}: {e}")))?,
         )
     };
-    let opened = read_stream(input, from, keep, disk)?;
+    let opened = read_stream(input, from, keep, disk, base)?;
     if from == "-" {
         // SAFETY: opens a path and moves the descriptor onto stdin; nothing
         // else holds stdin's lock now that the read is done.
@@ -575,6 +601,7 @@ fn read_stream(
     from: &str,
     keep: Option<&str>,
     disk: Option<&str>,
+    base: Option<&str>,
 ) -> std::io::Result<Opened> {
     let mut reader = stream::StreamReader::new(std::io::BufReader::with_capacity(1 << 20, input));
     let mut built = None;
@@ -585,6 +612,9 @@ fn read_stream(
             let text = std::str::from_utf8(bytes).map_err(|e| stream_bad("profile.json", e))?;
             let profile =
                 MachineProfile::from_json(text).map_err(|e| stream_bad("profile.json", e))?;
+            if let Some(why) = base.and_then(|b| base_refusal(&profile, b)) {
+                return Err(stream_bad("profile.json", why));
+            }
             let regions: Vec<stream::StreamRegion> = profile
                 .ram_regions
                 .iter()
@@ -654,10 +684,28 @@ fn read_stream(
         disk.check(&profile)
             .map_err(|e| stream_bad("disk.json", e))?;
     }
-    if !received.disk.is_empty() {
-        if let Some(why) = streamed_disk_refusal(disk.as_ref(), &received.disk) {
-            return Err(stream_bad("stream", why));
+    if received.disk.is_empty() {
+        if let Some(base) = base {
+            return Err(stream_bad(
+                "stream",
+                format!(
+                    "--disk-base-sha256 {base}: the stream carried no disk rounds, so --disk, \
+                     a copy of that base, lacks every write the guest made; the source was not \
+                     booted with that base, and its disk moves whole"
+                ),
+            ));
         }
+        if let Some(listed) = disk.as_ref().and_then(|d| d.base_sha256.as_deref()) {
+            return Err(stream_bad(
+                "stream",
+                format!(
+                    "disk.json names base image {listed}, and the stream carried no disk \
+                     rounds to apply to it"
+                ),
+            ));
+        }
+    } else if let Some(why) = streamed_disk_refusal(disk.as_ref(), &received.disk) {
+        return Err(stream_bad("stream", why));
     }
     let session = parse_session(doc("session.json")?)?;
     if let Some(dir) = keep {
@@ -1456,7 +1504,7 @@ pub(crate) mod tests {
     fn a_stream_is_opened_as_its_directory_would_be() {
         let scratch = Scratch::new("stream-whole");
         let bytes = parts(&scratch).stream();
-        let opened = read_stream(&bytes[..], "test", None, None).unwrap();
+        let opened = read_stream(&bytes[..], "test", None, None, None).unwrap();
         assert!(opened.streamed());
         assert_eq!(
             refusals(&opened, &config(&scratch), &HVF),
@@ -1471,7 +1519,7 @@ pub(crate) mod tests {
         let scratch = Scratch::new("stream-disk");
         let mut parts = parts(&scratch);
         parts.disk.as_mut().unwrap().base_sha256 = Some("a".repeat(64));
-        let err = read_stream(&parts.stream()[..], "test", None, None)
+        let err = read_stream(&parts.stream()[..], "test", None, None, None)
             .err()
             .expect("refused");
         assert!(
@@ -1522,7 +1570,7 @@ pub(crate) mod tests {
     fn a_stream_writes_its_disk_rounds_into_the_disk() {
         let scratch = Scratch::new("stream-disk-ok");
         let bytes = disk_stream(&scratch, |_| {});
-        let opened = read_stream(&bytes[..], "test", None, Some(&scratch.disk())).unwrap();
+        let opened = read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None).unwrap();
         assert!(read_disk_back(&scratch) == written_disk());
         assert_eq!(
             refusals(&opened, &config(&scratch), &HVF),
@@ -1533,7 +1581,7 @@ pub(crate) mod tests {
     fn disk_stream_refusal(name: &str, edit: impl FnOnce(&mut DiskState)) -> String {
         let scratch = Scratch::new(name);
         let bytes = disk_stream(&scratch, edit);
-        read_stream(&bytes[..], "test", None, Some(&scratch.disk()))
+        read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None)
             .err()
             .expect("refused")
             .to_string()
@@ -1576,7 +1624,7 @@ pub(crate) mod tests {
     fn a_stream_with_disk_rounds_needs_a_disk_of_its_own() {
         let scratch = Scratch::new("stream-disk-none");
         let bytes = disk_stream(&scratch, |_| {});
-        let why = read_stream(&bytes[..], "test", None, None)
+        let why = read_stream(&bytes[..], "test", None, None, None)
             .err()
             .expect("refused")
             .to_string();
@@ -1584,7 +1632,7 @@ pub(crate) mod tests {
         // A disk another hvi holds, as the source's own on this host, is
         // refused before a block is written into it.
         let held = VirtioBlk::open(&scratch.disk()).unwrap();
-        let why = read_stream(&bytes[..], "test", None, Some(&scratch.disk()))
+        let why = read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None)
             .err()
             .expect("refused")
             .to_string();
@@ -1594,6 +1642,99 @@ pub(crate) mod tests {
             "nothing written"
         );
         drop(held);
+    }
+
+    /// [`parts`] whose profile and disk.json name a base image, streamed
+    /// with no disk rounds: what a source would send whose disk rounds
+    /// were left out.
+    fn base_without_rounds(scratch: &Scratch) -> Vec<u8> {
+        let mut parts = parts(scratch);
+        let base = "0".repeat(64);
+        parts.profile.disk_base_sha256 = Some(base.clone());
+        let disk = parts.disk.as_mut().unwrap();
+        disk.base_sha256 = Some(base);
+        disk.block_size = Some(65536);
+        disk.dirty_since_boot_b64 = Some(crate::checkpoint::platform::base64_encode(
+            crate::devices::virtio::block::DirtyBlocks::for_size(disk.size_bytes).as_bytes(),
+        ));
+        parts.stream()
+    }
+
+    // --disk-base-sha256 says --disk is a copy of that base, which only
+    // the stream's disk rounds make into the guest's disk. A stream of a
+    // guest with another base, or none, is refused at its profile, before
+    // a block lands; one that carried no disk rounds at its end.
+    #[test]
+    fn a_stream_onto_a_base_must_be_of_that_base_and_carry_its_rounds() {
+        let zero = "0".repeat(64);
+        let scratch = Scratch::new("stream-base-ok");
+        let bytes = disk_stream(&scratch, |_| {});
+        read_stream(&bytes[..], "test", None, Some(&scratch.disk()), Some(&zero))
+            .expect("the base the stream names");
+        assert!(read_disk_back(&scratch) == written_disk());
+
+        let scratch = Scratch::new("stream-base-other");
+        let bytes = disk_stream(&scratch, |_| {});
+        let why = read_stream(
+            &bytes[..],
+            "test",
+            None,
+            Some(&scratch.disk()),
+            Some(&"1".repeat(64)),
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+        assert!(
+            why.contains("profile.json: the source's disk has base image 0000"),
+            "{why}"
+        );
+        assert!(
+            read_disk_back(&scratch) == vec![0u8; 1 << 20],
+            "nothing written"
+        );
+
+        let scratch = Scratch::new("stream-base-none");
+        let why = read_stream(
+            &parts(&scratch).stream()[..],
+            "test",
+            None,
+            Some(&scratch.disk()),
+            Some(&zero),
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+        assert!(
+            why.contains("profile.json: the source's disk has no base image"),
+            "{why}"
+        );
+
+        let scratch = Scratch::new("stream-base-norounds");
+        let bytes = base_without_rounds(&scratch);
+        let why = read_stream(&bytes[..], "test", None, Some(&scratch.disk()), Some(&zero))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(why.contains("the stream carried no disk rounds"), "{why}");
+    }
+
+    // Without the flag too: disk.json names a base, so the guest's disk is
+    // that base plus disk rounds, and a stream with none of them is
+    // refused rather than restored onto whatever --disk holds.
+    #[test]
+    fn a_stream_whose_disk_has_a_base_and_no_rounds_is_refused() {
+        let scratch = Scratch::new("stream-base-only");
+        let bytes = base_without_rounds(&scratch);
+        let why = read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(
+            why.contains("disk.json names base image 0000")
+                && why.contains("carried no disk rounds"),
+            "{why}"
+        );
     }
 
     /// The flags that match [`parts`].
@@ -1606,6 +1747,7 @@ pub(crate) mod tests {
             checkpoint_root: None,
             disk: Some(DiskConfig::rw(scratch.disk())),
             disk_generation: None,
+            disk_base_sha256: None,
             net: true,
             net_gateway: None,
             net_mac: None,

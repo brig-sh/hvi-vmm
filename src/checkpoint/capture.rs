@@ -213,29 +213,47 @@ impl Capture {
     ///
     /// Errors when the sync fails.
     pub(crate) fn disk_state(&self, profile: &MachineProfile) -> io::Result<Option<DiskState>> {
+        self.disk_state_timed(profile).map(|(disk, _)| disk)
+    }
+
+    /// As [`disk_state`](Self::disk_state), and returns how long the sync
+    /// took, which a move reports: it runs with the guest paused.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the sync fails.
+    pub(crate) fn disk_state_timed(
+        &self,
+        profile: &MachineProfile,
+    ) -> io::Result<(Option<DiskState>, std::time::Duration)> {
         let Some((dev, path)) = &self.block else {
-            return Ok(None);
+            return Ok((None, std::time::Duration::ZERO));
         };
         let dev = dev.lock().unwrap();
+        let started = std::time::Instant::now();
         dev.sync_data()
             .map_err(|e| io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
+        let synced = started.elapsed();
         // A disk over 4 TiB has no base (its boot refuses one), and its
         // bitmap would not fit disk.json: it goes without, as before the
         // bitmap existed.
         let since_boot = (dev.size_bytes() <= MAX_BITMAP_DISK_BYTES)
             .then(|| base64_encode(dev.dirty_since_boot().as_bytes()));
-        Ok(Some(DiskState {
-            version: DOC_VERSION,
-            path_hint: path.clone(),
-            size_bytes: dev.size_bytes(),
-            sha256_sparse: None,
-            generation: dev.generation(),
-            synced: true,
-            base_sha256: profile.disk_base_sha256.clone(),
-            block_size: since_boot.is_some().then_some(DIRTY_BLOCK_BYTES),
-            dirty_since_boot_b64: since_boot,
-            rounds: dev.rounds().to_vec(),
-        }))
+        Ok((
+            Some(DiskState {
+                version: DOC_VERSION,
+                path_hint: path.clone(),
+                size_bytes: dev.size_bytes(),
+                sha256_sparse: None,
+                generation: dev.generation(),
+                synced: true,
+                base_sha256: profile.disk_base_sha256.clone(),
+                block_size: since_boot.is_some().then_some(DIRTY_BLOCK_BYTES),
+                dirty_since_boot_b64: since_boot,
+                rounds: dev.rounds().to_vec(),
+            }),
+            synced,
+        ))
     }
 
     /// Returns `session.json` for `request`.
