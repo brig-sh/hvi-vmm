@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::checkpoint::server::ControlSocket;
 use crate::devices::virtio::block;
@@ -45,7 +45,9 @@ use crate::hypervisor::vcpus::Kick;
 use crate::plugin::Plugin;
 use crate::sandbox::{confine_control_thread, confine_io_thread};
 use crate::sync::lock_or_recover;
-use crate::teardown::{join_by, kick_until_finished, StopSource, StopToken, STOP_TIMEOUT};
+use crate::teardown::{
+    join_within, kick_until_finished, StopSource, StopToken, DISK_STOP_TIMEOUT, STOP_TIMEOUT,
+};
 use crate::terminal;
 use crate::LOG_PREFIX;
 
@@ -67,8 +69,9 @@ pub(crate) struct IoThreads {
     source: StopSource,
     /// The console reader, which the stop also has to signal.
     console: JoinHandle<()>,
-    /// Every other thread, with the name a report of it uses.
-    threads: Vec<(&'static str, JoinHandle<()>)>,
+    /// Every other thread, with the name a report of it uses and how long
+    /// after the stop's request its join waits.
+    threads: Vec<(&'static str, JoinHandle<()>, Duration)>,
     /// What ends the threads that watch no stop token, called first.
     enders: Vec<Box<dyn FnOnce() + Send>>,
 }
@@ -128,7 +131,10 @@ impl IoThreads {
                     }
                 });
             });
-            io_threads.push_ended_by("virtio-blk worker", worker, move || wake.stop());
+            io_threads
+                .threads
+                .push(("virtio-blk worker", worker, DISK_STOP_TIMEOUT));
+            io_threads.enders.push(Box::new(move || wake.stop()));
         }
         if let Some(bridge) = bridge {
             let stop = io_threads.token();
@@ -203,27 +209,32 @@ impl IoThreads {
     /// it watches a stop [`token`](Self::token), or the backend stops it before
     /// calling `stop`.
     pub(crate) fn push(&mut self, name: &'static str, thread: JoinHandle<()>) {
-        self.threads.push((name, thread));
+        self.threads.push((name, thread, STOP_TIMEOUT));
     }
 
-    /// Adds a thread that watches no stop token, with `end`, which ends it.
-    /// [`stop`](Self::stop) calls `end` before it joins.
+    /// Adds a thread the backend started that watches no stop token, with
+    /// `end`, which ends it. [`stop`](Self::stop) calls `end` before it
+    /// joins.
+    // Only the arm64 backends start such a thread, for `hvi-time`.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn push_ended_by(
         &mut self,
         name: &'static str,
         thread: JoinHandle<()>,
         end: impl FnOnce() + Send + 'static,
     ) {
-        self.threads.push((name, thread));
+        self.threads.push((name, thread, STOP_TIMEOUT));
         self.enders.push(Box::new(end));
     }
 
     /// Requests the stop and joins every thread.
     ///
     /// The console reader also gets the kick signal until it exits, since a
-    /// read of stdin is where the stop token cannot reach it. Every join shares
-    /// one deadline, [`STOP_TIMEOUT`] from the request. A thread still running
-    /// at the deadline is left running and reported on stderr.
+    /// read of stdin is where the stop token cannot reach it. Every join but
+    /// one shares one deadline, [`STOP_TIMEOUT`] from the request. The
+    /// virtio-blk worker's is [`DISK_STOP_TIMEOUT`] from it, since a disk
+    /// call in flight cannot be cut short. A thread still running at its
+    /// deadline is left running and reported on stderr.
     ///
     /// # Errors
     ///
@@ -233,12 +244,13 @@ impl IoThreads {
         for end in self.enders {
             end();
         }
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        kick_until_finished(&self.console, deadline);
+        let requested = Instant::now();
+        kick_until_finished(&self.console, requested + STOP_TIMEOUT);
         let mut failure = None;
-        for (name, thread) in std::iter::once(("console reader", self.console)).chain(self.threads)
+        for (name, thread, within) in
+            std::iter::once(("console reader", self.console, STOP_TIMEOUT)).chain(self.threads)
         {
-            if let Err(e) = join_by(name, thread, deadline) {
+            if let Err(e) = join_within(name, thread, requested + within, within) {
                 eprintln!("{LOG_PREFIX} {e}; left running");
                 failure.get_or_insert(e);
             }

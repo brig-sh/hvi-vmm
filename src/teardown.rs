@@ -61,7 +61,17 @@ use crate::signal::kick_signal;
 /// virtio-fs worker waiting on a host file lock.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Joins `thread` if it exits before `deadline`.
+/// How long the stop waits for the virtio-blk worker after it is requested.
+///
+/// The worker may be in a disk call the stop cannot interrupt, such as the
+/// `fdatasync` of a guest flush, which takes seconds on a busy host disk.
+/// Before the worker, the vCPU made that call, and the stop waited for it
+/// without a bound. 30 s is the default I/O timeout of the Linux NVMe driver,
+/// so a call still running by then is one the drive itself has given up on.
+pub const DISK_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Joins `thread` if it exits before `deadline`, [`STOP_TIMEOUT`] after the
+/// stop was requested.
 ///
 /// A thread that has not exited by the deadline is left running.
 ///
@@ -69,11 +79,26 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// Errors when the thread has not exited by the deadline.
 pub fn join_by(name: &str, thread: JoinHandle<()>, deadline: Instant) -> io::Result<()> {
+    join_within(name, thread, deadline, STOP_TIMEOUT)
+}
+
+/// Joins `thread` if it exits before `deadline`, `within` after the stop was
+/// requested, which the error names.
+///
+/// # Errors
+///
+/// Errors when the thread has not exited by the deadline.
+pub fn join_within(
+    name: &str,
+    thread: JoinHandle<()>,
+    deadline: Instant,
+    within: Duration,
+) -> io::Result<()> {
     while !thread.is_finished() {
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
                 "{name} did not stop within {}s",
-                STOP_TIMEOUT.as_secs()
+                within.as_secs()
             )));
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -751,6 +776,25 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         drop(source);
         assert!(join_by("helper", helper, Instant::now() + STOP_TIMEOUT).is_ok());
+    }
+
+    /// A join given longer than [`STOP_TIMEOUT`] waits for a thread that
+    /// takes longer, as the virtio-blk worker's does for a disk call, and
+    /// one that runs out names its own bound.
+    #[test]
+    fn a_join_waits_out_its_own_bound() {
+        let slow = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(1200)));
+        let within = Duration::from_secs(3);
+        assert!(join_within("slow", slow, Instant::now() + within, within).is_ok());
+
+        let (_hold, held) = UnixStream::pair().expect("pair");
+        let source = StopSource::new().expect("pair");
+        let token = source.token();
+        let stuck = std::thread::spawn(move || drop(token.wait(held.as_fd())));
+        let within = Duration::from_millis(20);
+        let err = join_within("stuck", stuck, Instant::now() + within, within).unwrap_err();
+        assert_eq!(err.to_string(), "stuck did not stop within 0s");
+        source.request_stop();
     }
 
     #[test]
