@@ -16,12 +16,15 @@
 # Usage:
 #   tools/stream-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs INITRAMFS --out DIR [--cpus 2] [--mem 512] [--no-disk] \
-#       [--portable] [--dirty-mib 256]
+#       [--portable] [--dirty-mib 256 [--dirty-once SECS]]
 #
 # --dirty-mib N needs /dirty in the initramfs (tools/guest/dirty.c, built
 # static; tools/mk-initramfs.py --add): the guest then rewrites N MiB of
 # pseudo-random pages over and over during the move, which keeps it from
 # converging, so the rounds stop at the round cap, and checks that no page
-# lost a write. Exits 0 when every check passed.
+# lost a write. A page rewritten in every pass hides a write lost in a
+# round taken with the guest running, since the next round sends it again;
+# --dirty-once SECS writes each page once per SECS seconds instead, so such
+# a loss fails the check. Exits 0 when every check passed.
 set -euo pipefail
 exec "$(dirname "$0")/checkpoint-e2e.sh" --stream "$@"
