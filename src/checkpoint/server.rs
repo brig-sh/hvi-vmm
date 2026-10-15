@@ -51,6 +51,7 @@
 //! read it. A fenced VM is never streamed again: the fence released its
 //! disk, and the destination may already run it.
 
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileTypeExt;
@@ -74,7 +75,7 @@ use crate::config::Stop;
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, PauseError, Vcpus, WorkResult};
-use crate::teardown::{PauseGate, StopToken};
+use crate::teardown::{PauseGate, StopToken, Writable};
 use crate::LOG_PREFIX;
 
 /// How long a pause waits for the I/O threads and the vCPUs together, and how
@@ -82,6 +83,50 @@ use crate::LOG_PREFIX;
 /// longer, so a client that allows a little more than this for a reply never
 /// gives up on a pause that later succeeds.
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a `migrate` waits for its reader to take a byte, with the guest
+/// running or paused. A reader that has stopped reading without closing the
+/// connection would otherwise hold the control thread, and a paused guest,
+/// for as long as it stays stuck.
+const STREAM_STALL: Duration = Duration::from_secs(30);
+
+/// The least time a `migrate` gives the part of its stream written with the
+/// guest paused, before it gives up and the guest runs on. See
+/// [`StreamLimits::paused_budget`].
+const STREAM_PAUSED_FLOOR: Duration = Duration::from_secs(10);
+
+/// How long a `migrate` may wait on its reader.
+#[derive(Clone, Copy, Debug)]
+struct StreamLimits {
+    /// The longest one write waits for the reader to take a byte.
+    stall: Duration,
+    /// The least time the paused part of the stream is given.
+    paused_floor: Duration,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            stall: STREAM_STALL,
+            paused_floor: STREAM_PAUSED_FLOOR,
+        }
+    }
+}
+
+impl StreamLimits {
+    /// Returns how long the stream may take from the pause to the manifest,
+    /// given how long the last round with the guest running took.
+    ///
+    /// The final round holds what the guest wrote during that round, so it
+    /// is at most about as large, and the reader took that round at the rate
+    /// it can. Twice that time, plus the floor for the pause, the documents
+    /// and a reader's hiccup, bounds a healthy final round. A reader that
+    /// stops taking the stream then costs the guest at most this pause.
+    fn paused_budget(&self, last_round: Duration) -> Duration {
+        self.paused_floor
+            .saturating_add(last_round.saturating_mul(2))
+    }
+}
 
 /// How often a wait for the profile looks at whether the VM still runs.
 const PROFILE_POLL: Duration = Duration::from_millis(50);
@@ -276,10 +321,18 @@ impl ControlSocket {
         vcpus: &Vcpus<K>,
         capture: Option<Capture>,
     ) {
-        self.run_with(stop, gate, vcpus, capture, CONTROL_TIMEOUT);
+        self.run_with(
+            stop,
+            gate,
+            vcpus,
+            capture,
+            CONTROL_TIMEOUT,
+            StreamLimits::default(),
+        );
     }
 
-    /// [`run`](Self::run), with `timeout` for each wait.
+    /// [`run`](Self::run), with `timeout` for each wait and `stream` for a
+    /// `migrate`'s waits on its reader.
     fn run_with<K: Kick>(
         self,
         stop: &StopToken,
@@ -287,6 +340,7 @@ impl ControlSocket {
         vcpus: &Vcpus<K>,
         capture: Option<Capture>,
         timeout: Duration,
+        stream: StreamLimits,
     ) {
         let mut machine = Machine {
             state: self.initial,
@@ -296,6 +350,7 @@ impl ControlSocket {
             capture,
             root: self.checkpoint_root.clone(),
             timeout,
+            stream,
         };
         loop {
             match stop.wait(self.listener.as_fd()) {
@@ -375,8 +430,15 @@ fn answer<K: Kick>(
         return Ok(());
     }
     let (response, then) = match parse_request(&line) {
-        // The stream goes on this connection, ahead of the reply.
-        Ok(Request::Migrate(request)) => (machine.migrate(conn, stop, &request), None),
+        // The stream goes on this connection, ahead of the reply. Its reader
+        // may be the reason the stream failed, so the reply waits for it
+        // only as long as a pause would, and the connection is closed if
+        // the reply does not fit by then.
+        Ok(Request::Migrate(request)) => {
+            let response = machine.migrate(conn, stop, &request);
+            let none = Cell::new(None);
+            return SocketOut::new(conn, stop, machine.timeout, &none).send(&response);
+        }
         Ok(request) => machine.handle(request),
         Err(e) => (Response::Error(e), None),
     };
@@ -406,26 +468,79 @@ fn send(conn: &mut UnixStream, stop: &StopToken, response: &Response) -> std::io
     Ok(())
 }
 
-/// The control connection as a writer that waits for room beside the
-/// stop token, for a stream.
+/// The control connection as a writer for a stream: it waits for room
+/// beside the stop token, and gives up on a reader that takes nothing.
 struct SocketOut<'a> {
     /// The connection, non-blocking.
     conn: &'a mut UnixStream,
     /// The stop, which ends a wait for room.
     stop: &'a StopToken,
+    /// The longest one write waits for the reader to take a byte.
+    stall: Duration,
+    /// When every write fails, however the reader keeps up. The server sets
+    /// it at the pause, while the stream holds this writer.
+    deadline: &'a Cell<Option<Instant>>,
+}
+
+impl<'a> SocketOut<'a> {
+    /// Wraps `conn`, with `stall` for each write and `deadline` for all.
+    fn new(
+        conn: &'a mut UnixStream,
+        stop: &'a StopToken,
+        stall: Duration,
+        deadline: &'a Cell<Option<Instant>>,
+    ) -> Self {
+        Self {
+            conn,
+            stop,
+            stall,
+            deadline,
+        }
+    }
+
+    /// Writes `response` and its newline.
+    fn send(&mut self, response: &Response) -> std::io::Result<()> {
+        self.write_all((format_response(response) + "\n").as_bytes())
+    }
 }
 
 impl Write for SocketOut<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The stall counts from this call, so the time the stream spends
+        // reading and compressing RAM between writes is not the reader's.
+        let stalled_at = Instant::now() + self.stall;
+        let until = self
+            .deadline
+            .get()
+            .map_or(stalled_at, |d| d.min(stalled_at));
         loop {
             match self.conn.write(buf) {
                 Ok(n) => return Ok(n),
                 Err(e) if retry_read(&e) => {
-                    if !self.stop.wait_writable(self.conn.as_fd())? {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "the run is stopping",
-                        ));
+                    match self.stop.wait_writable_until(self.conn.as_fd(), until)? {
+                        Writable::Ready => {}
+                        Writable::Stopped => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "the run is stopping",
+                            ))
+                        }
+                        Writable::TimedOut if until < stalled_at => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "the reader did not take the stream within the time the \
+                                 guest may stay paused",
+                            ))
+                        }
+                        Writable::TimedOut => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!(
+                                    "the reader took nothing for {} ms",
+                                    self.stall.as_millis()
+                                ),
+                            ))
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -471,6 +586,8 @@ struct Machine<'a, K> {
     root: Option<CheckpointRoot>,
     /// The deadline of each wait, [`CONTROL_TIMEOUT`] outside the tests.
     timeout: Duration,
+    /// How long a `migrate` waits on its reader.
+    stream: StreamLimits,
 }
 
 impl<K: Kick> Machine<'_, K> {
@@ -680,7 +797,8 @@ impl<K: Kick> Machine<'_, K> {
         };
         let ram = Arc::clone(&capture.ram);
         let found = self.state;
-        let mut out = SocketOut { conn, stop };
+        let paused_deadline = Cell::new(None);
+        let mut out = SocketOut::new(conn, stop, self.stream.stall, &paused_deadline);
         let mut stream = StreamWriter::new(&mut out);
         if let Err(e) = stream.write_doc("profile.json", profile.to_json().as_bytes()) {
             return refuse(
@@ -710,6 +828,11 @@ impl<K: Kick> Machine<'_, K> {
         let precopy_end_unix_ms = unix_ms();
 
         let paused_at = Instant::now();
+        let last_round = precopy
+            .rounds
+            .last()
+            .map_or(Duration::ZERO, |r| Duration::from_millis(r.ms));
+        paused_deadline.set(Some(paused_at + self.stream.paused_budget(last_round)));
         if found == VmState::Running {
             if let Response::Error(e) = self.pause() {
                 tracker.stop();
@@ -1093,6 +1216,9 @@ mod tests {
         /// MiB of pages that do not compress, added to guest RAM after its
         /// first MiB, so a stream of it outgrows a socket's buffer.
         noise_mib: u64,
+        /// How long a `migrate` waits on its reader; the real limits when
+        /// not set.
+        stream: StreamLimits,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -1265,14 +1391,22 @@ mod tests {
                 }),
             });
             let server = {
-                let (stop, gate, vcpus) = (
+                let (stop, gate, vcpus, stream) = (
                     source.token(),
                     Arc::clone(source.gate()),
                     Arc::clone(&vcpus),
+                    spec.stream,
                 );
                 // A short deadline, so a test of a timeout is quick.
                 std::thread::spawn(move || {
-                    socket.run_with(&stop, &gate, &vcpus, capture, Duration::from_millis(200));
+                    socket.run_with(
+                        &stop,
+                        &gate,
+                        &vcpus,
+                        capture,
+                        Duration::from_millis(200),
+                        stream,
+                    );
                 })
             };
             let client = UnixStream::connect(&path).unwrap();
@@ -2217,7 +2351,69 @@ mod tests {
         }
     }
 
+    /// A record of the guest's writes that reports every page written in
+    /// every round, as a guest that never stops writing would.
+    #[derive(Default)]
+    struct BusyLog {
+        stops: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::memory::GuestWriteLog for BusyLog {
+        fn start(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn collect(&self, into: &mut crate::memory::DirtyPages) -> std::io::Result<()> {
+            for index in 0..into.region_count() {
+                let (_, pages) = into.region(index).unwrap();
+                into.set_range(index, 0, pages);
+            }
+            Ok(())
+        }
+        fn stop(&self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+        fn granule(&self) -> u64 {
+            4096
+        }
+    }
+
     impl Fixture {
+        /// Sends `line` and reads frames until the header of `component`,
+        /// without its bytes. Returns the headers read, `component`'s last.
+        fn read_stream_until(&mut self, line: &str, component: &str) -> Vec<serde_json::Value> {
+            self.client.write_all(line.as_bytes()).unwrap();
+            self.client.write_all(b"\n").unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut header = String::new();
+                self.replies.read_line(&mut header).unwrap();
+                let value: serde_json::Value = serde_json::from_str(header.trim_end())
+                    .unwrap_or_else(|e| panic!("{e}: {header}"));
+                let name = value["component"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{header}"));
+                let (done, size) = (name == component, value["size"].as_u64().unwrap());
+                headers.push(value);
+                if done {
+                    return headers;
+                }
+                let mut body = vec![0u8; usize::try_from(size).unwrap()];
+                self.replies.read_exact(&mut body).unwrap();
+            }
+        }
+
+        /// Asks a new connection for the status, as a client would while
+        /// this one is stuck.
+        fn status_elsewhere(&self) -> serde_json::Value {
+            let mut next = UnixStream::connect(&self.path).unwrap();
+            next.set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            next.write_all(b"{\"v\":1,\"op\":\"status\"}\n").unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(next).read_line(&mut line).unwrap();
+            reply(line.trim_end())
+        }
+
         /// Asks for a migrate and reads the stream into fresh guest RAM,
         /// then the reply line after it. Returns what was read, or the
         /// reader's error, and the reply.
@@ -2416,6 +2612,89 @@ mod tests {
         assert_eq!(reply(line.trim_end())["state"], "running", "{line}");
     }
 
+    // A reader that stops reading while the guest runs, without closing the
+    // connection, holds the stream only as long as the stall limit: the
+    // rounds fail, the tracking stops, the guest never paused, and the
+    // control socket serves the next client.
+    #[test]
+    fn a_migrate_whose_reader_stalls_while_the_guest_runs_gives_up() {
+        let log = Arc::new(QuietLog::default());
+        let mut f = Fixture::with(
+            "mig-stall-run",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                noise_mib: 8,
+                stream: StreamLimits {
+                    stall: Duration::from_millis(300),
+                    paused_floor: Duration::from_secs(60),
+                },
+                ..Spec::default()
+            },
+        );
+        let stalled_at = Instant::now();
+        f.read_stream_until(r#"{"v":1,"op":"migrate","then":"fence"}"#, "ram-round-0");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.stops.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the stalled migrate did not end");
+            assert_eq!(f.vcpus.parked(), 0, "the guest paused");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stalled_at.elapsed() >= Duration::from_millis(300));
+        f.assert_running();
+        let status = f.status_elsewhere();
+        assert_eq!(status["state"], "running", "{status}");
+    }
+
+    // A reader that stops reading during the final round, with the guest
+    // paused, keeps it paused only for the paused budget: the stream fails,
+    // the guest runs on unfenced, and the control socket serves the next
+    // client. Every page is written in every round, so the final round is
+    // 9 MiB, far more than the socket holds.
+    #[test]
+    fn a_migrate_whose_reader_stalls_while_the_guest_is_paused_resumes_it() {
+        let log = Arc::new(BusyLog::default());
+        let mut f = Fixture::with(
+            "mig-stall-paused",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                noise_mib: 8,
+                stream: StreamLimits {
+                    stall: Duration::from_secs(60),
+                    paused_floor: Duration::from_millis(300),
+                },
+                ..Spec::default()
+            },
+        );
+        let headers = f.read_stream_until(
+            r#"{"v":1,"op":"migrate","then":"fence","max_rounds":1}"#,
+            "ram-round-1",
+        );
+        assert!(headers.len() > 2, "round 0 came first: {headers:?}");
+        let stalled_at = Instant::now();
+        assert_eq!(
+            f.vcpus.parked(),
+            2,
+            "the final round began with the guest running"
+        );
+        assert!(
+            f.source.gate().is_paused(),
+            "the final round began with the gate open"
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log.stops.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the stalled migrate did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stalled_at.elapsed() >= Duration::from_millis(100));
+        f.assert_running();
+        let status = f.status_elsewhere();
+        assert_eq!(status["state"], "running", "{status}");
+    }
+
     // A fenced VM is not streamed again, whatever the second request asks:
     // the first destination may run it already.
     #[test]
@@ -2437,7 +2716,10 @@ mod tests {
                 r#"{{"v":1,"op":"migrate","then":"{then}","txid":"other","epoch":9}}"#
             ));
             let err = again.err().expect("a second stream was sent").to_string();
-            assert!(err.contains("the source ended the stream: fenced:"), "{err}");
+            assert!(
+                err.contains("the source ended the stream: fenced:"),
+                "{err}"
+            );
         }
         let status = reply(&f.ask(r#"{"v":1,"op":"status"}"#));
         assert_eq!(status["state"], "fenced", "{status}");

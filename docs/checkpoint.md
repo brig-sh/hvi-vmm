@@ -730,7 +730,19 @@ that takes to send. The final round is always taken paused.
 
 Only the control thread writes the stream. A slow reader holds it up, and
 the guest runs on meanwhile; the pause starts once the last round with the
-guest running is written. A zero page in a later round is sent as a clear
+guest running is written. A reader that stops taking the stream without
+closing the connection is not waited for without end, since it would hold
+the control socket and, in the final round, a paused guest:
+
+- Any write that waits 30 s for the reader to take a byte fails the move.
+- From the pause, the rest of the stream must be written within 10 s plus
+  twice the time the last round with the guest running took. The final
+  round holds what the guest wrote during that round, so a reader that kept
+  up with it keeps up with this one.
+
+Either failure leaves the VM as the request found it, as any failure before
+the manifest does: running, and not fenced. The reply then waits at most
+2 s for room, and the connection is closed if it does not fit. A zero page in a later round is sent as a clear
 bit, and the destination zeroes it where an earlier round wrote it.
 
 ### The fence of a live move
