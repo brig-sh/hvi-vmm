@@ -309,13 +309,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // does not check it.
             "--disk-base-sha256" => {
                 let v = it.next().ok_or("--disk-base-sha256 needs a value")?;
-                if v.len() != 64 || !v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                    return Err(format!(
-                        "--disk-base-sha256 must be 64 lowercase hex digits, not {v:?}"
-                    )
-                    .into());
-                }
-                disk_base_sha256 = Some(v.clone());
+                disk_base_sha256 = Some(base_digest(v)?);
             }
             // The blocks where the disk already differs from that base, as
             // a bitmap file: a launcher that wrote files into its copy of
@@ -582,10 +576,21 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     signals.finish(hvi::boot(cfg))
 }
 
+/// Returns `v` when it is a SHA-256 as `--disk-base-sha256` takes it.
+fn base_digest(v: &str) -> Result<String, String> {
+    if v.len() != 64 || !v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "--disk-base-sha256 must be 64 lowercase hex digits, not {v:?}"
+        ));
+    }
+    Ok(v.to_string())
+}
+
 /// Runs `restore`, which resumes a checkpoint bundle in this process.
 ///
 /// `restore (--from <bundle> [--disk-generation <g>] | --from-stream
-/// <socket>|- [--stream-keep <dir>]) --control-sock <path> --checkpoint-root
+/// <socket>|- [--stream-keep <dir>] [--disk-base-sha256 <hex>])
+/// --control-sock <path> --checkpoint-root
 /// <dir> [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac
 /// <mac>] [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
 /// [--profile-out <path>] [--no-sandbox]`. The guest waits restored-paused
@@ -598,6 +603,7 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checkpoint_root = None;
     let mut disk = None;
     let mut disk_generation = None;
+    let mut disk_base_sha256 = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_mac = None;
@@ -629,6 +635,9 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     v.parse()
                         .map_err(|_| format!("--disk-generation is not a generation: {v}"))?,
                 );
+            }
+            "--disk-base-sha256" => {
+                disk_base_sha256 = Some(base_digest(&value("--disk-base-sha256")?)?);
             }
             "--net-stub" => net = true,
             "--net-gateway" => net_gateway = Some(value("--net-gateway")?),
@@ -669,6 +678,13 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    if disk_base_sha256.is_some() && (from_stream.is_none() || disk.is_none()) {
+        return Err(
+            "--disk-base-sha256 goes with --from-stream and --disk: it names the base image \
+             --disk is a copy of, which the stream's disk rounds go onto"
+                .into(),
+        );
+    }
     // As in `boot_guest`: one malloc arena for a confined run, set while this
     // is still the only thread.
     #[cfg(target_os = "linux")]
@@ -687,6 +703,7 @@ fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ),
         disk,
         disk_generation,
+        disk_base_sha256,
         net,
         net_gateway,
         net_mac,

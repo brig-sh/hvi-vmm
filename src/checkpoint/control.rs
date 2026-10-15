@@ -104,8 +104,11 @@ pub struct Migrate {
     pub then: Then,
     /// The caller's transaction id, recorded in `session.json`.
     pub txid: Option<String>,
-    /// The caller's epoch for the sandbox, recorded in `session.json`.
-    pub epoch: u64,
+    /// The caller's epoch for the sandbox, recorded in `session.json` (0
+    /// when it gives none). A fenced VM is streamed again only for a
+    /// request that gives both this and `txid`, equal to the fence's, so
+    /// a request without one is told apart from one with epoch 0.
+    pub epoch: Option<u64>,
     /// The most rounds taken with the guest running, 1 to
     /// [`MAX_MIGRATE_ROUNDS`], default 5; 1 sends RAM once running and once
     /// paused.
@@ -307,8 +310,12 @@ pub struct MigrateStats {
     /// The bytes the disk rounds put on the stream.
     pub disk_stream_bytes: u64,
     /// The sync of the disk after the last round with the guest running
-    /// and before the pause, in milliseconds.
+    /// and before the pause, in milliseconds. The guest runs meanwhile,
+    /// and what it writes then goes into the final round.
     pub disk_sync_ms: u64,
+    /// The sync of the disk in the pause, before disk.json is written, in
+    /// milliseconds: part of `paused_ms`.
+    pub pause_sync_ms: u64,
     /// The bytes one record of the guest's writes covers: the host page on
     /// KVM, the IPA granule on HVF.
     pub write_granule: u64,
@@ -316,8 +323,15 @@ pub struct MigrateStats {
     pub write_faults: Option<u64>,
     /// The mean host time of one, in nanoseconds.
     pub write_fault_ns: Option<u64>,
-    /// When the rounds with the guest running ended and the disk was
-    /// synced, just before the pause, in milliseconds since the Unix epoch.
+    /// When the last round with the guest running ended, before the
+    /// disk's sync, in milliseconds since the Unix epoch. The guest is
+    /// stopped at most from here to its resume on the destination.
+    pub rounds_end_unix_ms: u64,
+    /// When the disk's sync after the rounds ended, just before the pause,
+    /// in milliseconds since the Unix epoch: `rounds_end_unix_ms` plus
+    /// `disk_sync_ms`. The guest still runs during the sync, so the time
+    /// from here to its resume on the destination is closer to how long
+    /// it was stopped.
     pub precopy_end_unix_ms: u64,
     /// When the manifest was written.
     pub sealed_at_unix_ms: u64,
@@ -422,7 +436,10 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
         "migrate" => Request::Migrate(Migrate {
             then: then_of(&fields)?,
             txid: txid_of(&fields)?,
-            epoch: epoch_of(&fields)?,
+            epoch: fields
+                .contains_key("epoch")
+                .then(|| epoch_of(&fields))
+                .transpose()?,
             max_rounds: match fields.get("max_rounds") {
                 None => None,
                 Some(n) => Some(
@@ -693,7 +710,7 @@ mod tests {
                 Request::Migrate(Migrate {
                     then: Then::Fence,
                     txid: Some("t2".into()),
-                    epoch: 3,
+                    epoch: Some(3),
                     max_rounds: None,
                     max_secs: None,
                 }),
@@ -703,9 +720,19 @@ mod tests {
                 Request::Migrate(Migrate {
                     then: Then::Continue,
                     txid: None,
-                    epoch: 0,
+                    epoch: None,
                     max_rounds: Some(2),
                     max_secs: Some(0),
+                }),
+            ),
+            (
+                r#"{"v":1,"op":"migrate","txid":"t3","epoch":0}"#,
+                Request::Migrate(Migrate {
+                    then: Then::Continue,
+                    txid: Some("t3".into()),
+                    epoch: Some(0),
+                    max_rounds: None,
+                    max_secs: None,
                 }),
             ),
             (
