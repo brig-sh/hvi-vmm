@@ -634,6 +634,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
                 path,
                 cfg.disk_base_sha256.is_some(),
+                cfg.disk_written.as_deref(),
             )?)))
         }
         None => None,
@@ -1007,7 +1008,9 @@ const RESTORER: Restorer = restore::portable("kvm");
 // One function so the order of the steps, which KVM and the seccomp
 // filters constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
-pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn restore(
+    cfg: RestoreConfig,
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source_profile = opened.profile().clone();
     let source = &source_profile;

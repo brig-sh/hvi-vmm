@@ -295,6 +295,7 @@ mod tests {
             cmdline: cmdline.into(),
             disk: None,
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: true,

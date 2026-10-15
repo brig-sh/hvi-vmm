@@ -426,6 +426,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
                 path,
                 cfg.disk_base_sha256.is_some(),
+                cfg.disk_written.as_deref(),
             )?)))
         }
         None => None,
@@ -604,8 +605,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 Kicker::new(num_cpus),
                 cfg.take_stop_handle()?,
             )),
-            plugin_threads: PluginThreads::new(),
             write_log: Some(write_log),
+            plugin_threads: PluginThreads::new(),
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
@@ -1148,6 +1149,7 @@ mod vcpu_cap_tests {
             cmdline: String::new(),
             disk: None,
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,

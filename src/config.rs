@@ -449,6 +449,13 @@ pub struct BootConfig {
     /// did, and keeps a copy, so a move can send only the blocks the guest
     /// wrote. It needs `disk`.
     pub disk_base_sha256: Option<String>,
+    /// The blocks where `disk` already differs from that base when this
+    /// boot opens it, as the bitmap a `disk-dirty` reply gives (bit `i` of
+    /// byte `i / 8` for 64 KiB block `i`). They start the blocks written
+    /// since boot, so a move by blocks sends them too. With it,
+    /// `disk_base_sha256` names the base image, not `disk` itself. It needs
+    /// `disk_base_sha256`.
+    pub disk_written: Option<Vec<u8>>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -878,6 +885,7 @@ mod tests {
             cmdline: String::new(),
             disk: None,
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,
