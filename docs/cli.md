@@ -222,7 +222,10 @@ ends, so a round under way, round 0 included, runs to its end however long it
 takes), then the paused part. So its client reads the frames and waits for
 the reply with no fixed timeout. hvi gives up on a client that takes nothing
 for 30 s, or that does not take the paused part within its budget, and the VM
-runs on (see [checkpoint.md](checkpoint.md#the-rounds)). A client that gives
+runs on (see [checkpoint.md](checkpoint.md#the-rounds)). A `migrate` that
+fails once its stream has begun closes the connection: the client reads the
+refusal where a frame header was due, if it fit, and then the end, and an end
+before the manifest means the VM was not fenced. A client that gives
 up on a `pause` before its reply cannot
 tell whether the VM paused: it should reconnect and ask `status`, or send
 `resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
