@@ -1657,6 +1657,68 @@ mod tests {
         assert!(net.irq_level(), "the used-buffer interrupt was raised");
     }
 
+    /// A guest cannot hand the host kernel checksum or segmentation metadata
+    /// through the tap. The device offers no offload, and `read_tx_frame`
+    /// drops whatever header the guest put on the chain: the tap gets the
+    /// all-zero `virtio_net_hdr_v1` from `tap::prepend_vnet_hdr`, so the
+    /// kernel never sees a `VIRTIO_NET_HDR_F_NEEDS_CSUM` with a guest-chosen
+    /// `csum_start`. That is what keeps a host-kernel bug in deferred checksum
+    /// completion (the October 2026 `ip_do_fragment()` disclosure, PwnEscape)
+    /// out of a guest's reach on hvi.
+    #[test]
+    fn a_guest_header_asking_for_offload_never_reaches_the_tap() {
+        use virtio_bindings::virtio_net::{VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4};
+
+        let (tap_host, tap_dev) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut net = VirtioNet::with_tap(std::fs::File::from(std::os::fd::OwnedFd::from(tap_dev)));
+
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+
+        // A 20-byte IPv4 header and 8 bytes of UDP: the first-fragment shape
+        // the disclosure used, behind 14 bytes of Ethernet.
+        let udp = udp_datagram(1234, 9999, b"");
+        let ip = ipv4_packet(GUEST_IP, Ipv4Addr::new(1, 2, 3, 4), IP_UDP, &udp);
+        let frame = eth_frame(OUR_MAC, GUEST_MAC, ETH_IPV4, &ip);
+
+        // The header a hostile driver would write, none of it negotiated:
+        // NEEDS_CSUM with csum_start at the IPv4 header (offset 14) and
+        // csum_offset at its checksum field, plus TCPv4 GSO.
+        let mut hdr = [0u8; NET_HDR_LEN];
+        hdr[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM as u8; // flags
+        hdr[1] = VIRTIO_NET_HDR_GSO_TCPV4 as u8; // gso_type
+        hdr[2..4].copy_from_slice(&34u16.to_le_bytes()); // hdr_len
+        hdr[4..6].copy_from_slice(&1400u16.to_le_bytes()); // gso_size
+        hdr[6..8].copy_from_slice(&14u16.to_le_bytes()); // csum_start
+        hdr[8..10].copy_from_slice(&10u16.to_le_bytes()); // csum_offset
+        let mut buf = hdr.to_vec();
+        buf.extend_from_slice(&frame);
+        mem.write(data, &buf).unwrap();
+        mem.write_u64(desc, data).unwrap();
+        mem.write_u32(desc + 8, buf.len() as u32).unwrap();
+        mem.write_u16(desc + 12, 0).unwrap(); // device-readable, no next
+        mem.write_u16(desc + 14, 0).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
+        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
+
+        net.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+
+        let mut got = vec![0u8; NET_HDR_LEN + frame.len()];
+        (&tap_host).read_exact(&mut got).unwrap();
+        assert_eq!(
+            &got[..NET_HDR_LEN],
+            &[0u8; NET_HDR_LEN],
+            "the guest's header was forwarded to the tap"
+        );
+        assert_eq!(&got[NET_HDR_LEN..], &frame[..], "the frame, unmangled");
+        assert!(
+            matches!(try_recv(&tap_host, &mut [0u8; 1]), Err(_) | Ok(0)),
+            "a second write reached the tap"
+        );
+    }
+
     // Config space alone cannot catch a reply framed to the wrong MAC, so
     // drive a real DISCOVER through the frame path and check the L2
     // destination of what comes back.

@@ -30,7 +30,7 @@ Everything a hostile guest can touch, it touches through hvi:
 | Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. |
 | virtio-blk backing file | Whatever `--disk` names. |
 | virtio-fs shares | The exported tree, read-only or read-write. |
-| Network frames | Parsed by the built-in stack, or relayed. |
+| Network frames | Parsed by the built-in stack, or relayed without the guest's virtio-net header. |
 | vsock | Bytes relayed to whatever listens on `--agent-sock`. |
 | Serial console | Bytes written to hvi's stdout, often the operator's terminal. |
 
