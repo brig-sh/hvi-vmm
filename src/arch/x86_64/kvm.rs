@@ -58,7 +58,7 @@ use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::{mptable, MAX_VCPUS};
 use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::{
-    device, hex, sha256_hex, MachineProfile, ProfileCell, UNKNOWN, X86Platform,
+    device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform, UNKNOWN,
 };
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};
@@ -412,6 +412,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
                 path,
                 cfg.disk_base_sha256.is_some(),
+                cfg.disk_written.as_deref(),
             )?)))
         }
         None => None,
@@ -575,8 +576,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 Kicker::new(num_cpus),
                 cfg.take_stop_handle()?,
             )),
-            plugin_threads: PluginThreads::new(),
             write_log: Some(write_log),
+            plugin_threads: PluginThreads::new(),
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
@@ -732,6 +733,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
         |vcpu, work| {
             crate::checkpoint::cpu::serve_from_regs_view(sh.guest.arch, "kvm", cpu_id, vcpu, work)
         },
+        || ControlFlow::Continue(()),
         |exit| {
             // The trace reads registers through the vCPU's second handle, since
             // the exit borrows the one the run uses.
@@ -1101,6 +1103,8 @@ mod vcpu_cap_tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disk: None,
+            disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             net: false,
             net_gateway: None,
@@ -1110,8 +1114,13 @@ mod vcpu_cap_tests {
             sandbox_id: "cap-test".to_string(),
             vcpus: 255,
             agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
             plugin: None,
             sandbox: false,
+            profile: crate::config::MachineProfileKind::Native,
+            arch_timer_irq: None,
             stop: None,
         };
         let error = boot(cfg).unwrap_err().to_string();
