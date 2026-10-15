@@ -701,8 +701,10 @@ on that connection and, after its manifest, the reply line:
 
 `pause_ms` is the time from the pause to every vCPU parked with its state
 exported; `gate_ms` and `park_ms` are its first two parts, the I/O threads
-held and the vCPUs parked. `paused_ms` is the time from the pause to the
-manifest written: the source's part of the downtime. The rest is the
+held and the vCPUs parked. The vCPUs run on during `gate_ms`, so
+`paused_ms` is the time from the end of the gate's wait to the manifest
+written: the source's part of the downtime. Before `fca7c94` it counted
+from the start of the pause, `gate_ms` included. The rest is the
 transport and the destination's restore. `rounds_end_unix_ms` is when the
 last round with the guest running ended. `disk_sync_ms` is the sync of the
 disk after it and just before the pause, with the guest still running,
@@ -772,11 +774,13 @@ When the rounds with the guest running end, the source:
    carry what it wrote, so a long sync grows them; the pause comes right
    after it, as the contract for live moves has it, with no round between.
 2. Holds the I/O threads and parks the vCPUs, waiting up to 10 s for both,
-   and then up to 10 s for the vCPUs' state. A `pause` op waits 2 s; a
-   move waits longer because a vCPU parks only between guest entries, and
-   one serving a virtio-blk flush is in an `fdatasync` on its own thread
-   until the flush ends (see [limitations.md](limitations.md)). A move
-   that still misses the bound fails, and the VM runs on.
+   and then up to 10 s for the vCPUs' state. A `pause` op waits 2 s. The
+   vCPUs park at once: a vCPU parks only between guest entries, and since
+   virtio-blk requests are served on the device's worker, none is in a
+   disk call. The gate instead waits for the worker's request in flight,
+   a flush's `fdatasync` among them, with the vCPUs still running; a move
+   waits longer than a `pause` for that. A move that still misses the
+   bound fails, and the VM runs on.
 3. Sends the final disk round, the blocks written since the last one, then
    the final RAM round, the pages left and every page written since, then
    the documents, with nothing running. disk.json's capture syncs the disk
@@ -1120,15 +1124,34 @@ was serving the guest's flush, which the host's ext4 journal held up
 behind the `O_DIRECT` writer, and a vCPU parks only between guest
 entries. With the CPU loops alone, 30 of 30 parked within 321 ms.
 
-The guest is stopped for all of the park, so the 10 s bound trades a
+The guest is stopped for all of the park, so the 10 s bound traded a
 failed move for a long pause under such a writer: over the 60 moves of
 `169e200` the park took a median of 622 ms and up to 2546 ms, and the
 whole paused part (`paused_ms`) a median of 1176 ms and up to 3217 ms.
 In the `dc99143` pass the in-pause sync (`pause_sync_ms`) took a median of
-300 ms and up to 586 ms of a `paused_ms` median of 643 ms. Serving a
-virtio-blk flush off the vCPU's thread would let the vCPU park at once;
-that is the change that removes the long park (see
-[limitations.md](limitations.md)).
+300 ms and up to 586 ms of a `paused_ms` median of 643 ms.
+
+Since `f05ac33` virtio-blk requests are served on the device's worker
+thread, and the vCPUs park at once. The same rig on rp2 on 2026-10-15,
+without the host's CPU loops, 30 moves per build, random gaps:
+
+| Build | Failed | `park_ms`: median, 90th percentile, longest; moves over 100 ms | `gate_ms`: median, longest | `paused_ms`: median, longest |
+| --- | --- | --- | --- | --- |
+| `c4131f5`, requests on the vCPU | 0 of 30 | 3, 540, 2237 ms; 13 | 0, 0 ms | 339, 5069 ms |
+| `ed47427`, requests on the worker | 0 of 30 | 0, 0, 0 ms; 0 | 0, 2120 ms | 326, 2475 ms, with the gate's wait |
+| `fca7c94`, the same, `paused_ms` without the gate | 0 of 30 | 0, 0, 0 ms; 0 | 0, 322 ms | 310, 11619 ms |
+
+The wait moved to the gate, where the vCPUs run on: in each worker build
+2 of 30 moves found a request in flight and waited 312 ms to 2120 ms for
+it, and in `fca7c94` one more waited 3 ms. What the
+guest is stopped for now is the sync in the pause: `pause_sync_ms` had a
+median of 303 ms of the 310 ms, and the longest, 11610 ms, is the whole
+of the longest `paused_ms` (see [limitations.md](limitations.md)). A
+guest running the same writer beside the same host writer for 10 minutes
+logged no RCU stall, hung task or soft lockup on `fca7c94`, and
+`hvi` stopped in 0.51 s with exit status 0. `c4131f5` logged none in its
+10 minutes either, so that run does not tell the two apart: the stalls
+seen before came with the drive stalling for 20 s and more.
 
 ## Moving the disk by its blocks
 

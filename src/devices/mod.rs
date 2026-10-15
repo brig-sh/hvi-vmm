@@ -28,3 +28,4 @@ pub(crate) mod irq;
 pub mod legacy;
 pub mod state;
 pub mod virtio;
+pub(crate) mod wake;
