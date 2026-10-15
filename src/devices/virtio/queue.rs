@@ -191,7 +191,9 @@ impl Queue {
 /// The rings themselves and `used.idx` are in guest RAM, which the checkpoint
 /// carries on its own, so these six fields are all the host holds of a queue.
 /// Every chain the device consumed (`last_avail`) was completed before the
-/// device lock was released, so no chain is ever half-served in a checkpoint.
+/// device lock was released, or, for virtio-blk, whose worker makes the disk
+/// call without the lock, before the worker left the pause gate, so no chain
+/// is ever half-served in a checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueState {

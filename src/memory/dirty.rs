@@ -572,15 +572,22 @@ mod device_writes {
         mmio_write(mmio::QUEUE_READY, 1);
     }
 
+    /// The read runs on the device's worker, as in a running VM, and every
+    /// page it wrote is marked by the time its chain is on the used ring.
     #[test]
     fn a_virtio_blk_read_marks_its_data_status_and_used_ring() {
+        use crate::devices::wake::Wake;
+        use crate::teardown::{join_by, StopSource};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
         let path = std::env::temp_dir().join(format!("hvi-dirty-blk-{}.img", std::process::id()));
         #[allow(clippy::disallowed_methods)]
         std::fs::write(&path, vec![0x5a; 4096]).unwrap();
         let mut blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
         #[allow(clippy::disallowed_methods)]
         let _ = std::fs::remove_file(&path);
-        let ram = guest();
+        let ram = Arc::new(guest());
         let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x7000);
         ram.write_u32(hdr, virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN)
             .unwrap();
@@ -595,21 +602,46 @@ mod device_writes {
             2,
         );
         descriptor(&ram, 2, status, 1, VIRTQ_DESC_F_WRITE, 0);
-        publish(&ram, 0);
         program(
             |o, v| {
                 blk.mmio(&ram, o, true, v);
             },
             0,
         );
+        let wake = Arc::new(Wake::new());
+        blk.connect_worker(Arc::clone(&wake));
+        let blk = Arc::new(Mutex::new(blk));
+        let source = StopSource::new().unwrap();
+        publish(&ram, 0);
         let _ = marked(&ram);
-        blk.mmio(&ram, mmio::QUEUE_NOTIFY, true, 0);
+        let worker = {
+            let (blk, ram, wake, stop) = (
+                Arc::clone(&blk),
+                Arc::clone(&ram),
+                Arc::clone(&wake),
+                source.token(),
+            );
+            std::thread::spawn(move || {
+                crate::devices::virtio::block::serve(&blk, &ram, &wake, &stop, |_| {});
+            })
+        };
+        blk.lock().unwrap().mmio(&ram, mmio::QUEUE_NOTIFY, true, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ram.read_u16(USED + 2).unwrap() == 0 {
+            assert!(Instant::now() < deadline, "the chain was never returned");
+            std::thread::yield_now();
+        }
+        // Read at once, before anything else could mark them.
+        let pages = marked(&ram);
+        source.request_stop();
+        wake.stop();
+        join_by("virtio-blk worker", worker, deadline).unwrap();
         assert_eq!(
             ram.read_u64(data).unwrap(),
             0x5a5a_5a5a_5a5a_5a5a,
             "the read landed"
         );
-        assert_eq!(marked(&ram), vec![USED_PAGE, 5, 7]);
+        assert_eq!(pages, vec![USED_PAGE, 5, 7]);
     }
 
     #[test]

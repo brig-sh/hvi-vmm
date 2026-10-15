@@ -81,6 +81,7 @@ use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
+use crate::devices::wake::Wake;
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Cpu, Guest, VcpuRegs};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
@@ -406,66 +407,7 @@ struct SharedFs {
     base: u64,
     intid: u32,
     dev: Arc<Mutex<VirtioFs>>,
-    wake: Arc<FsWake>,
-}
-
-/// A virtio-fs device's coalescing wake signal, which its worker thread parks
-/// on.
-///
-/// `service_fs` calls [`FsWake::wake`] when its inline drain leaves work. The
-/// worker's [`FsWake::park`] checks a predicate under a `Condvar`, so a wake
-/// that lands between the worker's last drain and its park is seen rather than
-/// lost. `spawn_fs_worker` has the full argument.
-struct FsWake {
-    state: Mutex<FsWakeState>,
-    ready: Condvar,
-}
-
-/// The flags behind [`FsWake`].
-#[derive(Default)]
-struct FsWakeState {
-    /// A notify arrived since the worker last drained.
-    woken: bool,
-    /// The stop has been requested.
-    stopped: bool,
-}
-
-impl FsWake {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(FsWakeState::default()),
-            ready: Condvar::new(),
-        }
-    }
-
-    /// Signals the worker. Safe to call whether or not it is currently
-    /// parked -- a signal that arrives mid-drain is simply picked up on the
-    /// worker's next pass, never lost.
-    fn wake(&self) {
-        let mut state = lock_or_recover(&self.state);
-        state.woken = true;
-        self.ready.notify_one();
-    }
-
-    /// Requests that the worker exit at its next pass.
-    fn stop(&self) {
-        let mut state = lock_or_recover(&self.state);
-        state.stopped = true;
-        self.ready.notify_one();
-    }
-
-    /// Blocks until the next [`FsWake::wake`] or [`FsWake::stop`].
-    ///
-    /// Clears the wake flag on return and returns `false` once stopped. Must
-    /// not be called with the virtio-fs device mutex held.
-    fn park(&self) -> bool {
-        let mut state = lock_or_recover(&self.state);
-        while !state.woken && !state.stopped {
-            state = self.ready.wait(state).unwrap();
-        }
-        state.woken = false;
-        !state.stopped
-    }
+    wake: Arc<Wake>,
 }
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing
@@ -1135,7 +1077,7 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
                 share.mode.writable(),
                 share.cache,
             )?)),
-            wake: Arc::new(FsWake::new()),
+            wake: Arc::new(Wake::new()),
         });
     }
     let has_blk = virtio.is_some();
@@ -1557,7 +1499,7 @@ impl IoStart {
     /// Starts the I/O threads, each virtio-fs device's worker and readahead
     /// threads, whose stops it returns, and the portable guest's hvi-time
     /// timer thread. Each polls its stop token beside its own descriptor,
-    /// or takes the stop through its `FsWake`, its `ReadaheadStop` or its
+    /// or takes the stop through its `Wake`, its `ReadaheadStop` or its
     /// device, and is joined after the vCPUs.
     ///
     /// # Errors
@@ -2974,13 +2916,13 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// mutex, and the device sets its line at the end of the pass. So a pass raises
 /// the line and kicks the vCPUs at most once, however many requests it served.
 ///
-/// `wake.park()` waits on a predicate and a `Condvar` (see `FsWake`), and the
+/// `wake.park()` waits on a predicate and a `Condvar` (see `Wake`), and the
 /// vCPU thread signals whenever its inline drain leaves work. A notify that
 /// races the loop is either served by the drain in progress, since both sides
 /// take the device mutex, or seen by the next `park()`. The mutex is held only
 /// for the drain, never across `park()`.
 ///
-/// `boot` calls [`FsWake::stop`] once the vCPUs have exited, and the worker
+/// `boot` calls [`Wake::stop`] once the vCPUs have exited, and the worker
 /// leaves its loop at the next `park`. It then drains the chains announced by a
 /// wake that arrived with the stop.
 ///
@@ -2989,7 +2931,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 fn spawn_fs_worker(
     dev: Arc<Mutex<VirtioFs>>,
     mem: Arc<GuestRam>,
-    wake: Arc<FsWake>,
+    wake: Arc<Wake>,
     stop: StopToken,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
