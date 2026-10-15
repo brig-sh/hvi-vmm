@@ -632,7 +632,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // Devices (same modules as the macOS backend).
     let disks = Disk::place(
-        block::open_boot_disks(&cfg.disks, cfg.disk_base_sha256.is_some(), None)?,
+        block::open_boot_disks(
+            &cfg.disks,
+            cfg.disk_base_sha256.is_some(),
+            cfg.disk_written.as_deref(),
+        )?,
         virtio_blk_base,
     );
     let mut net_source: Option<NetSource> = None;
@@ -1004,7 +1008,9 @@ const RESTORER: Restorer = restore::portable("kvm");
 // One function so the order of the steps, which KVM and the seccomp
 // filters constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
-pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn restore(
+    cfg: RestoreConfig,
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source_profile = opened.profile().clone();
     let source = &source_profile;
