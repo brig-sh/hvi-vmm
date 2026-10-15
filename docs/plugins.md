@@ -25,7 +25,8 @@ For constructing the `BootConfig` that carries a plugin, read
 | `Plugin::attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | main |
 | `Plugin::safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU |
 | `Plugin::request` | when the console reads `Ctrl-]` (0x1d) | the console input thread |
-| `IoSink::block`, egress `IoSink::net` | per request or frame, device lock held | a vCPU thread |
+| `IoSink::block` | per request, device lock held | the virtio-blk worker thread |
+| egress `IoSink::net` | per frame, device lock held | a vCPU thread |
 | ingress `IoSink::net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread |
 | ingress `IoSink::net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path |
 
@@ -47,6 +48,10 @@ and the VM stays parked forever.
 holds them, from its `pause` until its `resume`. Either way you hold nothing and
 owe nothing. Returning without a `resume()` on
 that path is correct, and a `resume()` there would do nothing.
+
+The pause holds the vCPUs only. The host-side threads go on: a frame the
+network relay receives, and a virtio-blk request the device's worker
+serves, still land in guest RAM while you hold the pause.
 
 ```rust
 if !cpu.pause() {
