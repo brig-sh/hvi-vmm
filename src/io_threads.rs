@@ -49,7 +49,9 @@ use crate::plugin::Plugin;
 use crate::sandbox::{confine_control_thread, confine_io_thread};
 use crate::signal::kick_signal;
 use crate::sync::lock_or_recover;
-use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
+use crate::teardown::{
+    FinishCount, FinishGuard, StopSource, StopToken, DISK_STOP_TIMEOUT, STOP_TIMEOUT,
+};
 use crate::terminal;
 use crate::LOG_PREFIX;
 
@@ -110,8 +112,6 @@ struct StopPlan {
     source: StopSource,
     /// The actions that run after the request, in the order they were added.
     actions: Vec<Box<dyn FnOnce() + Send>>,
-    /// What ends the threads that watch no stop token, called first.
-    enders: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl StopPlan {
@@ -138,11 +138,12 @@ impl<K: Kick> IoThreads<K> {
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
     /// which runs it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         source: StopSource,
         guest: &Arc<Guest<K>>,
         plugin: Option<Arc<dyn Plugin>>,
-        deliver: impl FnMut(u8) + Send + 'static,
+        mut deliver: impl FnMut(u8) + Send + 'static,
         bridge: Option<VsockBridge>,
         net: Option<NetSource>,
         control: Option<ControlSocket>,
@@ -152,14 +153,14 @@ impl<K: Kick> IoThreads<K> {
         K: 'static,
     {
         let vcpus = Arc::clone(&guest.vcpus);
-        let mut deliver = deliver;
-        let gate = source.token();
         let finish_count = Arc::new(FinishCount::default());
         let console = IoThread::spawn(
             "console reader",
             source.token(),
             &finish_count,
             Arc::clone(&guest.vcpus),
+            STOP_TIMEOUT,
+            confine_io_thread,
             move |stop| {
                 let gate = stop.clone();
                 terminal::input::run(
@@ -181,7 +182,6 @@ impl<K: Kick> IoThreads<K> {
             },
             console,
             threads: Vec::new(),
-            enders: Vec::new(),
             finish_count,
         };
         if let Some(dev) = &guest.block {
@@ -189,22 +189,26 @@ impl<K: Kick> IoThreads<K> {
             // vCPU's exit used to make. See `block::serve`.
             let wake = Arc::new(Wake::new());
             lock_or_recover(dev).connect_worker(Arc::clone(&wake));
-            let (dev, ram, ledger) = (
+            let (dev, ram, ledger, signal) = (
                 Arc::clone(dev),
                 Arc::clone(&guest.ram),
                 Arc::clone(&guest.ledger),
+                Arc::clone(&wake),
             );
-            let (stop, signal) = (io_threads.token(), Arc::clone(&wake));
-            let worker = std::thread::spawn(move || {
-                confine_io_thread();
-                block::serve(&dev, &ram, &signal, &stop, |events| {
-                    let mut ledger = lock_or_recover(&ledger);
-                    for event in events {
-                        ledger.captured(event);
-                    }
-                });
-            });
-            io_threads.push_ended_by("virtio-blk worker", worker, move || wake.stop());
+            io_threads.spawn_with(
+                "virtio-blk worker",
+                DISK_STOP_TIMEOUT,
+                confine_io_thread,
+                move |stop| {
+                    block::serve(&dev, &ram, &signal, &stop, |events| {
+                        let mut ledger = lock_or_recover(&ledger);
+                        for event in events {
+                            ledger.captured(event);
+                        }
+                    });
+                },
+            );
+            io_threads.on_stop(move || wake.stop());
         }
         if let Some(bridge) = bridge {
             io_threads.spawn("agent bridge", move |stop| bridge.run(&stop));
@@ -231,26 +235,23 @@ impl<K: Kick> IoThreads<K> {
                 }),
             }
         }
-        for PluginThread { name, run } in plugin_threads {
-            io_threads.spawn(name, run);
-        }
         if let Some(control) = control {
-            let (stop, gate) = (io_threads.token(), Arc::clone(io_threads.source.gate()));
+            let gate = Arc::clone(io_threads.stop.source.gate());
             let vcpus = Arc::clone(&guest.vcpus);
             let capture = control.capture_of(guest);
-            io_threads.push(
-                "control socket",
-                std::thread::spawn(move || {
-                    // Only a run that may write checkpoints gives the thread
-                    // the file calls a bundle needs.
-                    if control.checkpoint_root().is_some() {
-                        confine_control_thread();
-                    } else {
-                        confine_io_thread();
-                    }
-                    control.run(&stop, &gate, &vcpus, capture);
-                }),
-            );
+            // Only a run that may write checkpoints gives the thread the file
+            // calls a bundle needs.
+            let confine: fn() = if control.checkpoint_root().is_some() {
+                confine_control_thread
+            } else {
+                confine_io_thread
+            };
+            io_threads.spawn_with("control socket", STOP_TIMEOUT, confine, move |stop| {
+                control.run(&stop, &gate, &vcpus, capture);
+            });
+        }
+        for PluginThread { name, run } in plugin_threads {
+            io_threads.spawn(name, run);
         }
         io_threads
     }
@@ -276,11 +277,36 @@ impl<K: Kick> IoThreads<K> {
     ) where
         K: 'static,
     {
+        self.spawn_with(name, STOP_TIMEOUT, confine_io_thread, body);
+    }
+
+    /// [`spawn`](Self::spawn), for a thread that `confine` confines at its
+    /// start in place of the `vmm` filter, and that [`stop`](Self::stop) waits
+    /// for until `within` after the stop's request.
+    ///
+    /// A thread that must make a call the filter refuses before it confines
+    /// itself, such as the `prctl` of the `hvi-time` timer thread, passes a
+    /// `confine` that does nothing and confines itself in `body`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thread cannot be created.
+    pub(crate) fn spawn_with(
+        &mut self,
+        name: &'static str,
+        within: Duration,
+        confine: fn(),
+        body: impl FnOnce(StopToken) + Send + 'static,
+    ) where
+        K: 'static,
+    {
         let thread = IoThread::spawn(
             name,
             self.stop.source.token(),
             &self.finish_count,
             Arc::clone(&self.vcpus),
+            within,
+            confine,
             body,
         );
         self.threads.push(thread);
@@ -291,21 +317,8 @@ impl<K: Kick> IoThreads<K> {
     ///
     /// It is for a thread that waits on something a stop token cannot reach,
     /// such as a condition variable. The action must return at once.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn on_stop(&mut self, action: impl FnOnce() + Send + 'static) {
         self.stop.actions.push(Box::new(action));
-    }
-
-    /// Adds a thread that watches no stop token, with `end`, which ends it.
-    /// [`stop`](Self::stop) calls `end` before it joins.
-    pub(crate) fn push_ended_by(
-        &mut self,
-        name: &'static str,
-        thread: JoinHandle<()>,
-        end: impl FnOnce() + Send + 'static,
-    ) {
-        self.threads.push((name, thread));
-        self.enders.push(Box::new(end));
     }
 
     /// Requests the stop and joins every thread.
@@ -314,22 +327,25 @@ impl<K: Kick> IoThreads<K> {
     /// The console reader also gets the kick signal until it has finished,
     /// since a read of stdin is where the stop token cannot reach it. The wait
     /// for the threads ends when the last one has finished, or [`STOP_TIMEOUT`]
-    /// after the stop actions have run. A thread still running then is left
-    /// running and reported on stderr.
+    /// after the stop actions have run. A thread given a longer bound waits
+    /// out its own: the virtio-blk worker's is [`DISK_STOP_TIMEOUT`], since a
+    /// disk call in flight cannot be cut short. A thread still running at its
+    /// deadline is left running and reported on stderr.
     ///
     /// # Errors
     ///
     /// Errors with the first thread that did not stop in time.
     pub(crate) fn stop(mut self) -> std::io::Result<()> {
         self.stop.run();
-        for end in self.enders {
-            end();
-        }
-        let deadline = Instant::now() + STOP_TIMEOUT;
+        let requested = Instant::now();
+        let deadline = requested + STOP_TIMEOUT;
         self.console
             .kick_until_finished(&self.finish_count, deadline);
         let count = u32::try_from(self.threads.len() + 1).unwrap_or(u32::MAX);
         let _ = self.finish_count.wait_for(count, deadline);
+        for thread in &self.threads {
+            thread.wait_until(&self.finish_count, requested + thread.within);
+        }
         let mut failure = None;
         for thread in std::iter::once(self.console).chain(self.threads) {
             if let Err(e) = thread.try_join() {
@@ -353,6 +369,8 @@ impl<K: Kick + 'static> IoThreads<K> {
             source.token(),
             &finish_count,
             Arc::clone(&vcpus),
+            STOP_TIMEOUT,
+            confine_io_thread,
             |_| {},
         );
         Self {
@@ -374,14 +392,17 @@ struct IoThread {
     handle: JoinHandle<()>,
     /// Whether the thread has finished, set by its [`FinishGuard`].
     finished: Arc<AtomicBool>,
+    /// How long after the stop's request the stop waits for the thread.
+    within: Duration,
 }
 
 impl IoThread {
-    /// Starts a thread named `name` that confines itself and then runs `body`
-    /// with `stop`.
+    /// Starts a thread named `name` that confines itself with `confine` and
+    /// then runs `body` with `stop`.
     ///
     /// The thread holds a [`FinishGuard`] that notes on `count`, and a
     /// [`StopOnPanic`] that fails and stops the run of `vcpus` if it panics.
+    /// The stop waits for it until `within` after its request.
     ///
     /// # Panics
     ///
@@ -391,6 +412,8 @@ impl IoThread {
         stop: StopToken,
         count: &Arc<FinishCount>,
         vcpus: Arc<Vcpus<K>>,
+        within: Duration,
+        confine: fn(),
         body: impl FnOnce(StopToken) + Send + 'static,
     ) -> Self {
         let finished = Arc::new(AtomicBool::new(false));
@@ -405,11 +428,15 @@ impl IoThread {
                     count,
                 };
                 let _panic = StopOnPanic { vcpus, name };
-                confine_io_thread();
+                confine();
                 body(stop);
             })
             .unwrap_or_else(|e| panic!("spawning the {name} thread: {e}"));
-        Self { handle, finished }
+        Self {
+            handle,
+            finished,
+            within,
+        }
     }
 
     /// Sends the kick signal to the thread until its flag is set, or until
@@ -443,6 +470,22 @@ impl IoThread {
         }
     }
 
+    /// Waits until the thread's flag is set, or until `deadline` passes.
+    ///
+    /// A note from any thread ends a wait on `count`, so the flag is read
+    /// again after each.
+    fn wait_until(&self, count: &FinishCount, deadline: Instant) {
+        loop {
+            // The count is read before the flag, so a note that lands after
+            // the check ends the wait below at once.
+            let finished = count.finished();
+            if self.finished.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                return;
+            }
+            let _ = count.wait_for(finished + 1, deadline);
+        }
+    }
+
     /// Joins the thread if it has finished.
     ///
     /// A thread that has set its flag has left its body, so the join returns at
@@ -458,7 +501,8 @@ impl IoThread {
         }
         let name = self.handle.thread().name().unwrap_or("an I/O thread");
         Err(std::io::Error::other(format!(
-            "{name} did not stop within {STOP_TIMEOUT:?}"
+            "{name} did not stop within {:?}",
+            self.within
         )))
     }
 }
@@ -495,6 +539,8 @@ mod tests {
             source.token(),
             count,
             Arc::clone(vcpus),
+            STOP_TIMEOUT,
+            confine_io_thread,
             move |_| body(),
         )
     }
