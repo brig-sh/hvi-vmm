@@ -23,6 +23,14 @@
 //! `virtio_mmio` and `virtio_blk` drivers to negotiate `VIRTIO_F_VERSION_1`,
 //! set up one queue, and read and write.
 //!
+//! The requests are served on a worker thread of their own, `serve`, not
+//! in the vCPU's exit: a notify only wakes the worker. A guest flush is an
+//! `fdatasync`, and a write can wait on the host's writeback, so a request
+//! can take seconds on a busy host disk. On the vCPU's thread that stopped
+//! the guest's CPU for as long, and a pause could not park it. The worker
+//! makes the disk call without the device's lock, so the vCPU still reads
+//! and acknowledges the interrupt meanwhile.
+//!
 //! The device also keeps the disk's dirty blocks for a move: a bitmap of
 //! the 64 KiB blocks the guest wrote since it booted, and one of the blocks
 //! it wrote since a mover last read them, see [`DirtyBlocks`] and
@@ -50,8 +58,11 @@ use crate::devices::virtio::{
     mmio, Queue, QueueState, VirtioCommonState, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT,
     VIRTQ_DESC_F_WRITE,
 };
+use crate::devices::wake::Wake;
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
+use crate::sync::lock_or_recover;
+use crate::teardown::StopToken;
 use crate::LOG_PREFIX;
 
 const MAGIC_VALUE: u64 = 0x7472_6976; // "virt" little-endian
@@ -296,9 +307,11 @@ impl Dirty {
 /// What a checkpoint keeps of a virtio-blk device.
 ///
 /// The disk's bytes are not here: the image travels on its own, and a restore
-/// reopens it. Nothing is in flight either, since a notify serves every chain
-/// before the MMIO exit returns. The ledger staging, the plugin feed, the
-/// inode and the trace switch belong to the host the device runs on.
+/// reopens it. Nothing is in flight either: the worker holds the pause gate
+/// from the moment it takes a chain until it has returned it, so a capture,
+/// which runs with the gate closed, finds every chain taken already
+/// returned. The ledger staging, the plugin feed, the inode and the trace
+/// switch belong to the host the device runs on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlkState {
@@ -384,7 +397,18 @@ pub struct VirtioBlk {
     /// Whether a request of the current pass was finished without raising
     /// the interrupt, which the pass's end then owes the driver.
     owed_irq: bool,
+    /// The worker's wake signal, which a notify sets, once the worker runs.
+    wake: Option<Arc<Wake>>,
+    /// Set once a fence released the disk: no request is served after it.
+    fenced: bool,
+    /// Called as each request runs, so a test can hold the worker there.
+    #[cfg(test)]
+    run_hook: Option<RunHook>,
 }
+
+/// A test's hook into [`BlkRequest::run`], called with the request's kind.
+#[cfg(test)]
+pub(crate) type RunHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 /// Size in bytes of whatever is behind `file`.
 ///
@@ -541,13 +565,30 @@ impl VirtioBlk {
     }
 
     /// Releases the disk's lock, so another hvi may open the disk while
-    /// this one still has it open. Returns whether there was a lock.
+    /// this one still has it open, and serves no request from then on.
+    /// Returns whether there was a lock.
     ///
     /// A source fenced after a checkpoint calls it: its guest never runs
     /// again, so it never writes the disk again, and the restore that takes
-    /// the guest over may start before the source is stopped.
+    /// the guest over may start before the source is stopped. The fence runs
+    /// with the pause gate closed, so no request is in flight; the worker
+    /// passes the gate again once the stop opens it, and then finds nothing
+    /// to take, since chains the guest left pending belong to the restore.
     pub fn release_lock(&mut self) -> bool {
+        self.fenced = true;
         self.lock.take().is_some()
+    }
+
+    /// Gives the device its worker's wake signal, which every notify sets
+    /// from then on. See [`serve`].
+    pub(crate) fn connect_worker(&mut self, wake: Arc<Wake>) {
+        self.wake = Some(wake);
+    }
+
+    /// Calls `hook` as each request runs, with the request's kind.
+    #[cfg(test)]
+    pub(crate) fn set_run_hook(&mut self, hook: RunHook) {
+        self.run_hook = Some(hook);
     }
 
     /// Builds a reset device over `file`, an open read-write disk.
@@ -575,6 +616,10 @@ impl VirtioBlk {
             epoch: 0,
             pass_left: 0,
             owed_irq: false,
+            wake: None,
+            fenced: false,
+            #[cfg(test)]
+            run_hook: None,
         })
     }
 
@@ -860,7 +905,7 @@ impl VirtioBlk {
     pub const FEATURES: u64 = ((F_VERSION_1_HI as u64) << 32) | F_BLK_FLUSH_LO as u64;
 
     /// Services one MMIO access. Returns the read value (0 for writes). When
-    /// the driver notifies a queue, the virtqueue is processed inline.
+    /// the driver notifies the queue, the worker is woken to serve it.
     pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
         let read = self.serve_mmio(mem, offset, is_write, value);
         self.sync_irq();
@@ -875,7 +920,11 @@ impl VirtioBlk {
                 mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
                 mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
                 mmio::QUEUE_SEL => {} // only queue 0
-                mmio::QUEUE_NOTIFY => self.process_queue(mem),
+                mmio::QUEUE_NOTIFY => {
+                    if let Some(wake) = &self.wake {
+                        wake.wake();
+                    }
+                }
                 mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
                 mmio::STATUS if v == 0 => self.reset(),
                 mmio::STATUS => self.status = v,
@@ -957,8 +1006,9 @@ impl VirtioBlk {
     }
 
     /// Serves every chain the driver has made available on queue 0, in
-    /// order, on the caller's thread.
-    fn process_queue(&mut self, mem: &GuestRam) {
+    /// order, on the test's thread, as the worker would.
+    #[cfg(test)]
+    pub(crate) fn serve_now(&mut self, mem: &GuestRam) {
         while let Some(request) = self.take_request(mem) {
             let done = request.run(mem);
             self.finish(mem, request, done);
@@ -974,7 +1024,7 @@ impl VirtioBlk {
     /// request then runs with no lock held ([`BlkRequest::run`]), and
     /// [`finish`](Self::finish) completes it.
     pub(crate) fn take_request(&mut self, mem: &GuestRam) -> Option<BlkRequest> {
-        let head = self.next_head(mem);
+        let head = self.next_head(mem).filter(|_| !self.fenced);
         if head.is_none() {
             self.pass_left = 0;
             if self.owed_irq {
@@ -993,6 +1043,8 @@ impl VirtioBlk {
             file: Arc::clone(&self.file),
             op,
             last_of_pass: self.pass_left == 0,
+            #[cfg(test)]
+            run_hook: self.run_hook.clone(),
         })
     }
 
@@ -1251,6 +1303,9 @@ pub(crate) struct BlkRequest {
     op: Op,
     /// Whether this is the last request of its pass.
     last_of_pass: bool,
+    /// The device's test hook.
+    #[cfg(test)]
+    run_hook: Option<RunHook>,
 }
 
 /// What a chain asks the device for.
@@ -1374,6 +1429,15 @@ impl BlkRequest {
     /// positioned read, a positioned write of the data gathered from guest
     /// RAM, or `fdatasync` for a flush.
     pub(crate) fn run(&self, mem: &GuestRam) -> Done {
+        #[cfg(test)]
+        if let Some(hook) = &self.run_hook {
+            hook(match self.op {
+                Op::Read(_) => "read",
+                Op::Write(_) => "write",
+                Op::Flush { .. } => "flush",
+                Op::Malformed | Op::Refused { .. } | Op::Other { .. } => "other",
+            });
+        }
         match &self.op {
             Op::Read(rw) => {
                 let mut buf = vec![0u8; rw.len];
@@ -1386,6 +1450,64 @@ impl BlkRequest {
             // Honour the guest's cache flush (durability for fsync).
             Op::Flush { .. } => Done::Flushed(self.file.sync_data()),
             Op::Malformed | Op::Refused { .. } | Op::Other { .. } => Done::Nothing,
+        }
+    }
+}
+
+/// Serves `dev`'s queue on the calling thread, the device's worker, until
+/// the stop. `record` takes the requests the device captured, for the
+/// ledger.
+///
+/// The worker parks on `wake`, which every notify sets, and serves what the
+/// driver made available, in order, one request at a time: a flush is
+/// served only after every write before it in the queue has completed. It
+/// starts with a pass, since a restored guest may have chains pending that
+/// its notify announced to the process it was captured from.
+///
+/// Each request is taken, run and finished inside one admission of the
+/// pause gate (see [`PauseGate`]). The disk call runs with no device lock
+/// held, so a vCPU still reads and acknowledges the interrupt while an
+/// `fdatasync` waits on a busy disk. A pause closes the gate and waits for
+/// the request in flight to finish, with the vCPUs still running, and then
+/// finds none in flight: no chain is ever half-served in a checkpoint, and
+/// the device state stays what it was when the vCPU served the queue. The
+/// pause's `gate_ms` carries that wait, and its park no longer does.
+///
+/// A finished request marks guest RAM's dirty log for what it wrote there,
+/// and the disk's dirty blocks for a write, before the chain is on the used
+/// ring, so a move that sees the completion has the pages and blocks
+/// marked.
+///
+/// [`PauseGate`]: crate::teardown::PauseGate
+pub(crate) fn serve(
+    dev: &std::sync::Mutex<VirtioBlk>,
+    mem: &GuestRam,
+    wake: &Wake,
+    stop: &StopToken,
+    mut record: impl FnMut(&[CapturedEvent]),
+) {
+    wake.wake();
+    while wake.park() {
+        loop {
+            let _in = stop.enter();
+            // The stop opens the gate for good, so a worker held at it walks
+            // through. Once it sees the stop it serves nothing more, and a
+            // fenced device has nothing to take whichever comes first.
+            if wake.is_stopped() {
+                return;
+            }
+            let Some(request) = lock_or_recover(dev).take_request(mem) else {
+                break;
+            };
+            let done = request.run(mem);
+            let events = {
+                let mut dev = lock_or_recover(dev);
+                dev.finish(mem, request, done);
+                dev.take_events()
+            };
+            if !events.is_empty() {
+                record(&events);
+            }
         }
     }
 }
@@ -1502,6 +1624,7 @@ mod queue_tests {
 
         assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 0, "not ready");
         blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0); // must not panic
+        blk.serve_now(&mem);
         assert_eq!(blk.queue.size(), 0, "the size was refused");
     }
 
@@ -1652,6 +1775,7 @@ mod queue_tests {
         program_queue(&mut blk, &mem, 8, desc, avail, used);
         assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 1, "ready");
         blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(&mem);
         let _ = std::fs::remove_file(&path);
 
         let mut got = [0u8; 5];
@@ -1697,6 +1821,7 @@ mod queue_tests {
         program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
         blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(&mem);
         assert_eq!(
             mem.read_u16(BASE + 0x2000 + 2).unwrap(),
             1,
@@ -1714,6 +1839,7 @@ mod queue_tests {
         );
         publish_read(&mem, BASE + 0x3000, BASE + 0x4000, BASE + 0x7000);
         blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(&mem);
         assert_eq!(
             mem.read_u16(BASE + 0x5000 + 2).unwrap(),
             1,
@@ -1776,6 +1902,7 @@ mod queue_tests {
         program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
         blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(&mem);
         assert!(blk.irq_level());
 
         blk.mmio(&mem, mmio::STATUS, true, 0);
@@ -1846,6 +1973,7 @@ mod capacity_tests {
         blk.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
         blk.mmio(mem, mmio::QUEUE_READY, true, 1);
         blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(mem);
         mem.read_u16(status).unwrap() as u8
     }
 
@@ -1993,6 +2121,7 @@ mod state_tests {
         blk.mmio(mem, mmio::QUEUE_READY, true, 1);
         post_read(mem, 0);
         blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(mem);
     }
 
     /// Posts a read of sector 0 as avail entry `idx`, on descriptors 0-2.
@@ -2039,6 +2168,7 @@ mod state_tests {
         restored.mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
         post_read(&mem, 1);
         restored.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        restored.serve_now(&mem);
         assert_eq!(mem.read_u16(USED + 2).unwrap(), 2, "two chains used");
         assert_eq!(mem.read_u16(BASE + 0x6000).unwrap() as u8, VIRTIO_BLK_S_OK);
         assert_eq!(restored.state().queue.last_avail, 2);
@@ -2049,6 +2179,7 @@ mod state_tests {
         post_read(&mem, 2);
         mem.write_u32(BASE + 0x4000, VIRTIO_BLK_T_FLUSH).unwrap();
         restored.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        restored.serve_now(&mem);
         assert_eq!(mem.read_u16(USED + 2).unwrap(), 3, "three chains used");
         assert_eq!(restored.generation(), 1047);
     }
@@ -2252,6 +2383,7 @@ mod dirty_tests {
             blk.mmio(mem, mmio::QUEUE_READY, true, 1);
         }
         blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.serve_now(mem);
         mem.read_u16(status).unwrap() as u8
     }
 
@@ -2510,5 +2642,383 @@ mod dirty_tests {
             assert!(err.to_string().contains("--disk-written"), "{err}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use crate::devices::irq::test_line::LevelLine;
+    use crate::teardown::{join_by, StopSource};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    const BASE: u64 = 0x4000_0000;
+    const DESC: u64 = BASE;
+    const AVAIL: u64 = BASE + 0x1000;
+    const USED: u64 = BASE + 0x2000;
+    /// The ring size the rig programs.
+    const RING: u16 = 16;
+    /// The disk: 64 sectors, each byte 0x5a.
+    const DISK_BYTES: usize = 64 * 512;
+    /// How long a test waits for the worker before it fails.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// A disk removed on drop.
+    struct Disk(std::path::PathBuf);
+
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A device over a disk with its queue programmed, and its worker once
+    /// [`start`](Rig::start)ed.
+    struct Rig {
+        disk: Disk,
+        mem: Arc<GuestRam>,
+        dev: Arc<Mutex<VirtioBlk>>,
+        line: Arc<LevelLine>,
+        source: StopSource,
+        wake: Arc<Wake>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    fn rig(tag: &str) -> Rig {
+        let path =
+            std::env::temp_dir().join(format!("hvi-blk-worker-{tag}-{}.img", std::process::id()));
+        std::fs::write(&path, vec![0x5a; DISK_BYTES]).unwrap();
+        let disk = Disk(path);
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x10_0000)]));
+        let mut blk = VirtioBlk::open(disk.0.to_str().unwrap()).unwrap();
+        for (reg, v) in [
+            (mmio::QUEUE_NUM, u64::from(RING)),
+            (mmio::QUEUE_DESC_LOW, DESC),
+            (mmio::QUEUE_DRIVER_LOW, AVAIL),
+            (mmio::QUEUE_DEVICE_LOW, USED),
+            (mmio::QUEUE_READY, 1),
+        ] {
+            blk.mmio(&mem, reg, true, v);
+        }
+        let line = Arc::new(LevelLine::default());
+        blk.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        Rig {
+            disk,
+            mem,
+            dev: Arc::new(Mutex::new(blk)),
+            line,
+            source: StopSource::new().unwrap(),
+            wake: Arc::new(Wake::new()),
+            worker: None,
+        }
+    }
+
+    impl Rig {
+        /// Starts the worker, as `IoThreads::start` does.
+        fn start(&mut self) {
+            lock_or_recover(&self.dev).connect_worker(Arc::clone(&self.wake));
+            let (dev, mem, wake, stop) = (
+                Arc::clone(&self.dev),
+                Arc::clone(&self.mem),
+                Arc::clone(&self.wake),
+                self.source.token(),
+            );
+            self.worker = Some(std::thread::spawn(move || {
+                serve(&dev, &mem, &wake, &stop, |_| {});
+            }));
+        }
+
+        /// Posts request `slot` of type `typ` at `sector`: a header, one
+        /// sector of data filled with `fill` (none for a flush) and a status
+        /// byte poisoned to 0xff. Returns the chain's head.
+        fn post(&self, slot: u16, typ: u32, sector: u64, fill: u8) -> u16 {
+            let mem = &self.mem;
+            let room = BASE + 0x1_0000 + u64::from(slot) * 0x1000;
+            let (hdr, data, status) = (room, room + 0x200, room + 0x800);
+            mem.write_u32(hdr, typ).unwrap();
+            mem.write_u64(hdr + 8, sector).unwrap();
+            mem.write(data, &[fill; 512]).unwrap();
+            mem.write_u8(status, 0xff).unwrap();
+            let head = slot * 3;
+            let data_flag = if typ == VIRTIO_BLK_T_IN {
+                VIRTQ_DESC_F_WRITE
+            } else {
+                0
+            };
+            let mut chain = vec![(hdr, 16, VIRTQ_DESC_F_NEXT)];
+            if typ != VIRTIO_BLK_T_FLUSH {
+                chain.push((data, 512, VIRTQ_DESC_F_NEXT | data_flag));
+            }
+            chain.push((status, 1, VIRTQ_DESC_F_WRITE));
+            for (i, &(addr, len, flags)) in chain.iter().enumerate() {
+                let d = DESC + u64::from(head + i as u16) * 16;
+                mem.write_u64(d, addr).unwrap();
+                mem.write_u32(d + 8, len).unwrap();
+                mem.write_u16(d + 12, flags).unwrap();
+                mem.write_u16(d + 14, head + i as u16 + 1).unwrap();
+            }
+            let idx = mem.read_u16(AVAIL + 2).unwrap();
+            mem.write_u16(AVAIL + 4 + u64::from(idx % RING) * 2, head)
+                .unwrap();
+            mem.write_u16(AVAIL + 2, idx.wrapping_add(1)).unwrap();
+            head
+        }
+
+        /// The status byte of request `slot`.
+        fn status(&self, slot: u16) -> u8 {
+            let room = BASE + 0x1_0000 + u64::from(slot) * 0x1000;
+            self.mem.read_u16(room + 0x800).unwrap() as u8
+        }
+
+        /// The data of request `slot`.
+        fn data(&self, slot: u16) -> Vec<u8> {
+            let room = BASE + 0x1_0000 + u64::from(slot) * 0x1000;
+            let mut buf = vec![0; 512];
+            self.mem.read(room + 0x200, &mut buf).unwrap();
+            buf
+        }
+
+        /// Writes QUEUE_NOTIFY, as the guest's driver does.
+        fn notify(&self) {
+            lock_or_recover(&self.dev).mmio(&self.mem, mmio::QUEUE_NOTIFY, true, 0);
+        }
+
+        fn used_idx(&self) -> u16 {
+            self.mem.read_u16(USED + 2).unwrap()
+        }
+
+        /// The heads on the used ring, in the order they were returned.
+        fn used_heads(&self) -> Vec<u16> {
+            (0..self.used_idx())
+                .map(|i| {
+                    self.mem
+                        .read_u32(USED + 4 + u64::from(i % RING) * 8)
+                        .unwrap() as u16
+                })
+                .collect()
+        }
+
+        /// Waits until `n` chains are on the used ring.
+        fn wait_used(&self, n: u16) {
+            let deadline = Instant::now() + PATIENCE;
+            while self.used_idx() < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} of {n} chains returned",
+                    self.used_idx()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// The disk's bytes in `sector`.
+        fn sector(&self, sector: u64) -> Vec<u8> {
+            let bytes = std::fs::read(&self.disk.0).unwrap();
+            bytes[sector as usize * 512..][..512].to_vec()
+        }
+
+        /// Stops the worker as `IoThreads::stop` does, and checks it ended.
+        fn stop(mut self) {
+            self.source.request_stop();
+            self.wake.stop();
+            let worker = self.worker.take().expect("started");
+            join_by("virtio-blk worker", worker, Instant::now() + PATIENCE).unwrap();
+        }
+    }
+
+    /// A hook that holds a request of `kind` in its run until released.
+    #[derive(Clone, Default)]
+    struct Hold {
+        entered: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Hold {
+        fn hook(&self, kind: &'static str) -> RunHook {
+            let hold = self.clone();
+            Arc::new(move |k| {
+                if k != kind {
+                    return;
+                }
+                hold.entered.store(true, Ordering::SeqCst);
+                while !hold.released.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        }
+
+        fn wait_entered(&self) {
+            let deadline = Instant::now() + PATIENCE;
+            while !self.entered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "the request never ran");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_notify_only_wakes_the_worker_which_serves_the_chain() {
+        let mut rig = rig("notify");
+        let ran_on = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&ran_on);
+        lock_or_recover(&rig.dev).set_run_hook(Arc::new(move |_| {
+            *lock_or_recover(&seen) = Some(std::thread::current().id());
+        }));
+        rig.start();
+        rig.post(0, VIRTIO_BLK_T_IN, 3, 0);
+        rig.notify();
+        rig.wait_used(1);
+        assert_eq!(rig.status(0), VIRTIO_BLK_S_OK);
+        assert_eq!(rig.data(0), vec![0x5a; 512], "the read landed");
+        assert!(rig.line.is_high(), "the worker raised the line");
+        let ran_on = lock_or_recover(&ran_on).expect("the request ran");
+        assert_ne!(
+            ran_on,
+            std::thread::current().id(),
+            "not on the notifying thread"
+        );
+        rig.stop();
+    }
+
+    /// The gate: a pause waits for the request in flight, with the device's
+    /// lock free meanwhile, and then finds no chain taken but not returned.
+    /// A chain the guest posts while paused waits for the resume.
+    #[test]
+    fn a_pause_waits_for_the_request_in_flight_and_then_finds_none() {
+        let mut rig = rig("gate");
+        let hold = Hold::default();
+        lock_or_recover(&rig.dev).set_run_hook(hold.hook("write"));
+        rig.start();
+        rig.post(0, VIRTIO_BLK_T_OUT, 2, 0xc3);
+        rig.notify();
+        hold.wait_entered();
+
+        let gate = Arc::clone(rig.source.gate());
+        let pause = std::thread::spawn(move || gate.pause(PATIENCE));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !pause.is_finished(),
+            "the pause waits for the write in flight"
+        );
+        // A vCPU reads the interrupt status while the disk call runs: the
+        // device's lock is not held across it.
+        let started = Instant::now();
+        let _ = lock_or_recover(&rig.dev).mmio(&rig.mem, mmio::INTERRUPT_STATUS, false, 0);
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        hold.release();
+        assert_eq!(pause.join().unwrap(), Ok(()));
+        assert_eq!(rig.used_idx(), 1, "the write was returned before the pause");
+        let state = lock_or_recover(&rig.dev).state();
+        assert_eq!(state.queue.last_avail, rig.used_idx(), "nothing in flight");
+        assert_eq!(rig.sector(2), vec![0xc3; 512]);
+
+        rig.post(1, VIRTIO_BLK_T_IN, 2, 0);
+        rig.notify();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rig.used_idx(), 1, "nothing is served while paused");
+        rig.source.gate().unpause();
+        rig.wait_used(2);
+        assert_eq!(rig.data(1), vec![0xc3; 512]);
+        rig.stop();
+    }
+
+    /// A flush completes only after every write before it in the queue.
+    #[test]
+    fn a_flush_completes_after_every_write_before_it() {
+        let mut rig = rig("order");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&log);
+        lock_or_recover(&rig.dev).set_run_hook(Arc::new(move |kind| {
+            lock_or_recover(&seen).push(kind);
+        }));
+        rig.start();
+        let heads = [
+            rig.post(0, VIRTIO_BLK_T_OUT, 0, 1),
+            rig.post(1, VIRTIO_BLK_T_OUT, 1, 2),
+            rig.post(2, VIRTIO_BLK_T_FLUSH, 0, 0),
+            rig.post(3, VIRTIO_BLK_T_OUT, 2, 3),
+        ];
+        rig.notify();
+        rig.wait_used(4);
+        assert_eq!(rig.used_heads(), heads, "returned in the order posted");
+        assert_eq!(*lock_or_recover(&log), ["write", "write", "flush", "write"]);
+        assert!((0..4).all(|slot| rig.status(slot) == VIRTIO_BLK_S_OK));
+        rig.stop();
+    }
+
+    #[test]
+    fn the_stop_ends_a_parked_worker() {
+        let mut rig = rig("parked");
+        rig.start();
+        rig.stop();
+    }
+
+    /// A fenced source's worker held at the closed gate serves nothing when
+    /// the gate opens, as the stop opens it: the disk is the restore's by
+    /// then. The stop then ends it.
+    #[test]
+    fn a_fenced_device_serves_nothing_once_its_gate_opens() {
+        let mut rig = rig("fenced");
+        rig.start();
+        rig.source.gate().pause(PATIENCE).unwrap();
+        rig.post(0, VIRTIO_BLK_T_OUT, 4, 0x77);
+        rig.notify();
+        std::thread::sleep(Duration::from_millis(50));
+        lock_or_recover(&rig.dev).release_lock();
+        rig.source.gate().unpause();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rig.used_idx(), 0, "nothing returned");
+        assert_eq!(rig.sector(4), vec![0x5a; 512], "nothing written");
+        rig.stop();
+    }
+
+    /// A restored guest may have chains pending whose notify went to the
+    /// process it was captured from: the worker serves them with no notify.
+    #[test]
+    fn chains_pending_at_the_start_are_served_without_a_notify() {
+        let mut rig = rig("pending");
+        rig.post(0, VIRTIO_BLK_T_IN, 0, 0);
+        rig.start();
+        rig.wait_used(1);
+        assert_eq!(rig.data(0), vec![0x5a; 512]);
+        rig.stop();
+    }
+
+    /// A move's round read while a write is in flight does not take the
+    /// write's block, and the next round does: marked before the write, the
+    /// block would go with the round read before the write landed, and no
+    /// later round would send what it wrote.
+    #[test]
+    fn a_round_read_while_a_write_runs_leaves_its_block_to_the_next() {
+        let mut rig = rig("round");
+        let hold = Hold::default();
+        {
+            let mut dev = lock_or_recover(&rig.dev);
+            dev.set_run_hook(hold.hook("write"));
+            dev.read_dirty(DirtySince::Boot).unwrap();
+        }
+        rig.start();
+        rig.post(0, VIRTIO_BLK_T_OUT, 1, 0x99);
+        rig.notify();
+        hold.wait_entered();
+        let during = lock_or_recover(&rig.dev)
+            .read_dirty(DirtySince::Round)
+            .unwrap();
+        assert_eq!(during.dirty.count(), 0, "the write has not landed yet");
+        hold.release();
+        rig.wait_used(1);
+        let after = lock_or_recover(&rig.dev)
+            .read_dirty(DirtySince::Round)
+            .unwrap();
+        assert_eq!(after.dirty.iter().collect::<Vec<_>>(), [0]);
+        rig.stop();
     }
 }

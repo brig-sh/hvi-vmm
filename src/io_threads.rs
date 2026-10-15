@@ -15,18 +15,21 @@
 //! The host-side I/O threads a backend runs beside its vCPUs.
 //!
 //! [`IoThreads`] starts the threads that serve the guest's devices from the
-//! host: the console reader, the agent bridge, and the relay from a gateway or
-//! a tap. Each polls a stop token beside its own descriptor. [`IoThreads`] also
-//! starts the threads a plugin asked for in `attach`. A backend starts the
+//! host: the console reader, the virtio-blk worker, the agent bridge, the
+//! relay from a gateway or a tap, and the control socket's thread. Each polls
+//! a stop token beside its own descriptor, except the virtio-blk worker, which
+//! parks on its device's wake signal and is ended through it. [`IoThreads`]
+//! also starts the threads a plugin asked for in `attach`. A backend starts the
 //! threads only it has with [`IoThreads::spawn`]. Once the vCPUs have exited or
 //! been left running, [`IoThreads::stop`] requests the stop and joins every
 //! thread, as `teardown` describes.
 //!
 //! Each thread passes the token's pause gate around the work that touches a
 //! device or guest RAM, so a pause of the gate holds all of them back. The
-//! console's bytes are delivered inside the gate, and the relays receive and
-//! deliver their frames inside it. The control socket's thread, when there is
-//! one, is the one that closes it.
+//! console's bytes are delivered inside the gate, the relays receive and
+//! deliver their frames inside it, and the virtio-blk worker takes, runs and
+//! returns each request inside it. The control socket's thread, when there
+//! is one, is the one that closes it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,10 +37,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::checkpoint::server::ControlSocket;
+use crate::devices::virtio::block;
 use crate::devices::virtio::net::GatewayRelay;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::net::TapRelay;
 use crate::devices::virtio::vsock::VsockBridge;
+use crate::devices::wake::Wake;
 use crate::hypervisor::guest::{Guest, PluginThread};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
@@ -126,8 +131,9 @@ impl Drop for StopPlan {
 }
 
 impl<K: Kick> IoThreads<K> {
-    /// Starts the console reader, then the agent bridge, the network relay and
-    /// the control socket when the guest has them, then `plugin_threads`.
+    /// Starts the console reader, then the virtio-blk worker, the agent
+    /// bridge, the network relay and the control socket when the guest has
+    /// them, then `plugin_threads`.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
@@ -178,6 +184,28 @@ impl<K: Kick> IoThreads<K> {
             enders: Vec::new(),
             finish_count,
         };
+        if let Some(dev) = &guest.block {
+            // A notify only wakes this thread, which makes the disk calls the
+            // vCPU's exit used to make. See `block::serve`.
+            let wake = Arc::new(Wake::new());
+            lock_or_recover(dev).connect_worker(Arc::clone(&wake));
+            let (dev, ram, ledger) = (
+                Arc::clone(dev),
+                Arc::clone(&guest.ram),
+                Arc::clone(&guest.ledger),
+            );
+            let (stop, signal) = (io_threads.token(), Arc::clone(&wake));
+            let worker = std::thread::spawn(move || {
+                confine_io_thread();
+                block::serve(&dev, &ram, &signal, &stop, |events| {
+                    let mut ledger = lock_or_recover(&ledger);
+                    for event in events {
+                        ledger.captured(event);
+                    }
+                });
+            });
+            io_threads.push_ended_by("virtio-blk worker", worker, move || wake.stop());
+        }
         if let Some(bridge) = bridge {
             io_threads.spawn("agent bridge", move |stop| bridge.run(&stop));
         }
@@ -268,11 +296,8 @@ impl<K: Kick> IoThreads<K> {
         self.stop.actions.push(Box::new(action));
     }
 
-    /// Adds a thread the backend started that watches no stop token, with
-    /// `end`, which ends it. [`stop`](Self::stop) calls `end` before it
-    /// joins.
-    // Only the arm64 backends start such a thread, for `hvi-time`.
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    /// Adds a thread that watches no stop token, with `end`, which ends it.
+    /// [`stop`](Self::stop) calls `end` before it joins.
     pub(crate) fn push_ended_by(
         &mut self,
         name: &'static str,
