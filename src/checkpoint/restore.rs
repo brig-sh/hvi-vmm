@@ -320,8 +320,29 @@ struct StreamedDisk<'a> {
     lock: Option<crate::devices::virtio::block::DiskLock>,
     /// The sync of what the rounds wrote so far, started as each round
     /// ends, so it runs while the rest of the stream is read and the final
-    /// one has little left.
-    sync: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    /// one has little left. It returns how long it took.
+    sync: Option<std::thread::JoinHandle<std::io::Result<Duration>>>,
+    /// How long the syncs took, for the restore's report.
+    times: SyncTimes,
+}
+
+/// How long a stream restore's disk syncs took, and how many ran, which the
+/// restore reports: the final one and any wait for an earlier one are part
+/// of the guest's downtime.
+#[derive(Clone, Copy, Debug, Default)]
+struct SyncTimes {
+    /// The syncs started.
+    started: u32,
+    /// The running rounds whose sync was not started, since an earlier one
+    /// was still under way: the next sync covers them.
+    skipped: u32,
+    /// How long the final round waited for an earlier round's sync before
+    /// it started its own, with the stream's reading held up.
+    final_wait: Duration,
+    /// How long the final round's sync took.
+    final_sync: Duration,
+    /// How long the restore waited for that sync once the stream was read.
+    after_stream: Duration,
 }
 
 impl<'a> StreamedDisk<'a> {
@@ -331,19 +352,18 @@ impl<'a> StreamedDisk<'a> {
             file: None,
             lock: None,
             sync: None,
+            times: SyncTimes::default(),
         }
     }
 
-    /// Waits for the sync under way, if any.
-    fn join_sync(&mut self) -> std::io::Result<()> {
-        if let Some(sync) = self.sync.take() {
-            sync.join()
-                .map_err(|_| std::io::Error::other("the disk's sync panicked"))?
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("--disk {}: sync: {e}", self.path))
-                })?;
-        }
-        Ok(())
+    /// Waits for the sync under way, if any, and returns how long it took.
+    fn join_sync(&mut self) -> std::io::Result<Duration> {
+        let Some(sync) = self.sync.take() else {
+            return Ok(Duration::ZERO);
+        };
+        sync.join()
+            .map_err(|_| std::io::Error::other("the disk's sync panicked"))?
+            .map_err(|e| std::io::Error::new(e.kind(), format!("--disk {}: sync: {e}", self.path)))
     }
 
     /// Waits for the sync the final round started, then lets go of the
@@ -354,10 +374,15 @@ impl<'a> StreamedDisk<'a> {
     /// stalled on it: a loaded Pi showed an RCU stall of that kind after a
     /// streamed restore whose disk the mover had left unsynced.
     fn close(&mut self) -> std::io::Result<()> {
+        let waited = Instant::now();
         let synced = self.join_sync();
+        self.times.after_stream = waited.elapsed();
+        if let Ok(took) = synced {
+            self.times.final_sync = took;
+        }
         self.lock = None;
         self.file = None;
-        synced
+        synced.map(|_| ())
     }
 }
 
@@ -410,16 +435,25 @@ impl stream::DiskTarget for StreamedDisk<'_> {
         // A running round's sync is started only when the last one is done,
         // so they never pile up; the final round's always is, after it.
         if self.sync.as_ref().is_some_and(|s| !s.is_finished()) && !in_pause {
+            self.times.skipped += 1;
             return Ok(());
         }
+        let waited = Instant::now();
         self.join_sync()?;
+        if in_pause {
+            self.times.final_wait = waited.elapsed();
+        }
         if let Some(file) = &self.file {
             let file = Arc::clone(file);
             self.sync = Some(
                 std::thread::Builder::new()
                     .name("hvi-disk-sync".into())
-                    .spawn(move || file.sync_data())?,
+                    .spawn(move || {
+                        let started = Instant::now();
+                        file.sync_data().map(|()| started.elapsed())
+                    })?,
             );
+            self.times.started += 1;
         }
         Ok(())
     }
@@ -644,6 +678,29 @@ fn read_stream(
     let closed = target.as_mut().map_or(Ok(()), StreamedDisk::close);
     let received = received?;
     closed?;
+    if let Some(t) = target
+        .as_ref()
+        .map(|t| t.times)
+        .filter(|_| !received.disk.is_empty())
+    {
+        let final_blocks = received
+            .disk
+            .iter()
+            .filter(|d| d.in_pause)
+            .map(|d| d.blocks)
+            .sum::<u64>();
+        eprintln!(
+            "{} stream {from}: disk syncs: {} started, {} left to a later one; the final \
+             round's {final_blocks} block(s) waited {} ms for the sync before, took {} ms to \
+             sync, {} ms of it after the stream",
+            crate::LOG_PREFIX,
+            t.started,
+            t.skipped,
+            t.final_wait.as_millis(),
+            t.final_sync.as_millis(),
+            t.after_stream.as_millis(),
+        );
+    }
     let (profile, shared, ram) =
         built.ok_or_else(|| std::io::Error::other("the stream built no RAM"))?;
     let listed: Vec<(u64, u64)> = received
@@ -1513,6 +1570,30 @@ pub(crate) mod tests {
             refusals(&opened, &config(&scratch), &HVF),
             Vec::<String>::new()
         );
+    }
+
+    // A source that takes back a move it aborted restores the spooled
+    // stream onto its own disk, without --disk-base-sha256. That disk was
+    // not synced in the pause, so a host crash can have lost the writes
+    // still in its page cache; the rounds rewrite every block written
+    // since boot, so the restore gives the disk as it was at the fence.
+    #[test]
+    fn a_stream_restored_onto_a_stale_source_disk_gives_the_fence_time_disk() {
+        let scratch = Scratch::new("stream-disk-stale");
+        let bytes = disk_stream(&scratch, |_| {});
+        // Only the blocks the rounds carry differ from the fence-time
+        // disk: block 0 as written, block 1 with an older write, block 2
+        // with its write lost. The blocks not written since boot are the
+        // base on both.
+        let mut stale = written_disk();
+        stale[65536..65536 + 300].fill(0x99);
+        stale[2 * 65536..2 * 65536 + 300].fill(0);
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(scratch.disk(), &stale).unwrap();
+        assert!(read_disk_back(&scratch) != written_disk());
+        read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None)
+            .expect("the spooled stream restores onto the source's disk");
+        assert!(read_disk_back(&scratch) == written_disk());
     }
 
     fn disk_stream_refusal(name: &str, edit: impl FnOnce(&mut DiskState)) -> String {
