@@ -719,11 +719,14 @@ records, ORed into one set of 4 KiB pages:
 
 The rounds with the guest running stop when the pages written during the
 last one come to at most 8 MiB or 2% of the RAM round 0 found present,
-whichever is larger (`converged`), after 5 rounds (`round_cap`), or 60 s
-after the start (`time_cap`); `max_rounds` and `max_secs` on the request
-lower or change those two. Then the guest is paused as for a checkpoint,
-the disk is synced, and the final round sends the pages left and every page
-written since, with nothing running. A guest that writes faster than the
+whichever is larger (`converged`), after 5 rounds (`round_cap`), or when a
+round ends 60 s or more after the start (`time_cap`); `max_rounds` and
+`max_secs` on the request change those two. The time cap is checked only
+as each round ends, so a round under way runs to its end: a large round 0
+behind a slow reader can take longer than `max_secs` on its own. Then the
+guest is paused as for a checkpoint, the disk is synced, and the final
+round sends the pages left and every page written since, with nothing
+running. A guest that writes faster than the
 rounds copy never converges: the round cap ends it, and its final round is
 as large as what it writes in one round, so the pause lasts as long as
 that takes to send. The final round is always taken paused.
