@@ -310,8 +310,12 @@ pub struct MigrateStats {
     /// The bytes the disk rounds put on the stream.
     pub disk_stream_bytes: u64,
     /// The sync of the disk after the last round with the guest running
-    /// and before the pause, in milliseconds.
+    /// and before the pause, in milliseconds. The guest runs meanwhile,
+    /// and what it writes then goes into the final round.
     pub disk_sync_ms: u64,
+    /// The sync of the disk in the pause, before disk.json is written, in
+    /// milliseconds: part of `paused_ms`.
+    pub pause_sync_ms: u64,
     /// The bytes one record of the guest's writes covers: the host page on
     /// KVM, the IPA granule on HVF.
     pub write_granule: u64,
@@ -319,8 +323,15 @@ pub struct MigrateStats {
     pub write_faults: Option<u64>,
     /// The mean host time of one, in nanoseconds.
     pub write_fault_ns: Option<u64>,
-    /// When the rounds with the guest running ended and the disk was
-    /// synced, just before the pause, in milliseconds since the Unix epoch.
+    /// When the last round with the guest running ended, before the
+    /// disk's sync, in milliseconds since the Unix epoch. The guest is
+    /// stopped at most from here to its resume on the destination.
+    pub rounds_end_unix_ms: u64,
+    /// When the disk's sync after the rounds ended, just before the pause,
+    /// in milliseconds since the Unix epoch: `rounds_end_unix_ms` plus
+    /// `disk_sync_ms`. The guest still runs during the sync, so the time
+    /// from here to its resume on the destination is closer to how long
+    /// it was stopped.
     pub precopy_end_unix_ms: u64,
     /// When the manifest was written.
     pub sealed_at_unix_ms: u64,

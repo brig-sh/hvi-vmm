@@ -1042,6 +1042,7 @@ impl<K: Kick> Machine<'_, K> {
         let started = Instant::now();
         let precopy =
             migrate::precopy(&mut stream, &ram, &tracker, disk_rounds, &policy, &stopping);
+        let rounds_end_unix_ms = unix_ms();
         // The disk is synced here, with the guest still running and
         // without the device's lock, so the sync in the pause has only the
         // writes since left; that one took seconds on a busy host.
@@ -1115,8 +1116,10 @@ impl<K: Kick> Machine<'_, K> {
                 &stopping,
             )?;
             // After the final disk round, so disk.json lists it with its
-            // digest, and its generation is the disk's.
-            let disk = capture.disk_state(&profile)?;
+            // digest, and its generation is the disk's. Its sync has only
+            // what the guest wrote since the one before the pause, and is
+            // timed on its own, since the guest waits for it.
+            let (disk, pause_sync) = capture.disk_state_timed(&profile)?;
             let mut docs = vec![
                 (
                     "cpu.json",
@@ -1146,6 +1149,7 @@ impl<K: Kick> Machine<'_, K> {
                 docs,
                 manifest.components,
                 exported.capabilities,
+                pause_sync,
             ))
         })();
         // The destination may open the disk as soon as it has read the
@@ -1157,7 +1161,15 @@ impl<K: Kick> Machine<'_, K> {
         let faults = write_log.fault_stats();
         tracker.stop();
         let sealed = match sealed {
-            Ok((last, manifest_sha256, sealed_at, mut docs, components, capabilities)) => {
+            Ok((
+                last,
+                manifest_sha256,
+                sealed_at,
+                mut docs,
+                components,
+                capabilities,
+                pause_sync,
+            )) => {
                 // Only a move that names itself by both can be told from
                 // another, so only it may have the state again.
                 if let (Then::Fence, Some(txid), Some(epoch)) =
@@ -1178,11 +1190,11 @@ impl<K: Kick> Machine<'_, K> {
                         components,
                     });
                 }
-                Ok((last, manifest_sha256, sealed_at))
+                Ok((last, manifest_sha256, sealed_at, pause_sync))
             }
             Err(e) => Err(e),
         };
-        let (last, manifest_sha256, sealed_at_unix_ms) = match sealed {
+        let (last, manifest_sha256, sealed_at_unix_ms, pause_sync) = match sealed {
             Ok(sealed) => sealed,
             Err(e) => {
                 if !self.vcpus.is_running() {
@@ -1213,6 +1225,7 @@ impl<K: Kick> Machine<'_, K> {
                 disk_stream_bytes: disk_rounds.iter().map(|r| r.bytes).sum(),
                 disk_rounds,
                 disk_sync_ms,
+                pause_sync_ms: pause_sync.as_millis() as u64,
                 gate_ms: times.gate_ms,
                 park_ms: times.park_ms,
                 final_round_bytes: rounds.last().map_or(0, |r| r.bytes),
@@ -1230,6 +1243,7 @@ impl<K: Kick> Machine<'_, K> {
                 write_granule: write_log.granule(),
                 write_faults: faults.map(|(n, _)| n),
                 write_fault_ns: faults.map(|(n, ns)| ns / n.max(1)),
+                rounds_end_unix_ms,
                 precopy_end_unix_ms,
                 sealed_at_unix_ms,
                 first_manifest_sha256: None,
@@ -1363,11 +1377,13 @@ impl<K: Kick> Machine<'_, K> {
                 disk_stream_bytes: disk_rounds.iter().map(|r| r.bytes).sum(),
                 disk_rounds,
                 disk_sync_ms: 0,
+                pause_sync_ms: 0,
                 gate_ms: 0,
                 park_ms: 0,
                 write_granule: capture.write_log.as_ref().map_or(0, |l| l.granule()),
                 write_faults: None,
                 write_fault_ns: None,
+                rounds_end_unix_ms: sealed_at_unix_ms,
                 precopy_end_unix_ms: sealed_at_unix_ms,
                 sealed_at_unix_ms,
                 first_manifest_sha256: Some(record.manifest_sha256.clone()),
@@ -3708,6 +3724,20 @@ mod tests {
         assert_eq!(stats["disk_rounds"].as_array().unwrap().len(), 4, "{r}");
         assert_eq!(stats["disk_rounds"][3]["in_pause"], true, "{r}");
         assert_eq!(stats["rounds"].as_array().unwrap().len(), 4, "{r}");
+        // Both syncs are timed, and the rounds end before the sync after
+        // them does.
+        assert!(
+            stats["disk_sync_ms"].is_u64() && stats["pause_sync_ms"].is_u64(),
+            "{r}"
+        );
+        let (end, synced) = (
+            stats["rounds_end_unix_ms"].as_u64().unwrap(),
+            stats["precopy_end_unix_ms"].as_u64().unwrap(),
+        );
+        assert!(
+            end <= synced && synced <= stats["sealed_at_unix_ms"].as_u64().unwrap(),
+            "{r}"
+        );
         let disk_json =
             crate::checkpoint::bundle::parse_disk(received.doc("disk.json").unwrap()).unwrap();
         assert_eq!(disk_json.rounds.len(), 4);
