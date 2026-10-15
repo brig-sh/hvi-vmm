@@ -635,7 +635,8 @@ struct Machine<'a, K> {
     timeout: Duration,
     /// How long a `migrate` waits on its reader.
     stream: StreamLimits,
-    /// What the `migrate` that fenced the VM sent, when it gave a txid.
+    /// What the `migrate` that fenced the VM sent, when it gave a txid and
+    /// an epoch.
     fenced_by: Option<FenceRecord>,
 }
 
@@ -1105,7 +1106,7 @@ impl<K: Kick> Machine<'_, K> {
         let request_doc = capture::Request {
             then: request.then,
             txid: request.txid.as_deref(),
-            epoch: request.epoch,
+            epoch: request.epoch.unwrap_or(0),
         };
         let sealed = (|| -> std::io::Result<_> {
             let devices = capture.device_states()?;
@@ -1161,13 +1162,17 @@ impl<K: Kick> Machine<'_, K> {
         tracker.stop();
         let sealed = match sealed {
             Ok((last, manifest_sha256, sealed_at, mut docs, components, capabilities)) => {
-                if let (Then::Fence, Some(txid)) = (request.then, &request.txid) {
+                // Only a move that names itself by both can be told from
+                // another, so only it may have the state again.
+                if let (Then::Fence, Some(txid), Some(epoch)) =
+                    (request.then, &request.txid, request.epoch)
+                {
                     if disk_rounds.is_some() {
                         docs.retain(|(name, _)| *name != "disk.json");
                     }
                     self.fenced_by = Some(FenceRecord {
                         txid: txid.clone(),
-                        epoch: request.epoch,
+                        epoch,
                         profile: profile.clone(),
                         profile_json,
                         docs,
@@ -1254,10 +1259,13 @@ impl<K: Kick> Machine<'_, K> {
         let Some(record) = &self.fenced_by else {
             return refuse(
                 ErrorCode::Fenced,
-                "the VM was fenced after a checkpoint, or by a move that gave no txid",
+                "the VM was fenced after a checkpoint, or by a move that gave no txid and \
+                 epoch",
             );
         };
-        if request.txid.as_deref() != Some(record.txid.as_str()) || request.epoch != record.epoch {
+        if request.txid.as_deref() != Some(record.txid.as_str())
+            || request.epoch != Some(record.epoch)
+        {
             return refuse(
                 ErrorCode::Fenced,
                 "the VM is fenced; only the move that fenced it, by its txid and epoch, may \
@@ -3843,6 +3851,41 @@ mod tests {
         let (again, _) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"x","epoch":0}"#);
         let err = again.err().expect("refused").to_string();
         assert!(err.contains("fenced after a checkpoint"), "{err}");
+    }
+
+    // A request without an epoch is not one with epoch 0: a fence made
+    // with epoch 0 is streamed again only for epoch 0, and a fence made
+    // with no epoch cannot be told from another move, so never is.
+    #[test]
+    fn an_epoch_left_out_is_not_epoch_0() {
+        let spec = || Spec {
+            parking: 2,
+            capture: true,
+            write_log: Some(Arc::new(QuietLog::default())),
+            ..Spec::default()
+        };
+        let mut f = Fixture::with("mig-restream-e0", spec());
+        let (first, _) =
+            f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-0","epoch":0}"#);
+        assert!(first.is_ok());
+        let (again, _) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-0"}"#);
+        let err = again.err().expect("refused").to_string();
+        assert!(err.contains("only the move that fenced it"), "{err}");
+        let (again, r) =
+            f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-0","epoch":0}"#);
+        assert!(again.is_ok(), "{r}");
+        drop(f);
+        let mut f = Fixture::with("mig-restream-enone", spec());
+        let (first, _) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-0"}"#);
+        assert!(first.is_ok());
+        for line in [
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-0"}"#,
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-0","epoch":0}"#,
+        ] {
+            let (again, _) = f.migrate(line);
+            let err = again.err().expect("refused").to_string();
+            assert!(err.contains("gave no txid and epoch"), "{line}: {err}");
+        }
     }
 
     // With disk rounds, the stream sent again has one disk round, every

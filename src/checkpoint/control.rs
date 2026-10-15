@@ -104,8 +104,11 @@ pub struct Migrate {
     pub then: Then,
     /// The caller's transaction id, recorded in `session.json`.
     pub txid: Option<String>,
-    /// The caller's epoch for the sandbox, recorded in `session.json`.
-    pub epoch: u64,
+    /// The caller's epoch for the sandbox, recorded in `session.json` (0
+    /// when it gives none). A fenced VM is streamed again only for a
+    /// request that gives both this and `txid`, equal to the fence's, so
+    /// a request without one is told apart from one with epoch 0.
+    pub epoch: Option<u64>,
     /// The most rounds taken with the guest running, 1 to
     /// [`MAX_MIGRATE_ROUNDS`], default 5; 1 sends RAM once running and once
     /// paused.
@@ -422,7 +425,10 @@ pub fn parse_request(line: &str) -> Result<Request, Error> {
         "migrate" => Request::Migrate(Migrate {
             then: then_of(&fields)?,
             txid: txid_of(&fields)?,
-            epoch: epoch_of(&fields)?,
+            epoch: fields
+                .contains_key("epoch")
+                .then(|| epoch_of(&fields))
+                .transpose()?,
             max_rounds: match fields.get("max_rounds") {
                 None => None,
                 Some(n) => Some(
@@ -693,7 +699,7 @@ mod tests {
                 Request::Migrate(Migrate {
                     then: Then::Fence,
                     txid: Some("t2".into()),
-                    epoch: 3,
+                    epoch: Some(3),
                     max_rounds: None,
                     max_secs: None,
                 }),
@@ -703,9 +709,19 @@ mod tests {
                 Request::Migrate(Migrate {
                     then: Then::Continue,
                     txid: None,
-                    epoch: 0,
+                    epoch: None,
                     max_rounds: Some(2),
                     max_secs: Some(0),
+                }),
+            ),
+            (
+                r#"{"v":1,"op":"migrate","txid":"t3","epoch":0}"#,
+                Request::Migrate(Migrate {
+                    then: Then::Continue,
+                    txid: Some("t3".into()),
+                    epoch: Some(0),
+                    max_rounds: None,
+                    max_secs: None,
                 }),
             ),
             (
