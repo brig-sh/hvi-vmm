@@ -212,7 +212,7 @@ pub(crate) fn send_disk<W: Write>(
     let mut max_lock_us = 0;
     let mut chunks = 0u64;
     let mut send = |first: u64, count: u64| -> io::Result<()> {
-        if chunks % 64 == 0 && stopping() {
+        if chunks.is_multiple_of(64) && stopping() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "the run is stopping",
@@ -290,6 +290,23 @@ pub(crate) struct Precopy {
     pub(crate) present_bytes: u64,
     /// The threshold the rounds were held to.
     pub(crate) threshold_bytes: u64,
+}
+
+impl Precopy {
+    /// Returns how long the last round with the guest running took to
+    /// send: its RAM round and, when the disk moves by its blocks, the
+    /// disk round sent before it. The final round sends what the guest
+    /// wrote meanwhile, of both, so it takes about as long.
+    #[must_use]
+    pub(crate) fn last_round_time(&self) -> Duration {
+        let ram = self.rounds.last().map_or(0, |r| r.ms);
+        let disk = self
+            .disk_rounds
+            .last()
+            .filter(|d| !d.in_pause)
+            .map_or(0, |d| d.ms);
+        Duration::from_millis(ram.saturating_add(disk))
+    }
 }
 
 /// Returns guest RAM's layout as a stream lists it.
@@ -699,6 +716,49 @@ mod tests {
         .err()
         .expect("stopped");
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    }
+
+    // The paused part of a move is budgeted from the last running round,
+    // and with the disk moving by its blocks that round is its disk round
+    // and its RAM round: a guest that writes its disk fast over a slow
+    // link has a final disk round as long as its last running one.
+    #[test]
+    fn the_last_round_time_counts_its_disk_round() {
+        let src = guest();
+        let pre = |rounds: &[u64], disk: &[(u64, bool)]| Precopy {
+            rounds: rounds
+                .iter()
+                .map(|&ms| RoundStats {
+                    ms,
+                    ..RoundStats::default()
+                })
+                .collect(),
+            disk_rounds: disk
+                .iter()
+                .map(|&(ms, in_pause)| DiskRoundStats {
+                    ms,
+                    in_pause,
+                    ..DiskRoundStats::default()
+                })
+                .collect(),
+            pending: DirtyPages::new(&src.regions()),
+            pending_since: Instant::now(),
+            reason: StopReason::Converged,
+            present_bytes: 0,
+            threshold_bytes: 0,
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(pre(&[900, 40], &[]).last_round_time(), ms(40));
+        assert_eq!(
+            pre(&[900, 40], &[(70, false), (1500, false)]).last_round_time(),
+            ms(1540)
+        );
+        // Once the final disk round is in, it is not a running one.
+        assert_eq!(
+            pre(&[900, 40], &[(1500, false), (5, true)]).last_round_time(),
+            ms(40)
+        );
+        assert_eq!(pre(&[], &[]).last_round_time(), Duration::ZERO);
     }
 
     #[test]
