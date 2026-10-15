@@ -171,7 +171,7 @@ a real boot would describe.
 | Variable | Read by | Effect |
 | --- | --- | --- |
 | `HVI_SECCOMP=log` | Linux | Install the same allowlists, but let an off-list syscall run and be recorded instead of killing the process. **This turns enforcement off.** |
-| `HVI_X86_TRACE` | x86-64 | Any value. Log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
+| `HVI_X86_TRACE` | x86-64 | Any value. Print the guest's CPUID leaf 1 and `0x4000_0001` at boot, log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
 | `HVI_BLK_TRACE` | all | Any value. Log every virtio-blk request to stderr. Off by default: one synchronous write per request. |
 
 There are no others at run time. `HVI_BLOCK_DEV` appears only inside a test

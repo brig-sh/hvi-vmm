@@ -265,7 +265,7 @@ flowchart TB
     B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image or synthesized; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
     C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs<br/>acpi::build @0xe0000<br/>RSDP, DSDT (_S5), FACS,<br/>FADT (PM1 @0x600), MADT, XSDT"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
-    E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID +RDRAND +RDSEED"] --> F
+    E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID +RDRAND +RDSEED<br/>+hypervisor +TSC-deadline"] --> F
     F["BSP: rip=entry, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
 ```
 
@@ -279,6 +279,15 @@ a failure:
 - The CMOS RTC is not optional. An unimplemented PIO read returns `0xff`, so
   the update-in-progress bit would never clear and a guest polling it with
   interrupts disabled spins forever, before the console is up.
+
+CPUID also sets the hypervisor bit and the TSC-deadline bit, which older KVMs,
+such as Linux 6.8's, leave out of the CPUID they report. With the hypervisor bit
+the guest reads KVM's leaves and uses every paravirtual feature they list, such
+as kvm-clock, steal time and paravirtual EOI, IPIs and TLB flushes. It starts on
+kvm-clock, and moves to the TSC when the host's TSC is invariant. A Linux guest
+also runs its local APIC in x2APIC mode, which it allows without interrupt
+remapping only under a hypervisor. With the TSC-deadline bit the guest runs its
+APIC timer in that mode and skips calibrating it at boot.
 
 Only vCPU 0 is initialised. The APs are brought up by the guest itself, with
 INIT-SIPI-SIPI serviced by the in-kernel LAPIC.
