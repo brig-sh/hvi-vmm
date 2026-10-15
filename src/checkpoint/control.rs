@@ -287,8 +287,9 @@ pub struct MigrateStats {
     pub gate_ms: u64,
     /// Then the time for every vCPU to park.
     pub park_ms: u64,
-    /// From the pause to the manifest written: the source's part of the
-    /// time the guest is stopped.
+    /// From the pause to the manifest written, less `gate_ms`: the
+    /// source's part of the time the guest is stopped. The vCPUs run on
+    /// while the gate waits for the I/O threads.
     pub paused_ms: u64,
     /// The bytes of the final round, sent paused.
     pub final_round_bytes: u64,
