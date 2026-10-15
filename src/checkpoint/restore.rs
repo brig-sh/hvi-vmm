@@ -388,34 +388,39 @@ fn read_stream(
 ) -> std::io::Result<Opened> {
     let mut reader = stream::StreamReader::new(std::io::BufReader::with_capacity(1 << 20, input));
     let mut built = None;
-    let received = stream::receive(&mut reader, |bytes| {
-        let text = std::str::from_utf8(bytes).map_err(|e| stream_bad("profile.json", e))?;
-        let profile = MachineProfile::from_json(text).map_err(|e| stream_bad("profile.json", e))?;
-        let regions: Vec<stream::StreamRegion> = profile
-            .ram_regions
-            .iter()
-            .map(|r| stream::StreamRegion {
-                gpa: r.gpa,
-                size: r.size,
-            })
-            .collect();
-        // Checked before anything is allocated by them.
-        let space = stream::PageSpace::new(&regions)?;
-        let page = host_page_size();
-        if page == 0
-            || regions
+    let received = stream::receive(
+        &mut reader,
+        |bytes| {
+            let text = std::str::from_utf8(bytes).map_err(|e| stream_bad("profile.json", e))?;
+            let profile =
+                MachineProfile::from_json(text).map_err(|e| stream_bad("profile.json", e))?;
+            let regions: Vec<stream::StreamRegion> = profile
+                .ram_regions
                 .iter()
-                .any(|r| r.gpa % page != 0 || r.size % page != 0)
-        {
-            return Err(stream_bad(
-                "profile.json",
-                format!("the RAM regions are not whole {page}-byte host pages"),
-            ));
-        }
-        let (shared, ram) = alloc_ram(&profile.ram_regions)?;
-        built = Some((profile, shared, Arc::clone(&ram)));
-        Ok((space, ram))
-    })?;
+                .map(|r| stream::StreamRegion {
+                    gpa: r.gpa,
+                    size: r.size,
+                })
+                .collect();
+            // Checked before anything is allocated by them.
+            let space = stream::PageSpace::new(&regions)?;
+            let page = host_page_size();
+            if page == 0
+                || regions
+                    .iter()
+                    .any(|r| r.gpa % page != 0 || r.size % page != 0)
+            {
+                return Err(stream_bad(
+                    "profile.json",
+                    format!("the RAM regions are not whole {page}-byte host pages"),
+                ));
+            }
+            let (shared, ram) = alloc_ram(&profile.ram_regions)?;
+            built = Some((profile, shared, Arc::clone(&ram)));
+            Ok((space, ram))
+        },
+        None,
+    )?;
     let (profile, shared, ram) =
         built.ok_or_else(|| std::io::Error::other("the stream built no RAM"))?;
     let listed: Vec<(u64, u64)> = received

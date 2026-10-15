@@ -2614,9 +2614,11 @@ mod tests {
             let ram = Arc::new(GuestRam::from_ranges(&[(GPA, 1 << 20)]));
             let target = Arc::clone(&ram);
             let mut reader = StreamReader::new(&mut self.replies);
-            let got = receive(&mut reader, |_| {
-                Ok((PageSpace::new(&migrate::regions_of(&target))?, target))
-            });
+            let got = receive(
+                &mut reader,
+                |_| Ok((PageSpace::new(&migrate::regions_of(&target))?, target)),
+                None,
+            );
             let reply_line = match &got {
                 // A refusal is the line where the next frame header was due,
                 // and the reader read it.
