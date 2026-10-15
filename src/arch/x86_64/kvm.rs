@@ -43,7 +43,7 @@
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 
-use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment};
+use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment, CpuId};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::x86_64::acpi;
@@ -92,6 +92,16 @@ const EFER_LME_LMA: u64 = 0x0000_0500; // LME|LMA
 const PDE64_PRESENT_RW_PS: u64 = 0x83; // present | writable | page-size (1 GiB)
 const PDE64_PRESENT_RW: u64 = 0x03; // present | writable (table)
 
+/// The CPUID leaf 1 ECX bit that says the local APIC timer has a TSC-deadline
+/// mode.
+const CPUID_1_ECX_TSC_DEADLINE_TIMER: u32 = 1 << 24;
+/// The CPUID leaf 1 ECX bit for RDRAND.
+const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
+/// The CPUID leaf 1 ECX bit that says the CPU runs under a hypervisor.
+const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
+/// The CPUID leaf 7, subleaf 0, EBX bit for RDSEED.
+const CPUID_7_0_EBX_RDSEED: u32 = 1 << 18;
+
 /// State shared across the vCPU threads.
 #[derive(Clone)]
 struct Shared {
@@ -105,6 +115,30 @@ struct Shared {
     pm: Arc<Mutex<PmRegisters>>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
+}
+
+/// Returns `supported`, the CPUID KVM supports, with the bits added that the
+/// guest needs.
+///
+/// RDRAND and RDSEED give the guest's early KASLR and entropy path a source,
+/// which the host must have. The hypervisor bit tells the guest it runs under
+/// KVM, so it reads KVM's leaves from `0x4000_0000` and uses the paravirtual
+/// features they list. The TSC-deadline bit offers the local APIC timer mode
+/// that KVM's in-kernel local APIC emulates. Every KVM that hvi runs on reports
+/// `KVM_CAP_TSC_DEADLINE_TIMER`, so the bit is set without a check. Newer KVMs
+/// report the hypervisor and TSC-deadline bits themselves.
+fn guest_cpuid(mut supported: CpuId) -> CpuId {
+    for entry in supported.as_mut_slice() {
+        match entry.function {
+            1 => {
+                entry.ecx |=
+                    CPUID_1_ECX_TSC_DEADLINE_TIMER | CPUID_1_ECX_RDRAND | CPUID_1_ECX_HYPERVISOR;
+            }
+            7 if entry.index == 0 => entry.ebx |= CPUID_7_0_EBX_RDSEED,
+            _ => {}
+        }
+    }
+    supported
 }
 
 /// Splices the parameters we own into a caller-supplied kernel command line.
@@ -297,17 +331,21 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         kernel.format, kernel.entry
     );
 
-    // vCPUs. Each gets KVM's supported CPUID (the guest reads it for feature
-    // detection — without it early boot faults). We ensure RDRAND (leaf 1 ECX
-    // bit 30) and RDSEED (leaf 7 EBX bit 18) are advertised so the guest's
-    // early KASLR/entropy path has a source (the host must support them).
-    // The BSP enters in long mode; APs wait for the guest's SIPI.
-    let mut cpuid = kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?;
-    for e in cpuid.as_mut_slice() {
-        match e.function {
-            1 => e.ecx |= 1 << 30,                 // RDRAND
-            7 if e.index == 0 => e.ebx |= 1 << 18, // RDSEED
-            _ => {}
+    // vCPUs. The BSP enters in long mode; APs wait for the guest's SIPI.
+    let cpuid = guest_cpuid(kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?);
+    let trace = std::env::var_os("HVI_X86_TRACE").is_some();
+    // What the guest gets depends on the host's KVM, so the trace prints leaf 1
+    // and KVM's feature leaf.
+    if trace {
+        for entry in cpuid.as_slice() {
+            if entry.function == 1 || entry.function == 0x4000_0001 {
+                stderrln!(
+                    "[trace] CPUID {:#x}: eax={:#010x} ecx={:#010x}",
+                    entry.function,
+                    entry.eax,
+                    entry.ecx
+                );
+            }
         }
     }
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
@@ -372,7 +410,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         net_source,
     )?;
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
-    if std::env::var_os("HVI_X86_TRACE").is_some() {
+    if trace {
         let guest = Arc::clone(&shared.guest);
         io_threads.spawn("trace watchdog", move |watch| {
             for _ in 0..4 {
@@ -857,6 +895,59 @@ mod vcpu_cap_tests {
         };
         let error = boot(cfg).unwrap_err().to_string();
         assert_eq!(error, "x86-64 supports at most 254 vCPUs (asked for 255)");
+    }
+}
+
+#[cfg(test)]
+mod cpuid_tests {
+    use kvm_bindings::{kvm_cpuid_entry2, CpuId};
+
+    use super::{
+        guest_cpuid, CPUID_1_ECX_HYPERVISOR, CPUID_1_ECX_RDRAND, CPUID_1_ECX_TSC_DEADLINE_TIMER,
+        CPUID_7_0_EBX_RDSEED,
+    };
+
+    /// Leaf 1 ECX as an older KVM, such as Linux 6.8's, reports it, with SSE3
+    /// and x2APIC set and neither the hypervisor bit nor the TSC-deadline bit.
+    const LEAF_1_ECX: u32 = 1 | 1 << 21;
+    /// Leaf 7 subleaf 0 EBX as KVM reports it, with FSGSBASE set and RDSEED
+    /// clear.
+    const LEAF_7_EBX: u32 = 1;
+
+    /// Returns a CPUID entry with the given leaf, subleaf and registers.
+    fn entry(function: u32, index: u32, ebx: u32, ecx: u32, edx: u32) -> kvm_cpuid_entry2 {
+        kvm_cpuid_entry2 {
+            function,
+            index,
+            ebx,
+            ecx,
+            edx,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn guest_cpuid_adds_its_bits_and_keeps_other_leaves() {
+        // Leaf 7 subleaf 1 and KVM's signature leaf, "KVMKVMKVM", which
+        // `guest_cpuid` must leave alone.
+        let untouched = [
+            entry(7, 1, 0, 0, 0),
+            entry(0x4000_0000, 0, 0x4b4d_564b, 0x564b_4d56, 0x4d),
+        ];
+        let mut entries = vec![entry(1, 0, 0, LEAF_1_ECX, 0), entry(7, 0, LEAF_7_EBX, 0, 0)];
+        entries.extend(untouched);
+        let cpuid = guest_cpuid(CpuId::from_entries(&entries).unwrap());
+
+        let entries = cpuid.as_slice();
+        assert_eq!(
+            entries[0].ecx,
+            LEAF_1_ECX
+                | CPUID_1_ECX_TSC_DEADLINE_TIMER
+                | CPUID_1_ECX_RDRAND
+                | CPUID_1_ECX_HYPERVISOR
+        );
+        assert_eq!(entries[1].ebx, LEAF_7_EBX | CPUID_7_0_EBX_RDSEED);
+        assert_eq!(entries[2..], untouched);
     }
 }
 

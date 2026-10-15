@@ -239,6 +239,15 @@ jobs:
           grep -qE "Total of 2 processors activated|smp: Brought up 1 node, 2 CPUs" boot.log \
             || { echo "::error::AP did not come online — SMP bringup failed"; exit 1; }
           echo "SMP: 2 processors online ✓"
+          # With the hypervisor bit in its CPUID the guest starts on KVM's
+          # clock, which it leaves for the TSC on a host whose TSC is invariant.
+          # The TSC-deadline bit gives it the APIC timer mode it need not
+          # calibrate. A newer host KVM reports both bits itself.
+          grep -q "clocksource: Switched to clocksource kvm-clock" boot.log \
+            || { echo "::error::the guest did not start on kvm-clock"; exit 1; }
+          grep -q "TSC deadline timer available" boot.log \
+            || { echo "::error::the guest found no TSC-deadline timer"; exit 1; }
+          echo "kvm-clock and the TSC-deadline timer ✓"
       # The distribution vmlinuz is a bzImage. `scripts/extract-vmlinux` unpacks
       # the ELF inside it, which is the other x86 format hvi boots. It comes
       # from the headers package apt installed a step ago, so it is the copy

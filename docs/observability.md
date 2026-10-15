@@ -167,7 +167,7 @@ nothing above the hole and looks like it found an empty guest.
 | Variable | Effect |
 | --- | --- |
 | `HVI_BLK_TRACE=1` | Log every virtio-blk request to stderr. Off by default: one synchronous write per request. |
-| `HVI_X86_TRACE=1` | x86 backend: log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
+| `HVI_X86_TRACE=1` | x86 backend: print the guest's CPUID leaf 1 and `0x4000_0001` at boot, log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
 | `HVI_SECCOMP=log` | Linux: install the allowlists but let an off-list syscall run and be recorded. This turns enforcement off. See [security.md](security.md). |
 
 ## Writing your own tool
