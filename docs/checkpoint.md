@@ -197,7 +197,7 @@ on the byte layout of the build that wrote it.
 | `cpu.json` | `{"version":1,"arch":"aarch64"\|"x86_64","vcpus":[...]}`. Registers by architectural name, values as `"0x..."` strings. Each vCPU says whether it is `partial`. See [The vCPU state](#the-vcpu-state). |
 | `platform.json` | The interrupt controller (`irq`) and the guest counter (`timer`), each tagged with its `kind`, and an optional backend blob. See [The platform state](#the-platform-state). |
 | `devices.json` | Every device's state, with a `null` for a device the guest does not have, and `irq_levels`: the level of each device's interrupt line at the capture, so a restore can drive the lines again. |
-| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot, which a restore carries on, so it only grows across moves), `synced: true`, `sha256_sparse: null`, which whoever moves the disk fills in, and for a move by blocks `base_sha256`, `block_size`, `dirty_since_boot_b64` and `rounds`. See [Moving the disk by its blocks](#moving-the-disk-by-its-blocks). |
+| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot, which a restore carries on, so it only grows across moves), `synced` (whether the disk was synced with the guest stopped: `true`, but `false` in a live move's stream with disk rounds, see [The pause](#the-pause)), `sha256_sparse: null`, which whoever moves the disk fills in, and for a move by blocks `base_sha256`, `block_size`, `dirty_since_boot_b64` and `rounds`. See [Moving the disk by its blocks](#moving-the-disk-by-its-blocks). |
 | `session.json` | The sandbox id, `epoch`, `txid`, the capture time and `then`. |
 | `manifest.json` | Every other file's name, size and SHA-256, the RAM regions with their present page counts, the SHA-256 of `profile.json`, the hvi build, `capabilities` (what a restore must be able to load: `hvf-gic-state-v1` on HVF, empty on KVM) and the seal time. |
 
@@ -783,16 +783,36 @@ When the rounds with the guest running end, the source:
    bound fails, and the VM runs on.
 3. Sends the final disk round, the blocks written since the last one, then
    the final RAM round, the pages left and every page written since, then
-   the documents, with nothing running. disk.json's capture syncs the disk
-   once more, under the device's lock (`pause_sync_ms`): the source's disk
-   is durable when the move seals, as `disk.json` says with `synced`.
-   That sync is guest downtime. It took 0 to 3 ms on the Mac and on a
-   quiet Pi, but with an `O_DIRECT` writer beside it on the Pi a median of
-   300 ms, and up to 586 ms, of a `paused_ms` median of 643 ms (see [The
-   pause under load](#the-pause-under-load)): the first sync does not
-   leave it little to do on a disk that busy. `disk.json` is captured after the
+   the documents, with nothing running. `disk.json` is captured after the
    final disk round, so it lists every disk round with the digests of what
    the stream carried, and its last round's generation is the disk's.
+
+   A stream without disk rounds syncs the disk once more as `disk.json`
+   is captured, under the device's lock (`pause_sync_ms`): the mover
+   copies this disk whole, so it must be durable when the move seals, as
+   `disk.json` says with `synced: true`. A stream with disk rounds leaves
+   that sync out, `pause_sync_ms` is 0 and `disk.json` says `synced:
+   false`:
+
+   - The destination holds every block the guest wrote, from the rounds,
+     and syncs its own copy before it reports `restored-paused` (see
+     [Restoring a stream](#restoring-a-stream)). The source's file is not
+     what the guest resumes from.
+   - The source's file matters again only if the move fails before the
+     manifest and the guest runs on here. Its durability then rests on
+     the guest's own flushes, as on any running guest: the device served
+     every flush the guest was told had completed with an `fdatasync`.
+     The writes since the guest's last flush are in the host's page cache,
+     as they were before the move.
+   - A fenced source never runs again, and a stream sent again to the fence
+     owner reads the disk through the same page cache.
+
+   That sync was most of the guest's downtime on a busy host: with an
+   `O_DIRECT` writer beside it on the Pi a median of 300 ms, and up to
+   11.6 s (see [The pause under load](#the-pause-under-load)), since the
+   sync before the pause does not leave it little to do on a disk that
+   busy. On the Mac and on a quiet Pi it took 0 to 3 ms.
+   `checkpoint` (the directory form) keeps its sync too.
 
 Only the control thread writes the stream. A slow reader holds it up, and
 the guest runs on meanwhile; the pause starts once the last round with the
