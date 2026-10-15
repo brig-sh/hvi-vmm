@@ -255,6 +255,12 @@ impl PauseGate {
         self.paused.load(Ordering::SeqCst)
     }
 
+    /// Returns whether the stop opened the gate for good.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
     /// Opens the gate for good, for the stop.
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
@@ -332,6 +338,15 @@ impl StopToken {
     /// closed. See [`PauseGate::enter`].
     pub fn enter(&self) -> Admission<'_> {
         self.gate.enter()
+    }
+
+    /// Returns whether the stop is requested. It does not block, and a
+    /// helper that passed the gate checks it before it touches a device:
+    /// the stop opens the gate for good, and a helper held at a closed gate
+    /// then walks through with the guest still paused.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.gate.is_stopped()
     }
 
     /// Blocks until `fd` is readable or the stop is requested.

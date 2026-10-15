@@ -1498,9 +1498,12 @@ pub(crate) fn serve(
         loop {
             let _in = stop.enter();
             // The stop opens the gate for good, so a worker held at it walks
-            // through. Once it sees the stop it serves nothing more, and a
-            // fenced device has nothing to take whichever comes first.
-            if wake.is_stopped() {
+            // through with the guest still paused. It checks the stop first
+            // and serves nothing more: `IoThreads::stop` requests the stop
+            // before it ends the wake, so the wake alone would let it serve
+            // a chain in between. A fenced device has nothing to take
+            // either way.
+            if stop.is_stopped() || wake.is_stopped() {
                 return;
             }
             let Some(request) = lock_or_recover(dev).take_request(mem) else {
@@ -3013,6 +3016,24 @@ mod worker_tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(rig.used_idx(), 0, "nothing returned");
         assert_eq!(rig.sector(4), vec![0x5a; 512], "nothing written");
+        rig.stop();
+    }
+
+    /// A worker held at a closed gate when the stop is requested walks
+    /// through it with the guest paused, and serves nothing, even before
+    /// its wake is stopped: `IoThreads::stop` requests the stop first.
+    #[test]
+    fn a_paused_worker_serves_nothing_at_the_stop() {
+        let mut rig = rig("stop-paused");
+        rig.start();
+        rig.source.gate().pause(PATIENCE).unwrap();
+        rig.post(0, VIRTIO_BLK_T_OUT, 6, 0x44);
+        rig.notify();
+        std::thread::sleep(Duration::from_millis(50));
+        rig.source.request_stop();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rig.used_idx(), 0, "nothing returned");
+        assert_eq!(rig.sector(6), vec![0x5a; 512], "nothing written");
         rig.stop();
     }
 
