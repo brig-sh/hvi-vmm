@@ -844,14 +844,17 @@ pub struct RestoreConfig {
     /// The disk image to reopen for the guest's virtio-blk device, in
     /// `--disk`'s syntax. A checkpoint carries one writable disk, and the
     /// restored disk answers `GET_ID` with the serial the bundle records, so
-    /// a `serial` here must be that one, and `read_only` is refused.
+    /// a `serial` here must be that one, and `read_only` is refused. A
+    /// stream with disk rounds writes them into it first, so it is then the
+    /// destination's own copy of the guest's base image.
     pub disk: Option<DiskConfig>,
-    /// The `generation` of the `disk-dirty` reply that started the last
-    /// round of `disk-blocks` the mover applied onto its copy of the
-    /// guest's base image to make `disk`. `None` when the disk was copied
-    /// whole. With it, the restore refuses a disk.json with no base, or
-    /// captured at another generation: the guest wrote after that round,
-    /// and the disk lacks the write.
+    /// For a bundle directory only: the `generation` of the `disk-dirty`
+    /// reply that started the last round of `disk-blocks` the mover applied
+    /// onto its copy of the guest's base image to make `disk`. `None` when
+    /// the disk was copied whole. With it, the restore refuses a disk.json
+    /// with no base, or captured at another generation: the guest wrote
+    /// after that round, and the disk lacks the write. A stream checks its
+    /// own disk rounds the same way.
     pub disk_generation: Option<u64>,
     /// The built-in network stack, for a guest that ran on it.
     pub net: bool,

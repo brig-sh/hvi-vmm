@@ -43,7 +43,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::checkpoint::disk::MAX_REQUEST_BLOCKS;
-use crate::checkpoint::migrate::{RoundStats, StopReason};
+use crate::checkpoint::migrate::{DiskRoundStats, RoundStats, StopReason};
 use crate::checkpoint::profile::MachineProfile;
 use crate::devices::virtio::block::DirtySince;
 
@@ -295,6 +295,16 @@ pub struct MigrateStats {
     pub ram_stream_bytes: u64,
     /// The whole stream, frame headers and documents included.
     pub stream_bytes: u64,
+    /// Every disk round, the final one last; empty when the disk did not
+    /// move by its blocks.
+    pub disk_rounds: Vec<DiskRoundStats>,
+    /// The disk's bytes the disk rounds carried before compression.
+    pub disk_raw_bytes: u64,
+    /// The bytes the disk rounds put on the stream.
+    pub disk_stream_bytes: u64,
+    /// The sync of the disk after the last round with the guest running
+    /// and before the pause, in milliseconds.
+    pub disk_sync_ms: u64,
     /// The bytes one record of the guest's writes covers: the host page on
     /// KVM, the IPA granule on HVF.
     pub write_granule: u64,
@@ -302,8 +312,8 @@ pub struct MigrateStats {
     pub write_faults: Option<u64>,
     /// The mean host time of one, in nanoseconds.
     pub write_fault_ns: Option<u64>,
-    /// When the last round with the guest running was written, in
-    /// milliseconds since the Unix epoch.
+    /// When the rounds with the guest running ended and the disk was
+    /// synced, just before the pause, in milliseconds since the Unix epoch.
     pub precopy_end_unix_ms: u64,
     /// When the manifest was written.
     pub sealed_at_unix_ms: u64,

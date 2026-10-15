@@ -30,14 +30,29 @@
 //! writes faster than the rounds copy never converges, and the round cap
 //! bounds it: its last round is then as large as what it writes in one
 //! round, and the pause lasts as long as that takes to send.
+//!
+//! A guest whose disk has a base image (`--disk-base-sha256`) moves its
+//! disk in the same rounds: disk round `k`, the blocks it wrote since the
+//! disk round before (round 0: since boot, which is every difference from
+//! the base), goes before RAM round `k`, and the final disk round before
+//! the final RAM round, paused. The blocks are read through the device's
+//! lock one block at a time, so the guest's disk waits for one 64 KiB read
+//! at most, and a block the guest writes while it is read is in the next
+//! round either way.
 
 use std::io::{self, Write};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::checkpoint::disk::read_batch;
 use crate::checkpoint::ram::PAGE_SIZE;
-use crate::checkpoint::stream::{ChunkEncoder, PageSpace, StreamRegion, StreamWriter, CHUNK_PAGES};
+use crate::checkpoint::stream::{
+    ChunkEncoder, DiskEncoder, PageSpace, StreamRegion, StreamWriter, CHUNK_PAGES,
+    DISK_CHUNK_BLOCKS,
+};
+use crate::devices::virtio::block::{DirtySince, VirtioBlk, DIRTY_BLOCK_BYTES};
 use crate::memory::{DirtyPages, GuestRam, GuestWriteLog};
 
 /// When the rounds stop.
@@ -149,6 +164,98 @@ impl RoundStats {
     }
 }
 
+/// What one disk round sent, as the reply reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DiskRoundStats {
+    /// Its component in the stream: `disk-round-K`, or `disk-round-final`.
+    pub name: String,
+    /// The round as the device and `disk.json` count it, from 0.
+    pub round: u32,
+    /// Whether the guest was paused for it.
+    pub in_pause: bool,
+    /// The blocks it sent.
+    pub blocks: u64,
+    /// Their bytes before compression.
+    pub raw_bytes: u64,
+    /// The bytes it put on the stream, chunk headers included.
+    pub bytes: u64,
+    /// How long it took to read and send, in milliseconds.
+    pub ms: u64,
+    /// The disk's generation when the round was read.
+    pub generation: u64,
+    /// The longest the guest's disk waited for one block's read, in
+    /// microseconds.
+    pub max_lock_us: u64,
+}
+
+/// Sends the disk blocks `since` asks for, read from `dev`, as the next
+/// disk round of `stream`, and records the round's stream digest in the
+/// device, so `disk.json` lists it.
+///
+/// # Errors
+///
+/// Errors when the device refuses the read, a block cannot be read, the
+/// stream fails, or `stopping` returns true.
+pub(crate) fn send_disk<W: Write>(
+    stream: &mut StreamWriter<W>,
+    dev: &Mutex<VirtioBlk>,
+    since: DirtySince,
+    in_pause: bool,
+    stopping: &dyn Fn() -> bool,
+) -> io::Result<DiskRoundStats> {
+    let started = Instant::now();
+    let read = dev.lock().unwrap().read_dirty(since)?;
+    let mut round = stream.disk_round(in_pause);
+    let mut enc = DiskEncoder::default();
+    let mut buf = Vec::with_capacity((DISK_CHUNK_BLOCKS * DIRTY_BLOCK_BYTES) as usize);
+    let mut max_lock_us = 0;
+    let mut chunks = 0u64;
+    let mut send = |first: u64, count: u64| -> io::Result<()> {
+        if chunks % 64 == 0 && stopping() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the run is stopping",
+            ));
+        }
+        chunks += 1;
+        buf.clear();
+        max_lock_us = max_lock_us.max(read_batch(dev, first, count, &mut buf)?);
+        round.chunk(&mut enc, first, count, &buf)
+    };
+    // Runs of adjacent blocks, at most a chunk's each, taken from the
+    // bitmap as it is walked: a list of every block of a large disk would
+    // be large itself.
+    let mut run: Option<(u64, u64)> = None;
+    for block in read.dirty.iter() {
+        run = match run {
+            Some((first, count)) if first + count == block && count < DISK_CHUNK_BLOCKS => {
+                Some((first, count + 1))
+            }
+            Some((first, count)) => {
+                send(first, count)?;
+                Some((block, 1))
+            }
+            None => Some((block, 1)),
+        };
+    }
+    if let Some((first, count)) = run {
+        send(first, count)?;
+    }
+    let (summary, sha256) = round.finish()?;
+    dev.lock().unwrap().record_sent(read.round, sha256);
+    Ok(DiskRoundStats {
+        name: summary.name,
+        round: read.round,
+        in_pause,
+        blocks: summary.blocks,
+        raw_bytes: summary.raw_bytes,
+        bytes: summary.bytes,
+        ms: started.elapsed().as_millis() as u64,
+        generation: read.generation,
+        max_lock_us,
+    })
+}
+
 /// How the rounds with the guest running ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,6 +274,8 @@ pub enum StopReason {
 pub(crate) struct Precopy {
     /// Each round sent.
     pub(crate) rounds: Vec<RoundStats>,
+    /// Each disk round sent, when the disk moves by its blocks.
+    pub(crate) disk_rounds: Vec<DiskRoundStats>,
     /// The pages written during the last round, not sent yet.
     pub(crate) pending: DirtyPages,
     /// When the pages in `pending` started being recorded.
@@ -237,24 +346,30 @@ fn per_second(pages: u64, period: Duration) -> u64 {
 }
 
 /// Starts `tracker` and sends the rounds taken with the guest running, by
-/// `policy`, then returns what the final round still has to send. The
-/// tracker is left running for the final round; on an error the caller
+/// `policy`, then returns what the final round still has to send. With
+/// `disk`, each RAM round is preceded by the disk round of the same number.
+/// The tracker is left running for the final round; on an error the caller
 /// stops it.
 ///
 /// # Errors
 ///
-/// Errors when the tracker or the stream fails, or `stopping` returns
-/// true.
+/// Errors when the tracker, the disk or the stream fails, or `stopping`
+/// returns true.
 pub(crate) fn precopy<W: Write>(
     stream: &mut StreamWriter<W>,
     ram: &GuestRam,
     tracker: &Tracker<'_>,
+    disk: Option<&Mutex<VirtioBlk>>,
     policy: &Policy,
     stopping: &dyn Fn() -> bool,
 ) -> io::Result<Precopy> {
     let space = PageSpace::new(&regions_of(ram))?;
     let started = Instant::now();
     tracker.start()?;
+    let mut disk_rounds = Vec::new();
+    if let Some(dev) = disk {
+        disk_rounds.push(send_disk(stream, dev, DirtySince::Boot, false, stopping)?);
+    }
     let mut since = Instant::now();
     let all = DirtyPages::all(&ram.regions());
     let first = send(stream, ram, &space, &all, true, false, stopping)?;
@@ -277,6 +392,7 @@ pub(crate) fn precopy<W: Write>(
         if let Some(reason) = reason {
             return Ok(Precopy {
                 rounds,
+                disk_rounds,
                 pending: set,
                 pending_since: since,
                 reason,
@@ -285,26 +401,36 @@ pub(crate) fn precopy<W: Write>(
             });
         }
         since = now;
+        if let Some(dev) = disk {
+            disk_rounds.push(send_disk(stream, dev, DirtySince::Round, false, stopping)?);
+        }
         let mut stats = send(stream, ram, &space, &set, false, false, stopping)?;
         stats.dirty_pages_per_s = rate;
         rounds.push(stats);
     }
 }
 
-/// Sends the final round, with the guest paused: the pages `precopy` left
-/// pending and every page written since.
+/// Sends the final round, with the guest paused: with `disk`, the final
+/// disk round, the blocks written since the last one; then the pages
+/// `precopy` left pending and every page written since. The disk round is
+/// added to `precopy`'s.
 ///
 /// # Errors
 ///
-/// Errors when the tracker or the stream fails, or `stopping` returns
-/// true.
+/// Errors when the tracker, the disk or the stream fails, or `stopping`
+/// returns true.
 pub(crate) fn final_round<W: Write>(
     stream: &mut StreamWriter<W>,
     ram: &GuestRam,
     tracker: &Tracker<'_>,
+    disk: Option<&Mutex<VirtioBlk>>,
     precopy: &mut Precopy,
     stopping: &dyn Fn() -> bool,
 ) -> io::Result<RoundStats> {
+    if let Some(dev) = disk {
+        let last = send_disk(stream, dev, DirtySince::Round, true, stopping)?;
+        precopy.disk_rounds.push(last);
+    }
     let space = PageSpace::new(&regions_of(ram))?;
     let more = tracker.collect()?;
     let period = precopy.pending_since.elapsed();
@@ -405,9 +531,9 @@ mod tests {
         let mut stream = StreamWriter::new(&mut out);
         stream.write_doc("profile.json", b"{}").unwrap();
         let tracker = Tracker::new(src, fake);
-        let mut pre = precopy(&mut stream, src, &tracker, &policy, &|| false).unwrap();
+        let mut pre = precopy(&mut stream, src, &tracker, None, &policy, &|| false).unwrap();
         // The pause: the guest writes once more before it stops.
-        let last = final_round(&mut stream, src, &tracker, &mut pre, &|| false).unwrap();
+        let last = final_round(&mut stream, src, &tracker, None, &mut pre, &|| false).unwrap();
         tracker.stop();
         for name in ["cpu.json", "platform.json", "devices.json", "session.json"] {
             stream.write_doc(name, b"{}").unwrap();
@@ -428,9 +554,11 @@ mod tests {
         let dst = guest();
         let target = Arc::clone(&dst);
         let mut reader = StreamReader::new(io::BufReader::new(&out[..]));
-        receive(&mut reader, |_| {
-            Ok((PageSpace::new(&regions_of(&target))?, target))
-        })
+        receive(
+            &mut reader,
+            |_| Ok((PageSpace::new(&regions_of(&target))?, target)),
+            None,
+        )
         .unwrap();
         (pre, rounds, dst)
     }
@@ -518,9 +646,17 @@ mod tests {
         let mut stream = StreamWriter::new(&mut out);
         let tracker = Tracker::new(&src, &fake);
         stream.write_doc("profile.json", b"{}").unwrap();
-        let mut pre = precopy(&mut stream, &src, &tracker, &Policy::default(), &|| false).unwrap();
+        let mut pre = precopy(
+            &mut stream,
+            &src,
+            &tracker,
+            None,
+            &Policy::default(),
+            &|| false,
+        )
+        .unwrap();
         src.write(BASE + 77 * PAGE_SIZE + 5, b"device").unwrap();
-        let last = final_round(&mut stream, &src, &tracker, &mut pre, &|| false).unwrap();
+        let last = final_round(&mut stream, &src, &tracker, None, &mut pre, &|| false).unwrap();
         assert_eq!(last.pages, 1);
         assert_eq!(last.data_pages, 1);
     }
@@ -531,9 +667,16 @@ mod tests {
         let fake = FakeGuest::new(&src, 0);
         let mut stream = StreamWriter::new(Vec::new());
         let tracker = Tracker::new(&src, &fake);
-        let err = precopy(&mut stream, &src, &tracker, &Policy::default(), &|| true)
-            .err()
-            .expect("stopped");
+        let err = precopy(
+            &mut stream,
+            &src,
+            &tracker,
+            None,
+            &Policy::default(),
+            &|| true,
+        )
+        .err()
+        .expect("stopped");
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
     }
 
