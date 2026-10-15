@@ -199,7 +199,9 @@ impl<'a> From<&'a BootConfig> for IoConfig<'a> {
 /// Starts what runs beside a KVM backend's vCPUs, in the order its seccomp
 /// confinement needs.
 ///
-/// The plugin attaches to the guest before anything runs. The filters are armed
+/// A confined run first keeps glibc's malloc to one arena (see
+/// [`seccomp::one_malloc_arena`]). The plugin attaches to the guest before
+/// anything runs. The filters are armed
 /// before the first I/O or vCPU thread exists. The agent socket, the control
 /// socket and the stop source's socket pair are created before any filter goes
 /// in, since the allowlists allow accepting on a listener already held but not
@@ -209,8 +211,9 @@ impl<'a> From<&'a BootConfig> for IoConfig<'a> {
 ///
 /// # Errors
 ///
-/// Errors if the plugin refuses the guest, a filter does not compile, a socket
-/// cannot be bound or the stop source cannot be created.
+/// Errors if glibc refuses the one-arena setting, the plugin refuses the
+/// guest, a filter does not compile, a socket cannot be bound or the stop
+/// source cannot be created.
 pub(crate) fn start_io_threads(
     cfg: &IoConfig<'_>,
     guest: &Arc<Guest<Kicker>>,
@@ -219,6 +222,13 @@ pub(crate) fn start_io_threads(
     profile: Arc<ProfileCell>,
     console: Console,
 ) -> Result<(seccomp::Filters, IoThreads), Box<dyn std::error::Error>> {
+    // Before `attach`, which may start a thread. The `hvi` binary has set this
+    // already. For an embedder that has not, it is a partial fallback: arenas
+    // its own threads made stay in use, and glibc ignores the setting once it
+    // has fixed its arena limit. So the embedder must call it first in `main`.
+    if cfg.sandbox {
+        seccomp::one_malloc_arena()?;
+    }
     if let Some(plugin) = &cfg.plugin {
         plugin.attach(Arc::clone(guest) as Arc<dyn VmHandle>)?;
     }
