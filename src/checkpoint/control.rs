@@ -317,6 +317,14 @@ pub struct MigrateStats {
     pub precopy_end_unix_ms: u64,
     /// When the manifest was written.
     pub sealed_at_unix_ms: u64,
+    /// For a fenced VM's state sent again: the SHA-256 of the manifest of
+    /// the stream that fenced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_manifest_sha256: Option<String>,
+    /// For a fenced VM's state sent again: the components whose size and
+    /// SHA-256 equal the first stream's, in stream order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_as_first: Option<Vec<String>>,
 }
 
 /// What `disk-dirty` reports.
