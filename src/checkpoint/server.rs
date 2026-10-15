@@ -91,10 +91,11 @@ use crate::sync::lock_or_recover;
 use crate::teardown::{PauseGate, StopToken, Writable};
 use crate::LOG_PREFIX;
 
-/// How long a pause waits for the I/O threads and the vCPUs together, and how
-/// long `profile` waits for the profile to be complete. No request waits
-/// longer, so a client that allows a little more than this for a reply never
-/// gives up on a pause that later succeeds.
+/// How long a `pause` waits for the vCPUs to park once the I/O threads are
+/// held, how long a `checkpoint` then waits for their state, and how long
+/// `profile` waits for the profile to be complete. A `pause` waits up to
+/// [`MIGRATE_PARK_TIMEOUT`] for the I/O threads first, so a client allows a
+/// little more than the two together for its reply.
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a `migrate` waits for its reader to take a byte, with the guest
@@ -109,7 +110,8 @@ const STREAM_STALL: Duration = Duration::from_secs(30);
 const STREAM_PAUSED_FLOOR: Duration = Duration::from_secs(10);
 
 /// How long a `migrate` waits for the I/O threads and the vCPUs to stop,
-/// and then again for the vCPUs' state.
+/// and then again for the vCPUs' state, and how long a `pause` waits for
+/// the I/O threads.
 ///
 /// A vCPU parks only between guest entries, and an exit it is serving runs
 /// to its end first: a virtio-blk flush is an `fdatasync` on the vCPU's
@@ -989,7 +991,9 @@ impl<K: Kick> Machine<'_, K> {
                 return Response::Error(e);
             }
         }
-        let exported = match self.export(started + self.timeout) {
+        // From the park on, as the gate's wait may have taken longer than
+        // the control timeout.
+        let exported = match self.export(Instant::now() + self.timeout) {
             Ok(exported) => exported,
             Err(e) => {
                 self.back_to(found);
@@ -1156,7 +1160,7 @@ impl<K: Kick> Machine<'_, K> {
         let paused_at = Instant::now();
         let last_round = precopy.last_round_time();
         let times = if found == VmState::Running {
-            match self.pause_within(self.stream.park) {
+            match self.pause_within(self.stream.park, None) {
                 Ok(times) => times,
                 Err(refusal) => {
                     tracker.stop();
@@ -1619,17 +1623,25 @@ impl<K: Kick> Machine<'_, K> {
         }
     }
 
-    /// Holds the I/O threads, then parks the vCPUs, within one deadline for
-    /// both. Pausing a paused VM succeeds and changes nothing.
+    /// Holds the I/O threads, waiting as long as a `migrate` does for them,
+    /// then parks the vCPUs within the control timeout. Pausing a paused VM
+    /// succeeds and changes nothing.
+    ///
+    /// The vCPUs run on while the gate waits for the I/O threads, the
+    /// virtio-blk worker's request in flight among them, so the longer
+    /// wait costs the guest nothing. Under a disk hog that request was a
+    /// flush whose `fdatasync` took over 2 s, and a `pause` with the 2 s
+    /// bound failed where a `migrate` went ahead.
     fn pause(&mut self) -> Response {
-        match self.pause_within(self.timeout) {
+        match self.pause_within(self.stream.park, Some(self.timeout)) {
             Ok(_) => Response::State(self.state),
             Err(refusal) => refusal,
         }
     }
 
-    /// Holds the I/O threads, then parks the vCPUs, within `timeout` for
-    /// both, and returns how long each took. Pausing a paused VM succeeds
+    /// Holds the I/O threads within `gate`, then parks the vCPUs within
+    /// `vcpus`, or within what the gate left of `gate` when `vcpus` is
+    /// `None`, and returns how long each took. Pausing a paused VM succeeds
     /// and changes nothing.
     ///
     /// # Errors
@@ -1638,7 +1650,11 @@ impl<K: Kick> Machine<'_, K> {
     /// holds the vCPUs, or they did not all stop in time; the VM then runs
     /// on, and the refusal says how long the wait took and how much of it
     /// the I/O threads had.
-    fn pause_within(&mut self, timeout: Duration) -> Result<PauseTimes, Response> {
+    fn pause_within(
+        &mut self,
+        gate: Duration,
+        vcpus: Option<Duration>,
+    ) -> Result<PauseTimes, Response> {
         match self.state {
             VmState::Paused | VmState::RestoredPaused | VmState::Fenced => {
                 return Ok(PauseTimes::default())
@@ -1647,8 +1663,8 @@ impl<K: Kick> Machine<'_, K> {
             VmState::Running => {}
         }
         let started = Instant::now();
-        let deadline = started + timeout;
-        if let Err(inside) = self.gate.pause(timeout) {
+        let deadline = started + gate;
+        if let Err(inside) = self.gate.pause(gate) {
             // The gate gives up on the stop as well as at its deadline.
             if !self.vcpus.is_running() {
                 self.state = VmState::Stopping;
@@ -1656,13 +1672,13 @@ impl<K: Kick> Machine<'_, K> {
             }
             return Err(refuse(
                 ErrorCode::Timeout,
-                format!("{inside} I/O thread(s) still busy after {timeout:?}; the VM runs on"),
+                format!("{inside} I/O thread(s) still busy after {gate:?}; the VM runs on"),
             ));
         }
         let gate_ms = started.elapsed().as_millis() as u64;
-        // The vCPUs get what the gate left of the deadline, so the reply comes
-        // within the one deadline the client is told about.
-        let left = deadline.saturating_duration_since(Instant::now());
+        // A `migrate`'s vCPUs get what the gate left of its deadline; a
+        // `pause`'s get the control timeout of their own.
+        let left = vcpus.unwrap_or_else(|| deadline.saturating_duration_since(Instant::now()));
         let parking = Instant::now();
         match self.vcpus.pause_from_control(left) {
             Ok(_) => {
@@ -2305,19 +2321,32 @@ mod tests {
     }
 
     // An I/O thread that stays inside the gate fails the pause before any
-    // vCPU is asked to park, and the gate opens again.
+    // vCPU is asked to park, and the gate opens again. The gate waits a
+    // migrate's bound for it, not the control timeout.
     #[test]
     fn a_busy_io_thread_times_the_pause_out_with_the_vcpus_running() {
-        let mut f = Fixture::new("gate", 1, 0);
+        let mut f = Fixture::with(
+            "gate",
+            Spec {
+                parking: 1,
+                stream: StreamLimits {
+                    park: Duration::from_millis(600),
+                    ..StreamLimits::default()
+                },
+                ..Spec::default()
+            },
+        );
         let token = f.source.token();
         let inside = token.enter();
+        let asked = Instant::now();
         let reply = f.ask(r#"{"v":1,"op":"pause"}"#);
         assert!(
             reply.starts_with(
-                r#"{"v":1,"ok":false,"code":"timeout","error":"1 I/O thread(s) still busy"#
+                r#"{"v":1,"ok":false,"code":"timeout","error":"1 I/O thread(s) still busy after 600ms"#
             ),
             "{reply}"
         );
+        assert!(asked.elapsed() >= Duration::from_millis(600));
         assert!(!f.source.gate().is_paused(), "the gate stayed closed");
         assert_eq!(f.vcpus.parked(), 0);
         drop(inside);
@@ -2325,6 +2354,58 @@ mod tests {
             f.ask(r#"{"v":1,"op":"status"}"#),
             r#"{"v":1,"ok":true,"state":"running","vcpus":1,"vcpus_parked":0}"#
         );
+    }
+
+    // A pause waits for an I/O thread busy for longer than the control
+    // timeout, as a migrate does, with the vCPUs running meanwhile, and
+    // then parks them.
+    #[test]
+    fn a_pause_waits_for_a_busy_io_thread_as_long_as_a_migrate() {
+        let mut f = Fixture::with(
+            "gate-wait",
+            Spec {
+                parking: 2,
+                stream: StreamLimits {
+                    park: Duration::from_secs(5),
+                    ..StreamLimits::default()
+                },
+                ..Spec::default()
+            },
+        );
+        let token = f.source.token();
+        let (vcpus, held) = (Arc::clone(&f.vcpus), Duration::from_millis(600));
+        let (entered, inside_now) = std::sync::mpsc::channel();
+        let leaves = std::thread::spawn(move || {
+            let inside = token.enter();
+            entered.send(()).unwrap();
+            let until = Instant::now() + held;
+            let mut parked = 0;
+            while Instant::now() < until {
+                parked = parked.max(vcpus.parked());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(inside);
+            parked
+        });
+        inside_now.recv().unwrap();
+        let asked = Instant::now();
+        // The fixture's control timeout is 200 ms.
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"pause"}"#),
+            r#"{"v":1,"ok":true,"state":"paused"}"#
+        );
+        assert!(asked.elapsed() >= held, "{:?}", asked.elapsed());
+        assert_eq!(
+            leaves.join().unwrap(),
+            0,
+            "a vCPU parked while the gate waited"
+        );
+        assert_eq!(f.vcpus.parked(), 2);
+        assert_eq!(
+            f.ask(r#"{"v":1,"op":"resume"}"#),
+            r#"{"v":1,"ok":true,"state":"running"}"#
+        );
+        f.assert_running();
     }
 
     // A plugin's pause and the socket's are kept out of each other: the socket

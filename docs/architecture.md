@@ -489,8 +489,9 @@ holds the gate from taking a chain to returning it, its disk call included,
 so the pause waits for at most one request, with the vCPUs still running,
 and finds no chain half-served. It then calls
 `Vcpus::pause_from_control`, which waits for every started vCPU, since its
-caller parks none. The two waits share one 2 s deadline, and a pause that misses
-it is undone and the VM runs on. The agent bridge and the network relays read
+caller parks none. A `pause` waits up to 10 s for the gate and then 2 s for
+the vCPUs; a `migrate`'s two waits share one 10 s deadline. A pause that misses
+its bound is undone and the VM runs on. The agent bridge and the network relays read
 their non-blocking sockets inside the gate, so what they have read is in a
 device by the time a pause completes. Two pieces of input can still be off the
 host and not yet in a device: the start of a gateway frame whose rest has not
