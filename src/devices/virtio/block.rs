@@ -496,16 +496,22 @@ impl VirtioBlk {
     }
 
     /// Opens `path` as [`open`](Self::open) does, for a boot that was given
-    /// the digest of the disk's base image when `has_base`.
+    /// the digest of the disk's base image when `has_base`. `written`, when
+    /// given, is the bitmap of the blocks where the disk already differs
+    /// from that base, which start the blocks written since boot.
     ///
     /// # Errors
     ///
     /// Errors as [`open`](Self::open) does, and when `has_base` and the disk
     /// is larger than [`MAX_BITMAP_DISK_BYTES`]: a checkpoint could not
     /// record the blocks it wrote since boot, which a move by its blocks
-    /// needs.
-    pub fn open_with_base(path: &str, has_base: bool) -> std::io::Result<Self> {
-        let dev = Self::open(path)?;
+    /// needs. Errors too when `written` is not the bitmap of this disk.
+    pub fn open_with_base(
+        path: &str,
+        has_base: bool,
+        written: Option<&[u8]>,
+    ) -> std::io::Result<Self> {
+        let mut dev = Self::open(path)?;
         if has_base && dev.size_bytes() > MAX_BITMAP_DISK_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -515,6 +521,12 @@ impl VirtioBlk {
                     dev.size_bytes()
                 ),
             ));
+        }
+        if let Some(bits) = written {
+            dev.dirty.since_boot = DirtyBlocks::from_bytes(bits.to_vec(), dev.size_bytes())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("--disk-written for {path}: {e}"))
+                })?;
         }
         Ok(dev)
     }
@@ -2203,14 +2215,39 @@ mod dirty_tests {
             f.set_len(len).unwrap();
         };
         sized(MAX_BITMAP_DISK_BYTES);
-        let blk = VirtioBlk::open_with_base(&path, true).unwrap();
+        let blk = VirtioBlk::open_with_base(&path, true, None).unwrap();
         assert_eq!(blk.dirty_since_boot().blocks(), 1 << 26);
         drop(blk);
         sized(MAX_BITMAP_DISK_BYTES + DIRTY_BLOCK_BYTES);
-        let err = VirtioBlk::open_with_base(&path, true).err().unwrap();
+        let err = VirtioBlk::open_with_base(&path, true, None).err().unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("at most 4 TiB"), "{err}");
-        assert!(VirtioBlk::open_with_base(&path, false).is_ok());
+        assert!(VirtioBlk::open_with_base(&path, false, None).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A launcher that wrote files into its copy of the base before the boot
+    // names the blocks it changed, and round 0 holds them with the guest's
+    // own writes; a bitmap of another disk's size is refused.
+    #[test]
+    fn the_blocks_written_before_the_boot_start_round_0() {
+        let path = std::env::temp_dir().join(format!("hvi-blk-written-{}.img", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        std::fs::write(&path, vec![0u8; (20 * DIRTY_BLOCK_BYTES + 512) as usize]).unwrap();
+        let mut written = DirtyBlocks::for_size(20 * DIRTY_BLOCK_BYTES + 512);
+        written.mark(3 * DIRTY_BLOCK_BYTES, 1);
+        written.mark(20 * DIRTY_BLOCK_BYTES, 1);
+        let mut blk = VirtioBlk::open_with_base(&path, true, Some(written.as_bytes())).unwrap();
+        blk.write_for_test(7 * DIRTY_BLOCK_BYTES, &[1; 16]);
+        let round0 = blk.read_dirty(DirtySince::Boot).unwrap();
+        assert_eq!(round0.dirty.iter().collect::<Vec<_>>(), [3, 7, 20]);
+        drop(blk);
+        for bad in [vec![0u8; 2], vec![0u8; 4], vec![0, 0, 0x40]] {
+            let err = VirtioBlk::open_with_base(&path, true, Some(&bad))
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("--disk-written"), "{err}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
