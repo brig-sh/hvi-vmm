@@ -205,11 +205,23 @@ impl Capture {
     ///
     /// Errors when the sync fails.
     pub(crate) fn disk_state(&self, profile: &MachineProfile) -> io::Result<Option<DiskState>> {
-        self.disk_state_timed(profile).map(|(disk, _)| disk)
+        self.disk_state_timed(profile, true).map(|(disk, _)| disk)
     }
 
-    /// As [`disk_state`](Self::disk_state), and returns how long the sync
-    /// took, which a move reports: it runs with the guest paused.
+    /// As [`disk_state`](Self::disk_state), syncing the disk only when
+    /// `sync` says to, and returns how long the sync took, which a move
+    /// reports: it runs with the guest paused. `synced` in the state says
+    /// whether it ran.
+    ///
+    /// A move whose stream carries the disk rounds leaves the sync out: the
+    /// destination has every block the guest wrote, and syncs its own copy
+    /// before the guest runs there. If the move fails before the seal and
+    /// the guest runs on here, the guest's own flushes, every one of which
+    /// the device served with a sync, are what its durability rests on, as
+    /// on any running guest. A mover that takes the guest back after the
+    /// seal restores its spool of the stream onto this file, and the
+    /// rounds rewrite every block written since the boot and are synced
+    /// first, so the file's unsynced writes are not what it runs on.
     ///
     /// # Errors
     ///
@@ -217,14 +229,17 @@ impl Capture {
     pub(crate) fn disk_state_timed(
         &self,
         profile: &MachineProfile,
+        sync: bool,
     ) -> io::Result<(Option<DiskState>, std::time::Duration)> {
         let Some((dev, path)) = &self.block else {
             return Ok((None, std::time::Duration::ZERO));
         };
         let dev = lock_or_recover(dev);
         let started = std::time::Instant::now();
-        dev.sync_data()
-            .map_err(|e| io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
+        if sync {
+            dev.sync_data()
+                .map_err(|e| io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
+        }
         let synced = started.elapsed();
         // A disk over 4 TiB has no base (its boot refuses one), and its
         // bitmap would not fit disk.json: it goes without, as before the
@@ -238,7 +253,7 @@ impl Capture {
                 size_bytes: dev.size_bytes(),
                 sha256_sparse: None,
                 generation: dev.generation(),
-                synced: true,
+                synced: sync,
                 base_sha256: profile.disk_base_sha256.clone(),
                 block_size: since_boot.is_some().then_some(DIRTY_BLOCK_BYTES),
                 dirty_since_boot_b64: since_boot,
