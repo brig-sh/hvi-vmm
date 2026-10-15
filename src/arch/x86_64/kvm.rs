@@ -58,7 +58,7 @@ use crate::arch::x86_64::loader::LoadedKernel;
 use crate::arch::x86_64::{mptable, MAX_VCPUS};
 use crate::checkpoint::capture::Console;
 use crate::checkpoint::profile::{
-    device, hex, sha256_hex, MachineProfile, ProfileCell, X86Platform, UNKNOWN,
+    device, hex, sha256_hex, MachineProfile, ProfileCell, UNKNOWN, X86Platform,
 };
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};

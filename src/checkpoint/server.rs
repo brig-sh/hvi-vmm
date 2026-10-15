@@ -48,8 +48,8 @@
 //! `checkpoint`'s does, and the client reads the failure as a reply line
 //! where a frame header was due. `then: "fence"` fences the VM once the
 //! manifest is written to the connection, which is before the client has
-//! read it; a fenced VM can therefore be streamed again, unchanged, by a
-//! client whose stream did not arrive.
+//! read it. A fenced VM is never streamed again: the fence released its
+//! disk, and the destination may already run it.
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -639,12 +639,16 @@ impl<K: Kick> Machine<'_, K> {
         if !self.vcpus.is_running() {
             self.state = VmState::Stopping;
         }
-        // A fenced VM streams again: it has not run since the stream that
-        // fenced it, so the new stream is the same machine, and a caller
-        // whose first stream never arrived can send it once more. It stays
-        // fenced.
-        if self.state == VmState::Stopping {
-            return refuse(ErrorCode::Stopped, "the run is ending");
+        match self.state {
+            // The fence released the disk, and the destination may run by
+            // now. A second stream would hand out another copy that can
+            // resume, so a fenced VM is refused here as `checkpoint` refuses
+            // it.
+            VmState::Fenced => {
+                return refuse(ErrorCode::Fenced, "the VM was fenced after a checkpoint")
+            }
+            VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
+            VmState::Running | VmState::Paused | VmState::RestoredPaused => {}
         }
         let Some(capture) = self.capture.clone() else {
             return refuse(ErrorCode::Refused, "this run cannot be captured");
@@ -1030,10 +1034,10 @@ mod tests {
     use super::*;
     use crate::checkpoint::bundle::Component;
     use crate::checkpoint::cpu::Work;
-    use crate::config::Stop;
-    use crate::hypervisor::vcpus::Outcome;
     use crate::memory::GuestRam;
     use crate::plugin::{GuestArch, RegsView};
+    use crate::config::Stop;
+    use crate::hypervisor::vcpus::Outcome;
     use crate::run::StopHandle;
     use crate::teardown::StopSource;
     use std::io::BufRead;
@@ -2424,9 +2428,10 @@ mod tests {
         assert_eq!(reply(line.trim_end())["state"], "running", "{line}");
     }
 
-    // A fenced VM streams again, the same machine, and stays fenced.
+    // A fenced VM is not streamed again, whatever the second request asks:
+    // the first destination may run it already.
     #[test]
-    fn a_fenced_vm_streams_again_unchanged() {
+    fn a_fenced_vm_refuses_a_second_stream() {
         let mut f = Fixture::with(
             "mig-again",
             Spec {
@@ -2438,16 +2443,16 @@ mod tests {
         );
         let (first, r) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence"}"#);
         assert_eq!(r["state"], "fenced", "{r}");
-        let (again, r2) = f.migrate(r#"{"v":1,"op":"migrate","then":"continue"}"#);
-        assert_eq!(r2["state"], "fenced", "{r2}");
-        let ((a, ram_a), (b, ram_b)) = (first.unwrap(), again.unwrap());
-        for name in ["cpu.json", "platform.json", "devices.json"] {
-            assert_eq!(a.doc(name), b.doc(name), "{name}");
+        assert!(first.is_ok(), "the first stream was sealed");
+        for then in ["fence", "continue"] {
+            let (again, _) = f.migrate(&format!(
+                r#"{{"v":1,"op":"migrate","then":"{then}","txid":"other","epoch":9}}"#
+            ));
+            let err = again.err().expect("a second stream was sent").to_string();
+            assert!(err.contains("the source ended the stream: fenced:"), "{err}");
         }
-        let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
-        ram_a.read(GPA, &mut x).unwrap();
-        ram_b.read(GPA, &mut y).unwrap();
-        assert!(x == y, "the same RAM");
+        let status = reply(&f.ask(r#"{"v":1,"op":"status"}"#));
+        assert_eq!(status["state"], "fenced", "{status}");
         assert_eq!(reply(&f.ask(r#"{"v":1,"op":"resume"}"#))["code"], "fenced");
     }
 

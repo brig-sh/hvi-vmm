@@ -468,8 +468,7 @@ impl std::error::Error for BootError {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        check_export_overlap, BootConfig, BootError, CachePolicy, FsShare, MachineProfileKind,
-        ShareMode,
+        check_export_overlap, BootConfig, BootError, CachePolicy, FsShare, MachineProfileKind, ShareMode,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};

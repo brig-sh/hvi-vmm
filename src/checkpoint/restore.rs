@@ -1341,11 +1341,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_steps_run_in_order_with_a_barrier_between_each() {
-        let vcpus = Arc::new(Vcpus::new(
-            3,
-            NoKick,
-            crate::run::StopHandle::new_pair().unwrap().0,
-        ));
+        let vcpus = Arc::new(Vcpus::new(3, NoKick, crate::run::StopHandle::new_pair().unwrap().0));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let threads: Vec<_> = (0..2)
@@ -1365,11 +1361,7 @@ pub(crate) mod tests {
     fn the_controller_waits_for_every_vcpu_to_exist() {
         // vCPUs 2 and 3 were off. Their threads create them in turn after
         // vCPU 1's, and nothing else orders them before the import.
-        let vcpus = Arc::new(Vcpus::new(
-            4,
-            NoKick,
-            crate::run::StopHandle::new_pair().unwrap().0,
-        ));
+        let vcpus = Arc::new(Vcpus::new(4, NoKick, crate::run::StopHandle::new_pair().unwrap().0));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let threads: Vec<_> = (0..2)
@@ -1413,11 +1405,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_step_that_fails_ends_the_import_naming_the_vcpu() {
-        let vcpus = Arc::new(Vcpus::new(
-            2,
-            NoKick,
-            crate::run::StopHandle::new_pair().unwrap().0,
-        ));
+        let vcpus = Arc::new(Vcpus::new(2, NoKick, crate::run::StopHandle::new_pair().unwrap().0));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let threads = [
@@ -1434,11 +1422,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_vcpu_that_never_starts_times_the_import_out() {
-        let vcpus = Arc::new(Vcpus::new(
-            2,
-            NoKick,
-            crate::run::StopHandle::new_pair().unwrap().0,
-        ));
+        let vcpus = Arc::new(Vcpus::new(2, NoKick, crate::run::StopHandle::new_pair().unwrap().0));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let thread = importing_vcpu(&vcpus, 0, &log, None);

@@ -87,8 +87,8 @@ use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Emitter;
 use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
-    kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, IoConfig, Kicker,
-    KvmIrqLine,
+    kick_handle, run_guest, run_vcpu, start_io_threads, IoConfig, Kicker, KvmIrqLine,
+    unhandled_exit,
 };
 use crate::hypervisor::kvm_dirty::KvmWriteLog;
 use crate::hypervisor::vcpus::{Outcome, Vcpus};
@@ -1279,16 +1279,12 @@ pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + S
 /// allowlist has `prctl`, so it confines itself rather than at its start.
 fn spawn_timer(io_threads: &mut IoThreads<Kicker>, device: &Arc<HviTime>) {
     let timer = Arc::clone(device);
-    io_threads.spawn_with(
-        "hvi-time timer",
-        || {},
-        move |_| {
-            let how = hvitime::timer_thread_setup();
-            seccomp::install_thread(seccomp::Thread::Vmm);
-            eprintln!("{LOG_PREFIX} hvi-time: timer thread on {how}");
-            timer.run_timer();
-        },
-    );
+    io_threads.spawn_with("hvi-time timer", || {}, move |_| {
+        let how = hvitime::timer_thread_setup();
+        seccomp::install_thread(seccomp::Thread::Vmm);
+        eprintln!("{LOG_PREFIX} hvi-time: timer thread on {how}");
+        timer.run_timer();
+    });
     let timer = Arc::clone(device);
     io_threads.on_stop(move || timer.stop());
 }

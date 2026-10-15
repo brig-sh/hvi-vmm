@@ -40,10 +40,10 @@
 // clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
-use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
+use std::ops::ControlFlow;
 
 use applevisor::prelude::{
     ExitReason, FeatureReg, GicConfig, GicDisabled, GicEnabled, InterruptType, Reg, SysReg, Vcpu,
@@ -1351,10 +1351,7 @@ fn attach_hvitime(
 /// clear it: on the native machine the in-kernel GICv3's, with sizes from
 /// the framework so the devicetree matches `hv_gic`, and under the portable
 /// profile the software GICv2's, at QEMU virt's v2 addresses.
-fn gic_layout(
-    portable: bool,
-    num_cpus: u32,
-) -> Result<GicLayout, Box<dyn std::error::Error + Send + Sync>> {
+fn gic_layout(portable: bool, num_cpus: u32) -> Result<GicLayout, Box<dyn std::error::Error + Send + Sync>> {
     let gic = if portable {
         GicLayout::for_vcpus(GicVersion::V2, num_cpus)?
     } else {
@@ -1420,9 +1417,7 @@ fn create_vm(
 }
 
 /// Allocates `mem_bytes` of guest RAM and maps it at `RAM_BASE`.
-fn map_ram(
-    mem_bytes: u64,
-) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::error::Error + Send + Sync>> {
+fn map_ram(mem_bytes: u64) -> Result<(SharedRam, Arc<GuestRam>), Box<dyn std::error::Error + Send + Sync>> {
     // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
     // rather than allocated by applevisor, so an out-of-process plugin can
     // map the same pages. applevisor's memory_create uses hv_vm_allocate,
@@ -2010,8 +2005,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             // look at the guest, or the control socket captures it, doing
             // on this thread the work only it can.
             let mut read_platform = false;
-            sh.guest.pass_safepoint(&vcpu, cpu_id, plugin, |work| {
-                match (&sh.irqchip, &sh.hvitime) {
+            sh.guest.pass_safepoint(&vcpu, cpu_id, plugin, |work| match (&sh.irqchip, &sh.hvitime) {
                     (Irqchip::InKernel(vm_gic), _) => {
                         hvf_state::serve(cpu_id, &vcpu, vm_gic, clock, work)
                     }
@@ -2023,8 +2017,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                     (Irqchip::Soft(_), None) => {
                         Err(std::io::Error::other("the portable guest has no hvi-time"))
                     }
-                }
-            });
+                });
             // A capture froze hvi-time to read it. A guest that goes on
             // after it, as `then: "continue"` has it, gets its timers back.
             if read_platform {
