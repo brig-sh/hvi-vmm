@@ -2583,12 +2583,11 @@ mod tests {
                 ..Spec::default()
             },
         );
-        f.client
-            .write_all(b"{\"v\":1,\"op\":\"migrate\",\"then\":\"fence\"}\n")
-            .unwrap();
-        let mut first = String::new();
-        f.replies.read_line(&mut first).unwrap();
-        assert!(first.contains("profile.json"), "{first}");
+        // Past the profile and into round 0, so the tracking has started: a
+        // client that hung up after the profile's header alone could fail
+        // its body's write, which comes before the tracking.
+        f.read_stream_until(r#"{"v":1,"op":"migrate","then":"fence"}"#, "ram-round-0");
+        assert_eq!(log.starts.load(Ordering::SeqCst), 1);
         // Closed, not shut down: a macOS socket whose peer only shut its
         // reading side down takes the writes and drops them.
         let (spare, other) = UnixStream::pair().unwrap();
