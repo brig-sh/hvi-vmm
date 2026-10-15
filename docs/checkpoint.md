@@ -693,18 +693,24 @@ on that connection and, after its manifest, the reply line:
  "ram_raw_bytes":100995072,"ram_stream_bytes":36209327,"stream_bytes":36237937,
  "disk_rounds":[{"name":"disk-round-0","round":0,"in_pause":false,"blocks":5,"raw_bytes":327680,"bytes":5955,"ms":0,"generation":22,"max_lock_us":5},
                 {"name":"disk-round-final","round":1,"in_pause":true,"blocks":0,"raw_bytes":0,"bytes":0,"ms":0,"generation":22,"max_lock_us":0}],
- "disk_raw_bytes":327680,"disk_stream_bytes":5955,"disk_sync_ms":4,
+ "disk_raw_bytes":327680,"disk_stream_bytes":5955,"disk_sync_ms":4,"pause_sync_ms":1,
  "write_granule":16384,"write_faults":257,"write_fault_ns":2481,
- "precopy_end_unix_ms":1792036700123,"sealed_at_unix_ms":1792036700129}}
+ "rounds_end_unix_ms":1792036700119,"precopy_end_unix_ms":1792036700123,
+ "sealed_at_unix_ms":1792036700129}}
 ```
 
 `pause_ms` is the time from the pause to every vCPU parked with its state
 exported; `gate_ms` and `park_ms` are its first two parts, the I/O threads
 held and the vCPUs parked. `paused_ms` is the time from the pause to the
 manifest written: the source's part of the downtime. The rest is the
-transport and the destination's restore. `disk_sync_ms` is the sync of the
-disk just before the pause, with the guest still running, and
-`precopy_end_unix_ms` is taken after it, at the pause. A `migrate` needs no
+transport and the destination's restore. `rounds_end_unix_ms` is when the
+last round with the guest running ended. `disk_sync_ms` is the sync of the
+disk after it and just before the pause, with the guest still running,
+and `precopy_end_unix_ms` is taken after that sync, at the pause; it
+included the sync from the build that added the sync on, so a consumer
+that took it as the end of the rounds now reads the end of the sync.
+`pause_sync_ms` is the second sync, in the pause before disk.json, and
+is part of `paused_ms`. A `migrate` needs no
 `--checkpoint-root`, since it writes no file. It refuses, before the first
 frame and with the VM untouched, what a `checkpoint` refuses, and a backend
 that keeps no record of the guest's writes.
