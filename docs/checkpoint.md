@@ -835,9 +835,13 @@ fenced without both a `txid` and an `epoch`, is refused with `fenced`. `resume` 
 ### The stream format
 
 `checkpoint_format` 3 when the stream carries disk rounds, 2 when it does
-not (as before them, so an older reader still takes it): a sequence of
-frames, each one line of JSON then exactly `size` bytes whose SHA-256 is
-`sha256`:
+not, and the reader refuses a manifest that lists disk rounds under 2 or
+none under 3. The number only tells tooling that reads manifests whether
+to expect `disk`: an hvi from before the disk rounds does not restore
+either kind, since profile.json says format 3 and a restore refuses a
+profile of another format or from another hvi build. The stream is a
+sequence of frames, each one line of JSON then exactly `size` bytes whose
+SHA-256 is `sha256`:
 
 ```text
 {"component":"ram-round-0","size":1049352,"sha256":"5c2e..."}\n<1049352 bytes>
