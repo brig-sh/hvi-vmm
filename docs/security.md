@@ -26,7 +26,7 @@ Everything a hostile guest can touch, it touches through hvi:
 
 | Surface | Exposure |
 | --- | --- |
-| virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. |
+| virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. virtio-blk's descriptor chains are parsed on its worker thread, under the `vmm` filter. |
 | Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. |
 | virtio-blk backing file | Whatever `--disk` names. |
 | virtio-fs shares | The exported tree, read-only or read-write. |
@@ -104,7 +104,7 @@ thread as that thread's first act:
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
+| `vmm` | the thread that calls `boot`, the host-side I/O threads (the virtio-blk worker among them), the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
 | `control` | the control socket's thread, in a run started with `--checkpoint-root` | 57 syscalls | 64 syscalls |
 
 The stop-signal thread starts in the first run after a call to
