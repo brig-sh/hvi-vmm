@@ -861,20 +861,42 @@ the control socket and, in the final round, a paused guest:
   written while the vCPUs park.
 
 Either failure leaves the VM as the request found it, as any failure before
-the manifest does: running, and not fenced. The reply then waits at most
-2 s for room, and the connection is closed if it does not fit. A zero page in a later round is sent as a clear
-bit, and the destination zeroes it where an earlier round wrote it.
+the manifest does: running and not fenced, or fenced still for a stream
+sent again to the fence owner.
+
+Any failure once the stream has begun ends the connection: hvi gives
+the refusal line one write, so only as much of it as the socket has room
+for at once goes out, then shuts the connection down both ways and
+serves nothing more on it. A reader takes a line it cannot parse,
+followed by the end, as the end of a failed stream. A failure
+part way through a frame leaves the refusal inside that frame's bytes,
+where no reader can take it for a reply, and a reader that waited for
+one would wait until its own timeout. In one move under a disk hog,
+hull's relay waited out its 2 min idle bound after the paused part
+failed, most likely for this reason. The reader instead sees the
+end of the stream as soon as it has taken what is buffered, so a stalled
+reader that wakes after the paused budget gets the end at once. A
+refusal before the first frame, such as a fenced VM's or one with no
+record of the guest's writes, is a reply like any other, and the
+connection stays open for the next request.
+
+A zero page in a later round is sent as a clear bit, and the destination
+zeroes it where an earlier round wrote it.
 
 ### The fence of a live move
 
-A failure before the manifest leaves the VM as the request found it, and
-the client reads it as a reply line where the next frame header was due.
+A failure before the manifest leaves the VM as the request found it. The
+client may read it as a reply line where the next frame header was due,
+cut short if the socket lacked room for all of it, and then reads the
+end of the connection.
 `then: "fence"` fences once the manifest is written to the connection,
 which is before the client has read it, and releases the disk's lock at
 once, since the destination may open the disk as soon as it has the
-manifest. So a client that reads the end of the connection before the
+manifest. So a client that reads the end of a first stream before the
 manifest knows the source runs on, unfenced; one that has the manifest
-knows it is fenced.
+knows it is fenced. A stream sent again to the fence owner leaves the VM
+fenced however it ends. After any break a client can ask `status`, as
+hull does.
 
 The destination may run the guest as soon as it has the manifest, so a
 fenced VM is streamed again only for the move that fenced it. A `migrate`

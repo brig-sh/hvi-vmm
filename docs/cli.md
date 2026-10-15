@@ -177,7 +177,7 @@ hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>
 hvi: --disk-base-sha256 must be 64 lowercase hex digits, not "ABC"
-hvi: --disk-base-sha256 needs --disk, the disk it describes
+hvi: --disk-base-sha256 needs exactly one --disk, a writable one: a move carries one disk
 hvi: --disk-written needs --disk-base-sha256, the base it differs from
 hvi: unknown machine profile "portable"; expected native or portable-arm64-v1
 hvi: unknown boot arg "--nope"
@@ -221,7 +221,12 @@ batch header has none.
 for it. A `pause` replies within about 12 s, the I/O threads' 10 s and the
 vCPUs' 2 s, so give its client a reply timeout of at least 13 s. Apart from
 `pause`, `checkpoint`, `migrate` and `disk-blocks`, no reply takes longer than
-about 2 s, so give a client a reply timeout of at least 3 s. A `checkpoint`
+about 2 s once the server reads the request, so give a client a reply timeout
+of at least 3 s. The server serves one connection at a time, though, so a
+request on another connection waits until the one served is done: up to
+about 12 s behind a `pause`, and as long as a `checkpoint` or a `migrate`
+takes behind those. A client that may meet another client's `pause`, a
+`status` or `resume` after a break among them, gives itself 13 s. A `checkpoint`
 pauses as `pause` does, then waits up to 2 s for the vCPUs' state, and replies
 once its bundle is written, which takes longer the more
 guest RAM is in use, and a `disk-blocks` once its last batch is out, which
@@ -232,7 +237,13 @@ ends, so a round under way, round 0 included, runs to its end however long it
 takes), then the paused part. So its client reads the frames and waits for
 the reply with no fixed timeout. hvi gives up on a client that takes nothing
 for 30 s, or that does not take the paused part within its budget, and the VM
-runs on (see [checkpoint.md](checkpoint.md#the-rounds)). A client that gives
+runs on (see [checkpoint.md](checkpoint.md#the-rounds)). A `migrate` that
+fails once its stream has begun closes the connection: the client may read the
+refusal where a frame header was due, cut short if the socket lacked room for
+it, so a line it cannot parse followed by the end is that refusal, and then
+reads the end. An end before the manifest means this stream did not fence the
+VM: a first stream leaves it running, and a stream sent again to the fence
+owner leaves it fenced. Ask `status` after any break. A client that gives
 up on a `pause` before its reply cannot
 tell whether the VM paused: it should reconnect and ask `status`, or send
 `resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
@@ -490,9 +501,10 @@ guest stopped: SystemOff
 
 ## vCPU limits
 
-hvi has three caps. The GICv2 one takes at most 8 vCPUs: on Linux/arm64 when the
-host offers only a vGICv2 or the boot asks for `--profile portable-arm64-v1`,
-and on macOS under that profile, whose software GICv2 addresses at most 8 CPUs:
+hvi has three caps. The GICv2 one takes at most 8 vCPUs: on Linux/arm64 when
+the host offers only a vGICv2 or the boot asks for `--profile
+portable-arm64-v1`, and on macOS under that profile, whose software GICv2
+addresses at most 8 CPUs:
 
 ```text
 this host offers only vGICv2, which supports at most 8 vCPUs (asked for 16)
@@ -512,9 +524,9 @@ each vCPU a one-byte APIC id and the IOAPIC the next one:
 x86-64 supports at most 254 vCPUs (asked for 300)
 ```
 
-macOS has no hvi-side cap. An over-large `--cpus` there spawns that many
-threads, and the run then fails with exit 1 and `hvi: vcpuN: vcpu_create
-failed`. The absence of a cap is not unlimited capacity.
+Outside that profile, macOS has no hvi-side cap. An over-large `--cpus` there
+spawns that many threads, and the run then fails with exit 1 and `hvi: vcpuN:
+vcpu_create failed`. The absence of a cap is not unlimited capacity.
 
 ## See also
 
