@@ -1069,13 +1069,13 @@ pub trait DiskTarget {
     /// Errors as the write does.
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()>;
 
-    /// Called once the final disk round is written, before the final RAM
-    /// round is read.
+    /// Called as each disk round ends, `in_pause` for the final one, which
+    /// is called before the final RAM round is read.
     ///
     /// # Errors
     ///
     /// Errors when the disk cannot keep what was written.
-    fn finished(&mut self) -> io::Result<()>;
+    fn round_end(&mut self, in_pause: bool) -> io::Result<()>;
 }
 
 /// What one disk round wrote, as [`receive`] applied it.
@@ -1503,10 +1503,8 @@ pub fn receive<R: BufRead>(
                 if disk_round_of(name).is_some() {
                     let sha256 = reader.sha256_of(name).unwrap_or_default();
                     disks.push(d.end(sha256));
-                    if name == DISK_FINAL {
-                        if let Some(target) = disk.as_deref_mut() {
-                            target.finished()?;
-                        }
+                    if let Some(target) = disk.as_deref_mut() {
+                        target.round_end(name == DISK_FINAL)?;
                     }
                 }
             }
@@ -2260,8 +2258,10 @@ mod tests {
             self.bytes[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
             Ok(())
         }
-        fn finished(&mut self) -> io::Result<()> {
-            self.finished += 1;
+        fn round_end(&mut self, in_pause: bool) -> io::Result<()> {
+            if in_pause {
+                self.finished += 1;
+            }
             Ok(())
         }
     }

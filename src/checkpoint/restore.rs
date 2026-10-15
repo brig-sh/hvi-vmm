@@ -313,8 +313,9 @@ struct StreamedDisk<'a> {
     file: Option<Arc<std::fs::File>>,
     /// Its lock, while the stream writes it.
     lock: Option<crate::devices::virtio::block::DiskLock>,
-    /// The sync of what the rounds wrote, started once the final round is
-    /// written so that it runs while the rest of the stream is read.
+    /// The sync of what the rounds wrote so far, started as each round
+    /// ends, so it runs while the rest of the stream is read and the final
+    /// one has little left.
     sync: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
@@ -328,9 +329,8 @@ impl<'a> StreamedDisk<'a> {
         }
     }
 
-    /// Waits for the sync the final round started, then lets go of the
-    /// lock.
-    fn close(&mut self) -> std::io::Result<()> {
+    /// Waits for the sync under way, if any.
+    fn join_sync(&mut self) -> std::io::Result<()> {
         if let Some(sync) = self.sync.take() {
             sync.join()
                 .map_err(|_| std::io::Error::other("the disk's sync panicked"))?
@@ -338,9 +338,21 @@ impl<'a> StreamedDisk<'a> {
                     std::io::Error::new(e.kind(), format!("--disk {}: sync: {e}", self.path))
                 })?;
         }
+        Ok(())
+    }
+
+    /// Waits for the sync the final round started, then lets go of the
+    /// lock.
+    ///
+    /// The guest's first flush after the move would otherwise write back
+    /// every block the rounds wrote, on its vCPU's thread, with the guest
+    /// stalled on it: a loaded Pi showed an RCU stall of that kind after a
+    /// streamed restore whose disk the mover had left unsynced.
+    fn close(&mut self) -> std::io::Result<()> {
+        let synced = self.join_sync();
         self.lock = None;
         self.file = None;
-        Ok(())
+        synced
     }
 }
 
@@ -389,7 +401,13 @@ impl stream::DiskTarget for StreamedDisk<'_> {
         file.write_all_at(bytes, offset)
     }
 
-    fn finished(&mut self) -> std::io::Result<()> {
+    fn round_end(&mut self, in_pause: bool) -> std::io::Result<()> {
+        // A running round's sync is started only when the last one is done,
+        // so they never pile up; the final round's always is, after it.
+        if self.sync.as_ref().is_some_and(|s| !s.is_finished()) && !in_pause {
+            return Ok(());
+        }
+        self.join_sync()?;
         if let Some(file) = &self.file {
             let file = Arc::clone(file);
             self.sync = Some(
