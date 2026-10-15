@@ -906,7 +906,7 @@ with the source's error.
 ```sh
 hvi restore --from-stream /run/sb1/stream.sock --stream-keep /var/lib/sb1/checkpoints/tx-43 \
     --control-sock /run/sb1/ctl-2.sock --checkpoint-root /var/lib/sb1/checkpoints \
-    --disk root.img --net-stub --agent-sock /run/sb1/agent-2.sock
+    --disk root.img --disk-base-sha256 9f2c...e1 --net-stub --agent-sock /run/sb1/agent-2.sock
 ```
 
 The restore connects to the socket (or reads stdin, with `-`) before it is
@@ -934,7 +934,14 @@ generation `disk.json` was captured at. Otherwise the restore is refused
 before anything runs. That is the check `--disk-generation` asks for of a
 directory, so a stream restore refuses that flag. A stream without disk
 rounds leaves `--disk` as it is: the mover copied the whole disk, or the
-restore reopens the source's on the same host. A streaming source
+restore reopens the source's on the same host. Such a stream is refused
+when its `disk.json` names a base image, since the guest's disk is then
+that base plus disk rounds the stream does not have. A mover that passes
+a copy of the base gives `--disk-base-sha256` with it: the restore then
+refuses, at `profile.json` and before a block is written, a stream whose
+source named another base or none, and at its end a stream that carried
+no disk rounds, either of which would leave the bare base as the guest's
+disk. A streaming source
 releases the disk's lock as it fences, which can land just after the
 restore read the manifest, so such a restore waits up to 2 s for the
 lock. `--stream-keep` writes the documents and the
@@ -1074,7 +1081,8 @@ and send most of them while the guest still runs.
 A live move does this itself: `migrate` sends the disk rounds in its
 stream, takes the final one in its pause, and the manifest covers their
 bytes (see [Live moves](#live-moves)); the destination passes its copy of
-the base as `--disk` to `hvi restore --from-stream`. The `disk-dirty` and
+the base as `--disk`, with its digest as `--disk-base-sha256`, to
+`hvi restore --from-stream`. The `disk-dirty` and
 `disk-blocks` ops below move the disk beside a bundle directory, and serve
 to look at a guest's writes; a mover of a live move needs neither.
 
