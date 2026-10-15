@@ -647,6 +647,11 @@ pub struct RestoreConfig {
     /// after that round, and the disk lacks the write. A stream checks its
     /// own disk rounds the same way.
     pub disk_generation: Option<u64>,
+    /// For a stream only: the SHA-256 of the base image `disk` is a copy
+    /// of. With it, the restore refuses a stream that is not of a guest
+    /// booted with that base, or that carried no disk rounds, either of
+    /// which would leave `disk` without the guest's writes.
+    pub disk_base_sha256: Option<String>,
     /// The built-in network stack, for a guest that ran on it.
     pub net: bool,
     /// The gateway stream socket, for a guest that ran on a gateway.
@@ -901,9 +906,9 @@ mod tests {
             checkpoint_root: None,
             plugin: None,
             sandbox: false,
-            stop: None,
             profile,
             arch_timer_irq,
+            stop: None,
         }
     }
 
