@@ -18,9 +18,11 @@
 //! The thread is one of the I/O threads. It polls its listener and its one
 //! connection beside the stop token, so the stop ends it like the others, and
 //! it never passes the pause gate itself, since it is the one that closes it.
-//! It serves one connection at a time, in order. A client that disconnects
-//! while the VM is paused leaves it paused: the next client resumes it, or
-//! stops it.
+//! It serves one connection at a time, in order, so a request on another
+//! connection waits until the one served is done: behind a `pause`, which
+//! can wait 10 s for the I/O threads, up to about 12 s. A client that
+//! disconnects while the VM is paused leaves it paused: the next client
+//! resumes it, or stops it.
 //!
 //! `pause` closes the I/O gate first and parks the vCPUs second, so no host
 //! thread writes guest RAM once the vCPUs are still. Either step that misses
@@ -45,10 +47,14 @@
 //! writes, so a slow reader holds it up and never the guest; the pause
 //! starts once the last round with the guest running has been written. A
 //! failure before the manifest leaves the VM as the request found it, as a
-//! `checkpoint`'s does, and the client reads the failure as a reply line
-//! where a frame header was due. `then: "fence"` fences the VM once the
-//! manifest is written to the connection, which is before the client has
-//! read it. The fence released its disk, and the destination may already
+//! `checkpoint`'s does. The client may read the failure as a reply line
+//! where a frame header was due, cut short if the socket lacked room for
+//! all of it, and then reads the end of the connection, which a failed
+//! stream always closes. An end before the manifest means this stream did
+//! not fence the VM: a first stream leaves it running, and a stream sent
+//! again to the fence owner leaves it fenced. `then: "fence"` fences the VM
+//! once the manifest is written to the connection, which is before the client
+//! has read it. The fence released its disk, and the destination may already
 //! run it, so a fenced VM is streamed again only for the move that fenced
 //! it, by its txid and epoch, and stays fenced: the mover that lost the
 //! stream after the seal recovers it so. Any other `migrate` of a fenced
@@ -129,6 +135,9 @@ struct StreamLimits {
     /// How long the pause waits for the vCPUs to park, and then for their
     /// state.
     park: Duration,
+    /// Whether the stream's writes fail once the guest is paused.
+    #[cfg(test)]
+    fail_in_pause: bool,
 }
 
 impl Default for StreamLimits {
@@ -137,6 +146,8 @@ impl Default for StreamLimits {
             stall: STREAM_STALL,
             paused_floor: STREAM_PAUSED_FLOOR,
             park: MIGRATE_PARK_TIMEOUT,
+            #[cfg(test)]
+            fail_in_pause: false,
         }
     }
 }
@@ -406,9 +417,28 @@ impl ControlSocket {
 }
 
 /// Serves requests on `conn` until the client closes it, a line is too long,
-/// or `stop` is requested.
+/// a stream fails or a reply cannot be written, or `stop` is requested, then
+/// closes it.
+///
+/// Whatever the client sent that was not read is read and dropped before the
+/// close. Linux resets the peer of a Unix socket closed with bytes left
+/// unread, so a client that had sent a line behind its `migrate` would read
+/// `ECONNRESET` where the end of the connection was due: after a failed
+/// stream, or after a reply it did not take in time.
 fn serve<K: Kick>(
     mut conn: UnixStream,
+    stop: &StopToken,
+    machine: &mut Machine<'_, K>,
+) -> std::io::Result<()> {
+    let served = serve_requests(&mut conn, stop, machine);
+    let _ = conn.shutdown(std::net::Shutdown::Both);
+    discard_unread(&mut conn);
+    served
+}
+
+/// Serves requests on `conn`, as [`serve`] does, and leaves the close to it.
+fn serve_requests<K: Kick>(
+    conn: &mut UnixStream,
     stop: &StopToken,
     machine: &mut Machine<'_, K>,
 ) -> std::io::Result<()> {
@@ -425,7 +455,7 @@ fn serve<K: Kick>(
         let n = match conn.read(&mut chunk) {
             // A client that half-closes after its last request without a
             // newline still means it.
-            Ok(0) => return answer(&mut conn, stop, machine, &pending),
+            Ok(0) => return answer(conn, stop, machine, &pending).map(|_| ()),
             Ok(n) => n,
             Err(e) if retry_read(&e) => continue,
             Err(e) => return Err(e),
@@ -433,17 +463,28 @@ fn serve<K: Kick>(
         pending.extend_from_slice(&chunk[..n]);
         while let Some(end) = pending.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
-            answer(&mut conn, stop, machine, &line[..end])?;
+            if answer(conn, stop, machine, &line[..end])? == Served::Closed {
+                return Ok(());
+            }
         }
         if pending.len() > MAX_LINE {
             let e = Error::new(
                 ErrorCode::TooLong,
                 format!("a request line is at most {MAX_LINE} bytes"),
             );
-            send(&mut conn, stop, &Response::Error(e))?;
+            send(conn, stop, &Response::Error(e))?;
             return Ok(());
         }
     }
+}
+
+/// Whether a connection stays open after a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Served {
+    /// The connection takes the next request.
+    Open,
+    /// The connection closes, after a stream that failed.
+    Closed,
 }
 
 /// Serves the request `line`, without its newline, and replies on `conn`.
@@ -458,22 +499,18 @@ fn answer<K: Kick>(
     stop: &StopToken,
     machine: &mut Machine<'_, K>,
     line: &[u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<Served> {
     let line = String::from_utf8_lossy(line);
     if line.trim().is_empty() {
-        return Ok(());
+        return Ok(Served::Open);
     }
     let (response, then) = match parse_request(&line) {
-        // The stream goes on this connection, ahead of the reply. Its reader
-        // may be the reason the stream failed, so the reply waits for it
-        // only as long as a pause would, and the connection is closed if
-        // the reply does not fit by then.
-        Ok(Request::Migrate(request)) => {
-            let response = machine.migrate(conn, stop, &request);
-            let none = Cell::new(None);
-            return SocketOut::new(conn, stop, machine.timeout, &none).send(&response);
+        Ok(Request::Migrate(request)) => return stream_and_reply(conn, stop, machine, &request),
+        Ok(Request::DiskBlocks(selection)) => {
+            return machine
+                .disk_blocks(conn, stop, selection)
+                .map(|()| Served::Open)
         }
-        Ok(Request::DiskBlocks(selection)) => return machine.disk_blocks(conn, stop, selection),
         Ok(request) => machine.handle(request),
         Err(e) => (Response::Error(e), None),
     };
@@ -481,7 +518,69 @@ fn answer<K: Kick>(
     if let Some(after) = then {
         after.run(machine.vcpus);
     }
-    sent
+    sent.map(|()| Served::Open)
+}
+
+/// Serves a `migrate` on `conn`: the stream, then its reply.
+///
+/// The reply to a stream that ends with its manifest waits for the reader
+/// only as long as a pause would, and the connection is closed if it does
+/// not fit by then. A refusal before the first byte of the stream is a
+/// reply like any other, and the connection stays open.
+///
+/// A stream that failed once it had begun is cut off: the refusal gets one
+/// write, so only what the socket has room for at once goes out and the
+/// line may be cut short, and the connection is shut down both ways. The reader
+/// may be why the stream failed, and a failure part way through a frame leaves
+/// the refusal inside that frame's bytes, where no reader can take it for a
+/// reply. So the reader learns of the failure from the end of the stream, which
+/// it sees as soon as it has taken what is buffered, rather than from a reply
+/// it may wait for until its own timeout. An end before the manifest means this
+/// stream did not fence the VM; a stream sent again to the fence owner leaves
+/// it fenced.
+fn stream_and_reply<K: Kick>(
+    conn: &mut UnixStream,
+    stop: &StopToken,
+    machine: &mut Machine<'_, K>,
+    request: &Migrate,
+) -> std::io::Result<Served> {
+    let deadline = Cell::new(None);
+    let mut out = SocketOut::new(conn, stop, machine.stream.stall, &deadline);
+    #[cfg(test)]
+    {
+        out.fail_in_pause = machine.stream.fail_in_pause;
+    }
+    let response = machine.migrate(&mut out, request);
+    if out.written == 0 || !matches!(response, Response::Error(_)) {
+        out.stall = machine.timeout;
+        deadline.set(None);
+        return out.send(&response).map(|()| Served::Open);
+    }
+    let line = format_response(&response) + "\n";
+    match out.conn.write(line.as_bytes()) {
+        Ok(_) => {}
+        Err(e) if retry_read(&e) => {}
+        Err(e) => eprintln!("{LOG_PREFIX} control socket: the refusal after a stream: {e}"),
+    }
+    Ok(Served::Closed)
+}
+
+/// Reads and drops what the client sent that was not read, without
+/// waiting, on a connection shut down both ways.
+///
+/// The shutdown already refuses the client's further writes, so what is
+/// queued now is all there is. macOS drops it at the shutdown.
+fn discard_unread(conn: &mut UnixStream) {
+    let mut sink = [0u8; 4096];
+    // A bound, should the queue somehow refill.
+    for _ in 0..1024 {
+        match conn.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Writes `response` and its newline to `conn`, waiting for room beside the
@@ -521,6 +620,12 @@ struct SocketOut<'a> {
     /// When every write fails, however the reader keeps up. The server sets
     /// it at the pause, while the stream holds this writer.
     deadline: &'a Cell<Option<Instant>>,
+    /// The bytes the reader was given.
+    written: u64,
+    /// Whether a write once the pause's deadline is set fails, as a test's
+    /// write error.
+    #[cfg(test)]
+    fail_in_pause: bool,
 }
 
 impl<'a> SocketOut<'a> {
@@ -536,6 +641,9 @@ impl<'a> SocketOut<'a> {
             stop,
             stall,
             deadline,
+            written: 0,
+            #[cfg(test)]
+            fail_in_pause: false,
         }
     }
 
@@ -547,6 +655,12 @@ impl<'a> SocketOut<'a> {
 
 impl Write for SocketOut<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if self.fail_in_pause && self.deadline.get().is_some() {
+            return Err(std::io::Error::other(
+                "a test failed the write in the pause",
+            ));
+        }
         // The stall counts from this call, so the time the stream spends
         // reading and compressing RAM between writes is not the reader's.
         let stalled_at = Instant::now() + self.stall;
@@ -556,7 +670,10 @@ impl Write for SocketOut<'_> {
             .map_or(stalled_at, |d| d.min(stalled_at));
         loop {
             match self.conn.write(buf) {
-                Ok(n) => return Ok(n),
+                Ok(n) => {
+                    self.written += n as u64;
+                    return Ok(n);
+                }
                 Err(e) if retry_read(&e) => {
                     match self.stop.wait_writable_until(self.conn.as_fd(), until)? {
                         Writable::Ready => {}
@@ -616,6 +733,8 @@ impl After {
                 // The loop that owns the run's stop wakes on the request, and
                 // the run ends as `Stop::Requested`. The VM stops here at once
                 // as well, so a pause this socket holds ends with the reply.
+                // The request comes first, so whoever finds the VM stopped
+                // also finds it requested, and not a `Stop::SystemOff`.
                 vcpus.stop_handle().request_stop();
                 vcpus.stop();
             }
@@ -991,7 +1110,7 @@ impl<K: Kick> Machine<'_, K> {
     /// failure from the first frame to the manifest returns the VM to where
     /// the request found it, and stops the tracking of its writes.
     #[allow(clippy::too_many_lines)]
-    fn migrate(&mut self, conn: &mut UnixStream, stop: &StopToken, request: &Migrate) -> Response {
+    fn migrate(&mut self, out: &mut SocketOut<'_>, request: &Migrate) -> Response {
         if !self.vcpus.is_running() {
             self.state = VmState::Stopping;
         }
@@ -999,7 +1118,7 @@ impl<K: Kick> Machine<'_, K> {
             // The fence released the disk, and the destination may run by
             // now. A second stream would hand out another copy that can
             // resume, so only the move that fenced the VM may have it again.
-            VmState::Fenced => return self.restream(conn, stop, request),
+            VmState::Fenced => return self.restream(out, request),
             VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
             VmState::Running | VmState::Paused | VmState::RestoredPaused => {}
         }
@@ -1038,9 +1157,8 @@ impl<K: Kick> Machine<'_, K> {
         };
         let ram = Arc::clone(&capture.ram);
         let found = self.state;
-        let paused_deadline = Cell::new(None);
-        let mut out = SocketOut::new(conn, stop, self.stream.stall, &paused_deadline);
-        let mut stream = StreamWriter::new(&mut out);
+        let paused_deadline = out.deadline;
+        let mut stream = StreamWriter::new(out);
         let profile_json = profile.to_json().into_bytes();
         if let Err(e) = stream.write_doc("profile.json", &profile_json) {
             return refuse(
@@ -1296,7 +1414,7 @@ impl<K: Kick> Machine<'_, K> {
     /// reader. The record is kept for as long as the run lives, so the
     /// mover may ask again; only it can know that the first destination
     /// never resumed.
-    fn restream(&mut self, conn: &mut UnixStream, stop: &StopToken, request: &Migrate) -> Response {
+    fn restream(&mut self, out: &mut SocketOut<'_>, request: &Migrate) -> Response {
         let Some(record) = &self.fenced_by else {
             return refuse(
                 ErrorCode::Fenced,
@@ -1326,9 +1444,7 @@ impl<K: Kick> Machine<'_, K> {
         let vcpus = self.vcpus;
         let stopping = || !vcpus.is_running();
         let started = Instant::now();
-        let none = Cell::new(None);
-        let mut out = SocketOut::new(conn, stop, self.stream.stall, &none);
-        let mut stream = StreamWriter::new(&mut out);
+        let mut stream = StreamWriter::new(out);
         let sent = (|| -> std::io::Result<_> {
             stream.write_doc("profile.json", &record.profile_json)?;
             let mut disk_rounds = Vec::new();
@@ -1565,10 +1681,13 @@ impl<K: Kick> Machine<'_, K> {
     /// succeeds and changes nothing.
     ///
     /// The vCPUs run on while the gate waits for the I/O threads, the
-    /// virtio-blk worker's request in flight among them, so the longer
-    /// wait costs the guest nothing. Under a disk hog that request was a
-    /// flush whose `fdatasync` took over 2 s, and a `pause` with the 2 s
-    /// bound failed where a `migrate` went ahead.
+    /// virtio-blk worker's request in flight among them, but the gate is
+    /// closed before it waits, so the guest's I/O is held for the whole
+    /// wait: the network, the console, the agent's bridge and new disk
+    /// requests, up to 10 s, and a pause that then times out has held
+    /// them that long. Under a disk hog the request in flight was a flush
+    /// whose `fdatasync` took over 2 s, and a `pause` with the 2 s bound
+    /// failed where a `migrate` went ahead.
     fn pause(&mut self) -> Response {
         match self.pause_within(self.stream.park, Some(self.timeout)) {
             Ok(_) => Response::State(self.state),
@@ -2183,7 +2302,9 @@ mod tests {
         assert!(reply.contains(r#""ident":"0x61""#), "{reply}");
     }
 
-    // The stop must end the run even when the VM is paused, and say so.
+    // The stop must end the run even when the VM is paused, and say so. The
+    // reply goes out before the server stops the VM, so the test waits for
+    // the stop.
     #[test]
     fn stop_ends_a_paused_run() {
         let mut f = Fixture::new("stop", 2, 0);
@@ -2192,7 +2313,7 @@ mod tests {
             f.ask(r#"{"v":1,"op":"stop"}"#),
             r#"{"v":1,"ok":true,"state":"stopping"}"#
         );
-        assert!(!f.vcpus.is_running());
+        assert_stops(&f.vcpus, "the stop did not end the paused run");
         assert!(matches!(
             f.vcpus.outcome(),
             Outcome::Stopped(Stop::Requested)
@@ -2203,6 +2324,45 @@ mod tests {
         assert!(f
             .ask(r#"{"v":1,"op":"resume"}"#)
             .starts_with(r#"{"v":1,"ok":false,"code":"stopped""#));
+    }
+
+    /// Records whether the run's stop was requested when the vCPUs were
+    /// kicked, which [`Vcpus::stop`] does as it stops them.
+    struct SeesTheRequest {
+        stop: StopHandle,
+        requested: Mutex<Option<bool>>,
+    }
+
+    impl Kick for SeesTheRequest {
+        fn kick(&self, _cpu: u32) {}
+        fn kick_all(&self) {
+            *self.requested.lock().unwrap() = Some(self.stop.is_stop_requested());
+        }
+        fn try_kick_all(&self) -> bool {
+            self.kick_all();
+            true
+        }
+    }
+
+    // The stop's follow-up requests the run's stop before it stops the VM. The
+    // other order lets the loop that owns the run find the vCPUs gone and no
+    // request, and end the run as a `SystemOff`.
+    #[test]
+    fn a_stop_is_requested_before_the_vm_stops() {
+        let (stop, _registration) = StopHandle::new_pair().unwrap();
+        let kicker = SeesTheRequest {
+            stop: stop.clone(),
+            requested: Mutex::new(None),
+        };
+        let vcpus = Vcpus::new(1, kicker, stop);
+        After::Stop.run(&vcpus);
+        assert!(!vcpus.is_running());
+        assert_eq!(
+            *vcpus.kicker().requested.lock().unwrap(),
+            Some(true),
+            "the VM stopped before its stop was requested"
+        );
+        assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::Requested)));
     }
 
     // A client that hangs up while the VM is paused leaves it paused, and the
@@ -3115,6 +3275,25 @@ mod tests {
         /// Sends `line` and reads frames until the header of `component`,
         /// without its bytes. Returns the headers read, `component`'s last.
         fn read_stream_until(&mut self, line: &str, component: &str) -> Vec<serde_json::Value> {
+            let headers = self.read_stream(line, component, None);
+            let last = headers.last().unwrap();
+            assert!(
+                last.get("v").is_none(),
+                "a reply before {component}: {last}"
+            );
+            headers
+        }
+
+        /// Sends `line` and reads frames until the header of `component`,
+        /// without its bytes, or until a reply line. Writes `after_first`,
+        /// if given, once the first header is read. Returns the headers
+        /// read, then what it stopped on.
+        fn read_stream(
+            &mut self,
+            line: &str,
+            component: &str,
+            after_first: Option<&[u8]>,
+        ) -> Vec<serde_json::Value> {
             self.client.write_all(line.as_bytes()).unwrap();
             self.client.write_all(b"\n").unwrap();
             let mut headers = Vec::new();
@@ -3123,6 +3302,13 @@ mod tests {
                 self.replies.read_line(&mut header).unwrap();
                 let value: serde_json::Value = serde_json::from_str(header.trim_end())
                     .unwrap_or_else(|e| panic!("{e}: {header}"));
+                if value.get("v").is_some() {
+                    headers.push(value);
+                    return headers;
+                }
+                if let (true, Some(bytes)) = (headers.is_empty(), after_first) {
+                    self.client.write_all(bytes).unwrap();
+                }
                 let name = value["component"]
                     .as_str()
                     .unwrap_or_else(|| panic!("{header}"));
@@ -3288,7 +3474,8 @@ mod tests {
     }
 
     // A failure after the pause takes the place of the next frame, the VM
-    // runs on, and the tracking of its writes is stopped.
+    // runs on, the tracking of its writes is stopped, and the connection is
+    // closed after the refusal.
     #[test]
     fn a_migrate_that_fails_in_the_pause_leaves_the_vm_running() {
         use crate::devices::virtio::mmio;
@@ -3321,9 +3508,160 @@ mod tests {
         );
         f.assert_running();
         assert_eq!(log.stops.load(Ordering::SeqCst), 1);
-        assert!(f
-            .ask(r#"{"v":1,"op":"status"}"#)
-            .contains(r#""state":"running""#));
+        let mut rest = Vec::new();
+        f.replies.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the connection went on: {rest:?}");
+        assert_eq!(f.status_elsewhere()["state"], "running");
+    }
+
+    impl Fixture {
+        /// Reads what is left of the connection until it ends, within the
+        /// client's 30 s read timeout, and returns it with when it ended.
+        fn read_to_eof(&mut self) -> (Vec<u8>, Instant) {
+            let mut rest = Vec::new();
+            self.replies
+                .read_to_end(&mut rest)
+                .expect("the connection ended");
+            (rest, Instant::now())
+        }
+    }
+
+    /// Returns the refusal line at the end of `rest`, if the server had room
+    /// to write it.
+    fn trailing_refusal(rest: &[u8]) -> Option<serde_json::Value> {
+        let text = String::from_utf8_lossy(rest);
+        let at = text.rfind(r#"{"v":1,"ok":false"#)?;
+        serde_json::from_str(text[at..].trim_end()).ok()
+    }
+
+    // A reader that stalls once it has the final disk round, in the pause,
+    // is cut off at the paused budget: the stream ends there, and the
+    // connection with it, rather than staying open for a reply the reader
+    // could not tell from the frame it was reading. The VM runs on
+    // unfenced, as an end before the manifest says.
+    #[test]
+    fn a_reader_stalled_after_the_final_disk_round_sees_the_end_at_the_budget() {
+        let disk = TestDisk::new("mig-stall-eof", 4);
+        disk.write(1, 0x21);
+        let log = Arc::new(BusyLog::default());
+        let budget = Duration::from_millis(300);
+        let mut f = Fixture::with(
+            "mig-stall-eof",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                base: Some("ab".repeat(32)),
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                noise_mib: 8,
+                stream: StreamLimits {
+                    stall: Duration::from_secs(60),
+                    paused_floor: budget,
+                    ..StreamLimits::default()
+                },
+                ..Spec::default()
+            },
+        );
+        let headers = f.read_stream_until(
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"s1","epoch":1,"max_rounds":1}"#,
+            "disk-round-final",
+        );
+        let size = headers.last().unwrap()["size"].as_u64().unwrap();
+        let mut body = vec![0u8; usize::try_from(size).unwrap()];
+        f.replies.read_exact(&mut body).unwrap();
+        let stalled_at = Instant::now();
+        assert_eq!(f.vcpus.parked(), 2, "the final disk round came paused");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log.stops.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the stalled migrate did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let failed_at = Instant::now();
+        // The rounds took a few ms, so the budget is about the floor.
+        assert!(
+            failed_at - stalled_at < budget + Duration::from_secs(2),
+            "the stream ended {:?} after the stall",
+            failed_at - stalled_at
+        );
+        let (rest, ended_at) = f.read_to_eof();
+        // What was buffered, then the end: no wait for a reply.
+        assert!(
+            ended_at - failed_at < Duration::from_secs(2),
+            "the end came {:?} after the failure",
+            ended_at - failed_at
+        );
+        assert!(!rest.is_empty(), "the final RAM round was under way");
+        if let Some(r) = trailing_refusal(&rest) {
+            assert!(r["error"].as_str().unwrap().contains("as it was"), "{r}");
+        }
+        f.assert_running();
+        assert_eq!(f.status_elsewhere()["state"], "running");
+    }
+
+    // A write that fails in the pause ends the connection at once, after
+    // the refusal where the next frame was due, and the VM runs on. A line
+    // the client sent behind its request is not served, and the client
+    // still reads a clean end: Linux resets the peer of a socket closed with
+    // bytes left unread, and the server reads them first.
+    #[test]
+    fn a_write_error_in_the_pause_closes_the_connection_with_the_vm_running() {
+        let disk = TestDisk::new("mig-werr", 4);
+        disk.write(1, 0x31);
+        let log = Arc::new(QuietLog::default());
+        let mut f = Fixture::with(
+            "mig-werr",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                base: Some("ab".repeat(32)),
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                noise_mib: 8,
+                stream: StreamLimits {
+                    fail_in_pause: true,
+                    ..StreamLimits::default()
+                },
+                ..Spec::default()
+            },
+        );
+        let asked = Instant::now();
+        // The status line goes once the stream has begun, while the 8 MiB
+        // of noise hold it short of the pause: the server is not reading,
+        // so the line waits in the socket's queue.
+        let mut headers = f.read_stream(
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"w","epoch":1}"#,
+            "disk-round-final",
+            Some(b"{\"v\":1,\"op\":\"status\"}\n"),
+        );
+        let refusal = headers.pop().unwrap();
+        assert!(
+            refusal.get("v").is_some(),
+            "a frame went in the pause: {refusal}"
+        );
+        let names: Vec<&str> = headers
+            .iter()
+            .map(|h| h["component"].as_str().unwrap())
+            .collect();
+        assert_eq!(refusal["code"], "capture_failed", "{refusal}");
+        let why = refusal["error"].as_str().unwrap();
+        assert!(
+            why.contains("a test failed the write in the pause"),
+            "{why}"
+        );
+        assert!(why.contains("as it was"), "{why}");
+        assert!(names.contains(&"disk-round-0"), "{names:?}");
+        // Another connection is served only once this one is closed, so
+        // the end is read after the close, where a reset would show.
+        assert_eq!(f.status_elsewhere()["state"], "running");
+        let (rest, ended_at) = f.read_to_eof();
+        assert!(
+            ended_at - asked < Duration::from_secs(5),
+            "the end came {:?} after the request",
+            ended_at - asked
+        );
+        assert!(rest.is_empty(), "the status was served: {rest:?}");
+        assert_eq!(log.stops.load(Ordering::SeqCst), 1);
+        f.assert_running();
     }
 
     // A client that goes away part way through leaves the VM running: the
