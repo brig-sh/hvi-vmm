@@ -88,11 +88,13 @@ pub struct Migrate {
     pub txid: Option<String>,
     /// The caller's epoch for the sandbox, recorded in `session.json`.
     pub epoch: u64,
-    /// The most rounds taken with the guest running, when the caller sets
-    /// fewer than the default 5; 1 sends RAM once running and once paused.
+    /// The most rounds taken with the guest running, 1 to
+    /// [`MAX_MIGRATE_ROUNDS`], default 5; 1 sends RAM once running and once
+    /// paused.
     pub max_rounds: Option<u32>,
-    /// The longest the rounds run before the pause, in seconds, when the
-    /// caller sets a cap other than the default 60.
+    /// The time after which no new round starts with the guest running, in
+    /// seconds, 0 to 3600, default 60. It is checked as each round ends, so
+    /// a round under way runs to its end.
     pub max_secs: Option<u64>,
 }
 

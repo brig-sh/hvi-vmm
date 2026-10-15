@@ -204,9 +204,14 @@ and each reply is one line:
 for it. Apart from `checkpoint` and `migrate`, no reply takes longer than about
 2 s, so give a client a reply timeout of at least 3 s. A `checkpoint` replies
 once its bundle is written, which takes longer the more guest RAM is in use. A
-`migrate` writes its stream before its reply, as fast as the client reads it,
-for up to `max_secs` with the guest running and then the paused part, so its
-client reads the frames and waits for the reply with no fixed timeout. A client that gives up on a `pause` before its reply cannot
+`migrate` writes its stream before its reply, as fast as the client reads it:
+rounds with the guest running until one ends past `max_secs` (the cap is
+checked as each round ends, so a round under way, round 0 included, runs to
+its end however long it takes), then the paused part. So its
+client reads the frames and waits for the reply with no fixed timeout. hvi
+gives up on a client that takes nothing for 30 s, or that does not take the
+paused part within its budget, and the VM runs on (see
+[checkpoint.md](checkpoint.md#the-rounds)). A client that gives up on a `pause` before its reply cannot
 tell whether the VM paused: it should reconnect and ask `status`, or send
 `resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
 `code`; `error` is for a person. The codes are listed in
