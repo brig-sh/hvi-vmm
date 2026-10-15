@@ -384,14 +384,12 @@ def dirty_goes_on(guest, after, where):
           f"{bad[:2]}")
 
 
-def paused_from(reply, fallback):
-    """Returns this script's time of a live move's pause: the end of its
-    last round with the guest running, plus the time the pause took. A
-    checkpoint, or a reply without it, gives `fallback`."""
-    st = reply.get("stats") or {}
-    if not stream or not st.get("precopy_end_unix_ms"):
-        return fallback
-    return st["precopy_end_unix_ms"] / 1000 - wall_t0 + (st.get("pause_ms") or 0) / 1000
+def counted_twice(before, after):
+    """Returns the counts that both `before` and `after` printed: a guest
+    that ran on after the state the next one resumed from."""
+    def counts(guest):
+        return {c[0] for c in (tick(s) for _, s in guest.outputs(r"TICK ")) if c}
+    return sorted(counts(before) & counts(after))
 
 
 def boot_id(guest, after=0.0):
@@ -483,11 +481,13 @@ check(resumed.get("state") == "running", "resume")
 restore_ms = (status_at - spawned_at) * 1000
 before = [(t, tick(s)) for t, s in src.outputs(r"TICK ") if t <= fence_at]
 last_tick_at, (last_n, last_uptime, last_wall) = before[-1]
-# A live move pauses the guest only after its rounds: from then on the
-# source must print nothing, though the reply comes later.
-paused_at = paused_from(fence, fence_sent)
-late = src.outputs(r"TICK ", after=paused_at + 0.1)
-check(not late, f"the fenced source printed nothing once paused: {late[:2]}")
+# A fenced source prints nothing after the reply. Whether it ran on after
+# its pause, during the final round, is not read from the host's clock: a
+# console line can reach this script a second late on a busy host. The
+# count shows it instead: a source that ran past the state the destination
+# resumed from prints counts the destination prints again (checked below).
+late = src.outputs(r"TICK ", after=(fence_at if stream else fence_sent) + 0.1)
+check(not late, f"the fenced source printed nothing after the fence reply: {late[:2]}")
 if stream:
     kept = sorted(os.listdir(bundle)) if os.path.isdir(bundle) else []
     want = sorted(["profile.json", "cpu.json", "platform.json", "devices.json", "session.json",
@@ -513,9 +513,8 @@ if first:
     first_at, line = first
     n, uptime, wall = tick(line)
     check(n == last_n + 1, f"the count goes on: last before the fence {last_n}, first after {n}")
-    counted_twice = sorted({c[0] for c in (tick(s) for _, s in src.outputs(r"TICK ")) if c}
-                           & {c[0] for c in (tick(s) for _, s in dst.outputs(r"TICK ")) if c})
-    check(not counted_twice, f"no count was printed by both guests: {counted_twice[:3]}")
+    twice = counted_twice(src, dst)
+    check(not twice, f"no count was printed by both guests: {twice[:3]}")
     host_gap = first_at - last_tick_at
     # The ticks carry /proc/uptime, CLOCK_BOOTTIME, which on the portable
     # profile moves on by the downtime; its monotonic clock does not.
@@ -662,9 +661,6 @@ tctl.ask(op="resume")
 # A live move pauses the guest only at the end of its rounds, just before
 # its reply; a checkpoint, as soon as it is asked for.
 fenced2_at = fence2_at if stream else again_at
-if stream:
-    late2 = dst.outputs(r"TICK ", after=paused_from(fence2, fence2_at) + 0.1)
-    check(not late2, f"the second fenced source printed nothing once paused: {late2[:2]}")
 last2 = [tick(s)[0] for t, s in dst.outputs(r"TICK ") if t <= fenced2_at + 0.1]
 # The guest's last uptime reading before the second fence: the last tick,
 # or the end of the sleep that came after it.
@@ -679,6 +675,8 @@ check(status3.get("state") == "restored-paused" and moved is not None
       f"it resumes in a third process and counts on from {last2[-1] if last2 else None}, "
       f"its uptime {on} s on from the last reading before the move")
 check(not third.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT"), "the third process did not reboot it")
+twice = counted_twice(dst, third)
+check(not twice, f"no count was printed by both guests of the second move: {twice[:3]}")
 fp_goes_on(dst, third, "over the second move")
 dirty_goes_on(third, moved[0] if moved else 0.0, "after the second move")
 
