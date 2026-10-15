@@ -52,6 +52,9 @@ three things a reader should not have to guess between:
 | 254 vCPUs on x86-64. | The MP table and the ACPI tables give each vCPU a one-byte local APIC id and the IOAPIC the next one, so more vCPUs would share ids. x2APIC ids would lift the cap. | Design |
 | 8 vCPUs on a GICv2 arm64 host. | GICv2 addresses at most 8 CPU interfaces. The guest's controller follows the host's, so this is not a choice. | Platform |
 | 507 vCPUs on a GICv3 arm64 Linux host. | Each vCPU adds a redistributor frame from a fixed base, and the frames must end below the UART. Moving the UART or the redistributors higher would lift the cap. | Design |
+| An x86-64 guest's workqueue watchdog counts a pause. | Linux's workqueue watchdog reads the kvm-clock mark a paused vCPU gets but does not act on it, so a pause longer than its threshold can make the guest report a workqueue lockup for a pool with work queued. | Platform |
+| Frequent long pauses can hide a hung task in an x86-64 guest. | A pause the guest is told of resets its hung-task check, which covers the whole guest, so a pause of a second or more in each of the check's periods keeps a task hung in the kernel from being reported. | Platform |
+| An arm64 guest is not told of a pause. | Linux on arm64 has no paravirtual way to learn of one, so a pause longer than the guest's lockup threshold can make it report a soft lockup when it resumes. An x86-64 guest is told through kvm-clock. | Platform |
 | x86 vCPUs share one CPUID blob. | The APIC id a guest reports for a secondary CPU varies run to run. | Defect |
 | The default `--cmdline` names `ttyAMA0`. | That is the arm64 console. The x86 backend appends `console=ttyS0` itself, so a guest still gets one, but the default leaves a dead `console=` and a bare `earlycon` on the line. | Design |
 | `tools/mk-initramfs.py` builds an arm64 initramfs only. | An x86-64 guest needs its own. | Design |

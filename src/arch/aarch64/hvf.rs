@@ -54,7 +54,7 @@ use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Emitter;
-use crate::hypervisor::guest::{Cpu, Guest, PluginThreads, VcpuRegs};
+use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -796,7 +796,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     }
     sh.guest.vcpus.mark_started(cpu_id);
 
-    let is_boot = cpu_id == 0;
+    // The plugin runs on vcpu0, between guest entries, because only this thread
+    // can read this vCPU's registers.
+    let plugin = sh.plugin.as_deref().filter(|_| cpu_id == 0);
     // The loop runs inside `catch_unwind` only for the report. A panic is
     // reported with where the guest was and what it last did, and the thread
     // then reports its exit like any other.
@@ -804,18 +806,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         while sh.guest.vcpus.is_running() {
             // Safe point for every vCPU: park here while vcpu0 lets a plugin
             // look at the guest.
-            sh.guest.vcpus.checkpoint();
-            // The plugin runs on vcpu0, between guest entries, because only
-            // this thread can read this vCPU's registers. It is on the hot
-            // path: with no plugin this is a null check.
-            if is_boot {
-                if let Some(obs) = sh.plugin.as_deref() {
-                    obs.safepoint(&Cpu {
-                        vcpu: &vcpu,
-                        guest: &sh.guest,
-                    });
-                }
-            }
+            sh.guest.pass_safepoint(&vcpu, plugin);
 
             let flow = match vcpu.run() {
                 Ok(()) => handle_exit(&vcpu, &sh, cpu_id),
@@ -925,7 +916,7 @@ fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32) -> ControlFlow<Outcome> {
     ControlFlow::Continue(())
 }
 
-impl VcpuRegs for Vcpu {
+impl SafepointVcpu for Vcpu {
     fn regs(&self) -> RegsView {
         let ttbr1 = self.get_sys_reg(SysReg::TTBR1_EL1).unwrap_or(0);
         RegsView {

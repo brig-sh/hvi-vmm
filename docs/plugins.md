@@ -59,7 +59,14 @@ report(sample);
 A `safepoint` may hold the pause while it waits, for example for another process
 to finish reading. It checks `cpu.is_stopping()` as it waits. Once that returns
 `true`, it resumes and returns. The stop waits one second for the boot vCPU,
-then leaves its thread running and fails the run.
+then leaves its thread running and fails the run. On Linux the vCPU seccomp
+filter refuses `std::thread::sleep`, so a `safepoint` waits with
+`Condvar::wait_timeout` or `std::thread::park_timeout`, which the filter allows.
+
+A `safepoint` that waits a long time holds a pause while it waits. The other
+vCPUs then sit out the wait as well, and on x86-64 the guest is notified of it.
+A boot vCPU that waits alone while the others run looks to the guest like a
+stalled CPU, and the guest can report it.
 
 A plugin that needs the run to end calls `VmHandle::request_stop()`, from any
 thread. `boot` then returns `Stop::Requested`, unless a thread reports a

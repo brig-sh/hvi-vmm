@@ -42,6 +42,7 @@
 
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment, CpuId};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
@@ -64,7 +65,7 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
-use crate::hypervisor::guest::{Guest, PluginThreads, VcpuRegs};
+use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
@@ -101,6 +102,15 @@ const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
 const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
 /// The CPUID leaf 7, subleaf 0, EBX bit for RDSEED.
 const CPUID_7_0_EBX_RDSEED: u32 = 1 << 18;
+
+/// The shortest pause the guest is notified of.
+///
+/// It stays below the soft-lockup and RCU stall thresholds a Linux guest can be
+/// set to, and above the pause an observation takes. Each notice resets the
+/// soft-lockup check of its vCPU and the guest-wide RCU stall and hung-task
+/// checks, so leaving out shorter pauses keeps those checks armed through
+/// frequent observations.
+const MIN_NOTIFIED_PAUSE: Duration = Duration::from_secs(1);
 
 /// State shared across the vCPU threads.
 #[derive(Clone)]
@@ -608,13 +618,28 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
     );
 }
 
-impl VcpuRegs for VcpuFd {
+impl SafepointVcpu for VcpuFd {
     fn regs(&self) -> RegsView {
         // CR3 is the walk root on x86-64; the arm64 registers stay zero.
         RegsView {
             root: self.get_sregs().map(|s| s.cr3).unwrap_or(0),
             pc: self.get_regs().map(|r| r.rip).unwrap_or(0),
             ..RegsView::default()
+        }
+    }
+
+    fn notify_guest_paused(&self, paused_for: Duration) {
+        if paused_for < MIN_NOTIFIED_PAUSE {
+            return;
+        }
+        // The notice is the mark `KVM_KVMCLOCK_CTRL` leaves in the vCPU's
+        // kvm-clock page. KVM refuses it with `EINVAL` while the guest has no
+        // kvm-clock set up, such as early in boot, and then nothing in the
+        // guest would read it.
+        if let Err(e) = self.kvmclock_ctrl() {
+            if e.errno() != libc::EINVAL {
+                stderrln!("{LOG_PREFIX} could not notify the guest of the pause: {e}");
+            }
         }
     }
 }

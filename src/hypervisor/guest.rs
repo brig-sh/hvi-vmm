@@ -21,8 +21,10 @@
 //! [`VmHandle`] a plugin gets at attach. [`Cpu`] is the [`CpuHandle`] it gets
 //! at a safe point, where only the registers depend on the backend.
 
+use std::cell::Cell;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
@@ -138,6 +140,26 @@ impl<K> Guest<K> {
     }
 }
 
+impl<K: Kick> Guest<K> {
+    /// Holds the calling vCPU at its safe point between guest entries.
+    ///
+    /// The vCPU parks while a pause is in effect, and then `plugin`, if given,
+    /// looks at the guest. Either way the vCPU tells the guest of the time it
+    /// sat out. It is on the hot path: with no plugin and no pause, it loads
+    /// the quiesce flag and checks a zero duration.
+    pub(crate) fn pass_safepoint<V: SafepointVcpu>(&self, vcpu: &V, plugin: Option<&dyn Plugin>) {
+        // vcpu0 never parks, since a pause parks only the other vCPUs.
+        vcpu.notify_guest_paused(self.vcpus.checkpoint());
+        if let Some(plugin) = plugin {
+            let cpu = Cpu::new(vcpu, self);
+            plugin.safepoint(&cpu);
+            // vcpu0 holds each pause rather than parking, so it sat out their
+            // time.
+            vcpu.notify_guest_paused(cpu.paused_time());
+        }
+    }
+}
+
 impl<K: Kick + 'static> Guest<K> {
     /// Hands `plugin` the guest, when there is one, and returns the threads it
     /// asked for in `attach`.
@@ -227,10 +249,18 @@ impl<K: Kick> VmHandle for Guest<K> {
     }
 }
 
-/// Access to a vCPU's registers for a plugin at a safe point.
-pub(crate) trait VcpuRegs {
+/// The vCPU operations a safe point uses, reading its registers for a plugin
+/// and telling the guest of a pause.
+pub(crate) trait SafepointVcpu {
     /// Returns the registers a plugin walks guest memory with.
     fn regs(&self) -> RegsView;
+
+    /// Notifies the guest that this vCPU was held out of the guest for
+    /// `paused_for`, so the guest does not report that time as a lockup.
+    ///
+    /// Does nothing on a backend that has no way to notify it, or for a time
+    /// too short to look like a lockup.
+    fn notify_guest_paused(&self, _paused_for: Duration) {}
 }
 
 /// The [`CpuHandle`] over the boot vCPU at a safe point.
@@ -239,12 +269,33 @@ pub(crate) trait VcpuRegs {
 /// `Plugin::safepoint` call.
 pub(crate) struct Cpu<'a, K, V> {
     /// The boot vCPU, on its own thread.
-    pub(crate) vcpu: &'a V,
+    vcpu: &'a V,
     /// The guest it runs.
-    pub(crate) guest: &'a Guest<K>,
+    guest: &'a Guest<K>,
+    /// When the pause in effect began, while one is.
+    paused_at: Cell<Option<Instant>>,
+    /// The time of the pauses that ended during this safe point.
+    paused: Cell<Duration>,
 }
 
-impl<K: Kick, V: VcpuRegs> CpuHandle for Cpu<'_, K, V> {
+impl<'a, K, V> Cpu<'a, K, V> {
+    /// Returns the handle over `vcpu`, the boot vCPU of `guest`.
+    fn new(vcpu: &'a V, guest: &'a Guest<K>) -> Self {
+        Self {
+            vcpu,
+            guest,
+            paused_at: Cell::new(None),
+            paused: Cell::new(Duration::ZERO),
+        }
+    }
+
+    /// Returns the time of the pauses that ended during this safe point.
+    fn paused_time(&self) -> Duration {
+        self.paused.get()
+    }
+}
+
+impl<K: Kick, V: SafepointVcpu> CpuHandle for Cpu<'_, K, V> {
     fn arch(&self) -> GuestArch {
         self.guest.arch
     }
@@ -258,10 +309,19 @@ impl<K: Kick, V: VcpuRegs> CpuHandle for Cpu<'_, K, V> {
     }
 
     fn pause(&self) -> bool {
-        self.guest.vcpus.pause()
+        let start = Instant::now();
+        let paused = self.guest.vcpus.pause();
+        // A pause inside one in effect keeps the first one's start.
+        if paused && self.paused_at.get().is_none() {
+            self.paused_at.set(Some(start));
+        }
+        paused
     }
 
     fn resume(&self) {
+        if let Some(at) = self.paused_at.take() {
+            self.paused.set(self.paused.get() + at.elapsed());
+        }
         self.guest.vcpus.resume();
     }
 
@@ -275,8 +335,87 @@ impl<K: Kick, V: VcpuRegs> CpuHandle for Cpu<'_, K, V> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::run::StopHandle;
+
+    /// A kicker that reaches no thread.
+    pub(crate) struct NoopKicker;
+
+    impl Kick for NoopKicker {
+        fn kick(&self, _cpu: u32) {}
+
+        fn kick_all(&self) {}
+    }
+
+    /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices and
+    /// a ledger that writes nowhere.
+    pub(crate) fn guest(count: u32) -> Guest<NoopKicker> {
+        let shared_ram = SharedRam::new(RamRegion::ALIGN as usize).unwrap();
+        let ram = GuestRam::new(&shared_ram, &[shared_ram.region_at(0)]).unwrap();
+        Guest {
+            arch: GuestArch::X86_64,
+            sandbox_id: String::new(),
+            ram: Arc::new(ram),
+            shared_ram,
+            ledger: Arc::new(Mutex::new(Emitter::new(None, "test").unwrap())),
+            block: None,
+            net: None,
+            vsock: None,
+            plugin_threads: PluginThreads::new(),
+            vcpus: Arc::new(Vcpus::new(
+                count,
+                NoopKicker,
+                StopHandle::new_pair().unwrap().0,
+            )),
+        }
+    }
+
+    /// A boot vCPU that records what the guest is told.
+    #[derive(Default)]
+    struct RecordingVcpu {
+        /// The time of each notice, in order.
+        notices: Mutex<Vec<Duration>>,
+    }
+
+    impl SafepointVcpu for RecordingVcpu {
+        fn regs(&self) -> RegsView {
+            RegsView::default()
+        }
+
+        fn notify_guest_paused(&self, paused_for: Duration) {
+            self.notices.lock().unwrap().push(paused_for);
+        }
+    }
+
+    /// A plugin that holds two pauses of 10 ms at its safe point.
+    struct TwoPauses;
+
+    impl Plugin for TwoPauses {
+        fn safepoint(&self, cpu: &dyn CpuHandle) {
+            for _ in 0..2 {
+                assert!(cpu.pause());
+                std::thread::sleep(Duration::from_millis(10));
+                cpu.resume();
+            }
+        }
+    }
+
+    #[test]
+    fn boot_vcpu_is_told_of_the_pauses_its_safepoint_held() {
+        // With one vCPU, the boot vCPU, a pause has no other vCPU to wait for.
+        let guest = guest(1);
+        let vcpu = RecordingVcpu::default();
+        guest.pass_safepoint(&vcpu, Some(&TwoPauses));
+        let notices = vcpu.notices.lock().unwrap();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert_eq!(
+            notices[0],
+            Duration::ZERO,
+            "the checkpoint notice, with no time parked, comes first"
+        );
+        assert!(notices[1] >= Duration::from_millis(20), "{notices:?}");
+    }
 
     // A thread asked for after `attach` would start under no filter and outside
     // the join, so the request is refused.

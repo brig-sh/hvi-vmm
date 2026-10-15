@@ -289,6 +289,14 @@ also runs its local APIC in x2APIC mode, which it allows without interrupt
 remapping only under a hypervisor. With the TSC-deadline bit the guest runs its
 APIC timer in that mode and skips calibrating it at boot.
 
+With kvm-clock set up, a vCPU can tell the guest it was paused (section 5). A
+vCPU that parked for a second or more, and the boot vCPU after a safe point
+whose pauses add up to a second or more, call `KVM_KVMCLOCK_CTRL` before they
+enter the guest again. Each call leaves a mark that resets the soft-lockup check
+of its vCPU and the guest-wide RCU stall and hung-task checks, so the pause does
+not look like a lockup. Shorter pauses are not marked, so frequent observations
+leave those checks armed.
+
 Only vCPU 0 is initialised. The APs are brought up by the guest itself, with
 INIT-SIPI-SIPI serviced by the in-kernel LAPIC.
 

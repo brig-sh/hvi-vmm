@@ -133,10 +133,12 @@ impl<K: Kick> Vcpus<K> {
 
     /// Parks the calling vCPU thread while a quiesce is in effect.
     ///
-    /// A vCPU thread calls it between guest entries, where its registers and
-    /// the memory it has written are stable.
-    pub(crate) fn checkpoint(&self) {
-        self.quiesce.checkpoint();
+    /// Returns how long it stayed parked, zero when it did not park. A vCPU
+    /// thread calls it between guest entries, where its registers and the
+    /// memory it has written are stable.
+    #[must_use]
+    pub(crate) fn checkpoint(&self) -> Duration {
+        self.quiesce.checkpoint()
     }
 
     /// Parks every started vCPU but the calling one at its next checkpoint.
@@ -495,7 +497,7 @@ mod tests {
     }
 
     /// Waits up to five seconds for `thread` to exit.
-    fn exits(thread: &JoinHandle<()>) -> bool {
+    fn exits<T>(thread: &JoinHandle<T>) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !thread.is_finished() {
             if Instant::now() >= deadline {
@@ -528,7 +530,7 @@ mod tests {
             let vcpus = Arc::clone(&vcpus);
             std::thread::spawn(move || {
                 while vcpus.is_running() {
-                    vcpus.checkpoint();
+                    let _ = vcpus.checkpoint();
                     std::thread::yield_now();
                 }
             })
@@ -554,7 +556,7 @@ mod tests {
             let (vcpus, resumed) = (Arc::clone(&vcpus), Arc::clone(&resumed));
             std::thread::spawn(move || {
                 while vcpus.is_running() {
-                    vcpus.checkpoint();
+                    let _ = vcpus.checkpoint();
                     resumed.store(true, Ordering::SeqCst);
                     std::thread::yield_now();
                 }
@@ -584,7 +586,7 @@ mod tests {
                 vcpus.mark_started(1);
                 parking.send(()).unwrap();
                 while vcpus.is_running() {
-                    vcpus.checkpoint();
+                    let _ = vcpus.checkpoint();
                     std::thread::yield_now();
                 }
             })
@@ -610,7 +612,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(50));
                 vcpus.mark_started(2);
                 while vcpus.is_running() {
-                    vcpus.checkpoint();
+                    let _ = vcpus.checkpoint();
                     std::thread::yield_now();
                 }
             })
@@ -651,6 +653,10 @@ mod tests {
         assert!(!vcpus.pause(), "the second vCPU never reaches a checkpoint");
         let checkpoint = std::thread::spawn(move || vcpus.checkpoint());
         assert!(exits(&checkpoint), "the quiesce stayed requested");
+        assert!(
+            checkpoint.join().unwrap().is_zero(),
+            "parked after the quiesce ended"
+        );
     }
 
     #[test]
