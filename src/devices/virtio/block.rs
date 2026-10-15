@@ -1024,7 +1024,13 @@ impl VirtioBlk {
     /// request then runs with no lock held ([`BlkRequest::run`]), and
     /// [`finish`](Self::finish) completes it.
     pub(crate) fn take_request(&mut self, mem: &GuestRam) -> Option<BlkRequest> {
-        let head = self.next_head(mem).filter(|_| !self.fenced);
+        // A fenced device takes nothing, and leaves the chains on the ring:
+        // the queue's state is the restore's by then.
+        let head = if self.fenced {
+            None
+        } else {
+            self.next_head(mem)
+        };
         if head.is_none() {
             self.pass_left = 0;
             if self.owed_irq {
@@ -3011,11 +3017,17 @@ mod worker_tests {
         rig.post(0, VIRTIO_BLK_T_OUT, 4, 0x77);
         rig.notify();
         std::thread::sleep(Duration::from_millis(50));
+        let last_avail = lock_or_recover(&rig.dev).state().queue.last_avail;
         lock_or_recover(&rig.dev).release_lock();
         rig.source.gate().unpause();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(rig.used_idx(), 0, "nothing returned");
         assert_eq!(rig.sector(4), vec![0x5a; 512], "nothing written");
+        assert_eq!(
+            lock_or_recover(&rig.dev).state().queue.last_avail,
+            last_avail,
+            "the chain is left on the ring"
+        );
         rig.stop();
     }
 
