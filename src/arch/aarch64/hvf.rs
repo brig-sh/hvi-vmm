@@ -1094,7 +1094,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     };
 
     let disks = Disk::place(
-        block::open_boot_disks(&cfg.disks, cfg.disk_base_sha256.is_some(), None)?,
+        block::open_boot_disks(
+            &cfg.disks,
+            cfg.disk_base_sha256.is_some(),
+            cfg.disk_written.as_deref(),
+        )?,
         virtio_blk_base,
     );
     // virtio-net: gateway relay (real egress) when a gateway socket is given,

@@ -193,30 +193,6 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
     }
 }
 
-/// Returns the virtio-mmio devices the DSDT describes, the disks first and in
-/// order, then net, vsock and the exports.
-///
-/// Linux registers them in this order, so the disks keep their argv order. The
-/// guest still has to tell them apart by serial.
-fn mmio_devices(disks: usize, net: bool, vsock: bool, exports: &[Export]) -> Vec<MmioDevice> {
-    let device = |base: u64, gsi: u32| MmioDevice {
-        base,
-        size: VIRTIO_SIZE,
-        gsi,
-    };
-    let mut devices: Vec<MmioDevice> = (0..disks)
-        .filter_map(|index| Some(device(virtio_blk_base(index)?, virtio_blk_gsi(index)?)))
-        .collect();
-    if net {
-        devices.push(device(VIRTIO_NET_BASE, VIRTIO_NET_GSI));
-    }
-    if vsock {
-        devices.push(device(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI));
-    }
-    devices.extend(exports.iter().map(|export| device(export.base, export.irq)));
-    devices
-}
-
 /// The CPUID leaves the profile records, as `(leaf, subleaf)`: the vendor,
 /// the family and the basic features, the structured extended features, the
 /// XSAVE layout and the extended features. A guest kernel decides what to use
@@ -370,6 +346,30 @@ fn boot_profile(
     p
 }
 
+/// Returns the virtio-mmio devices the DSDT describes, the disks first and in
+/// order, then net, vsock and the exports.
+///
+/// Linux registers them in this order, so the disks keep their argv order. The
+/// guest still has to tell them apart by serial.
+fn mmio_devices(disks: usize, net: bool, vsock: bool, exports: &[Export]) -> Vec<MmioDevice> {
+    let device = |base: u64, gsi: u32| MmioDevice {
+        base,
+        size: VIRTIO_SIZE,
+        gsi,
+    };
+    let mut devices: Vec<MmioDevice> = (0..disks)
+        .filter_map(|index| Some(device(virtio_blk_base(index)?, virtio_blk_gsi(index)?)))
+        .collect();
+    if net {
+        devices.push(device(VIRTIO_NET_BASE, VIRTIO_NET_GSI));
+    }
+    if vsock {
+        devices.push(device(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI));
+    }
+    devices.extend(exports.iter().map(|export| device(export.base, export.irq)));
+    devices
+}
+
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     cfg.validate()?;
@@ -444,7 +444,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // Devices.
     let disks = Disk::place(
-        block::open_boot_disks(&cfg.disks, cfg.disk_base_sha256.is_some(), None)?,
+        block::open_boot_disks(
+            &cfg.disks,
+            cfg.disk_base_sha256.is_some(),
+            cfg.disk_written.as_deref(),
+        )?,
         virtio_blk_base,
     );
     let mut net_source: Option<NetSource> = None;
@@ -609,8 +613,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 Kicker::new(num_cpus),
                 cfg.take_stop_handle()?,
             )),
-            plugin_threads: PluginThreads::new(),
             write_log: Some(write_log),
+            plugin_threads: PluginThreads::new(),
         }),
         uart: Arc::new(Mutex::new(Uart16550::new())),
         rtc: Arc::new(Mutex::new(RtcCmos::new())),
@@ -1169,6 +1173,7 @@ mod vcpu_cap_tests {
             cmdline: String::new(),
             disks: Vec::new(),
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,

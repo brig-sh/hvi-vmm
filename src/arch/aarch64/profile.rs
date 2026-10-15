@@ -302,6 +302,7 @@ mod tests {
             cmdline: cmdline.into(),
             disks: Vec::new(),
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: true,

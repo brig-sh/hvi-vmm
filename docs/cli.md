@@ -208,7 +208,8 @@ and each reply is one line:
 
 `disk-dirty` and `disk-blocks` need `--checkpoint-root` and a disk, as a move
 does, and work in every state but `stopping`; without either they are
-`refused`. A `disk-blocks` whose list names a block past the disk, or out of
+`refused`, and so is a guest with a second disk or a read-only one, whose
+disk a move does not carry. A `disk-blocks` whose list names a block past the disk, or out of
 order, is `bad_request`, and one for a round that is not the last read is
 `refused`; neither sends a byte first. A block that cannot be read ends the
 stream with `capture_failed`. A line with a `v` key is always the reply; a

@@ -642,6 +642,13 @@ pub struct BootConfig {
     /// the image did, and keeps a copy, so a move can send only the blocks the
     /// guest wrote. It needs exactly one disk in `disks`, a writable one.
     pub disk_base_sha256: Option<String>,
+    /// The blocks where `disk` already differs from that base when this
+    /// boot opens it, as the bitmap a `disk-dirty` reply gives (bit `i` of
+    /// byte `i / 8` for 64 KiB block `i`). They start the blocks written
+    /// since boot, so a move by blocks sends them too. With it,
+    /// `disk_base_sha256` names the base image, not `disk` itself. It needs
+    /// `disk_base_sha256`.
+    pub disk_written: Option<Vec<u8>>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -788,6 +795,9 @@ impl BootConfig {
             && !matches!(self.disks.as_slice(), [disk] if !disk.read_only)
         {
             return Err(ONE_DISK_FOR_A_BASE.into());
+        }
+        if self.disk_written.is_some() && self.disk_base_sha256.is_none() {
+            return Err("--disk-written needs --disk-base-sha256, the base it differs from".into());
         }
         Ok(())
     }
@@ -1095,6 +1105,7 @@ mod tests {
             cmdline: String::new(),
             disks: Vec::new(),
             disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,
@@ -1144,6 +1155,45 @@ mod tests {
         let mut cfg = boot_config(Native, None);
         cfg.fs = vec![socket("tag=a,socket=/run/a.sock")];
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    // A portable guest is one that moves, and a move carries one writable
+    // disk: its base digest, its dirty blocks and its rounds name that disk.
+    #[test]
+    fn validate_holds_a_moving_guest_to_one_writable_disk() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        let two = vec![DiskConfig::rw("/a.img"), DiskConfig::ro("/b.img")];
+        let mut cfg = boot_config(PortableArm64V1, None);
+        cfg.disks = two.clone();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("a second --disk is not part of --profile"),
+            "{err}"
+        );
+        cfg.disks.truncate(1);
+        assert_eq!(cfg.validate(), Ok(()));
+        let mut cfg = boot_config(Native, None);
+        cfg.disks = two;
+        assert_eq!(cfg.validate(), Ok(()), "a native guest takes four");
+
+        let base = Some("ab".repeat(32));
+        for disks in [
+            Vec::new(),
+            vec![DiskConfig::ro("/a.img")],
+            vec![DiskConfig::rw("/a.img"), DiskConfig::rw("/b.img")],
+        ] {
+            let mut cfg = boot_config(Native, None);
+            cfg.disks = disks;
+            cfg.disk_base_sha256.clone_from(&base);
+            assert_eq!(cfg.validate(), Err(super::ONE_DISK_FOR_A_BASE.into()));
+        }
+        let mut cfg = boot_config(Native, None);
+        cfg.disks = vec![DiskConfig::rw("/a.img")];
+        cfg.disk_base_sha256 = base;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.disk_base_sha256 = None;
+        cfg.disk_written = Some(vec![0]);
+        assert!(cfg.validate().unwrap_err().contains("--disk-written needs"));
     }
 
     /// The portable profile's arch timer has no interrupts unless asked;

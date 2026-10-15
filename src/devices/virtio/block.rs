@@ -2771,4 +2771,29 @@ mod dirty_tests {
         assert!(VirtioBlk::open_with_base(&path, false, None).is_ok());
         let _ = std::fs::remove_file(&path);
     }
+
+    // A launcher that wrote files into its copy of the base before the boot
+    // names the blocks it changed, and round 0 holds them with the guest's
+    // own writes; a bitmap of another disk's size is refused.
+    #[test]
+    fn the_blocks_written_before_the_boot_start_round_0() {
+        let path = std::env::temp_dir().join(format!("hvi-blk-written-{}.img", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        std::fs::write(&path, vec![0u8; (20 * DIRTY_BLOCK_BYTES + 512) as usize]).unwrap();
+        let mut written = DirtyBlocks::for_size(20 * DIRTY_BLOCK_BYTES + 512);
+        written.mark(3 * DIRTY_BLOCK_BYTES, 1);
+        written.mark(20 * DIRTY_BLOCK_BYTES, 1);
+        let mut blk = VirtioBlk::open_with_base(&path, true, Some(written.as_bytes())).unwrap();
+        blk.write_for_test(7 * DIRTY_BLOCK_BYTES, &[1; 16]);
+        let round0 = blk.read_dirty(DirtySince::Boot).unwrap();
+        assert_eq!(round0.dirty.iter().collect::<Vec<_>>(), [3, 7, 20]);
+        drop(blk);
+        for bad in [vec![0u8; 2], vec![0u8; 4], vec![0, 0, 0x40]] {
+            let err = VirtioBlk::open_with_base(&path, true, Some(&bad))
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("--disk-written"), "{err}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
