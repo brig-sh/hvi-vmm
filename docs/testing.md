@@ -225,6 +225,18 @@ second restore onto the running guest's disk, which needs a bundle
 directory. Both modes also check that the guest's `boot_id` is the same
 after each move.
 
+With a disk, the disk moves in the stream too. The source boots with
+`--disk-base-sha256` of the fresh image, a copy of which the script keeps
+as the base, and each restore gets a new copy of the base (an APFS clone
+on a Mac, a reflink or a copy elsewhere) as its `--disk`. After each fence,
+with the source fenced and the destination restored-paused, the script
+checks that the restored disk hashes as the source's does, and that the
+move took a disk round before each RAM round, the last one paused.
+`--disk-churn` keeps the guest rewriting a 1 MiB file on its disk with
+`fsync` through the moves, so the rounds taken with the guest running carry
+blocks. `--disk-whole` moves the disk the old way: no base, and each
+restore reopens the source's image.
+
 `--dirty-mib N` starts `/dirty` (`tools/guest/dirty.c`, built static) in
 the guest before the move. It rewrites N MiB of pseudo-random pages over
 and over and checks that each page still holds what its last pass wrote,
@@ -236,16 +248,18 @@ the next round sends the page again; only a loss in the final round
 shows. `--dirty-once SECS` makes `/dirty` write each page once per cycle
 of SECS seconds instead, in a shuffled order, and check every page once a
 second, so a write lost in any round leaves a page that fails. Timers
-armed before the move then run 20 s, to outlast the rounds. `summary.json` gives each move's rounds, bytes, dirty rates,
-compression, write faults, `paused_ms` and the downtime from the end of the
-last round with the guest running to the resume reply.
+armed before the move then run 20 s, to outlast the rounds. `summary.json`
+gives each move's RAM and disk rounds, their bytes and compression, dirty
+rates, write faults, the sync before the pause, the time to hold the I/O
+threads and park the vCPUs, `paused_ms` and the downtime from the pause to
+the resume reply.
 
 ```sh
 python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
     --add dirty --out target/initramfs-stream.cpio
 tools/stream-e2e.sh --hvi target/release/hvi --kernel Image-portable \
     --initramfs target/initramfs-stream.cpio --out /tmp/stream --cpus 2 --mem 1024 \
-    --portable --dirty-mib 256
+    --portable --dirty-mib 256 --disk-churn
 ```
 
 `dirty`, `el0check` and `tfd` are static arm64 binaries:
