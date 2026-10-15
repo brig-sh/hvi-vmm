@@ -789,8 +789,18 @@ except subprocess.TimeoutExpired:
 check(third_rc == 0, f"stop ends the guest in the third process (exit {third_rc})")
 generations = None
 if image:
-    cat = subprocess.run([debugfs, "-R", "cat /after", third_disk], capture_output=True,
+    # The guest stopped without unmounting, so recent metadata may be in
+    # the journal only, which debugfs does not replay: it may then refuse
+    # the image or miss the file. Replay it on a copy first, as a mount
+    # would.
+    replayed = os.path.join(out, "replayed.img")
+    shutil.copyfile(third_disk, replayed)
+    e2fsck = os.path.join(os.path.dirname(debugfs), "e2fsck")
+    subprocess.run([e2fsck if os.path.exists(e2fsck) else "e2fsck", "-fy", replayed],
+                   capture_output=True)
+    cat = subprocess.run([debugfs, "-R", "cat /after", replayed], capture_output=True,
                          text=True)
+    os.remove(replayed)
     check(after_n is not None and cat.stdout.strip() == f"written-after {after_n}",
           f"the image holds the post-restore write: {cat.stdout.strip()!r}")
     generations = []
