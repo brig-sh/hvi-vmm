@@ -992,8 +992,30 @@ impl<K: Kick> Machine<'_, K> {
         let tracker = Tracker::new(&ram, &*write_log);
         let vcpus = self.vcpus;
         let stopping = || !vcpus.is_running();
+        // The disk moves in the rounds when the destination holds its base
+        // image; otherwise the stream has no disk rounds, and the mover
+        // copies the disk whole.
+        let block = capture.block.as_ref().map(|(dev, _)| Arc::clone(dev));
+        let disk_rounds = block
+            .as_deref()
+            .filter(|_| profile.disk_base_sha256.is_some());
         let started = Instant::now();
-        let mut precopy = match migrate::precopy(&mut stream, &ram, &tracker, &policy, &stopping) {
+        let precopy =
+            migrate::precopy(&mut stream, &ram, &tracker, disk_rounds, &policy, &stopping);
+        // The disk is synced here, with the guest still running and
+        // without the device's lock, so the sync in the pause has only the
+        // writes since left; that one took seconds on a busy host.
+        let disk_synced_at = Instant::now();
+        let precopy = precopy.and_then(|precopy| {
+            if let Some(dev) = &block {
+                let file = lock_or_recover(dev).data_file();
+                file.sync_data()
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("syncing the disk: {e}")))?;
+            }
+            Ok(precopy)
+        });
+        let disk_sync_ms = disk_synced_at.elapsed().as_millis() as u64;
+        let mut precopy = match precopy {
             Ok(precopy) => precopy,
             Err(e) => {
                 tracker.stop();
@@ -1038,8 +1060,17 @@ impl<K: Kick> Machine<'_, K> {
         };
         let sealed = (|| -> std::io::Result<_> {
             let devices = capture.device_states()?;
+            let last = migrate::final_round(
+                &mut stream,
+                &ram,
+                &tracker,
+                disk_rounds,
+                &mut precopy,
+                &stopping,
+            )?;
+            // After the final disk round, so disk.json lists it with its
+            // digest, and its generation is the disk's.
             let disk = capture.disk_state(&profile)?;
-            let last = migrate::final_round(&mut stream, &ram, &tracker, &mut precopy, &stopping)?;
             stream.write_doc(
                 "cpu.json",
                 &json(&CpuState::new(capture.arch, exported.vcpus))?,
@@ -1089,10 +1120,15 @@ impl<K: Kick> Machine<'_, K> {
         rounds.push(last);
         let ram_raw_bytes = rounds.iter().map(migrate::RoundStats::raw_bytes).sum();
         let ram_stream_bytes = rounds.iter().map(|r| r.bytes).sum();
+        let disk_rounds = precopy.disk_rounds;
         Response::Migrate {
             state: self.state,
             manifest_sha256,
             stats: Box::new(MigrateStats {
+                disk_raw_bytes: disk_rounds.iter().map(|r| r.raw_bytes).sum(),
+                disk_stream_bytes: disk_rounds.iter().map(|r| r.bytes).sum(),
+                disk_rounds,
+                disk_sync_ms,
                 final_round_bytes: rounds.last().map_or(0, |r| r.bytes),
                 rounds,
                 stop_reason: precopy.reason,
@@ -1412,6 +1448,8 @@ mod tests {
         /// A virtio-blk device the capture holds, and its path, in place of
         /// `disk`, so the test can write it as the guest would.
         blk: Option<(Arc<Mutex<VirtioBlk>>, String)>,
+        /// The profile's `disk_base_sha256`.
+        base: Option<String>,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -1533,7 +1571,9 @@ mod tests {
             ram.write(GPA + (1 << 20), &noise).unwrap();
             if spec.capture {
                 let regions = ram.regions();
+                let base = spec.base.clone();
                 cell.complete(|p| {
+                    p.disk_base_sha256 = base;
                     p.cpu.ident = Some("0x61".into());
                     p.vcpus = count;
                     p.fs_shares = spec.fs_shares;
@@ -2676,15 +2716,40 @@ mod tests {
             std::io::Result<(crate::checkpoint::stream::Received, Arc<GuestRam>)>,
             serde_json::Value,
         ) {
+            self.migrate_into(line, None)
+        }
+
+        /// As [`migrate`](Self::migrate), writing the disk rounds into
+        /// `disk`.
+        fn migrate_into(
+            &mut self,
+            line: &str,
+            disk: Option<&mut dyn crate::checkpoint::stream::DiskTarget>,
+        ) -> (
+            std::io::Result<(crate::checkpoint::stream::Received, Arc<GuestRam>)>,
+            serde_json::Value,
+        ) {
             use crate::checkpoint::stream::{receive, PageSpace, StreamReader};
             self.client.write_all(line.as_bytes()).unwrap();
             self.client.write_all(b"\n").unwrap();
-            let ram = Arc::new(GuestRam::from_ranges(&[(GPA, 1 << 20)]));
-            let target = Arc::clone(&ram);
+            let mut made = None;
             let mut reader = StreamReader::new(&mut self.replies);
-            let got = receive(&mut reader, |_| {
-                Ok((PageSpace::new(&migrate::regions_of(&target))?, target))
-            });
+            let got = receive(
+                &mut reader,
+                |profile| {
+                    // As large as the source's RAM, noise included.
+                    let profile =
+                        MachineProfile::from_json(std::str::from_utf8(profile).unwrap()).unwrap();
+                    let ram = Arc::new(GuestRam::from_ranges(&[(
+                        GPA,
+                        profile.ram_regions[0].size as usize,
+                    )]));
+                    made = Some(Arc::clone(&ram));
+                    Ok((PageSpace::new(&migrate::regions_of(&ram))?, ram))
+                },
+                disk,
+            );
+            let ram = made.unwrap_or_else(|| Arc::new(GuestRam::from_ranges(&[(GPA, 1 << 20)])));
             let reply_line = match &got {
                 // A refusal is the line where the next frame header was due,
                 // and the reader read it.
@@ -3328,5 +3393,146 @@ mod tests {
             "the base and the rounds are not the disk"
         );
         assert_eq!(r2["generation"].as_u64(), Some(disk_json.generation));
+    }
+
+    /// A record of the guest's writes for a move with a disk: at each of
+    /// its first collects it writes the next block of `writes` to `disk`,
+    /// as the guest would, and reports every page written, so the rounds
+    /// do not converge; after them it reports nothing. The collect the
+    /// final round makes, paused, finds the list empty.
+    struct DiskWritingLog {
+        disk: Arc<Mutex<VirtioBlk>>,
+        writes: Mutex<Vec<u64>>,
+    }
+
+    impl crate::memory::GuestWriteLog for DiskWritingLog {
+        fn start(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn collect(&self, into: &mut crate::memory::DirtyPages) -> std::io::Result<()> {
+            let Some(block) = self.writes.lock().unwrap().pop() else {
+                return Ok(());
+            };
+            lock_or_recover(&self.disk)
+                .write_for_test(block * DIRTY_BLOCK_BYTES + 100, &[0xd5; 64]);
+            for index in 0..into.region_count() {
+                let (_, pages) = into.region(index).unwrap();
+                into.set_range(index, 0, pages);
+            }
+            Ok(())
+        }
+        fn stop(&self) {}
+        fn granule(&self) -> u64 {
+            4096
+        }
+    }
+
+    /// A disk image in memory that a stream's disk rounds go into.
+    struct Image(Vec<u8>);
+
+    impl crate::checkpoint::stream::DiskTarget for Image {
+        fn begin(&mut self) -> std::io::Result<u64> {
+            Ok(self.0.len() as u64)
+        }
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+            self.0[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+        fn round_end(&mut self, _in_pause: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A guest whose disk has a base moves it in the migrate stream: disk
+    // round k before RAM round k, the final disk round paused, and the base
+    // with the rounds applied is the disk the source left. disk.json lists
+    // every round with the digests of what the stream carried, and its last
+    // round's generation is the disk's.
+    #[test]
+    fn a_migrate_moves_the_disk_in_its_rounds() {
+        let disk = TestDisk::new("mig-disk", 20);
+        let base = disk.bytes();
+        disk.write(2, 0xa1);
+        disk.write(3, 0xa2);
+        // Popped from the end: block 5 at the first collect, then 9, then
+        // the disk's short last block 20.
+        let log = Arc::new(DiskWritingLog {
+            disk: Arc::clone(&disk.dev),
+            writes: Mutex::new(vec![20, 9, 5]),
+        });
+        let mut f = Fixture::with(
+            "mig-disk",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                base: Some("ab".repeat(32)),
+                noise_mib: 9,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                ..Spec::default()
+            },
+        );
+        let mut image = Image(base.clone());
+        let (got, r) = f.migrate_into(
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"d1","epoch":2,"max_rounds":3}"#,
+            Some(&mut image),
+        );
+        let (received, _) = got.expect("the stream reads whole");
+        assert_eq!(r["state"], "fenced", "{r}");
+        assert!(
+            image.0 == disk.bytes(),
+            "the base and the rounds are the disk"
+        );
+        let names: Vec<&str> = received.disk.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "disk-round-0",
+                "disk-round-1",
+                "disk-round-2",
+                "disk-round-final"
+            ]
+        );
+        let blocks: Vec<u64> = received.disk.iter().map(|d| d.blocks).collect();
+        assert_eq!(blocks, [2, 1, 1, 1]);
+        let stats = &r["stats"];
+        assert_eq!(stats["disk_rounds"].as_array().unwrap().len(), 4, "{r}");
+        assert_eq!(stats["disk_rounds"][3]["in_pause"], true, "{r}");
+        assert_eq!(stats["rounds"].as_array().unwrap().len(), 4, "{r}");
+        let disk_json =
+            crate::checkpoint::bundle::parse_disk(received.doc("disk.json").unwrap()).unwrap();
+        assert_eq!(disk_json.rounds.len(), 4);
+        for (listed, got) in disk_json.rounds.iter().zip(&received.disk) {
+            assert_eq!(listed.sent_sha256.as_deref(), Some(got.sha256.as_str()));
+            assert_eq!(
+                listed.bitmap_sha256.as_deref(),
+                Some(got.bitmap_sha256.as_str())
+            );
+        }
+        assert_eq!(disk_json.rounds[3].generation, disk_json.generation);
+        assert_eq!(disk_json.generation, 5, "five writes");
+    }
+
+    // Without a base the stream has no disk rounds: the mover copies the
+    // disk whole, as before.
+    #[test]
+    fn a_migrate_without_a_base_sends_no_disk_rounds() {
+        let disk = TestDisk::new("mig-nobase", 4);
+        disk.write(1, 0x11);
+        let mut f = Fixture::with(
+            "mig-nobase",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        let (got, r) = f.migrate(r#"{"v":1,"op":"migrate","then":"continue"}"#);
+        let (received, _) = got.expect("the stream reads whole");
+        assert!(received.disk.is_empty() && received.manifest.disk.is_none());
+        assert_eq!(r["stats"]["disk_rounds"], serde_json::json!([]), "{r}");
+        assert!(received.doc("disk.json").is_some());
     }
 }

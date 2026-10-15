@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The streamed bundle, `checkpoint_format` 2: a checkpoint as one byte
-//! stream instead of a directory, so the destination reads it as the source
-//! writes it.
+//! The streamed bundle, `checkpoint_format` 3 (2 before it carried the
+//! disk): a checkpoint as one byte stream instead of a directory, so the
+//! destination reads it as the source writes it.
 //!
 //! The stream is a sequence of frames. Each frame is one line of JSON,
 //! [`FrameHeader`], `{"component":NAME,"size":N,"sha256":HEX}`, then exactly
@@ -23,7 +23,8 @@
 //! | component | frames | holds |
 //! |---|---|---|
 //! | `profile.json` | 1 | the source's machine profile |
-//! | `ram-round-0` .. `ram-round-K` | 1 or more each | guest RAM, see below |
+//! | `disk-round-k`, then `ram-round-k`, for each round `k` taken with the guest running | 1 or more each | the disk's blocks written since the disk round before (round 0: since boot), then guest RAM, see below |
+//! | `disk-round-final`, then `ram-round-K` | 1 or more each | the same, taken paused |
 //! | `cpu.json`, `platform.json`, `devices.json` | 1 each | as in the directory bundle |
 //! | `disk.json` | 1, when the guest has a disk | as in the directory bundle |
 //! | `session.json` | 1 | as in the directory bundle |
@@ -47,6 +48,14 @@
 //! | 18..20 | flags: bit 0 set means the payload is the pages as they are, clear means LZ4 |
 //! | 20..24 | the payload length |
 //!
+//! The disk rounds are there only when the guest's disk has a base image
+//! the destination holds; a stream either has a disk round before every
+//! RAM round or none at all. A disk round is a sequence of chunks of up to
+//! [`DISK_CHUNK_BLOCKS`] adjacent 64 KiB blocks, in ascending order, each
+//! block at most once (see [`DiskRoundWriter`]), which the reader writes
+//! into its copy of the base as they arrive, a later round over an earlier
+//! one. The manifest lists every disk round as it lists the RAM rounds.
+//!
 //! The payload is the present pages in order, as one LZ4 block, or as they
 //! are when LZ4 would not make them smaller. A page whose bit is clear is
 //! zero: round 0 leaves out a chunk whose pages are all zero, since fresh
@@ -67,10 +76,13 @@ use sha2::{Digest, Sha256};
 use crate::checkpoint::bundle::{hex, Component};
 use crate::checkpoint::profile::HviBuild;
 use crate::checkpoint::ram::{MAX_REGIONS, PAGE_SIZE};
+use crate::devices::virtio::block::{DirtyBlocks, DIRTY_BLOCK_BYTES};
 use crate::memory::{DirtyPages, GuestRam};
 
-/// The `checkpoint_format` of a streamed bundle.
-pub const STREAM_FORMAT: u32 = 2;
+/// The `checkpoint_format` of a streamed bundle that carries the disk's
+/// blocks. One without them is 2, as before them, and the reader takes
+/// both.
+pub const STREAM_FORMAT: u32 = 3;
 
 /// The longest frame header line the reader takes, newline included.
 pub const MAX_HEADER_LINE: usize = 1024;
@@ -103,15 +115,34 @@ const FLAG_RAW: u16 = 1;
 /// The name of the manifest component.
 pub const MANIFEST: &str = "manifest.json";
 
+/// The largest disk frame the reader takes.
+pub const MAX_DISK_FRAME: u64 = 8 << 20;
+
+/// The most blocks one disk chunk covers: 1 MiB of 64 KiB blocks.
+pub const DISK_CHUNK_BLOCKS: u64 = 16;
+
+/// The length of a disk chunk's header.
+pub const DISK_CHUNK_HEADER_LEN: usize = 24;
+
+/// The name of the disk round taken with the guest paused.
+pub const DISK_FINAL: &str = "disk-round-final";
+
 /// The name of RAM round `round`.
 #[must_use]
 pub fn round_name(round: u32) -> String {
     format!("ram-round-{round}")
 }
 
-/// Returns the round `name` is the RAM of, if it is one.
-fn round_of(name: &str) -> Option<u32> {
-    let digits = name.strip_prefix("ram-round-")?;
+/// The name of disk round `round`, taken with the guest running.
+#[must_use]
+pub fn disk_round_name(round: u32) -> String {
+    format!("disk-round-{round}")
+}
+
+/// Returns the number after `prefix` in `name`: 1 to 3 digits, with no
+/// leading zero.
+fn number_after(name: &str, prefix: &str) -> Option<u32> {
+    let digits = name.strip_prefix(prefix)?;
     if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -119,6 +150,28 @@ fn round_of(name: &str) -> Option<u32> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// Returns the round `name` is the RAM of, if it is one.
+fn round_of(name: &str) -> Option<u32> {
+    number_after(name, "ram-round-")
+}
+
+/// A disk round's place, as its component name gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskRound {
+    /// Round `k`, taken with the guest running, before RAM round `k`.
+    Running(u32),
+    /// The round taken paused, before the final RAM round.
+    Final,
+}
+
+/// Returns the disk round `name` is, if it is one.
+fn disk_round_of(name: &str) -> Option<DiskRound> {
+    if name == DISK_FINAL {
+        return Some(DiskRound::Final);
+    }
+    number_after(name, "disk-round-").map(DiskRound::Running)
 }
 
 /// Returns an `InvalidData` error naming `what`.
@@ -208,6 +261,36 @@ pub struct StreamManifest {
     pub capabilities: Vec<String>,
     /// When the source wrote the manifest, in milliseconds since the epoch.
     pub sealed_at_unix_ms: u64,
+    /// The disk rounds, when the stream carries the disk's blocks. Absent
+    /// otherwise, so a stream without them reads as it did before them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<StreamDisk>,
+}
+
+/// The disk rounds as the manifest describes them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDisk {
+    /// The size of a block, [`DIRTY_BLOCK_BYTES`].
+    pub block_size: u64,
+    /// The rounds, in stream order, the paused one last.
+    pub rounds: Vec<DiskRoundSummary>,
+}
+
+/// What one disk round carried.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskRoundSummary {
+    /// Its component name.
+    pub name: String,
+    /// Whether the source took it paused: only the last one is.
+    pub in_pause: bool,
+    /// The blocks it carries.
+    pub blocks: u64,
+    /// Their bytes before compression.
+    pub raw_bytes: u64,
+    /// The length of its frames' bytes.
+    pub bytes: u64,
 }
 
 /// Returns whether `s` is a lowercase hex SHA-256.
@@ -238,6 +321,9 @@ fn frame_limit(name: &str) -> Option<u64> {
     }
     if round_of(name).is_some() {
         return Some(MAX_RAM_FRAME);
+    }
+    if disk_round_of(name).is_some() {
+        return Some(MAX_DISK_FRAME);
     }
     DOCS.iter()
         .find(|(n, _)| *n == name)
@@ -291,6 +377,8 @@ pub struct StreamWriter<W> {
     components: Vec<StreamComponent>,
     /// The rounds written.
     rounds: Vec<RoundSummary>,
+    /// The disk rounds written.
+    disk_rounds: Vec<DiskRoundSummary>,
     /// Every byte written, headers included.
     written: u64,
 }
@@ -302,6 +390,7 @@ impl<W: Write> StreamWriter<W> {
             out,
             components: Vec::new(),
             rounds: Vec::new(),
+            disk_rounds: Vec::new(),
             written: 0,
         }
     }
@@ -360,6 +449,26 @@ impl<W: Write> StreamWriter<W> {
         }
     }
 
+    /// Starts the next disk round: the paused one with `in_pause`, else
+    /// the next one taken with the guest running.
+    pub fn disk_round(&mut self, in_pause: bool) -> DiskRoundWriter<'_, W> {
+        let name = if in_pause {
+            DISK_FINAL.to_string()
+        } else {
+            disk_round_name(self.disk_rounds.len() as u32)
+        };
+        DiskRoundWriter {
+            running: Running::new(&name),
+            summary: DiskRoundSummary {
+                name,
+                in_pause,
+                ..DiskRoundSummary::default()
+            },
+            frame: Vec::with_capacity(FRAME_TARGET + DISK_CHUNK_HEADER_LEN + DISK_CHUNK_BYTES),
+            stream: self,
+        }
+    }
+
     /// Returns the rounds written so far.
     #[must_use]
     pub fn rounds(&self) -> &[RoundSummary] {
@@ -393,7 +502,13 @@ impl<W: Write> StreamWriter<W> {
             .map(|c| c.sha256.clone())
             .ok_or_else(|| bad(MANIFEST, "the stream did not start with profile.json"))?;
         let manifest = StreamManifest {
-            checkpoint_format: STREAM_FORMAT,
+            // A stream without disk rounds is format 2 as it was, so an
+            // hvi from before them still reads it.
+            checkpoint_format: if self.disk_rounds.is_empty() {
+                2
+            } else {
+                STREAM_FORMAT
+            },
             hvi_build: build,
             components: self.components.clone(),
             ram: StreamRam {
@@ -404,6 +519,10 @@ impl<W: Write> StreamWriter<W> {
             profile_sha256,
             capabilities,
             sealed_at_unix_ms,
+            disk: (!self.disk_rounds.is_empty()).then(|| StreamDisk {
+                block_size: DIRTY_BLOCK_BYTES,
+                rounds: self.disk_rounds.clone(),
+            }),
         };
         let bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
         if bytes.len() as u64 > MAX_MANIFEST {
@@ -514,6 +633,132 @@ impl<W: Write> RoundWriter<'_, W> {
         self.stream.components.push(component);
         self.stream.rounds.push(self.summary.clone());
         Ok(self.summary.clone())
+    }
+}
+
+/// The largest uncompressed payload of a disk chunk.
+const DISK_CHUNK_BYTES: usize = (DISK_CHUNK_BLOCKS * DIRTY_BLOCK_BYTES) as usize;
+
+/// One disk round being written: chunks of adjacent blocks gathered into
+/// frames of about [`FRAME_TARGET`] bytes.
+///
+/// A disk chunk is a [`DISK_CHUNK_HEADER_LEN`]-byte header, little-endian,
+/// then its payload:
+///
+/// | bytes | field |
+/// |---|---|
+/// | 0..8 | the first block |
+/// | 8..12 | the block count, 1 to [`DISK_CHUNK_BLOCKS`] |
+/// | 12..16 | flags: bit 0 set means the payload is the blocks as they are, clear means LZ4 |
+/// | 16..20 | the length of the blocks: whole blocks, but the disk's last, which may be short |
+/// | 20..24 | the payload length |
+pub struct DiskRoundWriter<'a, W: Write> {
+    /// Its running hash.
+    running: Running,
+    /// What it carried.
+    summary: DiskRoundSummary,
+    /// The frame being filled.
+    frame: Vec<u8>,
+    /// The stream it belongs to.
+    stream: &'a mut StreamWriter<W>,
+}
+
+impl<W: Write> DiskRoundWriter<'_, W> {
+    /// Adds a chunk of the `count` blocks from block `first`, whose bytes
+    /// are `blocks`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `count` is not 1 to [`DISK_CHUNK_BLOCKS`], `blocks` is
+    /// not `count` blocks long (the last may be short), or a write fails.
+    pub fn chunk(
+        &mut self,
+        enc: &mut DiskEncoder,
+        first: u64,
+        count: u64,
+        blocks: &[u8],
+    ) -> io::Result<()> {
+        let len = blocks.len() as u64;
+        if count == 0
+            || count > DISK_CHUNK_BLOCKS
+            || len > count * DIRTY_BLOCK_BYTES
+            || len <= (count - 1) * DIRTY_BLOCK_BYTES
+        {
+            return Err(io::Error::other(format!(
+                "a disk chunk of {len} bytes is not {count} blocks"
+            )));
+        }
+        enc.encode(first, count, blocks, &mut self.frame);
+        self.summary.blocks += count;
+        self.summary.raw_bytes += len;
+        if self.frame.len() >= FRAME_TARGET {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the frame being filled, if it holds anything.
+    fn flush(&mut self) -> io::Result<()> {
+        if self.frame.is_empty() {
+            return Ok(());
+        }
+        self.stream.frame(&self.summary.name, &self.frame)?;
+        self.running.add(&self.frame);
+        self.summary.bytes += self.frame.len() as u64;
+        self.frame.clear();
+        Ok(())
+    }
+
+    /// Ends the round and returns what it carried with the SHA-256 of all
+    /// its frames' bytes, the digest the manifest lists for it. A round
+    /// with no block is written as one empty frame.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the write fails.
+    pub fn finish(mut self) -> io::Result<(DiskRoundSummary, String)> {
+        self.flush()?;
+        if self.running.frames == 0 {
+            self.stream.frame(&self.summary.name, &[])?;
+            self.running.add(&[]);
+        }
+        let component = std::mem::replace(&mut self.running, Running::new("")).finish();
+        let sha256 = component.sha256.clone();
+        self.stream.components.push(component);
+        self.stream.disk_rounds.push(self.summary.clone());
+        Ok((self.summary.clone(), sha256))
+    }
+}
+
+/// The buffer a disk chunk is compressed into, reused from chunk to chunk.
+pub struct DiskEncoder {
+    /// The LZ4 block.
+    compressed: Vec<u8>,
+}
+
+impl Default for DiskEncoder {
+    fn default() -> Self {
+        Self {
+            compressed: vec![0; lz4_flex::block::get_maximum_output_size(DISK_CHUNK_BYTES)],
+        }
+    }
+}
+
+impl DiskEncoder {
+    /// Appends the chunk of the `count` blocks from `first`, `blocks`, to
+    /// `out`, compressed unless that would make it larger.
+    fn encode(&mut self, first: u64, count: u64, blocks: &[u8], out: &mut Vec<u8>) {
+        let (flags, payload): (u32, &[u8]) =
+            match lz4_flex::block::compress_into(blocks, &mut self.compressed) {
+                Ok(n) if n < blocks.len() => (0, &self.compressed[..n]),
+                _ => (u32::from(FLAG_RAW), blocks),
+            };
+        out.extend_from_slice(&first.to_le_bytes());
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
     }
 }
 
@@ -806,6 +1051,213 @@ impl RamApplier {
     }
 }
 
+/// The disk a stream's disk rounds are written into.
+pub trait DiskTarget {
+    /// Makes the disk ready for the first block and returns its size in
+    /// bytes. Called once, when the first disk round arrives.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the disk cannot take the blocks; the stream is then
+    /// refused before a block is written.
+    fn begin(&mut self) -> io::Result<u64>;
+
+    /// Writes `bytes` at byte `offset` of the disk.
+    ///
+    /// # Errors
+    ///
+    /// Errors as the write does.
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()>;
+
+    /// Called as each disk round ends, `in_pause` for the final one, which
+    /// is called before the final RAM round is read.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the disk cannot keep what was written.
+    fn round_end(&mut self, in_pause: bool) -> io::Result<()>;
+}
+
+/// What one disk round wrote, as [`receive`] applied it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedDisk {
+    /// Its component name.
+    pub name: String,
+    /// Whether it is the round taken paused.
+    pub in_pause: bool,
+    /// The blocks it wrote.
+    pub blocks: u64,
+    /// Their bytes.
+    pub raw_bytes: u64,
+    /// The SHA-256 of the bitmap of the blocks it wrote, in the bit order
+    /// of `disk-dirty`'s `bitmap_b64`, as lowercase hex.
+    pub bitmap_sha256: String,
+    /// The SHA-256 of all its frames' bytes, as the manifest lists it.
+    pub sha256: String,
+}
+
+/// Writes disk round chunks into the disk as they arrive.
+struct DiskApplier {
+    /// The size of the disk in bytes.
+    size: u64,
+    /// The decompressed payload of a chunk.
+    scratch: Vec<u8>,
+    /// The round being applied: its name and whether it is the paused one.
+    round: Option<(String, bool)>,
+    /// The blocks the round wrote so far.
+    bitmap: DirtyBlocks,
+    /// The last block it wrote.
+    last: Option<u64>,
+    /// Its blocks and bytes so far.
+    blocks: u64,
+    /// Their bytes.
+    raw_bytes: u64,
+}
+
+impl DiskApplier {
+    /// Returns an applier for a disk of `size` bytes.
+    fn new(size: u64) -> Self {
+        Self {
+            size,
+            scratch: vec![0; DISK_CHUNK_BYTES],
+            round: None,
+            bitmap: DirtyBlocks::for_size(size),
+            last: None,
+            blocks: 0,
+            raw_bytes: 0,
+        }
+    }
+
+    /// Starts the round `name`.
+    fn start(&mut self, name: &str, in_pause: bool) {
+        self.round = Some((name.to_string(), in_pause));
+        self.bitmap = DirtyBlocks::for_size(self.size);
+        self.last = None;
+        self.blocks = 0;
+        self.raw_bytes = 0;
+    }
+
+    /// Ends the round and returns what it wrote; `sha256` is its
+    /// component's digest.
+    fn end(&mut self, sha256: String) -> AppliedDisk {
+        let (name, in_pause) = self.round.take().unwrap_or_default();
+        AppliedDisk {
+            name,
+            in_pause,
+            blocks: self.blocks,
+            raw_bytes: self.raw_bytes,
+            bitmap_sha256: hex(&Sha256::digest(self.bitmap.as_bytes())),
+            sha256,
+        }
+    }
+
+    /// Returns the length of block `block`: a whole block, or less for the
+    /// last block of a disk that is not whole blocks; `None` past the disk.
+    fn block_len(&self, block: u64) -> Option<u64> {
+        let start = block.checked_mul(DIRTY_BLOCK_BYTES)?;
+        (start < self.size).then(|| (self.size - start).min(DIRTY_BLOCK_BYTES))
+    }
+
+    /// Applies every chunk of one disk frame to `target`. Every chunk
+    /// header is checked before the first block is written.
+    ///
+    /// # Errors
+    ///
+    /// Errors, naming `name`, when a chunk is short, covers blocks past the
+    /// disk or not after the round's last one, sets a flag no writer sets,
+    /// or its payload is not exactly its blocks.
+    fn apply(&mut self, name: &str, frame: &[u8], target: &mut dyn DiskTarget) -> io::Result<()> {
+        let mut chunks = Vec::new();
+        let mut rest = frame;
+        let mut last = self.last;
+        while !rest.is_empty() {
+            if rest.len() < DISK_CHUNK_HEADER_LEN {
+                return Err(bad(name, "a disk chunk header is cut short"));
+            }
+            let (h, tail) = rest.split_at(DISK_CHUNK_HEADER_LEN);
+            let first = u64::from_le_bytes(h[0..8].try_into().expect("8 bytes"));
+            let count = u64::from(u32::from_le_bytes(h[8..12].try_into().expect("4 bytes")));
+            let flags = u32::from_le_bytes(h[12..16].try_into().expect("4 bytes"));
+            let raw_len = u32::from_le_bytes(h[16..20].try_into().expect("4 bytes")) as usize;
+            let len = u32::from_le_bytes(h[20..24].try_into().expect("4 bytes")) as usize;
+            if count == 0 || count > DISK_CHUNK_BLOCKS {
+                return Err(bad(name, format!("a disk chunk of {count} blocks")));
+            }
+            if flags & !u32::from(FLAG_RAW) != 0 {
+                return Err(bad(
+                    name,
+                    format!("disk chunk at block {first}: flags {flags:#x}"),
+                ));
+            }
+            if last.is_some_and(|l| first <= l) {
+                return Err(bad(
+                    name,
+                    format!(
+                        "disk chunk at block {first} is not after block {}",
+                        last.unwrap_or_default()
+                    ),
+                ));
+            }
+            let end = first
+                .checked_add(count - 1)
+                .ok_or_else(|| bad(name, "a disk chunk past every disk"))?;
+            let mut want = 0u64;
+            for block in first..=end {
+                want += self.block_len(block).ok_or_else(|| {
+                    bad(
+                        name,
+                        format!(
+                            "disk chunk at block {first}: block {block} is past the {}-byte \
+                             disk",
+                            self.size
+                        ),
+                    )
+                })?;
+            }
+            let raw = flags & u32::from(FLAG_RAW) != 0;
+            let fits = if raw {
+                len == raw_len
+            } else {
+                len > 0 && len <= lz4_flex::block::get_maximum_output_size(raw_len)
+            };
+            if raw_len as u64 != want || !fits || len > tail.len() {
+                return Err(bad(
+                    name,
+                    format!(
+                        "disk chunk at block {first}: {raw_len} bytes of blocks in a {len}-byte \
+                         payload, for {count} blocks of {want} bytes"
+                    ),
+                ));
+            }
+            let (payload, after) = tail.split_at(len);
+            chunks.push((first, count, raw, raw_len, payload));
+            last = Some(end);
+            rest = after;
+        }
+        for (first, count, raw, raw_len, payload) in chunks {
+            let data: &[u8] = if raw {
+                payload
+            } else {
+                let n = lz4_flex::block::decompress_into(payload, &mut self.scratch[..raw_len])
+                    .map_err(|e| bad(name, format!("disk chunk at block {first}: {e}")))?;
+                if n != raw_len {
+                    return Err(bad(
+                        name,
+                        format!("disk chunk at block {first} holds {n} bytes, not {raw_len}"),
+                    ));
+                }
+                &self.scratch[..raw_len]
+            };
+            target.write_at(first * DIRTY_BLOCK_BYTES, data)?;
+            self.bitmap.mark(first * DIRTY_BLOCK_BYTES, raw_len as u64);
+            self.blocks += count;
+            self.raw_bytes += raw_len as u64;
+            self.last = Some(first + count - 1);
+        }
+        Ok(())
+    }
+}
+
 /// One chunk of a frame, checked.
 struct Chunk<'f> {
     /// Its first page, counted across regions.
@@ -949,6 +1401,16 @@ impl<R: BufRead> StreamReader<R> {
         })
     }
 
+    /// Returns the SHA-256 of all the frames read so far of the last
+    /// component named `name`.
+    fn sha256_of(&self, name: &str) -> Option<String> {
+        self.seen
+            .iter()
+            .rev()
+            .find(|c| c.name == name)
+            .map(|c| hex(&c.hasher.clone().finalize()))
+    }
+
     /// Returns what was read of every component, for the manifest check.
     fn received(&mut self) -> Vec<StreamComponent> {
         std::mem::take(&mut self.seen)
@@ -975,6 +1437,8 @@ pub struct Received {
     pub stream_bytes: u64,
     /// The pages the rounds covered, round by round, as applied.
     pub applied: Vec<FrameCount>,
+    /// The disk rounds, in order, as applied.
+    pub disk: Vec<AppliedDisk>,
 }
 
 impl Received {
@@ -990,7 +1454,9 @@ impl Received {
 
 /// Reads a whole stream from `reader`. `prepare` gets `profile.json` once it
 /// is read and checked, and returns the guest RAM the rounds are applied
-/// to, laid out as the profile's regions.
+/// to, laid out as the profile's regions. `disk` takes the blocks of the
+/// disk rounds, when the stream has them; a stream with disk rounds and no
+/// `disk` is refused before a block is written.
 ///
 /// Each frame's hash is checked before its bytes are used, the components
 /// must come in the order of the module documentation, and the manifest
@@ -1001,11 +1467,13 @@ impl Received {
 /// # Errors
 ///
 /// Errors, naming the component, on the first thing that does not hold.
-/// Pages applied before the error stay applied, so the caller discards the
-/// RAM.
+/// Pages and blocks applied before the error stay applied, so the caller
+/// discards the RAM and the disk.
+#[allow(clippy::too_many_lines)]
 pub fn receive<R: BufRead>(
     reader: &mut StreamReader<R>,
     prepare: impl FnOnce(&[u8]) -> io::Result<(PageSpace, std::sync::Arc<GuestRam>)>,
+    mut disk: Option<&mut dyn DiskTarget>,
 ) -> io::Result<Received> {
     let first = reader.next_frame()?;
     if first.name != "profile.json" {
@@ -1018,36 +1486,135 @@ pub fn receive<R: BufRead>(
     let (space, ram) = prepare(&profile)?;
     let mut applier = RamApplier::new(space, &ram);
     let mut applied: Vec<FrameCount> = Vec::new();
+    let mut disk_applier: Option<DiskApplier> = None;
+    let mut disks: Vec<AppliedDisk> = Vec::new();
+    // The disk rounds taken with the guest running, and whether the paused
+    // one was read: each RAM round k follows disk round k, and the final
+    // RAM round the paused disk round.
+    let mut running_disk = 0u32;
+    let mut disk_final = false;
+    let mut current: Option<String> = None;
     let mut frame = reader.next_frame()?;
-    // The RAM rounds: 0, then each one either goes on or is the next.
-    while let Some(round) = round_of(&frame.name) {
-        let expected = applied.len() as u32;
-        let continues = expected > 0 && round == expected - 1;
-        if !continues && round != expected {
-            return Err(bad(
-                &frame.name,
-                format!("came after {} RAM round(s)", applied.len()),
-            ));
-        }
+    loop {
+        let continues = current.as_deref() == Some(frame.name.as_str());
         if !continues {
-            if round >= MAX_ROUNDS {
-                return Err(bad(
-                    &frame.name,
-                    format!("more than {MAX_ROUNDS} RAM rounds"),
-                ));
+            // A disk round ends where the next component starts.
+            if let (Some(name), Some(d)) = (current.as_deref(), disk_applier.as_mut()) {
+                if disk_round_of(name).is_some() {
+                    let sha256 = reader.sha256_of(name).unwrap_or_default();
+                    disks.push(d.end(sha256));
+                    if let Some(target) = disk.as_deref_mut() {
+                        target.round_end(name == DISK_FINAL)?;
+                    }
+                }
             }
-            applied.push(FrameCount::default());
         }
-        let got = applier.apply(&frame.name, &frame.bytes, &ram)?;
-        let last = applied.last_mut().expect("a round was pushed");
-        last.pages += got.pages;
-        last.data_pages += got.data_pages;
+        if let Some(round) = round_of(&frame.name) {
+            if !continues {
+                let expected = applied.len() as u32;
+                if round != expected {
+                    return Err(bad(
+                        &frame.name,
+                        format!("came after {} RAM round(s)", applied.len()),
+                    ));
+                }
+                if round >= MAX_ROUNDS {
+                    return Err(bad(
+                        &frame.name,
+                        format!("more than {MAX_ROUNDS} RAM rounds"),
+                    ));
+                }
+                let with_disk = running_disk > 0 || disk_final;
+                let disk_ok = if disk_final {
+                    round == running_disk
+                } else {
+                    running_disk == round + 1
+                };
+                if with_disk && !disk_ok {
+                    return Err(bad(
+                        &frame.name,
+                        if disk_final && round > running_disk {
+                            "came after the final RAM round".to_string()
+                        } else {
+                            format!("came without disk round {round} before it")
+                        },
+                    ));
+                }
+                applied.push(FrameCount::default());
+                current = Some(frame.name.clone());
+            }
+            let got = applier.apply(&frame.name, &frame.bytes, &ram)?;
+            let last = applied.last_mut().expect("a round was pushed");
+            last.pages += got.pages;
+            last.data_pages += got.data_pages;
+        } else if let Some(round) = disk_round_of(&frame.name) {
+            if !continues {
+                let k = applied.len() as u32;
+                let fits = match round {
+                    DiskRound::Running(r) => !disk_final && r == k && r == running_disk,
+                    DiskRound::Final => !disk_final && running_disk == k && k > 0,
+                };
+                if !fits {
+                    return Err(bad(
+                        &frame.name,
+                        format!(
+                            "came after {k} RAM round(s) and {running_disk} disk round(s){}",
+                            if disk_final { " and the final one" } else { "" }
+                        ),
+                    ));
+                }
+                if disk_applier.is_none() {
+                    let target = disk.as_deref_mut().ok_or_else(|| {
+                        bad(
+                            &frame.name,
+                            "the stream carries the disk's blocks, and the restore was given no \
+                             disk to write them into",
+                        )
+                    })?;
+                    disk_applier = Some(DiskApplier::new(target.begin()?));
+                }
+                let in_pause = round == DiskRound::Final;
+                if in_pause {
+                    disk_final = true;
+                } else {
+                    running_disk += 1;
+                }
+                disk_applier
+                    .as_mut()
+                    .expect("made above")
+                    .start(&frame.name, in_pause);
+                current = Some(frame.name.clone());
+            }
+            let target = disk.as_deref_mut().expect("checked at the round's start");
+            disk_applier
+                .as_mut()
+                .expect("made at the round's start")
+                .apply(&frame.name, &frame.bytes, target)?;
+        } else {
+            break;
+        }
         frame = reader.next_frame()?;
     }
     if applied.is_empty() {
         return Err(bad(
             "stream",
             format!("{} came before any RAM round", frame.name),
+        ));
+    }
+    if (running_disk > 0 || disk_final) && !(disk_final && applied.len() as u32 == running_disk + 1)
+    {
+        return Err(bad(
+            "stream",
+            format!(
+                "{} came after {} RAM round(s) and {running_disk} disk round(s), {}",
+                frame.name,
+                applied.len(),
+                if disk_final {
+                    "the final one before the last RAM round"
+                } else {
+                    "but not the final disk round"
+                }
+            ),
         ));
     }
     let mut docs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1072,7 +1639,7 @@ pub fn receive<R: BufRead>(
     let manifest: StreamManifest =
         serde_json::from_slice(&manifest_bytes).map_err(|e| bad(MANIFEST, e))?;
     let received = reader.received();
-    check_manifest(&manifest, &received, &applied)?;
+    check_manifest(&manifest, &received, &applied, &disks)?;
     Ok(Received {
         profile,
         docs,
@@ -1081,6 +1648,7 @@ pub fn receive<R: BufRead>(
         manifest_bytes,
         stream_bytes: reader.bytes_read(),
         applied,
+        disk: disks,
     })
 }
 
@@ -1089,12 +1657,13 @@ fn check_manifest(
     manifest: &StreamManifest,
     received: &[StreamComponent],
     applied: &[FrameCount],
+    disks: &[AppliedDisk],
 ) -> io::Result<()> {
-    if manifest.checkpoint_format != STREAM_FORMAT {
+    if !(2..=STREAM_FORMAT).contains(&manifest.checkpoint_format) {
         return Err(bad(
             MANIFEST,
             format!(
-                "checkpoint_format {}, a stream is {STREAM_FORMAT}",
+                "checkpoint_format {}, a stream is 2 to {STREAM_FORMAT}",
                 manifest.checkpoint_format
             ),
         ));
@@ -1166,6 +1735,60 @@ fn check_manifest(
     let profile = received.first().map(|c| c.sha256.as_str());
     if profile != Some(manifest.profile_sha256.as_str()) {
         return Err(bad(MANIFEST, "profile_sha256 is not the profile's"));
+    }
+    check_disk_rounds(manifest, received, disks)
+}
+
+/// Checks the manifest's disk rounds against the ones applied.
+fn check_disk_rounds(
+    manifest: &StreamManifest,
+    received: &[StreamComponent],
+    disks: &[AppliedDisk],
+) -> io::Result<()> {
+    let listed = manifest.disk.as_ref().map_or(&[][..], |d| &d.rounds[..]);
+    if let Some(d) = &manifest.disk {
+        if d.block_size != DIRTY_BLOCK_BYTES || d.rounds.is_empty() {
+            return Err(bad(
+                MANIFEST,
+                format!(
+                    "disk lists {} round(s) of {}-byte blocks, and a stream has at least one of \
+                     {DIRTY_BLOCK_BYTES}",
+                    d.rounds.len(),
+                    d.block_size
+                ),
+            ));
+        }
+    }
+    if listed.len() != disks.len() {
+        return Err(bad(
+            MANIFEST,
+            format!(
+                "lists {} disk round(s), and the stream held {}",
+                listed.len(),
+                disks.len()
+            ),
+        ));
+    }
+    for (round, got) in listed.iter().zip(disks) {
+        let size = received
+            .iter()
+            .find(|c| c.name == got.name)
+            .map_or(0, |c| c.size);
+        if round.name != got.name
+            || round.in_pause != got.in_pause
+            || round.blocks != got.blocks
+            || round.raw_bytes != got.raw_bytes
+            || round.bytes != size
+        {
+            return Err(bad(
+                MANIFEST,
+                format!(
+                    "disk round {} lists {} blocks of {} bytes, and the stream held {} of {} \
+                     in {}",
+                    round.name, round.blocks, round.raw_bytes, got.blocks, got.raw_bytes, got.name
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1252,7 +1875,11 @@ mod tests {
         let ram = guest();
         let mut reader = StreamReader::new(io::BufReader::new(bytes));
         let target = Arc::clone(&ram);
-        let got = receive(&mut reader, |_| Ok((PageSpace::new(&regions())?, target)))?;
+        let got = receive(
+            &mut reader,
+            |_| Ok((PageSpace::new(&regions())?, target)),
+            None,
+        )?;
         Ok((got, ram))
     }
 
@@ -1309,7 +1936,12 @@ mod tests {
         let ram = guest();
         let mut reader = StreamReader::new(io::BufReader::new(&bytes[..]));
         let target = Arc::clone(&ram);
-        receive(&mut reader, |_| Ok((PageSpace::new(&regions())?, target))).unwrap();
+        receive(
+            &mut reader,
+            |_| Ok((PageSpace::new(&regions())?, target)),
+            None,
+        )
+        .unwrap();
         let mut set = DirtyPages::new(&ram.regions());
         ram.dirty_log().take_into(&mut set).unwrap();
         // Page 0: written by round 0, zeroed by round 1. Page 1: never.
@@ -1590,5 +2222,345 @@ mod tests {
         ] {
             assert_eq!(round_of(bad), None, "{bad}");
         }
+    }
+
+    /// A disk of 20 whole blocks and a short last one.
+    const DISK_SIZE: u64 = 20 * DIRTY_BLOCK_BYTES + 1000;
+
+    /// A disk in memory, as the destination's copy of the base.
+    struct MemDisk {
+        bytes: Vec<u8>,
+        begun: u32,
+        finished: u32,
+        writes: u32,
+    }
+
+    impl MemDisk {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                begun: 0,
+                finished: 0,
+                writes: 0,
+            }
+        }
+    }
+
+    impl DiskTarget for MemDisk {
+        fn begin(&mut self) -> io::Result<u64> {
+            self.begun += 1;
+            Ok(self.bytes.len() as u64)
+        }
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+            self.writes += 1;
+            self.bytes[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+        fn round_end(&mut self, in_pause: bool) -> io::Result<()> {
+            if in_pause {
+                self.finished += 1;
+            }
+            Ok(())
+        }
+    }
+
+    /// Returns the base image the tests' disks start from.
+    fn base_disk() -> Vec<u8> {
+        (0..DISK_SIZE).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Writes a stream whose rounds each carry a disk round, the last one
+    /// paused: round `k` sends the blocks `rounds[k].1` read from the image
+    /// `rounds[k].0`. RAM rounds carry nothing.
+    fn disk_stream(rounds: &[(&[u8], &[u64])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut w = StreamWriter::new(&mut out);
+        w.write_doc("profile.json", b"{\"p\":1}").unwrap();
+        let mut enc = DiskEncoder::default();
+        let mut ram = ChunkEncoder::default();
+        for (k, (image, blocks)) in rounds.iter().enumerate() {
+            let in_pause = k + 1 == rounds.len();
+            let mut round = w.disk_round(in_pause);
+            for &block in *blocks {
+                let start = (block * DIRTY_BLOCK_BYTES) as usize;
+                let end = (start + DIRTY_BLOCK_BYTES as usize).min(image.len());
+                round.chunk(&mut enc, block, 1, &image[start..end]).unwrap();
+            }
+            round.finish().unwrap();
+            let mut r = w.round(in_pause);
+            r.chunk(&mut ram, 0, &page_of(k as u8), false).unwrap();
+            r.finish().unwrap();
+        }
+        for (name, _) in DOCS {
+            if name != "disk.json" {
+                w.write_doc(name, b"{}").unwrap();
+            }
+        }
+        w.seal(build(), regions(), vec![], 1).unwrap();
+        out
+    }
+
+    fn read_disk(bytes: &[u8], disk: &mut MemDisk) -> io::Result<Received> {
+        let ram = guest();
+        let mut reader = StreamReader::new(io::BufReader::new(bytes));
+        receive(
+            &mut reader,
+            |_| Ok((PageSpace::new(&regions())?, ram)),
+            Some(disk),
+        )
+    }
+
+    /// Returns the bitmap digest of `blocks` on a disk of [`DISK_SIZE`].
+    fn bitmap_sha(blocks: &[u64]) -> String {
+        let mut set = DirtyBlocks::for_size(DISK_SIZE);
+        for &b in blocks {
+            set.mark(b * DIRTY_BLOCK_BYTES, 1);
+        }
+        hex(&Sha256::digest(set.as_bytes()))
+    }
+
+    /// Three disk rounds over the base: round 0 with blocks 0 to 2, 5 and
+    /// the short last one, round 1 block 1 written again, the final block 5
+    /// written again; and the source image after each.
+    fn three_rounds() -> (Vec<u8>, Vec<u8>) {
+        let mut image = base_disk();
+        image[..3 * DIRTY_BLOCK_BYTES as usize].fill(7);
+        image[(5 * DIRTY_BLOCK_BYTES) as usize] = 9;
+        let last = image.len() - 1;
+        image[last] = 1;
+        let first = image.clone();
+        image[(DIRTY_BLOCK_BYTES + 3) as usize] = 0xaa;
+        let second = image.clone();
+        image[(5 * DIRTY_BLOCK_BYTES + 7) as usize] = 0xbb;
+        let bytes = disk_stream(&[(&first, &[0, 1, 2, 5, 20]), (&second, &[1]), (&image, &[5])]);
+        (bytes, image)
+    }
+
+    #[test]
+    fn disk_rounds_round_trip_and_later_rounds_win() {
+        let (bytes, image) = three_rounds();
+        let mut disk = MemDisk::new(base_disk());
+        let got = read_disk(&bytes, &mut disk).unwrap();
+        assert!(
+            disk.bytes == image,
+            "the destination holds the last rounds' blocks"
+        );
+        assert_eq!((disk.begun, disk.finished), (1, 1));
+        let names: Vec<&str> = got.disk.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["disk-round-0", "disk-round-1", DISK_FINAL]);
+        assert_eq!(got.disk[0].blocks, 5);
+        assert_eq!(got.disk[0].raw_bytes, 4 * DIRTY_BLOCK_BYTES + 1000);
+        assert_eq!(got.disk[0].bitmap_sha256, bitmap_sha(&[0, 1, 2, 5, 20]));
+        assert_eq!(got.disk[2].bitmap_sha256, bitmap_sha(&[5]));
+        assert!(got.disk[2].in_pause && !got.disk[1].in_pause);
+        // Each round's digest is its component's, which the manifest lists.
+        for d in &got.disk {
+            let listed = got.manifest.components.iter().find(|c| c.name == d.name);
+            assert_eq!(listed.map(|c| c.sha256.as_str()), Some(d.sha256.as_str()));
+        }
+        let listed = got
+            .manifest
+            .disk
+            .as_ref()
+            .expect("the manifest lists the disk");
+        assert_eq!(listed.rounds.len(), 3);
+        assert_eq!(listed.block_size, DIRTY_BLOCK_BYTES);
+        assert_eq!(got.manifest.checkpoint_format, STREAM_FORMAT);
+        // Blocks of one value compress.
+        assert!(listed.rounds[0].bytes < listed.rounds[0].raw_bytes / 4);
+    }
+
+    #[test]
+    fn a_stream_without_disk_rounds_has_no_disk_in_its_manifest() {
+        let src = guest();
+        let bytes = stream(&src, &[], true);
+        let mut disk = MemDisk::new(base_disk());
+        let got = read_disk(&bytes, &mut disk).unwrap();
+        assert!(got.disk.is_empty() && got.manifest.disk.is_none());
+        assert_eq!(got.manifest.checkpoint_format, 2);
+        assert_eq!((disk.begun, disk.writes), (0, 0));
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        assert!(!text.contains("\"disk\""), "a reader of format 2 takes it");
+    }
+
+    fn disk_refusal(bytes: &[u8]) -> String {
+        read_disk(bytes, &mut MemDisk::new(base_disk()))
+            .expect_err("refused")
+            .to_string()
+    }
+
+    // Every disk round is covered by the manifest and by the order: one
+    // left out, a forged one whose frame checks out, or the paused one
+    // missing, is refused.
+    #[test]
+    fn the_manifest_and_the_order_cover_the_disk_rounds() {
+        let (bytes, _) = three_rounds();
+        let mut f = frames(&bytes);
+        f.retain(|(h, _)| h.component != "disk-round-1");
+        let why = disk_refusal(&join(&f));
+        assert!(
+            why.contains("ram-round-1: came without disk round 1"),
+            "{why}"
+        );
+
+        let mut f = frames(&bytes);
+        f.retain(|(h, _)| h.component != DISK_FINAL);
+        let why = disk_refusal(&join(&f));
+        assert!(
+            why.contains("ram-round-2: came without disk round 2"),
+            "{why}"
+        );
+
+        // A disk round's bytes replaced by another valid round's, frame
+        // header and all: the frame checks out, the manifest does not.
+        let mut f = frames(&bytes);
+        let one = f
+            .iter()
+            .position(|(h, _)| h.component == "disk-round-1")
+            .unwrap();
+        let zero = f
+            .iter()
+            .position(|(h, _)| h.component == "disk-round-0")
+            .unwrap();
+        f[one].1 = f[zero].1.clone();
+        f[one].0.size = f[one].1.len() as u64;
+        f[one].0.sha256 = hex(&Sha256::digest(&f[one].1));
+        let why = disk_refusal(&join(&f));
+        assert!(why.contains("disk-round-1 differ"), "{why}");
+
+        // A disk round sent twice.
+        let mut f = frames(&bytes);
+        let again = f[zero].clone();
+        f.insert(zero + 1, again);
+        let why = disk_refusal(&join(&f));
+        assert!(
+            why.contains("disk-round-0") && why.contains("not after block"),
+            "{why}"
+        );
+
+        // The paused disk round after the RAM round it belongs before.
+        let mut f = frames(&bytes);
+        let fin = f
+            .iter()
+            .position(|(h, _)| h.component == DISK_FINAL)
+            .unwrap();
+        f.swap(fin, fin + 1);
+        let why = disk_refusal(&join(&f));
+        assert!(
+            why.contains("ram-round-2: came without disk round 2"),
+            "{why}"
+        );
+
+        // A RAM round after the final one.
+        let mut f = frames(&bytes);
+        let extra = f
+            .iter()
+            .position(|(h, _)| h.component == "ram-round-2")
+            .unwrap();
+        let mut again = f[extra].clone();
+        again.0.component = "ram-round-3".into();
+        f.insert(extra + 1, again);
+        let why = disk_refusal(&join(&f));
+        assert!(
+            why.contains("ram-round-3: came after the final RAM round"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn disk_rounds_need_a_disk_to_go_into() {
+        let (bytes, _) = three_rounds();
+        let ram = guest();
+        let mut reader = StreamReader::new(io::BufReader::new(&bytes[..]));
+        let why = receive(
+            &mut reader,
+            |_| Ok((PageSpace::new(&regions())?, ram)),
+            None,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            why.contains("disk-round-0: the stream carries the disk's blocks"),
+            "{why}"
+        );
+    }
+
+    /// Returns a one-chunk disk frame from its header fields and payload.
+    fn disk_chunk(first: u64, count: u32, flags: u32, raw: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(first.to_le_bytes());
+        out.extend(count.to_le_bytes());
+        out.extend(flags.to_le_bytes());
+        out.extend(raw.to_le_bytes());
+        out.extend((payload.len() as u32).to_le_bytes());
+        out.extend(payload);
+        out
+    }
+
+    // Every chunk of a frame is checked against the disk before its first
+    // block is written: none of the bad frames below writes a byte.
+    #[test]
+    fn disk_chunks_are_checked_before_a_block_is_written() {
+        let whole = vec![3u8; DIRTY_BLOCK_BYTES as usize];
+        let good = disk_chunk(0, 1, 1, DIRTY_BLOCK_BYTES as u32, &whole);
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                [good.clone(), disk_chunk(21, 1, 1, 4, &[0; 4])].concat(),
+                "past the",
+            ),
+            (
+                [good.clone(), disk_chunk(20, 1, 1, 999, &[0; 999])].concat(),
+                "999 bytes",
+            ),
+            ([good.clone(), good.clone()].concat(), "not after block 0"),
+            (
+                [good.clone(), disk_chunk(1, 0, 1, 0, &[])].concat(),
+                "of 0 blocks",
+            ),
+            (
+                [good.clone(), disk_chunk(1, 17, 1, 0, &[])].concat(),
+                "of 17 blocks",
+            ),
+            (
+                [good.clone(), disk_chunk(1, 1, 2, 0, &[])].concat(),
+                "flags 0x2",
+            ),
+            ([good.clone(), good[..20].to_vec()].concat(), "cut short"),
+            (
+                [good.clone(), disk_chunk(u64::MAX, 2, 1, 0, &[])].concat(),
+                "past every disk",
+            ),
+        ];
+        for (frame, want) in cases {
+            let mut disk = MemDisk::new(base_disk());
+            let mut applier = DiskApplier::new(DISK_SIZE);
+            applier.start("disk-round-0", false);
+            let why = applier
+                .apply("disk-round-0", &frame, &mut disk)
+                .expect_err("refused")
+                .to_string();
+            assert!(why.contains(want), "{want}: {why}");
+            assert_eq!(disk.writes, 0, "{want}: nothing written");
+        }
+        let mut disk = MemDisk::new(base_disk());
+        let mut applier = DiskApplier::new(DISK_SIZE);
+        applier.start("disk-round-0", false);
+        applier.apply("disk-round-0", &good, &mut disk).unwrap();
+        assert_eq!(disk.bytes[..DIRTY_BLOCK_BYTES as usize], whole[..]);
+    }
+
+    #[test]
+    fn disk_round_names_parse_strictly() {
+        assert_eq!(disk_round_of("disk-round-0"), Some(DiskRound::Running(0)));
+        assert_eq!(disk_round_of(DISK_FINAL), Some(DiskRound::Final));
+        for bad in [
+            "disk-round-",
+            "disk-round-01",
+            "disk-round-final2",
+            "disk-blocks",
+        ] {
+            assert_eq!(disk_round_of(bad), None, "{bad}");
+        }
+        assert_eq!(frame_limit("disk-round-3"), Some(MAX_DISK_FRAME));
     }
 }
