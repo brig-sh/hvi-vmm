@@ -30,6 +30,10 @@ use vm_memory::{
 
 use crate::memory::{RamRegion, SharedRam};
 
+/// The number of bytes beyond the needle's length that [`GuestRamView::scan`]
+/// copies out of guest RAM at a time.
+const SCAN_CHUNK: usize = 64 << 10;
+
 impl RamRegion {
     /// Maps this region of `file` with `prot` as its own `MAP_SHARED` mapping,
     /// after checking that it is aligned and lies inside the file.
@@ -171,30 +175,41 @@ impl GuestRamView {
 
     /// Scans all of guest RAM for `needle`, returning the guest-physical
     /// addresses of the matches (capped at 64).
+    ///
+    /// Matches do not overlap. The guest can write its RAM during the scan, so
+    /// the search copies the mapping out in windows of 64 KiB plus the needle's
+    /// length and matches in the copy. A match that starts too late to fit in
+    /// one window is looked for again in the next.
     #[must_use]
     pub fn scan(&self, needle: &[u8]) -> Vec<u64> {
         let mut out = Vec::new();
         if needle.is_empty() {
             return out;
         }
+        let mut window = vec![0u8; SCAN_CHUNK + needle.len()];
         for mapping in &self.mapped {
             let len = usize::try_from(mapping.region.size).expect("a mapping fits in usize");
-            // SAFETY: the mapping holds `len` valid bytes for as long as `self`
-            // lives, and the slice is only read. The search needs a byte slice
-            // over the whole region; `vm-memory` only hands out copies.
-            let hay = unsafe { std::slice::from_raw_parts(mapping.mmap.as_ptr(), len) };
-            let first = needle[0];
-            let mut i = 0;
-            while i + needle.len() <= len {
-                if hay[i] == first && &hay[i..i + needle.len()] == needle {
-                    out.push(mapping.region.gpa + i as u64);
-                    if out.len() >= 64 {
-                        return out;
+            // The first offset in the region not yet ruled out as a match.
+            let mut pos = 0;
+            while pos + needle.len() <= len {
+                let n = window.len().min(len - pos);
+                let Ok(slice) = mapping.mmap.get_slice(MemoryRegionAddress(pos as u64), n) else {
+                    break;
+                };
+                slice.copy_to(&mut window[..n]);
+                let mut i = 0;
+                while i + needle.len() <= n {
+                    if window[i..i + needle.len()] == *needle {
+                        out.push(mapping.region.gpa + (pos + i) as u64);
+                        if out.len() >= 64 {
+                            return out;
+                        }
+                        i += needle.len();
+                    } else {
+                        i += 1;
                     }
-                    i += needle.len();
-                } else {
-                    i += 1;
                 }
+                pos += i;
             }
         }
         out
@@ -489,6 +504,34 @@ mod tests {
         let hits = ram.scan(b"needle-xy");
         assert_eq!(hits, vec![base + 0x100, base + 0x800]);
         assert!(ram.scan(b"not-present").is_empty());
+    }
+
+    // The scan copies guest RAM out one window at a time, so a match has to
+    // be found whichever window boundary it crosses.
+    #[test]
+    fn scan_finds_a_match_across_a_window_boundary() {
+        let base = 0x4000_0000;
+        let ram = GuestRam::from_ranges(&[(base, 4 * SCAN_CHUNK)]);
+        let needle = b"needle-xy";
+        let across = (SCAN_CHUNK + needle.len() - 3) as u64;
+        let last = (4 * SCAN_CHUNK - needle.len()) as u64;
+        for off in [0, across, last] {
+            ram.write(base + off, needle).unwrap();
+        }
+        assert_eq!(ram.scan(needle), vec![base, base + across, base + last]);
+    }
+
+    #[test]
+    fn scan_matches_do_not_overlap_and_stop_at_64() {
+        let base = 0x4000_0000;
+        let ram = GuestRam::from_ranges(&[(base, 0x1000)]);
+        ram.write(base, b"aaaaa").unwrap();
+        assert_eq!(ram.scan(b"aa"), vec![base, base + 2]);
+
+        ram.write(base, &[b'z'; 0x100]).unwrap();
+        let hits = ram.scan(b"z");
+        assert_eq!(hits.len(), 64);
+        assert_eq!(hits[63], base + 63);
     }
 
     #[test]
