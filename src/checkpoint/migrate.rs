@@ -21,8 +21,10 @@
 //! the `Tracker` reports: the guest's own writes from the hypervisor and
 //! hvi's from guest RAM's [`DirtyLog`](crate::memory::DirtyLog). The rounds
 //! stop when the pages written during the last one come to at most
-//! `Policy::threshold`, after `Policy::max_rounds` rounds, or once
-//! `Policy::max_time` has passed since the start, whichever comes first.
+//! `Policy::threshold`, after `Policy::max_rounds` rounds, or when a round
+//! ends after `Policy::max_time` has passed since the start, whichever comes
+//! first. The time is checked only as each round ends, so a round under way
+//! runs to its end.
 //! The caller then pauses the guest and sends the final round, the pages
 //! not yet sent and those written since, with nothing running. A guest that
 //! writes faster than the rounds copy never converges, and the round cap
@@ -43,7 +45,8 @@ use crate::memory::{DirtyPages, GuestRam, GuestWriteLog};
 pub(crate) struct Policy {
     /// The most rounds taken with the guest running, round 0 included.
     pub(crate) max_rounds: u32,
-    /// The longest the rounds run before the pause.
+    /// The time after which no new round starts before the pause. A round
+    /// under way when it passes runs to its end.
     pub(crate) max_time: Duration,
     /// The smallest dirty set that ends the rounds, whatever the guest's
     /// size.
