@@ -181,9 +181,11 @@ hvi: /var/lib/sb1/checkpoints/tx-42: ram.bin: SHA-256 does not match the manifes
 ## The bundle format
 
 The bundle directory is `checkpoint_format` 1; the stream of a live move
-is format 2 (see [The stream format](#the-stream-format)), with the same
-documents. A profile gives the newest format its hvi writes, now 2, and a
-directory may hold a profile of either. Every document is JSON with fields by name and a
+is format 2, or 3 when it carries the disk's rounds (see [The stream
+format](#the-stream-format)), with the same documents. A profile gives the
+newest format its hvi writes, now 3, so a mover can tell an hvi whose
+stream carries the disk and whose fenced source streams again for its
+fence owner; a directory may hold a profile of any of them. Every document is JSON with fields by name and a
 `version`. No file holds a native struct layout, so a bundle does not depend
 on the byte layout of the build that wrote it.
 
@@ -667,9 +669,12 @@ restored-paused 196.0 ms native and 199.6 ms portable, against 525.7 and
 A checkpoint stops the guest for as long as it takes to write all of its
 RAM. A live move stops it only for what it wrote last: the source sends its
 RAM in rounds while the guest runs, then pauses it for the final round and
-its state. The control socket's `migrate` op does it, on the connection
-that asked, since a confined hvi may write to a socket it accepted but
-cannot open a new one:
+its state. When the guest's disk has a base image the destination holds
+(`--disk-base-sha256`, see [Moving the disk by its
+blocks](#moving-the-disk-by-its-blocks)), the disk's written blocks travel
+in the same rounds. The control socket's `migrate` op does it, on the
+connection that asked, since a confined hvi may write to a socket it
+accepted but cannot open a new one:
 
 ```text
 {"v":1,"op":"migrate","then":"fence","txid":"tx-43","epoch":8}
@@ -680,18 +685,26 @@ on that connection and, after its manifest, the reply line:
 
 ```json
 {"v":1,"ok":true,"state":"fenced","manifest_sha256":"...","stats":{
- "rounds":[{"round":0,"in_pause":false,"pages":25664,"data_pages":23817,"bytes":35627331,"ms":188,"dirty_pages_per_s":0},
-           {"round":1,"in_pause":true,"pages":804,"data_pages":604,"bytes":406935,"ms":2,"dirty_pages_per_s":4150}],
- "stop_reason":"converged","threshold_bytes":8388608,"precopy_ms":189,"pause_ms":0,"paused_ms":7,
- "final_round_bytes":406935,"ram_total_bytes":536870912,"ram_present_bytes":97251328,
- "ram_raw_bytes":100028416,"ram_stream_bytes":36024172,"stream_bytes":36045338,
- "write_granule":16384,"write_faults":202,"write_fault_ns":3219,
- "precopy_end_unix_ms":1792019500123,"sealed_at_unix_ms":1792019500131}}
+ "rounds":[{"round":0,"in_pause":false,"pages":25920,"data_pages":24022,"bytes":35800360,"ms":165,"dirty_pages_per_s":0},
+           {"round":1,"in_pause":true,"pages":844,"data_pages":635,"bytes":408967,"ms":2,"dirty_pages_per_s":4948}],
+ "stop_reason":"converged","threshold_bytes":8388608,"precopy_ms":170,
+ "pause_ms":0,"gate_ms":0,"park_ms":0,"paused_ms":6,
+ "final_round_bytes":408967,"ram_total_bytes":536870912,"ram_present_bytes":98394112,
+ "ram_raw_bytes":100995072,"ram_stream_bytes":36209327,"stream_bytes":36237937,
+ "disk_rounds":[{"name":"disk-round-0","round":0,"in_pause":false,"blocks":5,"raw_bytes":327680,"bytes":5955,"ms":0,"generation":22,"max_lock_us":5},
+                {"name":"disk-round-final","round":1,"in_pause":true,"blocks":0,"raw_bytes":0,"bytes":0,"ms":0,"generation":22,"max_lock_us":0}],
+ "disk_raw_bytes":327680,"disk_stream_bytes":5955,"disk_sync_ms":4,
+ "write_granule":16384,"write_faults":257,"write_fault_ns":2481,
+ "precopy_end_unix_ms":1792036700123,"sealed_at_unix_ms":1792036700129}}
 ```
 
-`pause_ms` is the time to park the vCPUs, `paused_ms` the time from the
-pause to the manifest written: the source's part of the downtime. The rest
-is the transport and the destination's restore. A `migrate` needs no
+`pause_ms` is the time from the pause to every vCPU parked with its state
+exported; `gate_ms` and `park_ms` are its first two parts, the I/O threads
+held and the vCPUs parked. `paused_ms` is the time from the pause to the
+manifest written: the source's part of the downtime. The rest is the
+transport and the destination's restore. `disk_sync_ms` is the sync of the
+disk just before the pause, with the guest still running, and
+`precopy_end_unix_ms` is taken after it, at the pause. A `migrate` needs no
 `--checkpoint-root`, since it writes no file. It refuses, before the first
 frame and with the VM untouched, what a `checkpoint` refuses, and a backend
 that keeps no record of the guest's writes.
@@ -727,13 +740,40 @@ whichever is larger (`converged`), after 5 rounds (`round_cap`), or when a
 round ends 60 s or more after the start (`time_cap`); `max_rounds` and
 `max_secs` on the request change those two. The time cap is checked only
 as each round ends, so a round under way runs to its end: a large round 0
-behind a slow reader can take longer than `max_secs` on its own. Then the
-guest is paused as for a checkpoint, the disk is synced, and the final
-round sends the pages left and every page written since, with nothing
-running. A guest that writes faster than the
-rounds copy never converges: the round cap ends it, and its final round is
-as large as what it writes in one round, so the pause lasts as long as
-that takes to send. The final round is always taken paused.
+behind a slow reader can take longer than `max_secs` on its own. A guest
+that writes faster than the rounds copy never converges: the round cap
+ends it, and its final round is as large as what it writes in one round,
+so the pause lasts as long as that takes to send. The final round is
+always taken paused.
+
+With a disk base, each round `k` taken with the guest running sends disk
+round `k` before RAM round `k`: round 0 the blocks written since boot,
+which are every block that differs from the base, each later round the
+blocks written since the disk round before. The blocks are read through
+the device's lock one block at a time, so the guest's disk waits for one
+64 KiB read at most (`max_lock_us`), and a block the guest writes while it
+is read is in the next round either way. Whether the rounds converge is
+judged by RAM alone.
+
+### The pause
+
+When the rounds with the guest running end, the source:
+
+1. Syncs the disk with `fdatasync` on a second handle to the device's
+   file, without the device's lock, while the guest still runs. The sync in
+   the pause then has only the writes since; with it inside the pause, a
+   busy Pi spent up to 4.9 s of downtime on it.
+2. Holds the I/O threads and parks the vCPUs, waiting up to 10 s for both,
+   and then up to 10 s for the vCPUs' state. A `pause` op waits 2 s; a
+   move waits longer because a vCPU parks only between guest entries, and
+   one serving a virtio-blk flush is in an `fdatasync` on its own thread
+   until the flush ends (see [limitations.md](limitations.md)). A move
+   that still misses the bound fails, and the VM runs on.
+3. Sends the final disk round, the blocks written since the last one, then
+   the final RAM round, the pages left and every page written since, then
+   the documents, with nothing running. `disk.json` is captured after the
+   final disk round, so it lists every disk round with the digests of what
+   the stream carried, and its last round's generation is the disk's.
 
 Only the control thread writes the stream. A slow reader holds it up, and
 the guest runs on meanwhile; the pause starts once the last round with the
@@ -742,10 +782,12 @@ closing the connection is not waited for without end, since it would hold
 the control socket and, in the final round, a paused guest:
 
 - Any write that waits 30 s for the reader to take a byte fails the move.
-- From the pause, the rest of the stream must be written within 10 s plus
-  twice the time the last round with the guest running took. The final
-  round holds what the guest wrote during that round, so a reader that kept
-  up with it keeps up with this one.
+- From the moment the vCPUs are parked with their state in hand, the rest
+  of the stream must be written within 10 s plus twice the time the last
+  round with the guest running took. The final round holds what the guest
+  wrote during that round, so a reader that kept up with it keeps up with
+  this one. A slow park does not count against it, since nothing is
+  written while the vCPUs park.
 
 Either failure leaves the VM as the request found it, as any failure before
 the manifest does: running, and not fenced. The reply then waits at most
@@ -759,16 +801,42 @@ the client reads it as a reply line where the next frame header was due.
 `then: "fence"` fences once the manifest is written to the connection,
 which is before the client has read it, and releases the disk's lock at
 once, since the destination may open the disk as soon as it has the
-manifest. A later `migrate` on the fenced VM is refused with `fenced`,
-whatever its `then`, `txid` or `epoch`: the destination may run the guest
-by then, and a second stream would be a second copy that can resume. A
-caller that must be able to send the stream again keeps its own copy as it
-reads it.
+manifest. So a client that reads the end of the connection before the
+manifest knows the source runs on, unfenced; one that has the manifest
+knows it is fenced.
+
+The destination may run the guest as soon as it has the manifest, so a
+fenced VM is streamed again only for the move that fenced it. A `migrate`
+on a fenced VM with the same `txid` and `epoch` as the one that fenced it,
+and `then: "fence"`, streams the sealed state again: the mover that died
+after hvi's manifest went out and before it had kept a whole copy
+recovers it this way. The VM stays fenced. The stream is the final round
+alone:
+
+- with disk rounds, one disk round, `disk-round-final`, of every block
+  written since boot, read from the disk the fence left;
+- one RAM round, taken paused, of every page that is not zero, which is
+  the RAM the first stream carried, since nothing has run since;
+- `profile.json`, `cpu.json`, `platform.json`, `devices.json` and
+  `session.json` as the first stream sent them, byte for byte, and
+  `disk.json` written again for its one disk round (as first sent, when
+  the stream has no disk rounds);
+- a manifest of its own.
+
+The reply carries `first_manifest_sha256`, the first stream's manifest,
+and `same_as_first`, the components whose size and SHA-256 equal the
+first stream's: the documents above, and RAM round 0 too when the guest
+wrote nothing during the first move. Only the stall bound applies to the
+reader; the guest is not waiting. Any other `txid` or `epoch`, a request
+with no `txid`, `then: "continue"`, or a VM a `checkpoint` fenced, is
+refused with `fenced`. `resume` stays refused, and `stop` ends the run.
 
 ### The stream format
 
-`checkpoint_format` 2: a sequence of frames, each one line of JSON then
-exactly `size` bytes whose SHA-256 is `sha256`:
+`checkpoint_format` 3 when the stream carries disk rounds, 2 when it does
+not (as before them, so an older reader still takes it): a sequence of
+frames, each one line of JSON then exactly `size` bytes whose SHA-256 is
+`sha256`:
 
 ```text
 {"component":"ram-round-0","size":1049352,"sha256":"5c2e..."}\n<1049352 bytes>
@@ -777,11 +845,16 @@ exactly `size` bytes whose SHA-256 is `sha256`:
 | Component | Frames | Holds |
 | --- | --- | --- |
 | `profile.json` | 1 | The source's machine profile, first, so the destination can refuse it or build RAM for it before anything else arrives. |
-| `ram-round-0` .. `ram-round-K` | 1 or more each | Guest RAM, in chunks. The last round is the one taken paused. |
+| `disk-round-k`, then `ram-round-k`, for each round `k` taken with the guest running | 1 or more each | The disk's blocks written since the disk round before (round 0: since boot), then guest RAM, in chunks. |
+| `disk-round-final`, then `ram-round-K` | 1 or more each | The same, taken paused. |
 | `cpu.json`, `platform.json`, `devices.json` | 1 each | As in the bundle directory. |
 | `disk.json` | 1, when the guest has a disk | As in the bundle directory. |
 | `session.json` | 1 | As in the bundle directory. |
-| `manifest.json` | 1 | Every other component with its size, its frame count and the SHA-256 of all its frames' bytes in order, the RAM regions and page size, each round's pages and bytes and whether it was taken paused, the profile's hash, the capabilities a restore needs, and the seal time. |
+| `manifest.json` | 1 | Every other component with its size, its frame count and the SHA-256 of all its frames' bytes in order, the RAM regions and page size, each round's pages and bytes and whether it was taken paused, each disk round's blocks and bytes (`disk`, absent without disk rounds), the profile's hash, the capabilities a restore needs, and the seal time. |
+
+A stream has a disk round before every RAM round, or none at all: the disk
+rounds are there only when the guest's disk has a base. A fenced VM's
+state sent again has only the paused pair.
 
 A RAM round is cut into frames of about 1 MiB, so neither side holds a
 whole round. A frame is a sequence of chunks, each a 24-byte header,
@@ -796,12 +869,28 @@ little-endian, then its payload:
 | 20..24 | The payload length. |
 
 The payload is the present pages in order, compressed unless that would
-make them larger. The reader checks each frame's header against its limits
-(a header line of at most 1 KiB, a RAM frame of at most 8 MiB, a document
-at most the directory's limit for it, at most 64 rounds) before it reads
-the bytes, and the hash before it uses them. It checks every chunk header
-in a frame before the frame writes a page, and that each payload is
-exactly its present pages. The components must come in the order above,
+make them larger.
+
+A disk round is cut into frames the same way. Its chunks cover 1 to 16
+adjacent 64 KiB blocks, in ascending order, each block at most once in a
+round, and are a 24-byte header, little-endian, then the payload:
+
+| Bytes | Field |
+| --- | --- |
+| 0..8 | The first block. |
+| 8..12 | The block count, 1 to 16. |
+| 12..16 | Flags: bit 0 set means the payload is the blocks as they are; clear means one LZ4 block. |
+| 16..20 | The length of the blocks: whole blocks, but the disk's last when it is short. |
+| 20..24 | The payload length. |
+
+The reader checks each frame's header against its limits (a header line
+of at most 1 KiB, a RAM or disk frame of at most 8 MiB, a document at most
+the directory's limit for it, at most 64 rounds) before it reads the
+bytes, and the hash before it uses them. It checks every chunk header in a
+frame before the frame writes a page or a block, that each RAM payload is
+exactly its present pages, and that each disk chunk lies on the
+destination's disk, after the round's last block, and is exactly its
+blocks. The components must come in the order above,
 and the manifest must list exactly what was read: a frame dropped,
 repeated, reordered or changed is refused, as is a stream that ends before
 the manifest. A reply line where a frame header was due ends the stream
@@ -822,9 +911,28 @@ RAM and applies each round to it as it arrives, a later page over an
 earlier one; no RAM reaches disk. After the manifest it parses the
 documents, refuses with every reason as a directory restore does, and
 otherwise builds the VM over the RAM it filled and waits restored-paused.
-A streaming source releases the disk's lock as it fences, which can land
-just after the restore read the manifest, so a restore from a stream waits
-up to 2 s for the lock. `--stream-keep` writes the documents and the
+
+A stream with disk rounds writes them into `--disk`, which must then be
+the destination's own copy of the guest's base image. The restore opens
+it when the first disk round arrives, takes its lock and refuses a disk
+another hvi holds, rather than wait: on one host that is the source's own
+disk, and the blocks of the rounds sent while the guest ran would
+overwrite its newer writes. Each round's blocks go in as they arrive, a
+later round over an earlier one, and a sync of the disk starts as each
+round ends, one at a time, and once more after the final round; the
+restore waits for it, so the guest's first flush does not inherit the
+writeback. Once the manifest checks, the disk rounds must be `disk.json`'s,
+one for one: the bitmap of the blocks each round wrote hashes to the
+round's `bitmap_sha256`, its component's SHA-256 is the round's
+`sent_sha256`, the last one is the paused round, and it was read at the
+generation `disk.json` was captured at. Otherwise the restore is refused
+before anything runs. That is the check `--disk-generation` asks for of a
+directory, so a stream restore refuses that flag. A stream without disk
+rounds leaves `--disk` as it is: the mover copied the whole disk, or the
+restore reopens the source's on the same host. A streaming source
+releases the disk's lock as it fences, which can land just after the
+restore read the manifest, so such a restore waits up to 2 s for the
+lock. `--stream-keep` writes the documents and the
 manifest, as they came and unsynced, as the record of what was restored.
 A stream read from stdin leaves stdin as `/dev/null`, so the console never
 reads what followed the stream.
@@ -873,6 +981,83 @@ do not compress, and it never converges.
   read on the Mac as the resume reply arrived back over `ssh`. The guest
   counted on and printed no boot banner.
 
+#### With the disk in the stream
+
+Measured again on 2026-10-15 at `169e200`, with the disk moving in the
+stream: the same guests and `tools/stream-e2e.sh`, the source booted with
+`--disk-base-sha256` of its fresh 64 MiB ext4 image, and each restore
+given a new copy of that base. The busy runs add `--disk-churn`, a guest
+loop rewriting 1 MiB of random data on the disk with `fsync` every 0.1 s.
+Downtime here is from the pause, after the sync before it, to the resume
+reply, less the e2e's hash of both disks (about 50 ms on the Mac) that
+sits between the restore and the resume.
+
+| Host | Guest | RAM rounds | RAM on the stream | Disk rounds: blocks | Disk on the stream | `paused_ms` | Downtime |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Apple M5 Pro | idle, 512 MiB | 2 | 100 MB raw, 36.0 MB (2.8:1) | 68, 0 | 4.5 MB raw, 22 KB | 2 | 21.5 ms |
+| Apple M5 Pro | 256 MiB writer and disk churn, 1024 MiB | 6 (round cap) | 1748 MB raw, 1659 MB (1.05:1) | 46, 75, then 34 or 35 a round, 35 paused | 17.0 MB raw, 11.6 MB | 432 | 448 ms |
+| Apple M5 Pro | `--dirty-once 10` and disk churn | 4 (converged) | 469 MB raw, 391 MB | 22, 51, 27, 0 paused | 6.6 MB raw, 4.2 MB | 7 | 24 ms |
+| Raspberry Pi 5 | idle, 512 MiB | 2 | 99 MB raw, 36.4 MB (2.7:1) | 68, 0 | 4.5 MB raw, 22 KB | 8 | 20 ms |
+| Raspberry Pi 5 | 256 MiB writer and disk churn | 6 (round cap) | 1749 MB raw, 1660 MB | 85, then 34 or 35 a round, 35 paused | 17.0 MB raw, 11.6 MB | 848 | 861 ms |
+| Raspberry Pi 5 | `--dirty-once 10` and disk churn | 6 (converged) | 635 MB raw, 550 MB | 85, 35, 34, 18, 18, 0 paused | 12.5 MB raw, 7.4 MB | 21 | 33 ms |
+
+- Every restored disk hashed as the source's disk at its fence, on both
+  hosts and in both moves of each run.
+- A disk round of churn is 34 or 35 blocks of random data, which LZ4
+  leaves as it is (2.1 MB on the stream); the blocks ext4 writes on its own
+  compress 50 to 200 to 1. The final disk round of the busy runs was 2.1 MB
+  and took 3 ms on the Mac and 6 ms on the Pi to read and send.
+- The longest hold of the device's lock for one block was 59 us on the
+  Mac and 223 us on the Pi (579 us in an earlier run).
+- In the Pi's `--dirty-once` run, disk round 1 of the second move took
+  29.9 s for 18 blocks: the guest's vCPU 0 was in a virtio-blk exit for
+  about 21 s (its kernel logged an RCU stall in `vm_notify`, the same trace
+  as below), holding the device's lock, which each block's read waits for.
+  The move went on and every check passed. See [limitations.md](limitations.md).
+- The sync before the pause (`disk_sync_ms`) took 0 to 4 ms on a quiet
+  host; with an `O_DIRECT` writer beside it on the Pi, a median of 234 to
+  293 ms and once 10.2 s, all of it with the guest running.
+- The destination's part, manifest to restored-paused, includes the sync of
+  the disk rounds it wrote: 13 to 16 ms on both hosts.
+- Mac to Pi, through `ssh` (rp2, 43 MB/s for round 0), with the base copied
+  to the Pi first (64 MiB in 1.9 s) and cloned there: idle, 2 RAM rounds
+  (36.0 MB), disk rounds of 69 and 0 blocks (23 KB), `paused_ms` 27, the
+  whole move 0.85 s, and at most 138 ms from the pause to the resume reply
+  seen back on the Mac over `ssh`, 56 ms of it the Pi hashing the restored
+  disk before the resume. With the 256 MiB writer and the disk churn: 6
+  RAM rounds of 271 to 307 MB each over the link, so the final round alone
+  took 6.1 s: `paused_ms` 6206 and 6.2 s of downtime; a guest that does
+  not converge pays for its final round at the link's rate. The restored
+  disk hashed as the source's in both, the count, the awk's sum and the
+  `boot_id` went on, `/dirty` reported no lost page, and the guest's disk
+  writes after the move were on the Pi's disk.
+
+### The pause under load
+
+On a Raspberry Pi 5 running the guest above with a disk writer in it
+(`dd conv=fsync` in a loop), 4 host loops spinning on all cores and a host
+`dd oflag=direct conv=fsync` loop on the same filesystem, 30 `migrate`s
+with `then: "continue"` per pass:
+
+| Build | Passes | Moves that failed to park | Park time of the others: median, 90th percentile, longest |
+| --- | --- | --- | --- |
+| `d43bd55`, before the disk rounds | 1 | 4 of 30 | 85, 1166, 1799 ms (`pause_ms`) |
+| `9aae1a8`, the disk rounds, the 2 s bound | 3 | 19 of 90 | 305 to 424, 696 to 1746, 1452 to 1979 ms |
+| `81da52d`, the 10 s bound | 3 | 0 of 90 | 3 to 5, 329 to 346, 754 to 1666 ms |
+| `9aae1a8`, random gaps between moves | 2 | 4 of 60 | 4 to 5, 677 to 688, 1519 to 1982 ms |
+| `169e200`, the 10 s bound, random gaps | 2 | 0 of 60 | 365 to 1492, 2168 to 2285, 2491 to 2545 ms; 13 moves parked in 2.0 to 2.5 s |
+
+The first passes ran a move every 0.5 s and may have locked to the host
+writer's cycle; the last two wait 0.3 to 2 s at random between moves.
+Each failure was "0 of 2" or "1 of 2 vCPUs parked in time", or once "1 of
+2 vCPUs exported their state in time", and the VM ran on. Sampling
+`/proc/PID/task/*/syscall` and `wchan` every 10 ms during each pause put
+the vCPU thread that had not parked in `fdatasync` (syscall 83) in
+`jbd2_log_wait_commit` or `folio_wait_bit_common` for the whole wait: it
+was serving the guest's flush, which the host's ext4 journal held up
+behind the `O_DIRECT` writer, and a vCPU parks only between guest
+entries. With the CPU loops alone, 30 of 30 parked within 321 ms.
+
 ## Moving the disk by its blocks
 
 A move that copies the whole disk image copies 1.6 GB for the claude-code
@@ -880,6 +1065,13 @@ guest, even when the destination already holds the image the guest booted
 from and the guest changed a few MB of it. hvi tracks which blocks the guest
 wrote, so a mover that keeps a copy of that base image can send only them,
 and send most of them while the guest still runs.
+
+A live move does this itself: `migrate` sends the disk rounds in its
+stream, takes the final one in its pause, and the manifest covers their
+bytes (see [Live moves](#live-moves)); the destination passes its copy of
+the base as `--disk` to `hvi restore --from-stream`. The `disk-dirty` and
+`disk-blocks` ops below move the disk beside a bundle directory, and serve
+to look at a guest's writes; a mover of a live move needs neither.
 
 **The base.** Whoever starts hvi hashes the disk as this boot opens it,
 before this hvi writes it, keeps a copy, and passes the digest with
@@ -892,6 +1084,13 @@ and a restore carries it to the restored guest's profile. A disk with a
 base must be at most 4 TiB, whose bitmap (8 MiB, 11,184,812 characters of
 base64) still fits `disk.json`'s 12 MiB limit; the boot refuses a larger
 one. A disk over 4 TiB without a base is checkpointed without the bitmap.
+
+A launcher that writes files into its copy of the base before the boot, as
+hull writes an instance's own files, has a disk that differs from the base
+before this hvi wrote anything. It passes the digest of the base image and,
+with `--disk-written`, the bitmap of the blocks it changed; they start the
+blocks written since boot, so round 0 sends them with the guest's own
+writes, and the destination needs only the base.
 
 **The bitmaps.** virtio-blk keeps two bitmaps of the disk's 64 KiB blocks
 (a 16 GiB disk takes 32 KiB each): the blocks written since the guest
@@ -924,7 +1123,7 @@ SHA-256 of the bitmap it returns, which the reply gives as
 guest paused (`paused`, `restored-paused` or `fenced`), it first syncs the
 disk with `fdatasync`, as a capture does.
 
-A move then runs:
+A move beside a bundle directory then runs:
 
 1. Boot with `--disk-base-sha256`, and keep the base image.
 2. While the guest runs: `disk-dirty` since boot, and `disk-blocks` for
@@ -1004,16 +1203,20 @@ stream instead.
 `disk.json` records `base_sha256` (the profile's `disk_base_sha256`),
 `block_size` (65536), `dirty_since_boot_b64` (the first bitmap as base64)
 and `rounds`, each `{"round","generation","blocks","bitmap_sha256",
-"sent_sha256"}`. `bitmap_sha256` is the digest the round's `disk-dirty`
-reply gave; `sent_sha256` is the one its `{"round":k}` reply gave, or
-`null` for a round not streamed that way before the capture. With them a
-destination can show it applied each listed round's blocks, and that no
-round was read before the one before it went out: such a round has no
-`sent_sha256`. hvi records them and checks only their form; comparing
-them with what was applied is the mover's work. A final round read after
-a fence is not in `disk.json`, so its digests are only in its replies.
-The manifest covers `disk.json`, and so the digests it lists, but not
-the block bytes themselves.
+"sent_sha256"}`. `bitmap_sha256` is the digest of the round's bitmap, as
+its `disk-dirty` reply gave it. `sent_sha256` is, for a round a live
+move's stream carried, the SHA-256 of that disk round's frames, which the
+stream's manifest lists too; for a round `disk-blocks` sent as
+`{"round":k}`, the digest its reply gave; and `null` for a round not sent
+either way before the capture. With them a destination can show it
+applied each listed round's blocks, and that no round was read before the
+one before it went out: such a round has no `sent_sha256`. A stream
+restore compares them with what it applied (see [Restoring a
+stream](#restoring-a-stream)); for a directory, hvi checks only their form
+and comparing them is the mover's work. A final round read after a fence
+is not in `disk.json`, so its digests are only in its replies. A
+directory's manifest covers `disk.json`, and so the digests it lists, but
+not the block bytes themselves; a stream's covers both.
 
 A `disk.json` written before these fields existed still reads. The reader
 refuses one whose base is not the profile's, whose rounds are out of order
