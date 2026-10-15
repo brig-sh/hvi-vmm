@@ -105,6 +105,18 @@ const STREAM_STALL: Duration = Duration::from_secs(30);
 /// [`StreamLimits::paused_budget`].
 const STREAM_PAUSED_FLOOR: Duration = Duration::from_secs(10);
 
+/// How long a `migrate` waits for the I/O threads and the vCPUs to stop,
+/// and then again for the vCPUs' state.
+///
+/// A vCPU parks only between guest entries, and an exit it is serving runs
+/// to its end first: a virtio-blk flush is an `fdatasync` on the vCPU's
+/// thread, which took seconds on a loaded Raspberry Pi. The 2 s of
+/// [`CONTROL_TIMEOUT`] failed the pause of a move there again and again,
+/// and the move with it, while the guest ran on. A move has already spent
+/// its rounds, and its client waits for the stream with no fixed timeout,
+/// so it waits longer for the park than a `pause` does.
+const MIGRATE_PARK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long a `migrate` may wait on its reader.
 #[derive(Clone, Copy, Debug)]
 struct StreamLimits {
@@ -112,6 +124,9 @@ struct StreamLimits {
     stall: Duration,
     /// The least time the paused part of the stream is given.
     paused_floor: Duration,
+    /// How long the pause waits for the vCPUs to park, and then for their
+    /// state.
+    park: Duration,
 }
 
 impl Default for StreamLimits {
@@ -119,6 +134,7 @@ impl Default for StreamLimits {
         Self {
             stall: STREAM_STALL,
             paused_floor: STREAM_PAUSED_FLOOR,
+            park: MIGRATE_PARK_TIMEOUT,
         }
     }
 }
@@ -573,6 +589,15 @@ impl Write for SocketOut<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// How long a pause took to stop each part of the VM.
+#[derive(Clone, Copy, Debug, Default)]
+struct PauseTimes {
+    /// The I/O threads, in milliseconds.
+    gate_ms: u64,
+    /// The vCPUs, after the I/O threads.
+    park_ms: u64,
 }
 
 /// What a request does once its reply is on its way.
@@ -1065,14 +1090,18 @@ impl<K: Kick> Machine<'_, K> {
             .rounds
             .last()
             .map_or(Duration::ZERO, |r| Duration::from_millis(r.ms));
-        paused_deadline.set(Some(paused_at + self.stream.paused_budget(last_round)));
-        if found == VmState::Running {
-            if let Response::Error(e) = self.pause() {
-                tracker.stop();
-                return Response::Error(e);
+        let times = if found == VmState::Running {
+            match self.pause_within(self.stream.park) {
+                Ok(times) => times,
+                Err(refusal) => {
+                    tracker.stop();
+                    return refusal;
+                }
             }
-        }
-        let exported = match self.export(paused_at + self.timeout) {
+        } else {
+            PauseTimes::default()
+        };
+        let exported = match self.export(Instant::now() + self.stream.park) {
             Ok(exported) => exported,
             Err(e) => {
                 tracker.stop();
@@ -1081,6 +1110,11 @@ impl<K: Kick> Machine<'_, K> {
             }
         };
         let pause_ms = paused_at.elapsed().as_millis() as u64;
+        // The budget for the paused part of the stream starts once the
+        // vCPUs are still and their state is in hand, since nothing was
+        // written before: a park that took long under load does not eat
+        // into what the final round may take.
+        paused_deadline.set(Some(Instant::now() + self.stream.paused_budget(last_round)));
         let request_doc = capture::Request {
             then: request.then,
             txid: request.txid.as_deref(),
@@ -1191,6 +1225,8 @@ impl<K: Kick> Machine<'_, K> {
                 disk_stream_bytes: disk_rounds.iter().map(|r| r.bytes).sum(),
                 disk_rounds,
                 disk_sync_ms,
+                gate_ms: times.gate_ms,
+                park_ms: times.park_ms,
                 final_round_bytes: rounds.last().map_or(0, |r| r.bytes),
                 rounds,
                 stop_reason: precopy.reason,
@@ -1331,6 +1367,8 @@ impl<K: Kick> Machine<'_, K> {
                 disk_stream_bytes: disk_rounds.iter().map(|r| r.bytes).sum(),
                 disk_rounds,
                 disk_sync_ms: 0,
+                gate_ms: 0,
+                park_ms: 0,
                 write_granule: capture.write_log.as_ref().map_or(0, |l| l.granule()),
                 write_faults: None,
                 write_fault_ns: None,
@@ -1487,35 +1525,55 @@ impl<K: Kick> Machine<'_, K> {
     /// Holds the I/O threads, then parks the vCPUs, within one deadline for
     /// both. Pausing a paused VM succeeds and changes nothing.
     fn pause(&mut self) -> Response {
+        match self.pause_within(self.timeout) {
+            Ok(_) => Response::State(self.state),
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// Holds the I/O threads, then parks the vCPUs, within `timeout` for
+    /// both, and returns how long each took. Pausing a paused VM succeeds
+    /// and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal to send when the run is ending, another pause
+    /// holds the vCPUs, or they did not all stop in time; the VM then runs
+    /// on, and the refusal says how long the wait took and how much of it
+    /// the I/O threads had.
+    fn pause_within(&mut self, timeout: Duration) -> Result<PauseTimes, Response> {
         match self.state {
             VmState::Paused | VmState::RestoredPaused | VmState::Fenced => {
-                return Response::State(self.state)
+                return Ok(PauseTimes::default())
             }
-            VmState::Stopping => return refuse(ErrorCode::Stopped, "the run is ending"),
+            VmState::Stopping => return Err(refuse(ErrorCode::Stopped, "the run is ending")),
             VmState::Running => {}
         }
-        let deadline = Instant::now() + self.timeout;
-        if let Err(inside) = self.gate.pause(self.timeout) {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        if let Err(inside) = self.gate.pause(timeout) {
             // The gate gives up on the stop as well as at its deadline.
             if !self.vcpus.is_running() {
                 self.state = VmState::Stopping;
-                return refuse(ErrorCode::Stopped, "the run is ending");
+                return Err(refuse(ErrorCode::Stopped, "the run is ending"));
             }
-            return refuse(
+            return Err(refuse(
                 ErrorCode::Timeout,
-                format!(
-                    "{inside} I/O thread(s) still busy after {:?}; the VM runs on",
-                    self.timeout
-                ),
-            );
+                format!("{inside} I/O thread(s) still busy after {timeout:?}; the VM runs on"),
+            ));
         }
+        let gate_ms = started.elapsed().as_millis() as u64;
         // The vCPUs get what the gate left of the deadline, so the reply comes
         // within the one deadline the client is told about.
         let left = deadline.saturating_duration_since(Instant::now());
+        let parking = Instant::now();
         match self.vcpus.pause_from_control(left) {
             Ok(_) => {
                 self.state = VmState::Paused;
-                Response::State(VmState::Paused)
+                Ok(PauseTimes {
+                    gate_ms,
+                    park_ms: parking.elapsed().as_millis() as u64,
+                })
             }
             Err(e) => {
                 self.gate.unpause();
@@ -1527,7 +1585,13 @@ impl<K: Kick> Machine<'_, K> {
                     PauseError::Busy => ErrorCode::Busy,
                     PauseError::Timeout { .. } | PauseError::NotPaused => ErrorCode::Timeout,
                 };
-                refuse(code, format!("{e}; the VM runs on"))
+                Err(refuse(
+                    code,
+                    format!(
+                        "{e} ({} ms, after {gate_ms} ms for the I/O threads); the VM runs on",
+                        parking.elapsed().as_millis()
+                    ),
+                ))
             }
         }
     }
@@ -1645,6 +1709,10 @@ mod tests {
         blk: Option<(Arc<Mutex<VirtioBlk>>, String)>,
         /// The profile's `disk_base_sha256`.
         base: Option<String>,
+        /// How long each parking vCPU stays in an exit after a pause is
+        /// asked, before it reaches its checkpoint: a vCPU serving a slow
+        /// disk flush.
+        slow_exit: Option<Duration>,
     }
 
     /// Where the fixture's guest RAM starts, 1 MiB of it.
@@ -1710,8 +1778,18 @@ mod tests {
                 .map(|cpu| {
                     vcpus.mark_started(vcpus.started());
                     let vcpus = Arc::clone(&vcpus);
+                    let slow_exit = spec.slow_exit;
                     std::thread::spawn(move || {
+                        let mut delayed = false;
                         while vcpus.is_running() {
+                            if let Some(slow) = slow_exit {
+                                if !vcpus.quiesce_requested() {
+                                    delayed = false;
+                                } else if !delayed {
+                                    delayed = true;
+                                    std::thread::sleep(slow);
+                                }
+                            }
                             let _ = vcpus.checkpoint_with(cpu, |work| match work {
                                 Work::Export => Ok(Some(Output::Vcpu {
                                     state: VcpuState::from_regs_view(
@@ -3140,6 +3218,7 @@ mod tests {
                 stream: StreamLimits {
                     stall: Duration::from_millis(300),
                     paused_floor: Duration::from_secs(60),
+                    ..StreamLimits::default()
                 },
                 ..Spec::default()
             },
@@ -3176,6 +3255,7 @@ mod tests {
                 stream: StreamLimits {
                     stall: Duration::from_secs(60),
                     paused_floor: Duration::from_millis(300),
+                    ..StreamLimits::default()
                 },
                 ..Spec::default()
             },
@@ -3221,6 +3301,7 @@ mod tests {
                 stream: StreamLimits {
                     stall: Duration::from_secs(600),
                     paused_floor: Duration::from_secs(600),
+                    ..StreamLimits::default()
                 },
                 ..Spec::default()
             },
@@ -3886,5 +3967,39 @@ mod tests {
             Some(again.disk[0].sha256.as_str())
         );
         assert_eq!(disk_json.rounds[0].generation, disk_json.generation);
+    }
+
+    // A vCPU that is in a long exit when the pause comes parks late. A
+    // `pause` gives up at the control timeout and the VM runs on; a
+    // `migrate` waits its own, longer bound, and the move goes ahead. The
+    // refusal says how long the wait took.
+    #[test]
+    fn a_migrate_waits_longer_than_a_pause_for_a_slow_vcpu() {
+        let mut f = Fixture::with(
+            "mig-slow-park",
+            Spec {
+                parking: 2,
+                capture: true,
+                slow_exit: Some(Duration::from_millis(700)),
+                write_log: Some(Arc::new(QuietLog::default())),
+                ..Spec::default()
+            },
+        );
+        let r = reply(&f.ask(r#"{"v":1,"op":"pause"}"#));
+        assert_eq!(r["code"], "timeout", "{r}");
+        let why = r["error"].as_str().unwrap();
+        assert!(
+            why.contains("vCPUs parked in time (") && why.contains("ms for the I/O threads"),
+            "{r}"
+        );
+        // Let the vCPUs leave the exit the failed pause found them in.
+        std::thread::sleep(Duration::from_millis(800));
+        f.assert_running();
+        let (got, r) = f.migrate(r#"{"v":1,"op":"migrate","then":"continue","max_rounds":1}"#);
+        got.expect("the stream reads whole");
+        assert_eq!(r["state"], "running", "{r}");
+        let park = r["stats"]["park_ms"].as_u64().unwrap();
+        assert!((600..5000).contains(&park), "{r}");
+        f.assert_running();
     }
 }
