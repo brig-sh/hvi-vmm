@@ -518,11 +518,11 @@ impl Write for SocketOut<'_> {
                 Err(e) if retry_read(&e) => {
                     match self.stop.wait_writable_until(self.conn.as_fd(), until)? {
                         Writable::Ready => {}
+                        // Not `Interrupted`, which `write_all` retries: the
+                        // retry would find the stop again at once, and spin
+                        // on it for as long as the reader stays stuck.
                         Writable::Stopped => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "the run is stopping",
-                            ))
+                            return Err(std::io::Error::other("the run is stopping"))
                         }
                         Writable::TimedOut if until < stalled_at => {
                             return Err(std::io::Error::new(
@@ -2705,6 +2705,46 @@ mod tests {
         f.assert_running();
         let status = f.status_elsewhere();
         assert_eq!(status["state"], "running", "{status}");
+    }
+
+    // The stop ends a migrate stuck on a reader that takes nothing, at once
+    // and not at the stall limit, and the server with it.
+    #[test]
+    fn the_stop_ends_a_migrate_stuck_on_its_reader() {
+        let log = Arc::new(QuietLog::default());
+        let mut f = Fixture::with(
+            "mig-stall-stop",
+            Spec {
+                parking: 2,
+                capture: true,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                noise_mib: 8,
+                stream: StreamLimits {
+                    stall: Duration::from_secs(600),
+                    paused_floor: Duration::from_secs(600),
+                },
+                ..Spec::default()
+            },
+        );
+        f.read_stream_until(r#"{"v":1,"op":"migrate","then":"fence"}"#, "ram-round-0");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            log.stops.load(Ordering::SeqCst),
+            0,
+            "the stream ended early"
+        );
+        f.source.request_stop();
+        let server = f.server.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !server.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the stuck migrate ignored the stop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        server.join().unwrap();
+        assert_eq!(log.stops.load(Ordering::SeqCst), 1);
     }
 
     // A fenced VM is not streamed again, whatever the second request asks:
