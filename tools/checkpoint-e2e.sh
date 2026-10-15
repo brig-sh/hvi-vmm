@@ -38,7 +38,10 @@
 # must report no page that lost a write, and go on counting after each
 # move. summary.json then also holds each move's rounds, bytes, dirty
 # rates, compression, write faults and downtime: from the end of the last
-# round taken with the guest running to the resume reply.
+# round taken with the guest running to the resume reply. --dirty-once SECS
+# makes /dirty write each page once per cycle of SECS seconds instead, in
+# a shuffled order, so that a write lost in any round, not only the final
+# one, leaves a page that fails its check.
 #
 # With --portable the guest boots the portable profile
 # (--profile portable-arm64-v1) and the kernel must be the portable one,
@@ -56,7 +59,7 @@
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs target/initramfs-workload.cpio --out DIR \
 #       [--cpus 2] [--mem 512] [--no-disk] [--portable] [--stream]
-#       [--dirty-mib N]
+#       [--dirty-mib N [--dirty-once SECS]]
 #
 # DIR receives the checkpoint root (with the bundle), the disk image, both
 # processes' consoles, their profiles and summary.json with the timings.
@@ -66,7 +69,7 @@
 # is limited to 104 bytes on macOS. Exits 0 when every check passed.
 set -euo pipefail
 
-hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no stream=no dirty=0
+hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no stream=no dirty=0 dirty_once=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --hvi) hvi="$2"; shift 2 ;;
@@ -79,7 +82,8 @@ while [ $# -gt 0 ]; do
         --portable) portable=yes; shift ;;
         --stream) stream=yes; shift ;;
         --dirty-mib) dirty="$2"; shift 2 ;;
-        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable] [--stream] [--dirty-mib N]" >&2; exit 2 ;;
+        --dirty-once) dirty_once="$2"; shift 2 ;;
+        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable] [--stream] [--dirty-mib N [--dirty-once SECS]]" >&2; exit 2 ;;
     esac
 done
 for v in hvi kernel initramfs out; do
@@ -114,14 +118,15 @@ socks="$(mktemp -d /tmp/hvi-e2e.XXXXXX)"
 trap 'rm -rf "$socks"' EXIT
 
 python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" \
-    "$debugfs" "$portable" "$stream" "$dirty" <<'PY'
+    "$debugfs" "$portable" "$stream" "$dirty" "$dirty_once" <<'PY'
 import json, os, re, socket, subprocess, sys, threading, time
 
 (hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs, portable, stream,
- dirty) = sys.argv[1:]
+ dirty, dirty_once) = sys.argv[1:]
 portable = portable == "yes"
 stream = stream == "yes"
 dirty = int(dirty)
+dirty_once = int(dirty_once)
 # A timer armed before a live move must still be pending when it ends:
 # with a busy guest the rounds can take several seconds.
 TIMER_S = 20 if dirty else 6
@@ -355,14 +360,36 @@ def stream_summary(reply, resume_wall=None):
 
 def dirty_goes_on(guest, after, where):
     """Checks that /dirty writes on in `guest` after `after` and that no
-    page it wrote lost a write."""
+    page it wrote lost a write.
+
+    The first pass reported after `after` may have begun before the move,
+    so it checked some pages before the move only; the pass after it
+    checks every page after the move."""
     if not dirty:
         return
-    got = guest.wait_for(r"DIRTY pass \d+ bad \d+", 20, after=after)
+    pass_line = r"DIRTY pass (\d+) bad \d+"
+    first = guest.wait_for(pass_line, 20, after=after)
+    got = None
+    if first:
+        n = int(re.search(pass_line, first[1]).group(1))
+        end = time.monotonic() + 20
+        while got is None and time.monotonic() < end:
+            got = next((line for line in guest.outputs(pass_line, after=first[0])
+                        if int(re.search(pass_line, line[1]).group(1)) > n), None)
+            time.sleep(0.05)
     bad = [s for _, s in guest.outputs(r"DIRTY-BAD")]
     check(got is not None and " bad 0 " in got[1] and not bad,
-          f"/dirty writes on {where} and every page held its last write: "
-          f"{got[1] if got else None}, {len(bad)} DIRTY-BAD line(s) {bad[:2]}")
+          f"/dirty writes on {where} and every page held its last write, through a pass "
+          f"begun after the move: {got[1] if got else None}, {len(bad)} DIRTY-BAD line(s) "
+          f"{bad[:2]}")
+
+
+def counted_twice(before, after):
+    """Returns the counts that both `before` and `after` printed: a guest
+    that ran on after the state the next one resumed from."""
+    def counts(guest):
+        return {c[0] for c in (tick(s) for _, s in guest.outputs(r"TICK ")) if c}
+    return sorted(counts(before) & counts(after))
 
 
 def boot_id(guest, after=0.0):
@@ -401,10 +428,12 @@ if not ready:
 boot_before = boot_id(src)
 check(boot_before is not None, f"the source guest's boot_id: {boot_before}")
 if dirty:
-    src.type(f"/dirty {dirty} &\n")
+    src.type(f"/dirty {dirty} rand {dirty_once} &\n" if dirty_once else f"/dirty {dirty} &\n")
     check(src.wait_for(r"DIRTY-READY ", 60) is not None
           and src.wait_for(r"DIRTY pass ", 30) is not None,
-          f"/dirty writes {dirty} MiB over and over in the source guest")
+          f"/dirty writes {dirty} MiB "
+          + (f"once every {dirty_once} s" if dirty_once else "over and over")
+          + " in the source guest")
 if portable:
     # Two timers armed just before the capture, which must fire after the
     # resume, 6 s of guest time after they were armed.
@@ -452,9 +481,13 @@ check(resumed.get("state") == "running", "resume")
 restore_ms = (status_at - spawned_at) * 1000
 before = [(t, tick(s)) for t, s in src.outputs(r"TICK ") if t <= fence_at]
 last_tick_at, (last_n, last_uptime, last_wall) = before[-1]
-# A live move pauses the guest only after its rounds, just before the reply.
-check(not src.outputs(r"TICK ", after=(fence_at if stream else fence_sent) + 0.1),
-      "the fenced source printed nothing more")
+# A fenced source prints nothing after the reply. Whether it ran on after
+# its pause, during the final round, is not read from the host's clock: a
+# console line can reach this script a second late on a busy host. The
+# count shows it instead: a source that ran past the state the destination
+# resumed from prints counts the destination prints again (checked below).
+late = src.outputs(r"TICK ", after=(fence_at if stream else fence_sent) + 0.1)
+check(not late, f"the fenced source printed nothing after the fence reply: {late[:2]}")
 if stream:
     kept = sorted(os.listdir(bundle)) if os.path.isdir(bundle) else []
     want = sorted(["profile.json", "cpu.json", "platform.json", "devices.json", "session.json",
@@ -480,6 +513,8 @@ if first:
     first_at, line = first
     n, uptime, wall = tick(line)
     check(n == last_n + 1, f"the count goes on: last before the fence {last_n}, first after {n}")
+    twice = counted_twice(src, dst)
+    check(not twice, f"no count was printed by both guests: {twice[:3]}")
     host_gap = first_at - last_tick_at
     # The ticks carry /proc/uptime, CLOCK_BOOTTIME, which on the portable
     # profile moves on by the downtime; its monotonic clock does not.
@@ -640,6 +675,8 @@ check(status3.get("state") == "restored-paused" and moved is not None
       f"it resumes in a third process and counts on from {last2[-1] if last2 else None}, "
       f"its uptime {on} s on from the last reading before the move")
 check(not third.outputs(r"Booting Linux|HVI-WORKLOAD-BOOT"), "the third process did not reboot it")
+twice = counted_twice(dst, third)
+check(not twice, f"no count was printed by both guests of the second move: {twice[:3]}")
 fp_goes_on(dst, third, "over the second move")
 dirty_goes_on(third, moved[0] if moved else 0.0, "after the second move")
 
@@ -683,7 +720,7 @@ summary = {
     "guest_wall_clock_lag_s": wall_lag,
     "disk_generations": generations,
     "portable": portable, **timers,
-    "stream": stream, "dirty_mib": dirty, "moves": stream_moves,
+    "stream": stream, "dirty_mib": dirty, "dirty_once_s": dirty_once, "moves": stream_moves,
     "failures": failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:

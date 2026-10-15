@@ -81,6 +81,11 @@ pub trait VmHandle: Send + Sync {
     fn sandbox_id(&self) -> &str;
 
     /// Accessor over the guest's RAM. Valid for the lifetime of the VM.
+    ///
+    /// Its write accessors record what they write for a live move. A plugin
+    /// that writes through [`GuestRam::host_ptr`], or through a mapping of
+    /// [`ram_fd`](Self::ram_fd), calls [`GuestRam::mark_dirty`] after the
+    /// write, or a live move misses it.
     fn ram(&self) -> &GuestRam;
 
     /// Descriptor of the object backing guest RAM, borrowed from this handle.
@@ -165,7 +170,9 @@ pub trait CpuHandle {
     /// The guest architecture this vCPU is running.
     fn arch(&self) -> GuestArch;
 
-    /// Accessor over the guest's RAM.
+    /// Accessor over the guest's RAM. A write through
+    /// [`GuestRam::host_ptr`] is marked with [`GuestRam::mark_dirty`], as
+    /// for [`VmHandle::ram`].
     fn ram(&self) -> &GuestRam;
 
     /// This vCPU's registers. Cheap: no other vCPU is parked for it, so the

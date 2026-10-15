@@ -229,9 +229,14 @@ after each move.
 the guest before the move. It rewrites N MiB of pseudo-random pages over
 and over and checks that each page still holds what its last pass wrote,
 so a page a move did not copy again after the guest wrote it prints
-`DIRTY-BAD`. The script checks that none does and that it writes on after
-each move. Timers armed before the move then run 20 s, to outlast the
-rounds. `summary.json` gives each move's rounds, bytes, dirty rates,
+`DIRTY-BAD`. The script checks that none does, and that a pass begun
+after each move found every page as it should. A page rewritten in every
+pass hides a write that a round taken with the guest running lost, since
+the next round sends the page again; only a loss in the final round
+shows. `--dirty-once SECS` makes `/dirty` write each page once per cycle
+of SECS seconds instead, in a shuffled order, and check every page once a
+second, so a write lost in any round leaves a page that fails. Timers
+armed before the move then run 20 s, to outlast the rounds. `summary.json` gives each move's rounds, bytes, dirty rates,
 compression, write faults, `paused_ms` and the downtime from the end of the
 last round with the guest running to the resume reply.
 
