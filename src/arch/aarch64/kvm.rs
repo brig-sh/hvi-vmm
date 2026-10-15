@@ -281,6 +281,7 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, boot: &VcpuFd) -> 
     p.firmware.psci_version =
         read_u64(boot, REG_PSCI_VERSION).map(|v| format!("{}.{}", v >> 16, v & 0xffff));
     p.agent_sock = cfg.agent_sock.is_some();
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 
@@ -617,7 +618,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let virtio = match &cfg.disk {
         Some(path) => {
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
+            Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
+                path,
+                cfg.disk_base_sha256.is_some(),
+            )?)))
         }
         None => None,
     };

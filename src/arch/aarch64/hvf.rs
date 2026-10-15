@@ -615,6 +615,7 @@ fn boot_profile(cfg: &BootConfig, machine: &Arm64Machine<'_>, fs: &[SharedFs]) -
     }
     p.agent_sock = cfg.agent_sock.is_some();
     p.fs_shares = u32::try_from(cfg.fs_shares.len()).unwrap_or(u32::MAX);
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 
@@ -1002,7 +1003,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let virtio = match &cfg.disk {
         Some(path) => {
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
+            Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
+                path,
+                cfg.disk_base_sha256.is_some(),
+            )?)))
         }
         None => None,
     };

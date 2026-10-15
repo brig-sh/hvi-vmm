@@ -278,6 +278,7 @@ fn boot_profile(
         p.firmware.boot_params_sha256 = Some(sha256_hex(&page));
     }
     p.agent_sock = cfg.agent_sock.is_some();
+    p.disk_base_sha256.clone_from(&cfg.disk_base_sha256);
     p
 }
 
@@ -350,7 +351,10 @@ pub fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error>> {
     let virtio = match &cfg.disk {
         Some(path) => {
             eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
+            Some(Arc::new(Mutex::new(VirtioBlk::open_with_base(
+                path,
+                cfg.disk_base_sha256.is_some(),
+            )?)))
         }
         None => None,
     };

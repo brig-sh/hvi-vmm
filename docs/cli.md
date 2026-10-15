@@ -48,6 +48,7 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot, and so does a disk another process holds locked: hvi holds an exclusive `flock` on its disk (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
+| `--disk-base-sha256 <hex>` | none | The SHA-256 of `--disk` as this boot opens it, before this hvi writes it, 64 lowercase hex digits. hvi tracks only the writes it serves from this boot on, so a disk that an earlier boot wrote needs a new digest, or no flag. hvi does not hash the disk: the caller did, and keeps a copy of that image. The machine profile records it as `disk_base_sha256`, and a move can then send only the blocks the guest wrote (see [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks)). Needs `--disk`. The boot refuses a disk over 4 TiB with it, when it opens the disk. |
 | `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. macOS only. |
 | `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
 | `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
@@ -94,7 +95,8 @@ hvi: boot needs --kernel <Image>
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
 `--fs-gid`, `--share-ro`, `--share-rw`, `--sandbox-id`, `--cpus`,
-`--dump-after`, `--control-sock`, `--profile-out`, `--checkpoint-root`.
+`--dump-after`, `--control-sock`, `--profile-out`, `--checkpoint-root`,
+`--disk-base-sha256`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -167,6 +169,8 @@ hvi: duplicate virtio-fs tag "dup"
 hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>
+hvi: --disk-base-sha256 must be 64 lowercase hex digits, not "ABC"
+hvi: --disk-base-sha256 needs --disk, the disk it describes
 hvi: unknown machine profile "portable"; expected native or portable-arm64-v1
 hvi: unknown boot arg "--nope"
 ```
@@ -193,25 +197,38 @@ and each reply is one line:
 | `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
 | `checkpoint` | Captures the VM into a new bundle directory below `--checkpoint-root`, then resumes it or fences it. See [checkpoint.md](checkpoint.md#taking-a-checkpoint). |
 | `migrate` | Streams the VM on this connection: its RAM in rounds while the guest runs, then the last round and its state paused, then resumes it or fences it. Takes `then`, `txid` and `epoch` as `checkpoint` does, and optionally `max_rounds` (1 to 16, default 5) and `max_secs` (0 to 3600, default 60). Needs no `--checkpoint-root`. See [checkpoint.md](checkpoint.md#live-moves). |
+| `disk-dirty` | `{"since":"boot"}` or `{"since":"round"}`. Replies with the disk's 64 KiB blocks the guest wrote since it booted, or since the last `disk-dirty`, as a base64 bitmap under `bitmap_b64`, with `round`, `block_size`, `blocks` (of the disk), `dirty` (set in the bitmap), `generation` and `bitmap_sha256` (the SHA-256 of the bitmap). Each read starts a round: `boot` is round 0 and clears what `round` would return. With the guest paused it syncs the disk first. See [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks). |
+| `disk-blocks` | `{"blocks":[3,4,9]}` (ascending, at most 4096) or `{"round":k}` (the round the last `disk-dirty` read). Streams the blocks' bytes on the connection in batches, each a header line and its bytes, then replies with `round` (for a round), `blocks`, `bytes`, `batches`, `generation`, `max_lock_us` and `sent_sha256` (the SHA-256 of the batches' digests in order). See [checkpoint.md](checkpoint.md#the-block-stream). |
+
+`disk-dirty` and `disk-blocks` need `--checkpoint-root` and a disk, as a move
+does, and work in every state but `stopping`; without either they are
+`refused`. A `disk-blocks` whose list names a block past the disk, or out of
+order, is `bad_request`, and one for a round that is not the last read is
+`refused`; neither sends a byte first. A block that cannot be read ends the
+stream with `capture_failed`. A line with a `v` key is always the reply; a
+batch header has none.
 
 `pause` and `resume` are idempotent. A pause outlives the connection that asked
-for it. Apart from `checkpoint` and `migrate`, no reply takes longer than about
-2 s, so give a client a reply timeout of at least 3 s. A `checkpoint` replies
-once its bundle is written, which takes longer the more guest RAM is in use. A
-`migrate` writes its stream before its reply, as fast as the client reads it:
-rounds with the guest running until one ends past `max_secs` (the cap is
-checked as each round ends, so a round under way, round 0 included, runs to
-its end however long it takes), then the paused part. So its
-client reads the frames and waits for the reply with no fixed timeout. hvi
-gives up on a client that takes nothing for 30 s, or that does not take the
-paused part within its budget, and the VM runs on (see
-[checkpoint.md](checkpoint.md#the-rounds)). A client that gives up on a `pause` before its reply cannot
+for it. Apart from `checkpoint`, `migrate` and `disk-blocks`, no reply takes
+longer than about 2 s, so give a client a reply timeout of at least 3 s. A
+`checkpoint` replies once its bundle is written, which takes longer the more
+guest RAM is in use, and a `disk-blocks` once its last batch is out, which
+takes as long as the client takes to read them. A `migrate` writes its stream
+before its reply, as fast as the client reads it: rounds with the guest
+running until one ends past `max_secs` (the cap is checked as each round
+ends, so a round under way, round 0 included, runs to its end however long it
+takes), then the paused part. So its client reads the frames and waits for
+the reply with no fixed timeout. hvi gives up on a client that takes nothing
+for 30 s, or that does not take the paused part within its budget, and the VM
+runs on (see [checkpoint.md](checkpoint.md#the-rounds)). A client that gives
+up on a `pause` before its reply cannot
 tell whether the VM paused: it should reconnect and ask `status`, or send
 `resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
 `code`; `error` is for a person. The codes are listed in
 `src/checkpoint/control.rs`. The socket has no authentication: anyone who can
-connect to it can pause or stop the VM, so put it in a directory only its owner
-can reach.
+connect to it can pause or stop the VM, and read its disk with `disk-blocks`
+once it has a checkpoint root, so put it in a directory only its owner can
+reach.
 
 `--profile-out` writes the machine profile: what the guest was built against,
 such as the CPU's ID registers, the counter frequency, the interrupt
@@ -242,6 +259,7 @@ before it creates anything, and otherwise brings the guest up
 | `--control-sock <path>` | required | The control socket, as for `boot`. The guest waits on it for `resume`, so a restore without one could never run. |
 | `--checkpoint-root <dir>` | required | The directory a later `checkpoint` of the restored guest writes below, as for `boot`. |
 | `--disk <path>` | none | The disk to reopen for the guest's virtio-blk. Required when the guest had a disk, refused when it had none. It must be the size the guest was given, and no other process may hold it locked: a second restore onto the disk of a running guest fails (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
+| `--disk-generation <g>` | none | Says `--disk` is the guest's base image with every round of `disk-blocks` applied, the last of them started by a `disk-dirty` reply whose `generation` was `g`. The restore then refuses a `disk.json` with no base, or captured at another generation: the guest wrote after that round. Needs `--disk`. See [checkpoint.md](checkpoint.md#restoring-onto-the-base). |
 | `--net-stub` | off | The built-in stack, for a guest that ran on it. |
 | `--net-gateway <socket>` | none | The gateway, for a guest that ran on one. Unlike `boot`, a gateway that cannot be reached is an error, not a fallback to the stub. |
 | `--net-mac <mac>` | none | Optional: the bundle holds the MAC. One given here must be that MAC. |

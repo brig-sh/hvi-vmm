@@ -611,6 +611,36 @@ pub(crate) fn refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> 
     why
 }
 
+/// Returns why a disk made from the guest's base image and the rounds of
+/// its blocks a mover applied is not the disk `disk` describes, or `None`
+/// when it is.
+///
+/// `applied` is the `generation` of the `disk-dirty` reply that started the
+/// last round the mover applied. That round holds every write up to it, so
+/// the disk holds every write the guest made only when it is the disk's
+/// generation at the capture. The read may come before the capture, in the
+/// pause the capture is taken in, or after a fence: a fenced guest never
+/// writes again, so its next read is at the captured generation.
+fn final_round_refusal(disk: &DiskState, applied: u64) -> Option<String> {
+    if disk.base_sha256.is_none() {
+        return Some(
+            "--disk-generation: disk.json names no base image the rounds apply to".to_string(),
+        );
+    }
+    (applied != disk.generation).then(|| {
+        format!(
+            "--disk-generation {applied}: the last round applied was read at disk generation \
+             {applied}, and disk.json was captured at generation {}; {}",
+            disk.generation,
+            if applied < disk.generation {
+                "the disk lacks the guest's writes after that round"
+            } else {
+                "that round is not of this capture"
+            }
+        )
+    })
+}
+
 /// Returns every reason the host resources `cfg` names do not match the
 /// devices the guest had.
 fn device_refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> Vec<String> {
@@ -637,12 +667,18 @@ fn device_refusals(opened: &Opened, cfg: &RestoreConfig, can: &Restorer) -> Vec<
                     disk.size_bytes
                 ));
             }
+            if let Some(applied) = cfg.disk_generation {
+                why.extend(final_round_refusal(disk, applied));
+            }
         }
         (Some(_), None, _) => {
             why.push("the guest had a disk; give it with --disk".to_string());
         }
         (None, Some(path), _) => {
             why.push(format!("--disk {path}: the guest had no disk"));
+        }
+        (_, None, _) if cfg.disk_generation.is_some() => {
+            why.push("--disk-generation describes --disk; give both".to_string());
         }
         (Some(_), Some(_), None) => why.push("disk.json is missing".to_string()),
         (None, None, _) => {}
@@ -953,6 +989,10 @@ pub(crate) mod tests {
                 sha256_sparse: None,
                 generation: 0,
                 synced: true,
+                base_sha256: None,
+                block_size: None,
+                dirty_since_boot_b64: None,
+                rounds: Vec::new(),
             }),
             states: DeviceStates {
                 blk: Some(blk),
@@ -1021,6 +1061,7 @@ pub(crate) mod tests {
             control_sock: "/unused".into(),
             checkpoint_root: None,
             disk: Some(scratch.disk()),
+            disk_generation: None,
             net: true,
             net_gateway: None,
             net_mac: None,
@@ -1114,6 +1155,89 @@ pub(crate) mod tests {
             &reasons,
             &["the guest had a stub network; give it with --net-stub"],
         );
+    }
+
+    /// Makes `parts` a guest booted from a base image, whose source read
+    /// rounds at the generations `rounds` and was captured at `generation`.
+    fn moved(parts: &mut Parts, rounds: &[u64], generation: u64) {
+        use crate::devices::virtio::block::{DirtyBlocks, DiskRound, DIRTY_BLOCK_BYTES};
+        let base = "ab".repeat(32);
+        parts.profile.disk_base_sha256 = Some(base.clone());
+        let disk = parts.disk.as_mut().unwrap();
+        disk.base_sha256 = Some(base);
+        disk.block_size = Some(DIRTY_BLOCK_BYTES);
+        disk.dirty_since_boot_b64 = Some(crate::checkpoint::platform::base64_encode(
+            DirtyBlocks::for_size(disk.size_bytes).as_bytes(),
+        ));
+        disk.generation = generation;
+        disk.rounds = (0u32..)
+            .zip(rounds)
+            .map(|(round, &generation)| DiskRound {
+                round,
+                generation,
+                blocks: 1,
+                bitmap_sha256: None,
+                sent_sha256: None,
+            })
+            .collect();
+    }
+
+    // Only the mover knows whether it made the disk from rounds, so only
+    // its --disk-generation asks for the check: rounds left from a move that
+    // was given up do not refuse a bundle whose disk was copied whole.
+    #[test]
+    fn a_disk_made_from_rounds_must_hold_the_guest_s_last_write() {
+        let none = refused("rounds-stale", |p| moved(p, &[3], 5), |_| {});
+        assert_eq!(none, Vec::<String>::new());
+        // The last round read before the capture, in its pause.
+        let ok = refused(
+            "rounds-final",
+            |p| moved(p, &[3, 5], 5),
+            |cfg| cfg.disk_generation = Some(5),
+        );
+        assert_eq!(ok, Vec::<String>::new());
+        // hull's order: rounds 0 and 1 while the guest ran, the fence, then
+        // the final round, which disk.json cannot list. Its read is at the
+        // captured generation, since a fenced guest writes nothing more.
+        let ok = refused(
+            "rounds-after-fence",
+            |p| moved(p, &[3, 4], 5),
+            |cfg| cfg.disk_generation = Some(5),
+        );
+        assert_eq!(ok, Vec::<String>::new());
+        // A mover that skipped that final round has only round 1's read.
+        let reasons = refused(
+            "rounds-skipped",
+            |p| moved(p, &[3, 4], 5),
+            |cfg| cfg.disk_generation = Some(4),
+        );
+        has(
+            &reasons,
+            &[
+                "--disk-generation 4: the last round applied was read at disk generation 4, \
+                 and disk.json was captured at generation 5; the disk lacks the guest's writes",
+            ],
+        );
+        let reasons = refused(
+            "rounds-other",
+            |p| moved(p, &[3, 4], 5),
+            |cfg| cfg.disk_generation = Some(9),
+        );
+        has(&reasons, &["that round is not of this capture"]);
+        let reasons = refused("rounds-nobase", |_| {}, |cfg| cfg.disk_generation = Some(0));
+        has(&reasons, &["disk.json names no base image"]);
+        let reasons = refused(
+            "rounds-nodisk",
+            |p| {
+                p.states.blk = None;
+                p.disk = None;
+            },
+            |cfg| {
+                cfg.disk = None;
+                cfg.disk_generation = Some(1);
+            },
+        );
+        has(&reasons, &["--disk-generation describes --disk; give both"]);
     }
 
     #[test]

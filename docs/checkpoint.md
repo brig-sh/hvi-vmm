@@ -17,7 +17,10 @@ This page says what works today and what does not.
     [portable-profile.md](portable-profile.md)) does the same on the Mac and
     on arm64 KVM (a Raspberry Pi 5), and its bundle is the same on both, so
     `hvi restore` takes a bundle of either backend on either. See
-    [Moving between hosts](#moving-between-hosts).
+    [Moving between hosts](#moving-between-hosts);
+  - the disk's written blocks can be read and streamed while the guest
+    runs, and applied onto a copy of the image it booted from. See
+    [Moving the disk by its blocks](#moving-the-disk-by-its-blocks).
 - **Does not work yet:** a native KVM bundle cannot be restored: its vCPUs
   are whole, but the vGICv3 and the counter are not captured. A native HVF
   bundle moves only between hosts on the same macOS build, CPU and hvi
@@ -192,7 +195,7 @@ on the byte layout of the build that wrote it.
 | `cpu.json` | `{"version":1,"arch":"aarch64"\|"x86_64","vcpus":[...]}`. Registers by architectural name, values as `"0x..."` strings. Each vCPU says whether it is `partial`. See [The vCPU state](#the-vcpu-state). |
 | `platform.json` | The interrupt controller (`irq`) and the guest counter (`timer`), each tagged with its `kind`, and an optional backend blob. See [The platform state](#the-platform-state). |
 | `devices.json` | Every device's state, with a `null` for a device the guest does not have, and `irq_levels`: the level of each device's interrupt line at the capture, so a restore can drive the lines again. |
-| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot, which a restore carries on, so it only grows across moves), `synced: true`, and `sha256_sparse: null`, which whoever moves the disk fills in. |
+| `disk.json` | Only when the guest has a disk: the path it was opened at, its size, `generation` (the writes and flushes since boot, which a restore carries on, so it only grows across moves), `synced: true`, `sha256_sparse: null`, which whoever moves the disk fills in, and for a move by blocks `base_sha256`, `block_size`, `dirty_since_boot_b64` and `rounds`. See [Moving the disk by its blocks](#moving-the-disk-by-its-blocks). |
 | `session.json` | The sandbox id, `epoch`, `txid`, the capture time and `then`. |
 | `manifest.json` | Every other file's name, size and SHA-256, the RAM regions with their present page counts, the SHA-256 of `profile.json`, the hvi build, `capabilities` (what a restore must be able to load: `hvf-gic-state-v1` on HVF, empty on KVM) and the seal time. |
 
@@ -397,15 +400,16 @@ written from a `vmm` thread (Linux), is refused.
 | --- | --- | --- |
 | Guest RAM | Whole, without zero pages. | The same. |
 | Device state | Whole: virtio-blk, virtio-net and virtio-vsock queues and registers, and the PL011. | The same, with the 16550 and the CMOS RTC on x86-64. |
-| Disk | Synced, with its size and generation. The image itself is not in the bundle; whoever moves the sandbox moves the disk. | The same. |
+| Disk | Synced, with its size, generation, base digest, the blocks written since boot and the rounds read. The image itself is not in the bundle; whoever moves the sandbox moves the disk, whole or by its blocks. | The same. |
 | vCPU registers | Whole. See [The vCPU state](#the-vcpu-state). | arm64: whole, by the same names, with the firmware and fixed registers and `mp_state`. x86-64: **partial**, the plugin register view. |
 | A secondary the guest never started | `off`, or `pending_on` with the entry and context of the `CPU_ON` it had not taken. | `off` when KVM reports it stopped. PSCI is KVM's: a vCPU whose `CPU_ON` KVM has not served yet still holds its initialisation registers (pc 0), and the capture fails until the guest has run again. One turned off and being turned on again is not seen (`portable-profile.md`, Limits). |
 | Interrupt controller | Native: the `hv_gic_state` blob, and the GICv3 registers in canonical form. Portable: the software GICv2's state. | Portable: the vGICv2 in canonical form. Native: **not captured**. |
 | Guest counter | Native: the counter at the capture. Portable: `hvi-time`'s state and the raw counter. | Portable: the same. Native: **not captured**. |
 
 A restore refuses a vCPU marked `partial` and a `not-captured` section.
-`hvi checkpoint-verify` reports both. Dirty tracking for pre-copy rounds and
-a dirty-sector bitmap for the disk come later.
+`hvi checkpoint-verify` reports both. Dirty tracking for pre-copy rounds of
+guest RAM comes later; the disk's written blocks are tracked, see
+[Moving the disk by its blocks](#moving-the-disk-by-its-blocks).
 
 ### What a capture can lose
 
@@ -868,6 +872,202 @@ do not compress, and it never converges.
   29, the whole move 0.79 to 0.81 s, and at most 83 to 85 ms of downtime,
   read on the Mac as the resume reply arrived back over `ssh`. The guest
   counted on and printed no boot banner.
+
+## Moving the disk by its blocks
+
+A move that copies the whole disk image copies 1.6 GB for the claude-code
+guest, even when the destination already holds the image the guest booted
+from and the guest changed a few MB of it. hvi tracks which blocks the guest
+wrote, so a mover that keeps a copy of that base image can send only them,
+and send most of them while the guest still runs.
+
+**The base.** Whoever starts hvi hashes the disk as this boot opens it,
+before this hvi writes it, keeps a copy, and passes the digest with
+`--disk-base-sha256`. hvi tracks only the writes it serves from this boot
+on, so a disk that an earlier boot wrote needs a new digest, or no flag:
+the earlier boot's writes are in no bitmap, and a move by blocks would
+leave them out. hvi does not read the image to check it. The machine
+profile records it as `disk_base_sha256`, no compatibility check reads it,
+and a restore carries it to the restored guest's profile. A disk with a
+base must be at most 4 TiB, whose bitmap (8 MiB, 11,184,812 characters of
+base64) still fits `disk.json`'s 12 MiB limit; the boot refuses a larger
+one. A disk over 4 TiB without a base is checkpointed without the bitmap.
+
+**The bitmaps.** virtio-blk keeps two bitmaps of the disk's 64 KiB blocks
+(a 16 GiB disk takes 32 KiB each): the blocks written since the guest
+booted, and the blocks written since a mover last read them. A write marks
+its blocks before it reaches the image, with the device's lock held, so a
+write that fails part way is marked too. A read or a flush marks nothing.
+The device offers neither discard nor write-zeroes, so a write is the only
+request that changes the image. A reset, as a guest reboot makes, keeps
+both bitmaps. A restore starts the first from `disk.json`, so the blocks
+written since boot are counted over every move, as `generation` is. Bit
+`i` is bit `i % 8` of byte `i / 8`, as in `ram.map`; the last block is
+short when the disk is not a whole number of blocks.
+
+### The rounds
+
+`disk-dirty` on the control socket reads a bitmap and starts a round:
+
+1. `{"since":"boot"}` returns the blocks written since boot. It is round 0,
+   it starts the rounds over, and it clears the second bitmap, since round 0
+   holds those writes already.
+2. `{"since":"round"}` returns the blocks written since the last read and
+   clears them: round 1, 2 and on. It is refused before a round 0, and
+   after round 1024, so the list of rounds `disk.json` records stays
+   small; reading since boot again starts over.
+
+Each read records the device's generation, under the lock the guest's
+writes take, so a write after a read is in the next round, and the
+SHA-256 of the bitmap it returns, which the reply gives as
+`bitmap_sha256`. Read with the
+guest paused (`paused`, `restored-paused` or `fenced`), it first syncs the
+disk with `fdatasync`, as a capture does.
+
+A move then runs:
+
+1. Boot with `--disk-base-sha256`, and keep the base image.
+2. While the guest runs: `disk-dirty` since boot, and `disk-blocks` for
+   round 0; then `disk-dirty` since the last round and `disk-blocks` for
+   it, until a round is small. The destination applies each round into
+   its copy of the base as it arrives.
+3. The final round, read with the guest still, so no write comes after
+   it. Either order works:
+   - `pause`, then `disk-dirty` since the last round and its
+     `disk-blocks`, then `checkpoint` with `then: "fence"`. Its
+     `disk.json` lists the final round too.
+   - `checkpoint` with `then: "fence"`, then `disk-dirty` since the last
+     round and its `disk-blocks`. `disk.json` was written before that
+     read and does not list it, but a fenced guest never writes again,
+     so the read is at the generation `disk.json` records.
+4. On the destination, `hvi restore --disk <the copy> --disk-generation G`,
+   where `G` is the `generation` of the `disk-dirty` reply that started
+   the final round.
+
+`G` must come from the `disk-dirty` reply, not from the `disk-blocks`
+reply. While the guest runs, a write can land between the read and the
+end of its export: the `disk-blocks` reply's generation then counts a
+write that only the next round holds. After a fence the two are equal.
+
+A block applied twice is harmless: a later round carries the newer bytes.
+
+### The block stream
+
+`disk-blocks` names the blocks as a list, `{"blocks":[3,4,9]}`, ascending
+and each once, at most 4096 per request, which fit a request line of
+64 KiB, or as `{"round":k}`, the round the last `disk-dirty` read, which is
+the way to ask for a whole round. A longer list is `bad_request`. Every
+block number is checked before the first byte goes out. The blocks then
+come on the connection in batches, then the op's reply:
+
+```text
+{"component":"disk-blocks","batch":0,"first":3,"count":2,"offset":196608,"size":131072,"sha256":"<hex>"}
+<131072 bytes: blocks 3 and 4>
+{"component":"disk-blocks","batch":1,"first":9,"count":1,"offset":589824,"size":65536,"sha256":"<hex>"}
+<65536 bytes: block 9>
+{"v":1,"ok":true,"blocks":3,"bytes":196608,"batches":2,"generation":41,"max_lock_us":38,"sent_sha256":"<hex>"}
+```
+
+| Header field | Meaning |
+| --- | --- |
+| `component` | Always `disk-blocks`. |
+| `batch` | The batch's number in this stream, from 0. |
+| `first`, `count` | The blocks: `count` adjacent blocks from `first`, at most 16 (1 MiB). |
+| `offset` | The byte on the disk the first block starts at, `first * 65536`. |
+| `size` | The bytes after the line: `count` blocks, less when the last is the disk's short last block. |
+| `sha256` | The SHA-256 of those bytes, lowercase hex. |
+
+A line with a `v` key is the reply and ends the stream; a header has none.
+A block that cannot be read ends it with a `capture_failed` reply. Each
+block is read with the device's lock held for that block only, so the
+guest's I/O waits for one 64 KiB read at most; `max_lock_us` is the
+longest hold. A block the guest writes while it is exported may go out
+with or without the write, and is in the next round either way.
+
+The reply's `sent_sha256` is the SHA-256 of the batches' `sha256` texts,
+in order, with nothing between them. A reader that hashes the digests of
+the batches it applied the same way, and compares `blocks`, `bytes` and
+`batches` with what it applied, knows it applied the whole stream. For
+`{"round":k}` the reply also carries `round`, and the device records the
+digest against the round, so a `disk.json` captured later lists it as
+the round's `sent_sha256`.
+
+`tools/apply-blocks.py --image <copy> --sock <control socket> --round <k>`
+applies a round as a destination would: it checks each header, that the
+blocks are inside the image and at their own offset, and each digest,
+never grows the image, and refuses a reply whose counts or `sent_sha256`
+are not those of the batches it applied. `--stream FILE` reads a saved
+stream instead.
+
+### Restoring onto the base
+
+`disk.json` records `base_sha256` (the profile's `disk_base_sha256`),
+`block_size` (65536), `dirty_since_boot_b64` (the first bitmap as base64)
+and `rounds`, each `{"round","generation","blocks","bitmap_sha256",
+"sent_sha256"}`. `bitmap_sha256` is the digest the round's `disk-dirty`
+reply gave; `sent_sha256` is the one its `{"round":k}` reply gave, or
+`null` for a round not streamed that way before the capture. With them a
+destination can show it applied each listed round's blocks, and that no
+round was read before the one before it went out: such a round has no
+`sent_sha256`. hvi records them and checks only their form; comparing
+them with what was applied is the mover's work. A final round read after
+a fence is not in `disk.json`, so its digests are only in its replies.
+The manifest covers `disk.json`, and so the digests it lists, but not
+the block bytes themselves.
+
+A `disk.json` written before these fields existed still reads. The reader
+refuses one whose base is not the profile's, whose rounds are out of order
+or of a generation past the disk's, whose digests are not 64 lowercase hex
+digits, or whose bitmap is not the bitmap of a disk this size; it checks
+the bitmap's length before it decodes it.
+
+Only the mover knows how it made the destination's disk, so it says so:
+`hvi restore --disk-generation G` means `--disk` is the base with every
+round applied, and the last round's `disk-dirty` read was at generation
+`G`. The restore then refuses, with its other reasons and before it
+creates anything, a `disk.json` with no base, or one captured at another
+generation. A `G` below it means the guest wrote after that round and the
+disk lacks the write, as when a mover skips the final round. Without the
+flag nothing about rounds is checked, so rounds left over from a move that
+was given up do not refuse a bundle whose disk was copied whole.
+
+The restored device goes on from `dirty_since_boot_b64`, so a second move
+from the destination against the same base still sends every block that
+differs from it.
+
+### Measured
+
+On the Mac (Apple M5 Pro, HVF), a 2-vCPU, 512 MiB guest with a raw 1 GiB
+disk (16384 blocks), driven by a scratch script around
+`tools/apply-blocks.py`. The guest wrote 32 MiB at 8 MiB, one block at
+block 5 and 6 bytes at byte 512000. `disk-dirty` since boot returned
+exactly those 514 blocks (5, 7 and 128 to 639), in 0.1 ms. Then a guest
+loop wrote random 64 KiB blocks with `conv=fsync` while the rounds ran:
+
+| Round | Guest | Blocks | MiB | Batches | Applied in | Longest lock hold |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | after its pattern | 514 | 32.1 | 34 | 309 ms (104 MiB/s) | 397 µs |
+| 1 | writing | 482 | 30.1 | 465 | 1039 ms (29 MiB/s) | 53 µs |
+| 2 | writing | 690 | 43.1 | 652 | 1351 ms (32 MiB/s) | 51 µs |
+| 3 (final) | paused | 320 | 20.0 | 316 | 135 ms (148 MiB/s) | 20 µs |
+
+The base with the four rounds applied had the live disk's SHA-256. From
+the `pause` request to the final round applied took 141 ms. The fenced
+bundle verified, its `disk.json` (3.3 KB) listed the four rounds with the
+last at the disk's generation, a restore from the copy came up
+restored-paused, reported the source's 1923 blocks since boot, and its
+guest answered after `resume`. The rates include the Python reader's
+hashing; scattered single blocks cost one batch each.
+
+The same check with the final round read after the fence, as hull does
+it: rounds 0 to 2 while the guest wrote (514, 376 and 543 blocks), then
+`checkpoint` with `then: "fence"`, then round 3 (252 blocks, 15.8 MiB,
+applied in 81 ms). The base with rounds 0 to 3 had the live disk's
+SHA-256. `disk.json` listed rounds 0 to 2 and generation 28357, the
+generation of round 3's `disk-dirty` reply. A restore with
+`--disk-generation 24022`, round 2's read, as a mover that skipped the
+final round would pass, was refused; with `--disk-generation 28357` it
+came up restored-paused and its guest answered after `resume`.
 
 ## Clock policy
 
