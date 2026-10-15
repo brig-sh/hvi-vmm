@@ -1073,8 +1073,11 @@ sits between the restore and the resume.
   earlier had 4.2 s and 20.3 s of downtime (`hvi-time`'s downtime total),
   where the same move took 0.17 s before: the restore's line for the
   stream, which it prints after that sync, came 3.9 s and 20 s after the
-  source fenced, for a stream that had left the Mac in about 1 s. A mover
-  makes and syncs its copy before the move.
+  source fenced, for a stream that had left the Mac in about 1 s. With
+  `sync` run on the copy right after the `cp` (0.85 and 1.15 s), the
+  next two moves had 0.27 s and 0.26 s of downtime and at most 142 ms
+  from the pause to the resume reply. A mover makes and syncs its copy
+  before the move.
 - The destination's part, manifest to restored-paused, includes the sync of
   the disk rounds it wrote: 13 to 16 ms on both hosts.
 - Mac to Pi, through `ssh` (rp2, 43 MB/s for round 0), with the base copied
