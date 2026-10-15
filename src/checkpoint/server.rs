@@ -3632,7 +3632,7 @@ mod tests {
             self.0[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
             Ok(())
         }
-        fn finished(&mut self) -> std::io::Result<()> {
+        fn round_end(&mut self, _in_pause: bool) -> std::io::Result<()> {
             Ok(())
         }
     }
