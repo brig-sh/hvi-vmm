@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The streamed bundle, `checkpoint_format` 3 (2 before it carried the
-//! disk): a checkpoint as one byte stream instead of a directory, so the
-//! destination reads it as the source writes it.
+//! The streamed bundle, `checkpoint_format` 3 when it carries the disk's
+//! blocks and 2 when it does not: a checkpoint as one byte stream instead
+//! of a directory, so the destination reads it as the source writes it.
 //!
 //! The stream is a sequence of frames. Each frame is one line of JSON,
 //! [`FrameHeader`], `{"component":NAME,"size":N,"sha256":HEX}`, then exactly
@@ -79,9 +79,12 @@ use crate::checkpoint::ram::{MAX_REGIONS, PAGE_SIZE};
 use crate::devices::virtio::block::{DirtyBlocks, DIRTY_BLOCK_BYTES};
 use crate::memory::{DirtyPages, GuestRam};
 
-/// The `checkpoint_format` of a streamed bundle that carries the disk's
-/// blocks. One without them is 2, as before them, and the reader takes
-/// both.
+/// The `checkpoint_format` of a streamed bundle's manifest when it carries
+/// the disk's blocks; one without them says 2, and the reader refuses any
+/// other pairing. The number tells tooling that reads manifests whether
+/// to expect `disk`. It does not let another build restore the stream:
+/// `profile.json` says the profile's own format, 3, and a restore
+/// refuses a profile from another format or another hvi build.
 pub const STREAM_FORMAT: u32 = 3;
 
 /// The longest frame header line the reader takes, newline included.
@@ -261,8 +264,9 @@ pub struct StreamManifest {
     pub capabilities: Vec<String>,
     /// When the source wrote the manifest, in milliseconds since the epoch.
     pub sealed_at_unix_ms: u64,
-    /// The disk rounds, when the stream carries the disk's blocks. Absent
-    /// otherwise, so a stream without them reads as it did before them.
+    /// The disk rounds, when the stream carries the disk's blocks, and
+    /// then the format is [`STREAM_FORMAT`]. Absent otherwise, and the
+    /// format is 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<StreamDisk>,
 }
@@ -502,8 +506,9 @@ impl<W: Write> StreamWriter<W> {
             .map(|c| c.sha256.clone())
             .ok_or_else(|| bad(MANIFEST, "the stream did not start with profile.json"))?;
         let manifest = StreamManifest {
-            // A stream without disk rounds is format 2 as it was, so an
-            // hvi from before them still reads it.
+            // 3 exactly when the manifest lists disk rounds, which the
+            // reader holds it to. An hvi from before the disk rounds still
+            // refuses the stream, by its profile, whatever this says.
             checkpoint_format: if self.disk_rounds.is_empty() {
                 2
             } else {
@@ -1661,12 +1666,22 @@ fn check_manifest(
     applied: &[FrameCount],
     disks: &[AppliedDisk],
 ) -> io::Result<()> {
-    if !(2..=STREAM_FORMAT).contains(&manifest.checkpoint_format) {
+    let want = if manifest.disk.is_some() {
+        STREAM_FORMAT
+    } else {
+        2
+    };
+    if manifest.checkpoint_format != want {
         return Err(bad(
             MANIFEST,
             format!(
-                "checkpoint_format {}, a stream is 2 to {STREAM_FORMAT}",
-                manifest.checkpoint_format
+                "checkpoint_format {}, and a stream {} disk rounds is {want}",
+                manifest.checkpoint_format,
+                if manifest.disk.is_some() {
+                    "with"
+                } else {
+                    "without"
+                }
             ),
         ));
     }
@@ -2382,7 +2397,42 @@ mod tests {
         assert_eq!(got.manifest.checkpoint_format, 2);
         assert_eq!((disk.begun, disk.writes), (0, 0));
         let text = String::from_utf8_lossy(&bytes).to_string();
-        assert!(!text.contains("\"disk\""), "a reader of format 2 takes it");
+        assert!(
+            !text.contains("\"disk\""),
+            "the manifest of a stream without disk rounds has no disk"
+        );
+    }
+
+    // The manifest's format says whether it lists disk rounds: 3 with,
+    // 2 without, and the reader takes no other pairing.
+    #[test]
+    fn the_manifest_format_matches_its_disk_rounds() {
+        let base = base_disk();
+        let bytes = disk_stream(&[(&base, &[1]), (&base, &[2])]);
+        let got = read_disk(&bytes, &mut MemDisk::new(base_disk())).unwrap();
+        let check = |m: &StreamManifest| {
+            check_manifest(m, &m.components, &got.applied, &got.disk).map_err(|e| e.to_string())
+        };
+        assert_eq!(check(&got.manifest), Ok(()));
+        let mut two = got.manifest.clone();
+        two.checkpoint_format = 2;
+        let why = check(&two).expect_err("format 2 with disk rounds");
+        assert!(
+            why.contains("checkpoint_format 2, and a stream with disk rounds is 3"),
+            "{why}"
+        );
+        let (plain, _) = read(&stream(&guest(), &[], true)).unwrap();
+        let check = |m: &StreamManifest| {
+            check_manifest(m, &m.components, &plain.applied, &plain.disk).map_err(|e| e.to_string())
+        };
+        assert_eq!(check(&plain.manifest), Ok(()));
+        let mut three = plain.manifest.clone();
+        three.checkpoint_format = STREAM_FORMAT;
+        let why = check(&three).expect_err("format 3 without disk rounds");
+        assert!(
+            why.contains("checkpoint_format 3, and a stream without disk rounds is 2"),
+            "{why}"
+        );
     }
 
     fn disk_refusal(bytes: &[u8]) -> String {
