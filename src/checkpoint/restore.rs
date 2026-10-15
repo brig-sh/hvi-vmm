@@ -362,6 +362,30 @@ pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Ope
                 .map_err(|e| std::io::Error::new(e.kind(), format!("connecting to {from}: {e}")))?,
         )
     };
+    let opened = read_stream(input, from, keep)?;
+    if from == "-" {
+        // SAFETY: opens a path and moves the descriptor onto stdin; nothing
+        // else holds stdin's lock now that the read is done.
+        #[allow(clippy::disallowed_methods)]
+        let null = std::fs::File::open("/dev/null")?;
+        if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(opened)
+}
+
+/// Reads the streamed bundle from `input`, which `from` names, whole, and
+/// returns it opened; see [`open_stream`].
+///
+/// # Errors
+///
+/// Errors, naming the component, on the first thing that does not hold.
+fn read_stream(
+    input: impl std::io::Read,
+    from: &str,
+    keep: Option<&str>,
+) -> std::io::Result<Opened> {
     let mut reader = stream::StreamReader::new(std::io::BufReader::with_capacity(1 << 20, input));
     let mut built = None;
     let received = stream::receive(&mut reader, |bytes| {
@@ -392,15 +416,6 @@ pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Ope
         built = Some((profile, shared, Arc::clone(&ram)));
         Ok((space, ram))
     })?;
-    if from == "-" {
-        // SAFETY: opens a path and moves the descriptor onto stdin; nothing
-        // else holds stdin's lock now that the read is done.
-        #[allow(clippy::disallowed_methods)]
-        let null = std::fs::File::open("/dev/null")?;
-        if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), 0) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
     let (profile, shared, ram) =
         built.ok_or_else(|| std::io::Error::other("the stream built no RAM"))?;
     let listed: Vec<(u64, u64)> = received
@@ -431,7 +446,13 @@ pub(crate) fn open_stream(from: &str, keep: Option<&str>) -> std::io::Result<Ope
         .map_err(|e| stream_bad("platform.json", e))?;
     let devices =
         DevicesDoc::from_json(doc("devices.json")?).map_err(|e| stream_bad("devices.json", e))?;
+    // As `Bundle::disk` checks a directory's: the base digest is the
+    // profile's, and a base comes with the blocks written since boot.
     let disk = received.doc("disk.json").map(parse_disk).transpose()?;
+    if let Some(disk) = &disk {
+        disk.check(&profile)
+            .map_err(|e| stream_bad("disk.json", e))?;
+    }
     let session = parse_session(doc("session.json")?)?;
     if let Some(dir) = keep {
         keep_documents(Path::new(dir), &received)?;
@@ -1036,20 +1057,105 @@ pub(crate) mod tests {
             if let Some(disk) = &self.disk {
                 w.write_json(Component::Disk, disk).unwrap();
             }
-            w.write_json(
-                Component::Session,
-                &Session {
-                    version: DOC_VERSION,
-                    sandbox_id: "sb".into(),
-                    epoch: 4,
-                    txid: None,
-                    captured_at_unix_ms: unix_ms(),
-                    then: "fence".into(),
-                },
-            )
-            .unwrap();
+            w.write_json(Component::Session, &session()).unwrap();
             w.seal(self.capabilities).unwrap();
         }
+    }
+
+    impl Parts {
+        /// Writes the bundle as a stream, with one RAM round, taken paused.
+        fn stream(self) -> Vec<u8> {
+            use crate::checkpoint::stream::{ChunkEncoder, StreamRegion, StreamWriter};
+            let mut out = Vec::new();
+            let mut w = StreamWriter::new(&mut out);
+            w.write_doc("profile.json", self.profile.to_json().as_bytes())
+                .unwrap();
+            let mut round = w.round(true);
+            let mut page = vec![0u8; 4096];
+            page[..5].copy_from_slice(b"guest");
+            round
+                .chunk(&mut ChunkEncoder::default(), 2, &page, false)
+                .unwrap();
+            round.finish().unwrap();
+            w.write_doc(
+                "cpu.json",
+                &json(&CpuState::new(GuestArch::Aarch64, self.vcpus)),
+            )
+            .unwrap();
+            w.write_doc("platform.json", &json(&self.platform)).unwrap();
+            let devices = DevicesDoc {
+                states: self.states,
+                irq_levels: IrqLevels::default(),
+            };
+            w.write_doc("devices.json", &devices.to_json().unwrap())
+                .unwrap();
+            if let Some(disk) = &self.disk {
+                w.write_doc("disk.json", &json(disk)).unwrap();
+            }
+            w.write_doc("session.json", &json(&session())).unwrap();
+            let regions = self
+                .profile
+                .ram_regions
+                .iter()
+                .map(|r| StreamRegion {
+                    gpa: r.gpa,
+                    size: r.size,
+                })
+                .collect();
+            w.seal(
+                crate::checkpoint::profile::this_build(),
+                regions,
+                self.capabilities,
+                unix_ms(),
+            )
+            .unwrap();
+            out
+        }
+    }
+
+    /// Returns `doc` as JSON, as a capture writes it.
+    fn json<T: serde::Serialize>(doc: &T) -> Vec<u8> {
+        serde_json::to_vec(doc).unwrap()
+    }
+
+    /// The `session.json` the tests write.
+    fn session() -> Session {
+        Session {
+            version: DOC_VERSION,
+            sandbox_id: "sb".into(),
+            epoch: 4,
+            txid: None,
+            captured_at_unix_ms: unix_ms(),
+            then: "fence".into(),
+        }
+    }
+
+    #[test]
+    fn a_stream_is_opened_as_its_directory_would_be() {
+        let scratch = Scratch::new("stream-whole");
+        let bytes = parts(&scratch).stream();
+        let opened = read_stream(&bytes[..], "test", None).unwrap();
+        assert!(opened.streamed());
+        assert_eq!(
+            refusals(&opened, &config(&scratch), &HVF),
+            Vec::<String>::new()
+        );
+    }
+
+    // The stream's disk.json gets the checks a directory's does: a base
+    // digest the profile does not record is refused before anything runs.
+    #[test]
+    fn a_stream_s_disk_json_is_checked_against_its_profile() {
+        let scratch = Scratch::new("stream-disk");
+        let mut parts = parts(&scratch);
+        parts.disk.as_mut().unwrap().base_sha256 = Some("a".repeat(64));
+        let err = read_stream(&parts.stream()[..], "test", None)
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains("disk.json: base_sha256 is aaaa"),
+            "{err}"
+        );
     }
 
     /// The flags that match [`parts`].
