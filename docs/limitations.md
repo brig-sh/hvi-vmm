@@ -43,7 +43,7 @@ three things a reader should not have to guess between:
 | The open file limit is raised when the first share is set up. | A boot with no share never raises it and never logs the line. macOS only. | Design |
 | A node keeps at most 16 alias paths. | A file with more than 16 hard links inside a share can lose a name from the table. | Design |
 | Symlink expansion stops at 40. | Deeply chained links end as `ELOOP`. | Design |
-| A few call sites still pass a full path string to the host. | Containment is strong and tested rather than proven. Resolution is otherwise by parent descriptor with `O_NOFOLLOW`. | Defect |
+| The export root is resolved by full path when the share is set up. | Containment is strong and tested rather than proven. Resolution after that is by parent descriptor with `O_NOFOLLOW`. | Defect |
 
 ## Guests and CPUs
 

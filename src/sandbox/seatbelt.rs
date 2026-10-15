@@ -219,7 +219,7 @@ fn policy_for<'a>(roots: impl IntoIterator<Item = (&'a Path, bool)>) -> io::Resu
     }
     if any_writable {
         // SYNCFS on a writable export syncs the export's volume
-        // (`sync_volume_np(3)`), which is an fsctl. This allows that one
+        // (`fsync_volume_np(3)`), which is an fsctl. This allows that one
         // command and no other; it can make a volume write out what it
         // already holds, and nothing more. SBPL has no _IOW, hence the
         // number.
@@ -299,6 +299,9 @@ pub struct SelftestFixtures {
     /// write through a symlink that points outside, are only meaningful
     /// denials in a subtree where the profile otherwise permits writes.
     export: std::path::PathBuf,
+    /// The writable export's root, opened before entry, as the VMM opens the
+    /// descriptor that SYNCFS syncs through.
+    export_root: std::fs::File,
     /// A second export, entered read-only, so the selftest installs and
     /// probes the other branch of the rule.
     ///
@@ -481,24 +484,23 @@ fn probes() -> Vec<Probe> {
             what: "another fsctl on the writable export",
             expect_ok: false,
             run: |f| {
-                use std::os::unix::ffi::OsStrExt;
+                use std::os::unix::io::AsRawFd;
                 extern "C" {
-                    fn fsctl(
-                        path: *const libc::c_char,
+                    fn ffsctl(
+                        fd: libc::c_int,
                         request: libc::c_ulong,
                         data: *mut libc::c_void,
                         options: libc::c_uint,
                     ) -> libc::c_int;
                 }
-                let path = CString::new(f.export.as_os_str().as_bytes())
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
                 let mut data = 0u32;
                 // `_IOW('A', 2, uint32_t)`, the command after
-                // FSIOC_SYNC_VOLUME. Safety: `path` is NUL-terminated and
-                // `data` is a live u32 of the size the command encodes.
+                // FSIOC_SYNC_VOLUME, through the descriptor SYNCFS uses.
+                // Safety: the descriptor is open and `data` is a live u32 of
+                // the size the command encodes.
                 let rc = unsafe {
-                    fsctl(
-                        path.as_ptr(),
+                    ffsctl(
+                        f.export_root.as_raw_fd(),
                         0x8004_4102,
                         (&mut data as *mut u32).cast(),
                         0,
@@ -526,11 +528,14 @@ fn probes() -> Vec<Probe> {
             run: |f| std::fs::write(f.export.join("inside"), b"x"),
         },
         Probe {
-            // SYNCFS on a writable export. Without the fsctl grant the
-            // guest's sync fails with EPERM.
+            // SYNCFS on a writable export, through the root descriptor.
+            // Without the fsctl grant the guest's sync fails with EPERM.
             what: "sync the writable export's volume",
             expect_ok: true,
-            run: |f| server::sync_volume(&f.export),
+            run: |f| {
+                use std::os::unix::io::AsFd;
+                server::sync_volume(f.export_root.as_fd())
+            },
         },
         Probe {
             // The same for the read-only grant, so its denial above
@@ -717,6 +722,7 @@ pub fn selftest() -> io::Result<usize> {
         pre_tty: open_pty()?,
         dir: dir.clone(),
         export: export.clone(),
+        export_root: std::fs::File::open(&export)?,
         export_ro: export_ro.clone(),
     };
 

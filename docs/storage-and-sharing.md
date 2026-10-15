@@ -147,9 +147,9 @@ restarts at the export root, a relative one continues from where it was found,
 a target that climbs is clamped at the root, and a cycle ends as `ELOOP` after
 40 expansions.
 
-A few call sites still hand the host a full path string, so the host kernel
-walks the intermediate components itself. Treat containment as strong and
-tested, not as proven.
+The export root is the one path the host resolves whole, when the share is
+set up and before the guest starts. The host kernel walks its intermediate
+components itself. Treat containment as strong and tested, not as proven.
 
 ### Limits worth knowing before you share real data
 
@@ -193,8 +193,9 @@ needs, `FSIOC_SYNC_VOLUME`, and no other. See [security.md](security.md).
 
 SYNCFS on a writable export flushes every file the guest holds open, then
 syncs the export's volume, drive cache included, before it answers. That
-covers the volume the export root is on. A second volume mounted inside the
-export is not synced by it.
+covers the volume the export root is on. The sync goes through the root's
+descriptor, so it stays on that volume if the root's path is renamed or
+replaced later. A second volume mounted inside the export is not synced by it.
 
 SMB cannot sync a volume this way. On an export there, the first SYNCFS fails
 with `ENOSYS`, and the guest's FUSE client stops sending SYNCFS for that
