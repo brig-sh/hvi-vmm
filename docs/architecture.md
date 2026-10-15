@@ -381,7 +381,15 @@ thing that differs by backend:
   sync, adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with
   the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image
   is locked while open, shared for a read-only disk and exclusive for a
-  writable one.
+  writable one. Each disk's requests are served on a worker thread of its own
+  (`block::serve`), not in the vCPU's exit: a notify only wakes the worker,
+  which takes each chain, makes the disk call with no device lock held, and
+  returns the chain, in order and one at a time. A write's data is copied out
+  of guest RAM when the chain is taken, under the lock, so a driver that resets
+  the device while the write is in flight cannot change what lands on the disk.
+  A flush or a write that waits seconds on a busy host disk then stops no vCPU.
+  The worker starts with the I/O threads, runs under the `vmm` seccomp filter
+  and raises the line from its thread, as the network relay does.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
@@ -498,7 +506,10 @@ not a vCPU. Its `pause` first closes the I/O threads' `PauseGate`
 (`teardown.rs`): each of the console reader, the network relay, the agent
 bridge and its connections, and the macOS virtio-fs workers passes the gate
 around every call that takes a device mutex or writes guest RAM, so the pause
-waits only for the work in progress, never for traffic. It then calls
+waits only for the work in progress, never for traffic. The virtio-blk worker
+holds the gate from taking a chain to returning it, its disk call included,
+so the pause waits for at most one request, with the vCPUs still running,
+and finds no chain half-served. It then calls
 `Vcpus::pause_from_control`, which waits for every started vCPU, since its
 caller parks none. The two waits share one 2 s deadline, and a pause that misses
 it is undone and the VM runs on. The agent bridge and the network relays read

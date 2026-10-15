@@ -102,6 +102,7 @@ use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::run::StopHandle;
 use crate::sandbox::seccomp;
 use crate::signal::install_kick_handler;
+use crate::teardown::STOP_TIMEOUT;
 use crate::LOG_PREFIX;
 
 // --- ONE_REG ids (architectural KVM ABI, aarch64). ---------------
@@ -1353,6 +1354,7 @@ fn spawn_timer(io_threads: &mut IoThreads<Kicker>, device: &Arc<HviTime>) {
     let timer = Arc::clone(device);
     io_threads.spawn_with(
         "hvi-time timer",
+        STOP_TIMEOUT,
         || {},
         move |_| {
             let how = hvitime::timer_thread_setup();

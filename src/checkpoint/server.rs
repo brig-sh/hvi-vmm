@@ -1223,7 +1223,10 @@ impl<K: Kick> Machine<'_, K> {
                 );
             }
         };
-        let paused_ms = paused_at.elapsed().as_millis() as u64;
+        // The vCPUs ran on while the gate waited for the I/O threads, the
+        // virtio-blk worker's request in flight among them: the guest was
+        // stopped from the park on.
+        let paused_ms = (paused_at.elapsed().as_millis() as u64).saturating_sub(times.gate_ms);
         if request.then == Then::Continue {
             self.back_to(found);
         }

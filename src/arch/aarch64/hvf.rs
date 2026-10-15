@@ -83,6 +83,7 @@ use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
+use crate::devices::wake::Wake;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{
     Disk, Guest, LedgerCloseGuard, PluginThread, PluginThreads, SafepointVcpu,
@@ -482,66 +483,7 @@ struct SharedFs {
     base: u64,
     intid: u32,
     dev: Arc<Mutex<VirtioFs>>,
-    wake: Arc<FsWake>,
-}
-
-/// A virtio-fs device's coalescing wake signal, which its worker thread parks
-/// on.
-///
-/// `service_fs` calls [`FsWake::wake`] when its inline drain leaves work. The
-/// worker's [`FsWake::park`] checks a predicate under a `Condvar`, so a wake
-/// that lands between the worker's last drain and its park is seen rather than
-/// lost. `run_fs_worker` has the full argument.
-struct FsWake {
-    state: Mutex<FsWakeState>,
-    ready: Condvar,
-}
-
-/// The flags behind [`FsWake`].
-#[derive(Default)]
-struct FsWakeState {
-    /// A notify arrived since the worker last drained.
-    woken: bool,
-    /// The stop has been requested.
-    stopped: bool,
-}
-
-impl FsWake {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(FsWakeState::default()),
-            ready: Condvar::new(),
-        }
-    }
-
-    /// Signals the worker. Safe to call whether or not it is currently
-    /// parked -- a signal that arrives mid-drain is simply picked up on the
-    /// worker's next pass, never lost.
-    fn wake(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.woken = true;
-        self.ready.notify_one();
-    }
-
-    /// Requests that the worker exit at its next pass.
-    fn stop(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.stopped = true;
-        self.ready.notify_one();
-    }
-
-    /// Blocks until the next [`FsWake::wake`] or [`FsWake::stop`].
-    ///
-    /// Clears the wake flag on return and returns `false` once stopped. Must
-    /// not be called with the virtio-fs device mutex held.
-    fn park(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        while !state.woken && !state.stopped {
-            state = self.ready.wait(state).unwrap();
-        }
-        state.woken = false;
-        !state.stopped
-    }
+    wake: Arc<Wake>,
 }
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing
@@ -766,7 +708,9 @@ const RESTORER_PORTABLE: Restorer = restore::portable("hvf");
 // One function so the order of the steps, which the hypervisor and the
 // confinement constrain, reads top to bottom.
 #[allow(clippy::too_many_lines)]
-pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn restore(
+    cfg: RestoreConfig,
+) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let mut opened = restore::open_config(&cfg).map_err(|e| format!("{}: {e}", cfg.from))?;
     let source_profile = opened.profile().clone();
     let source = &source_profile;
@@ -1216,7 +1160,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 });
                 dev
             })),
-            wake: Arc::new(FsWake::new()),
+            wake: Arc::new(Wake::new()),
         });
     }
     let has_net = net.is_some();
@@ -1355,6 +1299,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         ledger_guard: Some(ledger_guard),
         sandbox: cfg.sandbox,
     };
+    // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
+    // error goes back as `run` returned it.
     run(shared, num_cpus, io, None)
 }
 
@@ -1675,7 +1621,7 @@ impl IoStart {
     /// Starts the I/O threads, each virtio-fs device's worker and readahead
     /// threads, and the portable guest's hvi-time timer thread. Each polls its
     /// stop token beside its own descriptor, or takes the stop through its
-    /// `FsWake`, its `ReadaheadStop` or its device, and is joined after the
+    /// `Wake`, its `ReadaheadStop` or its device, and is joined after the
     /// vCPUs.
     fn start(self, shared: &Shared) -> IoThreads<Kicker> {
         let mut io_threads = IoThreads::start(
@@ -1785,6 +1731,7 @@ fn run(
         guard.disarm();
     }
     let _current = record_start(&shared.guest, sandbox);
+
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
@@ -1991,7 +1938,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         let set = set_baseline(&vcpu, cpu_id, cpu_id == 0)
             .and_then(|()| set_vtimer_offset(&vcpu, sh.vtimer_offset));
         if let Err(e) = set {
-            eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
+            stderrln!("{LOG_PREFIX} vcpu{cpu_id}: {e}");
             p.refused.lock().unwrap().get_or_insert(e);
             return;
         }
@@ -2036,7 +1983,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             }
         }
         if let Err(e) = sh.profile.complete(|p| p.cpu.ident = midr.map(hex)) {
-            eprintln!("{LOG_PREFIX} {e}");
+            stderrln!("{LOG_PREFIX} {e}");
         }
     }
     let runs_at_once = sh
@@ -2135,10 +2082,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
                 let pending = sh.restoring.as_ref().and_then(|r| r.hvitime.as_ref());
                 if let (Some(pending), Some(device)) = (pending, &sh.hvitime) {
                     if let Err(e) = pending.publish(device) {
-                        eprintln!("{LOG_PREFIX} cpu{cpu_id}: {e}");
-                        if let Some(p) = portable {
-                            p.refused.lock().unwrap().get_or_insert(e);
-                        }
+                        sh.guest
+                            .vcpus
+                            .report(Outcome::Failed(format!("vcpu{cpu_id}: {e}")));
                         break;
                     }
                 }
@@ -2147,7 +2093,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             if !clock_set {
                 if let Some(clock) = clock {
                     if let Err(e) = vcpu.set_vtimer_offset(clock.offset()) {
-                        eprintln!("{LOG_PREFIX} cpu{cpu_id}: setting the vtimer offset: {e:?}");
+                        sh.guest.vcpus.report(Outcome::Failed(format!(
+                            "vcpu{cpu_id}: setting the vtimer offset: {e:?}"
+                        )));
                         break;
                     }
                 }
@@ -2331,9 +2279,9 @@ fn handle_exit(
                     }
                     advance_pc(vcpu);
                 }
-                // WFx. The native machine's hv_gic handled the wait. Without it
-                // a WFI exits at once with the PC on it, so hvi steps past it
-                // and waits here.
+                // WFx. The native machine's hv_gic handled the wait. Without
+                // it a WFI exits at once with the PC on it, so hvi steps past
+                // it and waits here.
                 Ec::Other(0x01) => {
                     trace::exit(trace::Exit::Wfi);
                     if let Some(p) = portable {
@@ -2354,9 +2302,9 @@ fn handle_exit(
         ExitReason::VTIMER_ACTIVATED => {
             trace::exit(trace::Exit::Vtimer);
             let _ = vcpu.set_vtimer_mask(true);
-            // Without hv_gic the timer reaches the guest only as this exit.
-            // The line stays high, and the timer masked, until the guest ends
-            // the interrupt (`end_vtimer_interrupt`).
+            // Without hv_gic the timer reaches the guest only as this exit. The
+            // line stays high, and the timer masked, until the guest ends the
+            // interrupt (`end_vtimer_interrupt`).
             if let Some(p) = portable {
                 vtimer.raised = true;
                 p.gic
@@ -3085,19 +3033,19 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// mutex, and the device sets its line at the end of the pass. So a pass raises
 /// the line and kicks the vCPUs at most once, however many requests it served.
 ///
-/// `wake.park()` waits on a predicate and a `Condvar` (see `FsWake`), and the
+/// `wake.park()` waits on a predicate and a `Condvar` (see `Wake`), and the
 /// vCPU thread signals whenever its inline drain leaves work. A notify that
 /// races the loop is either served by the drain in progress, since both sides
 /// take the device mutex, or seen by the next `park()`. The mutex is held only
 /// for the drain, never across `park()`.
 ///
-/// [`FsWake::stop`], which runs once the vCPUs have exited or been left
-/// running, ends the loop at the next `park`. The worker then drains the chains
+/// [`Wake::stop`], which runs once the vCPUs have exited or been left running,
+/// ends the loop at the next `park`. The worker then drains the chains
 /// announced by a wake that arrived with the stop.
 ///
 /// Each drain passes the pause gate of `stop` first, so a pause holds the
 /// worker back between drains. The worker parks outside the gate.
-fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake, stop: &StopToken) {
+fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &Wake, stop: &StopToken) {
     while wake.park() {
         let _in = stop.enter();
         dev.lock().unwrap().drain_notified(mem);
@@ -3184,6 +3132,46 @@ fn gpr(idx: u8) -> Option<Reg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CachePolicy;
+
+    // A worker stuck in a host call holds the device past the stop deadline.
+    // The report must not wait for it, or `boot` never returns the error that
+    // names the worker.
+    #[test]
+    fn report_fs_usage_skips_a_device_another_thread_holds() {
+        let dir = std::env::temp_dir().join(format!("hvi-fs-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let dev = Arc::new(Mutex::new(
+            VirtioFs::new(root, "share", false, CachePolicy::Auto).unwrap(),
+        ));
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || {
+                let _device = dev.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = released.recv();
+            })
+        };
+        holding.recv().unwrap();
+        let report = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || report_fs_usage(0, &dev))
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !report.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let finished = report.is_finished();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        report.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(finished, "the report waited for the device");
+    }
 
     /// The ISS of a guest `mrs x3, cntpct_el0` without hv_gic, as measured on
     /// an M5 (`S3_3_C14_C0_1`, Rt 3, read).
@@ -3234,48 +3222,6 @@ mod tests {
         let p = machine(&[true]);
         assert!(p.in_gic(0x0800_0000) && p.in_gic(0x0801_ffff));
         assert!(!p.in_gic(0x0802_0000) && !p.in_gic(0x07ff_fffc));
-    }
-
-    use crate::config::CachePolicy;
-    use std::time::{Duration, Instant};
-
-    // A worker stuck in a host call holds the device past the stop deadline.
-    // The report must not wait for it, or `boot` never returns the error that
-    // names the worker.
-    #[test]
-    fn report_fs_usage_skips_a_device_another_thread_holds() {
-        let dir = std::env::temp_dir().join(format!("hvi-fs-usage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = std::fs::canonicalize(&dir).unwrap();
-        let dev = Arc::new(Mutex::new(
-            VirtioFs::new(root, "share", false, CachePolicy::Auto).unwrap(),
-        ));
-        let (held, holding) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let worker = {
-            let dev = Arc::clone(&dev);
-            std::thread::spawn(move || {
-                let _device = dev.lock().unwrap();
-                held.send(()).unwrap();
-                let _ = released.recv();
-            })
-        };
-        holding.recv().unwrap();
-        let report = {
-            let dev = Arc::clone(&dev);
-            std::thread::spawn(move || report_fs_usage(0, &dev))
-        };
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !report.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let finished = report.is_finished();
-        release.send(()).unwrap();
-        worker.join().unwrap();
-        report.join().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(finished, "the report waited for the device");
     }
 
     #[test]

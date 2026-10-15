@@ -24,9 +24,11 @@ Three filters. `vcpu` is the tight one and the one that matters most, because
 MMIO exits are serviced inline on the vCPU thread -- the virtio device models,
 the code that parses guest descriptors, run there. `vmm` covers the thread that
 calls `boot`, the host-side I/O threads, the threads a plugin starts with
-`VmHandle::spawn`, the stop-signal thread and the ledger's writer. `control` is
-`vmm` plus the file calls a checkpoint bundle needs, and only the control
-socket's thread installs it, and only in a run started with
+`VmHandle::spawn`, the stop-signal thread and the ledger's writer. Among the
+I/O threads is the virtio-blk worker: it parses the block device's descriptors
+and makes its disk calls, which a notify on the vCPU only wakes it for.
+`control` is `vmm` plus the file calls a checkpoint bundle needs, and only the
+control socket's thread installs it, and only in a run started with
 `--checkpoint-root`. That thread parses the control protocol, never guest data;
 a unit test holds `control` to `vmm` plus those file calls.
 
