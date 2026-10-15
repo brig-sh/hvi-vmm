@@ -823,14 +823,36 @@ alone:
   the stream has no disk rounds);
 - a manifest of its own.
 
-The reply carries `first_manifest_sha256`, the first stream's manifest,
-and `same_as_first`, the components whose size and SHA-256 equal the
-first stream's: the documents above, and RAM round 0 too when the guest
-wrote nothing during the first move. Only the stall bound applies to the
-reader; the guest is not waiting. Any other `txid` or `epoch`, a request
-that leaves out `txid` or `epoch` (a missing epoch is not epoch 0),
-`then: "continue"`, a VM a `checkpoint` fenced, or one a `migrate`
-fenced without both a `txid` and an `epoch`, is refused with `fenced`. `resume` stays refused, and `stop` ends the run.
+The stream sent again moves the same machine as the first: applied to
+fresh RAM and another copy of the base, it gives the RAM and the disk
+the first stream gives, which are the source's at the fence, though the
+guest wrote both during the first stream's rounds. Its manifest is not
+the first one's and its SHA-256 never equals the first's: the first
+stream's RAM rounds and disk rounds are gone, so this one carries RAM
+in one round and the disk in one round, and is sealed at another time.
+A mover therefore does not compare whole manifests. It compares the
+SHA-256 that each manifest lists for `profile.json`, `cpu.json`,
+`platform.json`, `devices.json` and `session.json`, taken from the first
+manifest it kept, with the ones the new manifest lists: they are always
+equal. The reply carries `first_manifest_sha256`, the first stream's
+manifest, and `same_as_first`, the components whose size and SHA-256
+equal the first stream's: those five documents, and RAM round 0 too
+when the guest wrote nothing during the first move. hvi computes
+`same_as_first` itself, so it is a report, not a check a mover can rely
+on.
+
+hvi streams the state again as often as the fence owner asks, so a
+mover may retry its recovery. It cannot know whether the first
+destination resumed the guest: the mover must make sure the first
+destination is gone, or never resumed, before it restores a stream
+sent again, or two hosts run the guest.
+
+Only the stall bound applies to the reader; the guest is not waiting.
+Any other `txid` or `epoch`, a request that leaves out `txid` or `epoch`
+(a missing epoch is not epoch 0), `then: "continue"`, a VM a
+`checkpoint` fenced, or one a `migrate` fenced without both a `txid` and
+an `epoch`, is refused with `fenced`. `resume` stays refused, and `stop`
+ends the run.
 
 ### The stream format
 

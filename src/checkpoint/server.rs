@@ -1253,8 +1253,13 @@ impl<K: Kick> Machine<'_, K> {
     /// documents as the first stream sent them, disk.json written again
     /// for its one round. So profile.json, the vCPU, platform, device and
     /// session documents, and disk.json without disk rounds, are the first
-    /// stream's bytes, and the reply names them. The pause is long over, so
-    /// only the stall bound applies to the reader.
+    /// stream's bytes, and the reply names them. The manifest is a new
+    /// one, whose SHA-256 never equals the first's, since the rounds are
+    /// not the first stream's: a mover compares those documents' digests.
+    /// The pause is long over, so only the stall bound applies to the
+    /// reader. The record is kept for as long as the run lives, so the
+    /// mover may ask again; only it can know that the first destination
+    /// never resumed.
     fn restream(&mut self, conn: &mut UnixStream, stop: &StopToken, request: &Migrate) -> Response {
         let Some(record) = &self.fenced_by else {
             return refuse(
@@ -1722,6 +1727,8 @@ mod tests {
         given_root: std::path::PathBuf,
         /// The import steps the vCPUs carried out, when restored.
         log: crate::checkpoint::restore::tests::Log,
+        /// Guest RAM, which a test may write as the guest would.
+        ram: Arc<GuestRam>,
     }
 
     impl Fixture {
@@ -1855,6 +1862,7 @@ mod tests {
             if spec.restore {
                 socket = socket.restored();
             }
+            let guest_ram = Arc::clone(&ram);
             let capture = spec.capture.then(|| Capture {
                 arch: GuestArch::Aarch64,
                 backend: "hvf",
@@ -1923,6 +1931,7 @@ mod tests {
                 given_root: root.clone(),
                 root: std::fs::canonicalize(&root).unwrap(),
                 log,
+                ram: guest_ram,
             }
         }
 
@@ -3851,6 +3860,127 @@ mod tests {
         let (again, _) = f.migrate(r#"{"v":1,"op":"migrate","then":"fence","txid":"x","epoch":0}"#);
         let err = again.err().expect("refused").to_string();
         assert!(err.contains("fenced after a checkpoint"), "{err}");
+    }
+
+    /// A record of the guest's writes for a move whose guest changes both
+    /// RAM and its disk while the rounds run: at each of its first
+    /// collects it writes the next block of `writes` to `disk` and a page
+    /// of RAM with a value of its own, through the guest's side, and
+    /// reports every page written; after them it reports nothing.
+    struct MovingGuestLog {
+        ram: std::sync::OnceLock<Arc<GuestRam>>,
+        disk: Arc<Mutex<VirtioBlk>>,
+        writes: Mutex<Vec<u64>>,
+    }
+
+    impl crate::memory::GuestWriteLog for MovingGuestLog {
+        fn start(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn collect(&self, into: &mut crate::memory::DirtyPages) -> std::io::Result<()> {
+            let Some(block) = self.writes.lock().unwrap().pop() else {
+                return Ok(());
+            };
+            let byte = 0xc0 | block as u8;
+            lock_or_recover(&self.disk)
+                .write_for_test(block * DIRTY_BLOCK_BYTES + 200, &[byte; 64]);
+            let ram = self.ram.get().expect("the test set the RAM");
+            // Not through `GuestRam::write`, which would mark hvi's own log:
+            // the guest's stores do not.
+            let ptr = ram.host_ptr(GPA + 0x3000, 4096).unwrap();
+            // SAFETY: host_ptr bounds-checked the page.
+            unsafe { std::ptr::write_bytes(ptr, byte, 4096) };
+            for index in 0..into.region_count() {
+                let (_, pages) = into.region(index).unwrap();
+                into.set_range(index, 0, pages);
+            }
+            Ok(())
+        }
+        fn stop(&self) {}
+        fn granule(&self) -> u64 {
+            4096
+        }
+    }
+
+    // The fence owner's second stream is the machine the first one moved,
+    // though the guest wrote RAM and its disk during the first one's
+    // rounds: applied to fresh RAM and to another copy of the base, it
+    // makes the same RAM and the same disk as the first stream does, which
+    // are the source's at the fence. Its manifest is its own, and RAM
+    // round 0 differs from the first stream's round 0, so a mover compares
+    // the documents by their digests, not the manifests.
+    #[test]
+    fn a_stream_sent_again_is_the_machine_the_first_one_moved() {
+        let disk = TestDisk::new("mig-again-same", 20);
+        let base = disk.bytes();
+        disk.write(2, 0xa1);
+        let log = Arc::new(MovingGuestLog {
+            ram: std::sync::OnceLock::new(),
+            disk: Arc::clone(&disk.dev),
+            writes: Mutex::new(vec![20, 9, 5]),
+        });
+        let mut f = Fixture::with(
+            "mig-again-same",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                base: Some("ab".repeat(32)),
+                noise_mib: 9,
+                write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                ..Spec::default()
+            },
+        );
+        log.ram.set(Arc::clone(&f.ram)).ok().unwrap();
+        let line =
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"tx-9","epoch":4,"max_rounds":3}"#;
+        let mut first_disk = Image(base.clone());
+        let (first, r1) = f.migrate_into(line, Some(&mut first_disk));
+        let (first, first_ram) = first.expect("the first stream reads whole");
+        assert_eq!(r1["state"], "fenced", "{r1}");
+        let mut again_disk = Image(base);
+        let (again, r2) = f.migrate_into(line, Some(&mut again_disk));
+        let (again, again_ram) = again.expect("the stream sent again reads whole");
+        assert_eq!(r2["state"], "fenced", "{r2}");
+
+        let whole = |ram: &GuestRam| {
+            let mut bytes = vec![0u8; 10 << 20];
+            ram.read(GPA, &mut bytes).unwrap();
+            bytes
+        };
+        let source = whole(&f.ram);
+        assert_eq!(source[0x3000], 0xc0 | 20, "the guest wrote during the move");
+        assert!(whole(&first_ram) == source, "the first stream moved RAM");
+        assert!(
+            whole(&again_ram) == source,
+            "the second stream moved the same RAM"
+        );
+        assert!(
+            first_disk.0 == disk.bytes(),
+            "the first stream moved the disk"
+        );
+        assert!(
+            again_disk.0 == disk.bytes(),
+            "the second moved the same disk"
+        );
+
+        assert_ne!(r2["manifest_sha256"], r1["manifest_sha256"], "{r2}");
+        assert_eq!(r2["stats"]["first_manifest_sha256"], r1["manifest_sha256"]);
+        assert_eq!(
+            r2["stats"]["same_as_first"],
+            serde_json::json!([
+                "profile.json",
+                "cpu.json",
+                "platform.json",
+                "devices.json",
+                "session.json"
+            ]),
+            "{r2}"
+        );
+        for name in ["cpu.json", "platform.json", "devices.json", "session.json"] {
+            assert_eq!(first.doc(name), again.doc(name), "{name}");
+        }
+        assert_eq!(first.profile, again.profile);
     }
 
     // A request without an epoch is not one with epoch 0: a fence made
