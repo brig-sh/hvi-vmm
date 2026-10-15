@@ -116,6 +116,15 @@ The device is opened through `/dev/net/tun` with `IFF_TAP`, `IFF_NO_PI` and
 `IFF_VNET_HDR`, and the vnet header size is set to the `virtio_net_hdr_v1`
 length rather than tun's legacy default. No offloads are negotiated.
 
+The guest's own virtio-net header never reaches the host. hvi drops the
+header from each transmit chain and writes an all-zero header in its place,
+so the kernel sees no checksum-offload or segmentation request that a guest
+chose (`VIRTIO_NET_HDR_F_NEEDS_CSUM`, `csum_start`, `csum_offset`, GSO). A
+host-kernel bug in deferred checksum completion, such as the October 2026
+`ip_do_fragment()` disclosure (PwnEscape), is not reachable from a guest on
+hvi. The host kernel still needs its own fix for any other VMM on the same
+host that forwards the guest's header.
+
 An interface name must be 1 to 15 bytes. A tap that cannot be opened fails the
 boot and names the interface, which is the opposite of the gateway's silent
 fallback.
