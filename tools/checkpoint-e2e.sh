@@ -43,6 +43,16 @@
 # a shuffled order, so that a write lost in any round, not only the final
 # one, leaves a page that fails its check.
 #
+# With --stream and a disk, the disk moves in the stream too: the source
+# boots with --disk-base-sha256 of the fresh image, a copy of which is kept
+# as the base, and each restore gets a new copy of the base as its --disk,
+# which the stream's disk rounds make into the guest's disk. After each
+# fence the restored disk, held restored-paused, must hash as the source's
+# disk does. --disk-whole moves it the old way instead: no base, no disk
+# rounds, and the restore reopens the source's own image. --disk-churn
+# rewrites a 1 MiB file on the guest's disk with fsync in a loop through
+# the moves, so the rounds taken with the guest running carry blocks.
+#
 # With --portable the guest boots the portable profile
 # (--profile portable-arm64-v1) and the kernel must be the portable one,
 # with hvi-time. The initramfs must then hold /el0check and /tfd
@@ -59,7 +69,7 @@
 #   tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
 #       --initramfs target/initramfs-workload.cpio --out DIR \
 #       [--cpus 2] [--mem 512] [--no-disk] [--portable] [--stream]
-#       [--dirty-mib N [--dirty-once SECS]]
+#       [--dirty-mib N [--dirty-once SECS]] [--disk-whole] [--disk-churn]
 #
 # DIR receives the checkpoint root (with the bundle), the disk image, both
 # processes' consoles, their profiles and summary.json with the timings.
@@ -70,6 +80,7 @@
 set -euo pipefail
 
 hvi="" kernel="" initramfs="" out="" cpus=2 mem=512 disk=yes portable=no stream=no dirty=0 dirty_once=0
+disk_whole=no churn=no
 while [ $# -gt 0 ]; do
     case "$1" in
         --hvi) hvi="$2"; shift 2 ;;
@@ -83,7 +94,9 @@ while [ $# -gt 0 ]; do
         --stream) stream=yes; shift ;;
         --dirty-mib) dirty="$2"; shift 2 ;;
         --dirty-once) dirty_once="$2"; shift 2 ;;
-        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable] [--stream] [--dirty-mib N [--dirty-once SECS]]" >&2; exit 2 ;;
+        --disk-whole) disk_whole=yes; shift ;;
+        --disk-churn) churn=yes; shift ;;
+        *) echo "usage: $0 --hvi PATH --kernel PATH --initramfs PATH --out DIR [--cpus N] [--mem MIB] [--no-disk] [--portable] [--stream] [--dirty-mib N [--dirty-once SECS]] [--disk-whole] [--disk-churn]" >&2; exit 2 ;;
     esac
 done
 for v in hvi kernel initramfs out; do
@@ -118,13 +131,16 @@ socks="$(mktemp -d /tmp/hvi-e2e.XXXXXX)"
 trap 'rm -rf "$socks"' EXIT
 
 python3 - "$hvi" "$kernel" "$initramfs" "$out" "$root" "$socks" "$cpus" "$mem" "$image" \
-    "$debugfs" "$portable" "$stream" "$dirty" "$dirty_once" <<'PY'
-import json, os, re, socket, subprocess, sys, threading, time
+    "$debugfs" "$portable" "$stream" "$dirty" "$dirty_once" "$disk_whole" "$churn" <<'PY'
+import hashlib, json, os, re, shutil, socket, subprocess, sys, threading, time
 
 (hvi, kernel, initramfs, out, root, socks, cpus, mem, image, debugfs, portable, stream,
- dirty, dirty_once) = sys.argv[1:]
+ dirty, dirty_once, disk_whole, churn) = sys.argv[1:]
 portable = portable == "yes"
 stream = stream == "yes"
+churn = churn == "yes"
+# The disk moves in the stream's disk rounds onto a copy of its base.
+by_blocks = stream and bool(image) and disk_whole != "yes"
 dirty = int(dirty)
 dirty_once = int(dirty_once)
 # A timer armed before a live move must still be pending when it ends:
@@ -352,10 +368,28 @@ def stream_summary(reply, resume_wall=None):
         "stream_bytes", "write_granule", "write_faults", "write_fault_ns")}
     summary["rounds"] = [{k: r.get(k) for k in keep} for r in st.get("rounds") or []]
     summary["compression_ratio"] = round(raw / wire, 2) if wire else None
+    for k in ("disk_raw_bytes", "disk_stream_bytes", "disk_sync_ms", "gate_ms", "park_ms"):
+        summary[k] = st.get(k)
+    dkeep = ("name", "round", "in_pause", "blocks", "raw_bytes", "bytes", "ms", "max_lock_us")
+    summary["disk_rounds"] = [{k: r.get(k) for k in dkeep} for r in st.get("disk_rounds") or []]
+    draw, dwire = summary["disk_raw_bytes"] or 0, summary["disk_stream_bytes"] or 0
+    summary["disk_compression_ratio"] = round(draw / dwire, 2) if dwire else None
     if resume_wall is not None and st.get("precopy_end_unix_ms"):
         summary["downtime_precopy_end_to_resume_ms"] = round(
             resume_wall * 1000 - st["precopy_end_unix_ms"], 1)
     return summary
+
+
+def check_disk_rounds(move, where):
+    """Checks that `move` took the disk in rounds: one before each RAM
+    round, the last one paused."""
+    d, r = move.get("disk_rounds") or [], move.get("rounds") or []
+    check(len(d) == len(r) and len(d) >= 2 and d[-1]["in_pause"]
+          and d[-1]["name"] == "disk-round-final"
+          and not any(x["in_pause"] for x in d[:-1]),
+          f"{where} took the disk in {len(d)} round(s) for {len(r)} RAM round(s), the last "
+          f"one paused: " + ", ".join(f"{x['name']} {x['blocks']} blocks / {x['bytes']} B"
+                                     for x in d))
 
 
 def dirty_goes_on(guest, after, where):
@@ -399,10 +433,40 @@ def boot_id(guest, after=0.0):
     return re.search(r"BOOTID ([0-9a-f-]{36})$", got[1]).group(1) if got else None
 
 
-common = ["--net-stub"] + (["--disk", image] if image else [])
+def sha256_of(path):
+    """Returns the SHA-256 of the file at `path`, as hex."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def clone_base(name):
+    """Returns the path of a new copy of the base image, for a restore's
+    --disk: an APFS clone on a Mac, a reflink or a copy elsewhere."""
+    path = os.path.join(out, name)
+    if os.path.exists(path):
+        os.remove(path)
+    if sys.platform == "darwin":
+        subprocess.run(["cp", "-c", base_image, path], check=True)
+    else:
+        subprocess.run(["cp", "--reflink=auto", base_image, path], check=True)
+    return path
+
+
+net = ["--net-stub"]
+base = []
+base_image = None
+if by_blocks:
+    # The base is the image as the source boots from it.
+    base_image = os.path.join(out, "base.img")
+    shutil.copyfile(image, base_image)
+    base = ["--disk-base-sha256", sha256_of(image)]
+common = net + (["--disk", image] if image else [])
 profile = ["--profile", "portable-arm64-v1"] if portable else []
 src = Guest("source", [hvi, "boot", "--kernel", kernel, "--initramfs", initramfs,
-                       "--cpus", cpus, "--mem-mib", mem] + profile + [
+                       "--cpus", cpus, "--mem-mib", mem] + profile + base + [
                        "--control-sock", f"{socks}/src.sock", "--checkpoint-root", root,
                        "--agent-sock", f"{socks}/src-agent.sock",
                        "--profile-out", os.path.join(out, "source-profile.json")] + common)
@@ -434,6 +498,9 @@ if dirty:
           f"/dirty writes {dirty} MiB "
           + (f"once every {dirty_once} s" if dirty_once else "over and over")
           + " in the source guest")
+if churn and image:
+    src.type("( while :; do /bin/busybox dd if=/dev/urandom of=/mnt/churn bs=65536 count=16 "
+             "conv=fsync 2>/dev/null; /bin/busybox sleep 0.1; done ) &\n")
 if portable:
     # Two timers armed just before the capture, which must fire after the
     # resume, 6 s of guest time after they were armed.
@@ -448,9 +515,11 @@ if portable:
 # timings are the move's: the checks that need a pause come afterwards.
 sctl = Control(src, f"{socks}/src.sock")
 bundle = os.path.join(root, "move")
+dst_disk = clone_base("disk-restored.img") if by_blocks else image
 dst_args = ["--control-sock", f"{socks}/dst.sock", "--checkpoint-root", root,
             "--agent-sock", f"{socks}/dst-agent.sock",
-            "--profile-out", os.path.join(out, "restored-profile.json")] + common
+            "--profile-out", os.path.join(out, "restored-profile.json")] + net + (
+                ["--disk", dst_disk] if image else [])
 if stream:
     # The restore builds the VM once the manifest is in; until then it
     # applies the rounds as they come.
@@ -463,6 +532,9 @@ else:
     dst = Guest("restored", [hvi, "restore", "--from", bundle] + dst_args)
 dctl = Control(dst, f"{socks}/dst.sock")
 status, status_at = dctl.ask(op="status")
+if by_blocks:
+    # Both still: the source fenced, the destination restored-paused.
+    disk_sums = (sha256_of(image), sha256_of(dst_disk))
 resumed, resume_at = dctl.ask(op="resume")
 stream_moves = [stream_summary(fence, wall_t0 + resume_at)] if stream else []
 
@@ -476,6 +548,11 @@ if stream_moves:
           f"stopping as {stream_moves[0]['stop_reason']}: "
           + ", ".join(f"{r['pages']} pages / {r['bytes']} B" for r in rounds))
 stats = fence.get("stats", {})
+if by_blocks:
+    check_disk_rounds(stream_moves[0], "the move")
+    check(disk_sums[0] == disk_sums[1],
+          f"the restored disk is the source's at the fence: sha256 {disk_sums[0][:16]} on the "
+          f"source, {disk_sums[1][:16]} restored from the base and the disk rounds")
 check(status.get("state") == "restored-paused", f"the restore reports restored-paused ({status})")
 check(resumed.get("state") == "running", "resume")
 restore_ms = (status_at - spawned_at) * 1000
@@ -617,8 +694,10 @@ else:
 
 # A restored guest is a guest like any other: move it once more.
 again_at = now()
+third_disk = clone_base("disk-again.img") if by_blocks else image
 third_args = ["--control-sock", f"{socks}/third.sock", "--checkpoint-root", root,
-              "--agent-sock", f"{socks}/third-agent.sock"] + common
+              "--agent-sock", f"{socks}/third-agent.sock"] + net + (
+                  ["--disk", third_disk] if image else [])
 if stream:
     fence2, third, _, manifest2_at, fence2_at = stream_move(
         "restored-again", dctl, os.path.join(root, "move-again"), "e2e-2", 2, third_args)
@@ -635,6 +714,12 @@ if stream:
     stream_moves.append(stream_summary(fence2))
     stream_moves[-1]["manifest_to_restored_paused_ms"] = round(
         (status3_at - manifest2_at) * 1000, 1)
+if by_blocks:
+    check_disk_rounds(stream_moves[-1], "the second move")
+    sums = (sha256_of(dst_disk), sha256_of(third_disk))
+    check(sums[0] == sums[1],
+          f"the disk restored in the third process is the second one's at its fence: "
+          f"{sums[0][:16]}, {sums[1][:16]}")
 # Held restored-paused for five tick periods: a guest that ran in that time
 # would print, and its clock would have moved on by the time it resumes.
 time.sleep(1.0)
@@ -696,7 +781,8 @@ except subprocess.TimeoutExpired:
 check(third_rc == 0, f"stop ends the guest in the third process (exit {third_rc})")
 generations = None
 if image:
-    cat = subprocess.run([debugfs, "-R", "cat /after", image], capture_output=True, text=True)
+    cat = subprocess.run([debugfs, "-R", "cat /after", third_disk], capture_output=True,
+                         text=True)
     check(after_n is not None and cat.stdout.strip() == f"written-after {after_n}",
           f"the image holds the post-restore write: {cat.stdout.strip()!r}")
     generations = []
@@ -721,6 +807,7 @@ summary = {
     "disk_generations": generations,
     "portable": portable, **timers,
     "stream": stream, "dirty_mib": dirty, "dirty_once_s": dirty_once, "moves": stream_moves,
+    "disk_by_blocks": by_blocks, "disk_churn": churn,
     "failures": failures,
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
