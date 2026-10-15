@@ -1194,10 +1194,14 @@ impl<K: Kick> Machine<'_, K> {
                 &stopping,
             )?;
             // After the final disk round, so disk.json lists it with its
-            // digest, and its generation is the disk's. Its sync has only
-            // what the guest wrote since the one before the pause, and is
-            // timed on its own, since the guest waits for it.
-            let (disk, pause_sync) = capture.disk_state_timed(&profile)?;
+            // digest, and its generation is the disk's. With disk rounds
+            // the destination holds every block and syncs them itself, so
+            // the source's disk is not synced again with the guest paused:
+            // that sync took seconds on a busy host. Without them the mover
+            // copies this disk, which must then be durable. The sync has
+            // only what the guest wrote since the one before the pause, and
+            // is timed on its own, since the guest waits for it.
+            let (disk, pause_sync) = capture.disk_state_timed(&profile, disk_rounds.is_none())?;
             let mut docs = vec![
                 (
                     "cpu.json",
@@ -3975,6 +3979,9 @@ mod tests {
         }
         assert_eq!(disk_json.rounds[3].generation, disk_json.generation);
         assert_eq!(disk_json.generation, 5, "five writes");
+        // The destination has the blocks, so the pause syncs nothing.
+        assert!(!disk_json.synced, "the disk was synced in the pause");
+        assert_eq!(stats["pause_sync_ms"], 0, "{r}");
     }
 
     // Without a base the stream has no disk rounds: the mover copies the
@@ -3997,7 +4004,10 @@ mod tests {
         let (received, _) = got.expect("the stream reads whole");
         assert!(received.disk.is_empty() && received.manifest.disk.is_none());
         assert_eq!(r["stats"]["disk_rounds"], serde_json::json!([]), "{r}");
-        assert!(received.doc("disk.json").is_some());
+        // The mover copies this disk, so it is synced in the pause.
+        let disk_json =
+            crate::checkpoint::bundle::parse_disk(received.doc("disk.json").unwrap()).unwrap();
+        assert!(disk_json.synced, "the disk was synced in the pause");
     }
 
     // hull's recovery after it died between hvi's seal and its own: the
