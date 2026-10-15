@@ -828,8 +828,9 @@ and `same_as_first`, the components whose size and SHA-256 equal the
 first stream's: the documents above, and RAM round 0 too when the guest
 wrote nothing during the first move. Only the stall bound applies to the
 reader; the guest is not waiting. Any other `txid` or `epoch`, a request
-with no `txid`, `then: "continue"`, or a VM a `checkpoint` fenced, is
-refused with `fenced`. `resume` stays refused, and `stop` ends the run.
+that leaves out `txid` or `epoch` (a missing epoch is not epoch 0),
+`then: "continue"`, a VM a `checkpoint` fenced, or one a `migrate`
+fenced without both a `txid` and an `epoch`, is refused with `fenced`. `resume` stays refused, and `stop` ends the run.
 
 ### The stream format
 
