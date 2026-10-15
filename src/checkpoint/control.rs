@@ -280,6 +280,10 @@ pub struct MigrateStats {
     pub precopy_ms: u64,
     /// From the pause to every vCPU parked with its state exported.
     pub pause_ms: u64,
+    /// Of that, the time to hold the I/O threads.
+    pub gate_ms: u64,
+    /// Then the time for every vCPU to park.
+    pub park_ms: u64,
     /// From the pause to the manifest written: the source's part of the
     /// time the guest is stopped.
     pub paused_ms: u64,
