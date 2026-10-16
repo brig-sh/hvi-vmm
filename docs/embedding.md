@@ -53,33 +53,42 @@ console; nothing else in the process should read stdin while `boot` runs. It
 also takes over the kick signal, `SIGRTMIN` on Linux and `SIGUSR1` on macOS: it
 installs a no-op handler for it and does not restore the one it replaced. It
 sends that signal to its own threads to interrupt them, so nothing else in the
-process should use it. Before it returns, the ledger is flushed, the agent
-listener and every accepted agent connection are closed, and every thread it
-started itself has exited, with two exceptions. A thread still running at its
-deadline is left running and `boot` returns an error naming the first such
-thread, a vCPU thread before a helper thread. The thread that receives the stop
-signals runs for the life of the process (see [Stopping a run from the
-host](#stopping-a-run-from-the-host)). `boot` waits up to one second for the
+process should use it.
+
+Before it returns, the ledger is closed, the agent listener and every accepted
+agent connection are closed, and every thread it started itself has exited, with
+three exceptions. A thread still running at its deadline is left running and
+`boot` returns an error naming the first such thread, a vCPU thread before a
+helper thread. The thread that receives the stop signals runs for the life of
+the process (see [Stopping a run from the host](#stopping-a-run-from-the-host)).
+The ledger's writer thread is not joined. `boot` waits up to one second for the
 vCPU threads, then up to one second for the helper threads, and then up to one
-second for the ledger, which a thread left running can hold; it does not write
-the tail of a ledger still held. It returns at most three seconds after the
-stop. The waits it cannot interrupt are a plugin blocking in `request`, in
-`safepoint` or on a thread it started with `VmHandle::spawn`, and a virtio-fs
-worker waiting on a host file lock. On macOS such a lock wait can also stall a
-vCPU (see [Known limits](limitations.md#virtio-fs-resource-limits)). A plugin
-that keeps the `Arc<dyn VmHandle>` it was given keeps guest RAM, the ledger file
-and the block, net and vsock devices until it drops the handle. It also keeps
-the VM, through the vCPU kicker on macOS and through the interrupt line of each
-block, net or vsock device on Linux. The vCPUs have exited or been left running,
-so a kick reaches only a vCPU left running. The tap under `--net-tap` keeps its
-carrier up. The disk stays open. The gateway connection under `--net-gateway`
-stays on the handle, but the relay shut it down as it ended, so it carries
-nothing. A thread the plugin started with `VmHandle::spawn` is joined with the
-I/O threads. One it started any other way is not joined, and holds the handle
-for as long as it runs. On macOS a second `boot` fails while such a handle
-exists, because Hypervisor.framework allows one VM per process. On either host
-the handle also holds the disks' image locks, so a second `boot` on the same
-writable image fails with "the image is open elsewhere" while it lives.
+second for the writer to write the `vmm.stop` record, so it returns at most
+three seconds after the stop, with no error for a writer still in a write. The
+writer finishes the ledger if the process keeps running. A write that blocks, as
+on a hung network file system, holds the file and its lock until it returns, so
+a later run needs another ledger path (see [When a record reaches the
+file](observability.md#when-a-record-reaches-the-file)). The waits `boot` cannot
+interrupt are a plugin blocking in `request`, in `safepoint` or on a thread it
+started with `VmHandle::spawn`, and a virtio-fs worker waiting on a host file
+lock. On macOS such a lock wait can also stall a vCPU (see [Known
+limits](limitations.md#virtio-fs-resource-limits)).
+
+A plugin that keeps the `Arc<dyn VmHandle>` it was given keeps guest RAM and the
+block, net and vsock devices until it drops the handle. It also keeps the VM,
+through the vCPU kicker on macOS and through the interrupt line of each block,
+net or vsock device on Linux. The ledger's writer closes the ledger file once it
+has written the `vmm.stop` record, whether or not a plugin keeps the handle. The
+vCPUs have exited or been left running, so a kick reaches only a vCPU left
+running. The tap under `--net-tap` keeps its carrier up. The disks stay open.
+The gateway connection under `--net-gateway` stays on the handle, but the relay
+shut it down as it ended, so it carries nothing. A thread the plugin started
+with `VmHandle::spawn` is joined with the I/O threads. One it started any other
+way is not joined, and holds the handle for as long as it runs. On macOS a
+second `boot` fails while such a handle exists, because Hypervisor.framework
+allows one VM per process. On either host the handle also holds the disks' image
+locks, so a second `boot` on the same writable image fails with "the image is
+open elsewhere" while it lives.
 
 ## A minimal caller
 
@@ -157,7 +166,7 @@ Create a pair with `hvi::run::StopHandle::new_pair()` before `boot`, keep the
 `StopHandle` and pass the `StopRegistration` in `BootConfig::stop`. `boot` takes
 the registration by value, so it serves one run. `StopHandle::request_stop` from
 any thread stops the run: the VM stops, the threads are joined and the ledger is
-flushed, and `boot` returns `Stop::Requested`. A failure a thread reports, or a
+closed, and `boot` returns `Stop::Requested`. A failure a thread reports, or a
 guest stop a vCPU reports, before `boot` reads how the run ended takes the place
 of `Stop::Requested`. A plugin asks for the same stop with
 `VmHandle::request_stop`.
@@ -175,12 +184,13 @@ let stop = run.wait()?;
 `Run::wait` returns what `boot` returned, and `Run::is_finished` says whether
 the run has ended. A `BootConfig` whose `stop` is set keeps that stop, and
 `Run::stop_handle` returns a handle on it. Dropping a `Run` leaves the guest
-running until it stops on its own, and a process that exits before the run ends
-skips the terminal restore and the ledger flush, so call `wait` before
-returning. On Linux, `boot` installs its seccomp filter on the thread that calls
-it, which with `spawn` is the `run` thread. On macOS the Seatbelt profile
-confines the whole process, the thread that called `spawn` included, from the
-start of the run until the process exits.
+running until it stops on its own. A process that exits before the run ends
+skips the terminal restore, and its ledger loses the `vmm.stop` record and the
+records not written yet, so call `wait` before returning. On Linux, `boot`
+installs its seccomp filter on the thread that calls it, which with `spawn` is
+the `run` thread. On macOS the Seatbelt profile confines the whole process, the
+thread that called `spawn` included, from the start of the run until the process
+exits.
 
 A process runs one guest at a time, since runs that overlap share stdin, the
 terminal settings, the stop signals and the seccomp state. `boot` refuses a run
@@ -219,9 +229,9 @@ with `eprintln!` too, so a binary that stopped on `SIGHUP` should end rather
 than boot again.
 
 Another stop signal, one second or more after the first, restores the terminal
-and ends the process at once by that signal, and the ledger loses its tail. One
-that arrives sooner, such as a copy a wrapper forwards, has no effect. A later
-call moves the signals to another handle.
+and ends the process at once by that signal, and the ledger loses the records
+not written yet. One that arrives sooner, such as a copy a wrapper forwards, has
+no effect. A later call moves the signals to another handle.
 
 Once `boot` has returned, `handle.signal()` names the first stop signal that
 asked for the stop, if one did, even one that asked after another request, and

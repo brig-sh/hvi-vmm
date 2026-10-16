@@ -19,7 +19,7 @@ repository = "https://github.com/brig-sh/hvi-vmm"
 # On any other target the build stops with a compile error.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # Kernel virtio headers as bindgen output: feature bits, device ids, the mmio
 # register map and the net header layout. Every backend needs them.
 virtio-bindings = "0.2.7"

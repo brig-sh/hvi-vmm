@@ -160,21 +160,48 @@ A tool's records go into the same `--events` stream as the VMM's own:
 #[derive(serde::Serialize)]
 struct MyPayload { interesting: u64 }
 
-if let Ok(mut led) = cpu.ledger().lock() {
-    led.emit_payload("boundary", "my-source", &MyPayload { interesting });
+let payload = MyPayload { interesting };
+if let Err(e) = cpu.ledger().emit_payload("boundary", "my-source", &payload) {
+    eprintln!("my-tool: ledger: {e}");
 }
 ```
 
-Lines emitted after `boot` has returned are written on the 100 ms cadence and
-when the last handle drops. Call `flush()` on the ledger before you stop, or the
-last interval is lost.
+`emit_payload` waits up to 100 ms for the ledger's writer thread to write the
+record. A record it returns `Ok` for has reached the kernel, so it survives the
+death of the process. When the record is not written in time, the call returns
+an error of kind `TimedOut`, and the record stays buffered until the writer
+writes it. While the ledger's writes fail, the call returns that error at once.
+A payload that fails to serialize, such as a map keyed by a tuple, is not added,
+and the call returns an error of kind `InvalidData`. Once the run's `vmm.stop`
+record is added, the ledger takes no more records, and the call returns an error
+of kind `Other`. A payload is serialized before the ledger's lock is taken, so a
+panic in its `Serialize` leaves the ledger as it was.
+
+Records added to a batch are written together, and no other record falls between
+them:
+
+```rust
+let written = cpu.ledger().batch(|batch| {
+    for task in &tasks {
+        batch.emit_payload("boundary", "my-source", task);
+    }
+});
+```
+
+A payload in a batch that fails to serialize leaves the whole batch out. A batch
+with no records waits for the records added before it. Each call wakes the
+writer and waits for its own write: tens of microseconds, and up to 100 ms when
+the disk stalls. A loop that calls `emit_payload` once per record pays that wait
+once per record, while a batch pays it once, so batch the records of a loop. A
+plugin that pauses the guest in `safepoint` calls `resume` before it writes, so
+the write does not extend the pause.
 
 The envelope is this crate's and its wire shape is pinned by tests. The
 payload is yours, and the VMM never looks inside it. That is the whole of the
 coupling between a ledger reader and whatever produced a record.
 
-The stream is buffered and drained on continued traffic, not on a timer. See
-[observability.md](observability.md#the-event-ledger).
+[observability.md](observability.md#when-a-record-reaches-the-file) says when
+the VMM's own records reach the file.
 
 ## Panics
 

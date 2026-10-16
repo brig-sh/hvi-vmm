@@ -56,7 +56,7 @@ including a typo, silently runs the plain test.
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
-| `--events <path>` | none | Write the `RawEvent` NDJSON ledger here. |
+| `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. hvi refuses anything that is not a regular file, such as `/dev/null` or a FIFO. It also refuses a locked file, such as another run's ledger or disk. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
 | `--dump-after <secs>` | none | Dump automatically after this long. Needs `--dump-memory`. `0` becomes 1. |
@@ -214,14 +214,14 @@ reboot calls it again.
 ### Signals and the terminal
 
 `SIGTERM`, `SIGINT` and `SIGHUP` stop the run. hvi stops the vCPUs, joins its
-threads, flushes the ledger and restores the terminal, and then ends by the
+threads, closes the ledger and restores the terminal, and then ends by the
 signal it received, so a shell reports status 128 plus the signal number and a
 service manager sees the process end by that signal. The guest is not asked to
 shut down first. If the stop does not complete, another of these signals, one
 second or more after the first, restores the terminal and ends hvi at once by
-that signal, and the ledger loses its tail. One that arrives sooner, such as a
-copy a wrapper script forwards, has no effect. A signal hvi starts with ignored,
-such as `SIGHUP` under `nohup`, stays ignored.
+that signal, and the ledger loses the records not written yet. One that arrives
+sooner, such as a copy a wrapper script forwards, has no effect. A signal hvi
+starts with ignored, such as `SIGHUP` under `nohup`, stays ignored.
 
 In raw mode the terminal sends Ctrl-C to the guest as a byte, so `SIGINT`
 reaches hvi only from `kill` or when stdin is not a TTY.

@@ -128,11 +128,14 @@ compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux onl
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the first that did not stop within
-/// [`teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. The
-/// exception is the thread that receives the stop signals, which the first run
-/// after [`stop_on_signals`](signal::stop_on_signals) starts for the life of
-/// the process. What remains of the VM is a `VmHandle` a plugin kept, in a
-/// field or on a thread it started from `attach`.
+/// [`teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. There are
+/// two exceptions. The thread that receives the stop signals, which the first
+/// run after [`stop_on_signals`](signal::stop_on_signals) starts, runs for the
+/// life of the process. The ledger's writer thread is not joined: it exits once
+/// it has written the ledger, or given up on a write that keeps failing, and a
+/// write that blocks in the kernel holds it until the write returns. What
+/// remains of the VM is a `VmHandle` a plugin kept, in a field or on a thread
+/// it started from `attach`.
 ///
 /// # Errors
 ///

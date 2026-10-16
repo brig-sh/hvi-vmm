@@ -160,7 +160,9 @@ Two things that are easy to miss:
 
 ## What the ledger records
 
-With `--events <path>`, hvi writes a `net` record for observed traffic. Two
+With `--events <path>`, hvi writes a `net` record for observed traffic, unless
+the ledger's buffer is full (see
+[observability.md](observability.md#when-a-record-reaches-the-file)). Two
 properties decide what those records can be used for:
 
 - **They are per packet, not per flow.** There is no flow table and no

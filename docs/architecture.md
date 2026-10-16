@@ -449,10 +449,10 @@ report has to stay unsymbolized: with `RUST_BACKTRACE` set it opens the binary,
 which the vCPU allowlist refuses, and the process dies of `SIGSYS` after the
 message.
 
-Device and ledger mutexes on the macOS backend and in the helper threads go
-through `sync::lock_or_recover`, which takes a poisoned lock so the panic that
-poisoned it is reported once, where it happened. The vCPU-side device locks on
-the Linux and x86 backends use `.lock().unwrap()`.
+Device mutexes on the macOS backend and in the helper threads go through
+`sync::lock_or_recover`, which takes a poisoned lock so the panic that poisoned
+it is reported once, where it happened. The vCPU-side device locks on the Linux
+and x86 backends use `.lock().unwrap()`.
 
 ## 6. The event ledger
 

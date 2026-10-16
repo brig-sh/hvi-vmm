@@ -26,9 +26,9 @@ use crate::run::StopHandle;
 /// A guest that [`spawn`] booted on a thread of its own.
 ///
 /// Dropping it leaves the guest running until it stops on its own. A process
-/// that exits before the run ends skips the terminal restore and the ledger
-/// flush, so it calls [`request_stop`](Self::request_stop) and then
-/// [`wait`](Self::wait) first.
+/// that exits before the run ends skips the terminal restore, and the ledger
+/// loses its `vmm.stop` record and the records not written yet, so it calls
+/// [`request_stop`](Self::request_stop) and then [`wait`](Self::wait) first.
 pub struct Run {
     /// The handle on the run's stop.
     stop: StopHandle,

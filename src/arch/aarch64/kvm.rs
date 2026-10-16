@@ -62,7 +62,7 @@ use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
-use crate::events::Emitter;
+use crate::events::Ledger;
 use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
@@ -277,7 +277,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         fs_count: fs.len(),
     };
 
-    let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
+    let ledger = Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
     let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
@@ -358,7 +358,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
             shared_ram,
-            ledger: Arc::new(Mutex::new(emitter)),
+            ledger: Arc::new(ledger),
             disks,
             net,
             vsock,
@@ -399,7 +399,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // The plugin attach, the seccomp arm and the I/O threads, in the order the
     // filters need. Each polls its stop token beside its own descriptor and is
     // joined after the vCPUs; `teardown` describes the stop.
-    let (filters, mut io_threads) = start_io_threads(
+    let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &shared.guest,
         {
@@ -409,6 +409,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         net_source,
     )?;
     vhost_user::start_interrupt_threads(&shared.fs, &mut io_threads);
+
+    // The run closes the ledger from here on.
+    ledger_guard.disarm();
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_guest` returned it.
@@ -526,7 +529,7 @@ fn dev_read<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, off: u64) -
         let v = d.mmio(&sh.guest.ram, off, false, 0);
         (v, d.take_events())
     };
-    drain(sh, &events);
+    sh.guest.ledger.captured(&events);
     v
 }
 
@@ -541,7 +544,7 @@ fn dev_write<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, off: u64, 
         d.mmio(&sh.guest.ram, off, true, val);
         d.take_events()
     };
-    drain(sh, &events);
+    sh.guest.ledger.captured(&events);
 }
 
 /// Services a read of virtio-vsock register `off`.
@@ -558,17 +561,6 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
         return;
     };
     dev.lock().unwrap().mmio(&sh.guest.ram, off, true, val);
-}
-
-/// Moves a device's captured `events` into the ledger.
-fn drain(sh: &Shared, events: &[crate::events::CapturedEvent]) {
-    if events.is_empty() {
-        return;
-    }
-    let mut e = sh.guest.ledger.lock().unwrap();
-    for ev in events {
-        e.captured(ev);
-    }
 }
 
 /// The virtio-mmio surface `dev_read`/`dev_write` need (blk and net share it).

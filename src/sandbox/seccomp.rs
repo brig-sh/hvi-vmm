@@ -61,8 +61,10 @@
 //! `vmm` covers the thread that calls `boot`, the boot thread below, the
 //! host-side I/O threads (the console reader, the agent bridge and its
 //! per-connection readers, the tap and gateway readers, and the debug watchdog
-//! when it is enabled), the threads a plugin starts with `VmHandle::spawn` and
-//! the thread that receives the stop signals.
+//! when it is enabled), the threads a plugin starts with `VmHandle::spawn`, the
+//! thread that receives the stop signals and the ledger writer. The ledger
+//! writer starts with the ledger, before the filters are armed, and installs
+//! `vmm` before its first write after the filters are armed.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
@@ -201,7 +203,8 @@ pub fn install(thread: Thread) -> io::Result<()> {
 /// Set by [`arm`] before a run spawns its threads, read by every thread that
 /// filters itself. A flag rather than a parameter passed to each of those
 /// threads. The threads that read it start after it is set, apart from the
-/// stop-signal thread, which outlives the run that started it.
+/// stop-signal thread, which outlives the run that started it, and a ledger's
+/// writer, which can start before [`arm`].
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
@@ -228,9 +231,11 @@ pub fn arm() -> io::Result<()> {
 /// Installs `thread`'s filter if [`arm`] was called, and aborts if it cannot.
 ///
 /// Called at the top of each thread hvi spawns *before* the thread that calls
-/// `boot` filters itself. Not called by the per-connection vsock readers: those
-/// are spawned by an already-filtered thread and correctly inherit its filter.
-/// Calling `seccomp` from under a filter that does not allow it would trap.
+/// `boot` filters itself, and before each pass of a thread that can start
+/// before [`arm`]: the stop-signal thread and a ledger's writer. Not called by
+/// the per-connection vsock readers: those are spawned by an already-filtered
+/// thread and correctly inherit its filter. Calling `seccomp` from under a
+/// filter that does not allow it would trap.
 ///
 /// Aborting rather than returning an error is deliberate. There is no
 /// meaningful recovery inside a worker thread: continuing would run a
@@ -574,9 +579,9 @@ fn probes() -> Vec<Probe> {
                 let _ = std::thread::spawn(|| 0u8).join();
             },
         },
-        // The stop sleeps under the vmm filter while it waits for a ledger that
-        // a thread left running holds. Which syscall a sleep reaches depends on
-        // std and the libc.
+        // The ledger writer sleeps under the vmm filter before it tries a
+        // failed write again. Which syscall a sleep reaches depends on std and
+        // the libc.
         Probe {
             what: "sleep (vmm)",
             thread: Thread::Vmm,

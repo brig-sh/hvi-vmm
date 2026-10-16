@@ -17,9 +17,9 @@
 
 use std::io;
 use std::os::fd::BorrowedFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::events::Emitter;
+use crate::events::Ledger;
 use crate::memory::GuestRam;
 pub use crate::memory::RamRegion;
 use crate::teardown::StopToken;
@@ -68,11 +68,11 @@ pub struct RegsView {
 ///
 /// It is handed over as an `Arc`, so a plugin that runs its own threads (a
 /// timer, a doorbell) can keep it and call [`VmHandle::kick`] from them. A
-/// handle kept past the end of `boot` keeps guest RAM, the ledger, and the
-/// block, net and vsock devices. It also keeps the VM, through the vCPU kicker
-/// on macOS and through those devices' interrupt lines on Linux. The vCPUs have
-/// exited or been left running by then, so a kick reaches only a vCPU left
-/// running.
+/// handle kept past the end of `boot` keeps guest RAM and the block, net and
+/// vsock devices. The ledger is closed by then, and takes no more records. The
+/// handle also keeps the VM, through the vCPU kicker on macOS and through those
+/// devices' interrupt lines on Linux. The vCPUs have exited or been left
+/// running by then, so a kick reaches only a vCPU left running.
 pub trait VmHandle: Send + Sync {
     /// The guest architecture this VM is running.
     fn arch(&self) -> GuestArch;
@@ -100,7 +100,7 @@ pub trait VmHandle: Send + Sync {
 
     /// The `RawEvent` ledger, so a plugin's own records land in the same
     /// stream as the VMM's device observations.
-    fn ledger(&self) -> &Arc<Mutex<Emitter>>;
+    fn ledger(&self) -> &Arc<Ledger>;
 
     /// Returns whether this VM has at least one virtio-blk disk.
     fn has_block(&self) -> bool;
@@ -201,7 +201,7 @@ pub trait CpuHandle {
     fn is_stopping(&self) -> bool;
 
     /// The `RawEvent` ledger.
-    fn ledger(&self) -> &Arc<Mutex<Emitter>>;
+    fn ledger(&self) -> &Arc<Ledger>;
 }
 
 /// A tool attached to a running guest.

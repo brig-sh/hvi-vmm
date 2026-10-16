@@ -24,7 +24,7 @@ hvi boot --kernel <Image> --disk disk.img --net-stub --events ledger.ndjson
 One compact JSON object per line:
 
 ```json
-{"sandbox_id":"hvi","ts":1788992154877294000,"provenance":"boundary","source":"block","payload":{"lba":0,"len":4096,"rw":"r"}}
+{"sandbox_id":"hvi","ts":1788992154877294000,"provenance":"boundary","source":"block","payload":{"disk":"disk0","lba":0,"len":4096,"rw":"r"}}
 {"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
 ```
 
@@ -37,14 +37,19 @@ The VMM also records the run's lifecycle, with `provenance` `vmm`:
 | --- | --- | --- |
 | `vmm.start` | The vCPU threads are about to start. | `arch`, `vcpus`, `mem_bytes`, `confined`, `core_version` |
 | `vmm.vcpu_started` | A vCPU entered its run loop. | `vcpu` |
-| `vmm.stop` | The run has been torn down, before the last flush. | `reason`, `signal`, `error` |
+| `vmm.dropped` | `block` or `net` records were dropped just before it, because the ledger's buffer was full. | `records` |
+| `vmm.stop` | The run has been torn down. | `reason`, `signal`, `error`, `dropped` |
 
 `confined` says whether the confinement is on, and `vcpu` is the vCPU id.
 `reason` is `system_off`, `system_reset`, `requested` or `failed`. `signal`
 names the stop signal, `SIGTERM`, `SIGINT` or `SIGHUP`, when it asked first and
 the run stopped on its request, and `error` is the error `boot` returns when the
-run failed. A boot that fails before it writes `vmm.start` writes no `vmm.stop`
-either. A record's `ts` is when the VMM wrote it, so a `vmm.vcpu_started` record
+run failed. `records` counts the records dropped since the last `vmm.dropped`
+record, which comes right after them, before the next record the ledger takes.
+`dropped` counts every `block` and `net` record the run left out because the
+ledger's buffer was full, and appears only when there were any. A boot that
+fails before it writes `vmm.start` writes no `vmm.stop` either. A record's `ts`
+is when the VMM added it to the ledger's buffer, so a `vmm.vcpu_started` record
 can follow records the vCPU caused after it entered its run loop.
 
 On KVM every vCPU enters its run loop at the start, and one the guest has not
@@ -60,20 +65,20 @@ run loop when the guest brings it up.
 
 What the ledger is not:
 
-- **Not lossless.** Records are buffered and drained when a new event arrives
-  more than 100 ms after the last drain. That is a cadence of continued traffic,
-  not of wall time. Events emitted just before a guest goes quiet stay in the
-  buffer until something else is emitted or the emitter is dropped. A VMM ended
-  by `SIGKILL` or a crash loses the tail. A run loses nothing when the guest
-  stops it, a vCPU fails, or a stop is requested, by `SIGTERM` for example.
-  `boot` flushes the ledger before it returns. A thread left running at the stop
-  can hold the ledger, and that run then ends without its `vmm.stop` record and
-  tail. A plugin thread that holds the ledger for one second or more as the run
-  starts leaves out the `vmm.start` record. A repeated stop signal that arrives
-  one second or more after the first ends the process at once, also without the
-  record and the tail. One that arrives sooner has no effect.
+- **Not lossless.** A VMM that is killed or crashes can lose the records not
+  written yet, and a write that stalls can make the ledger drop `block` and
+  `net` records. [When a record reaches the
+  file](#when-a-record-reaches-the-file) says what each case loses.
 - **Not tamper-proof.** It is an ordinary file written by the VMM process.
   Nothing signs, chains or seals it.
+- **Not private, and its lock is advisory.** The file is created under the
+  process's umask, which often lets every local user read it. It records what
+  the guest did: block offsets, packet addresses and the names the guest
+  resolves. hvi locks the file while it writes it, so a second ledger at the
+  path is refused. Any process that can open the file can hold that lock too,
+  and so refuse the next run at that path. Keep the ledger where only its
+  trusted readers can open it, such as a directory of mode 0750 with a group for
+  them.
 - **Not monotonic.** `ts` is host wall-clock nanoseconds. It can move
   backwards when the host clock does.
 - **Not aggregated.** `net` records are per packet, and egress only. See
@@ -81,6 +86,41 @@ What the ledger is not:
 
 A boot with no block device and no network traffic produces the lifecycle
 records alone.
+
+### When a record reaches the file
+
+A thread of hvi's own writes the file. The call that adds `vmm.start`,
+`vmm.stop` or a plugin's record waits for that thread and returns once the
+record has reached the kernel, so the record survives the death of the process.
+It waits up to one second, or 100 ms for a plugin's record, and then returns
+with the record still buffered. The `block`, `net` and `vmm.vcpu_started`
+records do not wait. The writer takes them at once when it is idle. After each
+write it waits 1 ms for more records before it goes idle, so the records of a
+burst are written together, within about 1 ms, and a write in progress delays
+them until it ends.
+
+A run loses nothing when the guest stops it, a vCPU fails, or a stop is
+requested, by `SIGTERM` for example, unless a write at the stop stalls for one
+second or more, or a vCPU left running at the stop causes records after it,
+which are discarded. A VMM ended by `SIGKILL`, a crash or a syscall the seccomp
+filter refuses loses the records not written yet. A repeated stop signal that
+arrives one second or more after the first ends the process at once, and the
+records not yet written are lost. One that arrives sooner has no effect.
+
+Once a stalled write lets the buffer fill to 4 MiB, the ledger drops later
+`block` and `net` records. A `vmm.dropped` record after each run of them says
+how many, and `dropped` in `vmm.stop` counts them all. The VMM prints a line on
+stderr when it starts to drop them, and another with the number dropped once a
+`block` or `net` record fits after one second with no drop, or at the stop.
+
+A write that fails is tried again every 100 ms, and the records after it wait
+for it. While writes fail, a call that adds `vmm.start` or a plugin's record
+returns at once instead of waiting. Once the ledger is closed, the writer tries
+for one more second and then drops what it holds. A process that ends while a
+write still fails can leave a partial last line, which is the part the failed
+write put in the file. A write the writer gives up can leave one too. A write
+that blocks, as on a hung network file system, holds the writer and the file's
+lock until it returns.
 
 ## The I/O trace
 

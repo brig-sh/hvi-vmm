@@ -80,13 +80,13 @@ touches guest data unconfined.
 
 ### Linux: seccomp-bpf
 
-Two allowlists per architecture, in `resources/seccomp/`, installed per
-thread as that thread's first act:
+Two allowlists per architecture, in `resources/seccomp/`, installed by each
+thread for itself:
 
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn` and the stop-signal thread | 47 syscalls | 48 syscalls |
+| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -94,6 +94,12 @@ the `vmm` filter as its first act. It outlives the run and stays filtered. When
 that first run has the sandbox off, the thread starts unfiltered, and installs
 the filter the first time a stop signal wakes it in a later run with the sandbox
 on.
+
+The ledger writer starts when `boot` opens the `--events` file, before the
+filters are armed. Before each write it checks whether they are armed, and
+installs the `vmm` filter once they are, so only a write under way as they are
+armed runs unfiltered. The `vmm.start` record wakes it before any vCPU thread
+starts.
 
 `vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
 action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
@@ -170,6 +176,10 @@ sandbox is secure.
 - Host resource exhaustion that follows from limits the operator chose, such
   as running many VMs with no bound on memory.
 - Anything under `--no-sandbox` or `HVI_SECCOMP=log`.
+- A local user who can open the `--events` file. The ledger's lock is advisory,
+  so such a user can hold it and refuse the next run at that path, and can read
+  what the guest did. Keep the file where only trusted readers can open it, as
+  [observability.md](observability.md#the-event-ledger) says.
 - Side channels that come from sharing microarchitecture, such as speculative
   execution and cache timing. They are real, and they are the platform's to
   mitigate.

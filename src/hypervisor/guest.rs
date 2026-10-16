@@ -30,12 +30,12 @@ use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
-use crate::events::Emitter;
+use crate::events::Ledger;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::sync::lock_or_recover;
-use crate::teardown::StopToken;
+use crate::teardown::{StopToken, STOP_TIMEOUT};
 
 /// A virtio-blk disk and the guest-physical base of its virtio-mmio window.
 pub(crate) struct Disk {
@@ -78,7 +78,7 @@ pub(crate) struct Guest<K> {
     /// another process.
     pub(crate) shared_ram: SharedRam,
     /// The `RawEvent` ledger.
-    pub(crate) ledger: Arc<Mutex<Emitter>>,
+    pub(crate) ledger: Arc<Ledger>,
     /// The virtio-blk disks, in the order of `BootConfig::disks`.
     pub(crate) disks: Vec<Disk>,
     /// The virtio-net device, when the VM has a network.
@@ -105,6 +105,28 @@ pub(crate) struct PluginThread {
 /// then would run unfiltered. So the threads are queued, and the queue is taken
 /// once the attach is over. A request after that is refused.
 pub(crate) struct PluginThreads(Mutex<Option<Vec<PluginThread>>>);
+
+/// A guard that closes a guest's ledger when it drops, unless it was disarmed.
+///
+/// A plugin can keep its handle on the guest past a boot that fails before the
+/// run, and with it the ledger, its writer and its file.
+#[must_use]
+pub(crate) struct LedgerCloseGuard(Option<Arc<Ledger>>);
+
+impl LedgerCloseGuard {
+    /// Leaves the ledger open when the guard drops.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for LedgerCloseGuard {
+    fn drop(&mut self) {
+        if let Some(ledger) = self.0.take() {
+            let _ = ledger.close_with(Instant::now() + STOP_TIMEOUT, |_| {});
+        }
+    }
+}
 
 impl PluginThreads {
     /// Returns an empty queue that takes requests.
@@ -200,11 +222,13 @@ impl<K: Kick> Guest<K> {
 }
 
 impl<K: Kick + 'static> Guest<K> {
-    /// Hands `plugin` the guest, when there is one, and returns the threads it
-    /// asked for in `attach`.
+    /// Hands `plugin` the guest, when there is one.
     ///
-    /// The queue is taken whether or not the attach succeeds, so a queued
-    /// thread, which can hold the guest, never outlives a failed boot.
+    /// It returns the threads the plugin asked for in `attach`, and a
+    /// [`LedgerCloseGuard`] for the guest's ledger. The queue is taken whether
+    /// or not the attach succeeds, so a queued thread, which can hold the
+    /// guest, never outlives a failed boot. The ledger is closed when the
+    /// attach fails.
     ///
     /// # Errors
     ///
@@ -212,12 +236,13 @@ impl<K: Kick + 'static> Guest<K> {
     pub(crate) fn attach(
         self: &Arc<Self>,
         plugin: Option<&Arc<dyn Plugin>>,
-    ) -> std::io::Result<Vec<PluginThread>> {
+    ) -> std::io::Result<(Vec<PluginThread>, LedgerCloseGuard)> {
+        let ledger_guard = LedgerCloseGuard(Some(Arc::clone(&self.ledger)));
         let attached = plugin.map_or(Ok(()), |plugin| {
             plugin.attach(Arc::clone(self) as Arc<dyn VmHandle>)
         });
         let threads = self.plugin_threads.take();
-        attached.map(|()| threads)
+        attached.map(|()| (threads, ledger_guard))
     }
 }
 
@@ -246,7 +271,7 @@ impl<K: Kick> VmHandle for Guest<K> {
         self.ram.regions()
     }
 
-    fn ledger(&self) -> &Arc<Mutex<Emitter>> {
+    fn ledger(&self) -> &Arc<Ledger> {
         &self.ledger
     }
 
@@ -368,7 +393,7 @@ impl<K: Kick, V: SafepointVcpu> CpuHandle for Cpu<'_, K, V> {
         !self.guest.vcpus.is_running()
     }
 
-    fn ledger(&self) -> &Arc<Mutex<Emitter>> {
+    fn ledger(&self) -> &Arc<Ledger> {
         &self.guest.ledger
     }
 }
@@ -397,7 +422,7 @@ pub(crate) mod tests {
             sandbox_id: String::new(),
             ram: Arc::new(ram),
             shared_ram,
-            ledger: Arc::new(Mutex::new(Emitter::new(None, "test").unwrap())),
+            ledger: Arc::new(Ledger::new(None, "test").unwrap()),
             disks: Vec::new(),
             net: None,
             vsock: None,
@@ -438,6 +463,36 @@ pub(crate) mod tests {
                 cpu.resume();
             }
         }
+    }
+
+    /// A plugin that keeps the guest it is handed.
+    #[derive(Default)]
+    struct Keeper(Mutex<Option<Arc<dyn VmHandle>>>);
+
+    impl Plugin for Keeper {
+        fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+            *self.0.lock().unwrap() = Some(vmm);
+            Ok(())
+        }
+    }
+
+    // A boot that fails between the attach and the run drops the guard while
+    // the plugin still holds the guest. The host-path ban in clippy.toml is
+    // aimed at the virtio-fs device, where every component of a path comes from
+    // the guest. This test removes the ledger file it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn dropped_ledger_guard_closes_the_ledger_a_plugin_keeps() {
+        let path = std::env::temp_dir().join(format!("hvi-guard-{}.ndjson", std::process::id()));
+        let mut guest = guest(1);
+        guest.ledger = Arc::new(Ledger::new(path.to_str(), "test").unwrap());
+        let guest = Arc::new(guest);
+        let plugin: Arc<dyn Plugin> = Arc::new(Keeper::default());
+        let (_, ledger_guard) = guest.attach(Some(&plugin)).unwrap();
+        drop(ledger_guard);
+        let refused = guest.ledger.batch(|_| {}).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::Other);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
