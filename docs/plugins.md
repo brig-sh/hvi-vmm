@@ -131,7 +131,11 @@ not allow the length check. The type has no write accessor and its pages are
 `GuestRam` dereferences to `GuestRamView`, so code written against the view runs
 unchanged on `ram()` inside the VMM. A tool outside the VMM process builds the
 pairs from the descriptors it was sent, one for each region. When one object
-backs every region, the same descriptor pairs with each of them.
+backs every region, the same descriptor pairs with each of them. On Linux the
+view's mappings are marked `MADV_DONTDUMP`, like the VMM's own, so a core file
+of your process leaves guest RAM out. A tool that maps `ram_fd()` itself should
+mark its mapping the same way. So should a vhost-user daemon that serves a
+virtio-fs export on Linux, which maps all of guest RAM in its own process.
 
 Guest RAM is not always one span. `ram_regions()` returns one region on arm64.
 On x86-64 it returns one region up to 3328 MiB of guest RAM and two above
