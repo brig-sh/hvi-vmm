@@ -87,7 +87,6 @@ use crate::checkpoint::platform::{base64_encode, PlatformState};
 use crate::checkpoint::profile::this_build;
 use crate::checkpoint::profile::{MachineProfile, ProfileCell};
 use crate::checkpoint::stream::StreamWriter;
-use crate::config::Stop;
 use crate::devices::virtio::block::{DirtySince, VirtioBlk, DIRTY_BLOCK_BYTES};
 use crate::devices::virtio::vsock::retry_read;
 use crate::hypervisor::guest::Guest;
@@ -415,9 +414,28 @@ impl ControlSocket {
 }
 
 /// Serves requests on `conn` until the client closes it, a line is too long,
-/// or `stop` is requested.
+/// a stream fails or a reply cannot be written, or `stop` is requested, then
+/// closes it.
+///
+/// Whatever the client sent that was not read is read and dropped before the
+/// close. Linux resets the peer of a Unix socket closed with bytes left
+/// unread, so a client that had sent a line behind its `migrate` would read
+/// `ECONNRESET` where the end of the connection was due: after a failed
+/// stream, or after a reply it did not take in time.
 fn serve<K: Kick>(
     mut conn: UnixStream,
+    stop: &StopToken,
+    machine: &mut Machine<'_, K>,
+) -> std::io::Result<()> {
+    let served = serve_requests(&mut conn, stop, machine);
+    let _ = conn.shutdown(std::net::Shutdown::Both);
+    discard_unread(&mut conn);
+    served
+}
+
+/// Serves requests on `conn`, as [`serve`] does, and leaves the close to it.
+fn serve_requests<K: Kick>(
+    conn: &mut UnixStream,
     stop: &StopToken,
     machine: &mut Machine<'_, K>,
 ) -> std::io::Result<()> {
@@ -434,7 +452,7 @@ fn serve<K: Kick>(
         let n = match conn.read(&mut chunk) {
             // A client that half-closes after its last request without a
             // newline still means it.
-            Ok(0) => return answer(&mut conn, stop, machine, &pending).map(|_| ()),
+            Ok(0) => return answer(conn, stop, machine, &pending).map(|_| ()),
             Ok(n) => n,
             Err(e) if retry_read(&e) => continue,
             Err(e) => return Err(e),
@@ -444,7 +462,7 @@ fn serve<K: Kick>(
             let line: Vec<u8> = pending.drain(..=end).collect();
             // Whatever the client sent after a stream that failed is not
             // read: the connection is shut down.
-            if answer(&mut conn, stop, machine, &line[..end])? == Served::Closed {
+            if answer(conn, stop, machine, &line[..end])? == Served::Closed {
                 return Ok(());
             }
         }
@@ -453,7 +471,7 @@ fn serve<K: Kick>(
                 ErrorCode::TooLong,
                 format!("a request line is at most {MAX_LINE} bytes"),
             );
-            send(&mut conn, stop, &Response::Error(e))?;
+            send(conn, stop, &Response::Error(e))?;
             return Ok(());
         }
     }
@@ -543,21 +561,18 @@ fn stream_and_reply<K: Kick>(
         Err(e) if retry_read(&e) => {}
         Err(e) => eprintln!("{LOG_PREFIX} control socket: the refusal after a stream: {e}"),
     }
-    // The connection closes when it is dropped; the shutdown says so to
-    // the reader even if another handle on the socket outlives it.
+    // The connection closes when it is dropped, after [`serve`] has read
+    // what the client left unread; the shutdown says so to the reader even
+    // if another handle on the socket outlives it.
     let _ = out.conn.shutdown(std::net::Shutdown::Both);
-    discard_unread(out.conn);
     Ok(Served::Closed)
 }
 
 /// Reads and drops what the client sent that was not read, without
 /// waiting, on a connection shut down both ways.
 ///
-/// Linux resets the peer of a Unix socket closed with bytes left unread,
-/// so a client that sent a line behind its `migrate` would read
-/// `ECONNRESET` where the end of the stream was due. The shutdown already
-/// refuses the client's further writes, so what is queued now is all
-/// there is. macOS drops it at the shutdown.
+/// The shutdown already refuses the client's further writes, so what is
+/// queued now is all there is. macOS drops it at the shutdown.
 fn discard_unread(conn: &mut UnixStream) {
     let mut sink = [0u8; 4096];
     // A bound, should the queue somehow refill.
@@ -718,7 +733,10 @@ impl After {
     fn run<K: Kick>(self, vcpus: &Vcpus<K>) {
         match self {
             Self::Stop => {
-                vcpus.set_stop_reason(Stop::Requested);
+                // The loop that owns the run's stop wakes on the request, and
+                // the run ends as `Stop::Requested`. The VM stops here at once
+                // as well, so a pause this socket holds ends with the reply.
+                vcpus.stop_handle().request_stop();
                 vcpus.stop();
             }
         }
@@ -1772,8 +1790,11 @@ mod tests {
     use super::*;
     use crate::checkpoint::bundle::Component;
     use crate::checkpoint::cpu::Work;
+    use crate::config::Stop;
+    use crate::hypervisor::vcpus::Outcome;
     use crate::memory::GuestRam;
     use crate::plugin::{GuestArch, RegsView};
+    use crate::run::StopHandle;
     use crate::teardown::StopSource;
     use std::io::BufRead;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1900,6 +1921,7 @@ mod tests {
                 NoKick {
                     pending: spec.pending,
                 },
+                StopHandle::new_pair().unwrap().0,
             ));
             let log = crate::checkpoint::restore::tests::Log::default();
             if spec.restore {
@@ -1909,7 +1931,7 @@ mod tests {
             let fake_vcpus = (0..spec.parking)
                 .filter(|_| !spec.restore)
                 .map(|cpu| {
-                    vcpus.mark_started();
+                    vcpus.mark_started(vcpus.started());
                     let vcpus = Arc::clone(&vcpus);
                     let slow_exit = spec.slow_exit;
                     std::thread::spawn(move || {
@@ -1923,7 +1945,7 @@ mod tests {
                                     std::thread::sleep(slow);
                                 }
                             }
-                            vcpus.checkpoint_with(cpu, |work| match work {
+                            let _ = vcpus.checkpoint_with(cpu, |work| match work {
                                 Work::Export => Ok(Some(Output::Vcpu {
                                     state: VcpuState::from_regs_view(
                                         GuestArch::Aarch64,
@@ -1956,7 +1978,7 @@ mod tests {
                 fake_vcpus
             };
             for _ in 0..spec.stuck {
-                vcpus.mark_started();
+                vcpus.mark_started(vcpus.started());
             }
             let cell = Arc::new(
                 ProfileCell::new(MachineProfile::for_this_host("aarch64", "hvf"), None).unwrap(),
@@ -2272,7 +2294,10 @@ mod tests {
             r#"{"v":1,"ok":true,"state":"stopping"}"#
         );
         assert!(!f.vcpus.is_running());
-        assert!(matches!(f.vcpus.stop_reason(), Stop::Requested));
+        assert!(matches!(
+            f.vcpus.outcome(),
+            Outcome::Stopped(Stop::Requested)
+        ));
         for fake in f.fake_vcpus.drain(..) {
             fake.join().unwrap();
         }
@@ -2323,7 +2348,10 @@ mod tests {
         c.shutdown(std::net::Shutdown::Both).unwrap();
         drop(c);
         assert_stops(&f.vcpus, "a stop whose client hung up never stopped the VM");
-        assert!(matches!(f.vcpus.stop_reason(), Stop::Requested));
+        assert!(matches!(
+            f.vcpus.outcome(),
+            Outcome::Stopped(Stop::Requested)
+        ));
     }
 
     // A last request without its newline, before the client half-closes, is
@@ -3438,7 +3466,10 @@ mod tests {
     }
 
     // A write that fails in the pause ends the connection at once, after
-    // the refusal where the next frame was due, and the VM runs on.
+    // the refusal where the next frame was due, and the VM runs on. A line
+    // the client sent behind its request is not served, and the client
+    // still reads a clean end: Linux resets the peer of a socket closed with
+    // bytes left unread, and the server reads them first.
     #[test]
     fn a_write_error_in_the_pause_closes_the_connection_with_the_vm_running() {
         let disk = TestDisk::new("mig-werr", 4);
@@ -3466,44 +3497,52 @@ mod tests {
                 b"{\"v\":1,\"op\":\"migrate\",\"then\":\"fence\",\"txid\":\"w\",\"epoch\":1}\n",
             )
             .unwrap();
-        // A request sent once the stream has begun, which the server has
-        // stopped reading, waits in the socket's queue and is not served.
-        // The 8 MiB of noise hold the stream short of the pause until the
-        // rest is read, so the line is queued before the failure. Linux
-        // resets a client whose line was left unread at the close, and
-        // the read below would fail.
-        let mut first = String::new();
-        f.replies.read_line(&mut first).unwrap();
-        assert!(first.contains(r#""component""#), "{first}");
-        f.client
-            .write_all(b"{\"v\":1,\"op\":\"status\"}\n")
-            .unwrap();
+        let mut names = Vec::new();
+        let refusal = loop {
+            let mut line = String::new();
+            f.replies.read_line(&mut line).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(line.trim_end()).unwrap_or_else(|e| panic!("{e}: {line}"));
+            if value.get("v").is_some() {
+                break value;
+            }
+            if names.is_empty() {
+                // Sent once the stream has begun, while the 8 MiB of noise
+                // hold it short of the pause: the server is not reading,
+                // so the line waits in the socket's queue.
+                f.client
+                    .write_all(b"{\"v\":1,\"op\":\"status\"}\n")
+                    .unwrap();
+            }
+            names.push(value["component"].as_str().unwrap().to_string());
+            let size = usize::try_from(value["size"].as_u64().unwrap()).unwrap();
+            let mut body = vec![0u8; size];
+            f.replies.read_exact(&mut body).unwrap();
+        };
+        assert_eq!(refusal["code"], "capture_failed", "{refusal}");
+        let why = refusal["error"].as_str().unwrap();
+        assert!(
+            why.contains("a test failed the write in the pause"),
+            "{why}"
+        );
+        assert!(why.contains("as it was"), "{why}");
+        assert!(names.iter().any(|n| n == "disk-round-0"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "disk-round-final"),
+            "a frame went in the pause: {names:?}"
+        );
+        // Another connection is served only once this one is closed, so
+        // the end is read after the close, where a reset would show.
+        assert_eq!(f.status_elsewhere()["state"], "running");
         let (rest, ended_at) = f.read_to_eof();
         assert!(
             ended_at - asked < Duration::from_secs(5),
             "the end came {:?} after the request",
             ended_at - asked
         );
-        let text = format!("{first}{}", String::from_utf8_lossy(&rest));
-        assert!(text.contains("disk-round-0"), "the stream began");
-        assert!(
-            !text.contains("disk-round-final"),
-            "a frame went in the pause"
-        );
-        let r = trailing_refusal(&rest).expect("the refusal fit");
-        assert_eq!(r["code"], "capture_failed", "{r}");
-        assert!(
-            r["error"]
-                .as_str()
-                .unwrap()
-                .contains("a test failed the write in the pause"),
-            "{r}"
-        );
-        assert!(r["error"].as_str().unwrap().contains("as it was"), "{r}");
-        assert!(!text.contains(r#""vcpus_parked""#), "the status was served");
+        assert!(rest.is_empty(), "the status was served: {rest:?}");
         assert_eq!(log.stops.load(Ordering::SeqCst), 1);
         f.assert_running();
-        assert_eq!(f.status_elsewhere()["state"], "running");
     }
 
     // A client that goes away part way through leaves the VM running: the
