@@ -21,11 +21,11 @@ flag to select one.
 | Guest | Host | Backend | Shares | Networking |
 | --- | --- | --- | --- | --- |
 | aarch64 | macOS, Apple silicon | Hypervisor.framework (`applevisor`) | virtio-fs | `--net-stub`, `--net-gateway` |
-| aarch64 | Linux | KVM | none | `--net-stub`, `--net-gateway`, `--net-tap` |
-| x86-64 | Linux | KVM | none | `--net-stub`, `--net-gateway`, `--net-tap` |
+| aarch64 | Linux | KVM | virtio-fs, through a caller's daemon | `--net-stub`, `--net-gateway`, `--net-tap` |
+| x86-64 | Linux | KVM | virtio-fs, through a caller's daemon | `--net-stub`, `--net-gateway`, `--net-tap` |
 
-All three carry virtio-blk, virtio-net and virtio-vsock. virtio-fs is macOS
-only. CI boots each backend on real hardware: the two arm64 lanes reach
+All three carry virtio-blk, virtio-net and virtio-vsock. virtio-fs is served
+in-process on macOS and by a vhost-user daemon the caller runs on Linux. CI boots each backend on real hardware: the two arm64 lanes reach
 userspace, and the x86 lane reaches the userspace or root-filesystem gate.
 No boot job attaches a disk or a vsock agent, so those devices are covered by
 unit tests rather than by a live boot. On any other target the build stops with
@@ -135,7 +135,9 @@ hvi is young. Read these before you build on it.
   the socket that needs, so the guest gets a reply with no addresses in it.
   Only `--no-sandbox` resolves.
 - **One disk and one NIC.** No hotplug, and no PCI at all.
-- **virtio-fs is macOS only**, one request queue per share, no DAX window.
+- **virtio-fs** is served in-process on macOS. On Linux it is served by a
+  vhost-user daemon the caller runs, such as `virtiofsd`. One request queue per
+  share on macOS, no DAX window, and no file-level events on the Linux path.
 - **8 vCPUs on a GICv2 arm64 host.** The guest interrupt controller follows
   the host, and GICv2 caps there.
 - **507 vCPUs on a GICv3 arm64 Linux host.** Each vCPU adds a redistributor

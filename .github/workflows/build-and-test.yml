@@ -378,6 +378,68 @@ jobs:
             </dev/null 2>&1 | tee stop.log || true
           grep -q "test result: ok. 8 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
+      # The vhost-user handover runs on the vCPU thread that services the
+      # guest's DRIVER_OK write, so it is the seccomp filter for that thread
+      # that has to allow it. A missing entry there does not fail a unit test:
+      # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
+      - name: serve a virtio-fs export through virtiofsd
+        if: steps.kvm.outputs.ok == 'yes'
+        run: |
+          sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
+          VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
+          echo "daemon: $VFSD"; "$VFSD" --version
+          KREL=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)
+          # The distribution kernel builds virtiofs as a module, so the guest
+          # loads it before it can mount anything.
+          W=$(mktemp -d); mkdir -p "$W/bin"
+          cp /bin/busybox "$W/bin/busybox"
+          for a in sh mount ls cat echo sleep insmod poweroff sync; do ln -sf busybox "$W/bin/$a"; done
+          unzstd -f -o "$W/virtiofs.ko" "/lib/modules/$KREL/kernel/fs/fuse/virtiofs.ko.zst"
+          {
+            echo '#!/bin/sh'
+            echo 'export PATH=/bin'
+            echo '/bin/busybox mount -t proc proc /proc'
+            echo '/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null'
+            echo 'insmod /virtiofs.ko'
+            echo 'mkdir -p /mnt/s'
+            echo 'mount -t virtiofs hvishare /mnt/s && echo FS-MOUNT-OK'
+            echo 'cat /mnt/s/hello.txt && echo FS-READ-OK'
+            echo 'echo from-guest > /mnt/s/from-guest.txt && sync && echo FS-WRITE-OK'
+            echo 'echo FS-DONE'
+            echo '/bin/busybox sleep 2'
+            echo 'poweroff -f'
+          } > "$W/init"
+          chmod +x "$W/init"
+          ( cd "$W" && find . | cpio -o -H newc --quiet | gzip -1 ) > fs-initramfs.cpio.gz
+          rm -rf share && mkdir share && echo "hello from the host" > share/hello.txt
+          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
+          # hvi starts no daemon. The step runs virtiofsd as a runtime would,
+          # and the daemon exits once hvi closes the connection.
+          rm -f fs.sock
+          sudo "$VFSD" --socket-path="$PWD/fs.sock" --shared-dir "$PWD/share" \
+            --sandbox namespace --cache auto 2>daemon-fs.log &
+          # An hvi that exits before it connects leaves the daemon waiting, on
+          # a runner the next job reuses.
+          VFSD_PID=$!
+          trap 'sudo kill "$VFSD_PID" 2>/dev/null || true' EXIT
+          # The guest does its work in a couple of seconds and powers off.
+          sudo timeout 30 ./target/release/hvi boot --kernel "$KIMG" \
+            --initramfs fs-initramfs.cpio.gz --mem-mib 1024 --cpus 2 \
+            --fs "tag=hvishare,socket=$PWD/fs.sock" \
+            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-fs.log || true
+          sudo timeout 10 sh -c 'while pgrep -f "socket-path=$0" >/dev/null; do sleep 0.2; done' "$PWD/fs.sock" \
+            || { echo "::error::virtiofsd outlived the run"; cat daemon-fs.log; exit 1; }
+          grep -qa "seccomp: on" boot-fs.log \
+            || { echo "::error::the share boot ran without seccomp enforcement"; exit 1; }
+          for marker in FS-MOUNT-OK FS-READ-OK FS-WRITE-OK; do
+            grep -qa "$marker" boot-fs.log || { echo "::error::$marker missing"; exit 1; }
+          done
+          # The write has to have reached the host, not just the guest's cache.
+          grep -q from-guest share/from-guest.txt \
+            || { echo "::error::the guest's write never reached the host"; exit 1; }
+          grep -q "guest stopped: SystemOff" boot-fs.log \
+            || { echo "::error::the share boot did not power off"; exit 1; }
+          echo "virtio-fs export served end to end ✓"
       # The searches above keep only the lines they match. When the job
       # fails, the full log answers what those lines cannot.
       - name: keep the boot evidence
@@ -394,6 +456,8 @@ jobs:
             reboot-no-acpi.log
             blk.log
             stop.log
+            boot-fs.log
+            daemon-fs.log
           retention-days: 7
           if-no-files-found: ignore
 

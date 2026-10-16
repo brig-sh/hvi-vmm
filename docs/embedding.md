@@ -91,6 +91,7 @@ let cfg = BootConfig {
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
     disk: None,
     fs_shares: Vec::new(),
+    fs: Vec::new(),
     net: true,
     net_gateway: None,
     net_tap: None,
@@ -128,7 +129,8 @@ cargo build --release --example watch_guest
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
 | `disk` | `Option<String>` | One virtio-blk backing file. |
-| `fs_shares` | `Vec<FsShare>` | virtio-fs exports. macOS only: a non-empty vector **fails the boot** on either Linux backend. |
+| `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
+| `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
 | `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |
@@ -142,8 +144,10 @@ cargo build --release --example watch_guest
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
 
 `FsShare` carries a `path`, a `tag`, a `ShareMode`, a `CachePolicy` and the
-`uid` and `gid` the host user's files carry in the guest. `FsSpec::parse` reads
-one `--fs` into it. See [storage-and-sharing.md](storage-and-sharing.md).
+`uid` and `gid` the host user's files carry in the guest. `FsConfig` carries a
+`tag`, the `socket` its daemon listens on, `num_queues` and `queue_size`.
+`FsSpec::parse` reads one `--fs` into either. Each backend refuses the other's
+list. See [storage-and-sharing.md](storage-and-sharing.md).
 
 ## Stopping a run from the host
 

@@ -39,8 +39,8 @@ use applevisor::prelude::{
 use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    place_virtio_fs, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE,
+    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
@@ -318,6 +318,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // And exports that contradict each other, for the same reason: this is a
     // statement about the configuration, decidable before anything is built.
     check_export_overlap(&cfg.fs_shares)?;
+    // This backend serves every export itself, so a command line that names a
+    // daemon's socket asked for something it will not get.
+    if let Some(export) = cfg.fs.first() {
+        return Err(format!(
+            "--fs tag={},socket=: vhost-user exports are served on Linux only; \
+             use --fs tag=<tag>,path=<dir>",
+            export.tag
+        )
+        .into());
+    }
     let num_cpus = cfg.vcpus.max(1);
 
     // In-kernel GICv3; sizes from the framework so the DTB matches hv_gic.
@@ -467,20 +477,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         if !fs_tags.insert(share.tag.as_str()) {
             return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
         }
-        let base = virtio_fs_base(index).ok_or("too many virtio-fs devices")?;
-        let spi = virtio_fs_spi(index).ok_or("too many virtio-fs devices")?;
-        let end = base
-            .checked_add(VIRTIO_SIZE)
-            .ok_or("virtio-fs MMIO address overflow")?;
         // Same two bounds as the fixed windows above; these move with the
         // share count, so they are checked per share.
-        if base < gic_end || end > DEVICE_WINDOW_END {
-            return Err(format!(
-                "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
-                 between the GIC (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
-            )
-            .into());
-        }
+        let (base, spi) = place_virtio_fs(index, &gic, None)?;
         let root = std::fs::canonicalize(&share.path)?;
         let access = if share.mode.writable() {
             "read-write"

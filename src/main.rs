@@ -261,6 +261,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // The `--share-ro`/`--share-rw` exports, which `--fs-uid`/`--fs-gid` apply
     // to.
     let mut legacy_shares: Vec<usize> = Vec::new();
+    let mut fs: Vec<config::FsConfig> = Vec::new();
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -311,7 +312,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             // The old form of `--fs tag=<tag>,path=<dir>[,readonly=on]`. Kept
             // working on macOS, with one line saying where it went. The Linux
-            // backends refuse it.
+            // backends refuse it, and their refusal names the `socket=` form.
             "--share-ro" | "--share-rw" => {
                 if cfg!(target_os = "macos") {
                     eprintln!(
@@ -338,7 +339,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if tag.is_empty() || tag.len() > 36 || tag.as_bytes().contains(&0) {
                     return Err("virtio-fs tag must be 1..=36 bytes and contain no NUL".into());
                 }
-                if tag_taken(&fs_shares, tag) {
+                if tag_taken(&fs_shares, &fs, tag) {
                     return Err(format!("duplicate virtio-fs tag {tag:?}").into());
                 }
                 // An optional trailing `cache=auto|always|none`; any other
@@ -368,19 +369,26 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 });
                 legacy_shares.push(fs_shares.len() - 1);
             }
-            // One virtio-fs export, in Cloud Hypervisor's comma-separated
-            // syntax. `path=` is a directory hvi serves itself.
+            // One virtio-fs export. `socket=` is Cloud Hypervisor's form, for a
+            // daemon the caller runs, which decides what it serves and whether
+            // the guest may write it. `path=` is a directory hvi serves itself.
             "--fs" => {
                 let spec = it
                     .next()
                     .ok_or_else(|| format!("--fs needs {}", config::FsSpec::SYNTAX))?;
                 match config::FsSpec::parse(spec)? {
                     config::FsSpec::Share(mut share) => {
-                        if tag_taken(&fs_shares, &share.tag) {
+                        if tag_taken(&fs_shares, &fs, &share.tag) {
                             return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
                         }
                         share.path = export_dir(&share.path)?;
                         fs_shares.push(share);
+                    }
+                    config::FsSpec::Socket(socket) => {
+                        if tag_taken(&fs_shares, &fs, &socket.tag) {
+                            return Err(format!("duplicate virtio-fs tag {:?}", socket.tag).into());
+                        }
+                        fs.push(socket);
                     }
                 }
             }
@@ -450,6 +458,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cmdline,
         disk,
         fs_shares,
+        fs,
         net,
         net_gateway,
         net_tap,
@@ -473,8 +482,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Returns whether an export given so far already carries `tag`.
-fn tag_taken(shares: &[config::FsShare], tag: &str) -> bool {
-    shares.iter().any(|share| share.tag == tag)
+fn tag_taken(shares: &[config::FsShare], sockets: &[config::FsConfig], tag: &str) -> bool {
+    shares.iter().any(|share| share.tag == tag) || sockets.iter().any(|fs| fs.tag == tag)
 }
 
 /// Returns the canonical form of `path`, which an export hvi serves needs to

@@ -13,7 +13,7 @@
             {"syscall": "fdatasync", "comment": "virtio-blk flush: what File::sync_data calls"},
             {"syscall": "fsync", "comment": "safety net: sync_all, if a flush ever needs metadata"},
             {"syscall": "close", "comment": "accepted connections, dropped descriptors"},
-            {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end; the stop request; the gateway relay ending"},
+            {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end; the stop request; the gateway relay ending; the virtio-fs daemon connections at a stop"},
             {"syscall": "fcntl", "comment": "set_nonblocking on accepted sockets"},
             {"syscall": "ioctl", "comment": "KVM_RUN and friends; TUNSETIFF is pre-filter; the terminal restore's TCFLSH and TCSETS"},
             {"syscall": "accept4", "comment": "control socket and the agent bridge"},
@@ -93,6 +93,8 @@
             {"syscall": "clock_gettime", "comment": "safety net: event timestamps"},
             {"syscall": "close", "comment": "safety net: a device dropping a descriptor"},
             {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end"},
+            {"syscall": "sendmsg", "comment": "vhost-user: the guest's DRIVER_OK write hands the virtio-fs rings to the daemon from this thread, and its reset takes them back"},
+            {"syscall": "recvmsg", "comment": "vhost-user: what the daemon answers during the handover and the reset"},
             {"syscall": "exit", "comment": "thread exit"},
             {"syscall": "exit_group", "comment": "process exit on a guest power-off"}
         ]
