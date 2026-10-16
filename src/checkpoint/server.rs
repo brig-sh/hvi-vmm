@@ -18,9 +18,11 @@
 //! The thread is one of the I/O threads. It polls its listener and its one
 //! connection beside the stop token, so the stop ends it like the others, and
 //! it never passes the pause gate itself, since it is the one that closes it.
-//! It serves one connection at a time, in order. A client that disconnects
-//! while the VM is paused leaves it paused: the next client resumes it, or
-//! stops it.
+//! It serves one connection at a time, in order, so a request on another
+//! connection waits until the one served is done: behind a `pause`, which
+//! can wait 10 s for the I/O threads, up to about 12 s. A client that
+//! disconnects while the VM is paused leaves it paused: the next client
+//! resumes it, or stops it.
 //!
 //! `pause` closes the I/O gate first and parks the vCPUs second, so no host
 //! thread writes guest RAM once the vCPUs are still. Either step that misses
@@ -45,12 +47,14 @@
 //! writes, so a slow reader holds it up and never the guest; the pause
 //! starts once the last round with the guest running has been written. A
 //! failure before the manifest leaves the VM as the request found it, as a
-//! `checkpoint`'s does. The client reads the failure as a reply line where
-//! a frame header was due, if the socket had room for it, and then the end
-//! of the connection, which a failed stream always closes: an end before
-//! the manifest means the VM was not fenced. `then: "fence"` fences the VM once
-//! the manifest is written to the connection, which is before the client has
-//! read it. The fence released its disk, and the destination may already
+//! `checkpoint`'s does. The client may read the failure as a reply line
+//! where a frame header was due, cut short if the socket lacked room for
+//! all of it, and then reads the end of the connection, which a failed
+//! stream always closes. An end before the manifest means this stream did
+//! not fence the VM: a first stream leaves it running, and a stream sent
+//! again to the fence owner leaves it fenced. `then: "fence"` fences the VM
+//! once the manifest is written to the connection, which is before the client
+//! has read it. The fence released its disk, and the destination may already
 //! run it, so a fenced VM is streamed again only for the move that fenced
 //! it, by its txid and epoch, and stays fenced: the mover that lost the
 //! stream after the seal recovers it so. Any other `migrate` of a fenced
@@ -504,14 +508,16 @@ fn answer<K: Kick>(
 /// not fit by then. A refusal before the first byte of the stream is a
 /// reply like any other, and the connection stays open.
 ///
-/// A stream that failed once it had begun is cut off: the refusal is
-/// written only if the socket has room for it at once, and the connection
-/// is shut down both ways. The reader may be why the stream failed, and a
-/// failure part way through a frame leaves the refusal inside that frame's
-/// bytes, where no reader can take it for a reply. So the reader learns of
-/// the failure from the end of the stream, which it sees as soon as it has
-/// taken what is buffered, rather than from a reply it may wait for until
-/// its own timeout. An end before the manifest means the VM was not fenced.
+/// A stream that failed once it had begun is cut off: the refusal gets one
+/// write, so only what the socket has room for at once goes out and the
+/// line may be cut short, and the connection is shut down both ways. The reader
+/// may be why the stream failed, and a failure part way through a frame leaves
+/// the refusal inside that frame's bytes, where no reader can take it for a
+/// reply. So the reader learns of the failure from the end of the stream, which
+/// it sees as soon as it has taken what is buffered, rather than from a reply
+/// it may wait for until its own timeout. An end before the manifest means this
+/// stream did not fence the VM; a stream sent again to the fence owner leaves
+/// it fenced.
 fn stream_and_reply<K: Kick>(
     conn: &mut UnixStream,
     stop: &StopToken,
@@ -1650,10 +1656,13 @@ impl<K: Kick> Machine<'_, K> {
     /// succeeds and changes nothing.
     ///
     /// The vCPUs run on while the gate waits for the I/O threads, the
-    /// virtio-blk worker's request in flight among them, so the longer
-    /// wait costs the guest nothing. Under a disk hog that request was a
-    /// flush whose `fdatasync` took over 2 s, and a `pause` with the 2 s
-    /// bound failed where a `migrate` went ahead.
+    /// virtio-blk worker's request in flight among them, but the gate is
+    /// closed before it waits, so the guest's I/O is held for the whole
+    /// wait: the network, the console, the agent's bridge and new disk
+    /// requests, up to 10 s, and a pause that then times out has held
+    /// them that long. Under a disk hog the request in flight was a flush
+    /// whose `fdatasync` took over 2 s, and a `pause` with the 2 s bound
+    /// failed where a `migrate` went ahead.
     fn pause(&mut self) -> Response {
         match self.pause_within(self.stream.park, Some(self.timeout)) {
             Ok(_) => Response::State(self.state),
