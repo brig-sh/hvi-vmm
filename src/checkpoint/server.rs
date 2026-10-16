@@ -736,6 +736,8 @@ impl After {
                 // The loop that owns the run's stop wakes on the request, and
                 // the run ends as `Stop::Requested`. The VM stops here at once
                 // as well, so a pause this socket holds ends with the reply.
+                // The request comes first, so whoever finds the VM stopped
+                // also finds it requested, and not a `Stop::SystemOff`.
                 vcpus.stop_handle().request_stop();
                 vcpus.stop();
             }
@@ -2284,7 +2286,9 @@ mod tests {
         assert!(reply.contains(r#""ident":"0x61""#), "{reply}");
     }
 
-    // The stop must end the run even when the VM is paused, and say so.
+    // The stop must end the run even when the VM is paused, and say so. The
+    // reply goes out before the server stops the VM, so the test waits for
+    // the stop.
     #[test]
     fn stop_ends_a_paused_run() {
         let mut f = Fixture::new("stop", 2, 0);
@@ -2293,7 +2297,7 @@ mod tests {
             f.ask(r#"{"v":1,"op":"stop"}"#),
             r#"{"v":1,"ok":true,"state":"stopping"}"#
         );
-        assert!(!f.vcpus.is_running());
+        assert_stops(&f.vcpus, "the stop did not end the paused run");
         assert!(matches!(
             f.vcpus.outcome(),
             Outcome::Stopped(Stop::Requested)
@@ -2304,6 +2308,41 @@ mod tests {
         assert!(f
             .ask(r#"{"v":1,"op":"resume"}"#)
             .starts_with(r#"{"v":1,"ok":false,"code":"stopped""#));
+    }
+
+    /// Records whether the run's stop was requested when the vCPUs were
+    /// kicked, which [`Vcpus::stop`] does as it stops them.
+    struct SeesTheRequest {
+        stop: StopHandle,
+        requested: Mutex<Option<bool>>,
+    }
+
+    impl Kick for SeesTheRequest {
+        fn kick(&self, _cpu: u32) {}
+        fn kick_all(&self) {
+            *self.requested.lock().unwrap() = Some(self.stop.is_stop_requested());
+        }
+    }
+
+    // The stop's follow-up requests the run's stop before it stops the VM. The
+    // other order lets the loop that owns the run find the vCPUs gone and no
+    // request, and end the run as a `SystemOff`.
+    #[test]
+    fn a_stop_is_requested_before_the_vm_stops() {
+        let (stop, _registration) = StopHandle::new_pair().unwrap();
+        let kicker = SeesTheRequest {
+            stop: stop.clone(),
+            requested: Mutex::new(None),
+        };
+        let vcpus = Vcpus::new(1, kicker, stop);
+        After::Stop.run(&vcpus);
+        assert!(!vcpus.is_running());
+        assert_eq!(
+            *vcpus.kicker().requested.lock().unwrap(),
+            Some(true),
+            "the VM stopped before its stop was requested"
+        );
+        assert!(matches!(vcpus.outcome(), Outcome::Stopped(Stop::Requested)));
     }
 
     // A client that hangs up while the VM is paused leaves it paused, and the
