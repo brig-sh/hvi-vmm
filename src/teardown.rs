@@ -55,8 +55,9 @@ use crate::sync::lock_or_recover;
 /// and then for the ledger, after it is requested.
 ///
 /// The waits the stop cannot interrupt are a plugin blocking in `request`, in
-/// `safepoint` or on a thread it started with `VmHandle::spawn`, and a
-/// virtio-fs worker waiting on a host file lock.
+/// `safepoint` or on a thread it started with `VmHandle::spawn`, a virtio-fs
+/// worker waiting on a host file lock, and a ledger write that blocks in the
+/// kernel.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A count of the helper threads that have finished.

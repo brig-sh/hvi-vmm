@@ -30,12 +30,11 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::config::Stop;
-use crate::events::Emitter;
+use crate::events::Batch;
 use crate::hypervisor::guest::Guest;
 use crate::hypervisor::vcpus::{Kick, Outcome, VcpuThreads};
 use crate::io_threads::IoThreads;
 use crate::plugin::GuestArch;
-use crate::sync::try_lock_until;
 use crate::teardown::STOP_TIMEOUT;
 use crate::LOG_PREFIX;
 
@@ -163,8 +162,9 @@ impl<K: Kick> Drop for StopOnUnwind<'_, K> {
 /// `confined` says whether the run's confinement is on. Call it before the vCPU
 /// threads are spawned, so the record comes before any record the VMM writes
 /// for the run. A plugin can write earlier, from `attach` or from a thread it
-/// started there. Such a thread can also hold the ledger, so the call waits for
-/// it for at most [`STOP_TIMEOUT`] and skips the record when it is still held.
+/// started there. The call waits for the ledger's writer for at most
+/// [`STOP_TIMEOUT`], and not at all while the ledger's writes fail. A record
+/// not written by then stays buffered.
 pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
     let start = StartRecord {
         arch: match guest.arch {
@@ -176,11 +176,14 @@ pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
         confined,
         core_version: crate::CORE_VERSION,
     };
-    let Some(mut ledger) = try_lock_until(&guest.ledger, Instant::now() + STOP_TIMEOUT) else {
-        stderrln!("{LOG_PREFIX} the ledger is still locked; the start is not recorded");
-        return;
-    };
-    ledger.emit_payload("vmm", "vmm.start", &start);
+    let written = guest
+        .ledger
+        .batch_until(Instant::now() + STOP_TIMEOUT, |batch| {
+            batch.emit_payload("vmm", "vmm.start", &start);
+        });
+    if let Err(e) = written {
+        stderrln!("{LOG_PREFIX} writing the start record: {e}");
+    }
 }
 
 /// Runs the guest from its spawned vCPU threads to its stop.
@@ -189,15 +192,14 @@ pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
 /// started the run, from the spawn of the vCPU threads on. Without one, the
 /// calling thread waits until a vCPU thread exits or a stop is requested. It
 /// then stops the VM, joins the vCPU threads and stops `io_threads`, each by
-/// [`STOP_TIMEOUT`], and writes out the ledger tail, which the flush cadence
-/// alone would leave in the buffer.
+/// [`STOP_TIMEOUT`].
 ///
 /// The loop writes the rest of the run's lifecycle to the ledger, after the
 /// record of [`record_start`]: a `vmm.vcpu_started` record for each vCPU that
-/// enters its run loop, and, before the last flush, a `vmm.stop` record with
-/// how the run ended. A thread left running may hold the ledger, so after the
-/// joins the loop waits for it for at most [`STOP_TIMEOUT`], and writes neither
-/// the records nor the tail when it is still held.
+/// enters its run loop, and last a `vmm.stop` record with how the run ended. It
+/// adds a `vmm.vcpu_started` record without waiting for the ledger's writer.
+/// The `vmm.stop` record closes the ledger, and the loop waits for the writer
+/// to write it for at most [`STOP_TIMEOUT`].
 ///
 /// # Errors
 ///
@@ -219,15 +221,11 @@ pub(crate) fn run_to_stop<K: Kick>(
     let mut announced = 0;
     if failure.is_none() {
         let waited = guest.vcpus.wait_for_stop(|| {
-            // The ledger is only tried, so a thread that holds it does not keep
-            // the loop from a failure or a stop request. A record it cannot
-            // write now is written after the joins.
             let started = guest.vcpus.started_after(announced);
-            if started.is_empty() {
-                return;
-            }
-            if let Some(mut ledger) = try_lock_until(&guest.ledger, Instant::now()) {
-                record_vcpus_started(&mut ledger, &started);
+            if !started.is_empty() {
+                let _ = guest.ledger.batch_until(Instant::now(), |batch| {
+                    record_vcpus_started(batch, &started);
+                });
                 announced += started.len();
             }
         });
@@ -244,7 +242,6 @@ pub(crate) fn run_to_stop<K: Kick>(
         left_running.get_or_insert(e);
     }
 
-    let ledger = try_lock_until(&guest.ledger, Instant::now() + STOP_TIMEOUT);
     let result: Result<Stop, Box<dyn std::error::Error + Send + Sync>> =
         match (failure, guest.vcpus.outcome(), left_running) {
             (Some(e), outcome, left_running) => {
@@ -271,14 +268,6 @@ pub(crate) fn run_to_stop<K: Kick>(
                 left: None,
             })),
         };
-    let Some(mut ledger) = ledger else {
-        stderrln!(
-            "{LOG_PREFIX} the ledger is still locked; the stop record and the tail are not written"
-        );
-        return result;
-    };
-    // A vCPU that started after the last wake is recorded before the stop.
-    record_vcpus_started(&mut ledger, &guest.vcpus.started_after(announced));
     let error = result.as_ref().err().map(ToString::to_string);
     let stop = StopRecord {
         reason: match &result {
@@ -298,16 +287,26 @@ pub(crate) fn run_to_stop<K: Kick>(
             _ => None,
         },
         error: error.as_deref(),
+        dropped: guest.ledger.dropped(),
     };
-    ledger.emit_payload("vmm", "vmm.stop", &stop);
-    ledger.flush();
+    let written = guest
+        .ledger
+        .close_with(Instant::now() + STOP_TIMEOUT, |batch| {
+            // A vCPU that started after the last wake is recorded before the
+            // stop.
+            record_vcpus_started(batch, &guest.vcpus.started_after(announced));
+            batch.emit_payload("vmm", "vmm.stop", &stop);
+        });
+    if let Err(e) = written {
+        stderrln!("{LOG_PREFIX} writing the stop record: {e}");
+    }
     result
 }
 
-/// Writes a `vmm.vcpu_started` record for each of `cpus`.
-fn record_vcpus_started(ledger: &mut Emitter, cpus: &[u32]) {
+/// Adds a `vmm.vcpu_started` record for each of `cpus` to `batch`.
+fn record_vcpus_started(batch: &mut Batch, cpus: &[u32]) {
     for &cpu in cpus {
-        ledger.emit_payload("vmm", "vmm.vcpu_started", &VcpuStartedRecord { vcpu: cpu });
+        batch.emit_payload("vmm", "vmm.vcpu_started", &VcpuStartedRecord { vcpu: cpu });
     }
 }
 
@@ -346,20 +345,46 @@ struct StopRecord<'a> {
     /// The error `boot` returns, when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
+    /// The number of `block` and `net` records the ledger dropped because its
+    /// buffer was full, when it dropped any.
+    #[serde(skip_serializing_if = "is_zero")]
+    dropped: u64,
+}
+
+/// Returns whether `count` is zero.
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    use crate::events::Ledger;
 
     use crate::hypervisor::guest::tests::{guest, NoopKicker};
     use crate::run::StopHandle;
 
     /// The code a test vCPU thread runs.
     type Body = Box<dyn FnOnce() + Send>;
+
+    #[test]
+    fn stop_record_carries_dropped_only_when_records_were_dropped() {
+        let stop = |dropped| {
+            serde_json::to_string(&StopRecord {
+                reason: "requested",
+                signal: None,
+                error: None,
+                dropped,
+            })
+            .unwrap()
+        };
+        assert_eq!(stop(0), r#"{"reason":"requested"}"#);
+        assert_eq!(stop(670), r#"{"reason":"requested","dropped":670}"#);
+    }
 
     /// Runs `bodies` on the vCPU threads of `guest`, then runs the guest to its
     /// stop with `failure` as the caller's.
@@ -459,47 +484,43 @@ mod tests {
         );
     }
 
-    // A thread holds the ledger while the vCPUs start and the guest stops, so
-    // the loop cannot record the starts as they come. The holder lets go once
-    // the second vCPU sees the stop, after the loop's last wake. The host-path
-    // ban in clippy.toml is aimed at the virtio-fs device, where every
-    // component of a path comes from the guest. This test reads the ledger file
-    // it made.
+    // The writer's writes block while the vCPUs start and the guest stops. The
+    // second vCPU enters its run loop only after it sees the stop, which comes
+    // after the loop's last wake, so the closing batch records it. The writer
+    // resumes once that vCPU has entered its run loop. The host-path ban in
+    // clippy.toml is aimed at the virtio-fs device, where every component of a
+    // path comes from the guest. This test reads the ledger file it made.
     #[test]
     #[allow(clippy::disallowed_methods)]
-    fn vcpus_started_while_the_ledger_is_held_are_recorded_before_the_stop() {
+    fn vcpus_started_while_the_writer_stalls_are_recorded_before_the_stop() {
         let path = std::env::temp_dir().join(format!("hvi-run-{}.ndjson", std::process::id()));
         let mut guest = guest(2);
-        guest.ledger = Arc::new(Mutex::new(
-            Emitter::new(Some(path.to_str().unwrap()), "test").unwrap(),
-        ));
-        let (held, is_held) = mpsc::channel::<()>();
+        guest.ledger = Arc::new(Ledger::new(Some(path.to_str().unwrap()), "test").unwrap());
+        guest.ledger.set_paused(true);
         let (stopped, has_stopped) = mpsc::channel::<()>();
         let ledger = Arc::clone(&guest.ledger);
-        let holder = std::thread::spawn(move || {
-            let _held = ledger.lock().unwrap();
-            held.send(()).unwrap();
+        let resumer = std::thread::spawn(move || {
             has_stopped.recv().unwrap();
+            ledger.set_paused(false);
         });
-        is_held.recv().unwrap();
 
         let vcpus = Arc::clone(&guest.vcpus);
         let off: Body = Box::new(move || {
             vcpus.mark_started(0);
             vcpus.report(Outcome::Stopped(Stop::SystemOff));
         });
-        // The VM stops only after the loop's last wake, so once this vCPU sees
-        // the stop, the loop records the starts after the joins or not at all.
         let vcpus = Arc::clone(&guest.vcpus);
         let running: Body = Box::new(move || {
-            vcpus.mark_started(1);
             while vcpus.is_running() {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            vcpus.mark_started(1);
             stopped.send(()).unwrap();
         });
+        let start = Instant::now();
         let result = run(&guest, vec![off, running], None);
-        holder.join().unwrap();
+        assert!(start.elapsed() < STOP_TIMEOUT);
+        resumer.join().unwrap();
         assert!(matches!(result, Ok(Stop::SystemOff)), "{result:?}");
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -525,19 +546,19 @@ mod tests {
         assert_eq!(records.last().unwrap().0, "vmm.stop");
     }
 
-    /// Runs a guest with one vCPU to the stop `request` asks for on its handle,
-    /// with its ledger in a file named after `name`, and returns the payload of
-    /// the `vmm.stop` record.
-    // This test helper reads the ledger file it made, which the host-path ban
-    // in clippy.toml does not aim at.
+    /// Returns the `vmm.stop` payload of a one-vCPU guest run to the stop
+    /// `request` asks for on its handle.
+    ///
+    /// The ledger is a file named after `name`.
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This test helper reads
+    // the ledger file it made.
     #[allow(clippy::disallowed_methods)]
     fn stop_payload(name: &str, request: impl FnOnce(&StopHandle)) -> serde_json::Value {
         let path =
             std::env::temp_dir().join(format!("hvi-run-{name}-{}.ndjson", std::process::id()));
         let mut guest = guest(1);
-        guest.ledger = Arc::new(Mutex::new(
-            Emitter::new(Some(path.to_str().unwrap()), "test").unwrap(),
-        ));
+        guest.ledger = Arc::new(Ledger::new(Some(path.to_str().unwrap()), "test").unwrap());
         let vcpus = Arc::clone(&guest.vcpus);
         let running: Body = Box::new(move || {
             while vcpus.is_running() {

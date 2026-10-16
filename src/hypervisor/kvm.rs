@@ -32,7 +32,7 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
-use crate::hypervisor::guest::Guest;
+use crate::hypervisor::guest::{Guest, LedgerCloseGuard};
 use crate::hypervisor::vcpus::{Kick, Outcome};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::plugin::Plugin;
@@ -181,7 +181,7 @@ impl Drop for Registration<'_> {
 /// pair are created before any filter goes in, since the allowlists allow
 /// accepting on a listener already held but not creating one. Then the I/O
 /// threads start, with the threads the plugin asked for, each filtering itself
-/// as it begins.
+/// as it begins. It also returns the ledger's [`LedgerCloseGuard`].
 ///
 /// # Errors
 ///
@@ -193,8 +193,11 @@ pub(crate) fn start_io_threads(
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
-) -> Result<(seccomp::Filters, IoThreads<Kicker>), Box<dyn std::error::Error + Send + Sync>> {
-    let plugin_threads = guest.attach(cfg.plugin.as_ref())?;
+) -> Result<
+    (seccomp::Filters, IoThreads<Kicker>, LedgerCloseGuard),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let (plugin_threads, ledger_guard) = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
     // A binary's stop signals get their handlers, and the thread that receives
     // them starts, once the filters are armed, so the thread installs the `vmm`
@@ -220,7 +223,7 @@ pub(crate) fn start_io_threads(
         net,
         plugin_threads,
     );
-    Ok((filters, io_threads))
+    Ok((filters, io_threads, ledger_guard))
 }
 
 /// Runs the guest on one thread per vCPU and returns how the run ended.

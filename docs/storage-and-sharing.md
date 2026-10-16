@@ -51,10 +51,13 @@ for d in /sys/block/vd*; do
 done
 ```
 
-Every request emits a `block` record into the ledger when `--events` is set:
+Every read or write that succeeds emits a `block` record into the ledger when
+`--events` is set, unless the ledger's buffer is full (see
+[observability.md](observability.md#when-a-record-reaches-the-file)). `disk` is
+the disk's serial, so the records of two disks can be told apart:
 
 ```json
-{"sandbox_id":"hvi","ts":1788992154877294000,"provenance":"boundary","source":"block","payload":{"lba":0,"len":4096,"rw":"r"}}
+{"sandbox_id":"hvi","ts":1788992154877294000,"provenance":"boundary","source":"block","payload":{"disk":"disk0","lba":0,"len":4096,"rw":"r"}}
 ```
 
 `HVI_BLK_TRACE=1` also logs each request to stderr. It is off by default

@@ -66,7 +66,7 @@ use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
-use crate::events::{CapturedEvent, Emitter};
+use crate::events::Ledger;
 use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
@@ -409,10 +409,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
             shared_ram,
-            ledger: Arc::new(Mutex::new(Emitter::new(
-                cfg.events.as_deref(),
-                &cfg.sandbox_id,
-            )?)),
+            ledger: Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?),
             disks,
             net,
             vsock,
@@ -454,7 +451,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // The plugin attach, the seccomp arm and the I/O threads, in the order the
     // filters need. Each polls its stop token beside its own descriptor and is
     // joined after the vCPUs; `teardown` describes the stop.
-    let (filters, mut io_threads) = start_io_threads(
+    let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &shared.guest,
         {
@@ -480,6 +477,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             }
         });
     }
+
+    // The run closes the ledger from here on.
+    ledger_guard.disarm();
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_guest` returned it.
@@ -777,17 +777,6 @@ fn mmio_write(sh: &Shared, addr: u64, val: u64) {
     }
 }
 
-/// Moves a device's captured `events` into the ledger.
-fn drain(sh: &Shared, events: &[CapturedEvent]) {
-    if events.is_empty() {
-        return;
-    }
-    let mut e = sh.guest.ledger.lock().unwrap();
-    for ev in events {
-        e.captured(ev);
-    }
-}
-
 /// Services a read of register `off` of the virtio-blk device `dev`.
 ///
 /// The device's captured events then go to the ledger.
@@ -797,7 +786,7 @@ fn blk_read(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
         let v = d.mmio(&sh.guest.ram, off, false, 0);
         (v, d.take_events())
     };
-    drain(sh, &events);
+    sh.guest.ledger.captured(&events);
     v
 }
 
@@ -810,7 +799,7 @@ fn blk_write(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
         d.mmio(&sh.guest.ram, off, true, val);
         d.take_events()
     };
-    drain(sh, &events);
+    sh.guest.ledger.captured(&events);
 }
 
 /// Services a read of virtio-net register `off`.
@@ -825,7 +814,7 @@ fn net_read(sh: &Shared, off: u64) -> u64 {
         let v = d.mmio(&sh.guest.ram, off, false, 0);
         (v, d.take_events())
     };
-    drain(sh, &events);
+    sh.guest.ledger.captured(&events);
     v
 }
 
@@ -841,7 +830,7 @@ fn net_write(sh: &Shared, off: u64, val: u64) {
         d.mmio(&sh.guest.ram, off, true, val);
         d.take_events()
     };
-    drain(sh, &events);
+    sh.guest.ledger.captured(&events);
 }
 
 /// Services a read of virtio-vsock register `off`.

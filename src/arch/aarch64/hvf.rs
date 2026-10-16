@@ -16,10 +16,10 @@
 //!
 //! One thread per vCPU (an `applevisor::Vcpu` is thread-bound). vcpu0 boots at
 //! the kernel entry; secondaries park until the guest brings them up via PSCI
-//! `CPU_ON`. Guest RAM is a `GuestRam` shared by every vCPU thread; devices,
-//! the event emitter, and the vCPU-handle list are shared behind locks. A
-//! plugin, if the caller supplied one, is called on vcpu0 between guest
-//! entries. See [`crate::plugin`].
+//! `CPU_ON`. Guest RAM is a `GuestRam` shared by every vCPU thread. Devices and
+//! the vCPU-handle list are shared behind locks, and the event ledger is shared
+//! as an `Arc<Ledger>`. A plugin, if the caller supplied one, is called on
+//! vcpu0 between guest entries. See [`crate::plugin`].
 //!
 //! The exit-loop's timer/WFI/PC handling and the SMP hand-off are the
 //! boot-debug frontier.
@@ -54,7 +54,7 @@ use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
-use crate::events::Emitter;
+use crate::events::Ledger;
 use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
@@ -541,8 +541,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         fs_count: fs.len(),
     };
 
-    let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
-    if emitter.enabled() {
+    let ledger = Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
+    if ledger.is_enabled() {
         eprintln!(
             "{LOG_PREFIX} event ledger: {}",
             cfg.events.as_deref().unwrap_or("")
@@ -571,7 +571,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
             shared_ram,
-            ledger: Arc::new(Mutex::new(emitter)),
+            ledger: Arc::new(ledger),
             disks,
             net,
             vsock,
@@ -608,7 +608,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
-    let plugin_threads = shared.guest.attach(shared.plugin.as_ref())?;
+    let (plugin_threads, ledger_guard) = shared.guest.attach(shared.plugin.as_ref())?;
 
     // A binary's stop signals get their handlers, and the thread that receives
     // them starts, before the terminal goes into raw mode, so a first stop
@@ -673,6 +673,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         io_threads.on_stop(move || stop.stop());
     }
 
+    // The run closes the ledger from here on.
+    ledger_guard.disarm();
     record_start(&shared.guest, cfg.sandbox);
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
@@ -1052,12 +1054,7 @@ fn service_dev(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioBlk>>, offset: u6
         }
         d.take_events()
     };
-    if !events.is_empty() {
-        let mut e = lock_or_recover(&sh.guest.ledger);
-        for ev in &events {
-            e.captured(ev);
-        }
-    }
+    sh.guest.ledger.captured(&events);
 }
 
 /// Services a virtio-net MMIO access (same shape as `service_dev`).
@@ -1077,12 +1074,7 @@ fn service_net(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioNet>>, offset: u6
         }
         d.take_events()
     };
-    if !events.is_empty() {
-        let mut e = lock_or_recover(&sh.guest.ledger);
-        for ev in &events {
-            e.captured(ev);
-        }
-    }
+    sh.guest.ledger.captured(&events);
 }
 
 /// Services a virtio-vsock MMIO access.

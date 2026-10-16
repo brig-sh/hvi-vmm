@@ -23,7 +23,8 @@ Firecracker and reads the same files:
 Two threads. `vcpu` is the tight one and the one that matters most, because
 MMIO exits are serviced inline on the vCPU thread -- the virtio device models,
 the code that parses guest descriptors, run there. `vmm` covers the thread that
-calls `boot` and the host-side I/O threads.
+calls `boot`, the host-side I/O threads, the threads a plugin starts with
+`VmHandle::spawn`, the stop-signal thread and the ledger's writer.
 
 ## Why these are not Firecracker's lists
 

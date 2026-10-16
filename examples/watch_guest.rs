@@ -164,8 +164,11 @@ impl Plugin for WatchGuest {
 
         // Deliberately after the resume: the guest does not need to stay parked
         // while a record is serialized and written.
-        if let Ok(mut ledger) = cpu.ledger().lock() {
-            ledger.emit_payload("boundary", "watch-guest", &sample);
+        if let Err(e) = cpu
+            .ledger()
+            .emit_payload("boundary", "watch-guest", &sample)
+        {
+            eprintln!("[watch] writing the sample: {e}");
         }
         eprintln!(
             "[watch] pc={:#x} blk={} ({} bytes) net={}",

@@ -453,7 +453,7 @@ impl VirtioNet {
     }
 
     /// Drains the captured flows for the event ledger.
-    pub fn take_events(&mut self) -> Vec<CapturedEvent> {
+    pub(crate) fn take_events(&mut self) -> Vec<CapturedEvent> {
         std::mem::take(&mut self.events)
     }
 
