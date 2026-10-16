@@ -75,6 +75,16 @@ seccompiler = { version = "0.5", features = ["json"] }
 # The ACPI tables an x86-64 guest powers off and resets through.
 acpi_tables = "0.2.1"
 
+# virtio-fs on Linux is served out of process by virtiofsd, so what the VMM
+# needs is the frontend half of vhost-user: the handshake, the memory table and
+# the vring messages. The rust-vmm crate owns that protocol, which is the same
+# one cloud-hypervisor and QEMU speak, so the device in
+# `devices::virtio::fs::vhost_user` is a virtio-mmio transport and nothing else.
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { version = "0.17.0", features = ["vhost-user-frontend"] }
+# EventFd, the type `vhost` takes for the kick and call descriptors.
+vmm-sys-util = "0.15"
+
 # The VMM as a library, so it can be linked as well as run.
 [lib]
 name = "hvi"

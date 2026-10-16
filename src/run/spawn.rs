@@ -125,6 +125,7 @@ mod tests {
             cmdline: String::new(),
             disk: None,
             fs_shares: Vec::new(),
+            fs: Vec::new(),
             net: false,
             net_gateway: None,
             net_tap: None,

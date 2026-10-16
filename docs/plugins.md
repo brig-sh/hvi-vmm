@@ -56,6 +56,12 @@ cpu.resume();               // before anything that can fail or return
 report(sample);
 ```
 
+A pause parks the vCPUs only. The host side keeps writing guest RAM while they
+are parked. The network relay and the agent bridge deliver what arrives for the
+guest, and a virtio-fs export answers the requests already on its queue, from
+hvi's worker thread on macOS and from the daemon on Linux. Memory those devices
+own can change under a read the pause holds.
+
 A `safepoint` may hold the pause while it waits, for example for another process
 to finish reading. It checks `cpu.is_stopping()` as it waits. Once that returns
 `true`, it resumes and returns. The stop waits one second for the boot vCPU,

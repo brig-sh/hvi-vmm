@@ -78,31 +78,95 @@ pub struct FsShare {
     pub gid: u32,
 }
 
-/// One `--fs` export.
+/// A virtio-fs export served by a vhost-user daemon the caller runs.
+///
+/// The daemon serves the directory it was started with, and it decides whether
+/// the guest may write it. The VMM sees only the socket. Only the Linux
+/// backends serve these. The fields and their defaults are Cloud Hypervisor's
+/// `--fs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsConfig {
+    /// The tag the guest mounts the export by, 1 to 36 bytes.
+    pub tag: String,
+    /// The socket the daemon listens on.
+    pub socket: PathBuf,
+    /// The number of request queues, beside the hiprio queue. At most one per
+    /// vCPU.
+    pub num_queues: usize,
+    /// The size of each queue, a power of two up to 32768.
+    pub queue_size: u16,
+}
+
+impl FsConfig {
+    /// The request queues an export gets when `num_queues` is not given.
+    pub const DEFAULT_NUM_QUEUES: usize = 1;
+    /// The queue size an export gets when `queue_size` is not given.
+    pub const DEFAULT_QUEUE_SIZE: u16 = 1024;
+    /// The largest queue size, which is the largest split virtqueue.
+    pub const MAX_QUEUE_SIZE: u16 = 32768;
+
+    /// Refuses an export no guest could use.
+    ///
+    /// [`FsSpec::parse`] runs it on what it reads, and [`check_fs`] on every
+    /// export a backend is given, so a library caller that builds an
+    /// `FsConfig` itself gets the same checks as the command line.
+    ///
+    /// # Errors
+    ///
+    /// Returns why on a tag that is empty, longer than 36 bytes or holds a
+    /// NUL, on no request queue, and on a queue size that is not a power of
+    /// two up to [`Self::MAX_QUEUE_SIZE`].
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tag.is_empty() || self.tag.len() > FsSpec::MAX_TAG_LEN || self.tag.contains('\0') {
+            return Err(format!(
+                "the tag must be 1 to {} bytes with no NUL",
+                FsSpec::MAX_TAG_LEN
+            ));
+        }
+        if self.num_queues == 0 {
+            return Err("num_queues=0 is not a count of 1 or more".into());
+        }
+        if !self.queue_size.is_power_of_two() || self.queue_size > Self::MAX_QUEUE_SIZE {
+            return Err(format!(
+                "queue_size={} is not a power of two up to {}",
+                self.queue_size,
+                Self::MAX_QUEUE_SIZE
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One `--fs` export: a directory hvi serves, or a vhost-user daemon's socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsSpec {
     /// `path=`: hvi serves the directory itself, on macOS.
     Share(FsShare),
+    /// `socket=`: the caller's daemon serves it, on Linux.
+    Socket(FsConfig),
 }
 
 impl FsSpec {
     /// The syntax [`parse`](Self::parse) takes, for an error to quote.
     pub const SYNTAX: &'static str =
-        "tag=<tag>,path=<dir>[,readonly=on|off][,cache=auto|always|none][,uid=<n>][,gid=<n>]";
+        "tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>] \
+         or tag=<tag>,path=<dir>[,readonly=on|off][,cache=auto|always|none][,uid=<n>][,gid=<n>]";
     /// The longest tag, which is the length of the config-space field.
     pub const MAX_TAG_LEN: usize = 36;
 
     /// Returns the export `spec` describes, in the syntax of
     /// [`SYNTAX`](Self::SYNTAX).
     ///
-    /// The syntax is Cloud Hypervisor's comma-separated `--fs`. A `path=` is
-    /// returned as given; resolving it is the caller's.
+    /// The `socket=` form is Cloud Hypervisor's `--fs`, with its defaults.
+    /// The `path=` form takes what only hvi's own server can honor. A
+    /// `path=` is returned as given; resolving it is the caller's.
     ///
     /// # Errors
     ///
-    /// Errors on a missing tag or path, on a key that is unknown or repeated,
-    /// on a tag that is empty, longer than 36 bytes or holds a NUL, and on a
-    /// value a key cannot take.
+    /// Errors on a missing tag, on neither or both of `path` and `socket`, on
+    /// a key that is unknown, repeated or belongs to the other form, on a tag
+    /// that is empty, longer than 36 bytes or holds a NUL, and on a value a
+    /// key cannot take.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let bad = |why: String| format!("--fs {spec:?}: {why}; expected {}", Self::SYNTAX);
         let mut fields: Vec<(&str, &str)> = Vec::new();
@@ -110,7 +174,18 @@ impl FsSpec {
             let (key, value) = field
                 .split_once('=')
                 .ok_or_else(|| bad(format!("{field:?} is not key=value")))?;
-            if !matches!(key, "tag" | "path" | "readonly" | "cache" | "uid" | "gid") {
+            if !matches!(
+                key,
+                "tag"
+                    | "socket"
+                    | "num_queues"
+                    | "queue_size"
+                    | "path"
+                    | "readonly"
+                    | "cache"
+                    | "uid"
+                    | "gid"
+            ) {
                 return Err(bad(format!("unknown key {key:?}")));
             }
             if fields.iter().any(|(seen, _)| *seen == key) {
@@ -127,35 +202,119 @@ impl FsSpec {
                 Self::MAX_TAG_LEN
             )));
         }
-        let path = get("path")
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| bad("no path".into()))?;
-        let mode = match get("readonly") {
-            None | Some("off") => ShareMode::ReadWrite,
-            Some("on") => ShareMode::ReadOnly,
-            Some(v) => return Err(bad(format!("readonly {v:?} is not on or off"))),
+        let (path, socket) = (
+            get("path").filter(|v| !v.is_empty()),
+            get("socket").filter(|v| !v.is_empty()),
+        );
+        // A key of the other form says the caller expects hvi to do something
+        // the form cannot do, so it is refused rather than ignored.
+        let other = |keys: &[&str], form: &str, why: &str| -> Result<(), String> {
+            match keys.iter().find(|key| get(key).is_some()) {
+                Some(key) => Err(bad(format!(
+                    "{key} does not apply to a {form} export: {why}"
+                ))),
+                None => Ok(()),
+            }
         };
-        let cache = match get("cache") {
-            None | Some("auto") => CachePolicy::Auto,
-            Some("always") => CachePolicy::Always,
-            Some("none") => CachePolicy::None,
-            Some(v) => return Err(bad(format!("cache {v:?} is not auto, always or none"))),
-        };
-        let id = |key: &str| -> Result<u32, String> {
-            get(key).map_or(Ok(0), |v| {
-                v.parse()
-                    .map_err(|_| bad(format!("{key} {v:?} is not a numeric id")))
-            })
-        };
-        Ok(Self::Share(FsShare {
-            path: PathBuf::from(path),
-            tag: tag.to_string(),
-            mode,
-            cache,
-            uid: id("uid")?,
-            gid: id("gid")?,
-        }))
+        match (path, socket) {
+            (Some(_), Some(_)) => Err(bad("path and socket are two kinds of export".into())),
+            (None, None) => Err(bad("no path or socket".into())),
+            (None, Some(socket)) => {
+                other(
+                    &["readonly", "cache", "uid", "gid"],
+                    "socket",
+                    "the daemon decides the mode, the cache and the ownership \
+                     (for virtiofsd: --readonly, --cache, --translate-uid, --translate-gid)",
+                )?;
+                let num_queues = match get("num_queues") {
+                    None => FsConfig::DEFAULT_NUM_QUEUES,
+                    Some(n) => n
+                        .parse()
+                        .map_err(|_| bad(format!("num_queues {n:?} is not a count")))?,
+                };
+                let queue_size = match get("queue_size") {
+                    None => FsConfig::DEFAULT_QUEUE_SIZE,
+                    Some(n) => n.parse().map_err(|_| {
+                        bad(format!(
+                            "queue_size {n:?} is not a power of two up to {}",
+                            FsConfig::MAX_QUEUE_SIZE
+                        ))
+                    })?,
+                };
+                let fs = FsConfig {
+                    tag: tag.to_string(),
+                    socket: PathBuf::from(socket),
+                    num_queues,
+                    queue_size,
+                };
+                fs.validate().map_err(bad)?;
+                Ok(Self::Socket(fs))
+            }
+            (Some(path), None) => {
+                other(
+                    &["num_queues", "queue_size"],
+                    "path",
+                    "hvi serves it on one request queue of its own size",
+                )?;
+                let mode = match get("readonly") {
+                    None | Some("off") => ShareMode::ReadWrite,
+                    Some("on") => ShareMode::ReadOnly,
+                    Some(v) => return Err(bad(format!("readonly {v:?} is not on or off"))),
+                };
+                let cache = match get("cache") {
+                    None | Some("auto") => CachePolicy::Auto,
+                    Some("always") => CachePolicy::Always,
+                    Some("none") => CachePolicy::None,
+                    Some(v) => return Err(bad(format!("cache {v:?} is not auto, always or none"))),
+                };
+                let id = |key: &str| -> Result<u32, String> {
+                    get(key).map_or(Ok(0), |v| {
+                        v.parse()
+                            .map_err(|_| bad(format!("{key} {v:?} is not a numeric id")))
+                    })
+                };
+                Ok(Self::Share(FsShare {
+                    path: PathBuf::from(path),
+                    tag: tag.to_string(),
+                    mode,
+                    cache,
+                    uid: id("uid")?,
+                    gid: id("gid")?,
+                }))
+            }
+        }
     }
+}
+
+/// Refuses exports the guest could not tell apart or use.
+///
+/// The tag is the whole of what a guest has to name an export by, so a
+/// duplicate makes one of the two unreachable, and which one depends on the
+/// order the guest probes its devices in. A request queue beyond the guest's
+/// `vcpus` has no vCPU to submit on it, which Cloud Hypervisor refuses too.
+///
+/// # Errors
+///
+/// Returns the tag when an export fails [`FsConfig::validate`], when two
+/// exports carry it, or when an export asks for more request queues than the
+/// guest has vCPUs.
+pub fn check_fs(exports: &[FsConfig], vcpus: u32) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(exports.len());
+    for export in exports {
+        export
+            .validate()
+            .map_err(|e| format!("virtio-fs {:?}: {e}", export.tag))?;
+        if !seen.insert(export.tag.as_str()) {
+            return Err(format!("duplicate virtio-fs tag {:?}", export.tag));
+        }
+        if export.num_queues > vcpus as usize {
+            return Err(format!(
+                "virtio-fs {:?}: num_queues={} is more than the guest's {vcpus} vCPU(s)",
+                export.tag, export.num_queues
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses two exports of the same host subtree that disagree on whether the
@@ -245,6 +404,9 @@ pub struct BootConfig {
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
     pub fs_shares: Vec<FsShare>,
+    /// virtio-fs exports served by vhost-user daemons the caller runs, one
+    /// device each. Only the Linux backends serve these, and only these.
+    pub fs: Vec<FsConfig>,
     pub net: bool,
     /// When set, virtio-net relays frames to this gvisor-tap-vsock gateway QEMU
     /// stream socket (real egress) instead of the built-in user-space stack.
@@ -384,7 +546,10 @@ impl std::error::Error for BootError {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, BootError, CachePolicy, FsShare, FsSpec, ShareMode};
+    use super::{
+        check_export_overlap, check_fs, BootError, CachePolicy, FsConfig, FsShare, FsSpec,
+        ShareMode,
+    };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
 
@@ -591,10 +756,36 @@ mod tests {
         assert_eq!(error.to_string(), "vcpu0: failed");
     }
 
+    /// Returns the socket export `spec` parses to.
+    fn socket(spec: &str) -> FsConfig {
+        match FsSpec::parse(spec).unwrap() {
+            FsSpec::Socket(fs) => fs,
+            other => panic!("{spec}: {other:?}"),
+        }
+    }
+
     /// Returns the directory export `spec` parses to.
     fn share(spec: &str) -> FsShare {
-        let FsSpec::Share(fs) = FsSpec::parse(spec).unwrap();
-        fs
+        match FsSpec::parse(spec).unwrap() {
+            FsSpec::Share(fs) => fs,
+            other => panic!("{spec}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fs_socket_takes_cloud_hypervisors_syntax_and_defaults() {
+        assert_eq!(
+            socket("tag=fs0,socket=/run/fs0.sock"),
+            FsConfig {
+                tag: "fs0".into(),
+                socket: PathBuf::from("/run/fs0.sock"),
+                num_queues: 1,
+                queue_size: 1024,
+            }
+        );
+        let fs = socket("socket=/s,queue_size=256,tag=t,num_queues=2");
+        assert_eq!((fs.num_queues, fs.queue_size), (2, 256));
+        assert_eq!(socket("tag=t,socket=/s,queue_size=32768").queue_size, 32768);
     }
 
     #[test]
@@ -631,10 +822,31 @@ mod tests {
             ("path=/p", "no tag"),
             ("tag=t", "no path"),
             ("tag=t,path=", "no path"),
+            ("tag=t,socket=", "no path or socket"),
+            (
+                "tag=t,path=/p,socket=/s",
+                "path and socket are two kinds of export",
+            ),
             ("tag=,path=/p", "the tag must be"),
             (tag37.as_str(), "the tag must be"),
             ("tag=t,path=/p,ro=on", "unknown key \"ro\""),
             ("tag=t,tag=u,path=/p", "tag given twice"),
+            ("tag=t,socket=/s,num_queues=0", "num_queues=0"),
+            ("tag=t,socket=/s,num_queues=x", "num_queues \"x\""),
+            ("tag=t,socket=/s,queue_size=1000", "queue_size=1000"),
+            ("tag=t,socket=/s,queue_size=65536", "queue_size \"65536\""),
+            (
+                "tag=t,socket=/s,uid=1000",
+                "uid does not apply to a socket export",
+            ),
+            (
+                "tag=t,socket=/s,readonly=on",
+                "readonly does not apply to a socket export",
+            ),
+            (
+                "tag=t,path=/p,num_queues=2",
+                "num_queues does not apply to a path export",
+            ),
             (
                 "tag=t,path=/p,readonly=yes",
                 "readonly \"yes\" is not on or off",
@@ -646,6 +858,62 @@ mod tests {
             let err = FsSpec::parse(spec).expect_err(spec);
             assert!(err.contains(why), "{spec}: {err}");
             assert!(err.contains(FsSpec::SYNTAX), "{spec}: {err}");
+        }
+    }
+
+    #[test]
+    fn two_exports_may_not_share_a_tag() {
+        let export = |tag: &str| socket(&format!("tag={tag},socket=/s"));
+        check_fs(&[export("a"), export("b")], 1).expect("distinct tags");
+        let err = check_fs(&[export("a"), export("a")], 1).expect_err("a duplicate tag");
+        assert!(err.contains("\"a\""), "{err}");
+    }
+
+    #[test]
+    fn an_export_may_not_have_more_queues_than_vcpus() {
+        let export = socket("tag=t,socket=/s,num_queues=4");
+        check_fs(std::slice::from_ref(&export), 4).expect("one queue per vCPU");
+        let err = check_fs(&[export], 2).expect_err("four queues on two vCPUs");
+        assert!(err.contains("num_queues=4"), "{err}");
+    }
+
+    // A library caller builds FsConfig without the parser. Two 40-byte tags
+    // that share their first 36 bytes would reach the guest as one tag twice.
+    #[test]
+    fn check_fs_refuses_what_the_parser_refuses() {
+        let good = socket("tag=t,socket=/s");
+        for (export, why) in [
+            (
+                FsConfig {
+                    tag: "t".repeat(40),
+                    ..good.clone()
+                },
+                "the tag must be",
+            ),
+            (
+                FsConfig {
+                    tag: "a\0b".into(),
+                    ..good.clone()
+                },
+                "the tag must be",
+            ),
+            (
+                FsConfig {
+                    num_queues: 0,
+                    ..good.clone()
+                },
+                "num_queues=0",
+            ),
+            (
+                FsConfig {
+                    queue_size: 1000,
+                    ..good.clone()
+                },
+                "queue_size=1000",
+            ),
+        ] {
+            let err = check_fs(&[export], 4).expect_err(why);
+            assert!(err.contains(why), "{err}");
         }
     }
 }

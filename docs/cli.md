@@ -47,6 +47,7 @@ including a typo, silently runs the plain test.
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
 | `--fs tag=<tag>,path=<dir>[,readonly=on\|off][,cache=auto\|always\|none][,uid=<n>][,gid=<n>]` | none | virtio-fs export of `<dir>`, which hvi serves itself. Writable unless `readonly=on`; `cache` defaults to `auto`; `uid` and `gid` are the guest owner of the host user's files, 0 by default. Repeatable. macOS only. |
+| `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. Cloud Hypervisor's syntax and defaults: one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable. Linux only. |
 | `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
 | `--fs-uid <N>`, `--fs-gid <N>` | 0 | Deprecated: `uid=` and `gid=` on every `--share-ro`/`--share-rw` export. An `--fs` export keeps its own. Each prints a note. No effect on Linux. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
@@ -85,8 +86,8 @@ hvi: boot needs --kernel <Image>
 ```
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
-`--fs-gid`, `--share-ro`, `--share-rw`, `--sandbox-id`, `--cpus`,
-`--dump-after`.
+`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`,
+`--cpus`, `--dump-after`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -102,6 +103,7 @@ are three behaviours, not two.
 | Flag | macOS | Linux arm64 | Linux x86-64 |
 | --- | --- | --- | --- |
 | `--fs path=`, `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
+| `--fs socket=` | **refused**, boot fails | acted on | acted on |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
@@ -109,7 +111,8 @@ are three behaviours, not two.
 
 Two of those errors appear **after** `booting <kernel> with <N> MiB ...` has
 printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` on macOS, and the shares on either Linux backend.
+`--net-tap` and `--fs socket=` on macOS, and `--fs path=`, `--share-ro` and
+`--share-rw` on either Linux backend.
 
 ```text
 booting Image with 512 MiB ...
@@ -133,6 +136,7 @@ An unopenable `--net-tap` fails the boot.
 hvi: boot needs --kernel <Image>
 hvi: virtio-fs tag must be 1..=36 bytes and contain no NUL
 hvi: duplicate virtio-fs tag "dup"
+hvi: virtio-fs export /path/to/missing: No such file or directory (os error 2)
 hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>

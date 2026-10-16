@@ -33,6 +33,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::ops::ControlFlow;
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
@@ -47,13 +48,15 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    GicLayout, GicVersion, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    place_virtio_fs, GicLayout, GicVersion, GIC_NUM_IRQS, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI,
+    VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE,
+    VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
@@ -112,19 +115,26 @@ struct Shared {
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     pl011: Arc<Mutex<Pl011>>,
+    /// One entry per virtio-fs export, in the order the exports were given.
+    fs: Arc<Vec<Export>>,
     /// Whoever is watching this guest, if anyone.
     plugin: Option<Arc<dyn Plugin>>,
 }
 
 /// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
+    // The Linux backends serve only exports a caller's vhost-user daemon
+    // serves. Starting a daemon is the caller's job, as it is for every other
+    // VMM.
     if let Some(share) = cfg.fs_shares.first() {
         return Err(format!(
-            "virtio-fs {:?}: hvi serves a directory on macOS only",
+            "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
+             virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
             share.tag
         )
         .into());
     }
+    crate::config::check_fs(&cfg.fs, cfg.vcpus.max(1))?;
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
@@ -252,6 +262,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         .agent_sock
         .as_ref()
         .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
+    // virtio-fs: one transport per export, each served by the caller's daemon.
+    let fs = vhost_user::attach(&cfg.fs, shared_ram.as_raw_fd(), |index| {
+        place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).map_err(std::io::Error::other)
+    })?;
+
     let has_blk = virtio.is_some();
     let has_net = net.is_some();
     let has_vsock = vsock.is_some();
@@ -259,7 +274,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         blk: has_blk,
         net: has_net,
         vsock: has_vsock,
-        fs_count: 0,
+        fs_count: fs.len(),
     };
 
     let emitter = Emitter::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
@@ -308,8 +323,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         vcpus.push(vcpu);
     }
 
-    // Number of SPIs (multiple of 32), then finalize the GIC.
-    let nr_irqs: u32 = 256;
+    // Number of SPIs (multiple of 32), then finalize the GIC. The layout
+    // checks its own interrupt placements against the same constant.
+    let nr_irqs: u32 = GIC_NUM_IRQS;
     set_gic_attr_u32(&gicfd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &nr_irqs)?;
     let init_attr = kvm_device_attr {
         flags: 0,
@@ -343,6 +359,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
+        fs: Arc::new(fs),
         plugin: cfg.plugin.clone(),
     };
 
@@ -355,11 +372,21 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         line(VIRTIO_NET_SPI),
         line(VIRTIO_VSOCK_SPI),
     );
+    for export in shared.fs.iter() {
+        lock_or_recover(&export.dev).connect_irq(line(export.irq));
+    }
+    // A vCPU in an export's reset waits on its daemon, where no kick reaches
+    // it. Ending the connections at the stop frees it.
+    let fs = Arc::clone(&shared.fs);
+    shared
+        .guest
+        .vcpus
+        .on_stop(move || vhost_user::shut_down(&fs));
 
     // The plugin attach, the seccomp arm and the I/O threads, in the order the
     // filters need. Each polls its stop token beside its own descriptor and is
     // joined after the vCPUs; `teardown` describes the stop.
-    let (filters, io_threads) = start_io_threads(
+    let (filters, mut io_threads) = start_io_threads(
         &cfg,
         &shared.guest,
         {
@@ -368,6 +395,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         },
         net_source,
     )?;
+    vhost_user::start_interrupt_threads(&shared.fs, &mut io_threads);
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_guest` returned it.
@@ -446,6 +474,8 @@ fn read_device(sh: &Shared, addr: u64) -> u64 {
         dev_read(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
+    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, false, 0)
     } else {
         0
     }
@@ -464,6 +494,8 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
         dev_write(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
+    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, true, val);
     }
 }
 

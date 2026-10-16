@@ -1,7 +1,8 @@
 # Disks and directory shares
 
 A guest gets storage two ways: one virtio-blk disk, and any number of
-virtio-fs directory shares on macOS.
+virtio-fs directory shares. A guest can have both at once, and either on its
+own.
 
 ## virtio-blk: `--disk <file>`
 
@@ -25,15 +26,24 @@ Every request emits a `block` record into the ledger when `--events` is set:
 `HVI_BLK_TRACE=1` also logs each request to stderr. It is off by default
 because it costs a synchronous write per request.
 
-## virtio-fs shares, macOS only
+## virtio-fs shares
 
-`--fs tag=<tag>,path=<dir>` exports a host directory to the guest over
-virtio-fs, in Cloud Hypervisor's comma-separated syntax. hvi answers the guest's
-FUSE requests itself. There is no macFUSE mount, no block image, no DAX window
-and no indirect descriptors. `--share-ro <dir> <tag>` and
-`--share-rw <dir> <tag>` are the old form, which still works and prints a note.
+virtio-fs exports a host directory to the guest. Who serves it depends on the
+host.
 
-The Linux backends do not carry the device at all.
+Every export is one `--fs`, in Cloud Hypervisor's comma-separated syntax.
+
+On **macOS** hvi answers the guest's FUSE requests itself, and
+`--fs tag=<tag>,path=<dir>` names the directory. There is no macFUSE mount, no
+block image, no DAX window and no indirect descriptors. `--share-ro <dir> <tag>`
+and `--share-rw <dir> <tag>` are the old form, which still works and prints a
+note.
+
+On **Linux** the caller runs a vhost-user daemon, such as `virtiofsd`, for each
+export, and passes its socket with `--fs tag=<tag>,socket=<socket>`. hvi is the
+virtio-mmio transport in front of it: the daemon maps guest RAM through the
+memfd that backs it and walks the virtqueues in its own process. See
+[Serving a Linux export](#serving-a-linux-export).
 
 ```sh
 hvi boot --kernel <Image> \
@@ -48,8 +58,9 @@ mount -t virtiofs code /mnt/code
 ```
 
 Each share becomes its own device, with its own access mode, cache policy and
-owner. Repeat the flag for more. An export takes `readonly=on|off` (off by
-default), `cache=auto|always|none` and `uid=`/`gid=`. A tag is 1 to 36 bytes, carries no NUL, and must be
+owner. Repeat the flag for more. On macOS an export takes `readonly=on|off`
+(off by default), `cache=auto|always|none` and `uid=`/`gid=`; on Linux those
+are the daemon's, and only `num_queues=` and `queue_size=` apply. A tag is 1 to 36 bytes, carries no NUL, and must be
 unique.
 
 Two shares may not cover the same host directory, or one the other's parent,
@@ -62,7 +73,7 @@ The check covers the shares of one hvi process. Two processes can export the
 same tree, or a tree and a directory inside it, with one export writable and the
 other read-only. Neither process refuses that. A guest on the writable share can
 then store an owner and a mode on a file, setuid and setgid included (see
-[Ownership](#ownership-uid-and-gid)), and the other guest's kernel
+[Ownership](#ownership-uid-and-gid-macos)), and the other guest's kernel
 honors them. Export one tree to two sandboxes only when each may change what the
 other runs.
 
@@ -121,7 +132,55 @@ to a writable share: at `dd bs=4k` it batched 65536 requests down to a few
 hundred and ran 2.4 times faster, and at `bs=1M` it ran 3.7 times slower,
 because the guest's writeback path then costs more than the requests it saves.
 
-### Ownership: `uid=` and `gid=`
+### Serving a Linux export
+
+On Linux an export is served by a vhost-user daemon the caller runs, such as
+`virtiofsd` from the virtio-fs project. hvi starts no daemon. It connects to the
+daemon's socket before the guest runs, and the pair speaks vhost-user: hvi sends
+the rings and the memfd that backs guest RAM, and the daemon maps that memory
+and answers the guest's FUSE requests in its own process. Cloud Hypervisor and
+QEMU split the work the same way, and libvirt, Kata and urunc start the daemon
+for them.
+
+```sh
+virtiofsd --socket-path=/run/hvi/fs0.sock --shared-dir /path/to/scratch \
+  --sandbox namespace --cache auto &
+hvi boot --kernel <bzImage> --fs tag=fs0,socket=/run/hvi/fs0.sock
+```
+
+`--fs` takes Cloud Hypervisor's syntax,
+`tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]`, with its
+defaults: one request queue and a queue size of 1024. An export may have at most
+one request queue per vCPU, and the daemon has to serve them all. virtiofsd
+serves one, so `num_queues` above 1 needs another daemon. The queue size is a
+power of two up to 32768.
+
+That is all hvi knows of an export. The directory, whether the guest may write
+it, the cache policy and the daemon's sandbox are all options of the daemon. So
+the Linux backends refuse a `path=` export, and the overlap rule above does not
+apply.
+
+A runtime can start the daemon and hvi at once, as urunc does for its other
+monitors. So hvi waits for the socket, up to 60 seconds, as Cloud Hypervisor
+does. It retries while the socket is missing or refuses the connection, and
+fails the boot on any other error at once. urunc's hvi backend does not attach
+shares yet.
+
+The guest can mount an export as its root, which is what a container boot
+does: `root=fs0 rw rootfstype=virtiofs` on the kernel command line, with no
+block device in the machine at all.
+
+Two things about this backend are worth knowing:
+
+- **Read-only is the daemon's.** vhost-user has no message that asks a daemon
+  what it refuses, so hvi cannot check the mode. virtiofsd takes `--readonly`
+  from 1.13, and an older one exits on the flag rather than serving the export
+  writable.
+- **No file-level events.** A request the daemon serves never crosses the VMM,
+  so the ledger records nothing for it. `--events` still carries the block and
+  network boundaries.
+
+### Ownership: `uid=` and `gid=` (macOS)
 
 The host user's files appear in the guest as `uid`:`gid` of their export. Both
 default to 0, so a workload running as root sees the host's files as root. A
@@ -139,7 +198,11 @@ cannot read or forge that attribute: `SETXATTR` on the prefix returns `EPERM`,
 Each export has its own pair, in `FsShare`. The deprecated `--fs-uid` and
 `--fs-gid` set the pair of every `--share-ro`/`--share-rw` export.
 
-### Containment
+On Linux the daemon decides ownership; virtiofsd 1.13 and newer translate ids
+with `--translate-uid` and `--translate-gid`. hvi refuses `uid=` and `gid=` on a
+`socket=` export, since it cannot apply them.
+
+### Containment (macOS)
 
 Resolution goes through the parent directory's descriptor with `O_NOFOLLOW` on
 each component, so containment follows from how the descriptor was obtained
@@ -168,12 +231,16 @@ tested, not as proven.
   The budget is the process file limit less a reserve of 128. `CREATE` and
   `TMPFILE` are not counted against it, and directory descriptors cached for
   readdir are not either, so several busy exports can still exhaust the table.
-- **One request queue per share**, plus a hiprio queue. No DAX window. The
+- **One request queue per share on macOS**, plus a hiprio queue. A Linux
+  export takes `num_queues=`. No DAX window. The
   device reports no shared memory region, and a guest built with `FUSE_DAX`
   binds the device without DAX.
 - The open file limit is raised when the **first share** is set up, not at
   startup, and only on macOS. A boot with no share never raises it and never
   logs the line.
+- The node table, the descriptor budget and the lock behaviour above are the
+  macOS device's. On Linux those belong to the daemon, and its own
+  documentation covers them.
 
 Each export reports its peak handle count on a clean stop:
 
@@ -188,6 +255,13 @@ directory tree, bounded by the export root and by the process's own
 permissions. Give a writable export a directory you can afford to lose. For a
 development workload, an instance-owned APFS clone is the right shape. For a
 shared cache that several guests read, use `readonly=on`.
+
+On Linux the daemon decides what the guest reaches, outside the VMM's seccomp
+filter. virtiofsd with `--readonly` answers `EROFS` to every mutation. With
+`--sandbox namespace` it gets its own mount and pid namespace, which needs
+`CAP_SYS_ADMIN`. With `--sandbox none` it keeps its own seccomp filter, but it
+has no mount namespace and no chroot. The bound is then its own path resolution
+within the shared directory, and it reaches whatever its user reaches.
 
 The macOS Seatbelt profile grants exactly one rule per export, by resolved
 root path: `file-read*` for a read-only share and `file-read* file-write*` for

@@ -69,18 +69,68 @@ pub const VIRTIO_VSOCK_SPI: u32 = 4;
 pub const VIRTIO_FS_BASE: u64 = 0x0d00_0600;
 pub const VIRTIO_FS_SPI: u32 = 5;
 
-/// Placement of the `index`th virtio-fs device. Each export gets an
-/// independent transport and interrupt because one virtio-fs device carries
-/// exactly one mount tag.
+/// Number of interrupts the guest's GIC is created with.
+///
+/// A multiple of 32, and the ceiling every SPI in this layout is checked
+/// against: INTID is `32 + spi`, so an export past it would be advertised in
+/// the devicetree and never delivered.
+pub const GIC_NUM_IRQS: u32 = 256;
+
+/// Returns the base of the `index`th virtio-fs device, or `None` on overflow.
+///
+/// Each export gets an independent transport and interrupt, because one
+/// virtio-fs device carries exactly one mount tag.
 #[must_use]
 pub fn virtio_fs_base(index: usize) -> Option<u64> {
     let offset = (index as u64).checked_mul(VIRTIO_SIZE)?;
     VIRTIO_FS_BASE.checked_add(offset)
 }
 
+/// Returns the interrupt of the `index`th virtio-fs device as a GIC SPI number,
+/// or `None` on overflow.
 #[must_use]
 pub fn virtio_fs_spi(index: usize) -> Option<u32> {
     VIRTIO_FS_SPI.checked_add(u32::try_from(index).ok()?)
+}
+
+/// Returns the base and the SPI of the `index`th virtio-fs device.
+///
+/// An export whose SPI is past the GIC's interrupts would get a devicetree
+/// entry for an interrupt the controller does not have, and the guest would
+/// mount a device that never raises one. `num_irqs` is that count, where the
+/// backend sets it.
+///
+/// # Errors
+///
+/// Returns why the device does not fit: it would overlap `gic`, run past
+/// [`DEVICE_WINDOW_END`], or take an interrupt at or past `num_irqs`.
+pub fn place_virtio_fs(
+    index: usize,
+    gic: &GicLayout,
+    num_irqs: Option<u32>,
+) -> Result<(u64, u32), String> {
+    let (Some(base), Some(spi)) = (virtio_fs_base(index), virtio_fs_spi(index)) else {
+        return Err(format!("virtio-fs device {index}: address overflow"));
+    };
+    let end = base
+        .checked_add(VIRTIO_SIZE)
+        .ok_or_else(|| format!("virtio-fs device {index}: address overflow"))?;
+    let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
+    if base < gic_end || end > DEVICE_WINDOW_END {
+        return Err(format!(
+            "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
+             between the GIC (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
+        ));
+    }
+    if let Some(num_irqs) = num_irqs {
+        if 32 + u64::from(spi) >= u64::from(num_irqs) {
+            return Err(format!(
+                "too many virtio-fs devices: device {index} would take SPI {spi}, \
+                 past the GIC's {num_irqs} interrupts"
+            ));
+        }
+    }
+    Ok((base, spi))
 }
 
 /// GICv3 placement, defaulting to the QEMU virt values.
@@ -382,20 +432,33 @@ mod tests {
     fn virtio_fs_windows_clear_a_large_gic() {
         // What `hv_gic` reports on this host: a 32 MiB redistributor region,
         // where QEMU virt would have 128 KiB per vCPU.
-        let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
+        let gic = GicLayout {
+            gicr_size: 0x0200_0000,
+            ..GicLayout::QEMU_VIRT
+        };
         assert!(
-            gic_end < VIRTIO_FS_BASE,
+            gic.gicr_base + gic.gicr_size < VIRTIO_FS_BASE,
             "the GIC ends below the fs windows"
         );
-        for index in 0..16 {
-            let base = virtio_fs_base(index).expect("a placement");
-            let end = base + VIRTIO_SIZE;
-            assert!(base >= gic_end, "fs {index} at {base:#x} runs into the GIC");
-            assert!(
-                end <= DEVICE_WINDOW_END,
-                "fs {index} escapes the device map"
-            );
-        }
+        // Every interrupt the KVM backend hands out has to exist in the GIC it
+        // creates, which is what GIC_NUM_IRQS is.
+        let fits = (0..)
+            .take_while(|&index| place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).is_ok())
+            .count();
+        let last = u32::try_from(fits - 1).unwrap();
+        assert_eq!(32 + VIRTIO_FS_SPI + last, GIC_NUM_IRQS - 1);
+        let err = place_virtio_fs(fits, &gic, Some(GIC_NUM_IRQS)).unwrap_err();
+        assert!(err.contains("too many virtio-fs devices"), "{err}");
+        // Without an interrupt count, only the device window bounds them.
+        assert!(place_virtio_fs(fits, &gic, None).is_ok());
+    }
+
+    // The GICv3 layout covers every vCPU's redistributor already, so the
+    // exports start right above it at the most vCPUs it takes.
+    #[test]
+    fn virtio_fs_fits_above_the_largest_gicv3() {
+        let gic = GicLayout::for_vcpus(GicVersion::V3, GicLayout::V3_MAX_CPUS).unwrap();
+        place_virtio_fs(0, &gic, Some(GIC_NUM_IRQS)).expect("an export");
     }
 
     // A ragged initrd range kills a guest that turns it into a

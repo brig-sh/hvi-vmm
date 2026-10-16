@@ -20,8 +20,9 @@
 //! first two at the top of its run loop, between guest entries. A vCPU thread
 //! that exits reports it and wakes the loop in
 //! [`run_to_stop`](crate::run::run_to_stop), which calls [`stop`](Vcpus::stop).
-//! The stop clears the running flag, kicks every vCPU out of the hypervisor and
-//! then releases the quiesce, so each one sees the stop at its next check.
+//! The stop clears the running flag, kicks every vCPU out of the hypervisor,
+//! runs the backend's stop hook and then releases the quiesce, so each one sees
+//! the stop at its next check.
 //!
 //! How a kick reaches a vCPU depends on the hypervisor, so [`Vcpus`] takes it
 //! from a [`Kick`] implementation that owns the table of vCPU threads.
@@ -78,6 +79,9 @@ pub(crate) struct Vcpus<K> {
     stop_handle: StopHandle,
     /// The [`Kick`] implementation that kicks the vCPUs.
     kicker: K,
+    /// What every stop runs after its kicks, in the order the backend added
+    /// them.
+    stop_hooks: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl<K: Kick> Vcpus<K> {
@@ -94,7 +98,19 @@ impl<K: Kick> Vcpus<K> {
             exited: AtomicU32::new(0),
             stop_handle: stop,
             kicker,
+            stop_hooks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Adds `hook` to what every [`stop`](Self::stop) runs after its kicks.
+    ///
+    /// It is for a vCPU that waits outside the hypervisor on something no
+    /// kick reaches, such as a vhost-user daemon that has not answered a
+    /// device reset. The hook must return at once, and it runs again on each
+    /// later stop.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn on_stop(&self, hook: impl Fn() + Send + Sync + 'static) {
+        lock_or_recover(&self.stop_hooks).push(Box::new(hook));
     }
 
     /// Returns the number of vCPUs.
@@ -181,9 +197,9 @@ impl<K: Kick> Vcpus<K> {
     /// Ends the VM.
     ///
     /// Clears the running flag, kicks every vCPU, including the ones waiting
-    /// for the guest to start them, and then releases the quiesce so no vCPU
-    /// stays parked at a checkpoint. Only the first call kicks; a later one
-    /// just releases the quiesce again.
+    /// for the guest to start them, runs the stop hooks, and then releases the
+    /// quiesce so no vCPU stays parked at a checkpoint. Only the first call
+    /// kicks; a later one runs the hooks and releases the quiesce again.
     pub(crate) fn stop(&self) {
         let was_running = self.running.swap(false, Ordering::SeqCst);
         // One round of kicks is enough. The kick reaches a vCPU that has not
@@ -192,6 +208,11 @@ impl<K: Kick> Vcpus<K> {
         if was_running {
             self.kicker.kick_all();
             self.kicker.kick_halted();
+        }
+        // A hook frees a vCPU that waits outside the hypervisor. The hooks run
+        // after the flag is cleared, so that vCPU reads the stop as it returns.
+        for hook in lock_or_recover(&self.stop_hooks).iter() {
+            hook();
         }
         // A vCPU parked at a checkpoint waits on a condition variable that no
         // kick ends. The release comes after the kicks, so the run it goes on
@@ -516,6 +537,23 @@ mod tests {
         assert!(!vcpus.is_running());
         assert_eq!(vcpus.kicker().all.load(Ordering::SeqCst), 1);
         assert_eq!(vcpus.kicker().halted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_runs_every_hook_on_every_call_after_the_flag_clears() {
+        let vcpus = Arc::new(test_vcpus(2, CountingKicker::default()));
+        let runs = Arc::new(AtomicU32::new(0));
+        for _ in 0..2 {
+            let (weak, runs) = (Arc::downgrade(&vcpus), Arc::clone(&runs));
+            vcpus.on_stop(move || {
+                let running = weak.upgrade().is_some_and(|v| v.is_running());
+                assert!(!running, "a hook ran before the flag cleared");
+                runs.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        vcpus.stop();
+        vcpus.stop();
+        assert_eq!(runs.load(Ordering::SeqCst), 4);
     }
 
     // A vCPU parked for a pause waits on a condition variable no kick ends, so

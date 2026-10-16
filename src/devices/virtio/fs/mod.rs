@@ -12,14 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! virtio-fs over MMIO, served by a FUSE server inside the VMM.
+//! virtio-fs over MMIO.
 //!
-//! `server` holds the device and answers the guest's FUSE requests against the
-//! exported host directories. The server holds a host descriptor for every
-//! handle the guest has open, so `fdlimit` raises the process's open-file limit
-//! and derives from it how many handles the guest may hold.
+//! On macOS a FUSE server inside the VMM serves the exports. `server` holds the
+//! device and answers the guest's FUSE requests against the exported host
+//! directories. The server holds a host descriptor for every handle the guest
+//! has open, so `fdlimit` raises the process's open-file limit and derives from
+//! it how many handles the guest may hold.
+//!
+//! On Linux a vhost-user daemon the caller runs, such as `virtiofsd`, serves
+//! each export. `vhost_user` holds the register file the guest talks to and
+//! hands the queues to the daemon.
 
+#[cfg(target_os = "macos")]
 pub mod fdlimit;
+#[cfg(target_os = "macos")]
 pub mod server;
+pub mod vhost_user;
 
+#[cfg(target_os = "macos")]
 pub use server::GuestIds;
