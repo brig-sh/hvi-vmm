@@ -1,0 +1,166 @@
+From 3fd3cba0e98a91cc0808b0a6bfc186396e6180bf Mon Sep 17 00:00:00 2001
+From: Panagiotis Moustafellos <pmoust@nofire.ai>
+Date: Fri, 16 Oct 2026 19:40:15 +0300
+Subject: [PATCH] clocksource: hvi-time: Tell user space about each migration
+
+A TCP connection the guest only reads from does not notice a move: the
+destination never sees a packet for it, so nothing resets it, and the
+guest waits a minute for its own timers. A user space agent can close
+those connections at once, but it has to learn of the move first.
+
+The restore work now sends a KOBJ_CHANGE uevent on the node's platform
+device, with HVI_TIME_EVENT=migrated and MIGRATIONS=<count>, after it
+counts a restore. A host-sleep publish sends none. The count is also
+in /sys/kernel/hvi_time/migrations, for an agent that polls instead of
+reading uevents; the snapshot file is unchanged.
+
+TIMER_OF_DECLARE leaves the node to the OF core, which makes the
+platform device; the sysfs initcall finds it and keeps the reference.
+
+Signed-off-by: Panagiotis Moustafellos <pmoust@nofire.ai>
+---
+ drivers/clocksource/hvi-time.c | 60 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/clocksource/hvi-time.c b/drivers/clocksource/hvi-time.c
+index f0344e79b..fc617c585 100644
+--- a/drivers/clocksource/hvi-time.c
++++ b/drivers/clocksource/hvi-time.c
+@@ -52,7 +52,9 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
++#include <linux/of_platform.h>
+ #include <linux/percpu.h>
++#include <linux/platform_device.h>
+ #include <linux/rcupdate.h>
+ #include <linux/sched_clock.h>
+ #include <linux/sysfs.h>
+@@ -128,6 +130,9 @@ static u32 hvi_time_handled_gen;
+ static u32 hvi_time_handled_sleeps;
+ static DEFINE_MUTEX(hvi_time_migrate_lock);
+ static DEFINE_PER_CPU(struct hvi_time_cpu, hvi_time_pcpu);
++static struct device_node *hvi_time_np __ro_after_init;
++/* The platform device of the node, for the migration uevent; NULL before */
++static struct device *hvi_time_dev;
+ 
+ /*
+  * The page is ordinary memory mapped cacheable, so the plain accessors
+@@ -241,6 +246,27 @@ static int hvi_time_disarm(struct clock_event_device *evt)
+ 	return 0;
+ }
+ 
++/*
++ * Tell user space the guest was restored: a KOBJ_CHANGE uevent on the
++ * node's platform device with HVI_TIME_EVENT=migrated and the count. Its
++ * TCP peers are on the old host's network, and a connection the guest only
++ * reads from waits for its timers unless something closes it.
++ */
++static void hvi_time_uevent_migrated(int migrations)
++{
++	struct device *dev = READ_ONCE(hvi_time_dev);
++	char count[24];
++	char *envp[] = { "HVI_TIME_EVENT=migrated", count, NULL };
++	int ret;
++
++	if (!dev)
++		return;
++	snprintf(count, sizeof(count), "MIGRATIONS=%d", migrations);
++	ret = kobject_uevent_env(&dev->kobj, KOBJ_CHANGE, envp);
++	if (ret)
++		pr_warn_ratelimited("migration uevent: %d\n", ret);
++}
++
+ /*
+  * Restore or host wake: the page has a new generation, possibly for another
+  * host's counter. Guest nanoseconds carry on, so MONOTONIC is continuous;
+@@ -258,6 +284,7 @@ static void hvi_time_migrate(struct work_struct *work)
+ 	struct timespec64 ts;
+ 	u64 target_ns;
+ 	u32 publishes, sleeps;
++	int migrations;
+ 	s64 delta;
+ 
+ 	mutex_lock(&hvi_time_migrate_lock);
+@@ -288,12 +315,15 @@ static void hvi_time_migrate(struct work_struct *work)
+ 	touch_all_softlockup_watchdogs();
+ 	clocksource_touch_watchdog();
+ 	rcu_cpu_stall_reset();
+-	atomic_add(publishes - sleeps, &hvi_time_migrations);
++	migrations = atomic_add_return(publishes - sleeps, &hvi_time_migrations);
+ 	atomic_add(sleeps, &hvi_time_host_sleeps);
+ 	mutex_unlock(&hvi_time_migrate_lock);
+ 
+ 	pr_info("generation %u: counter %u Hz, lpj %lu, wall clock moved %lld ns, downtime total %llu ns\n",
+ 		s.generation, s.freq, loops_per_jiffy, delta, s.downtime_ns);
++
++	if (publishes > sleeps)
++		hvi_time_uevent_migrated(migrations);
+ }
+ 
+ static DECLARE_WORK(hvi_time_migrate_work, hvi_time_migrate);
+@@ -500,6 +530,7 @@ static int __init hvi_time_of_init(struct device_node *np)
+ 	sched_clock_register(hvi_time_sched_clock_read, 64, NSEC_PER_SEC);
+ 	arm64_set_el0_counter(hvi_time_el0_counter, HVI_EL0_COUNTER_HZ);
+ 	hvi_time_active = true;
++	hvi_time_np = of_node_get(np);
+ 
+ 	pr_info("clocksource, sched_clock and clockevent at 1 GHz, now %llu ns\n",
+ 		hvi_time_read_ns());
+@@ -609,12 +640,20 @@ HVI_SNAP_ATTR(now_ns, "%llu", s.now_ns);
+ HVI_SNAP_ATTR(cntvct, "%llu", s.cntvct);
+ static struct kobj_attribute snapshot_attr = __ATTR_RO(snapshot);
+ 
++static ssize_t migrations_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", atomic_read(&hvi_time_migrations));
++}
++static struct kobj_attribute migrations_attr = __ATTR_RO(migrations);
++
+ static struct attribute *hvi_time_attrs[] = {
+ 	&generation_attr.attr,
+ 	&counter_freq_hz_attr.attr,
+ 	&now_ns_attr.attr,
+ 	&cntvct_attr.attr,
+ 	&snapshot_attr.attr,
++	&migrations_attr.attr,
+ 	NULL,
+ };
+ 
+@@ -624,6 +663,7 @@ static const struct attribute_group hvi_time_attr_group = {
+ 
+ static int __init hvi_time_sysfs_init(void)
+ {
++	struct platform_device *pdev;
+ 	struct kobject *kobj;
+ 	int ret;
+ 
+@@ -635,8 +675,22 @@ static int __init hvi_time_sysfs_init(void)
+ 		return -ENOMEM;
+ 
+ 	ret = sysfs_create_group(kobj, &hvi_time_attr_group);
+-	if (ret)
++	if (ret) {
+ 		kobject_put(kobj);
+-	return ret;
++		return ret;
++	}
++
++	/*
++	 * TIMER_OF_DECLARE does not claim the node, so the OF core made a
++	 * platform device for it. Keep the reference: the uevent needs it
++	 * for as long as the guest runs.
++	 */
++	pdev = of_find_device_by_node(hvi_time_np);
++	if (pdev)
++		WRITE_ONCE(hvi_time_dev, &pdev->dev);
++	else
++		pr_warn("%pOF: no platform device, no migration uevents\n",
++			hvi_time_np);
++	return 0;
+ }
+ late_initcall(hvi_time_sysfs_init);
+-- 
+2.39.5
+
