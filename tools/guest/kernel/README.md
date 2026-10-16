@@ -29,7 +29,11 @@ guest resumes on another host, so no gateway resets it, and it waits about
 a minute for its keepalive timer. On the patch 0005 uevent the agent
 destroys each TCP connection whose peer is off the guest, and its client
 connects again at once. The agent is `urunit-agent`, from urunc's
-`cmd/urunit-agent`, which the boot bundle's initrd carries.
+`cmd/urunit-agent`, which the boot bundle's initrd carries. The version
+that acts on the uevent is on urunc's branch
+`feat/agent-migration-tcp-reset` and in no published bundle yet; with the
+bundle's agent this Image keeps such a connection open as the four-patch
+one did.
 
 The series is out of tree: there is no devicetree binding document for
 `hvi,time-v1`. The binding is summarised in the header of `hvi-time.c` and in
