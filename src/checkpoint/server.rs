@@ -539,7 +539,29 @@ fn stream_and_reply<K: Kick>(
     // The connection closes when it is dropped; the shutdown says so to
     // the reader even if another handle on the socket outlives it.
     let _ = out.conn.shutdown(std::net::Shutdown::Both);
+    discard_unread(out.conn);
     Ok(Served::Closed)
+}
+
+/// Reads and drops what the client sent that was not read, without
+/// waiting, on a connection shut down both ways.
+///
+/// Linux resets the peer of a Unix socket closed with bytes left unread,
+/// so a client that sent a line behind its `migrate` would read
+/// `ECONNRESET` where the end of the stream was due. The shutdown already
+/// refuses the client's further writes, so what is queued now is all
+/// there is. macOS drops it at the shutdown.
+fn discard_unread(conn: &mut UnixStream) {
+    let mut sink = [0u8; 4096];
+    // A bound, should the queue somehow refill.
+    for _ in 0..1024 {
+        match conn.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Writes `response` and its newline to `conn`, waiting for room beside the
@@ -3383,6 +3405,7 @@ mod tests {
                 blk: disk.spec(),
                 base: Some("ab".repeat(32)),
                 write_log: Some(Arc::clone(&log) as Arc<dyn crate::memory::GuestWriteLog>),
+                noise_mib: 8,
                 stream: StreamLimits {
                     fail_in_pause: true,
                     ..StreamLimits::default()
@@ -3396,7 +3419,15 @@ mod tests {
                 b"{\"v\":1,\"op\":\"migrate\",\"then\":\"fence\",\"txid\":\"w\",\"epoch\":1}\n",
             )
             .unwrap();
-        // A request sent behind it is not served.
+        // A request sent once the stream has begun, which the server has
+        // stopped reading, waits in the socket's queue and is not served.
+        // The 8 MiB of noise hold the stream short of the pause until the
+        // rest is read, so the line is queued before the failure. Linux
+        // resets a client whose line was left unread at the close, and
+        // the read below would fail.
+        let mut first = String::new();
+        f.replies.read_line(&mut first).unwrap();
+        assert!(first.contains(r#""component""#), "{first}");
         f.client
             .write_all(b"{\"v\":1,\"op\":\"status\"}\n")
             .unwrap();
@@ -3406,7 +3437,7 @@ mod tests {
             "the end came {:?} after the request",
             ended_at - asked
         );
-        let text = String::from_utf8_lossy(&rest);
+        let text = format!("{first}{}", String::from_utf8_lossy(&rest));
         assert!(text.contains("disk-round-0"), "the stream began");
         assert!(
             !text.contains("disk-round-final"),
