@@ -250,9 +250,10 @@ The guest cannot keep time with the architected timer: its counter runs at
 the host's rate, and a guest moved from a Mac to a Pi would see it change
 from 24 MHz to 54 MHz. The profile gives it `hvi-time` instead
 (`devices/hvitime.rs`), and the portable guest kernel's `hvi,time-v1` driver
-(`drivers/clocksource/hvi-time.c`, Linux 6.12.95 plus four patches, in
+(`drivers/clocksource/hvi-time.c`, Linux 6.12.95 plus five patches, in
 [tools/guest/kernel](../tools/guest/kernel/README.md); the third is in
-[Restore](#restore), the fourth in [Host sleep](#host-sleep)) builds the
+[Restore](#restore), the fourth in [Host sleep](#host-sleep), the fifth in
+[Telling user space about a move](#telling-user-space-about-a-move)) builds the
 kernel's clocksource, `sched_clock` and per-CPU clock event on it, all at
 1 GHz.
 
@@ -470,8 +471,8 @@ before the fourth patch of the series counted a host-sleep publish in
 the bit. `tools/checkpoint-e2e.sh --portable --cpus 4` on rp2, three runs
 of each Image: the old one logged and counted the move 2, 3 and 3 times,
 the one with the third patch once each time. On the Mac one run of each
-counted 1: the recount is a race, and the Mac did not hit it. The current
-Image, with the fourth patch too, counted 1 in three runs at `--cpus 4` and
+counted 1: the recount is a race, and the Mac did not hit it. The four-patch
+Image counted 1 in three runs at `--cpus 4` and
 one at `--cpus 2` on rp1, and one run of each on the Mac, every check
 passing (hvi at `a586ec7`).
 
@@ -562,6 +563,72 @@ once. The Pi's wall clock moved 19 µs less than the 30 s: its REALTIME had
 run that far ahead of the host's on the counter since the boot. With the
 Image `4b2e8c5c…`, which lacks the fourth patch, the hook run on the Mac
 fails two checks: the snapshot has no `host_sleeps`, and `migrations=1`.
+
+### Telling user space about a move
+
+The fifth patch tells user space when the driver counts a restore. After
+the restore work adds to `migrations`, it sends a `KOBJ_CHANGE` uevent on
+the node's platform device (`/devices/platform/d100000.hvi-time`) with
+`HVI_TIME_EVENT=migrated` and `MIGRATIONS=<count>`. A host-sleep publish
+sends none. The count is also in `/sys/kernel/hvi_time/migrations`, for a
+reader that polls; `snapshot` and the other files are unchanged. The OF
+core makes the platform device, because `TIMER_OF_DECLARE` leaves the node
+to it; the sysfs initcall finds the device and keeps it. Without one the
+driver logs `no platform device, no migration uevents` and sends none.
+
+It is for TCP. A guest moved to another host keeps its address, but its
+connections to peers off the guest went through the old host's gateway,
+and the new one has never seen them. A connection the guest sends on is
+reset at once: the new gateway answers its next segment with a RST. A
+connection the guest only reads from, such as an API response stream,
+sends nothing, so nothing resets it, and it waits for its keepalive timer:
+Claude Code waited 61 to 64 s on its stream after each of six moves on
+2026-10-16. A new version of the guest agent, `urunit-agent` (urunc's
+`cmd/urunit-agent`, on its branch `feat/agent-migration-tcp-reset`, not
+yet published or in a boot bundle), reads the uevent and destroys each TCP
+socket in a state that expects its peer, with inet_diag `SOCK_DESTROY`. It
+leaves a socket whose peer is loopback, one of the guest's addresses or
+reached through an interface without the default route, and one that heard
+from its peer since the move. That needs `CONFIG_INET_DIAG_DESTROY`, which
+the fragment sets. The client's next call fails with `ECONNABORTED`, and it
+connects again from the new host. The agent logs one line per move in the
+kernel log, such as `urunit-agent: migration 1: closed 2 TCP connections to
+peers off the guest in 6ms`. Until a published bundle carries that agent,
+a guest that boots this Image keeps its connections open across a move as
+it did with the four-patch one.
+
+Measured on 2026-10-16, moving a teleportable `claude-code` session from
+the Mac to rp2 with a stand-in for an API stream in the guest: a Python
+reader with curl's keepalive (60 s idle, 60 s interval) on a connection to
+a server on rp1 that sends one line and then nothing for 120 s (600 s in
+the last two moves, which began later). The reader polls `generation`
+every 10 ms, and the time is from the poll that saw it change to the
+reader's error, on the guest's CLOCK_MONOTONIC, which stops while the
+guest is paused:
+
+| | Kernel, agent | Moves | The generation's change to the reader's error |
+| --- | --- | --- | --- |
+| Before | `e85e4338…`, the bundle's agent | 3 | 53.0, 52.4 and 21.1 s, `ECONNRESET` at the next keepalive, 60.6 to 124.5 s after the last data |
+| After | `77870036…`, the agent's first version | 4 | `ECONNABORTED` within that 10 ms poll each time (-5 to +2 ms from it). The agent logged `closed 1 TCP connections` in 2 to 3 ms |
+
+In the last two moves the reader also held a loopback connection open
+across the move, and it still carried a byte afterwards.
+The guest was paused 0.14 to 45.5 s in these moves, by hull's estimate.
+The long pauses are the destination delay that is still open on rp2; the
+reader's result did not depend on them.
+
+The reviewed version of the agent moved the same way between the Pis,
+rp2 to rp1 and back, with the server on rp1 and the same reader. After
+each move one command in the guest read `snapshot` and CLOCK_MONOTONIC
+together, which puts `base_ns` on the reader's clock: the restore sets
+`base_ns` to the guest's time at the capture, so it marks the resume with
+no poll in it, and the reader's poll saw the new generation 2 to 2.5 ms
+after it. The stream failed with `ECONNABORTED` 8.8 and 9.5 ms after
+`base_ns`. A connection the reader opened 2 to 3 ms after the resume was
+closed too: `tcp_info` times a socket's last packet in ticks, so the agent
+cannot tell a connection that new from one that last heard from its peer
+just before the pause, and closes both. A loopback connection still
+carried a byte after each move.
 
 ### Clock policy
 
@@ -691,14 +758,18 @@ No line has the guest ahead of the host. Each stamp is taken after the
 guest printed its line, so a correct clock reads at or before it, and the
 console path's latency makes the guest look further behind than it is.
 
-The current Image adds a third patch, which handles each page generation
-once (see [Restore](#restore)), and a fourth, which counts host-sleep
-publishes apart (see [Host sleep](#host-sleep)): sha256
+The four-patch Image adds a third patch, which handles each page
+generation once (see [Restore](#restore)), and a fourth, which counts
+host-sleep publishes apart (see [Host sleep](#host-sleep)): sha256
 `e85e4338feeb361c5329b4105fa3bda5cd72a235c9ae16c3c4ff94728b12aa1f`, Linux
-`6.12.95-00004-gc61d393fb996`. [tools/guest/kernel](../tools/guest/kernel/README.md)
-holds the series and how to build it. The 1-vCPU runs in the next section
-used `32725b9b…`, where the recount does not happen; the 2-vCPU moves at
-its end used the current Image.
+`6.12.95-00004-gc61d393fb996`. The current Image adds a fifth, the uevent
+of [Telling user space about a move](#telling-user-space-about-a-move):
+sha256 `778700360da1641466b5b9791a0fe231a52a20c4fb221e1b0e2cdf42730ed295`,
+Linux `6.12.95-00005-g3fd3cba0e98a`.
+[tools/guest/kernel](../tools/guest/kernel/README.md) holds the series and
+how to build it. The 1-vCPU runs in the next section used `32725b9b…`,
+where the recount does not happen; the 2-vCPU moves at its end used the
+four-patch Image.
 
 ## Measured results
 
@@ -856,7 +927,7 @@ on the Mac and 849 on the Pi, checkpoint request to resume reply 917 ms and
 
 **Moves with 2 vCPUs.** On 2026-10-14 the same script moved a 2-vCPU
 guest from this Mac to rp1 (a Pi 5 Model B, KVM) and back, with
-hvi at `a586ec7` built on each host, the current Image `e85e4338…`, the
+hvi at `a586ec7` built on each host, the four-patch Image `e85e4338…`, the
 same initramfs, `--cpus 2 --drift-secs 60`, over the LAN. Each way passed
 all 41 checks, `migrations=1` among them:
 
