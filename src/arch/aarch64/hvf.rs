@@ -39,9 +39,9 @@ use applevisor::prelude::{
 use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    place_virtio_fs, GicLayout, GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE,
-    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
-    VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    mpidr_affinity, place_virtio_fs, vcpu_index, GicLayout, GicVersion, DEVICE_WINDOW_END,
+    RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI,
+    VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
@@ -765,8 +765,9 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     };
     let _ = vcpu.set_trap_debug_exceptions(false);
     let _ = vcpu.set_trap_debug_reg_accesses(false);
-    // GICv3 affinity: aff0 = cpu id, RES1 bit 31 set.
-    let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, 0x8000_0000 | u64::from(cpu_id));
+    // The affinity the devicetree names this vCPU by, with RES1 bit 31 set.
+    let mpidr = 0x8000_0000 | u64::from(mpidr_affinity(cpu_id));
+    let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, mpidr);
     // Declared after the vCPU, so it drops first.
     let _registration = sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
 
@@ -972,15 +973,15 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> ControlFlow<Outcome> {
             let target = vcpu.get_reg(Reg::X1).unwrap_or(0);
             let entry = vcpu.get_reg(Reg::X2).unwrap_or(0);
             let ctx = vcpu.get_reg(Reg::X3).unwrap_or(0);
-            let idx = (target & 0xff) as usize; // aff0
             let secondaries = &sh.guest.vcpus.kicker().secondaries;
-            let ret = if idx != 0 && idx < secondaries.len() {
-                let sec = &secondaries[idx];
-                *sec.mbox.lock().unwrap() = Some((entry, ctx));
-                sec.cv.notify_all();
-                psci::SUCCESS
-            } else {
-                psci::NOT_SUPPORTED
+            let ret = match vcpu_index(target).map(|idx| idx as usize) {
+                Some(idx) if idx != 0 && idx < secondaries.len() => {
+                    let sec = &secondaries[idx];
+                    *sec.mbox.lock().unwrap() = Some((entry, ctx));
+                    sec.cv.notify_all();
+                    psci::SUCCESS
+                }
+                _ => psci::NOT_SUPPORTED,
             };
             let _ = vcpu.set_reg(Reg::X0, ret);
             ControlFlow::Continue(())

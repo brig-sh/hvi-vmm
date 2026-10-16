@@ -234,8 +234,12 @@ The `/apb-pclk` node is load-bearing rather than decorative: the PL011 node's
 `clocks` property points at it twice, and the `amba-pl011` driver needs that
 to bind.
 
-`enable-method = "psci"` is emitted on the cpu nodes only when there is more
-than one vCPU.
+Each cpu node's `reg` is the vCPU's MPIDR affinity, numbered the way KVM resets
+it: the index's low four bits in Aff0 and the next eight in Aff1, so vCPU 16 is
+`cpu@100`. The guest's PSCI `CPU_ON` names its target by that value. The KVM
+backend checks at boot that KVM gave each vCPU that affinity, and the macOS
+backend writes it into each vCPU's `MPIDR_EL1`. `enable-method = "psci"` is
+emitted on the cpu nodes only when there is more than one vCPU.
 
 The DTB's own length feeds initrd placement, so `LoadedKernel::plan` builds it
 twice: once against a provisional `0x4000` slot, then again at the settled

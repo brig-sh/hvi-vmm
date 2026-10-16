@@ -28,8 +28,8 @@
 use vm_fdt::{Error, FdtWriter};
 
 use crate::arch::aarch64::layout::{
-    virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, GuestLayout, UART_BASE, UART_SIZE,
-    UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
+    mpidr_affinity, virtio_fs_base, virtio_fs_spi, GicLayout, GicVersion, GuestLayout, UART_BASE,
+    UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI,
     VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 
@@ -126,10 +126,11 @@ pub fn build(
     fdt.property_u32("#address-cells", 1)?;
     fdt.property_u32("#size-cells", 0)?;
     for cpu in 0..num_cpus {
-        let cpu_node = fdt.begin_node(&format!("cpu@{cpu:x}"))?;
+        let affinity = mpidr_affinity(cpu);
+        let cpu_node = fdt.begin_node(&format!("cpu@{affinity:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
-        fdt.property_u32("reg", cpu)?;
+        fdt.property_u32("reg", affinity)?;
         if num_cpus > 1 {
             // Secondaries are brought up via PSCI CPU_ON.
             fdt.property_string("enable-method", "psci")?;
@@ -326,6 +327,34 @@ pub(crate) mod tests {
     /// is enough to tell the two `compatible` strings apart.
     fn contains(blob: &[u8], needle: &str) -> bool {
         blob.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    // From the 17th vCPU on, the index and the affinity differ, and the guest's
+    // CPU_ON names its target by the node's `reg`.
+    #[test]
+    fn cpu_nodes_carry_the_mpidr_affinity() {
+        let blob = build(
+            &sample_layout(0),
+            &GicLayout::for_vcpus(GicVersion::V3, 17).unwrap(),
+            17,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+            KASLR_SEED,
+        )
+        .unwrap();
+        assert_eq!(
+            prop(&blob, "cpu@f", "reg"),
+            Some(0xf_u32.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            prop(&blob, "cpu@100", "reg"),
+            Some(0x100_u32.to_be_bytes().to_vec())
+        );
+        assert!(
+            !contains(&blob, "cpu@10\0"),
+            "vCPU 16 is named by its index"
+        );
     }
 
     #[test]
