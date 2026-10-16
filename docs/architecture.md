@@ -217,7 +217,8 @@ PSCI with `method = "hvc"`, the interrupt controller the backend chose
 (`arm,gic-v3`, or `arm,cortex-a15-gic` for the compatible QEMU virt advertises
 for its vGICv2), the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock,
 the PL011 console as `stdout-path`, and one `virtio_mmio@…` node per backed
-device.
+device. The timer node is marked `always-on`, because the hypervisor keeps each
+vCPU's timer while the vCPU is out of the guest.
 
 `/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
 every boot. Under HVF it is the guest's only entropy source at boot, since the
