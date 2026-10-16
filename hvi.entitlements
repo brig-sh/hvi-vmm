@@ -5,6 +5,9 @@
 	<!-- Required for any Hypervisor.framework use (hv_vm_create et al). -->
 	<key>com.apple.security.hypervisor</key>
 	<true/>
+	<!-- get-task-allow is left out, so AMFI writes no core file for hvi. A
+	     core file of hvi would hold all of guest RAM, since macOS cannot leave
+	     a mapping out of one. -->
 	<!-- Not needed: virtio-net runs a user-space stack, a gvisor-tap relay or a
 	     Linux tap, none of which touches vmnet. Uncomment only for a vmnet
 	     backend, which would also need a Developer ID signature.

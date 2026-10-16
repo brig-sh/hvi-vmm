@@ -234,7 +234,18 @@ hvi puts the terminal into raw mode when stdin is a TTY and restores it when the
 boot returns. The restore discards input the guest did not read. hvi also
 restores the terminal when any other signal ends the process, such as a crash,
 an abort, a syscall the seccomp filter refuses or `SIGQUIT`. The process then
-ends by that signal, with a core dump where that signal's default makes one.
+ends by that signal, with a core dump where that signal's default makes one and
+the core size limit (`ulimit -c`) allows it.
+
+On Linux the core dump leaves out guest RAM. It can still hold data a device
+copied out of guest RAM into hvi's own buffers, such as disk blocks and network
+frames. On macOS a binary signed without `get-task-allow` writes no core dump,
+and `hvi.entitlements` does not grant that entitlement. A build that carries it
+writes a core dump holding all of guest RAM when it runs with `--no-sandbox` or
+crashes before it enters the sandbox. Once hvi has entered the sandbox, the
+sandbox refuses the write. A crash still leaves a report with each thread's
+stack in `~/Library/Logs/DiagnosticReports`, or in
+`/Library/Logs/DiagnosticReports` for hvi run as root.
 
 CAUTION: `SIGKILL` cannot be handled. If hvi is killed with it, the terminal is
 left in raw mode. Run `stty sane` or `reset` to recover it.

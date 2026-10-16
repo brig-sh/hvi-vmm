@@ -350,6 +350,14 @@ An ad-hoc signature is enough, with SIP enabled and with no terminal session.
 Re-sign after every build. See
 [first-boot.md](first-boot.md#2-sign-on-macos-only).
 
+A core file of a process that links hvi holds all of guest RAM, since macOS
+cannot leave a mapping out of one. AMFI writes no core file for a binary without
+`com.apple.security.get-task-allow`, so make sure the signed binary does not
+carry it. Xcode adds it to a Debug build, and
+`codesign -d --entitlements - <binary>` lists what a binary carries. With it,
+the sandbox refuses the write only once a run has entered the sandbox, and never
+under `sandbox: false`.
+
 ## See also
 
 - [plugins.md](plugins.md) for the extension seam.

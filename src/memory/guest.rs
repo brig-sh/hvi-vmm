@@ -36,6 +36,9 @@ impl RamRegion {
     ///
     /// The file's length is read from the descriptor, so a region past the end
     /// of the object is refused here; mapped, it would fault on first access.
+    /// On Linux the mapping is marked `MADV_DONTDUMP` and left out of core
+    /// files, since guest RAM holds the guest's data and is most of the
+    /// process's memory.
     fn map(self, file: &Arc<File>, prot: i32) -> io::Result<Arc<GuestRegionMmap>> {
         if self.size == 0 {
             return Err(io::Error::new(
@@ -80,6 +83,21 @@ impl RamRegion {
             libc::MAP_NORESERVE | libc::MAP_SHARED,
         )
         .map_err(io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: the range is the mapping just made, and `MADV_DONTDUMP`
+            // changes none of its bytes.
+            if unsafe { libc::madvise(mapping.as_ptr().cast(), size, libc::MADV_DONTDUMP) } != 0 {
+                let e = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "leaving guest RAM region {:#x}+{:#x} out of core files: {e}",
+                        self.gpa, self.size
+                    ),
+                ));
+            }
+        }
         GuestRegionMmap::new(mapping, GuestAddress(self.gpa))
             .map(Arc::new)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guest RAM region wraps"))
@@ -444,6 +462,27 @@ mod tests {
     use super::*;
 
     const ALIGN: usize = RamRegion::ALIGN as usize;
+
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This test reads the
+    // process's own `/proc/self/smaps`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn guest_ram_is_left_out_of_core_files() {
+        let shared = SharedRam::new(ALIGN).expect("an aligned region of guest RAM should allocate");
+        let ram = GuestRam::new(&shared, &[shared.region_at(0)])
+            .expect("guest RAM should map over the region");
+        let start = ram.host_ptr(0, 1).unwrap() as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let header = format!("{start:x}-");
+        let flags = smaps
+            .lines()
+            .skip_while(|line| !line.starts_with(&header))
+            .find(|line| line.starts_with("VmFlags:"))
+            .expect("guest RAM should be in smaps with its flags");
+        assert!(flags.split_whitespace().any(|flag| flag == "dd"), "{flags}");
+    }
 
     #[test]
     fn read_write_roundtrip_and_bounds() {
