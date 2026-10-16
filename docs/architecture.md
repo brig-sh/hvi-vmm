@@ -89,9 +89,8 @@ or `Requested`.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
-Two settings a caller supplies are not in `BootConfig`: the guest file ownership
-(`devices::virtio::fs::set_guest_ids`, process-global) and the `HVI_*`
-environment variables. See
+One setting a caller supplies is not in `BootConfig`: the `HVI_*` environment
+variables. See
 [embedding.md](embedding.md#configuration-outside-bootconfig).
 
 ## 2. Guest memory

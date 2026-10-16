@@ -518,12 +518,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         fs.push(SharedFs {
             base,
             intid: 32 + spi,
-            dev: Arc::new(Mutex::new(VirtioFs::new(
-                root,
-                &share.tag,
-                share.mode.writable(),
-                share.cache,
-            )?)),
+            dev: Arc::new(Mutex::new({
+                let mut dev = VirtioFs::new(root, &share.tag, share.mode.writable(), share.cache)?;
+                dev.set_guest_ids(server::GuestIds {
+                    uid: share.uid,
+                    gid: share.gid,
+                });
+                dev
+            })),
             wake: Arc::new(FsWake::new()),
         });
     }

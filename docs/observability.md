@@ -132,12 +132,12 @@ The default confinement denies it:
 
 Two destinations work:
 
-- A path inside a `--share-rw` directory, which the Seatbelt profile grants.
+- A path inside a writable `--fs path=` directory, which the Seatbelt profile grants.
 - Anywhere, with `--no-sandbox`.
 
 ```sh
 # Keeps confinement on.
-hvi boot --kernel <Image> --share-rw ./dumps out \
+hvi boot --kernel <Image> --fs tag=out,path=./dumps \
          --dump-memory ./dumps/guest.ram --dump-after 30
 ```
 

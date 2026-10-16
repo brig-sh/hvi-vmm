@@ -76,18 +76,15 @@ chmod +x "$WORK/root/busybox" "$WORK/root/init"
 (cd "$WORK/root" && find . | cpio -o -H newc 2>/dev/null) > "$WORK/initrd"
 
 SHARE_OPT=""
-[ -n "$CACHE" ] && SHARE_OPT="cache=$CACHE"
+[ -n "$CACHE" ] && SHARE_OPT=",cache=$CACHE"
 
 echo "# hvi      : $HVI"
 echo "# workload : $WORKLOAD"
 echo "# tree     : $TREE"
 echo "# cache    : ${CACHE:-auto (default)}"
 
-# Empty-string args would become a stray argv entry, so build the command up
-# rather than interpolating a possibly-empty SHARE_OPT.
 set -- boot --kernel "$KERNEL" --initramfs "$WORK/initrd" \
-	--share-rw "$TREE" bench
-[ -n "$SHARE_OPT" ] && set -- "$@" "$SHARE_OPT"
+	--fs "tag=bench,path=$TREE$SHARE_OPT"
 set -- "$@" --cmdline "rdinit=/init console=ttyAMA0 panic=1" \
 	--mem-mib "$MEM_MIB" --cpus "$CPUS"
 

@@ -46,10 +46,9 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | One virtio-blk backing file. A failure to open fails the boot. |
-| `--share-ro <dir> <tag> [cache=…]` | none | Read-only virtio-fs share. Repeatable. macOS only. |
-| `--share-rw <dir> <tag> [cache=…]` | none | Read-write virtio-fs share. Repeatable. macOS only. |
-| `--fs-uid <N>` | 0 | Guest uid the host's files belong to. macOS only. |
-| `--fs-gid <N>` | 0 | Guest gid the host's files belong to. macOS only. |
+| `--fs tag=<tag>,path=<dir>[,readonly=on\|off][,cache=auto\|always\|none][,uid=<n>][,gid=<n>]` | none | virtio-fs export of `<dir>`, which hvi serves itself. Writable unless `readonly=on`; `cache` defaults to `auto`; `uid` and `gid` are the guest owner of the host user's files, 0 by default. Repeatable. macOS only. |
+| `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
+| `--fs-uid <N>`, `--fs-gid <N>` | 0 | Deprecated: `uid=` and `gid=` on every `--share-ro`/`--share-rw` export. An `--fs` export keeps its own. Each prints a note. No effect on Linux. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
@@ -66,7 +65,7 @@ including a typo, silently runs the plain test.
 
 Three things about the parser are worth knowing, because none of them warns.
 
-**Repeating a flag is last-wins.** Only `--share-ro` and `--share-rw`
+**Repeating a flag is last-wins.** Only `--fs`, `--share-ro` and `--share-rw`
 accumulate. A second `--disk` replaces the first.
 
 **A value-taking flag at the end of the line silently takes none.** These
@@ -102,8 +101,8 @@ are three behaviours, not two.
 
 | Flag | macOS | Linux arm64 | Linux x86-64 |
 | --- | --- | --- | --- |
-| `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
-| `--fs-uid`, `--fs-gid` | acted on | **ignored silently** | **ignored silently** |
+| `--fs path=`, `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
+| `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | everything else | acted on | acted on | acted on |

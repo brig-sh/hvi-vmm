@@ -555,7 +555,7 @@ jobs:
             "Listening on port 8123" \
             -- ./target/release/hvi boot \
             --kernel guest-httpreply/unikraft/bin/kernel --mem-mib 256 \
-            --net-stub --share-ro share-probe probe --cmdline httpreply
+            --net-stub --fs tag=probe,path=share-probe,readonly=on --cmdline httpreply
           tail -25 unikraft.log
           grep -aq "Powered by" unikraft.log \
             || { echo "::error::the Unikraft guest did not reach its banner"; exit 1; }

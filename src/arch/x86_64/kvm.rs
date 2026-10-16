@@ -190,10 +190,12 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    if !cfg.fs_shares.is_empty() {
-        return Err(
-            "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
-        );
+    if let Some(share) = cfg.fs_shares.first() {
+        return Err(format!(
+            "virtio-fs {:?}: hvi serves a directory on macOS only",
+            share.tag
+        )
+        .into());
     }
     let num_cpus = cfg.vcpus.max(1);
     if num_cpus > MAX_VCPUS {

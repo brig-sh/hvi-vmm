@@ -118,10 +118,12 @@ struct Shared {
 
 /// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    if !cfg.fs_shares.is_empty() {
-        return Err(
-            "--share-ro/--share-rw are currently implemented by the macOS HVI backend only".into(),
-        );
+    if let Some(share) = cfg.fs_shares.first() {
+        return Err(format!(
+            "virtio-fs {:?}: hvi serves a directory on macOS only",
+            share.tag
+        )
+        .into());
     }
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the

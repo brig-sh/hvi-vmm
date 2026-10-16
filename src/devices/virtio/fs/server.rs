@@ -1142,6 +1142,8 @@ pub struct VirtioFs {
     root: PathBuf,
     writable: bool,
     cache_policy: CachePolicy,
+    /// The guest identity the host user's files carry in this export.
+    ids: GuestIds,
     tag: [u8; TAG_LEN],
     status: u32,
     dev_feat_sel: u32,
@@ -1344,6 +1346,7 @@ impl VirtioFs {
             queues: std::array::from_fn(|_| Queue::default()),
             interrupt_status: 0,
             irq: Irq::default(),
+            ids: GuestIds::default(),
             notified: AtomicU32::new(0),
             nodes,
             inode_ids,
@@ -1487,6 +1490,12 @@ impl VirtioFs {
     /// Connects the device to the interrupt line it raises.
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
+    }
+
+    /// Sets the guest identity the host user's files carry in this export.
+    /// Call it before the device is served.
+    pub fn set_guest_ids(&mut self, ids: GuestIds) {
+        self.ids = ids;
     }
 
     /// Sets the interrupt line to the device's level.
@@ -2288,7 +2297,7 @@ impl VirtioFs {
                     let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
                     Stat::at(dirfd.as_fd(), name)?
                 };
-                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta);
+                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids);
                 if valid & FATTR_UID != 0 {
                     guest.uid = uid;
                 }
@@ -2300,12 +2309,12 @@ impl VirtioFs {
             #[cfg(target_os = "linux")]
             {
                 let host_uid = if valid & FATTR_UID != 0 {
-                    Some(guest_uid_to_host(uid))
+                    Some(guest_uid_to_host(uid, self.ids))
                 } else {
                     None
                 };
                 let host_gid = if valid & FATTR_GID != 0 {
-                    Some(guest_gid_to_host(gid))
+                    Some(guest_gid_to_host(gid, self.ids))
                 } else {
                     None
                 };
@@ -2327,7 +2336,7 @@ impl VirtioFs {
             let mut new_mode = if valid & FATTR_MODE != 0 {
                 mode & 0o7777
             } else {
-                guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta).mode & 0o7777
+                guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids).mode & 0o7777
             };
             if valid & FATTR_KILL_SUIDGID != 0 {
                 new_mode &= !0o6000;
@@ -2357,7 +2366,7 @@ impl VirtioFs {
                         chmod_at(dirfd.as_fd(), name, host_mode)?;
                     }
                 }
-                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta);
+                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids);
                 guest.mode = (current_meta.mode() & S_IFMT) | new_mode;
                 set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
             }
@@ -2744,7 +2753,7 @@ impl VirtioFs {
             initialize_guest_metadata(dirfd, &name, mode, context)?;
         }
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-            clear_suid_sgid(&path, &file)?;
+            clear_suid_sgid(&path, &file, self.ids)?;
         }
         let meta = Stat::of_file(&file)?;
         let node = self.node_for(path.clone(), &meta);
@@ -2896,7 +2905,7 @@ impl VirtioFs {
                 }
             };
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-                clear_suid_sgid(&path, &file)?;
+                clear_suid_sgid(&path, &file, self.ids)?;
                 self.invalidate_guest_attr(node);
             }
             // The access mode, like CREATE above and the orphan path below.
@@ -2954,7 +2963,7 @@ impl VirtioFs {
             file.set_len(0).map_err(io_errno)?;
         }
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-            clear_suid_sgid(&path, &file)?;
+            clear_suid_sgid(&path, &file, self.ids)?;
             self.invalidate_guest_attr(node);
         }
         // The attributes come from the descriptor, after any bits the open
@@ -3026,7 +3035,7 @@ impl VirtioFs {
             .map_err(io_errno)?;
         if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
-            clear_suid_sgid(&handle.path, &handle.file)?;
+            clear_suid_sgid(&handle.path, &handle.file, self.ids)?;
             self.invalidate_guest_attr(node);
         }
         let mut out = Vec::with_capacity(8);
@@ -3150,7 +3159,7 @@ impl VirtioFs {
         self.note_zero_copy_write();
         if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
             if let Some(handle) = self.handles.get(&fh) {
-                if let Err(errno) = clear_suid_sgid(&handle.path, &handle.file) {
+                if let Err(errno) = clear_suid_sgid(&handle.path, &handle.file, self.ids) {
                     return Some(Reply::Buffered(error_response(unique, errno)));
                 }
             }
@@ -4886,8 +4895,8 @@ impl VirtioFs {
         let _ = (node, path);
         GuestAttr {
             mode: meta.mode(),
-            uid: host_uid_to_guest(meta.uid()),
-            gid: host_gid_to_guest(meta.gid()),
+            uid: host_uid_to_guest(meta.uid(), self.ids),
+            gid: host_gid_to_guest(meta.gid(), self.ids),
         }
     }
 
@@ -6152,11 +6161,11 @@ fn initialize_guest_metadata(
 }
 
 #[cfg(target_os = "macos")]
-fn clear_suid_sgid(_path: &Path, file: &File) -> Result<(), i32> {
+fn clear_suid_sgid(_path: &Path, file: &File, ids: GuestIds) -> Result<(), i32> {
     // The open file is the entry, so its own descriptor answers this without
     // naming anything.
     let meta = Stat::of_file(file)?;
-    let mut guest = guest_attr(Some(file.as_fd()), &meta);
+    let mut guest = guest_attr(Some(file.as_fd()), &meta, ids);
     if guest.mode & 0o6000 != 0 {
         guest.mode &= !0o6000;
         set_guest_attr(file.as_fd(), guest)?;
@@ -6165,7 +6174,7 @@ fn clear_suid_sgid(_path: &Path, file: &File) -> Result<(), i32> {
 }
 
 #[cfg(target_os = "linux")]
-fn clear_suid_sgid(_path: &Path, file: &File) -> Result<(), i32> {
+fn clear_suid_sgid(_path: &Path, file: &File, _ids: GuestIds) -> Result<(), i32> {
     let mode = Stat::of_file(file)?.mode() & 0o7777;
     if mode & 0o6000 != 0 {
         file.set_permissions(Permissions::from_mode(mode & !0o6000))
@@ -6238,7 +6247,7 @@ fn decode_guest_attr(value: &[u8]) -> Option<GuestAttr> {
     })
 }
 
-fn guest_attr(fd: Option<BorrowedFd<'_>>, meta: &Stat) -> GuestAttr {
+fn guest_attr(fd: Option<BorrowedFd<'_>>, meta: &Stat, ids: GuestIds) -> GuestAttr {
     #[cfg(target_os = "macos")]
     if let Some(fd) = fd {
         if let Some(mut guest) = stored_guest_attr(fd) {
@@ -6249,8 +6258,8 @@ fn guest_attr(fd: Option<BorrowedFd<'_>>, meta: &Stat) -> GuestAttr {
 
     GuestAttr {
         mode: meta.mode(),
-        uid: host_uid_to_guest(meta.uid()),
-        gid: host_gid_to_guest(meta.gid()),
+        uid: host_uid_to_guest(meta.uid(), ids),
+        gid: host_gid_to_guest(meta.gid(), ids),
     }
 }
 
@@ -6259,8 +6268,8 @@ fn path_cstring(path: &Path) -> Result<CString, i32> {
 }
 
 #[cfg(target_os = "linux")]
-fn guest_uid_to_host(uid: u32) -> libc::uid_t {
-    if uid == guest_uid() {
+fn guest_uid_to_host(uid: u32, ids: GuestIds) -> libc::uid_t {
+    if uid == ids.uid {
         unsafe { libc::geteuid() }
     } else {
         uid
@@ -6268,15 +6277,15 @@ fn guest_uid_to_host(uid: u32) -> libc::uid_t {
 }
 
 #[cfg(target_os = "linux")]
-fn guest_gid_to_host(gid: u32) -> libc::gid_t {
-    if gid == guest_gid() {
+fn guest_gid_to_host(gid: u32, ids: GuestIds) -> libc::gid_t {
+    if gid == ids.gid {
         unsafe { libc::getegid() }
     } else {
         gid
     }
 }
 
-/// The guest-side identity the host user is presented as.
+/// The guest-side identity the host user is presented as, in one export.
 ///
 /// Everything the host user owns appears inside the guest as this uid/gid, and
 /// the guest writing as it maps back. Zero -- the default -- makes the person
@@ -6289,34 +6298,25 @@ fn guest_gid_to_host(gid: u32) -> libc::gid_t {
 /// reaches this file server -- so the failure is a bare EACCES with nothing
 /// pointing at the mapping that caused it. Point these at the uid the workload
 /// runs as and the files belong to it.
-static GUEST_UID: AtomicU32 = AtomicU32::new(0);
-static GUEST_GID: AtomicU32 = AtomicU32::new(0);
-
-/// Sets the identity above. Call once, before the device is served.
-pub fn set_guest_ids(uid: u32, gid: u32) {
-    GUEST_UID.store(uid, Ordering::Relaxed);
-    GUEST_GID.store(gid, Ordering::Relaxed);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuestIds {
+    /// The guest uid the host user's files belong to.
+    pub uid: u32,
+    /// The guest gid the host user's files belong to.
+    pub gid: u32,
 }
 
-fn guest_uid() -> u32 {
-    GUEST_UID.load(Ordering::Relaxed)
-}
-
-fn guest_gid() -> u32 {
-    GUEST_GID.load(Ordering::Relaxed)
-}
-
-fn host_uid_to_guest(uid: u32) -> u32 {
+fn host_uid_to_guest(uid: u32, ids: GuestIds) -> u32 {
     if uid == unsafe { libc::geteuid() } {
-        guest_uid()
+        ids.uid
     } else {
         uid
     }
 }
 
-fn host_gid_to_guest(gid: u32) -> u32 {
+fn host_gid_to_guest(gid: u32, ids: GuestIds) -> u32 {
     if gid == unsafe { libc::getegid() } {
-        guest_gid()
+        ids.gid
     } else {
         gid
     }
@@ -9420,6 +9420,27 @@ mod tests {
         assert_eq!(get_u64(&out, OUT_HEADER_LEN), Some(issue_node));
         assert_eq!(fs::read(dir.join("etc/banner")).unwrap(), b"hello\n");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // The identity used to be one per process, so two exports could not give
+    // the host user's files two different owners.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn each_export_reports_the_host_users_files_as_its_own_guest_ids() {
+        let (_mapped_dir, mut mapped) = fixture_with_access(true);
+        mapped.set_guest_ids(GuestIds {
+            uid: 1000,
+            gid: 100,
+        });
+        let (_default_dir, mut default) = fixture_with_access(true);
+        for (dev, ids) in [(&mut mapped, (1000, 100)), (&mut default, (0, 0))] {
+            let etc = lookup_node(dev, FUSE_ROOT_ID, b"etc");
+            let issue = lookup_node(dev, etc, b"issue");
+            let out = dev.handle_fuse(&request(GETATTR, issue, &[0u8; 16]), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0));
+            assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 68), Some(ids.0), "uid");
+            assert_eq!(get_u32(&out, OUT_HEADER_LEN + 16 + 72), Some(ids.1), "gid");
+        }
     }
 
     /// Attaching a previously unseen path to an inode we already know must

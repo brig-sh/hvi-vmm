@@ -97,7 +97,7 @@ and exits.
 
 ```sh
 hvi boot --kernel <Image> --disk disk.img --net-stub      # block device and a NIC
-hvi boot --kernel <Image> --share-ro ./src code           # a read-only share (macOS)
+hvi boot --kernel <Image> --fs tag=code,path=./src,readonly=on   # a read-only share (macOS)
 hvi boot --kernel <Image> --events ledger.ndjson          # record device I/O
 hvi dump-fdt --kernel <Image>                             # arm64 devicetree, no hypervisor
 hvi sandbox-selftest                                      # macOS: probe the Seatbelt profile
