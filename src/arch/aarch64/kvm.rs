@@ -48,9 +48,9 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    place_virtio_fs, GicLayout, GicVersion, GIC_NUM_IRQS, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI,
-    VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE,
-    VIRTIO_VSOCK_SPI,
+    mpidr_affinity, place_virtio_fs, GicLayout, GicVersion, GIC_NUM_IRQS, MPIDR_AFFINITY_MASK,
+    RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_BASE, VIRTIO_NET_BASE, VIRTIO_NET_SPI,
+    VIRTIO_SIZE, VIRTIO_SPI, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
@@ -81,6 +81,7 @@ const REG_PC: u64 = 0x6030_0000_0010_0040;
 const REG_PSTATE: u64 = 0x6030_0000_0010_0042;
 const REG_SP_EL1: u64 = 0x6030_0000_0010_0044;
 // System regs: KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | enc.
+const REG_MPIDR_EL1: u64 = 0x6030_0000_0013_c005;
 const REG_SCTLR_EL1: u64 = 0x6030_0000_0013_c080;
 const REG_TTBR0_EL1: u64 = 0x6030_0000_0013_c100;
 const REG_TTBR1_EL1: u64 = 0x6030_0000_0013_c101;
@@ -102,11 +103,12 @@ fn spi_gsi(spi: u32) -> u32 {
 fn set_u64(vcpu: &VcpuFd, id: u64, val: u64) {
     let _ = vcpu.set_one_reg(id, &val.to_le_bytes());
 }
-fn get_u64(vcpu: &VcpuFd, id: u64) -> u64 {
+fn try_get_u64(vcpu: &VcpuFd, id: u64) -> Result<u64, kvm_ioctls::Error> {
     let mut b = [0u8; 8];
-    vcpu.get_one_reg(id, &mut b)
-        .map(|_| u64::from_le_bytes(b))
-        .unwrap_or(0)
+    vcpu.get_one_reg(id, &mut b).map(|_| u64::from_le_bytes(b))
+}
+fn get_u64(vcpu: &VcpuFd, id: u64) -> u64 {
+    try_get_u64(vcpu, id).unwrap_or(0)
 }
 
 /// State shared across the vCPU threads.
@@ -319,6 +321,17 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             kvi_cpu.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
         }
         vcpu.vcpu_init(&kvi_cpu)?;
+        // The devicetree names each vCPU by the affinity KVM gives it at reset.
+        // A host kernel that numbered vCPUs another way would leave the guest's
+        // CPU_ON unable to reach them.
+        let affinity = try_get_u64(&vcpu, REG_MPIDR_EL1)? & MPIDR_AFFINITY_MASK;
+        let expected = u64::from(mpidr_affinity(id));
+        if affinity != expected {
+            return Err(format!(
+                "vcpu{id}: KVM gave it affinity {affinity:#x}, but the devicetree names it {expected:#x}"
+            )
+            .into());
+        }
         kick_handles.push(kick_handle(&vm, &vcpu)?);
         vcpus.push(vcpu);
     }

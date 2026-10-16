@@ -233,6 +233,41 @@ impl GicLayout {
     }
 }
 
+/// The bits of an MPIDR value that name a CPU: Aff3 in bits 32 to 39, and Aff2,
+/// Aff1 and Aff0 in bits 0 to 23.
+pub const MPIDR_AFFINITY_MASK: u64 = 0xff_00ff_ffff;
+
+/// Returns the MPIDR affinity of vCPU `index`, which is also the `reg` of its
+/// devicetree cpu node.
+///
+/// This is the numbering KVM gives a vCPU at reset: the index's low four bits
+/// go in Aff0, the next eight in Aff1 and the next eight in Aff2. Aff0 stays
+/// below 16 because a GICv3 SGI names its targets as a 16-bit list within one
+/// Aff1 group. The macOS backend writes the same value into each vCPU's
+/// `MPIDR_EL1`, so one devicetree describes the vCPUs of both backends.
+#[must_use]
+pub const fn mpidr_affinity(index: u32) -> u32 {
+    (index & 0xf) | (((index >> 4) & 0xff) << 8) | (((index >> 12) & 0xff) << 16)
+}
+
+/// Returns the index of the vCPU that [`mpidr_affinity`] gives `affinity`, or
+/// `None` if it gives that affinity to no vCPU.
+///
+/// An affinity with any bit set outside Aff2, Aff1 and Aff0, or with Aff0 above
+/// 15, names no vCPU. KVM's PSCI refuses such a `CPU_ON` target too.
+#[must_use]
+pub const fn vcpu_index(affinity: u64) -> Option<u32> {
+    if (affinity & !0xff_ffff) != 0 || (affinity & 0xff) > 0xf {
+        return None;
+    }
+    let (aff0, aff1, aff2) = (
+        affinity & 0xf,
+        (affinity >> 8) & 0xff,
+        (affinity >> 16) & 0xff,
+    );
+    Some((aff0 | (aff1 << 4) | (aff2 << 12)) as u32)
+}
+
 /// Rounds `v` up to the next multiple of `align` (a power of two).
 #[must_use]
 pub fn align_up(v: u64, align: u64) -> u64 {
@@ -337,6 +372,42 @@ impl GuestLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // KVM resets vCPU `index` to this numbering, and the devicetree has to name
+    // each vCPU the same way for the guest's CPU_ON to reach it.
+    #[test]
+    fn mpidr_affinity_follows_the_kvm_numbering() {
+        for (index, affinity) in [
+            (0, 0x0),
+            (15, 0xf),
+            (16, 0x100),
+            (17, 0x101),
+            (255, 0xf0f),
+            (256, 0x1000),
+            (GicLayout::V3_MAX_CPUS, 0x1f0b),
+        ] {
+            assert_eq!(mpidr_affinity(index), affinity, "vCPU {index}");
+        }
+    }
+
+    // The macOS backend answers CPU_ON by mapping the target's affinity back to
+    // a vCPU, so each vCPU a guest can have has to map back to itself, and a
+    // target KVM would refuse has to map to none.
+    #[test]
+    fn vcpu_index_inverts_mpidr_affinity() {
+        for index in 0..=GicLayout::V3_MAX_CPUS {
+            let affinity = u64::from(mpidr_affinity(index));
+            assert_eq!(vcpu_index(affinity), Some(index), "vCPU {index}");
+        }
+        for (target, why) in [
+            (0x10, "Aff0 above 15"),
+            (0x0100_0005, "MT bit set"),
+            (0x8000_0005, "RES1 bit set"),
+            (1 << 32, "Aff3 set"),
+        ] {
+            assert_eq!(vcpu_index(target), None, "{why} names no vCPU");
+        }
+    }
 
     #[test]
     fn align_up_rounds() {
