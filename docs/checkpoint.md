@@ -1260,7 +1260,7 @@ to the resume reply, both on rp2's clock. Three passes of 30 on
 
 In the median move the restore's waits for its syncs came to 8 ms idle
 and 24 ms under the hog. The long ones are all the sync, for one of
-three reasons, each about as common:
+three reasons:
 
 - The sync of a running round was still under way when the next round
   ended, so that round was left to the final round's sync (`left to a
@@ -1278,24 +1278,54 @@ for: with a plain `cp` of the 128 MiB image just before each move, 12 of
 for that sync. A mover syncs its copy first; hull does (its copy of a
 base is synced before it is used).
 
-Two ways to start the earlier rounds' writeback sooner were built and
-measured against `5d68d7f` in paired passes, and neither was kept:
+Three ways to start the earlier rounds' writeback sooner were built and
+measured against the restore as it is, and none was kept:
 
 - A thread of its own that syncs the disk as it opens and after every
   round, one sync for the rounds that ended during the one before, with
-  the stream never waiting for it. Its medians were the same (42 against
-  43 ms idle, 50 against 56 ms under the hog), but its longest moves
-  were 13.0 and 12.6 s against 3.7 and 1.4 s, and an earlier pass showed
-  the same: more syncs leave one more under way when the final round
-  ends, and on this drive a flush can take seconds.
+  the stream never waiting for it. In one paired pass of 30 it had fewer
+  moves at 300 ms or more (4 against 7 idle, 11 against 13 under the
+  hog), a lower 90th percentile idle (591 against 803 ms) and a higher
+  one under the hog (1355 against 713 ms). Its medians were the same (42
+  against 43 ms idle, 50 against 56 ms under the hog), and its longest
+  moves were 13.0 and 12.6 s against 3.7 and 1.4 s, each the final round
+  waiting with no blocks of its own for a sync under way. It was dropped
+  on those two moves, which one pass is too few to rest on; the third
+  way below was measured over three.
 - The same with `sync_file_range` starting the writeback on the stream's
   thread as the blocks land: 2 of 30 restores stopped reading while the
   drive timed out its writes, most likely in that call, and the source
   cut each stream as stalled after 30 s.
+- `sync_file_range` on a thread of its own, asked at each round's end
+  and every 8 MiB, with no sync of the running rounds and none at the
+  open, and the one sync after the final round, which waits for nothing
+  before it. It was measured against `7b1764c` in three paired passes,
+  30 moves per build and load in each, the order alternating, and
+  decided by a rule written down before the runs: kept only with fewer
+  moves at 300 ms or more under both loads, and a 90th percentile no
+  more than 10 % higher under either.
 
-So the restore keeps its sync after the final round, for the guest's
-writes to be durable before it runs, and the downtime of a move onto a
-busy disk is mostly that sync.
+  | Restore, 90 moves each | Idle: median, 90th percentile, longest | 300 ms or more | Hog: median, 90th percentile, longest | 300 ms or more |
+  | --- | --- | --- | --- | --- |
+  | `7b1764c`, a sync per running round | 43, 603, 2898 ms | 21 | 54, 712, 2638 ms | 26 |
+  | the writeback on its own thread | 42, 547, 1694 ms | 15 | 47, 788, 2348 ms | 35 |
+
+  It had fewer long moves idle and more under the hog, so the rule kept
+  the restore as it is. Its final round never waited for an earlier
+  sync, as intended, but 24 of its 35 long moves under the hog had a
+  final round of 1 block or none: they were the drive's flush, against
+  17 of `7b1764c`'s 26. The likely reason, not measured, is that with
+  no flush of the running rounds the drive's own cache still held their
+  blocks at the final flush. Three of the steps were run again, since a
+  hog's `dd` from the step before was still running as they started;
+  with their first runs kept instead the counts were 33 against 32
+  under the hog, and the same idle.
+
+So the restore keeps its sync of each running round and after the final
+round, for the guest's writes to be durable before it runs, and the
+downtime of a move onto a busy disk is mostly that sync. The decision
+rests on the counts of long moves and the 90th percentiles, not on the
+longest move.
 
 ### A reader that slows down in the pause
 
