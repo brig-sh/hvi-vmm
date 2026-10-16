@@ -160,6 +160,10 @@ pub fn build(
             IRQ_LEVEL_HIGH, // hypervisor physical
         ],
     )?;
+    // The hypervisor keeps each vCPU's timer while the vCPU is out of the
+    // guest. Without `always-on` the guest takes it for a timer that stops in
+    // deep idle states.
+    fdt.property_null("always-on")?;
     fdt.end_node(timer)?;
 
     // /intc: GICv3 distributor + redistributor, or GICv2 distributor + CPU
@@ -322,6 +326,21 @@ pub(crate) mod tests {
     /// is enough to tell the two `compatible` strings apart.
     fn contains(blob: &[u8], needle: &str) -> bool {
         blob.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    #[test]
+    fn timer_is_always_on() {
+        let blob = build(
+            &sample_layout(0),
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+            KASLR_SEED,
+        )
+        .unwrap();
+        assert!(contains(&blob, "always-on"));
     }
 
     /// The GIC version must reach the DTB: a v2 guest has to be told to bind
