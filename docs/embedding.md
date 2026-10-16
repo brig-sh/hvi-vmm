@@ -141,8 +141,9 @@ cargo build --release --example watch_guest
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
 
-`FsShare` carries a `path`, a `tag`, a `ShareMode` and a `CachePolicy`. See
-[storage-and-sharing.md](storage-and-sharing.md).
+`FsShare` carries a `path`, a `tag`, a `ShareMode`, a `CachePolicy` and the
+`uid` and `gid` the host user's files carry in the guest. `FsSpec::parse` reads
+one `--fs` into it. See [storage-and-sharing.md](storage-and-sharing.md).
 
 ## Stopping a run from the host
 
@@ -252,19 +253,7 @@ want it.
 
 ## Configuration outside `BootConfig`
 
-Two things a caller sets are not in the struct. Both matter.
-
-**Guest file ownership.** `--fs-uid` and `--fs-gid` become two process-global
-atomics through `devices::virtio::fs::set_guest_ids(uid, gid)`, because every
-share reads the same pair. Call it before `boot`, on macOS only:
-
-```rust
-#[cfg(target_os = "macos")]
-hvi::devices::virtio::fs::set_guest_ids(0, 0);
-```
-
-Setting it after a share is already answering hands the guest a home it cannot
-write.
+One thing a caller sets is not in the struct.
 
 **Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE` and `HVI_X86_TRACE`
 are read from the process environment, not from `BootConfig`. An embedder that

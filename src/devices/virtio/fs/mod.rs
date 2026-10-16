@@ -22,4 +22,4 @@
 pub mod fdlimit;
 pub mod server;
 
-pub use server::set_guest_ids;
+pub use server::GuestIds;

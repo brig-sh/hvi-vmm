@@ -27,16 +27,18 @@ because it costs a synchronous write per request.
 
 ## virtio-fs shares, macOS only
 
-`--share-ro` and `--share-rw` export a host directory to the guest over
-virtio-fs. hvi answers the guest's FUSE requests itself. There is no macFUSE
-mount, no block image, no DAX window and no indirect descriptors.
+`--fs tag=<tag>,path=<dir>` exports a host directory to the guest over
+virtio-fs, in Cloud Hypervisor's comma-separated syntax. hvi answers the guest's
+FUSE requests itself. There is no macFUSE mount, no block image, no DAX window
+and no indirect descriptors. `--share-ro <dir> <tag>` and
+`--share-rw <dir> <tag>` are the old form, which still works and prints a note.
 
 The Linux backends do not carry the device at all.
 
 ```sh
 hvi boot --kernel <Image> \
-  --share-ro /path/to/source code \
-  --share-rw /path/to/scratch work cache=none
+  --fs tag=code,path=/path/to/source,readonly=on \
+  --fs tag=work,path=/path/to/scratch,cache=none,uid=1000,gid=1000
 ```
 
 Inside the guest, mount by tag:
@@ -45,8 +47,9 @@ Inside the guest, mount by tag:
 mount -t virtiofs code /mnt/code
 ```
 
-Each share becomes its own device, with its own access mode and cache policy.
-Repeat the flag for more. A tag is 1 to 36 bytes, carries no NUL, and must be
+Each share becomes its own device, with its own access mode, cache policy and
+owner. Repeat the flag for more. An export takes `readonly=on|off` (off by
+default), `cache=auto|always|none` and `uid=`/`gid=`. A tag is 1 to 36 bytes, carries no NUL, and must be
 unique.
 
 Two shares may not cover the same host directory, or one the other's parent,
@@ -59,7 +62,7 @@ The check covers the shares of one hvi process. Two processes can export the
 same tree, or a tree and a directory inside it, with one export writable and the
 other read-only. Neither process refuses that. A guest on the writable share can
 then store an owner and a mode on a file, setuid and setgid included (see
-[Ownership](#ownership---fs-uid-and---fs-gid)), and the other guest's kernel
+[Ownership](#ownership-uid-and-gid)), and the other guest's kernel
 honors them. Export one tree to two sandboxes only when each may change what the
 other runs.
 
@@ -118,11 +121,13 @@ to a writable share: at `dd bs=4k` it batched 65536 requests down to a few
 hundred and ran 2.4 times faster, and at `bs=1M` it ran 3.7 times slower,
 because the guest's writeback path then costs more than the requests it saves.
 
-### Ownership: `--fs-uid` and `--fs-gid`
+### Ownership: `uid=` and `gid=`
 
-Both default to 0, so a workload running as root sees the host's files as
-root. A guest running as an unprivileged user needs its own uid here, or the
-guest kernel refuses every write before the request reaches hvi.
+The host user's files appear in the guest as `uid`:`gid` of their export. Both
+default to 0, so a workload running as root sees the host's files as root. A
+guest running as an unprivileged user needs its own uid here, or the guest
+kernel refuses every write before the request reaches hvi. Files other host
+users own keep their own ids.
 
 The mapping applies to host files that carry no stored ownership. A file the
 guest creates or chowns keeps the identity the guest asked for, recorded in a
@@ -131,9 +136,8 @@ guest owner survives a restart without being imposed on the host. The guest
 cannot read or forge that attribute: `SETXATTR` on the prefix returns `EPERM`,
 `GETXATTR` returns `ENODATA`, and `LISTXATTR` filters it out.
 
-These two flags are process-global, not per share. They are set once before
-any share is served, and they are not part of `BootConfig`. See
-[embedding.md](embedding.md#configuration-outside-bootconfig).
+Each export has its own pair, in `FsShare`. The deprecated `--fs-uid` and
+`--fs-gid` set the pair of every `--share-ro`/`--share-rw` export.
 
 ### Containment
 
@@ -181,9 +185,9 @@ Each export reports its peak handle count on a clean stop:
 
 CAUTION: A writable share gives a hostile guest write access to that host
 directory tree, bounded by the export root and by the process's own
-permissions. Give `--share-rw` a directory you can afford to lose. For a
+permissions. Give a writable export a directory you can afford to lose. For a
 development workload, an instance-owned APFS clone is the right shape. For a
-shared cache that several guests read, use `--share-ro`.
+shared cache that several guests read, use `readonly=on`.
 
 The macOS Seatbelt profile grants exactly one rule per export, by resolved
 root path: `file-read*` for a read-only share and `file-read* file-write*` for

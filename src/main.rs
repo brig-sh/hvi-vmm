@@ -257,7 +257,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut disk = None;
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
-    let mut fs_shares = Vec::new();
+    let mut fs_shares: Vec<config::FsShare> = Vec::new();
+    // The `--share-ro`/`--share-rw` exports, which `--fs-uid`/`--fs-gid` apply
+    // to.
+    let mut legacy_shares: Vec<usize> = Vec::new();
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -279,14 +282,48 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => disk = it.next().cloned(),
-            // The uid and gid the host's files carry inside the guest. The
-            // default is root, which suits a guest whose workload runs as root;
-            // a guest running as another user needs its own uid here, or the
-            // guest kernel refuses every write to a shared directory. See
-            // `devices::virtio::fs::set_guest_ids`.
-            "--fs-uid" => fs_uid = it.next().ok_or("--fs-uid needs a value")?.parse()?,
-            "--fs-gid" => fs_gid = it.next().ok_or("--fs-gid needs a value")?.parse()?,
+            // The old names of `uid=` and `gid=` on an `--fs path=` export.
+            // They apply to every `--share-ro`/`--share-rw` export, which is
+            // what they did when the identity was one per process. Kept
+            // working, with one line saying where they went.
+            "--fs-uid" | "--fs-gid" => {
+                let key = &a[5..];
+                if cfg!(target_os = "macos") {
+                    eprintln!(
+                        "[hvi] note: {a} is now {key}= on each --fs export; \
+                         the old flag applies to --share-ro/--share-rw exports only"
+                    );
+                } else {
+                    eprintln!(
+                        "[hvi] note: {a} has no effect on Linux; the daemon decides \
+                         ownership (virtiofsd: --translate-{key})"
+                    );
+                }
+                let id = it
+                    .next()
+                    .ok_or_else(|| format!("{a} needs a value"))?
+                    .parse()?;
+                if a == "--fs-uid" {
+                    fs_uid = id;
+                } else {
+                    fs_gid = id;
+                }
+            }
+            // The old form of `--fs tag=<tag>,path=<dir>[,readonly=on]`. Kept
+            // working on macOS, with one line saying where it went. The Linux
+            // backends refuse it.
             "--share-ro" | "--share-rw" => {
+                if cfg!(target_os = "macos") {
+                    eprintln!(
+                        "[hvi] note: {a} <dir> <tag> is now --fs tag=<tag>,path=<dir>{}; \
+                         the old form still works",
+                        if a == "--share-ro" {
+                            ",readonly=on"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 let mode = if a == "--share-rw" {
                     config::ShareMode::ReadWrite
                 } else {
@@ -301,10 +338,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if tag.is_empty() || tag.len() > 36 || tag.as_bytes().contains(&0) {
                     return Err("virtio-fs tag must be 1..=36 bytes and contain no NUL".into());
                 }
-                if fs_shares
-                    .iter()
-                    .any(|share: &config::FsShare| share.tag == *tag)
-                {
+                if tag_taken(&fs_shares, tag) {
                     return Err(format!("duplicate virtio-fs tag {tag:?}").into());
                 }
                 // An optional trailing `cache=auto|always|none`; any other
@@ -324,18 +358,31 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     };
                     it.next();
                 }
-                let path = std::fs::canonicalize(path)?;
-                if !path.is_dir() {
-                    return Err(
-                        format!("virtio-fs export is not a directory: {}", path.display()).into(),
-                    );
-                }
                 fs_shares.push(config::FsShare {
-                    path,
+                    path: export_dir(std::path::Path::new(path))?,
                     tag: tag.clone(),
                     mode,
                     cache,
+                    uid: 0,
+                    gid: 0,
                 });
+                legacy_shares.push(fs_shares.len() - 1);
+            }
+            // One virtio-fs export, in Cloud Hypervisor's comma-separated
+            // syntax. `path=` is a directory hvi serves itself.
+            "--fs" => {
+                let spec = it
+                    .next()
+                    .ok_or_else(|| format!("--fs needs {}", config::FsSpec::SYNTAX))?;
+                match config::FsSpec::parse(spec)? {
+                    config::FsSpec::Share(mut share) => {
+                        if tag_taken(&fs_shares, &share.tag) {
+                            return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
+                        }
+                        share.path = export_dir(&share.path)?;
+                        fs_shares.push(share);
+                    }
+                }
             }
             "--net-stub" => net = true,
             // The old name. It read as "networking", which is what the flag
@@ -387,17 +434,10 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let kernel_path = kernel.ok_or("boot needs --kernel <Image>")?;
-    // Set before any share is served: every attribute reply reads the mapping,
-    // and a device already answering with the old identity would leave the
-    // guest with files it cannot write.
-    //
-    // macOS only, because the virtio-fs server is: the Linux backend has no
-    // in-process file server. The flags still parse there so a command line is
-    // portable; on Linux they configure nothing.
-    #[cfg(target_os = "macos")]
-    hvi::devices::virtio::fs::set_guest_ids(fs_uid, fs_gid);
-    #[cfg(not(target_os = "macos"))]
-    let _ = (fs_uid, fs_gid);
+    for &index in &legacy_shares {
+        fs_shares[index].uid = fs_uid;
+        fs_shares[index].gid = fs_gid;
+    }
 
     // A stop signal asks the run to stop, and `finish` ends the process by it.
     let (signals, stop_registration) = StopOnSignals::new()?;
@@ -430,6 +470,30 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("booting {kernel_path} with {mem_mib} MiB ...");
     signals.finish(hvi::boot(cfg))
+}
+
+/// Returns whether an export given so far already carries `tag`.
+fn tag_taken(shares: &[config::FsShare], tag: &str) -> bool {
+    shares.iter().any(|share| share.tag == tag)
+}
+
+/// Returns the canonical form of `path`, which an export hvi serves needs to
+/// be a directory.
+///
+/// # Errors
+///
+/// Returns the path and the reason when it does not resolve or is not a
+/// directory.
+fn export_dir(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|e| format!("virtio-fs export {}: {e}", path.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "virtio-fs export is not a directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 fn main() {

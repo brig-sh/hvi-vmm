@@ -56,7 +56,7 @@ CONFIG_VIRTIO_BLK=y                 # --disk
 CONFIG_VIRTIO_NET=y                 # --net-stub, --net-gateway, --net-tap
 CONFIG_VSOCKETS=y                   # --agent-sock
 CONFIG_VIRTIO_VSOCKETS=y
-CONFIG_FUSE_FS=y                    # --share-ro, --share-rw
+CONFIG_FUSE_FS=y                    # --fs
 CONFIG_VIRTIO_FS=y
 CONFIG_BLK_DEV_INITRD=y             # --initramfs
 ```

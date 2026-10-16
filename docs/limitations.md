@@ -72,7 +72,7 @@ three things a reader should not have to guess between:
 | `ts` is host wall-clock. | It is not monotonic and can move backwards. | Design |
 | TLS SNI is recorded only under `--net-tap` and `--net-gateway`. | The built-in stack records no SNI. | Design |
 | An SNI value is a claim on the wire. | It is not proof of a connection, not application identity, and not authorization. Split ClientHellos, resumption, encrypted ClientHello and QUIC yield nothing. | Design |
-| `--dump-memory` is denied by the default sandbox. | The file is created after confinement. Use a destination inside a `--share-rw` directory, or `--no-sandbox`. See [#91](https://github.com/brig-sh/hvi-vmm/issues/91). | Defect |
+| `--dump-memory` is denied by the default sandbox. | The file is created after confinement. Use a destination inside a writable `--fs path=` directory, or `--no-sandbox`. See [#91](https://github.com/brig-sh/hvi-vmm/issues/91). | Defect |
 | `--dump-after` needs the guest to still be running. | A guest that stops first produces no dump and no error. | Design |
 | A dump is not a checkpoint. | Raw RAM only. No register, device or virtqueue state. Nothing can restore a VM from it. | Design |
 

@@ -60,13 +60,102 @@ pub enum CachePolicy {
     None,
 }
 
-/// One host directory exported to the guest through virtio-fs.
-#[derive(Debug, Clone)]
+/// One host directory exported to the guest through virtio-fs, which hvi
+/// serves itself. Only the macOS backend serves these.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsShare {
+    /// The host directory the export serves.
     pub path: PathBuf,
+    /// The tag the guest mounts the export by, 1 to 36 bytes.
     pub tag: String,
+    /// Whether the guest may write the export.
     pub mode: ShareMode,
+    /// How long the guest may cache what the export answers.
     pub cache: CachePolicy,
+    /// The guest uid the host user's files carry in this export.
+    pub uid: u32,
+    /// The guest gid the host user's files carry in this export.
+    pub gid: u32,
+}
+
+/// One `--fs` export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsSpec {
+    /// `path=`: hvi serves the directory itself, on macOS.
+    Share(FsShare),
+}
+
+impl FsSpec {
+    /// The syntax [`parse`](Self::parse) takes, for an error to quote.
+    pub const SYNTAX: &'static str =
+        "tag=<tag>,path=<dir>[,readonly=on|off][,cache=auto|always|none][,uid=<n>][,gid=<n>]";
+    /// The longest tag, which is the length of the config-space field.
+    pub const MAX_TAG_LEN: usize = 36;
+
+    /// Returns the export `spec` describes, in the syntax of
+    /// [`SYNTAX`](Self::SYNTAX).
+    ///
+    /// The syntax is Cloud Hypervisor's comma-separated `--fs`. A `path=` is
+    /// returned as given; resolving it is the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Errors on a missing tag or path, on a key that is unknown or repeated,
+    /// on a tag that is empty, longer than 36 bytes or holds a NUL, and on a
+    /// value a key cannot take.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let bad = |why: String| format!("--fs {spec:?}: {why}; expected {}", Self::SYNTAX);
+        let mut fields: Vec<(&str, &str)> = Vec::new();
+        for field in spec.split(',') {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| bad(format!("{field:?} is not key=value")))?;
+            if !matches!(key, "tag" | "path" | "readonly" | "cache" | "uid" | "gid") {
+                return Err(bad(format!("unknown key {key:?}")));
+            }
+            if fields.iter().any(|(seen, _)| *seen == key) {
+                return Err(bad(format!("{key} given twice")));
+            }
+            fields.push((key, value));
+        }
+        let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+
+        let tag = get("tag").ok_or_else(|| bad("no tag".into()))?;
+        if tag.is_empty() || tag.len() > Self::MAX_TAG_LEN || tag.contains('\0') {
+            return Err(bad(format!(
+                "the tag must be 1 to {} bytes with no NUL",
+                Self::MAX_TAG_LEN
+            )));
+        }
+        let path = get("path")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| bad("no path".into()))?;
+        let mode = match get("readonly") {
+            None | Some("off") => ShareMode::ReadWrite,
+            Some("on") => ShareMode::ReadOnly,
+            Some(v) => return Err(bad(format!("readonly {v:?} is not on or off"))),
+        };
+        let cache = match get("cache") {
+            None | Some("auto") => CachePolicy::Auto,
+            Some("always") => CachePolicy::Always,
+            Some("none") => CachePolicy::None,
+            Some(v) => return Err(bad(format!("cache {v:?} is not auto, always or none"))),
+        };
+        let id = |key: &str| -> Result<u32, String> {
+            get(key).map_or(Ok(0), |v| {
+                v.parse()
+                    .map_err(|_| bad(format!("{key} {v:?} is not a numeric id")))
+            })
+        };
+        Ok(Self::Share(FsShare {
+            path: PathBuf::from(path),
+            tag: tag.to_string(),
+            mode,
+            cache,
+            uid: id("uid")?,
+            gid: id("gid")?,
+        }))
+    }
 }
 
 /// Refuses two exports of the same host subtree that disagree on whether the
@@ -295,7 +384,7 @@ impl std::error::Error for BootError {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{check_export_overlap, BootError, CachePolicy, FsShare, ShareMode};
+    use super::{check_export_overlap, BootError, CachePolicy, FsShare, FsSpec, ShareMode};
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
 
@@ -308,6 +397,8 @@ mod tests {
                 tag: format!("tag{i}"),
                 mode: *mode,
                 cache: CachePolicy::Auto,
+                uid: 0,
+                gid: 0,
             })
             .collect()
     }
@@ -370,12 +461,16 @@ mod tests {
                 tag: "real".into(),
                 mode: ShareMode::ReadWrite,
                 cache: CachePolicy::Auto,
+                uid: 0,
+                gid: 0,
             },
             FsShare {
                 path: dir.join("link"),
                 tag: "link".into(),
                 mode: ShareMode::ReadOnly,
                 cache: CachePolicy::Auto,
+                uid: 0,
+                gid: 0,
             },
         ])
         .unwrap_err();
@@ -494,5 +589,63 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(error.to_string(), "vcpu0: failed");
+    }
+
+    /// Returns the directory export `spec` parses to.
+    fn share(spec: &str) -> FsShare {
+        let FsSpec::Share(fs) = FsSpec::parse(spec).unwrap();
+        fs
+    }
+
+    #[test]
+    fn fs_path_takes_mode_cache_and_ids() {
+        assert_eq!(
+            share("tag=src,path=/srv/src"),
+            FsShare {
+                path: PathBuf::from("/srv/src"),
+                tag: "src".into(),
+                mode: ShareMode::ReadWrite,
+                cache: CachePolicy::Auto,
+                uid: 0,
+                gid: 0,
+            }
+        );
+        let fs = share("tag=t,path=/p,readonly=on,cache=none,uid=1000,gid=100");
+        assert_eq!(fs.mode, ShareMode::ReadOnly);
+        assert_eq!(fs.cache, CachePolicy::None);
+        assert_eq!((fs.uid, fs.gid), (1000, 100));
+        assert_eq!(
+            share("tag=t,path=/p,readonly=off").mode,
+            ShareMode::ReadWrite
+        );
+        assert_eq!(
+            share("tag=t,path=/p,cache=always").cache,
+            CachePolicy::Always
+        );
+    }
+
+    #[test]
+    fn fs_spec_refuses_what_it_cannot_serve() {
+        let tag37 = format!("tag={},path=/p", "t".repeat(37));
+        for (spec, why) in [
+            ("path=/p", "no tag"),
+            ("tag=t", "no path"),
+            ("tag=t,path=", "no path"),
+            ("tag=,path=/p", "the tag must be"),
+            (tag37.as_str(), "the tag must be"),
+            ("tag=t,path=/p,ro=on", "unknown key \"ro\""),
+            ("tag=t,tag=u,path=/p", "tag given twice"),
+            (
+                "tag=t,path=/p,readonly=yes",
+                "readonly \"yes\" is not on or off",
+            ),
+            ("tag=t,path=/p,cache=sometimes", "cache \"sometimes\""),
+            ("tag=t,path=/p,uid=-1", "uid \"-1\" is not a numeric id"),
+            ("tag=t,path=/p,ro", "\"ro\" is not key=value"),
+        ] {
+            let err = FsSpec::parse(spec).expect_err(spec);
+            assert!(err.contains(why), "{spec}: {err}");
+            assert!(err.contains(FsSpec::SYNTAX), "{spec}: {err}");
+        }
     }
 }
