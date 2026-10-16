@@ -798,6 +798,16 @@ jobs:
             || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
           grep -q "SMP: Total of 2 processors activated" run.log \
             || { echo "::error::the second vCPU never came up"; exit 1; }
+          # The guest can get pointer authentication only from a host CPU that
+          # has it and a guest kernel built with it, so check it on those.
+          if grep -qw paca /proc/cpuinfo && grep -qw pacg /proc/cpuinfo \
+            && grep -qa "Address authentication" guest/Image; then
+            grep -q "Address authentication" run.log \
+              || { echo "::error::the host has pointer authentication, the guest did not get it"; exit 1; }
+            echo "pointer authentication reached the guest ✓"
+          else
+            echo "pointer authentication not checked: the host CPU or the guest kernel lacks it"
+          fi
       # The tap attach is the urunc integration path: urunc creates the tap and
       # hvi only opens it, so a CI tap created with `ip tuntap` stands in for
       # urunc exactly. Creating one needs CAP_NET_ADMIN, and the runner user's

@@ -38,9 +38,10 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{
     kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
     kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF,
-    KVM_ARM_VCPU_PSCI_0_2, KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR,
-    KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_VGIC_V2_ADDR_TYPE_CPU,
-    KVM_VGIC_V2_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
+    KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PTRAUTH_ADDRESS, KVM_ARM_VCPU_PTRAUTH_GENERIC,
+    KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
+    KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST,
+    KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
@@ -287,6 +288,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let mut kvi = kvm_vcpu_init::default();
     vm.get_preferred_target(&mut kvi)?;
     kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+    // KVM hides pointer authentication from the guest unless asked for it, and
+    // refuses a request for one of its two kinds without the other.
+    if vm.check_extension(Cap::ArmPtrAuthAddress) && vm.check_extension(Cap::ArmPtrAuthGeneric) {
+        kvi.features[0] |= 1 << KVM_ARM_VCPU_PTRAUTH_ADDRESS | 1 << KVM_ARM_VCPU_PTRAUTH_GENERIC;
+    }
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
     let mut kick_handles = Vec::with_capacity(num_cpus as usize);
     for id in 0..num_cpus {

@@ -243,6 +243,12 @@ layout. Both backends and `dump-fdt` call it.
 
 No firmware and no bootloader. hvi drops the kernel straight into EL1.
 
+On KVM each vCPU starts with PSCI 0.2, and with address and generic pointer
+authentication when KVM supports both. KVM hides pointer authentication from a
+guest whose vCPUs do not ask for it. Under HVF the guest gets the CPU features
+Hypervisor.framework passes through, which on Apple silicon include pointer
+authentication.
+
 The GIC version is not a choice. KVM offers the vGIC that matches the host, so
 a GIC-400 host gets v2 and refuses more than 8 vCPUs, and a GICv3 host gets
 v3. The macOS backend is always v3, because Apple's `hv_gic` is one.
