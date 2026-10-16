@@ -1151,9 +1151,9 @@ pub(crate) mod tests {
     ) -> JoinHandle<()> {
         let (vcpus, log) = (Arc::clone(vcpus), Arc::clone(log));
         std::thread::spawn(move || {
-            vcpus.mark_started();
+            vcpus.mark_started(vcpus.started());
             while vcpus.is_running() {
-                vcpus.checkpoint_with(cpu, |work| match work {
+                let _ = vcpus.checkpoint_with(cpu, |work| match work {
                     Work::Import(step, _) if Some(step) == fail => {
                         Err(std::io::Error::other("the hypervisor refused it"))
                     }
@@ -1570,6 +1570,30 @@ pub(crate) mod tests {
             refusals(&opened, &config(&scratch), &HVF),
             Vec::<String>::new()
         );
+    }
+
+    // A source that takes back a move it aborted restores the spooled
+    // stream onto its own disk, without --disk-base-sha256. That disk was
+    // not synced in the pause, so a host crash can have lost the writes
+    // still in its page cache; the rounds rewrite every block written
+    // since boot, so the restore gives the disk as it was at the fence.
+    #[test]
+    fn a_stream_restored_onto_a_stale_source_disk_gives_the_fence_time_disk() {
+        let scratch = Scratch::new("stream-disk-stale");
+        let bytes = disk_stream(&scratch, |_| {});
+        // Only the blocks the rounds carry differ from the fence-time
+        // disk: block 0 as written, block 1 with an older write, block 2
+        // with its write lost. The blocks not written since boot are the
+        // base on both.
+        let mut stale = written_disk();
+        stale[65536..65536 + 300].fill(0x99);
+        stale[2 * 65536..2 * 65536 + 300].fill(0);
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(scratch.disk(), &stale).unwrap();
+        assert!(read_disk_back(&scratch) != written_disk());
+        read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None)
+            .expect("the spooled stream restores onto the source's disk");
+        assert!(read_disk_back(&scratch) == written_disk());
     }
 
     fn disk_stream_refusal(name: &str, edit: impl FnOnce(&mut DiskState)) -> String {
@@ -2145,7 +2169,11 @@ pub(crate) mod tests {
 
     #[test]
     fn the_steps_run_in_order_with_a_barrier_between_each() {
-        let vcpus = Arc::new(Vcpus::new(3, NoKick));
+        let vcpus = Arc::new(Vcpus::new(
+            3,
+            NoKick,
+            crate::run::StopHandle::new_pair().unwrap().0,
+        ));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let threads: Vec<_> = (0..2)
@@ -2165,7 +2193,11 @@ pub(crate) mod tests {
     fn the_controller_waits_for_every_vcpu_to_exist() {
         // vCPUs 2 and 3 were off. Their threads create them in turn after
         // vCPU 1's, and nothing else orders them before the import.
-        let vcpus = Arc::new(Vcpus::new(4, NoKick));
+        let vcpus = Arc::new(Vcpus::new(
+            4,
+            NoKick,
+            crate::run::StopHandle::new_pair().unwrap().0,
+        ));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let threads: Vec<_> = (0..2)
@@ -2209,7 +2241,11 @@ pub(crate) mod tests {
 
     #[test]
     fn a_step_that_fails_ends_the_import_naming_the_vcpu() {
-        let vcpus = Arc::new(Vcpus::new(2, NoKick));
+        let vcpus = Arc::new(Vcpus::new(
+            2,
+            NoKick,
+            crate::run::StopHandle::new_pair().unwrap().0,
+        ));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let threads = [
@@ -2226,7 +2262,11 @@ pub(crate) mod tests {
 
     #[test]
     fn a_vcpu_that_never_starts_times_the_import_out() {
-        let vcpus = Arc::new(Vcpus::new(2, NoKick));
+        let vcpus = Arc::new(Vcpus::new(
+            2,
+            NoKick,
+            crate::run::StopHandle::new_pair().unwrap().0,
+        ));
         vcpus.pause_from_control(Duration::ZERO).unwrap();
         let log = Log::default();
         let thread = importing_vcpu(&vcpus, 0, &log, None);
@@ -2243,7 +2283,7 @@ pub(crate) mod tests {
         vcpus.stop();
         thread.join().unwrap();
         // The stop ends a wait for a vCPU that never comes.
-        let stopped = Vcpus::new(1, NoKick);
+        let stopped = Vcpus::new(1, NoKick, crate::run::StopHandle::new_pair().unwrap().0);
         stopped.stop();
         assert_eq!(
             import(&stopped, &plan(1, 0), Duration::from_secs(5), || 1).unwrap_err(),
