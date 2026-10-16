@@ -2430,6 +2430,56 @@ mod tests {
         f.assert_running();
     }
 
+    // A checkpoint whose pause waits on a busy I/O thread for longer than
+    // the control timeout still has that timeout for the vCPUs' export,
+    // counted from the park, and seals its bundle, with the disk synced in
+    // the pause as the directory form always is.
+    #[test]
+    fn a_checkpoint_that_waits_on_a_busy_io_thread_still_exports_and_seals() {
+        let disk = TestDisk::new("ck-gate-wait", 4);
+        disk.write(1, 0x41);
+        let mut f = Fixture::with(
+            "ck-gate-wait",
+            Spec {
+                parking: 2,
+                capture: true,
+                blk: disk.spec(),
+                stream: StreamLimits {
+                    park: Duration::from_secs(5),
+                    ..StreamLimits::default()
+                },
+                ..Spec::default()
+            },
+        );
+        let token = f.source.token();
+        let held = Duration::from_millis(600);
+        let (entered, inside_now) = std::sync::mpsc::channel();
+        let leaves = std::thread::spawn(move || {
+            let inside = token.enter();
+            entered.send(()).unwrap();
+            std::thread::sleep(held);
+            drop(inside);
+        });
+        inside_now.recv().unwrap();
+        let asked = Instant::now();
+        // The fixture's control timeout is 200 ms, which the gate's wait
+        // alone outlasts.
+        let line = f.checkpoint("ck", "continue");
+        leaves.join().unwrap();
+        let r = reply(&line);
+        assert_eq!(r["ok"], true, "{line}");
+        assert!(asked.elapsed() >= held, "{:?}", asked.elapsed());
+        f.assert_running();
+        let dir = f.root.join("ck");
+        crate::checkpoint::bundle::verify(&dir).unwrap();
+        let disk_json = crate::checkpoint::bundle::Bundle::open(&dir)
+            .unwrap()
+            .disk()
+            .unwrap()
+            .unwrap();
+        assert!(disk_json.synced, "the directory form syncs in the pause");
+    }
+
     // A plugin's pause and the socket's are kept out of each other: the socket
     // refuses while a plugin holds the vCPUs and leaves the gate open.
     #[test]
@@ -3881,6 +3931,7 @@ mod tests {
             .unwrap();
         assert_eq!(disk_json.generation, 5);
         assert_eq!(disk_json.base_sha256, None);
+        assert!(disk_json.synced, "the directory form syncs in the pause");
         let rounds: Vec<(u32, u64, u64)> = disk_json
             .rounds
             .iter()
@@ -4440,6 +4491,9 @@ mod tests {
             Some(again.disk[0].sha256.as_str())
         );
         assert_eq!(disk_json.rounds[0].generation, disk_json.generation);
+        // Sent again with the VM fenced, the disk is synced as a
+        // checkpoint's is.
+        assert!(disk_json.synced, "the stream sent again syncs the disk");
     }
 
     // A vCPU that is in a long exit when the pause comes parks late. A
