@@ -1005,7 +1005,20 @@ overwrite its newer writes. Each round's blocks go in as they arrive, a
 later round over an earlier one, and a sync of the disk starts as each
 round ends, one at a time, and once more after the final round; the
 restore waits for it, so the guest's first flush does not inherit the
-writeback. Once the manifest checks, the disk rounds must be `disk.json`'s,
+writeback. A running round that ends while a sync is still under way
+starts none, and the next sync covers it. Once the stream is read the
+restore reports the syncs on stderr:
+
+```text
+[hvi] stream -: disk syncs: 2 started, 1 left to a later one; the final round's 0 block(s) waited 285 ms for the sync before, took 651 ms to sync, 644 ms of it after the stream
+```
+
+`left to a later one` counts the running rounds whose sync was not
+started. The final round first waits for the sync before it to end, with
+the stream's reading held up, then starts its own; the last two numbers
+are how long that sync took and how much of it the restore waited for
+once the manifest was in. Both waits are guest downtime: see [The
+destination's sync](#the-destinations-sync). Once the manifest checks, the disk rounds must be `disk.json`'s,
 one for one: the bitmap of the blocks each round wrote hashes to the
 round's `bitmap_sha256`, its component's SHA-256 is the round's
 `sent_sha256`, the last one is the paused round, and it was read at the
@@ -1190,6 +1203,95 @@ logged no RCU stall, hung task or soft lockup on `fca7c94`, and
 `hvi` stopped in 0.51 s with exit status 0. `c4131f5` logged none in its
 10 minutes either, so that run does not tell the two apart: the stalls
 seen before came with the drive stalling for 20 s and more.
+
+### The pause and the destination's sync, measured again
+
+The same rig on rp2 on 2026-10-16, with the guest's base named
+(`--disk-base-sha256` of a fresh 128 MiB ext4 image), so each stream
+carries disk rounds; the guest's `dd conv=fsync` loop runs throughout,
+`max_rounds` 2, `then: "continue"`, 30 moves per pass, random gaps. "Idle"
+is no host load beside the guest; "hog" adds the host's `O_DIRECT` writer.
+No CPU loops. The build before, `ba9b2d291d5d1f1715425452117929a35f10ffbf`,
+syncs the source's disk inside the pause, and since `65a929f` a stream with
+disk rounds leaves that sync out (the build after is `5d68d7f`):
+
+| Build | Host | `paused_ms`: median, 90th percentile, longest | Moves at 100 ms or more | `pause_sync_ms`: median, longest |
+| --- | --- | --- | --- | --- |
+| before | idle | 7, 11, 84 ms | 0 of 30 | 0, 75 ms |
+| after | idle | 8, 15, 22 ms | 0 of 30 | 0, 0 ms |
+| before | hog | 279, 344, 3058 ms | 21 of 30 | 273, 3050 ms |
+| after | hog | 8, 18, 24 ms | 0 of 30 | 0, 0 ms |
+
+On the Mac, 15 moves each with the guest writer: before, 5 ms median
+and 32 ms longest, `pause_sync_ms` up to 26 ms; the new build 4 ms and
+5 ms. The guest is now stopped on the source only for the final rounds
+and the documents.
+
+### The destination's sync
+
+The same moves relayed into `hvi restore --from-stream -` on rp2, onto a
+copy of the base made and synced just before each move, then resumed
+once the restore reported `restored-paused`. Downtime is from the park
+to the resume reply, both on rp2's clock. Three passes of 30 on
+`5d68d7f`, at different times:
+
+| Host | Downtime: median, 90th percentile, longest | Moves at 300 ms or more | The restore's sync of those |
+| --- | --- | --- | --- |
+| idle | 46, 622, 3666 ms | 23 of 90 | 87 to 99 % of the downtime |
+| hog | 56, 713, 2219 ms | 32 of 90 | 89 to 99 % |
+
+In the median move the restore's waits for its syncs came to 8 ms idle
+and 24 ms under the hog. The long ones are all the sync, for one of
+three reasons, each about as common:
+
+- The sync of a running round was still under way when the next round
+  ended, so that round was left to the final round's sync (`left to a
+  later one`: 1): 10 of the 23 idle and 15 of the 32 hog moves, 0.3 to
+  3.7 s.
+- The final round had 2 to 75 blocks of the guest's writer: 10 and 7.
+- The final round had 1 block or none, and the sync was the drive's
+  flush alone: 3 and 10, 0.3 to 0.7 s. No scheduling of the writeback
+  shortens that one.
+
+A copy of the base still in the page cache when the move starts adds
+its whole writeback to the first sync, which the final round then waits
+for: with a plain `cp` of the 128 MiB image just before each move, 12 of
+30 moves had 3.2 to 42 s of downtime, all of it the final round waiting
+for that sync. A mover syncs its copy first; hull does (its copy of a
+base is synced before it is used).
+
+Two ways to start the earlier rounds' writeback sooner were built and
+measured against `5d68d7f` in paired passes, and neither was kept:
+
+- A thread of its own that syncs the disk as it opens and after every
+  round, one sync for the rounds that ended during the one before, with
+  the stream never waiting for it. Its medians were the same (42 against
+  43 ms idle, 50 against 56 ms under the hog), but its longest moves
+  were 13.0 and 12.6 s against 3.7 and 1.4 s, and an earlier pass showed
+  the same: more syncs leave one more under way when the final round
+  ends, and on this drive a flush can take seconds.
+- The same with `sync_file_range` starting the writeback on the stream's
+  thread as the blocks land: 2 of 30 restores stopped reading while the
+  drive timed out its writes, most likely in that call, and the source
+  cut each stream as stalled after 30 s.
+
+So the restore keeps its sync after the final round, for the guest's
+writes to be durable before it runs, and the downtime of a move onto a
+busy disk is mostly that sync.
+
+### A reader that slows down in the pause
+
+A reader that takes the stream at 16 KiB/s from the final disk round on,
+4 moves per build on rp2: with the build before, the stream failed at the paused
+budget part way through a frame, the reader had taken 244341 bytes, and
+then no byte came for 120 s, the reader's own limit, in 4 of 4: the
+connection stayed open after the refusal. With `2e7fb90` the reader
+reached the end of the connection as soon as it had taken the same
+244341 bytes, 14.9 s after the final disk round in 4 of 4, which is the
+time those bytes take at 16 KiB/s; hvi cut the stream at the budget. A
+reader at 64 KiB/s took the final round within the budget, and when one
+did not it read the refusal where a header was due: with the build before the
+connection then stayed open 30 s, the reader's limit.
 
 ## Moving the disk by its blocks
 
