@@ -573,36 +573,52 @@ reset at once: the new gateway answers its next segment with a RST. A
 connection the guest only reads from, such as an API response stream,
 sends nothing, so nothing resets it, and it waits for its keepalive timer:
 Claude Code waited 61 to 64 s on its stream after each of six moves on
-2026-10-16. The guest agent, `urunit-agent` (urunc's `cmd/urunit-agent`,
-from `3a3f2fd` on), reads the uevent and destroys each TCP socket in a
-state that expects its peer and whose peer is not loopback or the guest's
-own address, with inet_diag `SOCK_DESTROY`. That needs
-`CONFIG_INET_DIAG_DESTROY`, which the fragment sets. The client's next
-call fails with `ECONNABORTED`, and it connects again from the new host.
-The agent logs one line per move in the kernel log, such as
-`urunit-agent: migration 1: closed 1 TCP connections to peers off the guest
-in 2ms`.
+2026-10-16. A new version of the guest agent, `urunit-agent` (urunc's
+`cmd/urunit-agent`, on its branch `feat/agent-migration-tcp-reset`, not
+yet published or in a boot bundle), reads the uevent and destroys each TCP
+socket in a state that expects its peer, with inet_diag `SOCK_DESTROY`. It
+leaves a socket whose peer is loopback, one of the guest's addresses or
+reached through an interface without the default route, and one that heard
+from its peer since the move. That needs `CONFIG_INET_DIAG_DESTROY`, which
+the fragment sets. The client's next call fails with `ECONNABORTED`, and it
+connects again from the new host. The agent logs one line per move in the
+kernel log, such as `urunit-agent: migration 1: closed 2 TCP connections to
+peers off the guest in 6ms`. Until a published bundle carries that agent,
+a guest that boots this Image keeps its connections open across a move as
+it did with the four-patch one.
 
 Measured on 2026-10-16, moving a teleportable `claude-code` session from
 the Mac to rp2 with a stand-in for an API stream in the guest: a Python
 reader with curl's keepalive (60 s idle, 60 s interval) on a connection to
 a server on rp1 that sends one line and then nothing for 120 s (600 s in
-the last two moves, which began later). The time is from the guest's
-resume, the driver's `generation 4` line, to the reader's error, on the
-guest's clocks, which stop while it is paused:
+the last two moves, which began later). The reader polls `generation`
+every 10 ms, and the time is from the poll that saw it change to the
+reader's error, on the guest's CLOCK_MONOTONIC, which stops while the
+guest is paused:
 
-| | Kernel, agent | Moves | Resume to the reader's error |
+| | Kernel, agent | Moves | The generation's change to the reader's error |
 | --- | --- | --- | --- |
 | Before | `e85e4338…`, the bundle's agent | 3 | 53.0, 52.4 and 21.1 s, `ECONNRESET` at the next keepalive, 60.6 to 124.5 s after the last data |
-| After | `77870036…`, the agent at `3a3f2fd` | 4 | under 5 ms each time, `ECONNABORTED`. The agent logged `closed 1 TCP connections` in 2 to 3 ms |
+| After | `77870036…`, the agent's first version | 4 | `ECONNABORTED` within that 10 ms poll each time (-5 to +2 ms from it). The agent logged `closed 1 TCP connections` in 2 to 3 ms |
 
-"Under 5 ms" is as close as the probe measures: it reads the generation
-every 10 ms, and the kernel log's clock and CLOCK_MONOTONIC differ by a
-few milliseconds. In the last two moves the reader also held a loopback
-connection open across the move, and it still carried a byte afterwards.
+In the last two moves the reader also held a loopback connection open
+across the move, and it still carried a byte afterwards.
 The guest was paused 0.14 to 45.5 s in these moves, by hull's estimate.
 The long pauses are the destination delay that is still open on rp2; the
 reader's result did not depend on them.
+
+The reviewed version of the agent moved the same way between the Pis,
+rp2 to rp1 and back, with the server on rp1 and the same reader. After
+each move one command in the guest read `snapshot` and CLOCK_MONOTONIC
+together, which puts `base_ns` on the reader's clock: the restore sets
+`base_ns` to the guest's time at the capture, so it marks the resume with
+no poll in it, and the reader's poll saw the new generation 2 to 2.5 ms
+after it. The stream failed with `ECONNABORTED` 8.8 and 9.5 ms after
+`base_ns`. A connection the reader opened 2 to 3 ms after the resume was
+closed too: `tcp_info` times a socket's last packet in ticks, so the agent
+cannot tell a connection that new from one that last heard from its peer
+just before the pause, and closes both. A loopback connection still
+carried a byte after each move.
 
 ### Clock policy
 
