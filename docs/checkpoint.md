@@ -806,8 +806,20 @@ When the rounds with the guest running end, the source:
      every flush the guest was told had completed with an `fdatasync`.
      The writes since the guest's last flush are in the host's page cache,
      as they were before the move.
-   - A fenced source never runs again, and a stream sent again to the fence
-     owner reads the disk through the same page cache.
+   - A source fenced at the seal does not run from its file as it is
+     again. A mover that aborts the move after the seal and takes the
+     guest back here restores the stream it spooled onto the source's
+     disk (hull restores its spool with `restore --from-stream` onto the
+     instance's own `--disk`, and syncs the spool before it seals it). The stream's
+     disk rounds, round 0 counting from the boot, rewrite every block the
+     guest wrote since the boot, and the restore syncs them before the
+     guest runs, so a write the host lost from the unsynced file in a
+     crash comes back from the spool. That rests on two things: the
+     mover's spool holds the whole stream and is durable before the
+     move goes on, which is the mover's duty, and the restore writes
+     every round into `--disk`, which a restore test pins. A stream sent
+     again to the fence owner reads the disk through the same page
+     cache.
 
    That sync was most of the guest's downtime on a busy host: with an
    `O_DIRECT` writer beside it on the Pi a median of 300 ms, and up to

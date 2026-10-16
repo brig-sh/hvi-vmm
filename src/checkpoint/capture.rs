@@ -215,10 +215,13 @@ impl Capture {
     ///
     /// A move whose stream carries the disk rounds leaves the sync out: the
     /// destination has every block the guest wrote, and syncs its own copy
-    /// before the guest runs there. The source's file matters again only if
-    /// the move fails and the guest runs on here, and then the guest's own
-    /// flushes, every one of which the device served with a sync, are what
-    /// its durability rests on, as on any running guest.
+    /// before the guest runs there. If the move fails before the seal and
+    /// the guest runs on here, the guest's own flushes, every one of which
+    /// the device served with a sync, are what its durability rests on, as
+    /// on any running guest. A mover that takes the guest back after the
+    /// seal restores its spool of the stream onto this file, and the
+    /// rounds rewrite every block written since the boot and are synced
+    /// first, so the file's unsynced writes are not what it runs on.
     ///
     /// # Errors
     ///

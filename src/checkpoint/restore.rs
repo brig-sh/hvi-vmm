@@ -1572,6 +1572,30 @@ pub(crate) mod tests {
         );
     }
 
+    // A source that takes back a move it aborted restores the spooled
+    // stream onto its own disk, without --disk-base-sha256. That disk was
+    // not synced in the pause, so a host crash can have lost the writes
+    // still in its page cache; the rounds rewrite every block written
+    // since boot, so the restore gives the disk as it was at the fence.
+    #[test]
+    fn a_stream_restored_onto_a_stale_source_disk_gives_the_fence_time_disk() {
+        let scratch = Scratch::new("stream-disk-stale");
+        let bytes = disk_stream(&scratch, |_| {});
+        // Only the blocks the rounds carry differ from the fence-time
+        // disk: block 0 as written, block 1 with an older write, block 2
+        // with its write lost. The blocks not written since boot are the
+        // base on both.
+        let mut stale = written_disk();
+        stale[65536..65536 + 300].fill(0x99);
+        stale[2 * 65536..2 * 65536 + 300].fill(0);
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(scratch.disk(), &stale).unwrap();
+        assert!(read_disk_back(&scratch) != written_disk());
+        read_stream(&bytes[..], "test", None, Some(&scratch.disk()), None)
+            .expect("the spooled stream restores onto the source's disk");
+        assert!(read_disk_back(&scratch) == written_disk());
+    }
+
     fn disk_stream_refusal(name: &str, edit: impl FnOnce(&mut DiskState)) -> String {
         let scratch = Scratch::new(name);
         let bytes = disk_stream(&scratch, edit);
