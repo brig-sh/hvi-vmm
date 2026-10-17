@@ -40,13 +40,14 @@ use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
     mpidr_affinity, place_virtio_fs, vcpu_index, virtio_blk_base, virtio_blk_spi, GicLayout,
-    GicVersion, DEVICE_WINDOW_END, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GicVersion, DEVICE_WINDOW_END, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE, UART_SPI,
+    VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
+use crate::devices::legacy::rtc_pl031::Pl031;
 use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
@@ -302,6 +303,10 @@ struct Shared {
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     pl011: Arc<Mutex<Pl011>>,
+    /// The PL031 RTC.
+    ///
+    /// It has no interrupt line, because the alarm never fires.
+    rtc: Arc<Mutex<Pl031>>,
     fs: Vec<SharedFs>,
     kernel_addr: u64,
     dtb_addr: u64,
@@ -355,6 +360,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         .map(|base| ("virtio-blk", base, VIRTIO_SIZE));
     for (name, base, size) in [
         ("UART", UART_BASE, UART_SIZE),
+        ("RTC", RTC_BASE, RTC_SIZE),
         ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
         ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
     ]
@@ -573,6 +579,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
+        rtc: Arc::new(Mutex::new(Pl031::new())),
         fs,
         kernel_addr: layout.kernel_addr,
         dtb_addr: layout.dtb_addr,
@@ -854,6 +861,9 @@ fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32) -> ControlFlow<Outcome> {
                     if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
                         service_uart(vcpu, sh, ipa - UART_BASE, syn);
                         advance_pc(vcpu);
+                    } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&ipa) {
+                        service_rtc(vcpu, sh, ipa - RTC_BASE, syn);
+                        advance_pc(vcpu);
                     } else if let Some((dev, offset)) = sh.guest.disk_at(ipa, VIRTIO_SIZE) {
                         service_dev(vcpu, sh, dev, offset, syn);
                         advance_pc(vcpu);
@@ -1005,6 +1015,22 @@ fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
         p.mmio(offset, true, v);
     } else {
         let v = p.mmio(offset, false, 0) & width_mask(da.width);
+        write_gpr(vcpu, da.reg, v);
+    }
+}
+
+/// Services a PL031 MMIO access at `offset` into the RTC's window.
+fn service_rtc(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
+    let da = DataAbort::from_syndrome(syndrome);
+    if !da.isv {
+        return;
+    }
+    let width = usize::from(da.width);
+    let mut rtc = lock_or_recover(&sh.rtc);
+    if da.is_write {
+        rtc.mmio(offset, width, true, read_gpr(vcpu, da.reg));
+    } else {
+        let v = rtc.mmio(offset, width, false, 0);
         write_gpr(vcpu, da.reg, v);
     }
 }

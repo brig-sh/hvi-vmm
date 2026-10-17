@@ -532,6 +532,16 @@ jobs:
             || { echo "::error::the arm64 guest did not boot"; exit 1; }
           grep -q "HVI-INITRAMFS-UP" run.log \
             || { echo "::error::the arm64 guest did not reach userspace"; exit 1; }
+          # A kernel with rtc-pl031 and HCTOSYS prints the time it took from
+          # the RTC. The unit tests stop at the register file and the
+          # devicetree, so this is where the MMIO dispatch is checked.
+          if grep -qa "rtc-pl031" guest/Image; then
+            grep -q "setting system clock to 20" run.log \
+              || { echo "::error::the guest has rtc-pl031 but did not set its clock from the RTC"; exit 1; }
+            echo "the guest set its clock from the PL031 ✓"
+          else
+            echo "RTC not checked: the guest kernel lacks rtc-pl031"
+          fi
       # The tail above keeps 25 lines. When the job fails, the full log and
       # the event ledger answer what those lines cannot.
       - name: keep the boot evidence
@@ -871,6 +881,16 @@ jobs:
             echo "pointer authentication reached the guest ✓"
           else
             echo "pointer authentication not checked: the host CPU or the guest kernel lacks it"
+          fi
+          # A kernel with rtc-pl031 and HCTOSYS prints the time it took from
+          # the RTC. The unit tests stop at the register file and the
+          # devicetree, so this is where the MMIO dispatch is checked.
+          if grep -qa "rtc-pl031" guest/Image; then
+            grep -q "setting system clock to 20" run.log \
+              || { echo "::error::the guest has rtc-pl031 but did not set its clock from the RTC"; exit 1; }
+            echo "the guest set its clock from the PL031 ✓"
+          else
+            echo "RTC not checked: the guest kernel lacks rtc-pl031"
           fi
       # The tap attach is the urunc integration path: urunc creates the tap and
       # hvi only opens it, so a CI tap created with `ip tuntap` stands in for
