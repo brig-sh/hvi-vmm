@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 520" width="720" height="520" role="img" aria-labelledby="t d">
   <title id="t">arm64 guest physical address space</title>
-  <desc id="d">Address-ordered map of the arm64 guest. Devices sit above the GIC: the GIC at 0x08000000, the PL011 UART at 0x0c000000, and a virtio-mmio window of 0x200-byte device pages starting at 0x0d000000 (disk 0, net, vsock, disks 1 to 3, then one page per virtio-fs share). Guest RAM is one contiguous span starting at 0x40000000, with the kernel, devicetree blob and initramfs packed upward from its base. Addresses are ordered but not to scale.</desc>
+  <desc id="d">Address-ordered map of the arm64 guest. Devices sit above the GIC: the GIC at 0x08000000, the PL011 UART at 0x0c000000, the PL031 RTC at 0x0c001000 (no interrupt), and a virtio-mmio window of 0x200-byte device pages starting at 0x0d000000 (disk 0, net, vsock, disks 1 to 3, then one page per virtio-fs share). Guest RAM is one contiguous span starting at 0x40000000, with the kernel, devicetree blob and initramfs packed upward from its base. Addresses are ordered but not to scale.</desc>
 
   <rect x="0" y="0" width="720" height="520" fill="#f6f7f9"/>
 
@@ -26,16 +26,16 @@
   <text x="412" y="216" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#9ca3af">unmapped</text>
 
   <!-- GIC -->
-  <rect x="24" y="422" width="380" height="76" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
-  <text x="40" y="442" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#5b21b6">Interrupt controller (GIC)</text>
-  <text x="40" y="461" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x0800_0000  distributor, 0x1_0000</text>
-  <text x="40" y="478" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x080A_0000  redistributor  (v3)</text>
-  <text x="40" y="492" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x0801_0000  CPU interface  (v2)</text>
+  <rect x="24" y="432" width="380" height="76" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="40" y="452" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#5b21b6">Interrupt controller (GIC)</text>
+  <text x="40" y="471" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x0800_0000  distributor, 0x1_0000</text>
+  <text x="40" y="488" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x080A_0000  redistributor  (v3)</text>
+  <text x="40" y="502" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6d28d9">0x0801_0000  CPU interface  (v2)</text>
 
-  <text x="420" y="442" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">The version follows the host, not</text>
-  <text x="420" y="459" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">a flag. GICv2 caps the guest at</text>
-  <text x="420" y="476" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">8 vCPUs. On macOS the framework</text>
-  <text x="420" y="493" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">sizes the redistributor region.</text>
+  <text x="420" y="452" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">The version follows the host, not</text>
+  <text x="420" y="469" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">a flag. GICv2 caps the guest at</text>
+  <text x="420" y="486" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">8 vCPUs. On macOS the framework</text>
+  <text x="420" y="503" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">sizes the redistributor region.</text>
 
   <!-- virtio window -->
   <rect x="24" y="230" width="380" height="126" rx="6" fill="#dcfce7" stroke="#22c55e" stroke-width="1.5"/>
@@ -53,9 +53,10 @@
   <text x="420" y="340" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">+ <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">i * 0x200</tspan>.</text>
 
   <!-- UART -->
-  <rect x="24" y="358" width="380" height="48" rx="6" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.5"/>
-  <text x="40" y="378" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#92400e">Console</text>
+  <rect x="24" y="358" width="380" height="70" rx="6" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="40" y="378" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#92400e">Console and clock</text>
   <text x="40" y="397" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#b45309">0x0c00_0000  PL011 UART, 0x1000   SPI 1  INTID 33</text>
+  <text x="40" y="415" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#b45309">0x0c00_1000  PL031 RTC, 0x1000    no IRQ</text>
 
   <text x="420" y="386" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">
     <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">stdout-path</tspan> in the devicetree.

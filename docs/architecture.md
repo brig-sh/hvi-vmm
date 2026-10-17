@@ -33,8 +33,9 @@ usual mistake:
   devicetree and PSCI. An x86-64 guest gets a `bzImage` or an uncompressed
   `vmlinux` with a `boot_params` page, an e820 map, an MP table and ACPI tables
   for power-off and reset. Some devices are architecture-specific too: PL011
-  against 16550, and a CMOS RTC and ACPI power-management registers that only
-  x86 needs.
+  against 16550, a PL031 RTC where x86 has a CMOS RTC, and ACPI power-management
+  registers that only x86 needs. The PL031 is `vm-superio`'s, the crate the
+  x86-64 UART already wraps.
 
 Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file
 with a `Kick` and an `IrqLine` implementation and a `Guest` built from them, its
@@ -57,7 +58,7 @@ flowchart TB
         subgraph shared["Shared core"]
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable / acpi"]
-            dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos / acpi_pm"]
+            dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos / rtc_pl031 / acpi_pm"]
             obs["plugin: the seam<br/>plugin::builtin · events ledger"]
             vm["hypervisor: vcpus / guest / kvm / quiesce"]
             rt["run: spawn / stop / supervisor<br/>io_threads · signal<br/>terminal: filter / raw / input"]
@@ -123,7 +124,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
 ### Guest memory maps
 
-<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, virtio-mmio window from 0x0d000000 with disk 0, net, vsock, disks 1 to 3 and the virtio-fs shares, RAM at 0x40000000" width="720">
+<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, PL031 RTC at 0x0c001000, virtio-mmio window from 0x0d000000 with disk 0, net, vsock, disks 1 to 3 and the virtio-fs shares, RAM at 0x40000000" width="720">
 
 **aarch64** (`arch/aarch64/layout.rs`). Devices sit above the GIC, RAM at 1 GiB.
 
@@ -133,6 +134,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 | GIC CPU interface (v2) | `0x0801_0000` | `0x1_0000` shared | |
 | GIC redistributor (v3) | `0x080A_0000` | `0x2_0000` per vCPU | |
 | PL011 UART | `0x0c00_0000` | `0x1000` | SPI 1, INTID 33 |
+| PL031 RTC | `0x0c00_1000` | `0x1000` | none |
 | virtio-blk, disk 0 | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
 | virtio-net | `0x0d00_0200` | `0x200` | SPI 3, INTID 35 |
 | virtio-vsock | `0x0d00_0400` | `0x200` | SPI 4, INTID 36 |
@@ -210,7 +212,7 @@ assume a count. It returns one region on arm64, and on x86-64 one region up to
 flowchart TB
     A["Payload::load: linux-loader PE::load(kernel)<br/>magic check, kernel@RAM_BASE+text_offset<br/>image_size read from the header"] --> B
     B["LoadedKernel::plan: GuestLayout::new<br/>dtb@align2M(kernel+image_size)<br/>initrd@align4K(dtb_end)"] --> C
-    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011<br/>virtio_mmio@… per device"] --> D
+    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011 /pl031<br/>virtio_mmio@… per device"] --> D
     D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
 ```
 
@@ -218,9 +220,11 @@ flowchart TB
 PSCI with `method = "hvc"`, the interrupt controller the backend chose
 (`arm,gic-v3`, or `arm,cortex-a15-gic` for the compatible QEMU virt advertises
 for its vGICv2), the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock,
-the PL011 console as `stdout-path`, and one `virtio_mmio@…` node per backed
-device. The timer node is marked `always-on`, because the hypervisor keeps each
-vCPU's timer while the vCPU is out of the guest.
+the PL011 console as `stdout-path`, the PL031 RTC as `pl031@c001000`, and one
+`virtio_mmio@…` node per backed device. The PL031 node has no `interrupts`,
+because the `vm-superio` RTC has no alarm. Without an IRQ, Linux's rtc-pl031
+offers no alarm either. The timer node is marked `always-on`, because the
+hypervisor keeps each vCPU's timer while the vCPU is out of the guest.
 
 `/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
 every boot. Under HVF it is the guest's only entropy source at boot, since the
@@ -235,7 +239,8 @@ once it has read it.
 
 The `/apb-pclk` node is load-bearing rather than decorative: the PL011 node's
 `clocks` property points at it twice, and the `amba-pl011` driver needs that
-to bind.
+to bind. The PL031 node points at it once, as `apb_pclk`, the same clock the
+UART uses.
 
 Each cpu node's `reg` is the vCPU's MPIDR affinity, numbered the way KVM resets
 it: the index's low four bits in Aff0 and the next eight in Aff1, so vCPU 16 is
@@ -483,7 +488,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `acpi_pm.rs`; `devices/irq.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

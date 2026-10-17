@@ -16,8 +16,9 @@
 //!
 //! The addresses below mirror QEMU's `virt` board so a guest kernel configured
 //! for QEMU/virt (the arm64 build of the repo guest kernel) boots unmodified:
-//! RAM at 1 GiB, the GICv3 and a PL011 UART in the low MMIO window beneath it.
-//! The PL011 carries first-boot serial output (`earlycon`), and the virtio-mmio
+//! RAM at 1 GiB, the GICv3, a PL011 UART and a PL031 RTC in the low MMIO
+//! window beneath it. The PL011 carries first-boot serial output (`earlycon`),
+//! the PL031 gives the guest the wall clock at boot, and the virtio-mmio
 //! devices have a window of their own from [`VIRTIO_BASE`]. The GIC base/size
 //! must agree with what `hv_gic` actually claims, so [`GicLayout::QEMU_VIRT`]
 //! is treated as the default and reconciled against `applevisor`'s GIC size
@@ -58,6 +59,16 @@ pub const UART_BASE: u64 = 0x0c00_0000;
 pub const UART_SIZE: u64 = 0x1000;
 /// UART interrupt as a GIC SPI number (INTID = 32 + SPI = 33).
 pub const UART_SPI: u32 = 1;
+
+/// PL031 RTC MMIO base and size.
+///
+/// The RTC sits in the page right above the UART. That keeps it above the
+/// Apple redistributor region and below [`DEVICE_WINDOW_END`]. It is also above
+/// [`UART_BASE`], so the bound in [`GicLayout::V3_MAX_CPUS`] still holds.
+///
+/// The RTC has no SPI. [`crate::arch::aarch64::fdt`] says why.
+pub const RTC_BASE: u64 = 0x0c00_1000;
+pub const RTC_SIZE: u64 = 0x1000;
 
 /// virtio-mmio device windows and interrupts, above the GIC and clear of the
 /// UART. Each device is one 0x200 page with its own SPI, in this order:
@@ -470,6 +481,13 @@ mod tests {
             GicLayout::for_vcpus(GicVersion::V3, max + 1).is_err(),
             "one vCPU more must be refused, not overlapped"
         );
+        // The bound covers the RTC only while the RTC sits above the UART.
+        const {
+            assert!(
+                RTC_BASE >= UART_BASE + UART_SIZE,
+                "the RTC sits above the UART"
+            )
+        };
     }
 
     /// The refusal that no CI job reaches: the Pi 5 lane is the only host that
@@ -572,29 +590,44 @@ mod tests {
     }
 
     // Every disk adds a window and an SPI. Neither may land on another device,
-    // and the exports start right after the last disk slot.
+    // and the exports start right after the last disk slot. The RTC has a
+    // window and no SPI.
     #[test]
     fn disk_windows_and_spis_clash_with_no_other_device() {
         let mut windows = vec![
-            ("uart", UART_BASE, UART_SPI),
-            ("net", VIRTIO_NET_BASE, VIRTIO_NET_SPI),
-            ("vsock", VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI),
+            ("uart", UART_BASE, UART_SIZE, Some(UART_SPI)),
+            ("rtc", RTC_BASE, RTC_SIZE, None),
+            ("net", VIRTIO_NET_BASE, VIRTIO_SIZE, Some(VIRTIO_NET_SPI)),
+            (
+                "vsock",
+                VIRTIO_VSOCK_BASE,
+                VIRTIO_SIZE,
+                Some(VIRTIO_VSOCK_SPI),
+            ),
         ];
         for i in 0..32 {
-            windows.push(("fs", virtio_fs_base(i).unwrap(), virtio_fs_spi(i).unwrap()));
+            windows.push((
+                "fs",
+                virtio_fs_base(i).unwrap(),
+                VIRTIO_SIZE,
+                Some(virtio_fs_spi(i).unwrap()),
+            ));
         }
         for i in 0..MAX_DISKS {
             windows.push((
                 "blk",
                 virtio_blk_base(i).expect("a disk slot"),
-                virtio_blk_spi(i).expect("a disk SPI"),
+                VIRTIO_SIZE,
+                Some(virtio_blk_spi(i).expect("a disk SPI")),
             ));
         }
-        for (a, (na, base_a, spi_a)) in windows.iter().enumerate() {
-            for (nb, base_b, spi_b) in windows.iter().skip(a + 1) {
-                let overlap = base_a < &(base_b + VIRTIO_SIZE) && base_b < &(base_a + VIRTIO_SIZE);
+        for (a, (na, base_a, size_a, spi_a)) in windows.iter().enumerate() {
+            for (nb, base_b, size_b, spi_b) in windows.iter().skip(a + 1) {
+                let overlap = base_a < &(base_b + size_b) && base_b < &(base_a + size_a);
                 assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
-                assert_ne!(spi_a, spi_b, "{na} and {nb} share SPI {spi_a}");
+                if spi_a.is_some() {
+                    assert_ne!(spi_a, spi_b, "{na} and {nb} share SPI {spi_a:?}");
+                }
             }
         }
         assert_eq!(virtio_blk_base(0), Some(VIRTIO_BASE), "disk 0 stays put");
@@ -643,6 +676,7 @@ mod tests {
         let last_disk = virtio_blk_base(MAX_DISKS - 1).unwrap();
         let windows = [
             ("uart", UART_BASE, UART_SIZE),
+            ("rtc", RTC_BASE, RTC_SIZE),
             ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
             ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
             ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
