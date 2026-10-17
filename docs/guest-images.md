@@ -76,7 +76,7 @@ CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_RTC_DRV_CMOS=y               # not optional, see below
 CONFIG_X86_MPPARSE=y                # the CPUs from the MP table, without ACPI
-CONFIG_ACPI=y                       # power off, see below
+CONFIG_ACPI=y                       # power off and the console's IRQ, see below
 ```
 
 hvi implements the CMOS real-time clock on x86-64 because a guest that reads
@@ -92,6 +92,14 @@ the MP table. A kernel without `CONFIG_ACPI`, or booted with `acpi=off`, reads
 the MP table instead and has no way to power off: `poweroff` halts it, and hvi
 does not see the halt. `reboot -f` ends the run either way, through the ACPI
 reset register or the i8042's reset command.
+
+The DSDT also names COM1 as a PNP0501 device, with its eight ports at `0x3f8`
+and its interrupt on GSI 4. With ACPI, the 8250 driver takes ttyS0's line from
+that device and does not probe for it. Without ACPI (no `CONFIG_ACPI`, or
+`acpi=off`), a kernel with `CONFIG_SERIAL_8250_DETECT_IRQ`, which the x86-64
+defconfig sets, probes the line at boot. A probe that misses leaves ttyS0 on
+irq 0, polled at 9600 baud, and each 4 KiB of console output then takes about
+four seconds to drain.
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.
