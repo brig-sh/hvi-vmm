@@ -460,8 +460,6 @@ fn serve_requests<K: Kick>(
         pending.extend_from_slice(&chunk[..n]);
         while let Some(end) = pending.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
-            // Whatever the client sent after a stream that failed is not
-            // read: the connection is shut down.
             if answer(conn, stop, machine, &line[..end])? == Served::Closed {
                 return Ok(());
             }
@@ -482,7 +480,7 @@ fn serve_requests<K: Kick>(
 enum Served {
     /// The connection takes the next request.
     Open,
-    /// The connection was shut down, after a stream that failed.
+    /// The connection closes, after a stream that failed.
     Closed,
 }
 
@@ -561,10 +559,6 @@ fn stream_and_reply<K: Kick>(
         Err(e) if retry_read(&e) => {}
         Err(e) => eprintln!("{LOG_PREFIX} control socket: the refusal after a stream: {e}"),
     }
-    // The connection closes when it is dropped, after [`serve`] has read
-    // what the client left unread; the shutdown says so to the reader even
-    // if another handle on the socket outlives it.
-    let _ = out.conn.shutdown(std::net::Shutdown::Both);
     Ok(Served::Closed)
 }
 
