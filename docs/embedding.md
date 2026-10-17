@@ -89,7 +89,7 @@ let cfg = BootConfig {
     initramfs: Some(std::fs::read("initramfs.cpio")?),
     mem_bytes: 1024 << 20,
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
-    disk: None,
+    disks: Vec::new(),
     fs_shares: Vec::new(),
     fs: Vec::new(),
     net: true,
@@ -128,7 +128,7 @@ cargo build --release --example watch_guest
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
-| `disk` | `Option<String>` | One virtio-blk backing file. |
+| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
 | `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
 | `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
 | `net` | `bool` | The built-in stub stack. |

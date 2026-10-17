@@ -178,10 +178,11 @@ sudo apt-get install -y --no-install-recommends linux-image-virtual
   --cmdline "console=ttyS0 panic=-1"
 ```
 
-hvi appends `console=ttyS0` and the `virtio_mmio.device=` arguments its own
-devices need, so an x86-64 guest has a console even with the default
-`--cmdline`. Pass `console=ttyS0` anyway: the default names `ttyAMA0`, which
-is the arm64 console and does nothing here.
+hvi appends `console=ttyS0`, so an x86-64 guest has a console even with the
+default `--cmdline`. Pass `console=ttyS0` anyway: the default names `ttyAMA0`,
+which is the arm64 console and does nothing here. The devices are in the ACPI
+tables, so the guest kernel needs `CONFIG_ACPI`, which every distribution
+kernel has.
 
 `tools/mk-initramfs.py` builds an **arm64** initramfs only. For an x86-64
 guest, supply your own, or boot without one and let the kernel stop at the

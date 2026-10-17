@@ -48,11 +48,11 @@ use std::time::Duration;
 use kvm_bindings::{kvm_dtable, kvm_pit_config, kvm_segment, CpuId};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 
-use crate::arch::x86_64::acpi;
+use crate::arch::x86_64::acpi::{self, MmioDevice};
 use crate::arch::x86_64::layout::{
-    virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, ACPI_PM_PORT, BOOT_STACK, COM1_GSI, COM1_PORT,
-    GDT_ADDR, HIGH_RAM_BASE, I8042_COMMAND_PORT, MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR,
-    PML4_ADDR, RAM_BASE, VIRTIO_BLK_BASE, VIRTIO_BLK_GSI, VIRTIO_NET_BASE, VIRTIO_NET_GSI,
+    virtio_blk_base, virtio_blk_gsi, virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, ACPI_PM_PORT,
+    BOOT_STACK, COM1_GSI, COM1_PORT, GDT_ADDR, HIGH_RAM_BASE, I8042_COMMAND_PORT, MAX_FS_DEVICES,
+    MMIO_GAP_START, MPTABLE_ADDR, PDPT_ADDR, PML4_ADDR, RAM_BASE, VIRTIO_NET_BASE, VIRTIO_NET_GSI,
     VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::arch::x86_64::loader::LoadedKernel;
@@ -61,13 +61,13 @@ use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::virtio::block::VirtioBlk;
+use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::{CapturedEvent, Emitter};
-use crate::hypervisor::guest::{Guest, PluginThreads, SafepointVcpu};
+use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::kvm::{
     kick_handle, run_guest, run_vcpu, start_io_threads, unhandled_exit, Kicker, KvmIrqLine,
 };
@@ -160,12 +160,9 @@ fn guest_cpuid(mut supported: CpuId) -> CpuId {
 /// A bare `--` on a Linux command line ends the kernel's own parameters:
 /// everything after it is handed to init as argv. Callers that boot a wrapper
 /// init end their line that way -- urunc's is
-/// `... rdinit=/init -- <container entrypoint>` -- so appending our device
-/// descriptors would put them on the wrong side of the separator. The guest
-/// would then come up with no virtio devices at all and pass
-/// `virtio_mmio.device=...` to init as an argument, which is exactly as
-/// confusing to debug as it sounds: the devices are attached, the command line
-/// looks right, and nothing probes.
+/// `... rdinit=/init -- <container entrypoint>` -- so appending our console
+/// parameter would put it on the wrong side of the separator. The guest would
+/// then boot with no console and pass `console=ttyS0` to init as an argument.
 ///
 /// So insert ahead of the first standalone `--`, and append when there is none.
 /// Operating on byte offsets rather than tokens keeps the caller's quoting
@@ -190,6 +187,30 @@ fn splice_kernel_args(base: &str, extra: &str) -> String {
         }
         None => format!("{base} {extra}"),
     }
+}
+
+/// Returns the virtio-mmio devices the DSDT describes, the disks first and in
+/// order, then net, vsock and the exports.
+///
+/// Linux registers them in this order, so the disks keep their argv order.
+/// The guest still has to tell them apart by serial.
+fn mmio_devices(disks: usize, net: bool, vsock: bool, exports: &[Export]) -> Vec<MmioDevice> {
+    let device = |base: u64, gsi: u32| MmioDevice {
+        base,
+        size: VIRTIO_SIZE,
+        gsi,
+    };
+    let mut devices: Vec<MmioDevice> = (0..disks)
+        .filter_map(|index| Some(device(virtio_blk_base(index)?, virtio_blk_gsi(index)?)))
+        .collect();
+    if net {
+        devices.push(device(VIRTIO_NET_BASE, VIRTIO_NET_GSI));
+    }
+    if vsock {
+        devices.push(device(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI));
+    }
+    devices.extend(exports.iter().map(|export| device(export.base, export.irq)));
+    devices
 }
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
@@ -263,13 +284,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     vm.create_pit2(kvm_pit_config::default())?;
 
     // Devices.
-    let virtio = match &cfg.disk {
-        Some(path) => {
-            eprintln!("{LOG_PREFIX} virtio-blk: {path}");
-            Some(Arc::new(Mutex::new(VirtioBlk::open(path)?)))
-        }
-        None => None,
-    };
+    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
     let mut net_source: Option<NetSource> = None;
     let net_dev = if let Some(ifname) = &cfg.net_tap {
         // urunc already created the tap and redirected the veth to it, so all
@@ -325,31 +340,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         match (virtio_fs_base(index), virtio_fs_gsi(index)) {
             (Some(base), Some(gsi)) => Ok((base, gsi)),
             _ => Err(std::io::Error::other(format!(
-                "virtio-fs export {index} has no interrupt line left on this machine"
+                "virtio-fs export {index}: x86-64 has interrupt lines for {MAX_FS_DEVICES} exports"
             ))),
         }
     })?;
 
-    // Kernel command line: caller's args + ttyS0 console + virtio-mmio device
-    // descriptors for whatever we attached. (KASLR works now that the guest
-    // CPUID advertises RDRAND, so no nokaslr.)
-    let mut ours = String::from("console=ttyS0");
-    if virtio.is_some() {
-        ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_BLK_BASE:#x}:{VIRTIO_BLK_GSI}");
-    }
-    if net.is_some() {
-        ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_NET_BASE:#x}:{VIRTIO_NET_GSI}");
-    }
-    if vsock.is_some() {
-        ours += &format!(" virtio_mmio.device=0x200@{VIRTIO_VSOCK_BASE:#x}:{VIRTIO_VSOCK_GSI}");
-    }
-    for export in &fs {
-        ours += &format!(
-            " virtio_mmio.device=0x200@{:#x}:{}",
-            export.base, export.irq
-        );
-    }
-    let cmdline = splice_kernel_args(cfg.cmdline.trim(), &ours);
+    // Kernel command line: the caller's args and the ttyS0 console. The
+    // devices are in the DSDT. (KASLR works now that the guest CPUID
+    // advertises RDRAND, so no nokaslr.)
+    let ours = "console=ttyS0";
+    let cmdline = splice_kernel_args(cfg.cmdline.trim(), ours);
 
     // Load the kernel, write boot_params and the command line, then place the
     // initrd, the MP table and the ACPI tables.
@@ -359,7 +359,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         ram.write(addr, initramfs)?;
     }
     ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
-    ram.write(ACPI_ADDR, &acpi::build(num_cpus))?;
+    ram.write(
+        ACPI_ADDR,
+        &acpi::build(
+            num_cpus,
+            &mmio_devices(disks.len(), net.is_some(), vsock.is_some(), &fs),
+        ),
+    )?;
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
     eprintln!(
@@ -407,7 +413,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
                 cfg.events.as_deref(),
                 &cfg.sandbox_id,
             )?)),
-            block: virtio,
+            disks,
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(
@@ -429,7 +435,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
     lock_or_recover(&shared.uart).connect_irq(line(COM1_GSI));
     shared.guest.connect_irqs(
-        line(VIRTIO_BLK_GSI),
+        // `open_disks` refused more disks than there are GSIs.
+        |index| line(virtio_blk_gsi(index).expect("a GSI per disk")),
         line(VIRTIO_NET_GSI),
         line(VIRTIO_VSOCK_GSI),
     );
@@ -744,8 +751,8 @@ fn pio_write(sh: &Shared, port: u16, val: u8) {
 
 /// Services an MMIO read of the virtio register at `addr`.
 fn mmio_read(sh: &Shared, addr: u64) -> u64 {
-    if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
-        blk_read(sh, addr - VIRTIO_BLK_BASE)
+    if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
+        blk_read(sh, dev, off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         net_read(sh, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -759,8 +766,8 @@ fn mmio_read(sh: &Shared, addr: u64) -> u64 {
 
 /// Services an MMIO write of `val` to the virtio register at `addr`.
 fn mmio_write(sh: &Shared, addr: u64, val: u64) {
-    if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_SIZE).contains(&addr) {
-        blk_write(sh, addr - VIRTIO_BLK_BASE, val);
+    if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
+        blk_write(sh, dev, off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         net_write(sh, addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -781,13 +788,10 @@ fn drain(sh: &Shared, events: &[CapturedEvent]) {
     }
 }
 
-/// Services a read of virtio-blk register `off`.
+/// Services a read of register `off` of the virtio-blk device `dev`.
 ///
 /// The device's captured events then go to the ledger.
-fn blk_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.guest.block.as_ref() else {
-        return 0;
-    };
+fn blk_read(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
     let (v, events) = {
         let mut d = dev.lock().unwrap();
         let v = d.mmio(&sh.guest.ram, off, false, 0);
@@ -797,13 +801,10 @@ fn blk_read(sh: &Shared, off: u64) -> u64 {
     v
 }
 
-/// Services a write of `val` to virtio-blk register `off`.
+/// Services a write of `val` to register `off` of the virtio-blk device `dev`.
 ///
 /// The device's captured events then go to the ledger.
-fn blk_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.guest.block.as_ref() else {
-        return;
-    };
+fn blk_write(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
     let events = {
         let mut d = dev.lock().unwrap();
         d.mmio(&sh.guest.ram, off, true, val);
@@ -862,7 +863,36 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
 
 #[cfg(test)]
 mod cmdline_tests {
-    use super::splice_kernel_args;
+    use super::{mmio_devices, splice_kernel_args, MmioDevice};
+
+    // The DSDT lists the disks first, in order, so Linux registers them in
+    // argv order.
+    #[test]
+    fn mmio_devices_list_every_disk_first_and_in_order() {
+        let gsis = |disks, net, vsock| -> Vec<(u64, u32)> {
+            mmio_devices(disks, net, vsock, &[])
+                .iter()
+                .map(|d| (d.base, d.gsi))
+                .collect()
+        };
+        assert_eq!(
+            gsis(3, true, false),
+            [
+                (0xd000_0000, 5),
+                (0xd000_0600, 9),
+                (0xd000_0800, 10),
+                (0xd000_0200, 6)
+            ]
+        );
+        assert!(gsis(0, false, false).is_empty());
+        assert_eq!(gsis(1, false, true), [(0xd000_0000, 5), (0xd000_0400, 7)]);
+        assert!(mmio_devices(1, false, false, &[]).iter().all(|d| *d
+            == MmioDevice {
+                base: 0xd000_0000,
+                size: 0x200,
+                gsi: 5
+            }));
+    }
 
     const OURS: &str = "console=ttyS0 virtio_mmio.device=0x200@0xd0000000:5";
 
@@ -946,7 +976,7 @@ mod vcpu_cap_tests {
             initramfs: None,
             mem_bytes: 128 << 20,
             cmdline: String::new(),
-            disk: None,
+            disks: Vec::new(),
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,

@@ -393,13 +393,185 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
+/// Most virtio-blk disks one guest can have.
+///
+/// Each disk is its own virtio-mmio device with its own window and interrupt,
+/// and every backend reserves exactly this many slots for them (see
+/// `virtio_blk_base` in each architecture's layout module).
+pub const MAX_DISKS: usize = 4;
+
+/// One host file or block device backing a virtio-blk disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskConfig {
+    /// Host path of the image file or block device.
+    pub path: String,
+    /// Whether the disk is read-only.
+    ///
+    /// A read-only disk is opened `O_RDONLY` and advertised to the guest with
+    /// `VIRTIO_BLK_F_RO`. A write the guest sends anyway fails with an I/O
+    /// error.
+    pub read_only: bool,
+    /// The serial the disk answers `GET_ID` with, or `None` for
+    /// [`disk_serial`] of its position.
+    ///
+    /// The guest reads it from `/sys/block/vdX/serial`, so an initrd finds a
+    /// disk by a name the caller chose.
+    pub serial: Option<String>,
+}
+
+impl DiskConfig {
+    /// The syntax [`parse`](Self::parse) takes, for an error to quote.
+    pub const SYNTAX: &'static str = "<path> or path=<path>[,readonly=on|off][,serial=<id>]";
+    /// The longest serial, which is the length of the `GET_ID` field.
+    pub const MAX_SERIAL_LEN: usize = 20;
+
+    /// Returns a writable disk backed by `path`, with the default serial.
+    #[must_use]
+    pub fn rw(path: impl Into<String>) -> Self {
+        DiskConfig {
+            path: path.into(),
+            read_only: false,
+            serial: None,
+        }
+    }
+
+    /// Returns a read-only disk backed by `path`, with the default serial.
+    #[must_use]
+    pub fn ro(path: impl Into<String>) -> Self {
+        DiskConfig {
+            path: path.into(),
+            read_only: true,
+            serial: None,
+        }
+    }
+
+    /// Returns the disk `spec` describes, in the syntax of
+    /// [`SYNTAX`](Self::SYNTAX).
+    ///
+    /// A spec that does not start with `path=` is a bare path, so a file whose
+    /// name holds `=` or `,` still attaches. The `path=` form is Cloud
+    /// Hypervisor's `--disk`.
+    ///
+    /// # Errors
+    ///
+    /// Errors on an empty path, on a key that is unknown or repeated, on a
+    /// `readonly` that is not `on` or `off`, and on a serial that is empty,
+    /// longer than 20 bytes, or holds a byte outside printable ASCII.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let bad = |why: String| format!("--disk {spec:?}: {why}; expected {}", Self::SYNTAX);
+        if !spec.starts_with("path=") {
+            if spec.is_empty() {
+                return Err(bad("no path".into()));
+            }
+            return Ok(Self::rw(spec));
+        }
+        let mut fields: Vec<(&str, &str)> = Vec::new();
+        for field in spec.split(',') {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| bad(format!("{field:?} is not key=value")))?;
+            if !matches!(key, "path" | "readonly" | "serial") {
+                return Err(bad(format!("unknown key {key:?}")));
+            }
+            if fields.iter().any(|(seen, _)| *seen == key) {
+                return Err(bad(format!("{key} given twice")));
+            }
+            fields.push((key, value));
+        }
+        let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        let path = get("path").filter(|v| !v.is_empty());
+        let path = path.ok_or_else(|| bad("no path".into()))?;
+        let read_only = match get("readonly") {
+            None | Some("off") => false,
+            Some("on") => true,
+            Some(other) => return Err(bad(format!("readonly {other:?} is not on or off"))),
+        };
+        let serial = match get("serial") {
+            None => None,
+            Some(serial) => {
+                check_serial(serial).map_err(bad)?;
+                Some(serial.to_string())
+            }
+        };
+        Ok(DiskConfig {
+            path: path.to_string(),
+            read_only,
+            serial,
+        })
+    }
+
+    /// Returns the serial of this disk at position `index` in
+    /// [`BootConfig::disks`]: the one the caller set, or [`disk_serial`].
+    #[must_use]
+    pub fn serial_at(&self, index: usize) -> String {
+        self.serial.clone().unwrap_or_else(|| disk_serial(index))
+    }
+}
+
+/// Returns the virtio-blk serial of the disk at `index` in
+/// [`BootConfig::disks`] when the caller set none.
+///
+/// The guest reads it from `/sys/block/vdX/serial`. The `vdX` letter follows
+/// probe order, so the serial is the stable way to find a disk in the guest.
+#[must_use]
+pub fn disk_serial(index: usize) -> String {
+    format!("disk{index}")
+}
+
+/// Refuses a serial the `GET_ID` field cannot carry or a guest cannot read
+/// back as given.
+fn check_serial(serial: &str) -> Result<(), String> {
+    if serial.is_empty() || serial.len() > DiskConfig::MAX_SERIAL_LEN {
+        return Err(format!(
+            "the serial must be 1 to {} bytes",
+            DiskConfig::MAX_SERIAL_LEN
+        ));
+    }
+    if !serial.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+        return Err("the serial must be printable ASCII".into());
+    }
+    Ok(())
+}
+
+/// Refuses a disk list no backend can attach.
+///
+/// # Errors
+///
+/// Returns a message naming the limit when there are more than [`MAX_DISKS`],
+/// and the serial when two disks would answer `GET_ID` the same way, which
+/// is what the serial is for.
+pub fn check_disks(disks: &[DiskConfig]) -> Result<(), String> {
+    if disks.len() > MAX_DISKS {
+        return Err(format!(
+            "{} disks given; at most {MAX_DISKS} fit",
+            disks.len()
+        ));
+    }
+    let serials: Vec<String> = disks
+        .iter()
+        .enumerate()
+        .map(|(index, disk)| disk.serial_at(index))
+        .collect();
+    for (index, serial) in serials.iter().enumerate() {
+        if serials[..index].contains(serial) {
+            return Err(format!(
+                "two disks carry the serial {serial:?}; give one a serial= of its own"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Inputs for a boot, which [`boot`](crate::boot) takes.
 pub struct BootConfig {
     pub kernel: Vec<u8>,
     pub initramfs: Option<Vec<u8>>,
     pub mem_bytes: u64,
     pub cmdline: String,
-    pub disk: Option<String>,
+    /// virtio-blk disks, at most [`MAX_DISKS`], in the order the guest sees
+    /// them. The disk at index `N` answers `GET_ID` with its serial, or
+    /// [`disk_serial`]`(N)` when it has none.
+    pub disks: Vec<DiskConfig>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -547,8 +719,8 @@ impl std::error::Error for BootError {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        check_export_overlap, check_fs, BootError, CachePolicy, FsConfig, FsShare, FsSpec,
-        ShareMode,
+        check_disks, check_export_overlap, check_fs, disk_serial, BootError, CachePolicy,
+        DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -676,6 +848,90 @@ mod tests {
         ]))
         .expect("/srv/ab is a sibling of /srv/a, not a child");
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    #[test]
+    fn five_disks_are_refused() {
+        let mut disks: Vec<DiskConfig> = (0..MAX_DISKS)
+            .map(|i| DiskConfig::rw(format!("d{i}.img")))
+            .collect();
+        check_disks(&disks).expect("four disks fit");
+        disks.push(DiskConfig::ro("e.img"));
+        let err = check_disks(&disks).unwrap_err();
+        assert!(err.contains("at most 4"), "{err}");
+    }
+
+    #[test]
+    fn default_serials_fit_the_virtio_blk_id_field() {
+        assert_eq!(disk_serial(0), "disk0");
+        assert_eq!(disk_serial(3), "disk3");
+        // VIRTIO_BLK_ID_BYTES.
+        assert!(disk_serial(MAX_DISKS - 1).len() <= DiskConfig::MAX_SERIAL_LEN);
+        assert_eq!(DiskConfig::rw("a.img").serial_at(2), "disk2");
+        let named = DiskConfig::parse("path=a.img,serial=lower").unwrap();
+        assert_eq!(named.serial_at(2), "lower");
+    }
+
+    #[test]
+    fn disk_specs_take_a_bare_path_or_cloud_hypervisor_keys() {
+        assert_eq!(
+            DiskConfig::parse("up.img").unwrap(),
+            DiskConfig::rw("up.img")
+        );
+        // A bare path keeps every byte, even ones the keyed form would split.
+        assert_eq!(
+            DiskConfig::parse("a=b,c.img").unwrap(),
+            DiskConfig::rw("a=b,c.img")
+        );
+        assert_eq!(
+            DiskConfig::parse("path=lo.img,readonly=on,serial=lower").unwrap(),
+            DiskConfig {
+                path: "lo.img".into(),
+                read_only: true,
+                serial: Some("lower".into()),
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=up.img,readonly=off").unwrap(),
+            DiskConfig::rw("up.img")
+        );
+        for (spec, why) in [
+            ("", "no path"),
+            ("path=", "no path"),
+            ("path=a.img,ro=on", "unknown key"),
+            ("path=a.img,path=b.img", "given twice"),
+            ("path=a.img,readonly=yes", "not on or off"),
+            ("path=a.img,serial=", "1 to 20 bytes"),
+            ("path=a.img,serial=abcdefghijklmnopqrstu", "1 to 20 bytes"),
+            ("path=a.img,serial=\u{2603}", "printable ASCII"),
+        ] {
+            let err = DiskConfig::parse(spec).unwrap_err();
+            assert!(err.contains(why), "{spec:?}: {err}");
+            assert!(err.contains(DiskConfig::SYNTAX), "{spec:?}: {err}");
+        }
+    }
+
+    // The serial is how the guest tells the disks apart, so two alike are
+    // refused whether the caller set them or a default collided with one.
+    #[test]
+    fn two_disks_may_not_share_a_serial() {
+        let disks = [
+            DiskConfig::parse("path=a.img,serial=lower").unwrap(),
+            DiskConfig::parse("path=b.img,serial=lower").unwrap(),
+        ];
+        let err = check_disks(&disks).unwrap_err();
+        assert!(err.contains("\"lower\""), "{err}");
+        let disks = [
+            DiskConfig::rw("a.img"),
+            DiskConfig::parse("path=b.img,serial=disk0").unwrap(),
+        ];
+        let err = check_disks(&disks).unwrap_err();
+        assert!(err.contains("\"disk0\""), "{err}");
+        let disks = [
+            DiskConfig::parse("path=a.img,serial=lower").unwrap(),
+            DiskConfig::rw("b.img"),
+        ];
+        check_disks(&disks).expect("lower and disk1 differ");
     }
 
     #[test]
