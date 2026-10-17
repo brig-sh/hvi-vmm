@@ -56,7 +56,7 @@ including a typo, silently runs the plain test.
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
-| `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. hvi refuses anything that is not a regular file, such as `/dev/null` or a FIFO. It also refuses a locked file, such as another run's ledger or disk. |
+| `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. hvi refuses anything that is not a regular file, such as `/dev/null` or a FIFO. It also refuses a locked file, such as another run's ledger or disk, and a symbolic link as the last component of the path, such as `/dev/fd/N` on Linux. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
 | `--dump-after <secs>` | none | Dump automatically after this long. Needs `--dump-memory`. `0` becomes 1. |
