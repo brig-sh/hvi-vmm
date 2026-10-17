@@ -3201,6 +3201,25 @@ mod tests {
         /// Sends `line` and reads frames until the header of `component`,
         /// without its bytes. Returns the headers read, `component`'s last.
         fn read_stream_until(&mut self, line: &str, component: &str) -> Vec<serde_json::Value> {
+            let headers = self.read_stream(line, component, None);
+            let last = headers.last().unwrap();
+            assert!(
+                last.get("v").is_none(),
+                "a reply before {component}: {last}"
+            );
+            headers
+        }
+
+        /// Sends `line` and reads frames until the header of `component`,
+        /// without its bytes, or until a reply line. Writes `after_first`,
+        /// if given, once the first header is read. Returns the headers
+        /// read, then what it stopped on.
+        fn read_stream(
+            &mut self,
+            line: &str,
+            component: &str,
+            after_first: Option<&[u8]>,
+        ) -> Vec<serde_json::Value> {
             self.client.write_all(line.as_bytes()).unwrap();
             self.client.write_all(b"\n").unwrap();
             let mut headers = Vec::new();
@@ -3209,6 +3228,13 @@ mod tests {
                 self.replies.read_line(&mut header).unwrap();
                 let value: serde_json::Value = serde_json::from_str(header.trim_end())
                     .unwrap_or_else(|e| panic!("{e}: {header}"));
+                if value.get("v").is_some() {
+                    headers.push(value);
+                    return headers;
+                }
+                if let (true, Some(bytes)) = (headers.is_empty(), after_first) {
+                    self.client.write_all(bytes).unwrap();
+                }
                 let name = value["component"]
                     .as_str()
                     .unwrap_or_else(|| panic!("{header}"));
@@ -3525,33 +3551,23 @@ mod tests {
             },
         );
         let asked = Instant::now();
-        f.client
-            .write_all(
-                b"{\"v\":1,\"op\":\"migrate\",\"then\":\"fence\",\"txid\":\"w\",\"epoch\":1}\n",
-            )
-            .unwrap();
-        let mut names = Vec::new();
-        let refusal = loop {
-            let mut line = String::new();
-            f.replies.read_line(&mut line).unwrap();
-            let value: serde_json::Value =
-                serde_json::from_str(line.trim_end()).unwrap_or_else(|e| panic!("{e}: {line}"));
-            if value.get("v").is_some() {
-                break value;
-            }
-            if names.is_empty() {
-                // Sent once the stream has begun, while the 8 MiB of noise
-                // hold it short of the pause: the server is not reading,
-                // so the line waits in the socket's queue.
-                f.client
-                    .write_all(b"{\"v\":1,\"op\":\"status\"}\n")
-                    .unwrap();
-            }
-            names.push(value["component"].as_str().unwrap().to_string());
-            let size = usize::try_from(value["size"].as_u64().unwrap()).unwrap();
-            let mut body = vec![0u8; size];
-            f.replies.read_exact(&mut body).unwrap();
-        };
+        // The status line goes once the stream has begun, while the 8 MiB
+        // of noise hold it short of the pause: the server is not reading,
+        // so the line waits in the socket's queue.
+        let mut headers = f.read_stream(
+            r#"{"v":1,"op":"migrate","then":"fence","txid":"w","epoch":1}"#,
+            "disk-round-final",
+            Some(b"{\"v\":1,\"op\":\"status\"}\n"),
+        );
+        let refusal = headers.pop().unwrap();
+        assert!(
+            refusal.get("v").is_some(),
+            "a frame went in the pause: {refusal}"
+        );
+        let names: Vec<&str> = headers
+            .iter()
+            .map(|h| h["component"].as_str().unwrap())
+            .collect();
         assert_eq!(refusal["code"], "capture_failed", "{refusal}");
         let why = refusal["error"].as_str().unwrap();
         assert!(
@@ -3559,11 +3575,7 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("as it was"), "{why}");
-        assert!(names.iter().any(|n| n == "disk-round-0"), "{names:?}");
-        assert!(
-            !names.iter().any(|n| n == "disk-round-final"),
-            "a frame went in the pause: {names:?}"
-        );
+        assert!(names.contains(&"disk-round-0"), "{names:?}");
         // Another connection is served only once this one is closed, so
         // the end is read after the close, where a reset would show.
         assert_eq!(f.status_elsewhere()["state"], "running");
