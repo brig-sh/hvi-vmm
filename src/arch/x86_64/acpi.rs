@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The ACPI tables an x86-64 guest powers off and resets through.
+//! The ACPI tables that give an x86-64 guest its power-off, its reset and its
+//! console's interrupt line.
 //!
 //! These tables give the guest a power-off. Without them, Linux turns
 //! `poweroff` into a halt, which KVM's in-kernel irqchip handles with no exit
@@ -20,9 +21,12 @@
 //!
 //! The FADT describes a PC's fixed hardware: the [`PmRegisters`] at
 //! [`ACPI_PM_PORT`], and a system control interrupt hvi never raises. The DSDT
-//! holds only `\_S5`, the sleep type the guest writes to power off. The MADT
-//! lists the CPUs and the IOAPIC as the MP table does, since a guest that finds
-//! ACPI tables without a MADT discards the MP table.
+//! holds `\_S5`, the sleep type the guest writes to power off. It also names
+//! COM1 as a `PNP0501` device, with its ports at [`COM1_PORT`] and its line,
+//! [`COM1_GSI`]. The guest's 8250 driver takes the interrupt from the table
+//! instead of probing for it. The MADT lists the CPUs and the IOAPIC as the MP
+//! table does, since a guest that finds ACPI tables without a MADT discards the
+//! MP table.
 //!
 //! The FADT is not hardware-reduced. A hardware-reduced guest drops the legacy
 //! PIC and numbers its interrupts dynamically, so the ISA lines the console and
@@ -30,7 +34,7 @@
 //!
 //! [`PmRegisters`]: crate::devices::legacy::acpi_pm::PmRegisters
 
-use acpi_tables::aml::{Name, Package};
+use acpi_tables::aml::{Device, EISAName, Interrupt, Name, Package, ResourceTemplate, IO, ZERO};
 use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags, FADT};
 use acpi_tables::gas::{AccessSize, AddressSpace, GAS};
@@ -42,7 +46,9 @@ use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
 use acpi_tables::Aml;
 
-use crate::arch::x86_64::layout::{ACPI_ADDR, ACPI_PM_PORT, IOAPIC_ADDR, LAPIC_ADDR, SCI_GSI};
+use crate::arch::x86_64::layout::{
+    ACPI_ADDR, ACPI_PM_PORT, COM1_GSI, COM1_PORT, IOAPIC_ADDR, LAPIC_ADDR, SCI_GSI,
+};
 use crate::arch::x86_64::MAX_VCPUS;
 use crate::devices::legacy::acpi_pm::{
     PM1_CONTROL, PM1_CONTROL_LEN, PM1_EVENT_LEN, PM1_STATUS, RESET_REGISTER, RESET_VALUE,
@@ -64,6 +70,10 @@ const IAPC_VGA_NOT_PRESENT: u16 = 1 << 2;
 /// The IA-PC boot architecture flag that says the guest must not enable MSI.
 const IAPC_MSI_NOT_SUPPORTED: u16 = 1 << 3;
 
+/// The number of ports COM1 decodes from [`COM1_PORT`], the eight registers of
+/// a 16550.
+const COM1_PORTS: u8 = 8;
+
 /// Builds the tables for `num_cpus` vCPUs, as the bytes to write at
 /// [`ACPI_ADDR`].
 ///
@@ -79,6 +89,7 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
     let mut tables = Tables::new();
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, OEM_TABLE_ID, OEM_REVISION);
     Name::new("_S5_".into(), &Package::new(vec![&SLP_TYP_S5])).to_aml_bytes(&mut dsdt);
+    add_com1(&mut dsdt);
     let dsdt = tables.place(&dsdt, 1);
     let facs = tables.place(&FACS::new(), FACS_ALIGN);
     let fadt = tables.place(&build_fadt(dsdt, facs), 1);
@@ -143,6 +154,39 @@ fn build_madt(num_cpus: u32) -> MADT {
     madt
 }
 
+/// Appends COM1 to `dsdt`, as a `PNP0501` device with its ports and its line.
+///
+/// Without the device, the guest's 8250 driver finds COM1 only in its legacy
+/// port table. A kernel with `SERIAL_8250_DETECT_IRQ`, which the x86-64
+/// defconfig sets, then probes for the line. A probe that misses leaves the
+/// port at irq 0, and the console is then polled at the line rate.
+///
+/// [`COM1_GSI`] is the ISA IRQ of the same number, since the IOAPIC's lines
+/// start at GSI 0 and the MADT has no interrupt source override. The line is
+/// edge-triggered, active-high and exclusive, as in the MP table's ISA entry
+/// and as the guest programs the pin.
+fn add_com1(dsdt: &mut Sdt) {
+    let io = IO::new(COM1_PORT, COM1_PORT, 1, COM1_PORTS);
+    let irq = Interrupt::new(
+        true,  // consumer
+        true,  // edge-triggered
+        false, // active-low
+        false, // shared
+        COM1_GSI,
+    );
+    let crs = ResourceTemplate::new(vec![&io, &irq]);
+    let hid = EISAName::new("PNP0501");
+    Device::new(
+        "_SB_.COM1".into(),
+        vec![
+            &Name::new("_HID".into(), &hid),
+            &Name::new("_UID".into(), &ZERO),
+            &Name::new("_CRS".into(), &crs),
+        ],
+    )
+    .to_aml_bytes(dsdt);
+}
+
 /// The tables as they are laid out from [`ACPI_ADDR`], with the RSDP first.
 struct Tables {
     /// The bytes from [`ACPI_ADDR`] on, with the RSDP's place still zero.
@@ -204,6 +248,21 @@ mod tests {
     const MADT_IO_APIC: u8 = 1;
     const AML_PACKAGE_OP: u8 = 0x12;
     const AML_BYTE_PREFIX: u8 = 0x0a;
+    const AML_NAME_OP: u8 = 0x08;
+    const AML_ZERO_OP: u8 = 0x00;
+    const AML_DWORD_PREFIX: u8 = 0x0c;
+    const AML_BUFFER_OP: u8 = 0x11;
+    const AML_DUAL_NAME_PREFIX: u8 = 0x2e;
+    const AML_EXT_OP_PREFIX: u8 = 0x5b;
+    const AML_DEVICE_OP: u8 = 0x82;
+    const RES_IO_PORT: u8 = 0x47;
+    const RES_IO_DECODE_16: u8 = 0x01;
+    const RES_EXT_IRQ: u8 = 0x89;
+    const RES_END_TAG: u8 = 0x79;
+    const IRQ_CONSUMER: u8 = 1 << 0;
+    const IRQ_EDGE: u8 = 1 << 1;
+    // The EISA id of a 16550-compatible port, as ACPICA compares `_HID`.
+    const PNP0501: u32 = 0x0105_d041;
 
     /// Returns the byte sum of `bytes`, which is zero over a table with a valid
     /// checksum.
@@ -246,6 +305,14 @@ mod tests {
     /// Returns the FADT, the XSDT's first entry.
     fn fadt(blob: &[u8]) -> &[u8] {
         table(blob, xsdt_entries(blob)[0])
+    }
+
+    /// Returns the bytes that follow the name `name` in `aml`, which a `Name`
+    /// op precedes.
+    fn named<'a>(aml: &'a [u8], name: &[u8; 4]) -> &'a [u8] {
+        let at = aml.windows(4).position(|w| w == name).unwrap();
+        assert_eq!(aml[at - 1], AML_NAME_OP, "{}", name.escape_ascii());
+        &aml[at + 4..]
     }
 
     // The guest scans 0xe0000-0xfffff on 16-byte boundaries for the RSDP.
@@ -381,5 +448,43 @@ mod tests {
             pm.write(PM1_CONTROL, &off.to_le_bytes()),
             Some(Stop::SystemOff)
         ));
+    }
+
+    // The guest's 8250 PNP driver registers ttyS0 with the line from `_CRS` and
+    // does not probe for it.
+    #[test]
+    fn dsdt_names_com1_as_a_pnp_device() {
+        let blob = build(1);
+        let dsdt = table(&blob, u64_at(fadt(&blob), FADT_X_DSDT));
+        let at = HEADER_LEN
+            + dsdt[HEADER_LEN..]
+                .windows(2)
+                .position(|w| w == [AML_EXT_OP_PREFIX, AML_DEVICE_OP])
+                .unwrap();
+        let pkg = dsdt[at + 2];
+        assert_eq!(pkg >> 6, 0, "a one-byte PkgLength");
+        assert_eq!(at + 2 + usize::from(pkg), dsdt.len(), "the last object");
+        let device = &dsdt[at + 3..];
+        assert_eq!(device[0], AML_DUAL_NAME_PREFIX);
+        assert_eq!(&device[1..9], b"_SB_COM1");
+
+        let hid = named(device, b"_HID");
+        assert_eq!(hid[0], AML_DWORD_PREFIX);
+        assert_eq!(hid[1..5], PNP0501.to_le_bytes());
+        assert_eq!(named(device, b"_UID")[0], AML_ZERO_OP);
+
+        let crs = named(device, b"_CRS");
+        assert_eq!(crs[0], AML_BUFFER_OP);
+        assert_eq!(crs[1] >> 6, 0, "a one-byte PkgLength");
+        assert_eq!(1 + usize::from(crs[1]), crs.len(), "the last object");
+        assert_eq!(crs[2], AML_BYTE_PREFIX);
+        let resources = &crs[4..];
+        assert_eq!(usize::from(crs[3]), resources.len());
+        let [lo, hi] = COM1_PORT.to_le_bytes();
+        let mut expected = vec![RES_IO_PORT, RES_IO_DECODE_16, lo, hi, lo, hi, 1, COM1_PORTS];
+        expected.extend([RES_EXT_IRQ, 6, 0, IRQ_CONSUMER | IRQ_EDGE, 1]);
+        expected.extend(COM1_GSI.to_le_bytes());
+        expected.extend([RES_END_TAG, 0]);
+        assert_eq!(resources, expected);
     }
 }

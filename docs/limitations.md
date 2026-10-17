@@ -65,6 +65,7 @@ three things a reader should not have to guess between:
 | The default `--cmdline` names `ttyAMA0`. | That is the arm64 console. The x86 backend appends `console=ttyS0` itself, so a guest still gets one, but the default leaves a dead `console=` and a bare `earlycon` on the line. | Design |
 | `tools/mk-initramfs.py` builds an arm64 initramfs only. | An x86-64 guest needs its own. | Design |
 | An x86-64 guest powers off through ACPI only. | A kernel built without `CONFIG_ACPI`, or booted with `acpi=off`, halts on `poweroff`. KVM handles the halt itself, so the run goes on until a signal stops it. `reboot -f` ends it as `SystemReset`. | Design |
+| An x86-64 guest without ACPI probes COM1's IRQ. | The DSDT names COM1 and its line, so a guest with ACPI does not probe it. Without ACPI, a kernel with `CONFIG_SERIAL_8250_DETECT_IRQ` probes the line, and a probe that misses leaves the console polled at 9600 baud. | Design |
 | An x86-64 `vmlinux` boots without KASLR. | The kernel randomizes its placement in the `bzImage` decompressor, which a `vmlinux` skips. Boot a `bzImage` when KASLR matters. | Platform |
 | `SystemReset` stops the process. | hvi never reboots a guest and never recovers one. A caller that wants a reboot calls `boot` again, from a thread of its own after a sandboxed run on Linux (see [embedding.md](embedding.md#stopping-a-run-from-the-host)). | Design |
 

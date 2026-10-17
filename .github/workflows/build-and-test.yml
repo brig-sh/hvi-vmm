@@ -248,6 +248,13 @@ jobs:
           grep -q "TSC deadline timer available" boot.log \
             || { echo "::error::the guest found no TSC-deadline timer"; exit 1; }
           echo "kvm-clock and the TSC-deadline timer ✓"
+          # The DSDT names COM1 as a PNP0501 device, so the 8250 PNP driver
+          # registers ttyS0 under that device with the line the table gives
+          # (GSI 4). It does not probe for one, which is what left some boots
+          # on irq 0 and a polled console.
+          grep -qE "00:0[0-9a-f]: ttyS0 at I/O 0x3f8 \(irq = 4," boot.log \
+            || { echo "::error::ttyS0 was not registered from the ACPI PNP0501 device"; exit 1; }
+          echo "ttyS0 from the DSDT's PNP0501 device ✓"
       # The distribution vmlinuz is a bzImage. `scripts/extract-vmlinux` unpacks
       # the ELF inside it, which is the other x86 format hvi boots. It comes
       # from the headers package apt installed a step ago, so it is the copy
