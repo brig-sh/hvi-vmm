@@ -88,7 +88,7 @@
             {"syscall": "rt_sigreturn", "comment": "returning from the kick signal"},
             {"syscall": "rt_sigaction", "comment": "std signal setup; the fatal-signal handler setting the default action it raises with"},
             {"syscall": "restart_syscall", "comment": "safety net: an ioctl interrupted by the kick"},
-            {"syscall": "clock_gettime", "comment": "safety net: event timestamps"},
+            {"syscall": "clock_gettime", "comment": "safety net: event timestamps, and the PL031 data-register read on an arm64 vCPU, if vDSO is bypassed"},
             {"syscall": "close", "comment": "safety net: a device dropping a descriptor"},
             {"syscall": "shutdown", "comment": "virtio-vsock shutting down a session's host end"},
             {"syscall": "sendmsg", "comment": "vhost-user: the guest's DRIVER_OK write hands the virtio-fs rings to the daemon from this thread, and its reset takes them back"},

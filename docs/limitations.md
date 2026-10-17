@@ -18,13 +18,14 @@ three things a reader should not have to guess between:
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | The KVM backends need kernel 4.11 or newer. | hvi stops a vCPU through `kvm_run.immediate_exit` and refuses to boot without `KVM_CAP_IMMEDIATE_EXIT`, which 4.11 added. | Platform |
 | No published crate, no release, no tag. | Build from source. Pin a commit when you depend on it. | Design |
-| The arm64/KVM backend is unit-tested on its stop path only. | Its only tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a run stops: a vCPU thread that ends, a stop request, plugin threads, the lifecycle records, and a kick. They need `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
+| The arm64/KVM backend's KVM-dependent paths are unit-tested on the stop path only. | Its MMIO routing has the unit test `rtc_window_reaches_the_device`. The KVM stop tests in `src/hypervisor/kvm.rs` remain the only coverage that needs `/dev/kvm`: a vCPU thread that ends, a stop request, plugin threads, the lifecycle records, and a kick. The rest of that backend is cross-linted and booted. | Defect |
 
 ## Devices
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | At most four virtio-blk disks. | No hotplug, no PCI at all. | Design |
+| The PL031 has no alarm. | vm-superio does not implement the match register, so an RTC wakeup never fires; the device SPI 0 is advertised and never raised. | Design |
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |

@@ -70,6 +70,9 @@ CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
 CONFIG_ARM_PSCI_FW=y                # power off, and SMP bring-up
 CONFIG_ARM_GIC_V3=y                 # or CONFIG_ARM_GIC for a GICv2 host
 CONFIG_OF=y                         # hvi passes a devicetree
+CONFIG_RTC_DRV_PL031=y              # the wall clock at boot
+CONFIG_RTC_HCTOSYS=y                # set the system clock from it at boot
+CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
 
 # x86-64
 CONFIG_SERIAL_8250=y
@@ -85,6 +88,12 @@ update-in-progress bit with interrupts disabled, and an unimplemented port
 reads back `0xff`, so that bit never clears and the guest spins there forever,
 before the console is up. hvi supplies the device, so this is a reason the
 device exists rather than something you configure.
+
+On arm64 hvi supplies a PL031 at `0x0c00_1000`, which is the guest's wall clock.
+A kernel without `CONFIG_RTC_DRV_PL031` boots with the clock at 1970 and no
+`/dev/rtc0`. A kernel with the driver but without `CONFIG_RTC_HCTOSYS` has
+`/dev/rtc0` and still boots at 1970, until `hwclock -s` sets the system clock.
+Both are configuration choices, not a hang.
 
 An x86-64 guest finds its devices and powers off through ACPI. hvi supplies a
 DSDT that describes every virtio-mmio device, a FADT whose PM1 control register

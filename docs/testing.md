@@ -65,9 +65,11 @@ Where it actually runs in CI:
 | arm64 Linux, musl (`ubuntu-24.04-arm`) | The full suite for `aarch64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 
 `src/arch/x86_64/kvm.rs` has unit tests and they run on `ubuntu-latest`, so the
-x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm.rs` has none. The KVM
-stop tests in `src/hypervisor/kvm.rs` run on whichever KVM backend the host has,
-and they need `/dev/kvm`.
+x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm.rs` has the PL031
+routing test `rtc_window_reaches_the_device`, which needs no `/dev/kvm` and runs
+on the arm64 musl job and the self-hosted boot runners. The KVM stop tests in
+`src/hypervisor/kvm.rs` run on whichever KVM backend the host has, and they need
+`/dev/kvm`; they remain the only KVM-dependent coverage of that backend.
 
 The used-ring litmus, the virtio-fs benchmarks and the KVM stop tests are
 `#[ignore]`d and do not run in a normal `cargo test`.

@@ -16,8 +16,9 @@
 //!
 //! The addresses below mirror QEMU's `virt` board so a guest kernel configured
 //! for QEMU/virt (the arm64 build of the repo guest kernel) boots unmodified:
-//! RAM at 1 GiB, the GICv3 and a PL011 UART in the low MMIO window beneath it.
-//! The PL011 carries first-boot serial output (`earlycon`), and the virtio-mmio
+//! RAM at 1 GiB, the GICv3, a PL011 UART and a PL031 RTC in the low MMIO
+//! window beneath it. The PL011 carries first-boot serial output (`earlycon`),
+//! the PL031 gives the guest the wall clock at boot, and the virtio-mmio
 //! devices have a window of their own from [`VIRTIO_BASE`]. The GIC base/size
 //! must agree with what `hv_gic` actually claims, so [`GicLayout::QEMU_VIRT`]
 //! is treated as the default and reconciled against `applevisor`'s GIC size
@@ -58,6 +59,20 @@ pub const UART_BASE: u64 = 0x0c00_0000;
 pub const UART_SIZE: u64 = 0x1000;
 /// UART interrupt as a GIC SPI number (INTID = 32 + SPI = 33).
 pub const UART_SPI: u32 = 1;
+
+/// PL031 RTC MMIO base and size.
+///
+/// The RTC sits in the page right above the UART. That keeps it above the
+/// Apple redistributor region and below [`DEVICE_WINDOW_END`]. It is also above
+/// [`UART_BASE`], so the bound in [`GicLayout::V3_MAX_CPUS`] still holds.
+pub const RTC_BASE: u64 = 0x0c00_1000;
+pub const RTC_SIZE: u64 = 0x1000;
+/// RTC interrupt as a GIC SPI number (INTID = 32 + SPI = 32).
+///
+/// SPI 0 is the only free SPI below the virtio-fs range. The RTC never raises
+/// it, because vm-superio does not implement the match register and so the
+/// alarm never fires.
+pub const RTC_SPI: u32 = 0;
 
 /// virtio-mmio device windows and interrupts, above the GIC and clear of the
 /// UART. Each device is one 0x200 page with its own SPI, in this order:
@@ -643,6 +658,7 @@ mod tests {
         let last_disk = virtio_blk_base(MAX_DISKS - 1).unwrap();
         let windows = [
             ("uart", UART_BASE, UART_SIZE),
+            ("rtc", RTC_BASE, RTC_SIZE),
             ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
             ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
             ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
@@ -656,5 +672,33 @@ mod tests {
             );
             assert!(base >= gic_end, "{name} at {base:#x} overlaps the GIC");
         }
+    }
+
+    // The fixed windows are dispatched by address, so an overlap would hand a
+    // guest access to the wrong device.
+    #[test]
+    fn fixed_windows_are_disjoint() {
+        let windows = [
+            ("uart", UART_BASE, UART_SIZE),
+            ("rtc", RTC_BASE, RTC_SIZE),
+            ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
+            ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
+            ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
+            ("virtio-fs", virtio_fs_base(0).unwrap(), VIRTIO_SIZE),
+        ];
+        for (i, (a, a_base, a_size)) in windows.iter().enumerate() {
+            for (b, b_base, b_size) in &windows[i + 1..] {
+                assert!(
+                    a_base + a_size <= *b_base || b_base + b_size <= *a_base,
+                    "{a} at {a_base:#x} overlaps {b} at {b_base:#x}"
+                );
+            }
+        }
+        const {
+            assert!(
+                RTC_BASE >= UART_BASE + UART_SIZE,
+                "the RTC sits above the UART"
+            )
+        };
     }
 }
