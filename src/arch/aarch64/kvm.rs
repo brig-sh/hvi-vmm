@@ -21,8 +21,9 @@
 //! `immediate_exit` byte and signals its thread, as `hypervisor::kvm`
 //! describes.
 //!
-//! The image and layout, the DTB, the virtio devices, the PL011, the `RawEvent`
-//! ledger and the plugin interface are the same code the macOS backend uses.
+//! The image and layout, the DTB, the virtio devices, the PL011 and the PL031,
+//! the `RawEvent` ledger and the plugin interface are the same code the macOS
+//! backend uses.
 //!
 //! KVM's vGIC uses the host's CPU interface, so a GICv3 host serves vGICv3 and
 //! a GIC-400 host serves only vGICv2. The backend asks for v3, falls back to
@@ -49,12 +50,13 @@ use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
     mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
-    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE,
+    UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
+use crate::devices::legacy::rtc_pl031::Pl031;
 use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, VirtioNet};
@@ -117,6 +119,9 @@ struct Shared {
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     pl011: Arc<Mutex<Pl011>>,
+    /// The PL031, which the vCPU threads read for the time. It has no interrupt
+    /// line.
+    rtc: Arc<Mutex<Pl031>>,
     /// One entry per virtio-fs export, in the order the exports were given.
     fs: Arc<Vec<Export>>,
     /// Whoever is watching this guest, if anyone.
@@ -365,6 +370,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             plugin_threads: PluginThreads::new(),
         }),
         pl011: Arc::new(Mutex::new(Pl011::new())),
+        rtc: Arc::new(Mutex::new(Pl031::new())),
         fs: Arc::new(fs),
         plugin: cfg.plugin.clone(),
     };
@@ -465,16 +471,18 @@ impl SafepointVcpu for VcpuFd {
 /// Services an MMIO **read**: fills `data` with the addressed device's value.
 fn on_mmio(sh: &Shared, addr: u64, _read: bool, data: &mut [u8]) {
     let width = data.len();
-    let val = read_device(sh, addr);
+    let val = read_device(sh, addr, width);
     let bytes = val.to_le_bytes();
     let n = width.min(8);
     data[..n].copy_from_slice(&bytes[..n]);
 }
 
 /// Reads the device register at `addr`.
-fn read_device(sh: &Shared, addr: u64) -> u64 {
+fn read_device(sh: &Shared, addr: u64, width: usize) -> u64 {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, false, 0)
+    } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
+        lock_or_recover(&sh.rtc).mmio(addr - RTC_BASE, width, false, 0)
     } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
         dev_read(sh, Some(dev), off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -495,6 +503,8 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
     let val = u64::from_le_bytes(b);
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, true, val);
+    } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
+        lock_or_recover(&sh.rtc).mmio(addr - RTC_BASE, data.len(), true, val);
     } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
         dev_write(sh, Some(dev), off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {

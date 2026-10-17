@@ -16,21 +16,22 @@
 //!
 //! Describes the hardware an arm64 guest gets: RAM, the vCPUs (PSCI
 //! enable-method), a GIC (v3 or v2), the architected timer, a PL011 UART for
-//! `earlycon`, and one node per virtio-mmio device. The addresses come from
-//! [`crate::arch::aarch64::layout`] so the DTB and the actual device placement
-//! cannot drift. Interrupt encodings follow the GICv3 convention
-//! (`<type number flags>`, type 0=SPI/1=PPI, flag 4=level-high); the timer PPI
-//! flags in particular are the classic first-boot tuning knob, flagged inline.
+//! `earlycon`, a PL031 RTC for the wall clock, and one node per virtio-mmio
+//! device. The addresses come from [`crate::arch::aarch64::layout`] so the DTB
+//! and the actual device placement cannot drift. Interrupt encodings follow the
+//! GICv3 convention (`<type number flags>`, type 0=SPI/1=PPI, flag
+//! 4=level-high); the timer PPI flags in particular are the classic first-boot
+//! tuning knob, flagged inline.
 //!
-//! Phandles are fixed: `1` = GIC (the root `interrupt-parent`), `2` = the UART
-//! reference clock.
+//! Phandles are fixed: `1` = GIC (the root `interrupt-parent`), `2` = the fixed
+//! reference clock, shared by the UART and the RTC.
 
 use vm_fdt::{Error, FdtWriter};
 
 use crate::arch::aarch64::layout::{
     mpidr_affinity, virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, GicLayout,
-    GicVersion, GuestLayout, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI,
-    VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    GicVersion, GuestLayout, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE,
+    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 
 const PHANDLE_GIC: u32 = 1;
@@ -189,7 +190,7 @@ pub fn build(
     fdt.property_phandle(PHANDLE_GIC)?;
     fdt.end_node(intc)?;
 
-    // /apb-pclk: fixed clock the PL011 references.
+    // /apb-pclk: fixed clock the PL011 and the PL031 reference.
     let clk = fdt.begin_node("apb-pclk")?;
     fdt.property_string("compatible", "fixed-clock")?;
     fdt.property_u32("#clock-cells", 0)?;
@@ -210,6 +211,19 @@ pub fn build(
     fdt.property_array_u32("clocks", &[PHANDLE_CLK, PHANDLE_CLK])?;
     fdt.property_string_list("clock-names", vec!["uartclk".into(), "apb_pclk".into()])?;
     fdt.end_node(uart)?;
+
+    // /pl031: the RTC. The node has no `interrupts`. vm-superio does not
+    // implement the match register, so an alarm would never fire. Without an
+    // IRQ, Linux's rtc-pl031 offers no alarm, and a wakeup request fails.
+    let rtc = fdt.begin_node(&format!("pl031@{RTC_BASE:x}"))?;
+    fdt.property_string_list(
+        "compatible",
+        vec!["arm,pl031".into(), "arm,primecell".into()],
+    )?;
+    fdt.property_array_u64("reg", &[RTC_BASE, RTC_SIZE])?;
+    fdt.property_array_u32("clocks", &[PHANDLE_CLK])?;
+    fdt.property_string_list("clock-names", vec!["apb_pclk".into()])?;
+    fdt.end_node(rtc)?;
 
     // /virtio_mmio slots the guest probes, one per backed device. Omitted when
     // absent so the guest never touches an unbacked MMIO region.
@@ -467,6 +481,56 @@ pub(crate) mod tests {
         assert!(
             blob.windows(want.len()).any(|w| w == want.as_slice()),
             "GICv2 reg cell not found in the blob"
+        );
+    }
+
+    // Linux's rtc-pl031 offers an alarm only for a node with an IRQ, and this
+    // RTC's alarm never fires.
+    #[test]
+    fn advertises_a_pl031() {
+        let l = sample_layout(0);
+        let blob = build(
+            &l,
+            &GicLayout::QEMU_VIRT,
+            1,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+            KASLR_SEED,
+        )
+        .unwrap();
+        let mut reg = RTC_BASE.to_be_bytes().to_vec();
+        reg.extend_from_slice(&RTC_SIZE.to_be_bytes());
+        assert_eq!(
+            prop(&blob, "pl031@", "compatible"),
+            Some(b"arm,pl031\0arm,primecell\0".to_vec())
+        );
+        assert_eq!(prop(&blob, "pl031@", "reg"), Some(reg));
+        assert_eq!(prop(&blob, "pl031@", "interrupts"), None);
+        assert_eq!(
+            prop(&blob, "pl031@", "clocks"),
+            Some(2u32.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            prop(&blob, "pl031@", "clock-names"),
+            Some(b"apb_pclk\0".to_vec())
+        );
+        let name = b"pl031@c001000\0";
+        assert!(blob.windows(name.len()).any(|w| w == name));
+
+        let v2 = build(
+            &l,
+            &GicLayout::QEMU_VIRT_V2,
+            1,
+            "",
+            VirtioDevices::default(),
+            &SEED,
+            KASLR_SEED,
+        )
+        .unwrap();
+        assert_eq!(
+            prop(&v2, "pl031@", "compatible"),
+            Some(b"arm,pl031\0arm,primecell\0".to_vec())
         );
     }
 

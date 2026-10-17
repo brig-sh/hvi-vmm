@@ -25,6 +25,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | At most four virtio-blk disks. | No hotplug, no PCI at all. | Design |
+| The PL031 has no alarm. | vm-superio does not implement the match register. The devicetree gives the RTC no interrupt, so the guest's driver offers no alarm, and `rtcwake` fails. | Design |
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |
 | The built-in stack cannot resolve DNS while confined. | The guest gets a reply with no addresses. Resolution needs a socket the sandbox denies. Only `--no-sandbox` resolves. See [#90](https://github.com/brig-sh/hvi-vmm/issues/90). | Defect |

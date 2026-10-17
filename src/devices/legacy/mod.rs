@@ -16,9 +16,11 @@
 //!
 //! The PL011 and 16550 UARTs carry the serial console. An x86-64 guest reads
 //! the MC146818 CMOS RTC for the wall clock at boot, and powers off and resets
-//! through the ACPI registers.
+//! through the ACPI registers. An arm64 guest reads the PL031 RTC for the wall
+//! clock at boot.
 
 pub mod acpi_pm;
 pub mod pl011;
 pub mod rtc_cmos;
+pub mod rtc_pl031;
 pub mod uart16550;
