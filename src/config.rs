@@ -609,6 +609,10 @@ pub struct BootConfig {
     /// needs it to tell two guests apart, since it keys DHCP leases by MAC.
     /// The built-in stub frames its synthesized replies to it.
     pub net_mac: Option<[u8; 6]>,
+    /// The path of the `RawEvent` ledger, or `None` for no ledger.
+    ///
+    /// A file already at the path must be a regular file that no other ledger
+    /// is writing. The last component of the path cannot be a symbolic link.
     pub events: Option<String>,
     pub sandbox_id: String,
     /// Number of vCPUs (>= 1).

@@ -201,18 +201,19 @@ impl Ledger {
     /// Opens the ledger at `path` and starts its writer, or returns a disabled
     /// ledger when `path` is `None`.
     ///
-    /// The file is truncated. Anything at `path` other than a regular file is
-    /// refused, since the writer writes at an offset. The writer holds a lock
-    /// on the file until it exits, so a second ledger at `path`, in this
-    /// process or another, is refused while the first writer still writes it.
-    /// On a file system that cannot lock files, the ledger goes without the
-    /// lock.
+    /// The file is created when missing and truncated. A symbolic link as the
+    /// last component of `path` is refused. Anything else at `path` other than
+    /// a regular file is refused too, since the writer writes at an offset. The
+    /// writer holds a lock on the file until it exits, so a second ledger at
+    /// `path`, in this process or another, is refused while the first writer
+    /// still writes it. On a file system that cannot lock files, the ledger
+    /// goes without the lock.
     ///
     /// # Errors
     ///
-    /// Errors if the file cannot be opened, is not a regular file, is locked by
-    /// another ledger's writer, a reader or a disk, or the writer thread cannot
-    /// be started.
+    /// Errors if the file cannot be opened, is a symbolic link or not a regular
+    /// file, is locked by another ledger's writer, a reader or a disk, or the
+    /// writer thread cannot be started.
     pub fn new(path: Option<&str>, sandbox_id: &str) -> io::Result<Self> {
         let shared = match path {
             Some(path) => {
@@ -1007,18 +1008,29 @@ fn closed_error() -> io::Error {
     io::Error::other("the ledger is closed")
 }
 
-/// Opens the ledger file at `path` for writing, locked, and truncated once it
-/// is known to be a regular file.
+/// Opens the ledger file at `path` for writing and locks it.
 ///
-/// `O_NONBLOCK` keeps the open of a FIFO from waiting for a reader, so the open
-/// of one with no reader fails. `O_NOCTTY` keeps a terminal from becoming the
-/// controlling one.
+/// The file is truncated once it is known to be a regular file. `O_NOFOLLOW`
+/// refuses a symbolic link as the last component of `path`. `O_NONBLOCK` keeps
+/// the open of a FIFO from waiting for a reader, so the open of one with no
+/// reader fails. `O_NOCTTY` keeps a terminal from becoming the controlling one.
 fn open(path: &str) -> io::Result<File> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(|e| {
+            // `O_NOFOLLOW` refuses a link with `ELOOP`, whose message is about
+            // a loop of links. A loop of links in a parent directory also
+            // returns `ELOOP`, so the path itself is checked.
+            let is_link = || std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink());
+            if e.raw_os_error() == Some(libc::ELOOP) && is_link() {
+                io::Error::new(io::ErrorKind::InvalidInput, "a symbolic link")
+            } else {
+                e
+            }
+        })?;
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -1831,6 +1843,39 @@ mod tests {
             .close(Instant::now() + Duration::from_secs(5))
             .unwrap();
         assert!(take_lines(&path).is_empty());
+    }
+
+    #[test]
+    fn ledger_refuses_a_symbolic_link() {
+        let target = temp_path("link-target");
+        let link = temp_path("link");
+        std::fs::write(&target, "keep\n").unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = Ledger::new(link.to_str(), "vm1").err().unwrap();
+        assert!(
+            refused.to_string().ends_with("a symbolic link"),
+            "{refused}"
+        );
+        let _ = std::fs::remove_file(&link);
+        assert_eq!(take_lines(&target), ["keep"]);
+    }
+
+    #[test]
+    fn loop_of_links_above_the_ledger_keeps_its_own_error() {
+        let first = temp_path("loop-a");
+        let second = temp_path("loop-b");
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let path = first.join("ledger.ndjson");
+        let refused = Ledger::new(path.to_str(), "vm1").err().unwrap();
+        // Each libc words the message of `ELOOP` its own way.
+        let code = format!("(os error {})", libc::ELOOP);
+        assert!(refused.to_string().ends_with(&code), "{refused}");
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
     }
 
     #[test]
