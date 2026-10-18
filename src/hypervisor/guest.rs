@@ -34,7 +34,6 @@ use crate::events::Ledger;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
-use crate::sync::lock_or_recover;
 use crate::teardown::{StopToken, STOP_TIMEOUT};
 
 /// A virtio-blk disk and the guest-physical base of its virtio-mmio window.
@@ -147,7 +146,7 @@ impl PluginThreads {
                 format!("plugin thread {:?}: a name with a NUL byte", thread.name),
             ));
         }
-        match lock_or_recover(&self.0).as_mut() {
+        match self.0.lock().unwrap().as_mut() {
             Some(queued) => {
                 queued.push(thread);
                 Ok(())
@@ -163,7 +162,7 @@ impl PluginThreads {
     ///
     /// A request after this call is refused.
     pub(crate) fn take(&self) -> Vec<PluginThread> {
-        lock_or_recover(&self.0).take().unwrap_or_default()
+        self.0.lock().unwrap().take().unwrap_or_default()
     }
 }
 
@@ -181,13 +180,13 @@ impl<K> Guest<K> {
         vsock: Arc<dyn IrqLine>,
     ) {
         for (index, disk) in self.disks.iter().enumerate() {
-            lock_or_recover(&disk.dev).connect_irq(block(index));
+            disk.dev.lock().unwrap().connect_irq(block(index));
         }
         if let Some(dev) = &self.net {
-            lock_or_recover(dev).connect_irq(net);
+            dev.lock().unwrap().connect_irq(net);
         }
         if let Some(dev) = &self.vsock {
-            lock_or_recover(dev).connect_irq(vsock);
+            dev.lock().unwrap().connect_irq(vsock);
         }
     }
 
@@ -285,13 +284,13 @@ impl<K: Kick> VmHandle for Guest<K> {
 
     fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
         for disk in &self.disks {
-            lock_or_recover(&disk.dev).set_io_sink(Arc::clone(&sink));
+            disk.dev.lock().unwrap().set_io_sink(Arc::clone(&sink));
         }
     }
 
     fn set_net_sink(&self, sink: Arc<dyn IoSink>) {
         if let Some(dev) = &self.net {
-            lock_or_recover(dev).set_io_sink(sink);
+            dev.lock().unwrap().set_io_sink(sink);
         }
     }
 
@@ -410,6 +409,10 @@ pub(crate) mod tests {
         fn kick(&self, _cpu: u32) {}
 
         fn kick_all(&self) {}
+
+        fn try_kick_all(&self) -> bool {
+            true
+        }
     }
 
     /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices and

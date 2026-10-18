@@ -30,11 +30,14 @@
 //! reads it.
 //!
 //! [`stop_on_signals`](crate::signal::stop_on_signals) makes the stop signals
-//! request a stop on a handle.
+//! request a stop on a handle, and [`set_panic_hook`] makes a panic write the
+//! run's `vmm.stop` record in a binary that aborts on one.
 
+mod panic;
 pub(crate) mod spawn;
 mod stop;
 mod supervisor;
 
+pub use panic::{record_panic, set_panic_hook, wait_for_panic_abort};
 pub use stop::{StopHandle, StopRegistration};
-pub(crate) use supervisor::{record_start, run_to_stop, LeftRunning, RUN_SLOT};
+pub(crate) use supervisor::{record_start, run_to_stop, LeftRunning, CURRENT_RUN, RUN_SLOT};

@@ -180,6 +180,7 @@ a real boot would describe.
 | `HVI_SECCOMP=log` | Linux | Install the same allowlists, but let an off-list syscall run and be recorded instead of killing the process. **This turns enforcement off.** |
 | `HVI_X86_TRACE` | x86-64 | Any value. Print the guest's CPUID leaf 1 and `0x4000_0001` at boot, log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
 | `HVI_BLK_TRACE` | all | Any value. Log every virtio-blk request to stderr. Off by default: one synchronous write per request. |
+| `RUST_BACKTRACE` | all | A value other than `0` prints a backtrace after a panic's line, and `full` prints every frame. Under the seccomp sandbox on Linux hvi prints none. |
 
 There are no others at run time. `HVI_BLOCK_DEV` appears only inside a test
 module and is not read by the VMM.
@@ -194,14 +195,24 @@ An embedder inherits these from the process environment. They are not part of
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
 | A vCPU fails | `hvi: <what failed>`, exit 1. |
+| hvi panics | `[hvi] <thread>: panicked (<message>) at <file:line:column>`, and the process ends by `SIGABRT`. |
 | `SIGTERM`, `SIGINT` or `SIGHUP` | `guest stopped: Requested`, or `hvi: <what failed>` if the run failed, and then the process ends by that signal. |
 | An x86-64 guest halts, or powers off without ACPI | The run does not end. |
 
-A vCPU fails on an exit hvi does not service, on an error from the hypervisor,
-or on a panic in hvi. On macOS, an access to an address no device answers is
-such an exit. The line names the vCPU and the failure. A panic in one of hvi's
-I/O threads, such as the console reader or a network relay, fails the run the
-same way, and the line names the thread.
+A vCPU fails on an exit hvi does not service or on an error from the hypervisor.
+On macOS, an access to an address no device answers is such an exit. The line
+names the vCPU and the failure.
+
+A panic anywhere in hvi ends the process by `SIGABRT`, which a shell reports as
+status 134, with a core dump where the system writes one. Before the abort, hvi
+stops the vCPUs and writes a `vmm.stop` record to the ledger, with reason
+`failed` and the line's text. It waits at most one second in all for the vCPUs
+to exit and for the record to be written. On a vCPU thread the line adds the
+vCPU's program counter and, once the vCPU has run, its last exit. A backtrace
+follows the line when `RUST_BACKTRACE` asks for one (see [Environment
+variables](#environment-variables)). Under the seccomp sandbox on Linux hvi
+prints none, since resolving one opens the binary and the filters refuse that.
+Under the macOS sandbox the frames stay unresolved for the same reason.
 
 An x86-64 guest powers off through ACPI, so a kernel without ACPI cannot power
 off; see [guest-images.md](guest-images.md). `reboot -f` ends the run either

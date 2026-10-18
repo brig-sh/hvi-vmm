@@ -213,6 +213,16 @@ thread_local! {
     static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Returns whether a syscall outside the allowlists ends the process.
+///
+/// It does once [`arm`] has run, outside log mode, since every thread a run
+/// spawns from then on is filtered, and so is the thread that called `boot`. A
+/// thread the caller started itself stays unfiltered, and there it returns
+/// `true` while no filter applies.
+pub(crate) fn is_trapping() -> bool {
+    ARMED.load(std::sync::atomic::Ordering::SeqCst) && !log_mode()
+}
+
 /// Turns filtering on for the threads spawned after this call, and proves both
 /// filters compile first.
 ///

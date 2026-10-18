@@ -441,18 +441,26 @@ the I/O threads, each within one second, and leaves a thread still running at
 its deadline and names it in the error. The kick is the backend's:
 `hypervisor/kvm.rs` holds the one the two KVM backends share, and the macOS
 backend kicks with `hv_vcpus_exit`. The vCPU threads are named `vcpu0`, `vcpu1`
-and so on, so the panic hook's report says which vCPU panicked. A panic that
-leaves the vCPU thread is caught where the thread starts, and its message goes
-in the error. The macOS backend catches it at the loop instead, to add the
-vCPU's last exit reason and its program counter. Under the seccomp sandbox the
-report has to stay unsymbolized: with `RUST_BACKTRACE` set it opens the binary,
-which the vCPU allowlist refuses, and the process dies of `SIGSYS` after the
-message.
+and so on, so a panic report says which vCPU panicked.
 
-Device mutexes on the macOS backend and in the helper threads go through
-`sync::lock_or_recover`, which takes a poisoned lock so the panic that poisoned
-it is reported once, where it happened. The vCPU-side device locks on the Linux
-and x86 backends use `.lock().unwrap()`.
+hvi's binary aborts on a panic. Its panic hook, in `run/panic.rs`, stops the
+vCPUs and writes the run's `vmm.stop` record with the report before the abort.
+On a vCPU thread the report adds the vCPU's program counter and, once the vCPU
+has run, its last exit. Each backend's loop provides both through
+`report_on_panic` in `hypervisor/vcpus.rs`. Under the seccomp sandbox the report
+carries no backtrace, since resolving one opens the binary, which the allowlists
+refuse. In a binary that unwinds, a panic that leaves the vCPU thread is caught
+where the thread starts, and its message goes in the error. The macOS backend
+catches it at the loop instead, to add the last exit and the program counter.
+
+A blocking lock is taken with `.lock().unwrap()`, so the next thread to take a
+poisoned lock panics in turn. The panic hook can run on a thread that holds a
+lock it needs, so it takes those locks with `try_lock`: the lock on the current
+run, the run's outcome, the vCPU table it kicks through and, on macOS, the lock
+a halted vCPU waits under. It skips a kick whose lock is held, and retries the
+lock on the current run until its deadline. The virtio-fs statistics at the stop
+skip a device that is busy or poisoned. A payload is serialized before the
+ledger's lock is taken, so a panic in a plugin's `Serialize` cannot poison it.
 
 ## 6. The event ledger
 
@@ -492,7 +500,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `sync.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `run/panic.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

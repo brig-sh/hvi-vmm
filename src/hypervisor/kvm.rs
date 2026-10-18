@@ -21,8 +21,10 @@
 //! `kvm_run.immediate_exit` byte, which makes the next `KVM_RUN` return `EINTR`
 //! at once, and then sends the signal for a run already in progress.
 
+use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -32,14 +34,13 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
-use crate::hypervisor::guest::{Guest, LedgerCloseGuard};
-use crate::hypervisor::vcpus::{Kick, Outcome};
+use crate::hypervisor::guest::{Guest, LedgerCloseGuard, SafepointVcpu};
+use crate::hypervisor::vcpus::{report_on_panic, Kick, Outcome};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::plugin::Plugin;
 use crate::run::{record_start, run_to_stop};
 use crate::sandbox::seccomp;
 use crate::signal::kick_signal;
-use crate::sync::lock_or_recover;
 use crate::teardown::StopSource;
 use crate::terminal;
 use crate::LOG_PREFIX;
@@ -74,7 +75,7 @@ impl Kicker {
             tid: unsafe { libc::pthread_self() } as u64,
             vcpu,
         };
-        if let Some(slot) = lock_or_recover(&self.threads).get_mut(cpu as usize) {
+        if let Some(slot) = self.threads.lock().unwrap().get_mut(cpu as usize) {
             *slot = Some(thread);
         }
         Registration { kicker: self, cpu }
@@ -87,23 +88,52 @@ impl Kicker {
     /// it needs no borrow of the handle the vCPU thread runs.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn with_vcpu(&self, cpu: u32, inspect: impl FnOnce(&VcpuFd)) {
-        if let Some(Some(thread)) = lock_or_recover(&self.threads).get(cpu as usize) {
+        if let Some(Some(thread)) = self.threads.lock().unwrap().get(cpu as usize) {
             inspect(&thread.vcpu);
         }
+    }
+
+    /// Returns the program counter of vCPU `cpu`, with its last exit reason
+    /// when `ran`, or `None` when its thread is not registered or another
+    /// thread holds the table.
+    ///
+    /// It reads them through the second handle to the vCPU, which maps the same
+    /// run struct page as the vCPU thread's own handle. The run struct holds no
+    /// exit before the vCPU's first run.
+    fn describe(&self, cpu: u32, ran: bool) -> Option<String> {
+        let mut threads = self.threads.try_lock().ok()?;
+        let vcpu = &mut threads.get_mut(cpu as usize)?.as_mut()?.vcpu;
+        let pc = vcpu.regs().pc;
+        Some(if ran {
+            let exit = vcpu.get_kvm_run().exit_reason;
+            format!("last exit reason {exit}, pc {pc:#x}")
+        } else {
+            format!("pc {pc:#x}")
+        })
     }
 }
 
 impl Kick for Kicker {
     fn kick(&self, cpu: u32) {
-        if let Some(Some(thread)) = lock_or_recover(&self.threads).get_mut(cpu as usize) {
+        if let Some(Some(thread)) = self.threads.lock().unwrap().get_mut(cpu as usize) {
             thread.kick();
         }
     }
 
     fn kick_all(&self) {
-        for thread in lock_or_recover(&self.threads).iter_mut().flatten() {
+        for thread in self.threads.lock().unwrap().iter_mut().flatten() {
             thread.kick();
         }
+    }
+
+    fn try_kick_all(&self) -> bool {
+        let Ok(mut threads) = self.threads.try_lock() else {
+            return false;
+        };
+        for thread in threads.iter_mut().flatten() {
+            thread.kick();
+        }
+        true
     }
 }
 
@@ -166,7 +196,13 @@ pub(crate) struct Registration<'a> {
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        if let Some(slot) = lock_or_recover(&self.kicker.threads).get_mut(self.cpu as usize) {
+        if let Some(slot) = self
+            .kicker
+            .threads
+            .lock()
+            .unwrap()
+            .get_mut(self.cpu as usize)
+        {
             *slot = None;
         }
     }
@@ -252,7 +288,7 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 
     // Log mode traps nothing, so the run is not confined under it.
     let confined = filters.is_armed() && !seccomp::log_mode();
-    record_start(guest, confined);
+    let _current = record_start(guest, confined);
     let (threads, spawned) = guest.vcpus.spawn(
         vcpus
             .into_iter()
@@ -303,6 +339,12 @@ pub(crate) fn run_vcpu(
     // The registration drops when the loop ends, before the thread reports its
     // exit, so the entry is gone before the stop kicks.
     let _registration = guest.vcpus.kicker().register(cpu, kick_handle);
+    let vcpus = Arc::clone(&guest.vcpus);
+    let ran = Rc::new(Cell::new(false));
+    let _detail = report_on_panic({
+        let ran = Rc::clone(&ran);
+        move || vcpus.kicker().describe(cpu, ran.get())
+    });
     // Every KVM vCPU enters `KVM_RUN` at once. One the guest has not brought up
     // yet waits inside the run, where a kick reaches it.
     guest.vcpus.mark_started(cpu);
@@ -320,7 +362,9 @@ pub(crate) fn run_vcpu(
         // Safe point for every vCPU: park here while vcpu0 lets a plugin look
         // at the guest.
         guest.pass_safepoint(&vcpu, plugin);
-        let flow = match vcpu.run() {
+        let run = vcpu.run();
+        ran.set(true);
+        let flow = match run {
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
                 // A run that a kick cut short has completed the MMIO exit
                 // before it and left `exit_reason` as it was. Linux 5.0 to 5.2
@@ -850,7 +894,7 @@ mod stop_tests {
         let error = vcpu.run().expect_err("the run went ahead after the kick");
         assert_eq!(error.errno(), libc::EINTR);
         immediate_exit(&mut vcpu).store(0, Ordering::SeqCst);
-        let mut threads = lock_or_recover(&kicker.threads);
+        let mut threads = kicker.threads.lock().unwrap();
         let registered = threads[0].as_mut().expect("the thread is registered");
         assert_eq!(
             immediate_exit(&mut registered.vcpu).load(Ordering::SeqCst),

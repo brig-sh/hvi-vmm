@@ -35,14 +35,13 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use crate::config::CachePolicy;
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
 use crate::memory::GuestRam;
-use crate::sync::lock_or_recover;
 
 const MAGIC_VALUE: u64 = 0x7472_6976;
 const VIRTIO_FS_ID: u64 = 26;
@@ -541,9 +540,15 @@ struct ReadaheadShared {
 impl ReadaheadShared {
     /// Tells the workers to exit. A worker reading a directory leaves it at
     /// the next entry.
+    ///
+    /// It runs from [`Readahead`]'s drop too, so it does not panic on a lock a
+    /// worker's panic poisoned. Each worker panics in turn when it takes that
+    /// lock.
     fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
-        lock_or_recover(&self.lock).stopped = true;
+        if let Ok(mut state) = self.lock.lock() {
+            state.stopped = true;
+        }
         self.posted.fetch_add(1, Ordering::Release);
         self.work.notify_all();
     }
@@ -747,7 +752,7 @@ impl Readahead {
             completed,
             stopping,
         } = state;
-        let mut guard = lock_or_recover(lock);
+        let mut guard = lock.lock().unwrap();
         loop {
             if guard.stopped {
                 return;
@@ -770,9 +775,9 @@ impl Readahead {
                 {
                     std::hint::spin_loop();
                 }
-                guard = lock_or_recover(lock);
+                guard = lock.lock().unwrap();
                 if posted.load(Ordering::Acquire) == seen && !guard.stopped {
-                    guard = work.wait(guard).unwrap_or_else(PoisonError::into_inner);
+                    guard = work.wait(guard).unwrap();
                 }
                 continue;
             };
@@ -795,7 +800,7 @@ impl Readahead {
             let prepared = dir_fd
                 .as_ref()
                 .and_then(|fd| prepare_dir(fd.as_fd(), stopping));
-            guard = lock_or_recover(lock);
+            guard = lock.lock().unwrap();
             guard.in_flight.remove(&path);
             // The serving thread stopped waiting for this one and read the
             // directory itself.
@@ -832,7 +837,7 @@ impl Readahead {
     /// `path` names it for the cache. The worker opens it under `parent`,
     /// so it never resolves the path itself.
     fn request(&self, path: PathBuf, parent: Arc<OwnedFd>, name: CString) {
-        let mut guard = lock_or_recover(&self.state.lock);
+        let mut guard = self.state.lock.lock().unwrap();
         if guard.cache.contains_key(&path) || guard.in_flight.contains(&path) {
             return;
         }
@@ -858,7 +863,7 @@ impl Readahead {
             completed,
             ..
         } = &*self.state;
-        let mut guard = lock_or_recover(lock);
+        let mut guard = lock.lock().unwrap();
         if let Some(prepared) = guard.take_prepared(path) {
             return Some(prepared);
         }
@@ -879,12 +884,9 @@ impl Readahead {
                     {
                         std::hint::spin_loop();
                     }
-                    guard = lock_or_recover(lock);
+                    guard = lock.lock().unwrap();
                 } else {
-                    guard = done
-                        .wait_timeout(guard, deadline - now)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
+                    guard = done.wait_timeout(guard, deadline - now).unwrap().0;
                 }
             }
             if let Some(prepared) = guard.take_prepared(path) {
@@ -908,7 +910,7 @@ impl Readahead {
 
     /// Drops every prepared listing and every request in flight.
     fn invalidate(&self) {
-        let mut guard = lock_or_recover(&self.state.lock);
+        let mut guard = self.state.lock.lock().unwrap();
         guard.generation += 1;
         guard.queue.clear();
         guard.skip.clear();
@@ -938,7 +940,7 @@ impl Readahead {
             return;
         };
         if let Some(prepared) = prepare_dir(dir.as_fd(), &AtomicBool::new(false)) {
-            let mut guard = lock_or_recover(&self.state.lock);
+            let mut guard = self.state.lock.lock().unwrap();
             guard.order.push_back(path.to_owned());
             guard.cache.insert(path.to_owned(), prepared);
         }

@@ -75,7 +75,7 @@ three things a reader should not have to guess between:
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
-| The ledger is not lossless. | A VMM that is killed or crashes can lose the records not written yet, and a write that stalls until the 4 MiB buffer fills makes the ledger drop `block` and `net` records, which it counts. [observability.md](observability.md#when-a-record-reaches-the-file) says what each case loses. | Design |
+| The ledger is not lossless. | A VMM that is killed, crashes or panics can lose the records not written yet. A write that stalls until the 4 MiB buffer fills makes the ledger drop `block` and `net` records, and the ledger counts them. [observability.md](observability.md#when-a-record-reaches-the-file) says what each case loses. | Design |
 | The ledger is not tamper-proof. | An ordinary file written by the VMM. Nothing signs or chains it. | Design |
 | `net` records are per packet and egress only. | No flow aggregation. `direction` and `guest_initiated` are constants, not observations. Inbound frames produce no record. | Design |
 | `ts` is host wall-clock. | It is not monotonic and can move backwards. | Design |

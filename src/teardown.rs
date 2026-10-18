@@ -49,8 +49,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::sync::lock_or_recover;
-
 /// How long the stop waits for the vCPU threads, then for the helper threads,
 /// and then for the ledger, after it is requested.
 ///
@@ -72,13 +70,13 @@ pub(crate) struct FinishCount {
 impl FinishCount {
     /// Records that one more thread has finished.
     pub(crate) fn note(&self) {
-        *lock_or_recover(&self.count) += 1;
+        *self.count.lock().unwrap() += 1;
         self.changed.notify_all();
     }
 
     /// Returns the number of threads that have finished.
     pub(crate) fn finished(&self) -> u32 {
-        *lock_or_recover(&self.count)
+        *self.count.lock().unwrap()
     }
 
     /// Returns whether `count` threads have finished by `deadline`.
@@ -86,11 +84,11 @@ impl FinishCount {
     /// It blocks until they have or until `deadline` passes.
     pub(crate) fn wait_for(&self, count: u32, deadline: Instant) -> bool {
         let timeout = deadline.saturating_duration_since(Instant::now());
-        let noted = lock_or_recover(&self.count);
+        let noted = self.count.lock().unwrap();
         let (noted, _) = self
             .changed
             .wait_timeout_while(noted, timeout, |noted| *noted < count)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap();
         *noted >= count
     }
 }
@@ -271,6 +269,15 @@ pub(crate) fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::R
             }
         }
     }
+}
+
+/// Sleeps for 1 ms, or until `deadline` when that comes sooner.
+///
+/// It sleeps in `poll`, which both seccomp allowlists allow, so a vCPU thread
+/// can call it. `clock_nanosleep` is in the `vmm` allowlist only.
+pub(crate) fn sleep_step(deadline: Instant) {
+    let next = (Instant::now() + Duration::from_millis(1)).min(deadline);
+    let _ = poll(&mut [], Some(next));
 }
 
 #[cfg(test)]

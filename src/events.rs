@@ -59,6 +59,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::net::Ipv4Addr;
@@ -612,6 +613,17 @@ impl Drop for Ledger {
     }
 }
 
+thread_local! {
+    /// Whether the calling thread is a ledger's writer.
+    static WRITER_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns whether the calling thread is a ledger's writer, which cannot wait
+/// for its own writes.
+pub(crate) fn is_writer_thread() -> bool {
+    WRITER_THREAD.get()
+}
+
 /// What a [`Ledger`] shares with the thread that writes its file.
 struct Shared {
     /// The buffer and the writer's progress.
@@ -785,6 +797,7 @@ impl Shared {
     /// The thread can start before a run's seccomp filters are armed, so it
     /// calls [`crate::sandbox::confine_io_thread`] before each write.
     fn run_writer(&self, file: File) {
+        WRITER_THREAD.set(true);
         let mut taken = Vec::new();
         // The file was truncated as it was opened, and this thread is the only
         // one that writes it.

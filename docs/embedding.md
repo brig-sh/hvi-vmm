@@ -224,9 +224,9 @@ Once a run has started, the process outlives a `SIGHUP`, and stderr can then be
 a terminal that hung up. `eprintln!` panics on a failed write, so a line your
 code or your plugin prints with it after a `SIGHUP` panics that thread. A panic
 in a plugin hook, or in a thread the plugin started with `VmHandle::spawn`,
-fails the run. The setup lines of a later `boot` in the same process are printed
-with `eprintln!` too, so a binary that stopped on `SIGHUP` should end rather
-than boot again.
+fails the run, as [Panics](#panics) says. The setup lines of a later `boot` in
+the same process are printed with `eprintln!` too, so a binary that stopped on
+`SIGHUP` should end rather than boot again.
 
 Another stop signal, one second or more after the first, restores the terminal
 and ends the process at once by that signal, and the ledger loses the records
@@ -266,6 +266,39 @@ handler even when they have one. A fault goes to their earlier handler first,
 and the terminal is restored only when the fault still ends the process. It does
 not restore the handlers it replaces, so call it once, before `boot`, if you
 want it.
+
+## Panics
+
+The panic strategy belongs to the binary. hvi's own binary is built with
+`panic = "abort"` and calls `hvi::run::set_panic_hook()` before `boot`. Its
+panic hook stops the vCPUs and writes the run's `vmm.stop` record before the
+process aborts. The record has reason `failed` and a report that names the
+thread, the message and where the panic happened. On a vCPU thread the report
+adds the vCPU's program counter and, once the vCPU has run, its last exit.
+
+A binary built the same way calls `set_panic_hook` too, or
+`hvi::run::record_panic` from a hook of its own, since the abort skips the stop
+that writes the record. Such a hook prints its own report before it calls
+`record_panic`, since a panic on another thread can abort the process once the
+record is written. The terminal is still in raw mode while such a hook prints,
+so it ends its lines with `\r\n`. `record_panic` does not restore the terminal,
+so the binary also calls `hvi::terminal::restore_on_fatal_signals()`, whose
+handler restores it when the abort raises `SIGABRT`. Once either hook has
+started, `boot` does not return, so the abort ends the process. A binary that
+can end the process another way while `boot` runs, by `exit` from another thread
+for example, calls `hvi::run::wait_for_panic_abort()` first, so the process
+still ends by the abort, with its status and core file.
+
+A binary that unwinds gets the VM stopped, its threads joined and an error from
+`boot` that names the thread that panicked, for a panic on a vCPU thread, an I/O
+thread or a thread a plugin started with `VmHandle::spawn`, and the stop writes
+the `vmm.stop` record. hvi takes a blocking lock with `.lock().unwrap()`, so the
+next thread to take a lock that the panic poisoned panics in turn. A later
+`boot` in the process is refused only when a thread was left running or the
+panic unwound out of `boot` itself. Without hvi's hook, the default hook
+resolves a backtrace when `RUST_BACKTRACE` is set. Under the Linux seccomp
+sandbox that opens the binary, which the filters refuse, so the process ends by
+`SIGSYS`.
 
 ## Configuration outside `BootConfig`
 

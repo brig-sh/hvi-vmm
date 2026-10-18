@@ -133,7 +133,6 @@ mod device {
     use crate::hypervisor::vcpus::Kick;
     use crate::io_threads::IoThreads;
     use crate::memory::GuestRam;
-    use crate::sync::lock_or_recover;
     use crate::teardown::StopToken;
     use crate::LOG_PREFIX;
 
@@ -846,7 +845,7 @@ mod device {
         is_write: bool,
         value: u64,
     ) -> u64 {
-        lock_or_recover(dev).mmio(mem, offset, is_write, value)
+        dev.lock().unwrap().mmio(mem, offset, is_write, value)
     }
 
     /// Raises the guest's interrupt for `dev` each time the daemon signals
@@ -874,7 +873,7 @@ mod device {
                 stderrln!("{LOG_PREFIX} virtio-fs: queue interrupts stopped: {e}");
                 return;
             }
-            lock_or_recover(dev).signal_used();
+            dev.lock().unwrap().signal_used();
         }
     }
 
@@ -963,7 +962,7 @@ mod device {
         io_threads: &mut IoThreads<K>,
     ) {
         for export in exports {
-            let calls = match lock_or_recover(&export.dev).call_fds() {
+            let calls = match export.dev.lock().unwrap().call_fds() {
                 Ok(calls) => calls,
                 Err(e) => {
                     stderrln!("{LOG_PREFIX} virtio-fs: queue interrupts unavailable: {e}");

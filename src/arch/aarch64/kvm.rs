@@ -72,7 +72,6 @@ use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::signal::install_kick_handler;
-use crate::sync::lock_or_recover;
 use crate::LOG_PREFIX;
 
 // --- ONE_REG ids (architectural KVM ABI, aarch64). ---------------
@@ -378,7 +377,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Each device sets its own interrupt line, from the methods that change its
     // level and so under the lock that decides it.
     let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
-    lock_or_recover(&shared.pl011).connect_irq(line(UART_SPI));
+    shared.pl011.lock().unwrap().connect_irq(line(UART_SPI));
     shared.guest.connect_irqs(
         // `open_disks` refused more disks than there are SPIs.
         |index| line(virtio_blk_spi(index).expect("an SPI per disk")),
@@ -386,7 +385,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         line(VIRTIO_VSOCK_SPI),
     );
     for export in shared.fs.iter() {
-        lock_or_recover(&export.dev).connect_irq(line(export.irq));
+        export.dev.lock().unwrap().connect_irq(line(export.irq));
     }
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
@@ -404,7 +403,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         &shared.guest,
         {
             let pl011 = Arc::clone(&shared.pl011);
-            move |byte| lock_or_recover(&pl011).push_rx(byte)
+            move |byte| pl011.lock().unwrap().push_rx(byte)
         },
         net_source,
     )?;
@@ -485,7 +484,10 @@ fn read_device(sh: &Shared, addr: u64, width: usize) -> u64 {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, false, 0)
     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
-        lock_or_recover(&sh.rtc).mmio(addr - RTC_BASE, width, false, 0)
+        sh.rtc
+            .lock()
+            .unwrap()
+            .mmio(addr - RTC_BASE, width, false, 0)
     } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
         dev_read(sh, Some(dev), off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
@@ -507,7 +509,10 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, true, val);
     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
-        lock_or_recover(&sh.rtc).mmio(addr - RTC_BASE, data.len(), true, val);
+        sh.rtc
+            .lock()
+            .unwrap()
+            .mmio(addr - RTC_BASE, data.len(), true, val);
     } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
         dev_write(sh, Some(dev), off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {

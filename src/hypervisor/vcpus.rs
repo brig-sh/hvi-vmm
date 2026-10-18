@@ -27,6 +27,7 @@
 //! How a kick reaches a vCPU depends on the hypervisor, so [`Vcpus`] takes it
 //! from a [`Kick`] implementation that owns the table of vCPU threads.
 
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +37,6 @@ use std::time::{Duration, Instant};
 use crate::config::Stop;
 use crate::hypervisor::quiesce::Quiesce;
 use crate::run::StopHandle;
-use crate::sync::lock_or_recover;
 use crate::LOG_PREFIX;
 
 /// How the hypervisor ends a vCPU's run.
@@ -53,6 +53,34 @@ pub(crate) trait Kick: Send + Sync {
     /// Wakes the vCPUs that wait outside the hypervisor for the guest to start
     /// them.
     fn kick_halted(&self) {}
+
+    /// Kicks every vCPU but the caller's own and wakes the halted ones,
+    /// skipping each kick whose lock another thread holds.
+    ///
+    /// It returns whether every kick went out. It is for a caller that cannot
+    /// wait for a lock, such as a panic hook on the thread that holds it.
+    fn try_kick_all(&self) -> bool;
+}
+
+/// The vCPUs of the run in progress, as a panic hook stops them.
+pub(crate) trait StopVcpus: Send + Sync {
+    /// Stops the vCPUs with `failure` as how the run ended, without waiting for
+    /// a lock.
+    ///
+    /// It records the failure, clears the running flag and kicks the vCPUs, in
+    /// that order, so the run reports the failure rather than a guest stop once
+    /// the vCPUs exit. The failure is not recorded when another thread holds
+    /// the outcome lock. The stop hooks and the quiesce release of
+    /// [`Vcpus::stop`] take locks, so this leaves them out.
+    fn stop_without_blocking(&self, failure: &str);
+
+    /// Returns whether every vCPU thread spawned, but the caller's own, has
+    /// exited by `deadline`.
+    ///
+    /// It blocks until they have exited or the deadline passes. A vCPU parked
+    /// at a checkpoint does not exit, and neither does one blocked in a device,
+    /// such as on a lock the panicking thread holds or on a vhost-user daemon.
+    fn wait_for_exits_until(&self, deadline: Instant) -> bool;
 }
 
 /// The vCPUs of one VM, with the state their threads share.
@@ -75,6 +103,8 @@ pub(crate) struct Vcpus<K> {
     started_ids: Mutex<Vec<u32>>,
     /// The number of vCPU threads that have exited.
     exited: AtomicU32,
+    /// The number of vCPU threads spawned.
+    spawned: AtomicU32,
     /// The run's stop handle, which also wakes the loop.
     stop_handle: StopHandle,
     /// The [`Kick`] implementation that kicks the vCPUs.
@@ -96,6 +126,7 @@ impl<K: Kick> Vcpus<K> {
             started: AtomicU32::new(0),
             started_ids: Mutex::new(Vec::new()),
             exited: AtomicU32::new(0),
+            spawned: AtomicU32::new(0),
             stop_handle: stop,
             kicker,
             stop_hooks: Mutex::new(Vec::new()),
@@ -110,7 +141,7 @@ impl<K: Kick> Vcpus<K> {
     /// later stop.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn on_stop(&self, hook: impl Fn() + Send + Sync + 'static) {
-        lock_or_recover(&self.stop_hooks).push(Box::new(hook));
+        self.stop_hooks.lock().unwrap().push(Box::new(hook));
     }
 
     /// Returns the number of vCPUs.
@@ -134,14 +165,16 @@ impl<K: Kick> Vcpus<K> {
     /// calls it once, before its first checkpoint.
     pub(crate) fn mark_started(&self, cpu: u32) {
         self.started.fetch_add(1, Ordering::SeqCst);
-        lock_or_recover(&self.started_ids).push(cpu);
+        self.started_ids.lock().unwrap().push(cpu);
         self.stop_handle.wake();
     }
 
     /// Returns the ids of the vCPUs that entered their run loop after the first
     /// `seen`, in the order they did.
     pub(crate) fn started_after(&self, seen: usize) -> Vec<u32> {
-        lock_or_recover(&self.started_ids)
+        self.started_ids
+            .lock()
+            .unwrap()
             .get(seen..)
             .unwrap_or_default()
             .to_vec()
@@ -211,7 +244,7 @@ impl<K: Kick> Vcpus<K> {
         }
         // A hook frees a vCPU that waits outside the hypervisor. The hooks run
         // after the flag is cleared, so that vCPU reads the stop as it returns.
-        for hook in lock_or_recover(&self.stop_hooks).iter() {
+        for hook in self.stop_hooks.lock().unwrap().iter() {
             hook();
         }
         // A vCPU parked at a checkpoint waits on a condition variable that no
@@ -267,10 +300,10 @@ impl<K: Kick> Vcpus<K> {
     /// its failure. A failure that is not kept is printed. The vCPUs a stop
     /// kicks leave their loops without a report, so a later report comes from a
     /// thread that stopped or failed on its own at the same time. A report can
-    /// come from a thread that unwinds from a panic, where a second panic
-    /// aborts the process.
+    /// come from a thread that unwinds from a panic, so nothing that can panic
+    /// runs while it holds the outcome lock.
     pub(crate) fn report(&self, outcome: Outcome) {
-        let mut kept = lock_or_recover(&self.outcome);
+        let mut kept = self.outcome.lock().unwrap();
         let replaces = matches!(
             (kept.as_ref(), &outcome),
             (None, _) | (Some(Outcome::Stopped(_)), Outcome::Failed(_))
@@ -291,7 +324,7 @@ impl<K: Kick> Vcpus<K> {
     /// nor a request is one in which the guest stopped without saying how, and
     /// its outcome is [`Stop::SystemOff`].
     pub(crate) fn outcome(&self) -> Outcome {
-        let reported = lock_or_recover(&self.outcome).clone();
+        let reported = self.outcome.lock().unwrap().clone();
         reported.unwrap_or(Outcome::Stopped(if self.stop_handle.is_stop_requested() {
             Stop::Requested
         } else {
@@ -342,10 +375,14 @@ impl<K: Kick> Vcpus<K> {
             let exited = Arc::new(AtomicBool::new(false));
             let guard_exited = Arc::clone(&exited);
             // The guard is made on the thread, since a closure that fails to
-            // spawn is dropped and its guard would count an exit.
+            // spawn is dropped and its guard would count an exit. The thread is
+            // counted before it starts, so a panic hook never sees it run
+            // uncounted.
+            self.spawned.fetch_add(1, Ordering::SeqCst);
             let spawned = std::thread::Builder::new()
                 .name(format!("vcpu{id}"))
                 .spawn(move || {
+                    VCPU_THREAD.set(true);
                     let exit = ExitGuard {
                         vcpus,
                         exited: guard_exited,
@@ -362,6 +399,7 @@ impl<K: Kick> Vcpus<K> {
             match spawned {
                 Ok(handle) => threads.push(VcpuThread { handle, exited }),
                 Err(e) => {
+                    self.spawned.fetch_sub(1, Ordering::SeqCst);
                     self.stop();
                     let e = io::Error::new(e.kind(), format!("spawning the vcpu{id} thread: {e}"));
                     return (VcpuThreads(threads), Err(e));
@@ -461,6 +499,73 @@ impl VcpuThreads {
     }
 }
 
+impl<K: Kick> StopVcpus for Vcpus<K> {
+    fn stop_without_blocking(&self, failure: &str) {
+        // A failure replaces a stop, as `report` decides.
+        if let Ok(mut kept) = self.outcome.try_lock() {
+            if matches!(*kept, None | Some(Outcome::Stopped(_))) {
+                *kept = Some(Outcome::Failed(failure.to_string()));
+            }
+        }
+        self.running.store(false, Ordering::SeqCst);
+        self.kicker.try_kick_all();
+    }
+
+    fn wait_for_exits_until(&self, deadline: Instant) -> bool {
+        let own = u32::from(VCPU_THREAD.get());
+        // The exits are polled. A wait on the stop handle would drain the wake
+        // that the loop in `run_to_stop` waits for.
+        while self.exited.load(Ordering::SeqCst) + own < self.spawned.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            crate::teardown::sleep_step(deadline);
+        }
+        true
+    }
+}
+
+/// A closure that describes a vCPU for a panic report, or returns `None`.
+type PanicDetail = Box<dyn Fn() -> Option<String>>;
+
+thread_local! {
+    /// Whether the calling thread is a vCPU thread [`Vcpus::spawn`] started.
+    static VCPU_THREAD: Cell<bool> = const { Cell::new(false) };
+
+    /// The detail the calling thread's vCPU loop gives for a panic report,
+    /// until the guard from [`report_on_panic`] drops.
+    static PANIC_DETAIL: RefCell<Option<PanicDetail>> = const { RefCell::new(None) };
+}
+
+/// Makes `detail` part of the report of a panic on the calling thread, until
+/// the returned guard drops.
+///
+/// The guard is not `Send`, so it drops on the calling thread.
+pub(crate) fn report_on_panic(detail: impl Fn() -> Option<String> + 'static) -> PanicDetailGuard {
+    PANIC_DETAIL.with(|slot| *slot.borrow_mut() = Some(Box::new(detail)));
+    PanicDetailGuard(std::marker::PhantomData)
+}
+
+/// Returns the detail the calling thread's vCPU loop gives for a panic report,
+/// or `None` when it gives none.
+pub(crate) fn panic_detail() -> Option<String> {
+    PANIC_DETAIL
+        .try_with(|slot| slot.try_borrow().ok()?.as_ref()?())
+        .ok()
+        .flatten()
+}
+
+/// A guard that keeps a vCPU's detail in the report of a panic on its thread
+/// until it drops.
+#[must_use]
+pub(crate) struct PanicDetailGuard(std::marker::PhantomData<*const ()>);
+
+impl Drop for PanicDetailGuard {
+    fn drop(&mut self) {
+        let _ = PANIC_DETAIL.try_with(|slot| slot.borrow_mut().take());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +592,12 @@ mod tests {
         fn kick_halted(&self) {
             self.halted.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn try_kick_all(&self) -> bool {
+            self.kick_all();
+            self.kick_halted();
+            true
+        }
     }
 
     /// A kicker that records, at the stop's last kick, whether a vCPU parked
@@ -508,6 +619,11 @@ mod tests {
             // time to leave its checkpoint.
             std::thread::sleep(Duration::from_millis(50));
             *self.seen.lock().unwrap() = Some(self.resumed.load(Ordering::SeqCst));
+        }
+
+        fn try_kick_all(&self) -> bool {
+            self.kick_halted();
+            true
         }
     }
 

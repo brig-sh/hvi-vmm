@@ -99,7 +99,6 @@ pub mod plugin;
 pub mod run;
 pub mod sandbox;
 pub mod signal;
-pub mod sync;
 pub mod teardown;
 pub mod terminal;
 
@@ -124,7 +123,9 @@ compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux onl
 /// requests a stop.
 ///
 /// Returns the [`Stop`](config::Stop) that ended the run. When a vCPU fails,
-/// the run ends and the call returns an error that says how.
+/// the run ends and the call returns an error that says how. Once a panic hook
+/// has started in a binary built with `panic = "abort"`, the call does not
+/// return, and the abort ends the process.
 ///
 /// Every thread this call itself starts has exited when it returns, or the call
 /// returns an error naming the first that did not stop within
@@ -152,12 +153,14 @@ pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> 
     let mut claim = run::RUN_SLOT
         .claim()
         .map_err(|e| config::BootError::new(e.into()))?;
-    backend::boot(cfg).map_err(|e| {
+    let result = backend::boot(cfg).map_err(|e| {
         if e.is::<run::LeftRunning>() {
             claim.keep();
         }
         config::BootError::new(e)
-    })
+    });
+    run::wait_for_panic_abort();
+    result
 }
 
 pub use run::spawn::{spawn, Run};

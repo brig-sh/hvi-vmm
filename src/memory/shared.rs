@@ -184,8 +184,9 @@ mod tests {
     use super::*;
     use crate::memory::GuestRam;
 
-    // Read-held by every allocation between creating its name and unlinking
-    // it, and write-held by the probe below while it looks.
+    // Every allocation read-holds this lock between creating its name and
+    // unlinking it, and the probe below write-holds it while it looks. It
+    // guards no data, so a test takes it even when a failed test poisoned it.
     #[cfg(target_os = "macos")]
     pub(super) static NAME_WINDOW: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
