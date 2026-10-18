@@ -69,7 +69,7 @@ three things a reader should not have to guess between:
 | `tools/mk-initramfs.py` builds an arm64 initramfs only. | An x86-64 guest needs its own. | Design |
 | An x86-64 guest powers off through ACPI only. | A kernel built without `CONFIG_ACPI`, or booted with `acpi=off`, halts on `poweroff`. KVM handles the halt itself, so the run goes on until a signal stops it. `reboot -f` ends it as `SystemReset`. | Design |
 | An x86-64 `vmlinux` boots without KASLR. | The kernel randomizes its placement in the `bzImage` decompressor, which a `vmlinux` skips. Boot a `bzImage` when KASLR matters. | Platform |
-| `SystemReset` stops the process. | hvi never reboots a guest and never recovers one. A caller that wants a reboot calls `boot` again, from a thread of its own after a sandboxed run on Linux (see [embedding.md](embedding.md#stopping-a-run-from-the-host)). | Design |
+| `SystemReset` stops the process. | hvi never reboots a guest and never recovers one. A caller that wants a reboot starts a new run, through `spawn` after a sandboxed run on Linux. On macOS no run can follow one that entered the sandbox in the same process, so a reboot there takes a new process (see [embedding.md](embedding.md#stopping-a-run-from-the-host)). | Design |
 
 ## Observability
 

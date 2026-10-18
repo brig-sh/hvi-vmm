@@ -132,27 +132,31 @@ compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux onl
 /// [`teardown::STOP_TIMEOUT`], a vCPU thread before a helper thread. There are
 /// two exceptions. The thread that receives the stop signals, which the first
 /// run after [`stop_on_signals`](signal::stop_on_signals) starts, runs for the
-/// life of the process. The ledger's writer thread is not joined: it exits once
-/// it has written the ledger, or given up on a write that keeps failing, and a
-/// write that blocks in the kernel holds it until the write returns. What
-/// remains of the VM is a `VmHandle` a plugin kept, in a field or on a thread
-/// it started from `attach`.
+/// life of the process. The ledger's writer thread is not joined, and it can
+/// outlive the call while a ledger write blocks in the kernel or keeps failing.
+/// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
+/// thread it started from `attach`.
+///
+/// A sandboxed run leaves its confinement in place. On Linux the seccomp filter
+/// stays on the calling thread, refuses opening a file, and passes to every
+/// thread that thread starts later, so a later sandboxed `boot` starts from a
+/// thread outside the filter. On macOS the Seatbelt profile stays on the whole
+/// process and refuses what a later run sets up.
 ///
 /// # Errors
 ///
 /// Errors if the guest cannot be set up, if a vCPU or a thread fails, or if a
 /// thread does not stop in time. Errors at once while another run is in
 /// progress in the process, and once a run has left a thread running or unwound
-/// from a panic, since a process runs one guest at a time.
-///
-/// A sandboxed run leaves its confinement in place: on Linux the seccomp filter
-/// on the calling thread, which refuses opening a file, and on macOS the
-/// Seatbelt profile on the whole process. A later sandboxed `boot` on Linux
-/// starts from a thread of its own, as [`spawn`](fn@spawn) does.
+/// from a panic, since a process runs one guest at a time. Once the sandbox is
+/// on in the process, errors at once for a run with `sandbox` off, on Linux for
+/// a run from the thread that called a sandboxed `boot`, and on macOS for any
+/// run.
 pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> {
     let mut claim = run::RUN_SLOT
         .claim()
         .map_err(|e| config::BootError::new(e.into()))?;
+    sandbox::check_run(cfg.sandbox).map_err(|e| config::BootError::new(e.into()))?;
     let result = backend::boot(cfg).map_err(|e| {
         if e.is::<run::LeftRunning>() {
             claim.keep();

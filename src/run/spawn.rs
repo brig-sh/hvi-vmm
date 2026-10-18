@@ -82,8 +82,9 @@ impl Run {
 ///
 /// The thread calls [`boot`](crate::boot), and the returned [`Run`] waits for
 /// it. On Linux `boot` installs its seccomp filter on the thread that calls it,
-/// which here is the new thread, so the calling thread stays unfiltered. On
-/// macOS the Seatbelt profile confines the whole process, the calling thread
+/// which here is the new thread, so the calling thread stays unfiltered. A
+/// filter the calling thread already carries passes to the new thread. On macOS
+/// the Seatbelt profile confines the whole process, the calling thread
 /// included, from the start of the run until the process exits. The run keeps
 /// the stop `cfg.stop` holds, or takes a new one when it is `None`, and
 /// [`Run::stop_handle`] returns a handle on it either way.
@@ -91,8 +92,10 @@ impl Run {
 /// # Errors
 ///
 /// Errors if the pipe the stop request is written to cannot be created, or if
-/// the thread cannot be started.
+/// the thread cannot be started. Errors on Linux when called from the thread
+/// that called a sandboxed [`boot`](crate::boot).
 pub fn spawn(mut cfg: BootConfig) -> io::Result<Run> {
+    crate::sandbox::check_thread().map_err(io::Error::other)?;
     let stop = match &cfg.stop {
         Some(registration) => registration.handle(),
         None => {

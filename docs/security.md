@@ -49,7 +49,12 @@ is in [cli.md](cli.md#console-output).
 ## Confinement
 
 On by default. `--no-sandbox` turns it off, for debugging a run the profile or
-the filters break.
+the filters break. Once a run turns it on, it stays on for the life of the
+process, since a Seatbelt profile cannot be left and a seccomp filter cannot be
+removed from a thread. A process that embeds hvi and runs a sandboxed guest
+cannot run a later one with the sandbox off: `boot` refuses that run. On macOS
+the profile also refuses what a later sandboxed run sets up, so `boot` refuses
+every later run there.
 
 Each backend prints what it installed, so a host where confinement did not
 happen says so:

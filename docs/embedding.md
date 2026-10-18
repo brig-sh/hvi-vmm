@@ -43,9 +43,11 @@ powered off or reset. `Requested` means the host asked the run to stop (see
 `boot` returns an error that names the vCPU and says how it failed.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
-guest, and nothing in hvi restarts one. If your integration wants a reboot, call
-`boot` again yourself, from a thread of its own after a sandboxed run on Linux
-(see [Stopping a run from the host](#stopping-a-run-from-the-host)).
+guest, and nothing in hvi restarts one. If your integration wants a reboot,
+start a new run yourself, through `spawn` after a sandboxed run on Linux (see
+[Stopping a run from the host](#stopping-a-run-from-the-host)). On macOS no run
+can follow one that entered the sandbox in the same process, so a reboot there
+takes a new process.
 
 The call blocks until the guest stops, a vCPU fails, or a stop is requested. It
 reads the process's stdin for the whole run, one byte at a time, as the guest
@@ -198,11 +200,17 @@ while another is in progress. It refuses every run after one that left a thread
 running or whose `boot` unwound from a panic, since what that run left behind
 still shares them.
 
-A sandboxed run leaves its confinement in place after `boot` returns. On Linux
-the `vmm` seccomp filter stays on the thread that called `boot`, and it refuses
-opening a file, so a later `boot` from that thread dies of `SIGSYS`. Start each
-sandboxed run from a thread of its own, as `spawn` does. On macOS the Seatbelt
-profile stays on the whole process.
+A sandboxed run leaves its confinement in place for the life of the process. On
+Linux the `vmm` seccomp filter stays on the thread that called `boot`, and every
+thread that thread starts later inherits it. The filter refuses opening a file,
+so `boot` and `spawn` refuse a later run from that thread. A run from a thread
+the filtered thread started ends the process by `SIGSYS`. Start every sandboxed
+run with `spawn`, so the thread that calls it stays unfiltered. `boot` refuses a
+later run with `sandbox: false`. On macOS the Seatbelt profile stays on the
+whole process once a run has entered it, and refuses what a later run sets up,
+such as its guest RAM, so `boot` refuses every later run there. A sandboxed run
+that fails before it enters the profile leaves later runs free. A run that
+`boot` refuses for the sandbox needs a process of its own.
 
 The library installs no handler for a stop signal. To stop the run on `SIGTERM`,
 `SIGINT` and `SIGHUP`, as the `hvi` binary does, call
@@ -289,16 +297,16 @@ can end the process another way while `boot` runs, by `exit` from another thread
 for example, calls `hvi::run::wait_for_panic_abort()` first, so the process
 still ends by the abort, with its status and core file.
 
-A binary that unwinds gets the VM stopped, its threads joined and an error from
-`boot` that names the thread that panicked, for a panic on a vCPU thread, an I/O
-thread or a thread a plugin started with `VmHandle::spawn`, and the stop writes
-the `vmm.stop` record. hvi takes a blocking lock with `.lock().unwrap()`, so the
-next thread to take a lock that the panic poisoned panics in turn. A later
-`boot` in the process is refused only when a thread was left running or the
-panic unwound out of `boot` itself. Without hvi's hook, the default hook
-resolves a backtrace when `RUST_BACKTRACE` is set. Under the Linux seccomp
-sandbox that opens the binary, which the filters refuse, so the process ends by
-`SIGSYS`.
+In a binary that unwinds, a panic on a vCPU thread, an I/O thread or a thread a
+plugin started with `VmHandle::spawn` stops the run. The VM stops, the threads
+are joined, the `vmm.stop` record is written, and `boot` returns an error that
+names the thread that panicked. hvi takes a blocking lock with
+`.lock().unwrap()`, so the next thread to take a lock that the panic poisoned
+panics in turn. A panic makes `boot` refuse later runs in the process only when
+a thread was left running or the panic unwound out of `boot` itself. Without
+hvi's hook, the default hook resolves a backtrace when `RUST_BACKTRACE` is set.
+Resolving it opens the binary, which the Linux seccomp filters refuse, so under
+the sandbox the process ends by `SIGSYS`.
 
 ## Configuration outside `BootConfig`
 

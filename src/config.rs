@@ -627,14 +627,17 @@ pub struct BootConfig {
     /// flag it stays `None`. Any other plugin comes from a caller that links
     /// this crate as a library.
     pub plugin: Option<std::sync::Arc<dyn crate::plugin::Plugin>>,
-    /// Confine the VMM process before it services any guest I/O: a Seatbelt
-    /// profile on macOS (`sandbox::seatbelt`), seccomp-bpf allowlists on Linux
-    /// (`sandbox::seccomp`). Neither is an intra-doc link, because each module
-    /// is compiled only on its own OS and the link would dangle on every other
-    /// target. On by default; `--no-sandbox` clears it, for debugging a run the
-    /// confinement breaks. Both are per-process and irreversible, and the
-    /// backend logs which one it installed, so this is never a silent
-    /// "sandboxed" claim on a host that is not.
+    /// Whether the VMM process is confined before it services any guest I/O, by
+    /// a Seatbelt profile on macOS (`sandbox::seatbelt`) or seccomp-bpf
+    /// allowlists on Linux (`sandbox::seccomp`).
+    ///
+    /// Neither module is an intra-doc link, because each is compiled only on
+    /// its own OS and the link would dangle on every other target. It is on by
+    /// default, and `--no-sandbox` clears it, for debugging a run the
+    /// confinement breaks. Once the sandbox is on in the process, it stays on,
+    /// and [`boot`](crate::boot) refuses a run with it off and, on macOS, any
+    /// later run. The backend logs which one it installed, so this is never a
+    /// silent "sandboxed" claim on a host that is not.
     pub sandbox: bool,
     /// The registration of the [`StopHandle`](crate::run::StopHandle) that asks
     /// this run to stop from outside the guest, or `None` when the caller keeps
