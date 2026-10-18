@@ -76,7 +76,6 @@ use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RamRegion, RegsView};
 use crate::signal::install_kick_handler;
-use crate::sync::lock_or_recover;
 use crate::LOG_PREFIX;
 
 /// The i8042's CPU-reset command, on [`I8042_COMMAND_PORT`].
@@ -430,7 +429,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Each device sets its own interrupt line, from the methods that change its
     // level and so under the lock that decides it.
     let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
-    lock_or_recover(&shared.uart).connect_irq(line(COM1_GSI));
+    shared.uart.lock().unwrap().connect_irq(line(COM1_GSI));
     shared.guest.connect_irqs(
         // `open_disks` refused more disks than there are GSIs.
         |index| line(virtio_blk_gsi(index).expect("a GSI per disk")),
@@ -438,7 +437,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         line(VIRTIO_VSOCK_GSI),
     );
     for export in shared.fs.iter() {
-        lock_or_recover(&export.dev).connect_irq(line(export.irq));
+        export.dev.lock().unwrap().connect_irq(line(export.irq));
     }
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
@@ -456,7 +455,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         &shared.guest,
         {
             let uart = Arc::clone(&shared.uart);
-            move |byte| lock_or_recover(&uart).push_rx(byte)
+            move |byte| uart.lock().unwrap().push_rx(byte)
         },
         net_source,
     )?;
@@ -597,7 +596,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     // The PM1 registers are 16 bits wide, so the ACPI block
                     // takes the whole access. Every other port is a byte port.
                     if let Some(offset) = pm_offset(port) {
-                        lock_or_recover(&sh.pm).read(offset, data);
+                        sh.pm.lock().unwrap().read(offset, data);
                     } else {
                         for b in data.iter_mut() {
                             *b = pio_read(&sh, port);
@@ -606,7 +605,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                 }
                 VcpuExit::IoOut(port, data) => {
                     let stop = if let Some(offset) = pm_offset(port) {
-                        lock_or_recover(&sh.pm).write(offset, data)
+                        sh.pm.lock().unwrap().write(offset, data)
                     } else {
                         for &b in data.iter() {
                             pio_write(&sh, port, b);

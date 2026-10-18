@@ -37,7 +37,6 @@ use signal_hook::iterator::{Handle, Signals};
 
 use crate::config::{BootError, Stop};
 use crate::run::{StopHandle, StopRegistration};
-use crate::sync::lock_or_recover;
 use crate::teardown::STOP_TIMEOUT;
 
 /// The signals [`stop_on_signals`] turns into a stop request.
@@ -126,7 +125,7 @@ pub fn stop_on_signals(handle: &StopHandle) -> io::Result<()> {
             registered: Vec::new(),
         })
     });
-    let mut state = lock_or_recover(state);
+    let mut state = state.lock().unwrap();
     state.target = handle.clone();
     state.first = None;
     state.register()
@@ -149,7 +148,7 @@ pub(crate) fn start_stop_signal_thread() -> io::Result<()> {
     let Some(state) = STOP_SIGNAL_STATE.get() else {
         return Ok(());
     };
-    let mut stop_signals = lock_or_recover(state);
+    let mut stop_signals = state.lock().unwrap();
     if stop_signals.signals.is_none() {
         let signals = Signals::new(std::iter::empty::<libc::c_int>())?;
         let handle = signals.handle();
@@ -176,7 +175,7 @@ fn receive_stop_signals(state: &Mutex<StopSignals>, mut signals: Signals) {
         // confines it under the filters a later run armed.
         crate::sandbox::confine_io_thread();
         let escalate = {
-            let mut state = lock_or_recover(state);
+            let mut state = state.lock().unwrap();
             match state.first {
                 None => {
                     state.first = Some(Instant::now());
@@ -255,8 +254,12 @@ impl StopOnSignals {
     /// under its default action the write ends the process. When a stop signal
     /// asked for the stop, the process then ends by that signal, as
     /// [`exit_by_signal`] ends it, whether the run stopped or failed. Otherwise
-    /// it exits with status 0 after a stop and 1 after a failure.
+    /// it exits with status 0 after a stop and 1 after a failure. Once a panic
+    /// hook has started in a binary built with `panic = "abort"`, it waits for
+    /// the abort to end the process, as
+    /// [`wait_for_panic_abort`](crate::run::wait_for_panic_abort) does.
     pub fn finish(self, result: Result<Stop, BootError>) -> ! {
+        crate::run::wait_for_panic_abort();
         match &result {
             Ok(stop) => stderrln!("guest stopped: {stop:?}"),
             Err(e) => stderrln!("hvi: {e}"),

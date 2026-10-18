@@ -36,7 +36,6 @@ use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
 use crate::sandbox::confine_io_thread;
 use crate::signal::kick_signal;
-use crate::sync::lock_or_recover;
 use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
 use crate::LOG_PREFIX;
@@ -161,7 +160,7 @@ impl<K: Kick> IoThreads<K> {
         }
         if let (Some(net), Some(dev)) = (net, &guest.net) {
             let (dev, ram) = (Arc::clone(dev), Arc::clone(&guest.ram));
-            let deliver = move |frame: &[u8]| lock_or_recover(&dev).deliver(&ram, frame);
+            let deliver = move |frame: &[u8]| dev.lock().unwrap().deliver(&ram, frame);
             match net {
                 NetSource::Gateway(stream) => io_threads.spawn("gateway relay", move |stop| {
                     if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
@@ -387,6 +386,10 @@ mod tests {
         fn kick(&self, _cpu: u32) {}
 
         fn kick_all(&self) {}
+
+        fn try_kick_all(&self) -> bool {
+            true
+        }
     }
 
     /// Returns the vCPUs of a run with one vCPU and no threads.

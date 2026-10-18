@@ -217,6 +217,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // The example builds with the crate's profiles, which abort on a panic, so
+    // it installs the hook that restores the terminal and records the panic.
+    hvi::run::set_panic_hook();
     if let Err(e) = run() {
         eprintln!("watch_guest: {e}");
         std::process::exit(1);

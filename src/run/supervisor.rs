@@ -18,21 +18,24 @@
 //! the run's [`StopHandle`]. A vCPU thread reports how its loop ended and wakes
 //! the handle as it exits. [`run_to_stop`] then stops the VM and tears the run
 //! down. Only this loop stops the VM after the spawn, so the order of the stop
-//! and the reason it reports are decided in one place.
+//! and the reason it reports are decided in one place. The one exception is the
+//! panic hook of a binary that aborts, which stops the vCPUs and records the
+//! failure through [`CURRENT_RUN`].
 //!
 //! [`StopHandle`]: crate::run::StopHandle
 
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
 use serde::Serialize;
 
 use crate::config::Stop;
-use crate::events::Batch;
+use crate::events::{Batch, Ledger};
 use crate::hypervisor::guest::Guest;
-use crate::hypervisor::vcpus::{Kick, Outcome, VcpuThreads};
+use crate::hypervisor::vcpus::{Kick, Outcome, StopVcpus, VcpuThreads};
 use crate::io_threads::IoThreads;
 use crate::plugin::GuestArch;
 use crate::teardown::STOP_TIMEOUT;
@@ -111,6 +114,125 @@ impl Drop for RunClaim<'_> {
     }
 }
 
+/// The process's [`CurrentRun`].
+pub(crate) static CURRENT_RUN: CurrentRun = CurrentRun::new();
+
+/// A slot for the run in progress.
+pub(crate) struct CurrentRun(Mutex<Option<Current>>);
+
+/// What [`CurrentRun`] holds of the run in progress.
+#[derive(Clone)]
+struct Current {
+    /// The run's ledger.
+    ledger: Arc<Ledger>,
+    /// The run's vCPUs.
+    vcpus: Arc<dyn StopVcpus>,
+}
+
+impl CurrentRun {
+    /// Returns a slot with no run in it.
+    pub(crate) const fn new() -> Self {
+        CurrentRun(Mutex::new(None))
+    }
+
+    /// Makes the run of `ledger` and `vcpus` current once `f` has run, and
+    /// until the returned guard drops.
+    ///
+    /// `f` runs with the slot held, so a panic on another thread does not find
+    /// the run current before `f` returns.
+    pub(crate) fn enter(
+        &self,
+        ledger: &Arc<Ledger>,
+        vcpus: Arc<dyn StopVcpus>,
+        f: impl FnOnce(),
+    ) -> EnterGuard<'_> {
+        let mut current = self.0.lock().unwrap();
+        f();
+        *current = Some(Current {
+            ledger: Arc::clone(ledger),
+            vcpus,
+        });
+        EnterGuard(self)
+    }
+
+    /// Stops the vCPUs of the current run with `failure` as how it ended,
+    /// without waiting for them, unless another thread holds the slot.
+    pub(crate) fn stop_vcpus(&self, failure: &str) {
+        if let Ok(current) = self.0.try_lock() {
+            if let Some(current) = current.as_ref() {
+                current.vcpus.stop_without_blocking(failure);
+            }
+        }
+    }
+
+    /// Writes a `vmm.stop` record with `reason` `failed` and `error` as the
+    /// last record of the current run's ledger.
+    ///
+    /// It stops the vCPUs first, with `error` as how the run ended, and waits
+    /// for them to exit. It waits at most [`STOP_TIMEOUT`] in all, for the
+    /// slot, the vCPUs and the ledger's writer. The vCPUs get the first half.
+    /// The ledger is then closed whether or not they have exited, and the
+    /// writer gets the rest. It returns whether the record was written.
+    ///
+    /// It writes nothing when no run is current. When the ledger is already
+    /// closed, by the run's own `vmm.stop` record or another panic's, it writes
+    /// nothing and waits for that record until the deadline. On a ledger's
+    /// writer thread it does not wait, since it cannot wait for its own write.
+    pub(crate) fn record_failure(&self, error: &str) -> bool {
+        let start = Instant::now();
+        let deadline = start + STOP_TIMEOUT;
+        // No thread holds the slot for long, so it is tried until the deadline.
+        // A panic on a thread that holds the slot then gives up at the deadline
+        // instead of waiting for itself.
+        let current = loop {
+            match self.0.try_lock() {
+                Ok(current) => break current,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    crate::teardown::sleep_step(deadline);
+                }
+                Err(_) => return false,
+            }
+        };
+        let Some(Current { ledger, vcpus }) = current.clone() else {
+            return false;
+        };
+        drop(current);
+        // Every `block` and `net` record comes from a vCPU thread, so once the
+        // vCPUs have exited, the closed ledger drops none of them.
+        vcpus.stop_without_blocking(error);
+        vcpus.wait_for_exits_until(start + STOP_TIMEOUT / 2);
+        let stop = StopRecord {
+            reason: "failed",
+            signal: None,
+            error: Some(error),
+            dropped: ledger.dropped(),
+        };
+        let deadline = if crate::events::is_writer_thread() {
+            Instant::now()
+        } else {
+            deadline
+        };
+        ledger
+            .close_with(deadline, |batch| {
+                batch.emit_payload("vmm", "vmm.stop", &stop);
+            })
+            .is_ok()
+    }
+}
+
+/// A guard that keeps a run current, from [`CurrentRun::enter`] until it drops.
+#[must_use]
+pub(crate) struct EnterGuard<'a>(&'a CurrentRun);
+
+impl Drop for EnterGuard<'_> {
+    fn drop(&mut self) {
+        // The ledger is dropped once the slot is released, since dropping its
+        // last handle can wait for the writer.
+        let current = self.0 .0.lock().unwrap().take();
+        drop(current);
+    }
+}
+
 /// The error of a run that left a thread running.
 ///
 /// It keeps the error that failed the run as it was, beside the thread left
@@ -162,10 +284,18 @@ impl<K: Kick> Drop for StopOnUnwind<'_, K> {
 /// `confined` says whether the run's confinement is on. Call it before the vCPU
 /// threads are spawned, so the record comes before any record the VMM writes
 /// for the run. A plugin can write earlier, from `attach` or from a thread it
-/// started there. The call waits for the ledger's writer for at most
-/// [`STOP_TIMEOUT`], and not at all while the ledger's writes fail. A record
-/// not written by then stays buffered.
-pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
+/// started there.
+///
+/// The run is the [`CURRENT_RUN`] from that record on, until the returned guard
+/// drops. Hold the guard until [`run_to_stop`] returns.
+///
+/// The call waits for the ledger's writer for at most [`STOP_TIMEOUT`], and not
+/// at all while the ledger's writes fail. A record not written by then stays
+/// buffered.
+pub(crate) fn record_start<K: Kick + 'static>(
+    guest: &Guest<K>,
+    confined: bool,
+) -> EnterGuard<'static> {
     let start = StartRecord {
         arch: match guest.arch {
             GuestArch::Aarch64 => "aarch64",
@@ -176,14 +306,25 @@ pub(crate) fn record_start<K: Kick>(guest: &Guest<K>, confined: bool) {
         confined,
         core_version: crate::CORE_VERSION,
     };
-    let written = guest
-        .ledger
-        .batch_until(Instant::now() + STOP_TIMEOUT, |batch| {
+    // The start record is added as the run becomes current, so a panic writes
+    // the run's `vmm.stop` record only after it. It is added without waiting,
+    // since the slot is held, and then waited for.
+    let mut added = Ok(());
+    let current = CURRENT_RUN.enter(&guest.ledger, Arc::clone(&guest.vcpus) as _, || {
+        added = guest.ledger.batch_until(Instant::now(), |batch| {
             batch.emit_payload("vmm", "vmm.start", &start);
         });
+    });
+    let written = match added {
+        Err(e) if e.kind() != io::ErrorKind::TimedOut => Err(e),
+        _ => guest
+            .ledger
+            .batch_until(Instant::now() + STOP_TIMEOUT, |_| {}),
+    };
     if let Err(e) = written {
         stderrln!("{LOG_PREFIX} writing the start record: {e}");
     }
+    current
 }
 
 /// Runs the guest from its spawned vCPU threads to its stop.
@@ -363,7 +504,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::events::Ledger;
+    use crate::events::{CapturedEvent, Ledger};
 
     use crate::hypervisor::guest::tests::{guest, NoopKicker};
     use crate::run::StopHandle;
@@ -594,6 +735,152 @@ mod tests {
         });
         assert_eq!(payload["reason"], "requested");
         assert_eq!(payload["signal"], serde_json::Value::Null);
+    }
+
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This test reads the
+    // ledger file it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn current_run_ends_when_its_guard_drops() {
+        let path =
+            std::env::temp_dir().join(format!("hvi-run-current-{}.ndjson", std::process::id()));
+        let ledger = Arc::new(Ledger::new(path.to_str(), "test").unwrap());
+        let current = CurrentRun::new();
+        drop(current.enter(&ledger, Arc::clone(&guest(1).vcpus) as _, || {}));
+        assert!(!current.record_failure("vcpu0: panicked (boom)"));
+        assert!(ledger
+            .close_with(Instant::now() + STOP_TIMEOUT, |_| {})
+            .is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(text, "");
+    }
+
+    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
+    // every component of a path comes from the guest. This test reads the
+    // ledger file it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn failure_record_closes_the_ledger() {
+        let path =
+            std::env::temp_dir().join(format!("hvi-run-failure-{}.ndjson", std::process::id()));
+        let ledger = Arc::new(Ledger::new(path.to_str(), "test").unwrap());
+        let current = CurrentRun::new();
+        let block = || CapturedEvent::Block {
+            disk: "disk0".into(),
+            lba: 8,
+            len: 4096,
+            write: true,
+        };
+        let _entered = current.enter(&ledger, Arc::clone(&guest(1).vcpus) as _, || {});
+        ledger.captured(&[block()]);
+        assert!(current.record_failure("vcpu0: panicked (boom)"));
+        assert!(!current.record_failure("vcpu1: panicked (bang)"));
+        ledger.captured(&[block()]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["source"], "block");
+        assert_eq!(records[1]["source"], "vmm.stop");
+        assert_eq!(records[1]["payload"]["reason"], "failed");
+        assert_eq!(records[1]["payload"]["error"], "vcpu0: panicked (boom)");
+    }
+
+    // The vCPUs exit before the ledger closes, so the closed ledger drops no
+    // `block` record a vCPU adds. The host-path ban in clippy.toml is aimed at
+    // the virtio-fs device, where every component of a path comes from the
+    // guest. This test reads the ledger file it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn failure_record_follows_the_exit_of_the_vcpus() {
+        let path =
+            std::env::temp_dir().join(format!("hvi-run-exits-{}.ndjson", std::process::id()));
+        let mut guest = guest(2);
+        guest.ledger = Arc::new(Ledger::new(path.to_str(), "test").unwrap());
+        let bodies: Vec<Body> = (0..2)
+            .map(|_| {
+                let vcpus = Arc::clone(&guest.vcpus);
+                let ledger = Arc::clone(&guest.ledger);
+                Box::new(move || {
+                    while vcpus.is_running() {
+                        ledger.captured(&[CapturedEvent::Block {
+                            disk: "disk0".into(),
+                            lba: 8,
+                            len: 4096,
+                            write: true,
+                        }]);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }) as Body
+            })
+            .collect();
+        let (threads, spawned) = guest.vcpus.spawn(bodies, |_, body| body());
+        spawned.unwrap();
+        let current = CurrentRun::new();
+        let _entered = current.enter(&guest.ledger, Arc::clone(&guest.vcpus) as _, || {});
+        assert!(current.record_failure("vcpu0: panicked (boom)"));
+        assert!(threads.join_timeout(&guest.vcpus, Duration::ZERO).is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["source"], "vmm.stop");
+    }
+
+    // A vCPU that never exits, as one blocked on a lock the panicking vCPU
+    // holds, uses up only the vCPUs' half of `STOP_TIMEOUT`, and the record is
+    // written in the writer's half. The host-path ban in clippy.toml is aimed
+    // at the virtio-fs device, where every component of a path comes from the
+    // guest. This test reads the ledger file it made.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn failure_record_is_written_while_a_vcpu_stays() {
+        let path =
+            std::env::temp_dir().join(format!("hvi-run-stays-{}.ndjson", std::process::id()));
+        let mut guest = guest(1);
+        guest.ledger = Arc::new(Ledger::new(path.to_str(), "test").unwrap());
+        let held = Arc::new(std::sync::Mutex::new(()));
+        let holding = held.lock().unwrap();
+        let blocked = Arc::clone(&held);
+        let body: Body = Box::new(move || drop(blocked.lock().unwrap()));
+        let (threads, spawned) = guest.vcpus.spawn(vec![body], |_, body| body());
+        spawned.unwrap();
+        let current = CurrentRun::new();
+        let _entered = current.enter(&guest.ledger, Arc::clone(&guest.vcpus) as _, || {});
+        assert!(current.record_failure("vcpu1: panicked (boom)"));
+        drop(holding);
+        threads
+            .join_timeout(&guest.vcpus, Duration::from_secs(5))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["source"], "vmm.stop");
+    }
+
+    // A panic on a thread the stop does not wait for, such as an embedder's,
+    // stops the vCPUs, and their exits end the run with the panic's failure.
+    #[test]
+    fn panic_stop_ends_the_run_with_its_failure() {
+        let guest = guest(1);
+        let vcpus = Arc::clone(&guest.vcpus);
+        let running: Body = Box::new(move || {
+            while vcpus.is_running() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let vcpus = Arc::clone(&guest.vcpus);
+        let panicked = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            vcpus.stop_without_blocking("main: panicked (boom)");
+        });
+        let result = run(&guest, vec![running], None);
+        panicked.join().unwrap();
+        assert_eq!(result.unwrap_err(), "main: panicked (boom)");
     }
 
     #[test]

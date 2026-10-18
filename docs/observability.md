@@ -38,19 +38,28 @@ The VMM also records the run's lifecycle, with `provenance` `vmm`:
 | `vmm.start` | The vCPU threads are about to start. | `arch`, `vcpus`, `mem_bytes`, `confined`, `core_version` |
 | `vmm.vcpu_started` | A vCPU entered its run loop. | `vcpu` |
 | `vmm.dropped` | `block` or `net` records were dropped just before it, because the ledger's buffer was full. | `records` |
-| `vmm.stop` | The run has been torn down. | `reason`, `signal`, `error`, `dropped` |
+| `vmm.stop` | The run has stopped. | `reason`, `signal`, `error`, `dropped` |
 
 `confined` says whether the confinement is on, and `vcpu` is the vCPU id.
 `reason` is `system_off`, `system_reset`, `requested` or `failed`. `signal`
 names the stop signal, `SIGTERM`, `SIGINT` or `SIGHUP`, when it asked first and
 the run stopped on its request, and `error` is the error `boot` returns when the
-run failed. `records` counts the records dropped since the last `vmm.dropped`
-record, which comes right after them, before the next record the ledger takes.
-`dropped` counts every `block` and `net` record the run left out because the
-ledger's buffer was full, and appears only when there were any. A boot that
-fails before it writes `vmm.start` writes no `vmm.stop` either. A record's `ts`
-is when the VMM added it to the ledger's buffer, so a `vmm.vcpu_started` record
-can follow records the vCPU caused after it entered its run loop.
+run failed. `records` counts the `block` and `net` records dropped since the
+previous `vmm.dropped` record. `dropped` counts every `block` and `net` record
+the run left out because the ledger's buffer was full, and appears only when
+there were any. A boot that fails before it writes `vmm.start` writes no
+`vmm.stop` either. A record's `ts` is when the VMM added it to the ledger's
+buffer, so a `vmm.vcpu_started` record can follow records the vCPU caused after
+it entered its run loop.
+
+Under hvi's own binary, a panic stops the vCPUs and writes `vmm.stop` before the
+process aborts, with reason `failed` and the panic's report as `error`. Every
+`block` and `net` record comes from a vCPU thread, and the VMM waits up to half
+a second for the vCPUs to exit before it writes the record. So the record
+follows every record the vCPUs caused, unless a vCPU has not exited by then,
+such as one a plugin's pause holds. The VMM writes a `vmm.vcpu_started` record a
+moment after the vCPU starts, so a vCPU that starts just before a panic can have
+none.
 
 On KVM every vCPU enters its run loop at the start, and one the guest has not
 brought up yet waits inside the hypervisor. On macOS a secondary vCPU enters its
@@ -65,8 +74,8 @@ run loop when the guest brings it up.
 
 What the ledger is not:
 
-- **Not lossless.** A VMM that is killed or crashes can lose the records not
-  written yet, and a write that stalls can make the ledger drop `block` and
+- **Not lossless.** A VMM that is killed, crashes or panics can lose the records
+  not written yet, and a write that stalls can make the ledger drop `block` and
   `net` records. [When a record reaches the
   file](#when-a-record-reaches-the-file) says what each case loses.
 - **Not tamper-proof.** It is an ordinary file written by the VMM process.
@@ -96,22 +105,24 @@ It waits up to one second, or 100 ms for a plugin's record, and then returns
 with the record still buffered. The `block`, `net` and `vmm.vcpu_started`
 records do not wait. The writer takes them at once when it is idle. After each
 write it waits 1 ms for more records before it goes idle, so the records of a
-burst are written together, within about 1 ms, and a write in progress delays
-them until it ends.
+burst are written together, within about 1 ms. A write in progress delays them
+until it ends.
 
 A run loses nothing when the guest stops it, a vCPU fails, or a stop is
-requested, by `SIGTERM` for example, unless a write at the stop stalls for one
-second or more, or a vCPU left running at the stop causes records after it,
-which are discarded. A VMM ended by `SIGKILL`, a crash or a syscall the seccomp
-filter refuses loses the records not written yet. A repeated stop signal that
-arrives one second or more after the first ends the process at once, and the
-records not yet written are lost. One that arrives sooner has no effect.
+requested, by `SIGTERM` for example. The exceptions are a write at the stop that
+stalls for one second or more, and a vCPU left running at the stop, whose later
+records are discarded. A VMM ended by `SIGKILL`, a crash or a syscall the
+seccomp filter refuses loses the records not written yet. Under hvi's own
+binary, a panic loses the records not written within one second of it. A panic
+before `vmm.start` loses every record not written yet. A repeated stop signal
+that arrives one second or more after the first ends the process at once and
+loses the records not written yet. One that arrives sooner has no effect.
 
 Once a stalled write lets the buffer fill to 4 MiB, the ledger drops later
-`block` and `net` records. A `vmm.dropped` record after each run of them says
+`block` and `net` records. A `vmm.dropped` record after each run of drops says
 how many, and `dropped` in `vmm.stop` counts them all. The VMM prints a line on
-stderr when it starts to drop them, and another with the number dropped once a
-`block` or `net` record fits after one second with no drop, or at the stop.
+stderr when it starts to drop them. It prints the number dropped once a `block`
+or `net` record fits after one second with no drop, or at the stop.
 
 A write that fails is tried again every 100 ms, and the records after it wait
 for it. While writes fail, a call that adds `vmm.start` or a plugin's record
@@ -139,8 +150,9 @@ This is the raw counterpart to the ledger. It carries every layer-2 frame in
 both directions, unparsed, where the ledger's `net` records cover only IPv4
 TCP, UDP and ICMP leaving the guest.
 
-The trace buffers on the device path and flushes at a vCPU safe point, so a
-killed VMM loses only what had not reached the last safe point.
+The trace buffers on the device path and flushes at a vCPU safe point, so a VMM
+that is killed, or that panics, loses only what had not reached the last safe
+point. After a panic, that can include the request that panicked.
 
 ## Memory dumps
 

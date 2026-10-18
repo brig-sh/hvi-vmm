@@ -135,17 +135,16 @@ impl MemoryDump {
     /// The regions this dump covers, in file order, once attached.
     #[must_use]
     pub fn regions(&self) -> Vec<RamRegion> {
-        match self.view.lock() {
-            Ok(v) => v.as_ref().map(GuestRamView::regions).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
+        self.view
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(GuestRamView::regions)
+            .unwrap_or_default()
     }
 
     fn write_dump(&self) -> std::io::Result<u64> {
-        let guard = self
-            .view
-            .lock()
-            .map_err(|_| std::io::Error::other("dump view lock poisoned"))?;
+        let guard = self.view.lock().unwrap();
         let Some(view) = guard.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -187,10 +186,7 @@ impl Plugin for MemoryDump {
             .map(|region| (Arc::clone(&file), region))
             .collect();
         let view = GuestRamView::map(&regions)?;
-        *self
-            .view
-            .lock()
-            .map_err(|_| std::io::Error::other("dump view lock poisoned"))? = Some(view);
+        *self.view.lock().unwrap() = Some(view);
 
         if let Some(secs) = self.after {
             let pending = Arc::clone(&self.pending);
@@ -303,9 +299,7 @@ impl Plugin for IoTrace {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
         }
-        if let Ok(mut o) = self.out.lock() {
-            let _ = o.flush();
-        }
+        let _ = self.out.lock().unwrap().flush();
     }
 }
 
@@ -320,19 +314,18 @@ impl IoSink for TraceSink {
         // Called on the vCPU thread with the device lock held: buffered, never
         // flushed here, and a failed write is dropped rather than propagated. A
         // trace that stalls the guest it is tracing is not a trace.
-        if let Ok(mut o) = self.out.lock() {
-            let rw = if write { 'w' } else { 'r' };
-            let _ = writeln!(o, "blk {rw} disk={disk_id:#x} sector={sector} len={length}");
-            self.dirty.store(true, Ordering::SeqCst);
-        }
+        let rw = if write { 'w' } else { 'r' };
+        let _ = writeln!(
+            self.out.lock().unwrap(),
+            "blk {rw} disk={disk_id:#x} sector={sector} len={length}"
+        );
+        self.dirty.store(true, Ordering::SeqCst);
     }
 
     fn net(&self, frame: &[u8], egress: bool) {
-        if let Ok(mut o) = self.out.lock() {
-            let dir = if egress { "tx" } else { "rx" };
-            let _ = writeln!(o, "net {dir} len={}", frame.len());
-            self.dirty.store(true, Ordering::SeqCst);
-        }
+        let dir = if egress { "tx" } else { "rx" };
+        let _ = writeln!(self.out.lock().unwrap(), "net {dir} len={}", frame.len());
+        self.dirty.store(true, Ordering::SeqCst);
     }
 }
 

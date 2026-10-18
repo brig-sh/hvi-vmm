@@ -94,5 +94,12 @@ path = "src/lib.rs"
 name = "hvi"
 path = "src/main.rs"
 
+# A panic ends the process, so no thread runs on state the panic left
+# half-updated. On Linux the abort leaves a core file taken at the panic. Tests
+# still unwind.
+[profile.dev]
+panic = "abort"
+
 [profile.release]
 debug = true
+panic = "abort"

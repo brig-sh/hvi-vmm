@@ -113,10 +113,10 @@ reports the stop once the vCPUs have exited or been left running: wait on it
 with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own `poll`
 set, and return when it fires. A thread still running a second after the token
 reports the stop is left running and fails the run, and a thread that panics
-fails the run and stops it. Open files and bind sockets in `attach`, since the
-filter refuses them. A thread you start any other way is neither joined nor
-filtered, and it keeps the `VmHandle` and the VM it holds alive for as long as
-it runs.
+fails the run and stops it, as [Panics](#panics) says. Open files and bind
+sockets in `attach`, since the filter refuses them. A thread you start any other
+way is neither joined nor filtered, and it keeps the `VmHandle` and the VM it
+holds alive for as long as it runs.
 
 ## Reading guest memory
 
@@ -209,19 +209,26 @@ the VMM's own records reach the file.
 
 ## Panics
 
-A panic in `safepoint`, in the block sink, or in the egress net sink ends the VM
-on every backend: the other vCPUs are kicked, the quiesce is released so no vCPU
-stays parked, and `boot` returns an error that names the vCPU. The vCPU thread
-is named after its vCPU, so the panic report says which one panicked. A panic
-that leaves the vCPU thread is caught where the thread starts, and its message
-goes in the error. The macOS backend catches it at the loop instead, to add the
-vCPU's last exit reason and its program counter. With `RUST_BACKTRACE` set, that
-report symbolizes the backtrace by opening the binary, which the vCPU seccomp
-allowlist refuses, so a sandboxed run dies of `SIGSYS` right after the panic
-message instead of stopping the VM.
+A panic in `safepoint`, in a sink, or on a thread your tool started with
+`VmHandle::spawn` ends the run. hvi's own binary aborts on any panic. Before the
+abort, its panic hook stops the vCPUs and writes the run's `vmm.stop` record,
+with a report that names the thread, the message and where it happened. The vCPU
+threads are named after their vCPU. On a vCPU thread the report adds the vCPU's
+program counter and, once the vCPU has run, its last exit.
 
-`attach` runs before any vCPU thread exists, so a panic there fails the boot on
-its own, not through this path.
+In a binary that unwinds, the other vCPUs are kicked, the quiesce is released so
+no vCPU stays parked, and `boot` returns an error that names the thread. A panic
+that leaves a vCPU thread is caught where the thread starts, and its message
+goes in the error. The macOS backend catches it at the loop instead, to add the
+last exit and the program counter. [embedding.md](embedding.md#panics) has what
+each strategy asks of the binary.
+
+Under hvi's own binary, a panic in `attach`, or on a thread it started before
+the VMM has written `vmm.start`, writes no `vmm.stop` record. The process
+aborts, and the plugin's records still buffered at that point are lost. In a
+binary that unwinds, a panic in `attach` unwinds out of `boot`. A panic on a
+thread started with `VmHandle::spawn` stops the run there, and the teardown
+writes `vmm.stop` with reason `failed`.
 
 ## Running several
 

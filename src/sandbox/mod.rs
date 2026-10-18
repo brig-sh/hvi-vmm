@@ -33,3 +33,16 @@ pub(crate) fn confine_io_thread() {
     #[cfg(target_os = "linux")]
     seccomp::install_thread(seccomp::Thread::Vmm);
 }
+
+/// Returns whether a syscall outside the allowlists ends the process.
+///
+/// On Linux it does once the seccomp filters are armed, outside log mode. On
+/// macOS the Seatbelt profile refuses such a call with an error, so it never
+/// does.
+pub(crate) fn is_trapping() -> bool {
+    #[cfg(target_os = "linux")]
+    let trapping = seccomp::is_trapping();
+    #[cfg(not(target_os = "linux"))]
+    let trapping = false;
+    trapping
+}

@@ -51,7 +51,6 @@ use std::time::Duration;
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::memory::GuestRam;
-use crate::sync::lock_or_recover;
 use crate::teardown::StopToken;
 use crate::LOG_PREFIX;
 
@@ -214,11 +213,11 @@ impl HostGate {
     }
 
     fn close(&self) {
-        *lock_or_recover(&self.closed) = true;
+        *self.closed.lock().unwrap() = true;
     }
 
     fn open(&self) {
-        let mut closed = lock_or_recover(&self.closed);
+        let mut closed = self.closed.lock().unwrap();
         if *closed {
             *closed = false;
             self.opened.notify_all();
@@ -238,13 +237,13 @@ impl HostGate {
     /// reads EOF.
     pub fn wait(&self, mut running: impl FnMut() -> bool) -> bool {
         loop {
-            if !*lock_or_recover(&self.closed) {
+            if !*self.closed.lock().unwrap() {
                 return true;
             }
             if !running() {
                 return false;
             }
-            let closed = lock_or_recover(&self.closed);
+            let closed = self.closed.lock().unwrap();
             if *closed {
                 let _ = self.opened.wait_timeout(closed, GATE_POLL);
             }
@@ -254,15 +253,26 @@ impl HostGate {
     /// Blocks until the gate opens, with no timeout.
     ///
     /// The bridge writers wait here. Dropping the connection opens the gate,
-    /// and the bridge drops every connection when it stops, see
-    /// [`VirtioVsock::drop_conns`]. An idle writer therefore does not wake.
+    /// and so does the bridge when it stops.
     pub fn wait_open(&self) {
-        let mut closed = lock_or_recover(&self.closed);
+        let mut closed = self.closed.lock().unwrap();
         while *closed {
-            closed = match self.opened.wait(closed) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            closed = self.opened.wait(closed).unwrap();
+        }
+    }
+}
+
+/// The gates of a [`VsockBridge`]'s writers, which open when the list drops.
+///
+/// The bridge holds the list while it accepts connections, so its writers wake
+/// whether the bridge returns or unwinds. It unwinds when a panic has poisoned
+/// the device lock.
+struct WriterGates(Vec<Arc<HostGate>>);
+
+impl Drop for WriterGates {
+    fn drop(&mut self) {
+        for gate in &self.0 {
+            gate.open();
         }
     }
 }
@@ -1197,6 +1207,7 @@ impl VsockBridge {
     pub(crate) fn run(self, stop: &StopToken) {
         let Self { listener, dev, mem } = self;
         let mut relays: Vec<JoinHandle<()>> = Vec::new();
+        let mut gates = WriterGates(Vec::new());
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1217,7 +1228,7 @@ impl VsockBridge {
             };
             // Register the connection and send the guest agent a REQUEST.
             let (port, writer_gate) = {
-                let mut d = lock_or_recover(&dev);
+                let mut d = dev.lock().unwrap();
                 let Ok(port) = d.add_conn(stream) else {
                     continue;
                 };
@@ -1228,6 +1239,9 @@ impl VsockBridge {
                 continue;
             };
             relays.retain(|handle| !handle.is_finished());
+            // A gate only this list holds belongs to a connection that is gone.
+            gates.0.retain(|gate| Arc::strong_count(gate) > 1);
+            gates.0.push(Arc::clone(&writer_gate));
             relays.push(Self::spawn_writer(
                 &dev,
                 &mem,
@@ -1240,7 +1254,8 @@ impl VsockBridge {
         }
         // Dropping the connections shuts their sockets down and opens their
         // gates, so every reader and writer ends.
-        lock_or_recover(&dev).drop_conns();
+        drop(gates);
+        dev.lock().unwrap().drop_conns();
         for relay in relays {
             let _ = relay.join();
         }
@@ -1265,11 +1280,11 @@ impl VsockBridge {
                 Ok(false) => break,
                 Err(e) => {
                     stderrln!("{LOG_PREFIX} vsock bridge: {e}; guest bytes dropped");
-                    lock_or_recover(&dev).host_gone(&mem, port);
+                    dev.lock().unwrap().host_gone(&mem, port);
                     break;
                 }
             }
-            if !lock_or_recover(&dev).flush_to_host(&mem, port) {
+            if !dev.lock().unwrap().flush_to_host(&mem, port) {
                 break;
             }
         })
@@ -1306,13 +1321,13 @@ impl VsockBridge {
                     Err(e) if retry_read(&e) => continue,
                     Err(_) => break,
                 };
-                let gate = lock_or_recover(&dev).host_data(&mem, port, &buf[..n]);
+                let gate = dev.lock().unwrap().host_data(&mem, port, &buf[..n]);
                 // `HostGate::wait` says why its result is not needed.
                 if let Some(gate) = gate {
                     gate.wait(|| stop.keep_waiting(reader.as_fd()));
                 }
             }
-            lock_or_recover(&dev).host_closed(&mem, port);
+            dev.lock().unwrap().host_closed(&mem, port);
         })
     }
 }
@@ -1366,7 +1381,7 @@ mod tests {
 mod session_tests {
     use super::*;
     use std::io::Read;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::devices::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
@@ -2412,6 +2427,25 @@ mod session_tests {
             "a closed gate let the writer through"
         );
         opener.open();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn writer_gates_open_as_they_drop() {
+        let gate = Arc::new(HostGate::new_closed());
+        let gates = WriterGates(vec![Arc::clone(&gate)]);
+        let waiter = std::thread::spawn(move || gate.wait_open());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "a closed gate let the writer through"
+        );
+        drop(gates);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !waiter.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(waiter.is_finished(), "a dropped list left its gate closed");
         waiter.join().unwrap();
     }
 }

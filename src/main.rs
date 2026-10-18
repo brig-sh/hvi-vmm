@@ -522,7 +522,11 @@ fn push_disk(disks: &mut Vec<config::DiskConfig>, spec: Option<&String>) -> Resu
 }
 
 fn main() {
+    // A panic prints a report and writes the run's `vmm.stop` record, and the
+    // process then aborts, as the profiles in Cargo.toml set.
+    hvi::run::set_panic_hook();
     if let Err(e) = run() {
+        hvi::run::wait_for_panic_abort();
         // stderr can be a closed pipe, where `eprintln!` would panic, so a
         // failed write is ignored.
         let _ = writeln!(std::io::stderr(), "hvi: {e}");

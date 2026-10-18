@@ -56,14 +56,13 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
-use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
+use crate::hypervisor::vcpus::{panic_detail, report_on_panic, Kick, Outcome, Vcpus};
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, Plugin, RegsView};
 use crate::run::{record_start, run_to_stop};
 use crate::sandbox::seatbelt;
 use crate::signal::install_kick_handler;
-use crate::sync::lock_or_recover;
 use crate::teardown::StopSource;
 use crate::terminal;
 use crate::LOG_PREFIX;
@@ -159,10 +158,29 @@ impl Kicker {
     /// dropped, and must drop before the vCPU does.
     fn register(&self, cpu: u32, vcpu: &Vcpu) -> Registration<'_> {
         OWN_VCPU.with(|own| own.set(Some(vcpu.id())));
-        if let Some(slot) = lock_or_recover(&self.handles).get_mut(cpu as usize) {
+        if let Some(slot) = self.handles.lock().unwrap().get_mut(cpu as usize) {
             *slot = Some(vcpu.get_handle());
         }
         Registration { kicker: self, cpu }
+    }
+
+    /// Ends the current or next run of every vCPU in `handles` but the caller's
+    /// own.
+    ///
+    /// `handles` is the locked table, so no vCPU in the list is destroyed
+    /// before the kick.
+    fn kick_others(&self, handles: &[Option<VcpuHandle>]) {
+        // A cancel a vCPU sends itself stays pending and ends its next run
+        // before the guest ran, so a plugin that kicked from `safepoint` would
+        // run again at once.
+        let own = OWN_VCPU.get();
+        let others: Vec<VcpuHandle> = handles
+            .iter()
+            .flatten()
+            .filter(|handle| Some(handle.id()) != own)
+            .cloned()
+            .collect();
+        let _ = self.vm.vcpus_exit(&others);
     }
 }
 
@@ -179,7 +197,13 @@ struct Registration<'a> {
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        if let Some(slot) = lock_or_recover(&self.kicker.handles).get_mut(self.cpu as usize) {
+        if let Some(slot) = self
+            .kicker
+            .handles
+            .lock()
+            .unwrap()
+            .get_mut(self.cpu as usize)
+        {
             *slot = None;
         }
     }
@@ -188,7 +212,7 @@ impl Drop for Registration<'_> {
 impl Kick for Kicker {
     fn kick(&self, cpu: u32) {
         let own = OWN_VCPU.with(std::cell::Cell::get);
-        if let Some(Some(handle)) = lock_or_recover(&self.handles).get(cpu as usize) {
+        if let Some(Some(handle)) = self.handles.lock().unwrap().get(cpu as usize) {
             if Some(handle.id()) != own {
                 let _ = self.vm.vcpus_exit(std::slice::from_ref(handle));
             }
@@ -196,28 +220,33 @@ impl Kick for Kicker {
     }
 
     fn kick_all(&self) {
-        // A cancel a vCPU sends itself stays pending and ends its next run
-        // before the guest ran, so a plugin that kicked from `safepoint` would
-        // run again at once. The table stays locked through the kick, so no
-        // vCPU in the list is destroyed before it.
-        let own = OWN_VCPU.with(std::cell::Cell::get);
-        let handles = lock_or_recover(&self.handles);
-        let others: Vec<VcpuHandle> = handles
-            .iter()
-            .flatten()
-            .filter(|handle| Some(handle.id()) != own)
-            .cloned()
-            .collect();
-        let _ = self.vm.vcpus_exit(&others);
+        self.kick_others(&self.handles.lock().unwrap());
     }
 
     fn kick_halted(&self) {
         for sec in self.secondaries.iter() {
             // The lock is taken so a secondary cannot be between its check of
             // the running flag and its wait when the notify lands.
-            let _mbox = lock_or_recover(&sec.mbox);
+            let _mbox = sec.mbox.lock().unwrap();
             sec.cv.notify_all();
         }
+    }
+
+    fn try_kick_all(&self) -> bool {
+        let mut kicked = match self.handles.try_lock() {
+            Ok(handles) => {
+                self.kick_others(&handles);
+                true
+            }
+            Err(_) => false,
+        };
+        for sec in self.secondaries.iter() {
+            match sec.mbox.try_lock() {
+                Ok(_mbox) => sec.cv.notify_all(),
+                Err(_) => kicked = false,
+            }
+        }
+        kicked
     }
 }
 
@@ -264,14 +293,14 @@ impl FsWake {
     /// parked -- a signal that arrives mid-drain is simply picked up on the
     /// worker's next pass, never lost.
     fn wake(&self) {
-        let mut state = lock_or_recover(&self.state);
+        let mut state = self.state.lock().unwrap();
         state.woken = true;
         self.ready.notify_one();
     }
 
     /// Requests that the worker exit at its next pass.
     fn stop(&self) {
-        let mut state = lock_or_recover(&self.state);
+        let mut state = self.state.lock().unwrap();
         state.stopped = true;
         self.ready.notify_one();
     }
@@ -281,7 +310,7 @@ impl FsWake {
     /// Clears the wake flag on return and returns `false` once stopped. Must
     /// not be called with the virtio-fs device mutex held.
     fn park(&self) -> bool {
-        let mut state = lock_or_recover(&self.state);
+        let mut state = self.state.lock().unwrap();
         while !state.woken && !state.stopped {
             state = self.ready.wait(state).unwrap();
         }
@@ -595,7 +624,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             kick: kick.then(|| Arc::clone(&shared.guest.vcpus)),
         })
     };
-    lock_or_recover(&shared.pl011).connect_irq(line(UART_INTID, false));
+    shared
+        .pl011
+        .lock()
+        .unwrap()
+        .connect_irq(line(UART_INTID, false));
     shared.guest.connect_irqs(
         // `open_disks` refused more disks than there are SPIs.
         |index| line(32 + virtio_blk_spi(index).expect("an SPI per disk"), true),
@@ -603,7 +636,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         line(VIRTIO_VSOCK_INTID, true),
     );
     for fs in &shared.fs {
-        lock_or_recover(&fs.dev).connect_irq(line(fs.intid, true));
+        fs.dev.lock().unwrap().connect_irq(line(fs.intid, true));
     }
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
@@ -647,7 +680,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         shared.plugin.clone(),
         {
             let pl011 = Arc::clone(&shared.pl011);
-            move |byte| lock_or_recover(&pl011).push_rx(byte)
+            move |byte| pl011.lock().unwrap().push_rx(byte)
         },
         bridge,
         net_reader.map(NetSource::Gateway),
@@ -666,7 +699,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         });
         let wake = Arc::clone(&fs.wake);
         io_threads.on_stop(move || wake.stop());
-        let (workers, stop) = lock_or_recover(&fs.dev).readahead_workers();
+        let (workers, stop) = fs.dev.lock().unwrap().readahead_workers();
         for worker in workers {
             io_threads.spawn("virtio-fs readahead", move |_| worker());
         }
@@ -675,7 +708,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();
-    record_start(&shared.guest, cfg.sandbox);
+    let _current = record_start(&shared.guest, cfg.sandbox);
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
@@ -702,12 +735,15 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 /// readahead counts of virtio-fs device `index`.
 ///
 /// A worker left running at the stop deadline can still hold the device, stuck
-/// in a host call, so the lock is only tried. When the device is held, one line
-/// says so and the statistics are skipped.
+/// in a host call, so the lock is only tried. When the device is held, or a
+/// panic poisoned its lock, one line says so and the statistics are skipped.
 fn report_fs_usage(index: usize, dev: &Mutex<VirtioFs>) {
     let dev = match dev.try_lock() {
         Ok(dev) => dev,
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::Poisoned(_)) => {
+            stderrln!("{LOG_PREFIX} virtio-fs[{index}]: statistics skipped after a panic");
+            return;
+        }
         Err(TryLockError::WouldBlock) => {
             stderrln!(
                 "{LOG_PREFIX} virtio-fs[{index}]: statistics skipped, the device is still in use"
@@ -741,28 +777,17 @@ fn report_fs_usage(index: usize, dev: &Mutex<VirtioFs>) {
 }
 
 thread_local! {
-    /// The reason this thread's vCPU last left the guest.
-    ///
-    /// Recorded so the panic report in [`run_cpu`] can name it. `catch_unwind`
-    /// runs on the thread that panicked, so a thread-local survives the unwind
-    /// and is readable there, and it costs the other vCPU threads nothing.
-    static LAST_EXIT: std::cell::Cell<Option<ExitReason>> =
-        const { std::cell::Cell::new(None) };
-
     /// The handle id of this thread's vCPU, so a kick can leave it out.
     static OWN_VCPU: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-/// What this thread's vCPU last exited for, if it has run at all.
-fn last_exit() -> Option<ExitReason> {
-    LAST_EXIT.with(std::cell::Cell::get)
 }
 
 /// A single vCPU: create it, position it (boot entry, or wait for CPU_ON), and
 /// run its exit loop until the VM stops.
 fn run_cpu(cpu_id: u32, sh: Shared) {
+    // The vCPU is in an `Rc` so the panic report below can read it on this
+    // thread.
     let vcpu = match sh.vm.vcpu_create() {
-        Ok(v) => v,
+        Ok(v) => std::rc::Rc::new(v),
         Err(e) => {
             sh.guest.vcpus.report(Outcome::Failed(format!(
                 "vcpu{cpu_id}: vcpu_create failed: {e:?}"
@@ -777,6 +802,22 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, mpidr);
     // Declared after the vCPU, so it drops first.
     let _registration = sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
+    // A panic report names where the guest was and what it last did, so it is
+    // usable without a debugger. The exit is left out until a run of the vCPU
+    // has returned, since its exit information holds nothing before that.
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let _detail = report_on_panic({
+        let vcpu = std::rc::Rc::clone(&vcpu);
+        let ran = std::rc::Rc::clone(&ran);
+        move || {
+            let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+            Some(if ran.get() {
+                format!("last exit {:?}, pc {pc:#x}", vcpu.get_exit_info().reason)
+            } else {
+                format!("pc {pc:#x}")
+            })
+        }
+    });
 
     if cpu_id == 0 {
         let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
@@ -815,10 +856,13 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         while sh.guest.vcpus.is_running() {
             // Safe point for every vCPU: park here while vcpu0 lets a plugin
             // look at the guest.
-            sh.guest.pass_safepoint(&vcpu, plugin);
+            sh.guest.pass_safepoint(&*vcpu, plugin);
 
             let flow = match vcpu.run() {
-                Ok(()) => handle_exit(&vcpu, &sh, cpu_id),
+                Ok(()) => {
+                    ran.set(true);
+                    handle_exit(&vcpu, &sh, cpu_id)
+                }
                 Err(e) => ControlFlow::Break(Outcome::Failed(format!(
                     "vcpu{cpu_id}: vcpu run failed: {e:?}"
                 ))),
@@ -831,13 +875,12 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     }));
 
     if let Err(payload) = unwound {
-        // The report names where the guest was and what it last did, so it is
-        // usable without a debugger.
+        let detail = panic_detail()
+            .map(|detail| format!("; {detail}"))
+            .unwrap_or_default();
         sh.guest.vcpus.report(Outcome::Failed(format!(
-            "vcpu{cpu_id}: panicked ({}); last exit {:?}, pc {:#x}",
+            "vcpu{cpu_id}: panicked ({}){detail}",
             crate::panic_message(payload.as_ref()),
-            last_exit(),
-            vcpu.get_reg(Reg::PC).unwrap_or(0)
         )));
     }
 }
@@ -849,7 +892,6 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
 /// stop or a failure.
 fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32) -> ControlFlow<Outcome> {
     let exit = vcpu.get_exit_info();
-    LAST_EXIT.with(|last| last.set(Some(exit.reason)));
     match exit.reason {
         ExitReason::EXCEPTION => {
             let syn = exit.exception.syndrome;
@@ -1011,7 +1053,7 @@ fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
     if !da.isv {
         return;
     }
-    let mut p = lock_or_recover(&sh.pl011);
+    let mut p = sh.pl011.lock().unwrap();
     if da.is_write {
         let v = read_gpr(vcpu, da.reg);
         p.mmio(offset, true, v);
@@ -1028,7 +1070,7 @@ fn service_rtc(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
         return;
     }
     let width = usize::from(da.width);
-    let mut rtc = lock_or_recover(&sh.rtc);
+    let mut rtc = sh.rtc.lock().unwrap();
     if da.is_write {
         rtc.mmio(offset, width, true, read_gpr(vcpu, da.reg));
     } else {
@@ -1044,7 +1086,7 @@ fn service_dev(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioBlk>>, offset: u6
         return;
     }
     let events = {
-        let mut d = lock_or_recover(dev);
+        let mut d = dev.lock().unwrap();
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.guest.ram, offset, true, v);
@@ -1064,7 +1106,7 @@ fn service_net(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioNet>>, offset: u6
         return;
     }
     let events = {
-        let mut d = lock_or_recover(dev);
+        let mut d = dev.lock().unwrap();
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.guest.ram, offset, true, v);
@@ -1089,7 +1131,7 @@ fn service_vsock(
     if !da.isv {
         return;
     }
-    let mut d = lock_or_recover(dev);
+    let mut d = dev.lock().unwrap();
     if da.is_write {
         let v = read_gpr(vcpu, da.reg);
         d.mmio(&sh.guest.ram, offset, true, v);
@@ -1116,7 +1158,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
     }
     let is_notify = da.is_write && offset == mmio::QUEUE_NOTIFY;
     {
-        let mut d = lock_or_recover(&fs.dev);
+        let mut d = fs.dev.lock().unwrap();
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
             d.mmio(&sh.guest.ram, offset, true, v);
@@ -1133,8 +1175,11 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
         // than the pre-worker code. Anything past the budget goes to the
         // worker, which is where a deep queue belongs: the handoff is
         // amortised and the vCPU gets to run the guest while it drains.
-        let remaining =
-            lock_or_recover(&fs.dev).drain_notified_bounded(&sh.guest.ram, FS_INLINE_BUDGET);
+        let remaining = fs
+            .dev
+            .lock()
+            .unwrap()
+            .drain_notified_bounded(&sh.guest.ram, FS_INLINE_BUDGET);
         if remaining {
             fs.wake.wake();
         }
@@ -1165,14 +1210,14 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// announced by a wake that arrived with the stop.
 fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake) {
     while wake.park() {
-        lock_or_recover(dev).drain_notified(mem);
+        dev.lock().unwrap().drain_notified(mem);
     }
     // A wake that arrived with the stop was cleared by that last `park`, and
     // the chains it announced are still in the ring, so one unbounded pass
     // drains them. A vCPU left running at its join deadline that is still in
     // `service_fs` can leave chains past its inline budget after this pass,
     // with no worker to serve them. Only a run that already fails does that.
-    lock_or_recover(dev).drain_notified(mem);
+    dev.lock().unwrap().drain_notified(mem);
 }
 
 /// Zero-extension mask for a load of `width` bytes.
