@@ -200,17 +200,28 @@ pub fn install(thread: Thread) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("installing the {} filter: {e}", thread.key())))
 }
 
-/// Set by [`arm`] before a run spawns its threads, read by every thread that
-/// filters itself. A flag rather than a parameter passed to each of those
-/// threads. The threads that read it start after it is set, apart from the
-/// stop-signal thread, which outlives the run that started it, and a ledger's
-/// writer, which can start before [`arm`].
+/// Whether [`arm`] has run in this process.
+///
+/// It is set before a run spawns its threads and read by every thread that
+/// filters itself, a flag rather than a parameter passed to each of those
+/// threads. The threads that read it start after it is set, apart from two. The
+/// stop-signal thread outlives the run that started it, and a ledger's writer
+/// can start before [`arm`]. It is never cleared, since a filter cannot be
+/// removed from a thread.
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
-    /// Whether [`install_thread`] has already filtered this thread. See there
-    /// for why asking twice has to be harmless.
+    /// Whether this thread installed the `vmm` or `vcpu` filter, through
+    /// [`install_thread`] or as the thread that calls `boot`.
+    ///
+    /// A thread that inherited a filter from the thread that started it reads
+    /// `false`. See [`install_thread`] for why asking twice has to be harmless.
     static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returns whether [`arm`] has run in this process.
+pub(crate) fn is_entered() -> bool {
+    ARMED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Returns whether a syscall outside the allowlists ends the process.
@@ -220,7 +231,12 @@ thread_local! {
 /// thread the caller started itself stays unfiltered, and there it returns
 /// `true` while no filter applies.
 pub(crate) fn is_trapping() -> bool {
-    ARMED.load(std::sync::atomic::Ordering::SeqCst) && !log_mode()
+    is_entered() && !log_mode()
+}
+
+/// Returns whether the calling thread installed a filter.
+pub(crate) fn is_thread_filtered() -> bool {
+    INSTALLED.get()
 }
 
 /// Turns filtering on for the threads spawned after this call, and proves both
@@ -253,7 +269,7 @@ pub fn arm() -> io::Result<()> {
 /// [`arm`] has already proved the filter compiles, so reaching this is a kernel
 /// refusing the install, which is worth a loud death.
 pub fn install_thread(thread: Thread) {
-    if !ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+    if !is_entered() {
         return;
     }
     // "Make sure this thread is filtered", not "add a filter". Asking twice is
@@ -341,6 +357,7 @@ impl Filters {
             return Ok(());
         };
         install(Thread::Vmm)?;
+        INSTALLED.set(true);
         if log_mode() {
             stderrln!(
                 "{LOG_PREFIX} seccomp: LOGGING ONLY ({LOG_ENV}=log) — denials are recorded, not enforced"

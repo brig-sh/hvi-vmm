@@ -34,6 +34,57 @@ pub(crate) fn confine_io_thread() {
     seccomp::install_thread(seccomp::Thread::Vmm);
 }
 
+/// Checks that a run can start in this process with the sandbox as `sandbox`
+/// asks.
+///
+/// Once the sandbox is on, it stays on for the life of the process, since a
+/// seccomp filter cannot be removed from a thread and a Seatbelt profile cannot
+/// be left. On Linux a later run with the sandbox on is refused only from a
+/// thread that [`check_thread`] refuses. On macOS the profile refuses what a
+/// later run sets up, such as its guest RAM, so every later run is refused.
+///
+/// # Errors
+///
+/// Errors with the reason when the sandbox is on and the run cannot start.
+pub(crate) fn check_run(sandbox: bool) -> Result<(), &'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        if seccomp::is_entered() && !sandbox {
+            return Err("cannot start a run with the sandbox off once it is on");
+        }
+        check_thread()?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Every later run is refused, with the sandbox on or off.
+        let _ = sandbox;
+        if seatbelt::is_entered() {
+            return Err("cannot start a later run once the sandbox is on");
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a run can start from the calling thread.
+///
+/// On Linux a thread that installed the `vmm` or `vcpu` filter, such as the one
+/// that called a sandboxed `boot`, cannot start a run, since the filter ends
+/// the process when the run opens a file. The check passes on a thread started
+/// from a filtered thread, which inherits the filter, since nothing on that
+/// thread records it.
+///
+/// # Errors
+///
+/// Errors with the reason when the thread installed a filter that ends the
+/// process.
+pub(crate) fn check_thread() -> Result<(), &'static str> {
+    #[cfg(target_os = "linux")]
+    if seccomp::is_thread_filtered() && seccomp::is_trapping() {
+        return Err("cannot start a run from a thread the sandbox filters");
+    }
+    Ok(())
+}
+
 /// Returns whether a syscall outside the allowlists ends the process.
 ///
 /// On Linux it does once the seccomp filters are armed, outside log mode. On

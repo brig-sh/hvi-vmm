@@ -220,7 +220,8 @@ way, as `SystemReset`.
 
 **hvi never reboots a guest.** `SystemReset` ends the process exactly as
 `SystemOff` does. Nothing loops around `hvi::boot`. An integration that wants a
-reboot calls it again.
+reboot calls it again, within the limits the sandbox sets, which
+[embedding.md](embedding.md#stopping-a-run-from-the-host) describes.
 
 ### Signals and the terminal
 

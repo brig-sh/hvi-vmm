@@ -144,6 +144,14 @@ extern "C" {
     fn sandbox_free_error(errorbuf: *mut libc::c_char);
 }
 
+/// Whether this process has entered a profile, which it cannot leave.
+static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns whether this process has entered a profile.
+pub(crate) fn is_entered() -> bool {
+    ENTERED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Installs [`PROFILE`] on the calling process. Irreversible, and inherited by
 /// every thread -- including the vCPU threads spawned afterwards.
 ///
@@ -241,6 +249,7 @@ fn install(policy: String) -> io::Result<()> {
     // through its own allocator below.
     let rc = unsafe { sandbox_init(profile.as_ptr(), 0, &mut err) };
     if rc == 0 {
+        ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
         return Ok(());
     }
     let detail = if err.is_null() {
