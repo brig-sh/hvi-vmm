@@ -152,6 +152,7 @@
             {"syscall": "exit", "comment": "thread exit"},
             {"syscall": "exit_group", "comment": "process exit"},
             {"syscall": "openat", "comment": "checkpoint bundle: create each component, open the directory to sync it"},
+            {"syscall": "open", "comment": "checkpoint bundle: the same opens through open, which musl on x86_64 calls where glibc calls openat"},
             {"syscall": "mkdir", "comment": "checkpoint bundle: create the bundle directory (glibc and musl call mkdir)"},
             {"syscall": "mkdirat", "comment": "safety net: a libc may create the directory through mkdirat"},
             {"syscall": "rename", "comment": "checkpoint bundle: rename the manifest into place, which seals the bundle"},

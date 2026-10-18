@@ -110,7 +110,7 @@ thread for itself:
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
 | `vmm` | the thread that calls `boot`, the host-side I/O threads (the virtio-blk worker among them), the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
-| `control` | the control socket's thread, in a run started with `--checkpoint-root` | 57 syscalls | 64 syscalls |
+| `control` | the control socket's thread, in a run started with `--checkpoint-root` | 57 syscalls | 65 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs

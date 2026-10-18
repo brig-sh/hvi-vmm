@@ -1088,6 +1088,7 @@ mod tests {
         assert!(vmm.is_subset(&control), "control lacks part of vmm");
         let file_calls = [
             "openat",
+            "open",
             "mkdir",
             "mkdirat",
             "rename",
