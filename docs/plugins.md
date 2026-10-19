@@ -18,7 +18,7 @@ For constructing the `BootConfig` that carries a plugin, read
 
 ## When each hook runs
 
-<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: attach on the thread that calls boot before any vCPU starts, safepoint on the boot vCPU between guest entries, IoSink on a device thread with the device lock held, and request from the console" width="760">
+<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: attach on the thread that calls boot before any vCPU starts, safepoint on the boot vCPU between guest entries, IoSink on_block and on_net on a device thread with the device lock held and on_batch_end after it is released, and request from the console" width="760">
 
 | Trait | Called | Thread |
 | --- | --- | --- |
@@ -28,6 +28,7 @@ For constructing the `BootConfig` that carries a plugin, read
 | `IoSink::on_block`, egress `IoSink::on_net` | per request or frame, device lock held | a vCPU thread |
 | ingress `IoSink::on_net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread |
 | ingress `IoSink::on_net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path |
+| `IoSink::on_batch_end` | once per device access or reader burst that called `on_block` or `on_net`, device lock released | the thread that made those calls |
 
 All three methods on `Plugin` are defaulted, so an implementation takes only
 what it needs. All three backends call all three hooks.
@@ -92,12 +93,15 @@ reaches `safepoint`. The other vCPUs keep running.
 A `kick()` from the vCPU's own thread, inside `safepoint` or an `IoSink` on its
 exit path, is dropped. Call it from a thread of your own.
 
-**4. An `IoSink` must not block.** It is called with the device lock held. No
-`write(2)`, no allocation you can avoid. Count in the sink, set a dirty flag,
-and do the writing in `safepoint`, where slow things are allowed. `IoTrace` is
-the worked example. A sink must not keep the `VmHandle` either: the device holds
-the sink and the handle holds the device, so the three would keep one another
-alive after `boot` returns. A sink that needs the handle keeps a `Weak` from
+**4. An `IoSink` must not block.** `on_block` and `on_net` are called with the
+device lock held. No `write(2)` there, and no allocation you can avoid. A write
+that cannot block, such as one to an eventfd or a non-blocking pipe that wakes a
+reader, goes in `on_batch_end`, which runs once per batch with the lock
+released. A write that can block, such as one to a file, waits for `safepoint`:
+count in the sink, set a dirty flag, and write there. `IoTrace` is the worked
+example. A sink must not keep the `VmHandle` either: the device holds the sink
+and the handle holds the device, so the three would keep one another alive after
+`boot` returns. A sink that needs the handle keeps a `Weak` from
 `Arc::downgrade`.
 
 **5. `request` must return promptly.** It runs on the VMM's console thread, and
@@ -229,6 +233,10 @@ aborts, and the plugin's records still buffered at that point are lost. In a
 binary that unwinds, a panic in `attach` unwinds out of `boot`. A panic on a
 thread started with `VmHandle::spawn` stops the run there, and the teardown
 writes `vmm.stop` with reason `failed`.
+
+A panic in an `IoSink` method also loses the `block` and `net` records of the
+device access that called it. The VMM adds those records to the ledger after
+`on_batch_end` returns.
 
 ## Running several
 
