@@ -44,12 +44,13 @@ static ABORTING: AtomicBool = AtomicBool::new(false);
 /// vCPU thread it also names the vCPU's program counter and, once the vCPU has
 /// run, its last exit. It carries a backtrace when `RUST_BACKTRACE` asks for
 /// one. Once the Linux seccomp filters are armed, outside `HVI_SECCOMP=log`, it
-/// carries none on any thread, since resolving a backtrace opens the binary and
-/// the filters end the process when a filtered thread opens a file. In a binary
-/// built with `panic = "abort"`, the hook stops the vCPUs and restores the
-/// terminal before it prints the report, since the abort skips the restore
-/// `boot` makes. It then writes the run's `vmm.stop` record as [`record_panic`]
-/// does.
+/// carries none on any thread, since resolving a backtrace opens files and
+/// reads links, which the filters do not allow. Under `HVI_SECCOMP=log` a glibc
+/// build still refuses those opens on the threads hvi filters, so their frames
+/// come out unresolved. In a binary built with `panic = "abort"`, the hook
+/// stops the vCPUs and restores the terminal before it prints the report, since
+/// the abort skips the restore `boot` makes. It then writes the run's
+/// `vmm.stop` record as [`record_panic`] does.
 ///
 /// It replaces the hook the process had, so a binary calls it once, before
 /// `boot`. A binary that keeps a hook of its own calls [`record_panic`] from

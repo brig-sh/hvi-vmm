@@ -182,7 +182,7 @@ The default confinement denies it:
 [hvi] dump to /tmp/guest.ram failed: Operation not permitted (os error 1)
 ```
 
-Two destinations work:
+On macOS two destinations work:
 
 - A path inside a writable `--fs path=` directory, which the Seatbelt profile grants.
 - Anywhere, with `--no-sandbox`.
@@ -192,6 +192,10 @@ Two destinations work:
 hvi boot --kernel <Image> --fs tag=out,path=./dumps \
          --dump-memory ./dumps/guest.ram --dump-after 30
 ```
+
+On Linux the seccomp filters refuse every open after confinement, whatever the
+path, so only `--no-sandbox` works. A glibc build reports the error above, and a
+musl build ends the process by `SIGSYS`.
 
 `--events` and `--trace-io` do not have this problem. Their files are opened
 before confinement.

@@ -67,19 +67,20 @@ pub(crate) fn check_run(sandbox: bool) -> Result<(), &'static str> {
 
 /// Checks that a run can start from the calling thread.
 ///
-/// On Linux a thread that installed the `vmm` or `vcpu` filter, such as the one
-/// that called a sandboxed `boot`, cannot start a run, since the filter ends
-/// the process when the run opens a file. The check passes on a thread started
-/// from a filtered thread, which inherits the filter, since nothing on that
-/// thread records it.
+/// On Linux a thread that installed a filter, such as the one that called a
+/// sandboxed `boot`, cannot start a run, since the filter stays on the thread
+/// and does not allow the syscalls a run's setup makes. That holds under
+/// `HVI_SECCOMP=log` too: a glibc build still refuses the run's opens, and a
+/// musl build would log its whole setup as denials. The check passes on a
+/// thread started from a filtered thread, which inherits the filter, since
+/// nothing on that thread records it.
 ///
 /// # Errors
 ///
-/// Errors with the reason when the thread installed a filter that ends the
-/// process.
+/// Errors with the reason when the thread installed a filter.
 pub(crate) fn check_thread() -> Result<(), &'static str> {
     #[cfg(target_os = "linux")]
-    if seccomp::is_thread_filtered() && seccomp::is_trapping() {
+    if seccomp::is_thread_filtered() {
         return Err("cannot start a run from a thread the sandbox filters");
     }
     Ok(())

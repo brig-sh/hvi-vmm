@@ -448,10 +448,11 @@ vCPUs and writes the run's `vmm.stop` record with the report before the abort.
 On a vCPU thread the report adds the vCPU's program counter and, once the vCPU
 has run, its last exit. Each backend's loop provides both through
 `report_on_panic` in `hypervisor/vcpus.rs`. Under the seccomp sandbox the report
-carries no backtrace, since resolving one opens the binary, which the allowlists
-refuse. In a binary that unwinds, a panic that leaves the vCPU thread is caught
-where the thread starts, and its message goes in the error. The macOS backend
-catches it at the loop instead, to add the last exit and the program counter.
+carries no backtrace, since resolving one opens files and reads links, which the
+filters do not allow. In a binary that unwinds, a panic that leaves the vCPU
+thread is caught where the thread starts, and its message goes in the error. The
+macOS backend catches it at the loop instead, to add the last exit and the
+program counter.
 
 A blocking lock is taken with `.lock().unwrap()`, so the next thread to take a
 poisoned lock panics in turn. The panic hook can run on a thread that holds a
