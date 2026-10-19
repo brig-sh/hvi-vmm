@@ -204,8 +204,10 @@ impl<K> Guest<K> {
     /// Serves one access to register `offset` of `dev` and returns the value
     /// read, or 0 for a write.
     ///
-    /// The events the device captured go to the ledger once its lock is
-    /// released.
+    /// Once the device lock is released, the batch of the sink the access fed
+    /// ends, and then the events the device captured go to the ledger. The
+    /// batch ends first, so a reader that waits on the sink does not also wait
+    /// for the ledger.
     fn access_device<D: VirtioMmio>(
         &self,
         dev: &Mutex<D>,
@@ -213,11 +215,14 @@ impl<K> Guest<K> {
         is_write: bool,
         value: u64,
     ) -> u64 {
-        let (read, events) = {
+        let (read, events, sink) = {
             let mut device = dev.lock().unwrap();
             let read = device.mmio(&self.ram, offset, is_write, value);
-            (read, device.take_events())
+            (read, device.take_events(), device.take_fed_sink())
         };
+        if let Some(sink) = sink {
+            sink.on_batch_end();
+        }
         self.ledger.captured(&events);
         read
     }
@@ -431,7 +436,11 @@ impl<K: Kick, V: SafepointVcpu> CpuHandle for Cpu<'_, K, V> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Weak;
+
     use super::*;
+    use crate::events::CapturedEvent;
     use crate::run::StopHandle;
 
     /// A kicker that reaches no thread.
@@ -585,5 +594,93 @@ pub(crate) mod tests {
             .expect_err("a name with a NUL byte was queued");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(threads.take().is_empty());
+    }
+
+    /// A sink that counts the batches that end, and records whether its device
+    /// was locked at the end of each.
+    struct BatchSink {
+        device: Weak<Mutex<FeedingDevice>>,
+        batches: AtomicUsize,
+        locked_at_end: AtomicBool,
+    }
+
+    impl IoSink for BatchSink {
+        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {}
+
+        fn on_net(&self, _frame: &[u8], _egress: bool) {}
+
+        fn on_batch_end(&self) {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            let locked = self
+                .device
+                .upgrade()
+                .is_some_and(|device| device.try_lock().is_err());
+            self.locked_at_end.fetch_or(locked, Ordering::SeqCst);
+        }
+    }
+
+    /// A device whose every register write feeds its sink three requests, as a
+    /// queue notify with three requests on the queue does, and whose reads feed
+    /// nothing.
+    struct FeedingDevice {
+        sink: Arc<BatchSink>,
+        fed_sink: Option<Arc<dyn IoSink>>,
+    }
+
+    impl VirtioMmio for FeedingDevice {
+        fn mmio(&mut self, _mem: &GuestRam, _offset: u64, is_write: bool, _value: u64) -> u64 {
+            if is_write {
+                for sector in 0..3 {
+                    self.sink.on_block(sector, 512, 0, false);
+                }
+                self.fed_sink = Some(Arc::clone(&self.sink) as Arc<dyn IoSink>);
+            }
+            0
+        }
+
+        fn take_events(&mut self) -> Vec<CapturedEvent> {
+            Vec::new()
+        }
+
+        fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+            self.fed_sink.take()
+        }
+    }
+
+    /// Returns a device that feeds a fresh `BatchSink`, and that sink.
+    fn feeding_device() -> (Arc<Mutex<FeedingDevice>>, Arc<BatchSink>) {
+        let device = Arc::new_cyclic(|device| {
+            Mutex::new(FeedingDevice {
+                sink: Arc::new(BatchSink {
+                    device: device.clone(),
+                    batches: AtomicUsize::new(0),
+                    locked_at_end: AtomicBool::new(false),
+                }),
+                fed_sink: None,
+            })
+        });
+        let sink = Arc::clone(&device.lock().unwrap().sink);
+        (device, sink)
+    }
+
+    #[test]
+    fn access_that_feeds_the_sink_ends_one_batch_with_the_device_unlocked() {
+        let guest = guest(1);
+        let (device, sink) = feeding_device();
+        guest.write_device(&device, 0, 0);
+        assert_eq!(
+            sink.batches.load(Ordering::SeqCst),
+            1,
+            "one batch per access"
+        );
+        assert!(!sink.locked_at_end.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn access_that_feeds_no_sink_ends_no_batch() {
+        let guest = guest(1);
+        let (device, sink) = feeding_device();
+        guest.read_device(&device, 0);
+        assert_eq!(sink.batches.load(Ordering::SeqCst), 0);
     }
 }
