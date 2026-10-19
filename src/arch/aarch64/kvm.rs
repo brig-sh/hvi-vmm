@@ -57,7 +57,7 @@ use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::legacy::rtc_pl031::Pl031;
-use crate::devices::virtio::block::{self, VirtioBlk};
+use crate::devices::virtio::block;
 use crate::devices::virtio::fs::vhost_user::{self, export_at, serve_mmio, Export};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
@@ -473,14 +473,14 @@ impl SafepointVcpu for VcpuFd {
 /// Services an MMIO **read**: fills `data` with the addressed device's value.
 fn on_mmio(sh: &Shared, addr: u64, _read: bool, data: &mut [u8]) {
     let width = data.len();
-    let val = read_device(sh, addr, width);
+    let val = mmio_read(sh, addr, width);
     let bytes = val.to_le_bytes();
     let n = width.min(8);
     data[..n].copy_from_slice(&bytes[..n]);
 }
 
 /// Reads the device register at `addr`.
-fn read_device(sh: &Shared, addr: u64, width: usize) -> u64 {
+fn mmio_read(sh: &Shared, addr: u64, width: usize) -> u64 {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
         sh.pl011.lock().unwrap().mmio(addr - UART_BASE, false, 0)
     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
@@ -489,11 +489,19 @@ fn read_device(sh: &Shared, addr: u64, width: usize) -> u64 {
             .unwrap()
             .mmio(addr - RTC_BASE, width, false, 0)
     } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
-        dev_read(sh, Some(dev), off)
+        sh.guest.read_device(dev, off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_read(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE)
+        let off = addr - VIRTIO_NET_BASE;
+        sh.guest
+            .net
+            .as_ref()
+            .map_or(0, |dev| sh.guest.read_device(dev, off))
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
+        let off = addr - VIRTIO_VSOCK_BASE;
+        sh.guest
+            .vsock
+            .as_ref()
+            .map_or(0, |dev| sh.guest.read_device(dev, off))
     } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
         serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, false, 0)
     } else {
@@ -514,79 +522,17 @@ fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
             .unwrap()
             .mmio(addr - RTC_BASE, data.len(), true, val);
     } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
-        dev_write(sh, Some(dev), off, val);
+        sh.guest.write_device(dev, off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        dev_write(sh, sh.guest.net.as_ref(), addr - VIRTIO_NET_BASE, val);
+        if let Some(dev) = &sh.guest.net {
+            sh.guest.write_device(dev, addr - VIRTIO_NET_BASE, val);
+        }
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
+        if let Some(dev) = &sh.guest.vsock {
+            sh.guest.write_device(dev, addr - VIRTIO_VSOCK_BASE, val);
+        }
     } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
         serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, true, val);
-    }
-}
-
-/// Services a read of register `off` of a virtio-blk or virtio-net device.
-///
-/// The device's captured events then go to the ledger.
-fn dev_read<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, off: u64) -> u64 {
-    let Some(dev) = dev else { return 0 };
-    let (v, events) = {
-        let mut d = dev.lock().unwrap();
-        let v = d.mmio(&sh.guest.ram, off, false, 0);
-        (v, d.take_events())
-    };
-    sh.guest.ledger.captured(&events);
-    v
-}
-
-/// Services a write of `val` to register `off` of a virtio-blk or virtio-net
-/// device.
-///
-/// The device's captured events then go to the ledger.
-fn dev_write<D: VirtioMmio>(sh: &Shared, dev: Option<&Arc<Mutex<D>>>, off: u64, val: u64) {
-    let Some(dev) = dev else { return };
-    let events = {
-        let mut d = dev.lock().unwrap();
-        d.mmio(&sh.guest.ram, off, true, val);
-        d.take_events()
-    };
-    sh.guest.ledger.captured(&events);
-}
-
-/// Services a read of virtio-vsock register `off`.
-fn vsock_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.guest.vsock.as_ref() else {
-        return 0;
-    };
-    dev.lock().unwrap().mmio(&sh.guest.ram, off, false, 0)
-}
-
-/// Services a write of `val` to virtio-vsock register `off`.
-fn vsock_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.guest.vsock.as_ref() else {
-        return;
-    };
-    dev.lock().unwrap().mmio(&sh.guest.ram, off, true, val);
-}
-
-/// The virtio-mmio surface `dev_read`/`dev_write` need (blk and net share it).
-trait VirtioMmio {
-    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64;
-    fn take_events(&mut self) -> Vec<crate::events::CapturedEvent>;
-}
-impl VirtioMmio for VirtioBlk {
-    fn mmio(&mut self, m: &GuestRam, o: u64, w: bool, v: u64) -> u64 {
-        VirtioBlk::mmio(self, m, o, w, v)
-    }
-    fn take_events(&mut self) -> Vec<crate::events::CapturedEvent> {
-        VirtioBlk::take_events(self)
-    }
-}
-impl VirtioMmio for VirtioNet {
-    fn mmio(&mut self, m: &GuestRam, o: u64, w: bool, v: u64) -> u64 {
-        VirtioNet::mmio(self, m, o, w, v)
-    }
-    fn take_events(&mut self) -> Vec<crate::events::CapturedEvent> {
-        VirtioNet::take_events(self)
     }
 }
 

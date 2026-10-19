@@ -29,3 +29,50 @@ pub mod tap;
 pub mod vsock;
 
 use queue::{Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+
+use crate::events::CapturedEvent;
+use crate::memory::GuestRam;
+use block::VirtioBlk;
+use net::VirtioNet;
+use vsock::VirtioVsock;
+
+/// The register window of a virtio device, and the I/O an access left for the
+/// ledger.
+pub(crate) trait VirtioMmio {
+    /// Serves one access to register `offset` and returns the value read, or 0
+    /// for a write.
+    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64;
+
+    /// Returns the I/O the device captured since the last call.
+    fn take_events(&mut self) -> Vec<CapturedEvent>;
+}
+
+impl VirtioMmio for VirtioBlk {
+    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        VirtioBlk::mmio(self, mem, offset, is_write, value)
+    }
+
+    fn take_events(&mut self) -> Vec<CapturedEvent> {
+        VirtioBlk::take_events(self)
+    }
+}
+
+impl VirtioMmio for VirtioNet {
+    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        VirtioNet::mmio(self, mem, offset, is_write, value)
+    }
+
+    fn take_events(&mut self) -> Vec<CapturedEvent> {
+        VirtioNet::take_events(self)
+    }
+}
+
+impl VirtioMmio for VirtioVsock {
+    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+        VirtioVsock::mmio(self, mem, offset, is_write, value)
+    }
+
+    fn take_events(&mut self) -> Vec<CapturedEvent> {
+        Vec::new()
+    }
+}
