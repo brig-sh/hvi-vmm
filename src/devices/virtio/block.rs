@@ -40,7 +40,9 @@ use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
 
 use crate::devices::irq::{Irq, IrqLine};
-use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::devices::virtio::{
+    mmio, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+};
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
 
@@ -94,7 +96,7 @@ pub struct VirtioBlk {
     /// Live feed of each request to a plugin, when one asked for it. The
     /// same requests the ledger records, handed over as they happen rather
     /// than drained after the fact.
-    sink: Option<Arc<dyn IoSink>>,
+    sink: SinkSlot,
     /// Stable id for this backing file, so a reader can tell two disks apart.
     disk_id: u64,
     /// The backing file is open read-only, and every write is refused.
@@ -292,7 +294,7 @@ impl VirtioBlk {
             interrupt_status: 0,
             irq: Irq::default(),
             events: Vec::new(),
-            sink: None,
+            sink: SinkSlot::default(),
             disk_id,
             read_only,
             serial: id,
@@ -309,7 +311,7 @@ impl VirtioBlk {
 
     /// Feeds each request to `sink` as well as the ledger.
     pub fn set_io_sink(&mut self, sink: Arc<dyn IoSink>) {
-        self.sink = Some(sink);
+        self.sink.set(sink);
     }
 
     /// The interrupt line level: asserted while an unacknowledged used-buffer
@@ -332,6 +334,12 @@ impl VirtioBlk {
     /// Drains the captured requests for the event ledger.
     pub(crate) fn take_events(&mut self) -> Vec<CapturedEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Returns the sink fed a request since the last call, or `None` when no
+    /// request reached one.
+    pub(crate) fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+        self.sink.take_fed()
     }
 
     /// Services one MMIO access. Returns the read value (0 for writes). When
@@ -620,9 +628,8 @@ impl VirtioBlk {
             // Same observation, handed to whoever is watching. A sink that
             // cannot keep up accounts for that itself: a lost record must not
             // fail the guest's I/O.
-            if let Some(sink) = self.sink.as_ref() {
-                sink.on_block(sector, data_bytes, self.disk_id, write);
-            }
+            self.sink
+                .feed(|sink| sink.on_block(sector, data_bytes, self.disk_id, write));
         }
         Ok(device_written)
     }
@@ -1182,6 +1189,46 @@ mod capacity_tests {
         blk.mmio(mem, mmio::QUEUE_READY, true, 1);
         blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
         mem.read_u16(status).unwrap() as u8
+    }
+
+    /// A sink that counts the requests it is fed.
+    #[derive(Default)]
+    struct CountingSink(std::sync::atomic::AtomicUsize);
+
+    impl IoSink for CountingSink {
+        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn on_net(&self, _frame: &[u8], _egress: bool) {}
+    }
+
+    #[test]
+    fn request_that_reaches_the_disk_feeds_its_sink_once() {
+        let (_r, mut blk) = rig("fed");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let sink = Arc::new(CountingSink::default());
+        blk.set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
+        assert_eq!(
+            submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512),
+            VIRTIO_BLK_S_OK
+        );
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let fed = blk.take_fed_sink().expect("the request fed the sink");
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&fed), Arc::as_ptr(&sink)));
+        assert!(blk.take_fed_sink().is_none(), "the sink is taken once");
+    }
+
+    #[test]
+    fn refused_request_feeds_no_sink() {
+        let (_r, mut blk) = rig("unfed");
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let sink = Arc::new(CountingSink::default());
+        blk.set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
+        let status = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 9_999, 512);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(blk.take_fed_sink().is_none());
     }
 
     /// Regression for the guest writing outside the disk it was advertised.

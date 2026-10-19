@@ -44,6 +44,7 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::ops::ControlFlow;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
@@ -51,7 +52,7 @@ use crate::memory::GuestRam;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{
-    mmio, tap, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    mmio, tap, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
@@ -224,6 +225,28 @@ fn try_recv(stream: &UnixStream, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
+/// Runs `drain` over one burst of a relay and returns its result.
+///
+/// `drain` hands each frame to `deliver`, which returns the sink the frame fed.
+/// Once `drain` returns, whatever ended the burst, the batch of the first sink
+/// fed in the burst ends.
+fn relay_burst(
+    deliver: &mut impl FnMut(&[u8]) -> Option<Arc<dyn IoSink>>,
+    drain: impl FnOnce(&mut dyn FnMut(&[u8])) -> io::Result<ControlFlow<()>>,
+) -> io::Result<ControlFlow<()>> {
+    let mut fed = None;
+    let drained = drain(&mut |frame| {
+        let sink = deliver(frame);
+        if fed.is_none() {
+            fed = sink;
+        }
+    });
+    if let Some(sink) = fed {
+        sink.on_batch_end();
+    }
+    drained
+}
+
 /// One relay from the gateway socket to the guest, run on the reader thread.
 ///
 /// The relay owns the socket's read side, the frame parser and the receive
@@ -251,11 +274,12 @@ impl GatewayRelay {
     /// After each wakeup it receives what the socket holds without blocking and
     /// hands every complete frame to `deliver`. At most [`DRAIN_BURST`]
     /// receives run per wakeup, so a stop request is seen between bursts
-    /// however long the traffic lasts. The socket is shut down as the relay
-    /// ends, whatever ended it, so the device's next write fails instead of
-    /// blocking on a peer nobody reads anymore. macOS refuses the shutdown once
-    /// the peer has half-closed, so a gateway that stops sending but keeps the
-    /// socket open still accepts the device's writes there until its buffer
+    /// however long the traffic lasts. `deliver` returns the sink a frame fed,
+    /// for [`relay_burst`] to end its batch. The socket is shut down as the
+    /// relay ends, whatever ended it, so the device's next write fails instead
+    /// of blocking on a peer nobody reads anymore. macOS refuses the shutdown
+    /// once the peer has half-closed, so a gateway that stops sending but keeps
+    /// the socket open still accepts the device's writes there until its buffer
     /// fills.
     ///
     /// # Errors
@@ -266,33 +290,47 @@ impl GatewayRelay {
     pub(crate) fn run(
         &mut self,
         stop: &crate::teardown::StopToken,
-        mut deliver: impl FnMut(&[u8]),
+        mut deliver: impl FnMut(&[u8]) -> Option<Arc<dyn IoSink>>,
     ) -> io::Result<()> {
         use std::os::fd::AsFd;
-        let relayed = 'relay: loop {
+        let relayed = loop {
             match stop.wait(self.reader.as_fd()) {
                 Ok(true) => {}
                 Ok(false) => break Ok(()),
                 Err(e) => break Err(e),
             }
-            for _ in 0..DRAIN_BURST {
-                match try_recv(&self.reader, &mut self.buf) {
-                    Ok(0) => break 'relay Ok(()),
-                    Ok(n) => self.frames.push(&self.buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => break 'relay Err(e),
-                }
-                loop {
-                    match self.frames.next_frame() {
-                        Ok(Some(frame)) => deliver(frame),
-                        Ok(None) => break,
-                        Err(e) => break 'relay Err(e),
-                    }
-                }
+            match relay_burst(&mut deliver, |deliver| self.drain_burst(deliver)) {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(())) => break Ok(()),
+                Err(e) => break Err(e),
             }
         };
         let _ = self.reader.shutdown(std::net::Shutdown::Both);
         relayed
+    }
+
+    /// Receives up to [`DRAIN_BURST`] times and hands every complete frame to
+    /// `deliver`.
+    ///
+    /// Returns `Break` when the gateway has closed the connection.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the gateway sends a frame above [`MAX_FRAME_LEN`] or the
+    /// socket fails.
+    fn drain_burst(&mut self, mut deliver: impl FnMut(&[u8])) -> io::Result<ControlFlow<()>> {
+        for _ in 0..DRAIN_BURST {
+            match try_recv(&self.reader, &mut self.buf) {
+                Ok(0) => return Ok(ControlFlow::Break(())),
+                Ok(n) => self.frames.push(&self.buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+            while let Some(frame) = self.frames.next_frame()? {
+                deliver(frame);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -324,7 +362,8 @@ impl TapRelay {
     ///
     /// After each wakeup it reads until the queue is empty or until it has read
     /// [`DRAIN_BURST`] frames, so a burst costs one `poll` and a stop request
-    /// is still seen while frames keep arriving.
+    /// is still seen while frames keep arriving. `deliver` returns the sink a
+    /// frame fed, for [`relay_burst`] to end its batch.
     ///
     /// # Errors
     ///
@@ -333,26 +372,40 @@ impl TapRelay {
     pub(crate) fn run(
         &mut self,
         stop: &crate::teardown::StopToken,
-        mut deliver: impl FnMut(&[u8]),
+        mut deliver: impl FnMut(&[u8]) -> Option<Arc<dyn IoSink>>,
     ) -> io::Result<()> {
-        use std::io::Read;
         use std::os::fd::AsFd;
         loop {
             if !stop.wait(self.reader.as_fd())? {
                 return Ok(());
             }
-            for _ in 0..DRAIN_BURST {
-                let n = match self.reader.read(&mut self.buf) {
-                    Ok(0) => return Ok(()),
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
-                };
-                if let Some(frame) = tap::strip_vnet_hdr(&self.buf, n) {
-                    deliver(frame);
-                }
+            if relay_burst(&mut deliver, |deliver| self.drain_burst(deliver))?.is_break() {
+                return Ok(());
             }
         }
+    }
+
+    /// Reads up to [`DRAIN_BURST`] frames and hands each to `deliver`.
+    ///
+    /// Returns `Break` when the tap is gone.
+    ///
+    /// # Errors
+    ///
+    /// Errors when a read fails with anything but `WouldBlock`.
+    fn drain_burst(&mut self, mut deliver: impl FnMut(&[u8])) -> io::Result<ControlFlow<()>> {
+        use std::io::Read;
+        for _ in 0..DRAIN_BURST {
+            let n = match self.reader.read(&mut self.buf) {
+                Ok(0) => return Ok(ControlFlow::Break(())),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            };
+            if let Some(frame) = tap::strip_vnet_hdr(&self.buf, n) {
+                deliver(frame);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -380,7 +433,7 @@ pub struct VirtioNet {
     /// Live feed of every frame to a plugin, when one asked for it.
     /// Every L2 frame crossing the device goes in raw and unparsed, whichever
     /// backend carries it, so the reader decodes it with its own stack.
-    sink: Option<Arc<dyn IoSink>>,
+    sink: SinkSlot,
 }
 
 impl VirtioNet {
@@ -398,13 +451,13 @@ impl VirtioNet {
             tap_write_reported: false,
             tap: None,
             mac: GUEST_MAC,
-            sink: None,
+            sink: SinkSlot::default(),
         }
     }
 
     /// Feeds every L2 frame to `sink` as well as the ledger.
     pub fn set_io_sink(&mut self, sink: Arc<dyn IoSink>) {
-        self.sink = Some(sink);
+        self.sink.set(sink);
     }
 
     /// Builds a device in gateway-relay mode. `stream` is the (write side of
@@ -455,6 +508,12 @@ impl VirtioNet {
     /// Drains the captured flows for the event ledger.
     pub(crate) fn take_events(&mut self) -> Vec<CapturedEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Returns the sink fed a frame since it was last taken, or `None` when no
+    /// frame reached one.
+    pub(crate) fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+        self.sink.take_fed()
     }
 
     /// Records one observed IPv4 flow for the ledger.
@@ -579,9 +638,7 @@ impl VirtioNet {
                 // else too.
                 // The ledger records the frame before the write, so a frame the
                 // tap's full send buffer refuses still appears in it.
-                if let Some(sink) = self.sink.as_ref() {
-                    sink.on_net(&frame, true);
-                }
+                self.sink.feed(|sink| sink.on_net(&frame, true));
                 if self.tap.is_some() {
                     // Out through the container's NIC; capture the flow too, so
                     // the boundary vantage still sees it (incl. TLS SNI).
@@ -653,9 +710,7 @@ impl VirtioNet {
         // Ingress, published before the queue check: what the device was handed
         // for the guest is an observation whether or not the guest had a buffer
         // posted to take it.
-        if let Some(sink) = self.sink.as_ref() {
-            sink.on_net(frame, false);
-        }
+        self.sink.feed(|sink| sink.on_net(frame, false));
         let rx = &self.queues[RX_QUEUE as usize];
         if !rx.is_ready() {
             return;
@@ -779,12 +834,17 @@ impl VirtioNet {
         }
     }
 
-    /// Delivers one inbound Ethernet frame into the RX queue. Public so the
-    /// gateway or tap relay thread that `IoThreads` starts can call it under
-    /// the device lock.
-    pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) {
+    /// Delivers one inbound Ethernet frame into the RX queue, and returns the
+    /// sink the frame fed, or `None` when no sink is installed.
+    ///
+    /// Public so the gateway or tap relay thread that `IoThreads` starts can
+    /// call it under the device lock. The sink is handed over rather than kept,
+    /// so the device's next access does not end its batch.
+    #[must_use = "the caller ends the batch of the sink the frame fed"]
+    pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) -> Option<Arc<dyn IoSink>> {
         self.inject_rx(mem, frame);
         self.sync_irq();
+        self.sink.take_fed()
     }
 
     /// Captures a transmitted frame for the ledger without generating a reply:
@@ -1202,6 +1262,26 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A sink that counts the frames it is fed and the batches that end.
+    #[derive(Default)]
+    struct CountingSink {
+        frames: AtomicUsize,
+        batches: AtomicUsize,
+    }
+
+    impl IoSink for CountingSink {
+        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {}
+
+        fn on_net(&self, _frame: &[u8], _egress: bool) {
+            self.frames.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_batch_end(&self) {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     /// Returns `frames` as the device writes them to the gateway, framed by
     /// `relay_to_gateway`.
@@ -1255,17 +1335,46 @@ mod tests {
         use super::*;
         use crate::teardown::StopSource;
 
+        // The close ends the relay inside the burst that delivered the frames,
+        // and that burst still ends after them.
         #[test]
         fn delivers_until_the_gateway_closes() {
             let source = StopSource::new().expect("pair");
             let (mut ours, theirs) = UnixStream::pair().expect("pair");
             ours.write_all(&relayed(&[b"one", b"two"])).expect("write");
             drop(ours);
+            let sink = Arc::new(CountingSink::default());
             let mut got: Vec<Vec<u8>> = Vec::new();
             GatewayRelay::new(theirs)
-                .run(&source.token(), |frame| got.push(frame.to_vec()))
+                .run(&source.token(), |frame| {
+                    assert_eq!(sink.batches.load(Ordering::SeqCst), 0);
+                    got.push(frame.to_vec());
+                    Some(Arc::clone(&sink) as Arc<dyn IoSink>)
+                })
                 .expect("relay");
             assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec()]);
+            assert_eq!(sink.batches.load(Ordering::SeqCst), 1);
+        }
+
+        // A framing error ends the relay inside the burst that delivered the
+        // frame before it, and that burst still ends.
+        #[test]
+        fn burst_cut_short_by_a_framing_error_still_ends() {
+            let source = StopSource::new().expect("pair");
+            let (mut ours, theirs) = UnixStream::pair().expect("pair");
+            let mut bytes = relayed(&[b"one"]);
+            bytes.extend_from_slice(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes());
+            ours.write_all(&bytes).expect("write");
+            let sink = Arc::new(CountingSink::default());
+            let mut delivered = 0;
+            let relayed = GatewayRelay::new(theirs).run(&source.token(), |_| {
+                assert_eq!(sink.batches.load(Ordering::SeqCst), 0);
+                delivered += 1;
+                Some(Arc::clone(&sink) as Arc<dyn IoSink>)
+            });
+            assert!(relayed.is_err());
+            assert_eq!(delivered, 1);
+            assert_eq!(sink.batches.load(Ordering::SeqCst), 1);
         }
 
         #[test]
@@ -1273,7 +1382,7 @@ mod tests {
             let source = StopSource::new().expect("pair");
             let (_ours, theirs) = UnixStream::pair().expect("pair");
             let token = source.token();
-            let relay = std::thread::spawn(move || GatewayRelay::new(theirs).run(&token, |_| {}));
+            let relay = std::thread::spawn(move || GatewayRelay::new(theirs).run(&token, |_| None));
             source.request_stop();
             relay.join().expect("thread").expect("relay");
         }
@@ -1289,7 +1398,7 @@ mod tests {
             gateway
                 .write_all(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes())
                 .expect("write");
-            let relayed = GatewayRelay::new(hvi).run(&source.token(), |_| {});
+            let relayed = GatewayRelay::new(hvi).run(&source.token(), |_| None);
             assert!(relayed.is_err());
             dev.relay_to_gateway(b"after");
             let mut buf = [0u8; 16];
@@ -1315,7 +1424,7 @@ mod tests {
                 .shutdown(std::net::Shutdown::Write)
                 .expect("shutdown");
             GatewayRelay::new(hvi)
-                .run(&source.token(), |_| {})
+                .run(&source.token(), |_| None)
                 .expect("relay");
             dev.relay_to_gateway(b"after");
             let mut buf = [0u8; 16];
@@ -1394,7 +1503,10 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let token = source.token();
             let relay = std::thread::spawn(move || {
-                TapRelay::new(dev).run(&token, |frame| tx.send(frame.to_vec()).expect("send"))
+                TapRelay::new(dev).run(&token, |frame| {
+                    tx.send(frame.to_vec()).expect("send");
+                    None
+                })
             });
             host.send(&tap::prepend_vnet_hdr(b"one")).expect("send");
             host.send(&tap::prepend_vnet_hdr(b"two")).expect("send");
@@ -1422,6 +1534,7 @@ mod tests {
                 queued > DRAIN_BURST,
                 "the socket holds {queued} frames, the test needs more than one burst"
             );
+            let sink = Arc::new(CountingSink::default());
             let mut delivered = 0;
             TapRelay::new(dev)
                 .run(&source.token(), |_| {
@@ -1429,9 +1542,38 @@ mod tests {
                     if delivered == 1 {
                         source.request_stop();
                     }
+                    Some(Arc::clone(&sink) as Arc<dyn IoSink>)
                 })
                 .expect("relay");
             assert_eq!(delivered, DRAIN_BURST);
+            assert_eq!(
+                sink.batches.load(Ordering::SeqCst),
+                1,
+                "the burst ends once"
+            );
+        }
+
+        // A zero-length read ends the relay inside the burst that delivered the
+        // frames before it, and that burst still ends.
+        #[test]
+        fn burst_cut_short_by_a_gone_tap_still_ends() {
+            let source = StopSource::new().expect("pair");
+            let (host, dev) = tap_pair();
+            for _ in 0..3 {
+                host.send(&tap::prepend_vnet_hdr(b"x")).expect("send");
+            }
+            host.send(&[]).expect("send");
+            let sink = Arc::new(CountingSink::default());
+            let mut delivered = 0;
+            TapRelay::new(dev)
+                .run(&source.token(), |_| {
+                    assert_eq!(sink.batches.load(Ordering::SeqCst), 0);
+                    delivered += 1;
+                    Some(Arc::clone(&sink) as Arc<dyn IoSink>)
+                })
+                .expect("relay");
+            assert_eq!(delivered, 3);
+            assert_eq!(sink.batches.load(Ordering::SeqCst), 1);
         }
 
         #[test]
@@ -1439,7 +1581,7 @@ mod tests {
             let source = StopSource::new().expect("pair");
             let (_host, dev) = tap_pair();
             let token = source.token();
-            let relay = std::thread::spawn(move || TapRelay::new(dev).run(&token, |_| {}));
+            let relay = std::thread::spawn(move || TapRelay::new(dev).run(&token, |_| None));
             source.request_stop();
             relay.join().expect("thread").expect("relay");
         }
@@ -1492,6 +1634,56 @@ mod tests {
         net.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
         net.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
         net.mmio(mem, mmio::QUEUE_READY, true, 1);
+    }
+
+    // The built-in stack answers the DISCOVER inside the transmit path, so the
+    // frame and its reply feed the sink in one access.
+    #[test]
+    fn transmitted_frame_and_its_reply_feed_the_sink_in_one_batch() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut net = VirtioNet::new();
+        let sink = Arc::new(CountingSink::default());
+        net.set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
+        let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+        assert!(net.take_fed_sink().is_none(), "queue setup feeds no sink");
+
+        let udp = udp_datagram(68, 67, &bootp_discover(GUEST_MAC));
+        let ip = ipv4_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, IP_UDP, &udp);
+        let mut buf = vec![0u8; NET_HDR_LEN];
+        buf.extend_from_slice(&eth_frame([0xff; 6], GUEST_MAC, ETH_IPV4, &ip));
+        mem.write(data, &buf).unwrap();
+        mem.write_u64(desc, data).unwrap();
+        mem.write_u32(desc + 8, buf.len() as u32).unwrap();
+        mem.write_u16(desc + 12, 0).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap();
+        mem.write_u16(avail + 4, 0).unwrap();
+        net.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+
+        assert_eq!(
+            sink.frames.load(Ordering::SeqCst),
+            2,
+            "the DISCOVER and the OFFER"
+        );
+        let fed = net.take_fed_sink().expect("the frames fed the sink");
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&fed), Arc::as_ptr(&sink)));
+        assert!(net.take_fed_sink().is_none(), "the sink is taken once");
+    }
+
+    // A vCPU's next access must not end the relay's batch, so the device keeps
+    // no fed sink after the frame.
+    #[test]
+    fn delivered_frame_returns_the_sink_it_fed() {
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        let mut net = VirtioNet::new();
+        let sink = Arc::new(CountingSink::default());
+        net.set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
+        let fed = net.deliver(&mem, b"frame").expect("the frame fed the sink");
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&fed), Arc::as_ptr(&sink)));
+        assert_eq!(sink.frames.load(Ordering::SeqCst), 1);
+        assert!(net.take_fed_sink().is_none());
     }
 
     /// A TX chain that points back at itself must run out of budget rather
@@ -1554,7 +1746,7 @@ mod tests {
         let udp = udp_datagram(9999, 1234, b"a reply the guest must see");
         let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
         let frame = eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip);
-        net.deliver(&mem, &frame);
+        let _ = net.deliver(&mem, &frame);
 
         // The used ring reports header + frame, not just the head descriptor.
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "one buffer completed");
@@ -1589,7 +1781,7 @@ mod tests {
 
         let udp = udp_datagram(9999, 1234, b"too big for one header buffer");
         let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
-        net.deliver(&mem, &eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip));
+        let _ = net.deliver(&mem, &eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip));
 
         assert_eq!(mem.read_u16(used + 2).unwrap(), 0, "nothing completed");
     }
@@ -1946,7 +2138,7 @@ mod tests {
                 while !done.load(Ordering::SeqCst) {
                     let mut d = dev.lock().unwrap();
                     if !d.irq_level() {
-                        d.deliver(&mem, &frame);
+                        let _ = d.deliver(&mem, &frame);
                     }
                 }
             })

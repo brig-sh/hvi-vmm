@@ -31,9 +31,9 @@
 //! problem, which is what keeps a tool's idea of the guest out of the VMM.
 //!
 //! The whole seam is optional. With no plugin, the hooks cost a null check per
-//! guest entry of the boot vCPU, per block read or write and per network frame.
-//! The devices hold no sink, and no guest memory is read for any purpose but
-//! running the guest.
+//! guest entry of the boot vCPU, per block read or write, per network frame,
+//! and per access to a disk or the network device. The devices hold no sink,
+//! and no guest memory is read for any purpose but running the guest.
 
 mod api;
 pub mod builtin;
