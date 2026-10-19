@@ -777,59 +777,29 @@ fn mmio_write(sh: &Shared, addr: u64, val: u64) {
 }
 
 /// Services a read of register `off` of the virtio-blk device `dev`.
-///
-/// The device's captured events then go to the ledger.
 fn blk_read(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
-    let (v, events) = {
-        let mut d = dev.lock().unwrap();
-        let v = d.mmio(&sh.guest.ram, off, false, 0);
-        (v, d.take_events())
-    };
-    sh.guest.ledger.captured(&events);
-    v
+    sh.guest.read_device(dev, off)
 }
 
 /// Services a write of `val` to register `off` of the virtio-blk device `dev`.
-///
-/// The device's captured events then go to the ledger.
 fn blk_write(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
-    let events = {
-        let mut d = dev.lock().unwrap();
-        d.mmio(&sh.guest.ram, off, true, val);
-        d.take_events()
-    };
-    sh.guest.ledger.captured(&events);
+    sh.guest.write_device(dev, off, val);
 }
 
 /// Services a read of virtio-net register `off`.
-///
-/// The device's captured events then go to the ledger.
 fn net_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.guest.net.as_ref() else {
         return 0;
     };
-    let (v, events) = {
-        let mut d = dev.lock().unwrap();
-        let v = d.mmio(&sh.guest.ram, off, false, 0);
-        (v, d.take_events())
-    };
-    sh.guest.ledger.captured(&events);
-    v
+    sh.guest.read_device(dev, off)
 }
 
 /// Services a write of `val` to virtio-net register `off`.
-///
-/// The device's captured events then go to the ledger.
 fn net_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.guest.net.as_ref() else {
         return;
     };
-    let events = {
-        let mut d = dev.lock().unwrap();
-        d.mmio(&sh.guest.ram, off, true, val);
-        d.take_events()
-    };
-    sh.guest.ledger.captured(&events);
+    sh.guest.write_device(dev, off, val);
 }
 
 /// Services a read of virtio-vsock register `off`.
@@ -837,7 +807,7 @@ fn vsock_read(sh: &Shared, off: u64) -> u64 {
     let Some(dev) = sh.guest.vsock.as_ref() else {
         return 0;
     };
-    dev.lock().unwrap().mmio(&sh.guest.ram, off, false, 0)
+    sh.guest.read_device(dev, off)
 }
 
 /// Services a write of `val` to virtio-vsock register `off`.
@@ -845,8 +815,7 @@ fn vsock_write(sh: &Shared, off: u64, val: u64) {
     let Some(dev) = sh.guest.vsock.as_ref() else {
         return;
     };
-    let mut d = dev.lock().unwrap();
-    d.mmio(&sh.guest.ram, off, true, val);
+    sh.guest.write_device(dev, off, val);
 }
 
 #[cfg(test)]
