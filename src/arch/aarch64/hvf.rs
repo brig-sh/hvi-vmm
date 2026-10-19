@@ -48,12 +48,13 @@ use crate::config::{check_export_overlap, BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::legacy::rtc_pl031::Pl031;
-use crate::devices::virtio::block::{self, VirtioBlk};
+use crate::devices::virtio::block;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::mmio;
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
+use crate::devices::virtio::VirtioMmio;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{Disk, Guest, PluginThreads, SafepointVcpu};
 use crate::hypervisor::vcpus::{panic_detail, report_on_panic, Kick, Outcome, Vcpus};
@@ -909,16 +910,16 @@ fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32) -> ControlFlow<Outcome> {
                         service_rtc(vcpu, sh, ipa - RTC_BASE, syn);
                         advance_pc(vcpu);
                     } else if let Some((dev, offset)) = sh.guest.disk_at(ipa, VIRTIO_SIZE) {
-                        service_dev(vcpu, sh, dev, offset, syn);
+                        service_device(vcpu, sh, dev, offset, syn);
                         advance_pc(vcpu);
                     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
                         if let Some(dev) = &sh.guest.net {
-                            service_net(vcpu, sh, dev, ipa - VIRTIO_NET_BASE, syn);
+                            service_device(vcpu, sh, dev, ipa - VIRTIO_NET_BASE, syn);
                         }
                         advance_pc(vcpu);
                     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&ipa) {
                         if let Some(dev) = &sh.guest.vsock {
-                            service_vsock(vcpu, sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
+                            service_device(vcpu, sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
                         }
                         advance_pc(vcpu);
                     } else if let Some(fs) = sh
@@ -1079,51 +1080,11 @@ fn service_rtc(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
     }
 }
 
-/// Services a virtio-blk MMIO access and drains its captured events.
-fn service_dev(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioBlk>>, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
-    let events = {
-        let mut d = dev.lock().unwrap();
-        if da.is_write {
-            let v = read_gpr(vcpu, da.reg);
-            d.mmio(&sh.guest.ram, offset, true, v);
-        } else {
-            let v = d.mmio(&sh.guest.ram, offset, false, 0) & width_mask(da.width);
-            write_gpr(vcpu, da.reg, v);
-        }
-        d.take_events()
-    };
-    sh.guest.ledger.captured(&events);
-}
-
-/// Services a virtio-net MMIO access (same shape as `service_dev`).
-fn service_net(vcpu: &Vcpu, sh: &Shared, dev: &Arc<Mutex<VirtioNet>>, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
-    let events = {
-        let mut d = dev.lock().unwrap();
-        if da.is_write {
-            let v = read_gpr(vcpu, da.reg);
-            d.mmio(&sh.guest.ram, offset, true, v);
-        } else {
-            let v = d.mmio(&sh.guest.ram, offset, false, 0) & width_mask(da.width);
-            write_gpr(vcpu, da.reg, v);
-        }
-        d.take_events()
-    };
-    sh.guest.ledger.captured(&events);
-}
-
-/// Services a virtio-vsock MMIO access.
-fn service_vsock(
+/// Services a virtio-blk, virtio-net or virtio-vsock MMIO access.
+fn service_device<D: VirtioMmio>(
     vcpu: &Vcpu,
     sh: &Shared,
-    dev: &Arc<Mutex<VirtioVsock>>,
+    dev: &Mutex<D>,
     offset: u64,
     syndrome: u64,
 ) {
@@ -1131,13 +1092,11 @@ fn service_vsock(
     if !da.isv {
         return;
     }
-    let mut d = dev.lock().unwrap();
     if da.is_write {
-        let v = read_gpr(vcpu, da.reg);
-        d.mmio(&sh.guest.ram, offset, true, v);
+        sh.guest.write_device(dev, offset, read_gpr(vcpu, da.reg));
     } else {
-        let v = d.mmio(&sh.guest.ram, offset, false, 0) & width_mask(da.width);
-        write_gpr(vcpu, da.reg, v);
+        let read = sh.guest.read_device(dev, offset);
+        write_gpr(vcpu, da.reg, read & width_mask(da.width));
     }
 }
 

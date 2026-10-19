@@ -30,6 +30,7 @@ use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
+use crate::devices::virtio::VirtioMmio;
 use crate::events::Ledger;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
@@ -188,6 +189,37 @@ impl<K> Guest<K> {
         if let Some(dev) = &self.vsock {
             dev.lock().unwrap().connect_irq(vsock);
         }
+    }
+
+    /// Returns the value of register `offset` of `dev`.
+    pub(crate) fn read_device<D: VirtioMmio>(&self, dev: &Mutex<D>, offset: u64) -> u64 {
+        self.access_device(dev, offset, false, 0)
+    }
+
+    /// Writes `value` to register `offset` of `dev`.
+    pub(crate) fn write_device<D: VirtioMmio>(&self, dev: &Mutex<D>, offset: u64, value: u64) {
+        self.access_device(dev, offset, true, value);
+    }
+
+    /// Serves one access to register `offset` of `dev` and returns the value
+    /// read, or 0 for a write.
+    ///
+    /// The events the device captured go to the ledger once its lock is
+    /// released.
+    fn access_device<D: VirtioMmio>(
+        &self,
+        dev: &Mutex<D>,
+        offset: u64,
+        is_write: bool,
+        value: u64,
+    ) -> u64 {
+        let (read, events) = {
+            let mut device = dev.lock().unwrap();
+            let read = device.mmio(&self.ram, offset, is_write, value);
+            (read, device.take_events())
+        };
+        self.ledger.captured(&events);
+        read
     }
 
     /// Returns the disk whose `size`-byte window holds `addr`, and the offset
