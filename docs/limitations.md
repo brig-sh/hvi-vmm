@@ -81,7 +81,7 @@ three things a reader should not have to guess between:
 | `ts` is host wall-clock. | It is not monotonic and can move backwards. | Design |
 | TLS SNI is recorded only under `--net-tap` and `--net-gateway`. | The built-in stack records no SNI. | Design |
 | An SNI value is a claim on the wire. | It is not proof of a connection, not application identity, and not authorization. Split ClientHellos, resumption, encrypted ClientHello and QUIC yield nothing. | Design |
-| `--dump-memory` is denied by the default sandbox. | The file is created after confinement. Use a destination inside a writable `--fs path=` directory, or `--no-sandbox`. See [#91](https://github.com/brig-sh/hvi-vmm/issues/91). | Defect |
+| `--dump-memory` is denied by the default sandbox. | The file is created after confinement. On macOS use a destination inside a writable `--fs path=` directory, or `--no-sandbox`. On Linux only `--no-sandbox` works. See [#91](https://github.com/brig-sh/hvi-vmm/issues/91). | Defect |
 | `--dump-after` needs the guest to still be running. | A guest that stops first produces no dump and no error. | Design |
 | A dump is not a checkpoint. | Raw RAM only. No register, device or virtqueue state. Nothing can restore a VM from it. | Design |
 
@@ -92,7 +92,7 @@ three things a reader should not have to guess between:
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
 | A thread a plugin starts outside `VmHandle::spawn` is unfiltered on Linux. | It starts in `attach`, before the filters are armed, and stays unfiltered. | Design |
 | No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
-| `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. | Design |
+| `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. A glibc build still refuses an open, without a record. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |
 | No external security audit. | Testing, not assurance. | Design |
 

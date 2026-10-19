@@ -110,6 +110,15 @@ starts.
 action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
 
+Neither list carries an open syscall (`openat`, `openat2`, and on x86-64
+`open`). A glibc build also installs, on every filtered thread and before the
+allowlist, a filter that fails those with `EPERM`, and adds them to the
+allowlist it compiles. glibc's malloc opens `/proc/sys/vm/overcommit_memory`,
+`/sys/devices/system/cpu/online` and `/proc/stat` on its own, from whichever
+thread is allocating or freeing, and copes with each open failing. The open is
+refused rather than trapped, and the process still opens nothing. A musl build,
+whose malloc opens no file, installs the allowlist alone.
+
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
 `ppoll` alone, because aarch64 has no `poll` syscall.
@@ -127,7 +136,8 @@ Failure behaviour differs by install site, and all three fail closed:
 
 The variable rewrites every filter's mismatch action to `log`. The kernel then
 **permits** the off-list syscall and records it. This is not a softer
-enforcement mode. It is no enforcement, with logging.
+enforcement mode. It is no enforcement, with logging. A glibc build still
+refuses an open under it, without a record.
 
 Use it to find a syscall a distribution needs, by reading `dmesg` or the audit
 log while the VMM keeps running. Never run a workload with it set. The
@@ -141,8 +151,11 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 20 probes, 9 expect a SIGSYS trap, 11 expect success
+hvi seccomp-selftest    # Linux: 21 probes, 9 expect denial, 12 expect success
 ```
+
+On Linux a glibc build expects 2 of the 9 denials, the two opens, to fail with
+`EPERM`, and a musl build expects all 9 to raise `SIGSYS`.
 
 Both install the profile or the filters that actually ship and check both
 directions: what a confined thread must keep, and what it must lose. Neither

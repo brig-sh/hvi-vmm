@@ -35,8 +35,8 @@
 //! `aarch64-unknown-linux-musl.json`, musl only, and drives its devices with
 //! epoll and io_uring. hvi's lists were measured on a glibc build, and hvi
 //! uses blocking reads on dedicated threads. Their lists therefore carry
-//! `open`, `stat`, `io_uring_*` and `epoll_*`, which we never call, and omit
-//! `openat`, `statx`, `rseq`, `set_robust_list`, `sched_getaffinity` and
+//! `io_uring_*` and `epoll_*`, and on x86-64 `open` and `stat`, which we never
+//! call, and omit `statx`, `rseq`, `set_robust_list`, `sched_getaffinity` and
 //! `clone3`, without which a glibc Rust binary dies before it reaches `main`.
 //! Vendoring them would have been simultaneously too loose and fatally too
 //! tight. So the lists are measured from hvi under `strace -f`, and the entries
@@ -88,16 +88,34 @@
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
 //! absent from both lists. A compromised virtio backend cannot open a file.
 //!
+//! # The files glibc opens by itself
+//!
+//! glibc's malloc opens two files on its own, from whichever thread is
+//! allocating or freeing at the time: `/proc/sys/vm/overcommit_memory` the
+//! first time the heap of a thread's arena shrinks, and
+//! `/sys/devices/system/cpu/online`, falling back to `/proc/stat`, when a
+//! thread needs a new arena while more than eight exist. It copes with each
+//! open failing. So a glibc build installs, on every thread and before the
+//! allowlist, a second filter that fails the open syscalls (`openat`,
+//! `openat2`, and on x86-64 `open`) with `EPERM`, and adds them to the
+//! allowlist it compiles. The kernel takes the strictest answer of a thread's
+//! filters, so an open is refused rather than trapped, and a backend still
+//! opens nothing. musl's malloc opens no file, so a musl build installs the
+//! allowlist alone.
+//!
 //! # The default action, and diagnosing it
 //!
 //! A syscall outside the list traps: `SIGSYS`, a dead process, a core file.
 //! That is Firecracker's choice too and it is the right one for a security
 //! boundary -- `errno` would let a filtered VMM limp on doing something subtly
-//! wrong. The cost is that a list which is too tight on some distro is a crash
-//! rather than a warning, so there are two ways out: `--no-sandbox` skips the
-//! filter entirely, and `HVI_SECCOMP=log` installs the same filters with the
-//! mismatch action changed to `log`, which lets the kernel record what would
-//! have been killed (`dmesg`, or `auditctl`) while the VMM keeps running.
+//! wrong. The open refusal above is the one exception, since the opens it
+//! refuses come from glibc's malloc, which works without the file. The cost is
+//! that a list which is too tight on some distro is a crash rather than a
+//! warning, so there are two ways out: `--no-sandbox` skips the filter
+//! entirely, and `HVI_SECCOMP=log` installs the same filters with the mismatch
+//! action changed to `log`, which lets the kernel record what would have been
+//! killed (`dmesg`, or `auditctl`) while the VMM keeps running. The open
+//! refusal stays in under it, unrecorded.
 
 use std::io;
 
@@ -147,6 +165,16 @@ const ARCH: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "aarch64")]
 const ARCH: TargetArch = TargetArch::aarch64;
 
+/// The open syscalls of this architecture, which a glibc build refuses with
+/// [`open_refusal_program`].
+#[cfg(target_env = "gnu")]
+const OPEN_SYSCALLS: &[(&str, i64)] = &[
+    #[cfg(target_arch = "x86_64")]
+    ("open", libc::SYS_open),
+    ("openat", libc::SYS_openat),
+    ("openat2", libc::SYS_openat2),
+];
+
 /// Environment variable that swaps the mismatch action for `log`, so a syscall
 /// outside the allowlist is recorded by the kernel instead of killing the
 /// process. For diagnosing a too-tight list on a distro we have not measured;
@@ -158,30 +186,41 @@ pub fn log_mode() -> bool {
     std::env::var(LOG_ENV).is_ok_and(|v| v == "log")
 }
 
-/// Compiles [`FILTERS`] and returns the BPF program for `thread`.
+/// Returns the allowlist for `thread`, compiled from [`FILTERS`].
 ///
-/// In log mode the JSON is rewritten before compiling -- `default_action` is
-/// the mismatch action in seccompiler's schema -- rather than kept as a second
-/// copy of the lists that could drift from the real one.
-fn program(thread: Thread) -> io::Result<BpfProgram> {
-    let json = if log_mode() {
-        let mut doc: serde_json::Value =
-            serde_json::from_str(FILTERS).map_err(|e| io::Error::other(format!("filters: {e}")))?;
-        let Some(map) = doc.as_object_mut() else {
-            return Err(io::Error::other("filters: expected a JSON object"));
-        };
-        for (_name, filter) in map.iter_mut() {
-            if let Some(obj) = filter.as_object_mut() {
-                obj.insert(
-                    "default_action".to_string(),
-                    serde_json::Value::String("log".to_string()),
-                );
-            }
-        }
-        serde_json::to_string(&doc).map_err(|e| io::Error::other(format!("filters: {e}")))?
-    } else {
-        FILTERS.to_string()
+/// The JSON is rewritten before compiling rather than kept as a second copy of
+/// the lists that could drift from the real one. With `log` set,
+/// `default_action`, the mismatch action in seccompiler's schema, becomes
+/// `log`. A glibc build adds the open syscalls to each list, which is safe only
+/// behind the filter that refuses them, so the allowlist is compiled through
+/// [`programs`] alone.
+fn allowlist(thread: Thread, log: bool) -> io::Result<BpfProgram> {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(FILTERS).map_err(|e| io::Error::other(format!("filters: {e}")))?;
+    let Some(map) = doc.as_object_mut() else {
+        return Err(io::Error::other("filters: expected a JSON object"));
     };
+    for (_name, filter) in map.iter_mut() {
+        let Some(obj) = filter.as_object_mut() else {
+            continue;
+        };
+        if log {
+            obj.insert(
+                "default_action".to_string(),
+                serde_json::Value::String("log".to_string()),
+            );
+        }
+        #[cfg(target_env = "gnu")]
+        if let Some(list) = obj.get_mut("filter").and_then(|f| f.as_array_mut()) {
+            list.extend(
+                OPEN_SYSCALLS
+                    .iter()
+                    .map(|(name, _)| serde_json::json!({ "syscall": name })),
+            );
+        }
+    }
+    let json =
+        serde_json::to_string(&doc).map_err(|e| io::Error::other(format!("filters: {e}")))?;
 
     let mut map = seccompiler::compile_from_json(json.as_bytes(), ARCH)
         .map_err(|e| io::Error::other(format!("compiling the {} filter: {e}", thread.key())))?;
@@ -189,15 +228,57 @@ fn program(thread: Thread) -> io::Result<BpfProgram> {
         .ok_or_else(|| io::Error::other(format!("no {} filter in the allowlists", thread.key())))
 }
 
-/// Installs `thread`'s filter on the calling thread.
+/// Compiles the filter a glibc build installs before each allowlist.
+///
+/// It fails [`OPEN_SYSCALLS`] with `EPERM` and allows every other syscall, so
+/// the allowlist decides those. It returns `EPERM` rather than `ENOENT`, so an
+/// open the sandbox refused does not read as a missing file.
+#[cfg(target_env = "gnu")]
+fn open_refusal_program() -> io::Result<BpfProgram> {
+    let rules = OPEN_SYSCALLS
+        .iter()
+        .map(|&(_, number)| (number, Vec::new()))
+        .collect();
+    seccompiler::SeccompFilter::new(
+        rules,
+        seccompiler::SeccompAction::Allow,
+        seccompiler::SeccompAction::Errno(libc::EPERM.unsigned_abs()),
+        ARCH,
+    )
+    .and_then(BpfProgram::try_from)
+    .map_err(|e| io::Error::other(format!("compiling the open refusal filter: {e}")))
+}
+
+/// Compiles the filters `thread` installs, in the order it installs them, each
+/// with a name for its errors.
+///
+/// A glibc build puts the filter that refuses an open first, since neither
+/// allowlist allows `seccomp` and nothing can go in after one. `log` is whether
+/// the allowlist logs a syscall outside it rather than trapping.
+fn programs(thread: Thread, log: bool) -> io::Result<Vec<(&'static str, BpfProgram)>> {
+    Ok(vec![
+        #[cfg(target_env = "gnu")]
+        ("open refusal", open_refusal_program()?),
+        (thread.key(), allowlist(thread, log)?),
+    ])
+}
+
+/// Installs `thread`'s filters on the calling thread.
+///
+/// The thread counts as filtered once its first filter is in. A filter cannot
+/// be removed, so the thread keeps that one even when a later one fails to
+/// install.
 ///
 /// Irreversible, and inherited by anything this thread spawns afterwards. Fails
 /// closed: the caller refuses to boot rather than run unfiltered, because a
 /// filter that will not compile or install is one nobody has tested.
 pub fn install(thread: Thread) -> io::Result<()> {
-    let program = program(thread)?;
-    seccompiler::apply_filter(&program)
-        .map_err(|e| io::Error::other(format!("installing the {} filter: {e}", thread.key())))
+    for (name, program) in programs(thread, log_mode())? {
+        seccompiler::apply_filter(&program)
+            .map_err(|e| io::Error::other(format!("installing the {name} filter: {e}")))?;
+        INSTALLED.set(true);
+    }
+    Ok(())
 }
 
 /// Whether [`arm`] has run in this process.
@@ -211,8 +292,7 @@ pub fn install(thread: Thread) -> io::Result<()> {
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
-    /// Whether this thread installed the `vmm` or `vcpu` filter, through
-    /// [`install_thread`] or as the thread that calls `boot`.
+    /// Whether this thread installed a filter with [`install`].
     ///
     /// A thread that inherited a filter from the thread that started it reads
     /// `false`. See [`install_thread`] for why asking twice has to be harmless.
@@ -239,22 +319,21 @@ pub(crate) fn is_thread_filtered() -> bool {
     INSTALLED.get()
 }
 
-/// Turns filtering on for the threads spawned after this call, and proves both
-/// filters compile first.
+/// Turns filtering on for the threads spawned after this call.
 ///
-/// Compiling here is the point: it turns "this distro's kernel headers spell a
-/// syscall differently" into a boot error on the thread that calls `boot`,
-/// where it can be reported, instead of a `SIGSYS` inside a device thread later
-/// on.
+/// It compiles every filter first. That turns "this distro's kernel headers
+/// spell a syscall differently" into a boot error on the thread that calls
+/// `boot`, where it can be reported, instead of a `SIGSYS` inside a device
+/// thread later on.
 pub fn arm() -> io::Result<()> {
     for thread in [Thread::Vmm, Thread::Vcpu] {
-        program(thread)?;
+        programs(thread, log_mode())?;
     }
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
-/// Installs `thread`'s filter if [`arm`] was called, and aborts if it cannot.
+/// Installs `thread`'s filters if [`arm`] was called.
 ///
 /// Called at the top of each thread hvi spawns *before* the thread that calls
 /// `boot` filters itself, and before each pass of a thread that can start
@@ -263,11 +342,11 @@ pub fn arm() -> io::Result<()> {
 /// thread and correctly inherit its filter. Calling `seccomp` from under a
 /// filter that does not allow it would trap.
 ///
-/// Aborting rather than returning an error is deliberate. There is no
+/// It aborts if it cannot, rather than returning an error. There is no
 /// meaningful recovery inside a worker thread: continuing would run a
 /// guest-facing loop unfiltered, and returning would silently drop a device.
-/// [`arm`] has already proved the filter compiles, so reaching this is a kernel
-/// refusing the install, which is worth a loud death.
+/// [`arm`] has already proved the filters compile, so reaching this means the
+/// kernel refused the install.
 pub fn install_thread(thread: Thread) {
     if !is_entered() {
         return;
@@ -283,7 +362,7 @@ pub fn install_thread(thread: Thread) {
     }
     if let Err(e) = install(thread) {
         stderrln!(
-            "{LOG_PREFIX} FATAL: cannot install the {} seccomp filter: {e}",
+            "{LOG_PREFIX} FATAL: cannot filter the {} thread: {e}",
             thread.key()
         );
         std::process::abort();
@@ -306,9 +385,8 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
 /// The seccomp filters of a run, compiled before its I/O and vCPU threads
 /// start.
 ///
-/// Each thread installs its own filter as it starts, with [`install_thread`].
-/// [`Filters::install`] installs the filter of the thread that calls `boot`,
-/// last.
+/// Each thread installs its own filters as it starts, with [`install_thread`].
+/// [`Filters::install`] installs those of the thread that calls `boot`, last.
 pub(crate) struct Filters {
     /// The number of syscalls each filter allows, when the sandbox is on.
     counts: Option<(usize, usize)>,
@@ -317,7 +395,7 @@ pub(crate) struct Filters {
 impl Filters {
     /// Arms the seccomp filters when `sandbox` is set.
     ///
-    /// This compiles both allowlists, so a bad list fails the boot here rather
+    /// This compiles every filter, so a bad list fails the boot here rather
     /// than as a `SIGSYS` inside a device thread later. Nothing is filtered
     /// yet: each thread installs its own as it starts.
     ///
@@ -352,36 +430,49 @@ impl Filters {
     pub(crate) fn install(self) -> io::Result<()> {
         let Some((vmm, vcpu)) = self.counts else {
             stderrln!(
-                "{LOG_PREFIX} seccomp: OFF (--no-sandbox) — the VMM keeps the full host syscall surface"
+                "{LOG_PREFIX} seccomp: OFF (--no-sandbox); the VMM keeps the full host syscall surface"
             );
             return Ok(());
         };
         install(Thread::Vmm)?;
-        INSTALLED.set(true);
+        let opens = if cfg!(target_env = "gnu") {
+            "; open is refused"
+        } else {
+            ""
+        };
         if log_mode() {
             stderrln!(
-                "{LOG_PREFIX} seccomp: LOGGING ONLY ({LOG_ENV}=log) — denials are recorded, not enforced"
+                "{LOG_PREFIX} seccomp: LOGGING ONLY ({LOG_ENV}=log); denials are recorded, not enforced{opens}"
             );
         } else {
             stderrln!(
-                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch)"
+                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch{opens})"
             );
         }
         Ok(())
     }
 }
 
-/// One probe: a syscall, which filter to install first, and whether the
-/// filtered thread is supposed to survive making it.
+/// A probe of one syscall, the filter installed before it, and the outcome that
+/// filter is meant to give it.
 struct Probe {
     what: &'static str,
     thread: Thread,
-    /// True if the filter is meant to allow this, false if it must trap.
-    expect_ok: bool,
-    /// Run in the child, *after* the filter is installed. Returning normally
-    /// means the syscall was allowed.
+    /// The outcome the filter is meant to give the syscall.
+    expected: Outcome,
+    /// The code that makes the syscall in the child, after the filter is in. It
+    /// returns when the syscall is allowed. A probe that expects a refusal ends
+    /// the child with [`EXIT_REFUSED`] when its syscall fails with `EPERM`.
     run: fn(),
 }
+
+/// The outcome an open has under the filters, a refusal in a glibc build and a
+/// trap in a musl build.
+const OPEN_OUTCOME: Outcome = if cfg!(target_env = "gnu") {
+    Outcome::Refused
+} else {
+    Outcome::Trapped
+};
 
 /// The probes. Denials first, so a filter that is accidentally permissive reads
 /// as a wall of failures rather than one buried line.
@@ -390,28 +481,19 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "open a file (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: false,
-            run: || {
-                let p = c"/etc/hosts";
-                // SAFETY: a valid NUL-terminated path; the result is unused
-                // because reaching this line at all is the finding.
-                unsafe { libc::open(p.as_ptr(), libc::O_RDONLY) };
-            },
+            expected: OPEN_OUTCOME,
+            run: open_each_way,
         },
         Probe {
             what: "open a file (vmm)",
             thread: Thread::Vmm,
-            expect_ok: false,
-            run: || {
-                let p = c"/etc/hosts";
-                // SAFETY: as above.
-                unsafe { libc::open(p.as_ptr(), libc::O_RDONLY) };
-            },
+            expected: OPEN_OUTCOME,
+            run: open_each_way,
         },
         Probe {
             what: "create a socket (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             // SAFETY: socket(2) with constant arguments.
             run: || {
                 unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -420,7 +502,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "create a socket (vmm)",
             thread: Thread::Vmm,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             // The vmm filter allows accept4 on a listener bound beforehand but
             // never socket(2): it cannot make a new one.
             // SAFETY: socket(2) with constant arguments.
@@ -431,7 +513,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "execute another program (vmm)",
             thread: Thread::Vmm,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             run: || {
                 let p = c"/bin/true";
                 let argv = [p.as_ptr(), std::ptr::null()];
@@ -442,7 +524,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "spawn a thread (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             // clone is a vmm right (the agent bridge needs one per connection);
             // a vCPU thread servicing guest MMIO has no business making threads.
             run: || {
@@ -452,7 +534,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "unlink a file (vmm)",
             thread: Thread::Vmm,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             run: || {
                 let p = c"/tmp/hvi-seccomp-selftest-should-not-exist";
                 // SAFETY: a valid NUL-terminated path.
@@ -462,7 +544,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "change file mode (vmm)",
             thread: Thread::Vmm,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             run: || {
                 let p = c"/tmp";
                 // SAFETY: a valid NUL-terminated path.
@@ -472,7 +554,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "send a signal to another process (vmm)",
             thread: Thread::Vmm,
-            expect_ok: false,
+            expected: Outcome::Trapped,
             // kill(2) is absent; tgkill is allowed, and only reaches our own
             // threads because the filter cannot constrain the target beyond
             // what the caller passes.
@@ -493,7 +575,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "flush an inherited descriptor (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 // SAFETY: fdatasync on fd 1, which we inherited. It is the
                 // syscall `File::sync_data` makes on the virtio-blk flush path.
@@ -503,7 +585,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "flush an inherited descriptor (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 // SAFETY: as above.
                 unsafe { libc::fdatasync(1) };
@@ -512,7 +594,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "write to an inherited descriptor (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 let msg = b"";
                 // SAFETY: writing zero bytes to fd 1, which we inherited.
@@ -526,7 +608,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "read from an inherited descriptor (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 let mut b = [0u8; 1];
                 // SAFETY: reading zero bytes from fd 0, which we inherited.
@@ -536,7 +618,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "allocate host memory (vcpu)",
             thread: Thread::Vcpu,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 let v: Vec<u8> = vec![7u8; 4 << 20];
                 std::hint::black_box(&v);
@@ -545,16 +627,36 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "allocate host memory (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 let v: Vec<u8> = vec![7u8; 4 << 20];
                 std::hint::black_box(&v);
             },
         },
+        // A new thread gets an arena of its own, and freeing 800 KiB from it
+        // shrinks that arena's heap. glibc reads `overcommit_memory` the first
+        // time that happens in a process. The child inherits glibc's answer
+        // across the fork, so the probe reaches the read only while the
+        // selftest's own process has never shrunk a thread's arena. With
+        // `GLIBC_TUNABLES` that cap the arenas or move the trim or mmap
+        // threshold, the heap may not shrink, and the probe passes without
+        // reaching the read.
+        Probe {
+            what: "free a thread's heap memory (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Allowed,
+            run: || {
+                let _ = std::thread::spawn(|| {
+                    let blocks: Vec<Vec<u8>> = (0..8).map(|_| vec![7u8; 100 << 10]).collect();
+                    drop(std::hint::black_box(blocks));
+                })
+                .join();
+            },
+        },
         Probe {
             what: "poll an inherited descriptor (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             // Every helper thread waits in `poll` beside its stop token. If
             // glibc lowers the call to a syscall the allowlist does not carry,
             // every sandboxed run ends at the first wakeup.
@@ -572,7 +674,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "receive without blocking on an inherited descriptor (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             // The gateway relay drains its socket with `recv(MSG_DONTWAIT)`.
             run: || {
                 // SAFETY: a zero-length receive on fd 1, which we inherited,
@@ -584,7 +686,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "signal a thread of this process (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             // `IoThreads::stop` ends the console reader's blocking read with
             // the kick signal, sent from the thread that calls `boot` under
             // this filter.
@@ -599,7 +701,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "spawn a thread (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             // The agent bridge spawns a reader per accepted connection, after
             // the filter is in.
             run: || {
@@ -612,7 +714,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             what: "sleep (vmm)",
             thread: Thread::Vmm,
-            expect_ok: true,
+            expected: Outcome::Allowed,
             run: || {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             },
@@ -620,26 +722,104 @@ fn probes() -> Vec<Probe> {
     ]
 }
 
-/// Result of running one probe in a child process.
+/// Exit status of a probe child whose syscall failed with `EPERM`.
+const EXIT_REFUSED: i32 = 98;
+
+/// Opens a file through each open syscall of this architecture.
+///
+/// It makes the syscalls itself, since the libc picks which one `open` makes.
+/// It ends the child with [`EXIT_REFUSED`] if every one fails with `EPERM`, and
+/// returns at the first one that is not refused. In a musl build the first,
+/// `openat`, traps.
+fn open_each_way() {
+    let path = c"/etc/hosts";
+    let refused = |result: libc::c_long| {
+        result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    // SAFETY: openat(2) on a valid NUL-terminated path. A descriptor it returns
+    // is left open, since the child exits next.
+    let openat = unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::O_RDONLY,
+        )
+    };
+    if !refused(openat) {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: as above, for open(2).
+        let open = unsafe { libc::syscall(libc::SYS_open, path.as_ptr(), libc::O_RDONLY) };
+        if !refused(open) {
+            return;
+        }
+    }
+    // `struct open_how`: flags, mode and resolve. libc's is non-exhaustive, so
+    // a struct expression cannot build it.
+    let how: [u64; 3] = [libc::O_RDONLY as u64, 0, 0];
+    // SAFETY: as above, for openat2(2), with an `open_how` and its size.
+    let openat2 = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of_val(&how),
+        )
+    };
+    if refused(openat2) {
+        // SAFETY: terminating the child without running destructors.
+        unsafe { libc::_exit(EXIT_REFUSED) };
+    }
+}
+
+/// What a filter did with a probe's syscall, or is meant to do with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     /// The child ran the syscall and exited normally.
     Allowed,
     /// The child was killed by `SIGSYS`, i.e. the filter trapped the syscall.
     Trapped,
-    /// Anything else, with the raw wait status.
-    Other(i32),
+    /// The child's syscall failed with `EPERM`.
+    Refused,
 }
 
-/// Runs one probe in a forked child and reports what happened to it.
+impl Outcome {
+    /// Returns the selftest's label for this outcome as the expected one.
+    fn expected_label(self) -> &'static str {
+        match self {
+            Outcome::Allowed => "allowed",
+            Outcome::Trapped => "trapped",
+            Outcome::Refused => "refused",
+        }
+    }
+
+    /// Returns the selftest's label for this outcome as the one seen.
+    fn seen_label(self) -> &'static str {
+        match self {
+            Outcome::Allowed => "ran",
+            Outcome::Trapped => "killed by SIGSYS",
+            Outcome::Refused => "refused with EPERM",
+        }
+    }
+}
+
+/// Returns the outcome of one probe, run in a forked child.
+///
+/// It returns `Err` with the raw wait status when the child ended any other
+/// way.
 ///
 /// A child per probe is not incidental. The mismatch action is `trap`, so a
 /// denied syscall kills the thread that made it -- an in-process probe like the
 /// macOS selftest's would end the selftest at the first denial and could not
 /// report anything. The parent stays unfiltered so it can fork the next one.
-fn run_probe(probe: &Probe) -> io::Result<Outcome> {
+fn run_probe(probe: &Probe) -> io::Result<Result<Outcome, i32>> {
     // SAFETY: fork in a process that has not yet installed a filter. The child
-    // touches nothing that needs the parent's locks: it installs a filter, runs
-    // one closure and _exits without unwinding or flushing.
+    // touches nothing that needs the parent's locks: it installs the filters,
+    // runs one closure and _exits without unwinding or flushing.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
@@ -666,17 +846,16 @@ fn run_probe(probe: &Probe) -> io::Result<Outcome> {
             if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
                 return Err(io::Error::last_os_error());
             }
-            // WIFSIGNALED / WTERMSIG, spelled out because libc does not export
-            // the macros.
-            let termsig = status & 0x7f;
-            let exited = termsig == 0;
-            let exit_code = (status >> 8) & 0xff;
-            Ok(if exited && exit_code == 0 {
-                Outcome::Allowed
-            } else if !exited && termsig == libc::SIGSYS {
-                Outcome::Trapped
+            Ok(if libc::WIFEXITED(status) {
+                match libc::WEXITSTATUS(status) {
+                    0 => Ok(Outcome::Allowed),
+                    EXIT_REFUSED => Ok(Outcome::Refused),
+                    _ => Err(status),
+                }
+            } else if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS {
+                Ok(Outcome::Trapped)
             } else {
-                Outcome::Other(status)
+                Err(status)
             })
         }
     }
@@ -712,27 +891,18 @@ pub fn selftest() -> io::Result<usize> {
         // denial. Without this, running the selftest somewhere `seccomp(2)` is
         // itself refused (inside Docker's default profile, say) would report
         // every negative probe as passing while proving nothing.
-        let good = match outcome {
-            Outcome::Allowed => probe.expect_ok,
-            Outcome::Trapped => !probe.expect_ok,
-            Outcome::Other(_) => false,
-        };
+        let good = outcome == Ok(probe.expected);
         if !good {
             bad += 1;
         }
         let verdict = if good { "ok  " } else { "FAIL" };
-        let expectation = if probe.expect_ok {
-            "allowed"
-        } else {
-            "trapped"
-        };
         let actual = match outcome {
-            Outcome::Allowed => "ran".to_string(),
-            Outcome::Trapped => "killed by SIGSYS".to_string(),
-            Outcome::Other(s) => format!("unexpected wait status {s:#x}"),
+            Ok(seen) => seen.seen_label().to_string(),
+            Err(status) => format!("unexpected wait status {status:#x}"),
         };
         println!(
-            "  [{verdict}] want {expectation}  {:<38} {actual}",
+            "  [{verdict}] want {}  {:<38} {actual}",
+            probe.expected.expected_label(),
             probe.what
         );
     }
@@ -751,9 +921,115 @@ mod tests {
     #[test]
     fn filters_compile_for_this_arch() {
         for thread in [Thread::Vmm, Thread::Vcpu] {
-            let p = program(thread).expect("filter should compile");
-            assert!(!p.is_empty(), "{:?} compiled to an empty program", thread);
+            for (_, p) in programs(thread, false).expect("filter should compile") {
+                assert!(!p.is_empty(), "{:?} compiled to an empty program", thread);
+            }
         }
+    }
+
+    /// The audit architecture the kernel puts in `seccomp_data`.
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    /// The audit architecture the kernel puts in `seccomp_data`.
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+
+    /// Returns the action `program` takes for a syscall `number` with all-zero
+    /// arguments.
+    ///
+    /// It runs the program as the kernel's classic BPF interpreter would. It
+    /// knows the instructions seccompiler emits and panics on any other.
+    fn run_program(program: &[seccompiler::sock_filter], number: i64) -> u32 {
+        // `seccomp_data`: the syscall number, the audit architecture, the
+        // instruction pointer and six arguments.
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&u32::try_from(number).unwrap().to_ne_bytes());
+        data[4..8].copy_from_slice(&AUDIT_ARCH.to_ne_bytes());
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let insn = &program[pc];
+            pc += 1;
+            let code = u32::from(insn.code);
+            let jump = |taken: bool| usize::from(if taken { insn.jt } else { insn.jf });
+            match code {
+                c if c == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS => {
+                    let at = insn.k as usize;
+                    acc = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+                }
+                c if c == libc::BPF_ALU | libc::BPF_AND | libc::BPF_K => acc &= insn.k,
+                c if c == libc::BPF_JMP | libc::BPF_JA => pc += insn.k as usize,
+                c if c == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K => pc += jump(acc == insn.k),
+                c if c == libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K => pc += jump(acc > insn.k),
+                c if c == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K => pc += jump(acc >= insn.k),
+                c if c == libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K => {
+                    pc += jump(acc & insn.k != 0)
+                }
+                c if c == libc::BPF_RET | libc::BPF_K => return insn.k,
+                c => panic!("seccompiler emitted BPF opcode {c:#x}, which this test does not run"),
+            }
+        }
+    }
+
+    /// Returns the kernel's action for `number` under all of `programs`.
+    ///
+    /// That is the strictest of their actions, which is the lowest read as a
+    /// signed number.
+    fn verdict(programs: &[BpfProgram], number: i64) -> u32 {
+        programs
+            .iter()
+            .map(|p| run_program(p, number))
+            .min_by_key(|&action| (action & libc::SECCOMP_RET_ACTION_FULL) as i32)
+            .unwrap()
+    }
+
+    // It runs the filters `install` installs, so it covers the open refusal
+    // together with the allowlist that allows the opens. The syscall numbers
+    // come from libc rather than from `OPEN_SYSCALLS`, so a wrong entry there
+    // fails it.
+    #[test]
+    fn installed_filters_refuse_an_open_and_trap_a_socket() {
+        let open = if cfg!(target_env = "gnu") {
+            libc::SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs()
+        } else {
+            libc::SECCOMP_RET_TRAP
+        };
+        for thread in [Thread::Vmm, Thread::Vcpu] {
+            let filters: Vec<BpfProgram> = programs(thread, false)
+                .unwrap()
+                .into_iter()
+                .map(|(_, program)| program)
+                .collect();
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(verdict(&filters, libc::SYS_open), open, "open, {thread:?}");
+            assert_eq!(
+                verdict(&filters, libc::SYS_openat),
+                open,
+                "openat, {thread:?}"
+            );
+            assert_eq!(
+                verdict(&filters, libc::SYS_openat2),
+                open,
+                "openat2, {thread:?}"
+            );
+            assert_eq!(
+                verdict(&filters, libc::SYS_socket),
+                libc::SECCOMP_RET_TRAP,
+                "socket, {thread:?}"
+            );
+            assert_eq!(
+                verdict(&filters, libc::SYS_write),
+                libc::SECCOMP_RET_ALLOW,
+                "write, {thread:?}"
+            );
+        }
+    }
+
+    // `programs` compiles the lists through `serde_json::Value`, which keeps
+    // the last of two duplicate keys. Compiling the raw JSON fails on one.
+    #[test]
+    fn raw_filters_compile() {
+        seccompiler::compile_from_json(FILTERS.as_bytes(), ARCH)
+            .expect("the raw allowlists should compile");
     }
 
     /// Both filters must deny by default. A filter that allowed by default

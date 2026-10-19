@@ -35,8 +35,8 @@ deviation rather than an oversight.
 Firecracker ships `x86_64-unknown-linux-musl.json` and
 `aarch64-unknown-linux-musl.json`, musl only, and drives its devices with epoll
 and io_uring. hvi's lists were measured on a glibc build, and hvi uses blocking
-reads on dedicated threads. So their lists carry `open`, `stat`, `io_uring_*`
-and `epoll_*`, which we never call, and omit `openat`, `statx`, `rseq`,
+reads on dedicated threads. So their lists carry `io_uring_*` and `epoll_*`, and
+on x86-64 `open` and `stat`, which we never call, and omit `statx`, `rseq`,
 `set_robust_list`, `sched_getaffinity` and `clone3`, without which a glibc Rust
 binary does not reach `main`. Copying them would have been simultaneously too
 loose and fatally too tight, so no code or list of theirs is included here and
@@ -51,6 +51,20 @@ The musl build shares the lists. musl can reach a different syscall than glibc
 for the same library call, so `hvi seccomp-selftest` run on the musl binary is
 the check for that.
 
+## The files glibc opens by itself
+
+Neither list carries an open syscall (`openat`, `openat2`, and on x86-64
+`open`). glibc's malloc opens two files on its own, from whichever thread is
+allocating or freeing at the time: `/proc/sys/vm/overcommit_memory` the first
+time the heap of a thread's arena shrinks, and `/sys/devices/system/cpu/online`,
+falling back to `/proc/stat`, when a thread needs a new arena while more than
+eight exist. It copes with each open failing, so a glibc build installs, on
+every thread and before the allowlist, a second filter that fails those open
+syscalls with `EPERM`, and adds them to the allowlist it compiles. The kernel
+takes the strictest answer of a thread's filters, so an open is refused rather
+than trapped, and the process still opens nothing. musl's malloc opens no file,
+so a musl build installs the allowlist alone.
+
 ## Changing a list
 
 Adding a syscall is granting a right to a process that parses guest-controlled
@@ -60,13 +74,15 @@ data, so the bar is a demonstrated need, not a suspicion:
    filters with the mismatch action changed to `log`, so the kernel lets the
    off-list syscall run and records it (`dmesg`, `auditctl`) while the VMM
    keeps running. That names the syscall. It also means enforcement is off for
-   that run, so it is a diagnostic and never a way to operate.
+   that run, so it is a diagnostic and never a way to operate. A glibc build
+   still refuses an open under it, without a record.
 2. Add it to the narrowest filter that needs it, with a `comment` saying which
    code path calls it.
 3. `cargo test` -- the unit tests check that both lists compile for the target
    arch, that `vcpu` stays a strict subset of `vmm`, and that neither list ever
    gains `open*`, `socket`, `connect`, `execve`, `seccomp` or `prctl`, each of
-   which would undo the reason the filters go in after setup.
+   which would undo the reason the filters go in after setup. The opens a glibc
+   build adds are compiled in by the code, behind the filter that refuses them.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
 

@@ -203,8 +203,11 @@ still shares them.
 A sandboxed run leaves its confinement in place for the life of the process. On
 Linux the `vmm` seccomp filter stays on the thread that called `boot`, and every
 thread that thread starts later inherits it. The filter refuses opening a file,
-so `boot` and `spawn` refuse a later run from that thread. A run from a thread
-the filtered thread started ends the process by `SIGSYS`. Start every sandboxed
+so `boot` and `spawn` refuse a later run from that thread, under
+`HVI_SECCOMP=log` too. A run from a thread the filtered thread started stops at
+the first syscall of its setup that the filter does not allow. In a glibc build
+an open fails with `EPERM`, under `HVI_SECCOMP=log` too. Any other such syscall
+ends the process by `SIGSYS`, outside `HVI_SECCOMP=log`. Start every sandboxed
 run with `spawn`, so the thread that calls it stays unfiltered. `boot` refuses a
 later run with `sandbox: false`. On macOS the Seatbelt profile stays on the
 whole process once a run has entered it, and refuses what a later run sets up,
@@ -305,8 +308,8 @@ names the thread that panicked. hvi takes a blocking lock with
 panics in turn. A panic makes `boot` refuse later runs in the process only when
 a thread was left running or the panic unwound out of `boot` itself. Without
 hvi's hook, the default hook resolves a backtrace when `RUST_BACKTRACE` is set.
-Resolving it opens the binary, which the Linux seccomp filters refuse, so under
-the sandbox the process ends by `SIGSYS`.
+Resolving it opens files and reads links, which the Linux seccomp filters do not
+allow, so under the sandbox the process ends by `SIGSYS`.
 
 ## Configuration outside `BootConfig`
 
