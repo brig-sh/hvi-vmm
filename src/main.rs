@@ -45,8 +45,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("boot") => boot_guest(&args[2..]),
+        Some("restore") => restore_guest(&args[2..]),
         Some("--version" | "-V" | "version") => {
             print_version();
+            Ok(())
+        }
+        Some("checkpoint-verify") => {
+            let dir = args
+                .get(2)
+                .ok_or("checkpoint-verify needs the bundle directory")?;
+            let verified = hvi::checkpoint::bundle::verify(std::path::Path::new(dir))
+                .map_err(|e| format!("{dir}: {e}"))?;
+            println!("{verified}");
             Ok(())
         }
         Some("dump-fdt") => {
@@ -91,6 +101,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("seccomp-selftest") => {
             #[cfg(target_os = "linux")]
             {
+                // The allocation probes check the setting a confined run
+                // uses, so the selftest takes it too, before any thread.
+                hvi::sandbox::seccomp::one_malloc_arena()?;
                 let bad = hvi::sandbox::seccomp::selftest()?;
                 if bad > 0 {
                     return Err(format!(
@@ -141,14 +154,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             eprintln!(
-                "hvi — a microVMM\n\nusage: hvi \
-                 <boot|dump-fdt|smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
+                "hvi — a microVMM\n\nusage: hvi <boot|restore|checkpoint-verify|dump-fdt|\
+                 smoke|sandbox-selftest|seccomp-selftest|--version> [args]"
             );
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected `boot`, `dump-fdt`, `smoke`, \
-             `sandbox-selftest`, `seccomp-selftest` or `--version`"
+            "unknown subcommand {other:?}; expected `boot`, `restore`, `checkpoint-verify`, \
+             `dump-fdt`, `smoke`, `sandbox-selftest`, `seccomp-selftest` or `--version`"
         )
         .into()),
     }
@@ -255,6 +268,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_mib: u64 = 512;
     let mut cmdline = String::from("earlycon console=ttyAMA0 panic=-1");
     let mut disks = Vec::new();
+    let mut disk_base_sha256 = None;
+    let mut disk_written = None;
     let mut fs_uid: u32 = 0;
     let mut fs_gid: u32 = 0;
     let mut fs_shares: Vec<config::FsShare> = Vec::new();
@@ -270,10 +285,15 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut sandbox_id = String::from("hvi");
     let mut vcpus: u32 = 1;
     let mut agent_sock = None;
+    let mut profile_out = None;
+    let mut control_sock = None;
+    let mut checkpoint_root = None;
     let mut dump_memory = None;
     let mut dump_after = None;
     let mut trace_io = None;
     let mut sandbox = true;
+    let mut profile = config::MachineProfileKind::Native;
+    let mut arch_timer_irq = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -283,6 +303,21 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => push_disk(&mut disks, it.next())?,
+            // The digest of the disk as this boot opens it, before this hvi
+            // writes it, which the caller computed and keeps a copy of, so
+            // a move sends only what the guest wrote. hvi records it and
+            // does not check it.
+            "--disk-base-sha256" => {
+                let v = it.next().ok_or("--disk-base-sha256 needs a value")?;
+                disk_base_sha256 = Some(base_digest(v)?);
+            }
+            // The blocks where the disk already differs from that base, as
+            // a bitmap file: a launcher that wrote files into its copy of
+            // the base before the boot names them here, so a move by
+            // blocks sends them too.
+            "--disk-written" => {
+                disk_written = Some(it.next().ok_or("--disk-written needs a file")?.clone());
+            }
             // The old names of `uid=` and `gid=` on an `--fs path=` export.
             // They apply to every `--share-ro`/`--share-rw` export, which is
             // what they did when the identity was one per process. Kept
@@ -415,12 +450,31 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--cpus" => vcpus = it.next().ok_or("--cpus needs a value")?.parse()?,
             "--agent-sock" => agent_sock = it.next().cloned(),
+            "--profile-out" => {
+                profile_out = Some(it.next().ok_or("--profile-out needs a path")?.clone());
+            }
+            "--control-sock" => {
+                control_sock = Some(it.next().ok_or("--control-sock needs a path")?.clone());
+            }
+            "--checkpoint-root" => {
+                checkpoint_root = Some(
+                    it.next()
+                        .ok_or("--checkpoint-root needs a directory")?
+                        .clone(),
+                );
+            }
             "--dump-memory" => dump_memory = it.next().cloned(),
             "--dump-after" => {
                 dump_after = Some(it.next().ok_or("--dump-after needs seconds")?.parse()?);
             }
             "--trace-io" => trace_io = it.next().cloned(),
             "--no-sandbox" => sandbox = false,
+            "--profile" => {
+                profile = config::MachineProfileKind::from_name(
+                    it.next().ok_or("--profile needs a name")?,
+                )?;
+            }
+            "--arch-timer-irq" => arch_timer_irq = Some(true),
             other => return Err(format!("unknown boot arg {other:?}").into()),
         }
     }
@@ -447,6 +501,38 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fs_shares[index].gid = fs_gid;
     }
 
+    if disk_base_sha256.is_some() && !matches!(disks.as_slice(), [disk] if !disk.read_only) {
+        return Err(config::ONE_DISK_FOR_A_BASE.into());
+    }
+    if disk_written.is_some() && disk_base_sha256.is_none() {
+        return Err("--disk-written needs --disk-base-sha256, the base it differs from".into());
+    }
+    // A bitmap of the largest disk with a base, 4 TiB, is 8 MiB; read no
+    // more than one byte past that, so a wrong file is refused without
+    // reading it whole.
+    let disk_written = disk_written
+        .map(
+            |path: String| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                use std::io::Read as _;
+                let mut bits = Vec::new();
+                std::fs::File::open(&path)
+                    .map_err(|e| format!("--disk-written {path}: {e}"))?
+                    .take((8 << 20) + 1)
+                    .read_to_end(&mut bits)
+                    .map_err(|e| format!("--disk-written {path}: {e}"))?;
+                Ok(bits)
+            },
+        )
+        .transpose()?;
+    if checkpoint_root.is_some() && control_sock.is_none() {
+        return Err("--checkpoint-root needs --control-sock, which asks for the checkpoint".into());
+    }
+    // A confined run keeps glibc's malloc to one arena, set while this is still
+    // the only thread. `--no-sandbox` keeps glibc's defaults.
+    #[cfg(target_os = "linux")]
+    if sandbox {
+        hvi::sandbox::seccomp::one_malloc_arena()?;
+    }
     // A stop signal asks the run to stop, and `finish` ends the process by it.
     let (signals, stop_registration) = StopOnSignals::new()?;
     // A fatal signal restores the terminal before it ends the process.
@@ -459,6 +545,8 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: mem_mib << 20,
         cmdline,
         disks,
+        disk_base_sha256,
+        disk_written,
         fs_shares,
         fs,
         net,
@@ -469,7 +557,12 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         sandbox_id,
         vcpus,
         agent_sock,
+        profile_out,
+        control_sock,
+        checkpoint_root,
         sandbox,
+        profile,
+        arch_timer_irq,
         // `None` rather than an empty chain, so without tools the hooks stay a
         // null check.
         plugin: if tools.is_empty() {
@@ -481,6 +574,160 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("booting {kernel_path} with {mem_mib} MiB ...");
     signals.finish(hvi::boot(cfg))
+}
+
+/// Returns `v` when it is a SHA-256 as `--disk-base-sha256` takes it.
+fn base_digest(v: &str) -> Result<String, String> {
+    if v.len() != 64 || !v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "--disk-base-sha256 must be 64 lowercase hex digits, not {v:?}"
+        ));
+    }
+    Ok(v.to_string())
+}
+
+/// Runs `restore`, which resumes a checkpoint bundle in this process.
+///
+/// `restore (--from <bundle> [--disk-generation <g>] | --from-stream
+/// <socket>|- [--stream-keep <dir>] [--disk-base-sha256 <hex>])
+/// --control-sock <path> --checkpoint-root
+/// <dir> [--disk <path>] [--net-stub | --net-gateway <sock>] [--net-mac
+/// <mac>] [--agent-sock <path>] [--sandbox-id <id>] [--events <path>]
+/// [--profile-out <path>] [--no-sandbox]`. The guest waits restored-paused
+/// until a client sends `resume` on the control socket.
+fn restore_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut from = None;
+    let mut from_stream = None;
+    let mut stream_keep = None;
+    let mut control_sock = None;
+    let mut checkpoint_root = None;
+    let mut disk = None;
+    let mut disk_generation = None;
+    let mut disk_base_sha256 = None;
+    let mut net = false;
+    let mut net_gateway = None;
+    let mut net_mac = None;
+    let mut agent_sock = None;
+    let mut sandbox_id = None;
+    let mut events = None;
+    let mut profile_out = None;
+    let mut sandbox = true;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match a.as_str() {
+            "--from" => from = Some(value("--from")?),
+            "--from-stream" => from_stream = Some(value("--from-stream")?),
+            "--stream-keep" => stream_keep = Some(value("--stream-keep")?),
+            "--control-sock" => control_sock = Some(value("--control-sock")?),
+            "--checkpoint-root" => checkpoint_root = Some(value("--checkpoint-root")?),
+            "--disk" if disk.is_some() => {
+                return Err("restore takes one --disk: a checkpoint carries one disk".into());
+            }
+            "--disk" => disk = Some(config::DiskConfig::parse(&value("--disk")?)?),
+            "--disk-generation" => {
+                let v = value("--disk-generation")?;
+                disk_generation = Some(
+                    v.parse()
+                        .map_err(|_| format!("--disk-generation is not a generation: {v}"))?,
+                );
+            }
+            "--disk-base-sha256" => {
+                disk_base_sha256 = Some(base_digest(&value("--disk-base-sha256")?)?);
+            }
+            "--net-stub" => net = true,
+            "--net-gateway" => net_gateway = Some(value("--net-gateway")?),
+            "--net-mac" => {
+                let v = value("--net-mac")?;
+                net_mac = Some(
+                    tap::parse_mac(&v)
+                        .ok_or_else(|| format!("--net-mac is not a MAC address: {v}"))?,
+                );
+            }
+            "--agent-sock" => agent_sock = Some(value("--agent-sock")?),
+            "--sandbox-id" => sandbox_id = Some(value("--sandbox-id")?),
+            "--events" => events = Some(value("--events")?),
+            "--profile-out" => profile_out = Some(value("--profile-out")?),
+            "--no-sandbox" => sandbox = false,
+            other => return Err(format!("unknown restore arg {other:?}").into()),
+        }
+    }
+    let from = match (from, &from_stream) {
+        (Some(_), Some(_)) => {
+            return Err("restore takes --from or --from-stream, not both".into());
+        }
+        (Some(dir), None) => dir,
+        (None, Some(stream)) => format!("stream {stream}"),
+        (None, None) => {
+            return Err(
+                "restore needs --from <bundle directory> or --from-stream <socket>|-".into(),
+            )
+        }
+    };
+    if stream_keep.is_some() && from_stream.is_none() {
+        return Err("--stream-keep goes with --from-stream".into());
+    }
+    if disk_generation.is_some() && from_stream.is_some() {
+        return Err(
+            "--disk-generation goes with --from: a stream carries its disk rounds and \
+                    checks their generation itself"
+                .into(),
+        );
+    }
+    if disk_base_sha256.is_some() && (from_stream.is_none() || disk.is_none()) {
+        return Err(
+            "--disk-base-sha256 goes with --from-stream and --disk: it names the base image \
+             --disk is a copy of, which the stream's disk rounds go onto"
+                .into(),
+        );
+    }
+    // As in `boot_guest`: one malloc arena for a confined run, set while this
+    // is still the only thread.
+    #[cfg(target_os = "linux")]
+    if sandbox {
+        hvi::sandbox::seccomp::one_malloc_arena()?;
+    }
+    let cfg = config::RestoreConfig {
+        from,
+        from_stream,
+        stream_keep,
+        // The guest waits for `resume` on it, so a restore without one could
+        // never run.
+        control_sock: control_sock.ok_or("restore needs --control-sock, which resumes it")?,
+        checkpoint_root: Some(
+            checkpoint_root.ok_or("restore needs --checkpoint-root, as the next move does")?,
+        ),
+        disk,
+        disk_generation,
+        disk_base_sha256,
+        net,
+        net_gateway,
+        net_mac,
+        agent_sock,
+        sandbox_id,
+        events,
+        profile_out,
+        sandbox,
+    };
+    #[cfg(target_arch = "aarch64")]
+    {
+        eprintln!("restoring {} ...", cfg.from);
+        let stop = hvi::restore(cfg)?;
+        eprintln!("guest stopped: {stop:?}");
+        Ok(())
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = cfg;
+        Err(
+            "`restore` resumes arm64 guests only so far; the x86-64 restore is not built yet"
+                .into(),
+        )
+    }
 }
 
 /// Returns whether an export given so far already carries `tag`.

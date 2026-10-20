@@ -20,11 +20,17 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-Two threads. `vcpu` is the tight one and the one that matters most, because
+Three filters. `vcpu` is the tight one and the one that matters most, because
 MMIO exits are serviced inline on the vCPU thread -- the virtio device models,
 the code that parses guest descriptors, run there. `vmm` covers the thread that
 calls `boot`, the host-side I/O threads, the threads a plugin starts with
-`VmHandle::spawn`, the stop-signal thread and the ledger's writer.
+`VmHandle::spawn`, the stop-signal thread and the ledger's writer. Among the
+I/O threads is the virtio-blk worker: it parses the block device's descriptors
+and makes its disk calls, which a notify on the vCPU only wakes it for.
+`control` is `vmm` plus the file calls a checkpoint bundle needs, and only the
+control socket's thread installs it, and only in a run started with
+`--checkpoint-root`. That thread parses the control protocol, never guest data;
+a unit test holds `control` to `vmm` plus those file calls.
 
 ## Why these are not Firecracker's lists
 
@@ -50,6 +56,46 @@ lists.
 The musl build shares the lists. musl can reach a different syscall than glibc
 for the same library call, so `hvi seccomp-selftest` run on the musl binary is
 the check for that.
+
+## No `openat`, and the files glibc opens by itself
+
+`vmm` and `vcpu` carry no `openat`. Every file hvi needs is open before the
+filters go in, so a compromised device model cannot open one. The unit tests
+hold both lists to that.
+
+glibc's malloc does open two files on its own, from whichever thread is
+allocating or freeing at the time:
+
+- `/sys/devices/system/cpu/online`, to size its arena limit the first time a
+  thread needs a new arena while more than eight exist (`malloc/arena.c`,
+  `arena_get2`, which calls `__get_nprocs`). Every glibc reads it except the
+  2.35 to 2.38 releases as first tagged, which asked `sched_getaffinity`
+  there. Upstream went back to `__get_nprocs` in 2.39 (commit 472894d2cfee,
+  BZ 30945), and the 2.35 to 2.38 release branches carry the same change, so
+  any distribution that takes them reads the file too. Debian 12's 2.36 does.
+- `/proc/sys/vm/overcommit_memory`, the first time the heap of an arena other
+  than the main one shrinks (`check_may_shrink_heap`, called from
+  `shrink_heap`). This read is in every glibc, unpatched upstream included.
+
+Neither is specific to Debian or to arm64: an x86-64 host on a current glibc
+reaches both. They were found on a Raspberry Pi 5 running Debian 12, whose
+glibc 2.36-9+rpt2+deb12u12 and deb12u13 both trap. A guest with heavy
+agent traffic kept enough vsock bridge threads allocating at once to reach
+them, and the VMM died of `SIGSYS`. Allowing `openat` would undo the point of
+the lists, so a confined run keeps glibc's malloc to its main arena instead.
+`main` calls `mallopt(M_ARENA_MAX, 1)` once the arguments say the run is
+confined, while the process still has one thread, and a KVM boot or restore
+sets it again before its first thread. With the limit set, glibc never counts
+CPUs, and with no other arena there is no other heap to shrink. A
+`--no-sandbox` run installs no filter and keeps glibc's default arenas. `MALLOC_ARENA_MAX=4` in the
+environment avoids the first read and not the second, so it is not a
+workaround.
+
+The cost is one malloc lock for the process, which is how the musl build
+always runs. musl has no `mallopt` and its malloc opens no file, so on musl
+there is nothing to set. Two selftest probes, `allocate on many threads at
+once` and `free a thread's heap memory`, each reach one of these reads under
+`vmm`. A new read in a later glibc would need a probe of its own.
 
 ## Changing a list
 

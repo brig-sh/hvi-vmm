@@ -17,6 +17,8 @@ not apply returns a named error rather than "unknown subcommand".
 | Subcommand | Where it works | What it does |
 | --- | --- | --- |
 | `boot` | all three backends | Boot a Linux guest. |
+| `restore` | macOS, Apple silicon; arm64 Linux with KVM | Resume a checkpoint bundle, or the stream of a live move, in this process. See [`restore`](#restore). On KVM it restores the portable profile only. On x86-64 Linux it returns an error: that restore is not built yet. |
+| `checkpoint-verify <dir>` | everywhere | Check a checkpoint bundle whole and print what it holds. Exits 1, naming the file, on the first mismatch. See [checkpoint.md](checkpoint.md#checking-a-bundle). |
 | `dump-fdt` | aarch64 only | Build the arm64 devicetree and print the layout. No hypervisor needed. |
 | `smoke` | macOS, Apple silicon | The Hypervisor.framework smoke test. `--shm` runs it over shared guest RAM. |
 | `smoke-shm-verify <name> <hex>` | macOS, Apple silicon | The child half of `smoke --shm`. Not for direct use. |
@@ -45,8 +47,10 @@ including a typo, silently runs the plain test.
 | `--mem-mib <N>` | 512 | Guest RAM. On x86-64 it is split around the MMIO hole. |
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
-| `--disk <path>` | none | A writable virtio-blk disk. Repeatable, up to 4 disks. A failure to open, or a lock another hvi holds on the image, fails the boot. |
-| `--disk path=<path>[,readonly=on\|off][,serial=<id>]` | none | The same disk with options, in Cloud Hypervisor's form. `readonly=on` opens the image `O_RDONLY` and advertises `VIRTIO_BLK_F_RO`. `serial` is what the guest reads from `/sys/block/vdX/serial`, 1 to 20 printable ASCII bytes, `disk<N>` by default with `N` the disk's position. Two disks may not share one. |
+| `--disk <path>` | none | A writable virtio-blk disk. Repeatable, up to 4 disks. A failure to open, or a lock another hvi holds on the image, fails the boot (see [checkpoint.md](checkpoint.md#the-disk-lock)). |
+| `--disk path=<path>[,readonly=on\|off][,serial=<id>]` | none | The same disk with options, in Cloud Hypervisor's form. `readonly=on` opens the image `O_RDONLY` and advertises `VIRTIO_BLK_F_RO`. `serial` is what the guest reads from `/sys/block/vdX/serial`, 1 to 20 printable ASCII bytes, `disk<N>` by default with `N` the disk's position. Two disks may not share one. A checkpoint or a move takes a guest of exactly one writable disk. |
+| `--disk-base-sha256 <hex>` | none | The SHA-256 of the disk as this boot opens it, before this hvi writes it, 64 lowercase hex digits. hvi tracks only the writes it serves from this boot on, so a disk that an earlier boot wrote needs a new digest, or no flag. hvi does not hash the disk: the caller did, and keeps a copy of that image. The machine profile records it as `disk_base_sha256`, and a move can then send only the blocks the guest wrote (see [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks)). Needs exactly one `--disk`, a writable one. The boot refuses a disk over 4 TiB with it, when it opens the disk. With `--disk-written`, it is the digest of the base image the disk was made from instead. |
+| `--disk-written <file>` | none | The blocks where the disk already differs from the base image `--disk-base-sha256` names, as a bitmap file: bit `i` of byte `i / 8` for 64 KiB block `i`, exactly as long as the disk's bitmap (`ceil(blocks / 8)` bytes). A launcher that writes files into its copy of the base before the boot names the blocks it changed, and they start the blocks written since boot, so a move by blocks sends them too. hvi reads the file at the boot and does not check it against the disk. Needs `--disk-base-sha256`; the boot refuses a file of the wrong length or with a bit past the disk. |
 | `--fs tag=<tag>,path=<dir>[,readonly=on\|off][,cache=auto\|always\|none][,uid=<n>][,gid=<n>]` | none | virtio-fs export of `<dir>`, which hvi serves itself. Writable unless `readonly=on`; `cache` defaults to `auto`; `uid` and `gid` are the guest owner of the host user's files, 0 by default. Repeatable. macOS only. |
 | `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. Cloud Hypervisor's syntax and defaults: one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable, up to 11 exports on x86-64. Linux only. |
 | `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
@@ -56,12 +60,17 @@ including a typo, silently runs the plain test.
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
+| `--control-sock <path>` | none | Host Unix socket that pauses, resumes, reports and stops the VM. See [The control socket](#the-control-socket). |
+| `--profile-out <path>` | none | Write the machine profile here, as one line of JSON. See [The control socket](#the-control-socket). |
+| `--checkpoint-root <dir>` | none | The directory a `checkpoint` may write bundles below. It must exist, and should be private to this sandbox (mode 0700): bundles hold guest RAM in clear. Needs `--control-sock`. Without it every `checkpoint` is refused. See [checkpoint.md](checkpoint.md). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. hvi refuses anything that is not a regular file, such as `/dev/null` or a FIFO. It also refuses a locked file, such as another run's ledger or disk, and a symbolic link as the last component of the path, such as `/dev/fd/N` on Linux. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
 | `--dump-after <secs>` | none | Dump automatically after this long. Needs `--dump-memory`. `0` becomes 1. |
 | `--trace-io <path>` | none | Attach the I/O tracer. |
 | `--no-sandbox` | off | Boot unconfined. For debugging the profile or the filters. |
+| `--profile <name>` | `native` | The machine the guest gets: `native` or `portable-arm64-v1`. See [portable-profile.md](portable-profile.md). |
+| `--arch-timer-irq` | off | A debugging aid for `--profile portable-arm64-v1`, whose `/timer` otherwise has a fixed `clock-frequency` of 54 MHz and no interrupts. Gives `/timer` its four PPIs back, so a kernel without the `hvi-time` driver still ticks. It changes the devicetree and the profile's `dtb_sha256`. |
 
 ### Parsing behaviour
 
@@ -90,8 +99,9 @@ hvi: boot needs --kernel <Image>
 ```
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
-`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`,
-`--cpus`, `--dump-after`.
+`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`, `--cpus`,
+`--dump-after`, `--control-sock`, `--profile-out`, `--checkpoint-root`,
+`--disk-base-sha256`, `--disk-written`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -111,17 +121,39 @@ are three behaviours, not two.
 | `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
+| `--profile portable-arm64-v1`, `--arch-timer-irq` | acted on | acted on, on a host that can present the profile | **refused**, boot fails |
+| `--fs`, `--share-ro`, `--share-rw` with `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
+| `--arch-timer-irq` without `--profile portable-arm64-v1` | **refused**, boot fails | **refused**, boot fails | **refused**, boot fails |
 | everything else | acted on | acted on | acted on |
 
-Two of those errors appear **after** `booting <kernel> with <N> MiB ...` has
-printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` and `--fs socket=` on macOS, and `--fs path=`, `--share-ro` and
-`--share-rw` on either Linux backend.
+Every refusal in that table appears **after** `booting <kernel> with <N> MiB
+...` has printed, because it is raised inside the backend rather than at parse
+time. The last two are checked by every backend, so a program that embeds hvi
+gets them too:
 
 ```text
 booting Image with 512 MiB ...
 hvi: --net-tap tap0: no /dev/net/tun on macOS; use --net-gateway
 ```
+
+```text
+booting Image with 512 MiB ...
+hvi: --fs/--share-ro/--share-rw are not part of --profile portable-arm64-v1: a portable guest keeps its storage on virtio-blk
+```
+
+```text
+booting Image with 512 MiB ...
+hvi: --arch-timer-irq needs --profile portable-arm64-v1
+```
+
+On Linux/arm64 the portable profile also needs a host that can present it:
+a vGICv2, a Cortex-A76 r4p1 `MIDR_EL1`, ID register fields KVM can lower to
+the baseline, a 40-bit guest address space, `KVM_CAP_READONLY_MEM`, and 4 KiB
+or 16 KiB pages. Otherwise the boot fails, naming each problem, as in
+`this host cannot present --profile portable-arm64-v1: …`.
+
+`--no-arch-timer-irq` no longer exists: no interrupts on `/timer` is the
+portable profile's default. It is now an unknown flag.
 
 Unknown flags are the one class caught before anything prints.
 
@@ -144,8 +176,131 @@ hvi: virtio-fs export /path/to/missing: No such file or directory (os error 2)
 hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
 hvi: --dump-after needs --dump-memory <path>
+hvi: --disk-base-sha256 must be 64 lowercase hex digits, not "ABC"
+hvi: --disk-base-sha256 needs exactly one --disk, a writable one: a move carries one disk
+hvi: --disk-written needs --disk-base-sha256, the base it differs from
+hvi: unknown machine profile "portable"; expected native or portable-arm64-v1
 hvi: unknown boot arg "--nope"
 ```
+
+### The control socket
+
+`--control-sock` binds a Unix socket before confinement, as `--agent-sock` does,
+and serves one connection at a time. A socket left at the path by an earlier run
+is replaced. Anything else there is an error, and is left alone. Each request is one JSON object on a line,
+and each reply is one line:
+
+```text
+{"v":1,"op":"pause"}   ->  {"v":1,"ok":true,"state":"paused"}
+{"v":1,"op":"status"}  ->  {"v":1,"ok":true,"state":"paused","vcpus":2,"vcpus_parked":2}
+{"v":1,"op":"resume"}  ->  {"v":1,"ok":true,"state":"running"}
+```
+
+| `op` | Effect |
+| --- | --- |
+| `profile` | Replies with the machine profile under `profile`, waiting up to 2 s for it on macOS, where the boot vCPU completes it. |
+| `pause` | Holds the host I/O threads, waiting up to 10 s for them as `migrate` does, then parks every started vCPU, waiting up to 2 s. If either wait runs out, the pause is undone and the reply is `timeout`. The vCPUs run on while the I/O threads are waited for: the wait is for the virtio-blk worker's request in flight, a flush that took over 2 s on a busy disk among them. |
+| `resume` | Releases the vCPUs, then the I/O threads. |
+| `status` | Replies with `state` (`running`, `paused`, `restored-paused`, `fenced` or `stopping`), `vcpus` started and `vcpus_parked`. `restored-paused` is a guest `hvi restore` loaded that has not run yet; `resume` runs it, as from `paused`. |
+| `stop` | Ends the run, paused or not. `boot` returns `Requested`. |
+| `checkpoint` | Captures the VM into a new bundle directory below `--checkpoint-root`, then resumes it or fences it. See [checkpoint.md](checkpoint.md#taking-a-checkpoint). |
+| `migrate` | Streams the VM on this connection: its RAM in rounds while the guest runs, with the disk's written blocks in rounds of their own when the disk has a base, then the last rounds and its state paused, then resumes it or fences it. Takes `then`, `txid` and `epoch` as `checkpoint` does, and optionally `max_rounds` (1 to 16, default 5) and `max_secs` (0 to 3600, default 60). Needs no `--checkpoint-root`. Its pause waits up to 10 s for the I/O threads and the vCPUs together, where a `pause` gives the vCPUs 2 s of their own. On a fenced VM it streams the sealed state again only for the same `txid` and `epoch`, both given, with `then: "fence"`, and is `fenced` otherwise. See [checkpoint.md](checkpoint.md#live-moves). |
+| `disk-dirty` | `{"since":"boot"}` or `{"since":"round"}`. Replies with the disk's 64 KiB blocks the guest wrote since it booted, or since the last `disk-dirty`, as a base64 bitmap under `bitmap_b64`, with `round`, `block_size`, `blocks` (of the disk), `dirty` (set in the bitmap), `generation` and `bitmap_sha256` (the SHA-256 of the bitmap). Each read starts a round: `boot` is round 0 and clears what `round` would return. With the guest paused it syncs the disk first. See [checkpoint.md](checkpoint.md#moving-the-disk-by-its-blocks). |
+| `disk-blocks` | `{"blocks":[3,4,9]}` (ascending, at most 4096) or `{"round":k}` (the round the last `disk-dirty` read). Streams the blocks' bytes on the connection in batches, each a header line and its bytes, then replies with `round` (for a round), `blocks`, `bytes`, `batches`, `generation`, `max_lock_us` and `sent_sha256` (the SHA-256 of the batches' digests in order). See [checkpoint.md](checkpoint.md#the-block-stream). |
+
+`disk-dirty` and `disk-blocks` need `--checkpoint-root` and a disk, as a move
+does, and work in every state but `stopping`; without either they are
+`refused`, and so is a guest with a second disk or a read-only one, whose
+disk a move does not carry. A `disk-blocks` whose list names a block past the disk, or out of
+order, is `bad_request`, and one for a round that is not the last read is
+`refused`; neither sends a byte first. A block that cannot be read ends the
+stream with `capture_failed`. A line with a `v` key is always the reply; a
+batch header has none.
+
+`pause` and `resume` are idempotent. A pause outlives the connection that asked
+for it. A `pause` replies within about 12 s, the I/O threads' 10 s and the
+vCPUs' 2 s, so give its client a reply timeout of at least 13 s. Apart from
+`pause`, `checkpoint`, `migrate` and `disk-blocks`, no reply takes longer than
+about 2 s once the server reads the request, so give a client a reply timeout
+of at least 3 s. The server serves one connection at a time, though, so a
+request on another connection waits until the one served is done: up to
+about 12 s behind a `pause`, and as long as a `checkpoint` or a `migrate`
+takes behind those. A client that may meet another client's `pause`, a
+`status` or `resume` after a break among them, gives itself 13 s. A `checkpoint`
+pauses as `pause` does, then waits up to 2 s for the vCPUs' state, and replies
+once its bundle is written, which takes longer the more
+guest RAM is in use, and a `disk-blocks` once its last batch is out, which
+takes as long as the client takes to read them. A `migrate` writes its stream
+before its reply, as fast as the client reads it: rounds with the guest
+running until one ends past `max_secs` (the cap is checked as each round
+ends, so a round under way, round 0 included, runs to its end however long it
+takes), then the paused part. So its client reads the frames and waits for
+the reply with no fixed timeout. hvi gives up on a client that takes nothing
+for 30 s, or that does not take the paused part within its budget, and the VM
+runs on (see [checkpoint.md](checkpoint.md#the-rounds)). A `migrate` that
+fails once its stream has begun closes the connection: the client may read the
+refusal where a frame header was due, cut short if the socket lacked room for
+it, so a line it cannot parse followed by the end is that refusal, and then
+reads the end. An end before the manifest means this stream did not fence the
+VM: a first stream leaves it running, and a stream sent again to the fence
+owner leaves it fenced. Ask `status` after any break. A client that gives
+up on a `pause` before its reply cannot
+tell whether the VM paused: it should reconnect and ask `status`, or send
+`resume`, which is harmless on a running VM. A refusal is `{"v":1,"ok":false,"code":...,"error":...}`. Branch on
+`code`; `error` is for a person. The codes are listed in
+`src/checkpoint/control.rs`. The socket has no authentication: anyone who can
+connect to it can pause or stop the VM, and read its disk with `disk-blocks`
+once it has a checkpoint root, so put it in a directory only its owner can
+reach.
+
+`--profile-out` writes the machine profile: what the guest was built against,
+such as the CPU's ID registers, the counter frequency, the interrupt
+controller, RAM, devices and the hvi commit. Two hosts compare profiles before
+a guest moves between them. A profile matches no other when a value in it could
+not be read, or when its hvi does not know its commit or was built with
+uncommitted changes. The file is created before confinement. On Linux it
+is written before the guest starts. On macOS the boot vCPU writes it just
+before the guest's first instruction, since only that thread can read
+`MIDR_EL1`, so a reader that finds it empty waits or asks the socket.
+
+## `restore`
+
+`restore --from <dir> --control-sock <path> --checkpoint-root <dir> [flags]`
+resumes the checkpoint bundle in `<dir>` in this process, and
+`restore --from-stream <socket>|- [--stream-keep <dir>] --control-sock <path> --checkpoint-root <dir> [flags]`
+resumes the streamed bundle a `migrate` writes, on a host whose
+machine profile matches the bundle's. It refuses with every reason it finds
+before it creates anything, and otherwise brings the guest up
+`restored-paused` on the control socket. The guest runs once a client sends
+`resume`. See [checkpoint.md](checkpoint.md#restoring-a-bundle).
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--from <dir>` | one of the two | The bundle directory. |
+| `--from-stream <socket>\|-` | one of the two | The streamed bundle: `-` reads it from stdin, anything else is a Unix socket hvi connects to before confinement and reads it from. RAM is applied as it arrives and never reaches disk; the stream's disk rounds, if it has them, are written into `--disk` as they arrive; the documents and the disk rounds are checked once the manifest is in, before anything runs. Stdin that carried a stream is replaced with `/dev/null` afterwards, so the console reads nothing that followed it. See [checkpoint.md](checkpoint.md#restoring-a-stream). |
+| `--stream-keep <dir>` | none | With `--from-stream`: a new directory the stream's documents and manifest are written to as they came, without RAM, as the record of what was restored. They are not synced. |
+| `--control-sock <path>` | required | The control socket, as for `boot`. The guest waits on it for `resume`, so a restore without one could never run. |
+| `--checkpoint-root <dir>` | required | The directory a later `checkpoint` of the restored guest writes below, as for `boot`. |
+| `--disk <path>` or `--disk path=<path>[,readonly=on\|off][,serial=<id>]` | none | The disk to reopen for the guest's virtio-blk, in `boot`'s syntax, once. Required when the guest had a disk, refused when it had none. The restored disk answers `GET_ID` with the serial the bundle records, so a `serial=` that differs from it is refused, and so is `readonly=on`, since a checkpoint carries a writable disk; both refusals name the bundle's values. It must be the size the guest was given, and no other process may hold it locked: a second restore onto the disk of a running guest fails (see [checkpoint.md](checkpoint.md#the-disk-lock)). For a stream with disk rounds it is the destination's own copy of the guest's base image, which the rounds turn into the guest's disk; a disk another hvi holds is then refused at once. |
+| `--disk-generation <g>` | none | With `--from` only: says `--disk` is the guest's base image with every round of `disk-blocks` applied, the last of them started by a `disk-dirty` reply whose `generation` was `g`. The restore then refuses a `disk.json` with no base, or captured at another generation: the guest wrote after that round. Needs `--disk`. A stream checks its disk rounds this way itself, and refuses the flag. See [checkpoint.md](checkpoint.md#restoring-onto-the-base). |
+| `--disk-base-sha256 <hex>` | none | With `--from-stream` and `--disk` only: says `--disk` is a copy of the base image with this SHA-256, as the source's `boot --disk-base-sha256` named it. The restore then refuses, at `profile.json` and before a block is written, a stream whose source named another base or none, and refuses a stream that carried no disk rounds. Without it such a stream would restore onto the bare base, a disk without the guest's writes. A mover that restores onto a base copy should always give it. |
+| `--net-stub` | off | The built-in stack, for a guest that ran on it. |
+| `--net-gateway <socket>` | none | The gateway, for a guest that ran on one. Unlike `boot`, a gateway that cannot be reached is an error, not a fallback to the stub. |
+| `--net-mac <mac>` | none | Optional: the bundle holds the MAC. One given here must be that MAC. |
+| `--agent-sock <path>` | none | The agent socket. Required when the guest had a vsock device, refused when it had none. The guest's earlier connections are reset. |
+| `--sandbox-id <string>` | the bundle's | Written into every ledger record. |
+| `--events <path>` | none | The `RawEvent` ledger, as for `boot`. |
+| `--profile-out <path>` | none | This machine's profile, as for `boot`. |
+| `--no-sandbox` | off | Run unconfined. |
+
+Each flag needs exactly what the guest had: the network mode and the
+devices are part of the machine it was built against. `--net-tap` is not
+taken. The kernel, initramfs, command line, vCPU count and RAM size come
+from the bundle, and so does the machine profile: a bundle of a
+`--profile portable-arm64-v1` guest restores as one, on HVF or on arm64
+KVM, from either backend. On KVM only the portable profile restores; a
+native KVM bundle is refused, since its vGICv3 is not captured. See
+[checkpoint.md](checkpoint.md#the-portable-restore).
 
 ## `dump-fdt`
 
@@ -193,6 +348,7 @@ An embedder inherits these from the process environment. They are not part of
 | Path | Result |
 | --- | --- |
 | The guest powers off | `guest stopped: SystemOff`, exit 0. |
+| The control socket's `stop` | `guest stopped: Requested`, exit 0. |
 | The guest resets | `guest stopped: SystemReset`, exit 0. |
 | A vCPU fails | `hvi: <what failed>`, exit 1. |
 | hvi panics | `[hvi] <thread>: panicked (<message>) at <file:line:column>`, and the process ends by `SIGABRT`. |
@@ -316,6 +472,45 @@ booting Image with 1024 MiB ...
 [hvi] seatbelt sandbox: on (deny default)
 ```
 
+Under `--profile portable-arm64-v1` the GIC line names the software GICv2,
+`hvi-time` reports its windows and its timer thread, and the boot vCPU logs
+the CPU baseline it gave every vCPU:
+
+```text
+[hvi] 1 vCPU(s)  profile portable-arm64-v1  software GICv2: GICD 0x8000000+0x10000  GICC 0x8010000+0x10000  UART 0xc000000
+[hvi] hvi-time: page 0xd100000+0x10000 (read-only), timers 0xd110000+0x10000, PPI 4 (INTID 20), counter 24000000 Hz
+[hvi] seatbelt sandbox: on (deny default)
+[hvi] hvi-time: timer thread on time-constraint policy
+[hvi] portable-arm64-v1 CPU baseline: MIDR_EL1=0x414fd0b1 ID_AA64PFR0_EL1=0x1100000010110011 ... (host CTR_EL0=0x99444c004 DCZID_EL0=0x4, not settable)
+```
+
+On Linux/arm64 the same profile logs the baseline it wrote, the counter
+offset and its check, and the read-only memory slot:
+
+```text
+[hvi] 1 vCPU(s)  V2  GICD 0x8000000+0x10000  GICC 0x8010000+0x10000  profile portable-arm64-v1
+[hvi] portable-arm64-v1 CPU baseline: MIDR_EL1=0x414fd0b1 ... ID_AA64ISAR2_EL1=0x0 (host CTR_EL0=0x9444c004 DCZID_EL0=0x4, not lowered); firmware bitmaps 0, PSCI 1.1
+[hvi] hvi-time: guest counter set with KVM_ARM_SET_COUNTER_OFFSET; check: KVM_REG_ARM_TIMER_CNT 115 within hvi's [81, 125]: yes
+[hvi] hvi-time: page 0xd100000+0x10000 (read-only slot), timers 0xd110000+0x10000, PPI 4 (INTID 20), counter 54000000 Hz, counter offset 0x…
+[hvi] seccomp: on (vmm 47 syscalls, vcpu 37, trap on mismatch)
+[hvi] hvi-time: timer thread on timer slack 1 ns
+```
+
+`HVI_TIME_TRACE=1` in the environment adds one line a second with the exits
+hvi handled and how late the timers fired, for measuring the profile's cost:
+
+```text
+[hvi] hvi-time trace: exits/s 1750 (gic 750, hvi-time 750, kicked 250) fires/s 250 late avg 8 us max 18 us
+```
+
+`HVI_TIME_TEST_RESTORE=<at>,<downtime>` is a test hook, not a feature: it
+captures and restores `hvi-time` in the same process while the vCPUs are
+paused. See [portable-profile.md](portable-profile.md#restore).
+`HVI_TIME_TEST_SLEEP=<at>,<secs>` is one too: it moves the host clocks
+`hvi-time` reads `<secs>` ahead at `<at>`, as a host sleep would, and logs
+`hvi-time test sleep: …` at the start. `tools/sleep-e2e.py` uses it. See
+[portable-profile.md](portable-profile.md#host-sleep).
+
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
 share is configured, because the limit is raised while the first share is set
 up.
@@ -329,7 +524,10 @@ guest stopped: SystemOff
 
 ## vCPU limits
 
-hvi has three caps. On Linux/arm64 a vGICv2 host takes at most 8 vCPUs:
+hvi has three caps. The GICv2 one takes at most 8 vCPUs: on Linux/arm64 when
+the host offers only a vGICv2 or the boot asks for `--profile
+portable-arm64-v1`, and on macOS under that profile, whose software GICv2
+addresses at most 8 CPUs:
 
 ```text
 this host offers only vGICv2, which supports at most 8 vCPUs (asked for 16)
@@ -349,9 +547,9 @@ each vCPU a one-byte APIC id and the IOAPIC the next one:
 x86-64 supports at most 254 vCPUs (asked for 300)
 ```
 
-macOS has no hvi-side cap. An over-large `--cpus` there spawns that many
-threads, and the run then fails with exit 1 and `hvi: vcpuN: vcpu_create
-failed`. The absence of a cap is not unlimited capacity.
+Outside that profile, macOS has no hvi-side cap. An over-large `--cpus` there
+spawns that many threads, and the run then fails with exit 1 and `hvi: vcpuN:
+vcpu_create failed`. The absence of a cap is not unlimited capacity.
 
 ## See also
 

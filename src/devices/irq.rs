@@ -65,6 +65,67 @@ impl Irq {
     }
 }
 
+impl Irq {
+    /// Sets the line to `level` whatever level it was last set to.
+    ///
+    /// A restore calls it once the interrupt controller has been loaded:
+    /// loading it sets every line to the captured level behind the device's
+    /// back, so the level recorded here may no longer be the line's.
+    // The x86-64 restore does not exist yet.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(crate) fn redrive(&mut self, level: bool) {
+        let Some(line) = &self.line else { return };
+        if line.set_level(level).is_ok() {
+            self.high = level;
+        }
+    }
+}
+
+/// A line for tests that records what the device set it to.
+#[cfg(test)]
+pub(crate) mod test_line {
+    use super::IrqLine;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// A line that holds the level it was last set to, and counts the times
+    /// it was raised and lowered.
+    #[derive(Default)]
+    pub(crate) struct LevelLine {
+        /// The level the line was last set to.
+        high: AtomicBool,
+        /// The number of times the line was set high.
+        raised: AtomicU32,
+        /// The number of times the line was set low.
+        lowered: AtomicU32,
+    }
+
+    impl LevelLine {
+        /// Returns the level the line was last set to.
+        pub(crate) fn is_high(&self) -> bool {
+            self.high.load(Ordering::SeqCst)
+        }
+
+        /// Returns the number of times the line was set high.
+        pub(crate) fn raises(&self) -> u32 {
+            self.raised.load(Ordering::SeqCst)
+        }
+
+        /// Returns the number of times the line was set at all.
+        pub(crate) fn sets(&self) -> u32 {
+            self.raises() + self.lowered.load(Ordering::SeqCst)
+        }
+    }
+
+    impl IrqLine for LevelLine {
+        fn set_level(&self, level: bool) -> std::io::Result<()> {
+            self.high.store(level, Ordering::SeqCst);
+            let count = if level { &self.raised } else { &self.lowered };
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +173,20 @@ mod tests {
         for level in [false, true, true, true, false, false, true] {
             irq.set(level);
         }
+        assert_eq!(line.sets.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn redrive_sets_the_line_whatever_was_recorded() {
+        let line = Arc::new(CountingLine::default());
+        let mut irq = Irq::default();
+        irq.connect(Arc::clone(&line) as Arc<dyn IrqLine>);
+        irq.set(true);
+        irq.redrive(true);
+        irq.redrive(true);
+        assert_eq!(line.sets.load(Ordering::SeqCst), 3);
+        // The level is recorded: a set to it changes nothing.
+        irq.set(true);
         assert_eq!(line.sets.load(Ordering::SeqCst), 3);
     }
 

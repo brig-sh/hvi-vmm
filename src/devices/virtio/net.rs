@@ -47,11 +47,15 @@ use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::memory::GuestRam;
 
 use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::state::check_version;
 use crate::devices::virtio::{
-    mmio, tap, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    mmio, tap, Queue, QueueState, VirtioCommonState, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
@@ -248,8 +252,9 @@ impl GatewayRelay {
     /// Relays frames to `deliver` until the gateway closes or the stop is
     /// requested.
     ///
-    /// After each wakeup it receives what the socket holds without blocking and
-    /// hands every complete frame to `deliver`. At most [`DRAIN_BURST`]
+    /// After each wakeup it passes the stop token's pause gate, receives what
+    /// the socket holds without blocking and hands every complete frame to
+    /// `deliver`, which must not pass the gate itself. At most [`DRAIN_BURST`]
     /// receives run per wakeup, so a stop request is seen between bursts
     /// however long the traffic lasts. The socket is shut down as the relay
     /// ends, whatever ended it, so the device's next write fails instead of
@@ -275,6 +280,13 @@ impl GatewayRelay {
                 Ok(false) => break Ok(()),
                 Err(e) => break Err(e),
             }
+            // The burst runs inside the pause gate, receives and deliveries
+            // alike, and every receive is non-blocking, so a pause finds the
+            // relay either waiting above with nothing but a partial frame in
+            // hand, or here and about to finish. Were the receive outside, a
+            // pause could catch whole frames off the socket and not yet in the
+            // device, which a checkpoint taken then would drop.
+            let _in = stop.enter();
             for _ in 0..DRAIN_BURST {
                 match try_recv(&self.reader, &mut self.buf) {
                     Ok(0) => break 'relay Ok(()),
@@ -322,9 +334,10 @@ impl TapRelay {
     /// Relays frames to `deliver` until the tap is gone or the stop is
     /// requested.
     ///
-    /// After each wakeup it reads until the queue is empty or until it has read
-    /// [`DRAIN_BURST`] frames, so a burst costs one `poll` and a stop request
-    /// is still seen while frames keep arriving.
+    /// After each wakeup it passes the stop token's pause gate and reads until
+    /// the queue is empty or until it has read [`DRAIN_BURST`] frames, so a
+    /// burst costs one `poll` and a stop request is still seen while frames
+    /// keep arriving.
     ///
     /// # Errors
     ///
@@ -341,6 +354,9 @@ impl TapRelay {
             if !stop.wait(self.reader.as_fd())? {
                 return Ok(());
             }
+            // Inside the pause gate for the same reason as the gateway relay:
+            // a frame read is a frame delivered before a pause completes.
+            let _in = stop.enter();
             for _ in 0..DRAIN_BURST {
                 let n = match self.reader.read(&mut self.buf) {
                     Ok(0) => return Ok(()),
@@ -353,6 +369,91 @@ impl TapRelay {
                 }
             }
         }
+    }
+}
+
+/// The [`NetState`] format this build writes and reads.
+pub const NET_STATE_VERSION: u32 = 1;
+
+/// Which backend carries a virtio-net device's frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetMode {
+    /// The built-in responder, which holds no state of its own.
+    Stub,
+    /// The gvisor-tap-vsock gateway over its stream socket.
+    Gateway,
+    /// A host tap device.
+    Tap,
+}
+
+/// The backend a restored virtio-net device carries its frames over, opened
+/// on the host that restores it.
+pub enum NetBackend {
+    /// The built-in responder.
+    Stub,
+    /// The write side of a connection to the gateway's stream socket. The
+    /// caller keeps a cloned read side for the relay, as at boot.
+    Gateway(UnixStream),
+    /// An attached tap. The caller keeps a cloned fd for the relay.
+    Tap(File),
+}
+
+impl NetBackend {
+    /// Returns the mode this backend runs the device in.
+    fn mode(&self) -> NetMode {
+        match self {
+            NetBackend::Stub => NetMode::Stub,
+            NetBackend::Gateway(_) => NetMode::Gateway,
+            NetBackend::Tap(_) => NetMode::Tap,
+        }
+    }
+}
+
+/// What a checkpoint keeps of a virtio-net device.
+///
+/// The device holds no frame of its own: TX completes within the MMIO exit,
+/// and an RX frame with no buffer to land in is dropped. What a relay had
+/// read of a gateway frame it had not yet delivered lives in the relay, not
+/// here, and a restore drops it. To the guest that is one lost frame, which
+/// its TCP retransmits. Connections the gateway or the tap's network held for
+/// the guest belong to the source host and do not move.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetState {
+    /// [`NET_STATE_VERSION`] when written by this build.
+    pub version: u32,
+    /// The transport registers.
+    pub common: VirtioCommonState,
+    /// The RX and TX queues, in that order.
+    pub queues: [QueueState; 2],
+    /// The MAC the guest read from config space.
+    pub mac: [u8; 6],
+    /// The backend the frames went to.
+    pub mode: NetMode,
+    /// Whether a tap write already failed, so a restore reports no second
+    /// first failure.
+    pub tap_write_reported: bool,
+}
+
+impl NetState {
+    /// Refuses a state this build could not restore over `mem`, without
+    /// building the device or touching guest RAM.
+    ///
+    /// The backend's mode is not checked here, since only the backend knows
+    /// it; [`VirtioNet::restore`] checks it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, has a queue the transport
+    /// would not have accepted, or has interrupt bits the device never sets.
+    pub fn check(&self, mem: &GuestRam) -> io::Result<()> {
+        check_version("virtio-net", self.version, NET_STATE_VERSION)?;
+        self.common.check("virtio-net")?;
+        for queue in &self.queues {
+            queue.check(mem)?;
+        }
+        Ok(())
     }
 }
 
@@ -442,14 +543,108 @@ impl VirtioNet {
         self.interrupt_status != 0
     }
 
-    /// Connects the device to the interrupt line it raises.
+    /// Connects the device to the interrupt line it raises, and sets the line
+    /// to the device's level.
+    ///
+    /// A device built at boot has nothing pending, so the line stays low. A
+    /// restored one may hold an interrupt the driver has not acknowledged, and
+    /// it has to reach the guest, see [`VirtioNet::restore`].
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
+        self.sync_irq();
     }
 
     /// Sets the interrupt line to the device's level.
     fn sync_irq(&mut self) {
         self.irq.set(self.irq_level());
+    }
+
+    /// Sets the interrupt line to the device's level, whatever it was last
+    /// set to, after a restore loaded the interrupt controller. See
+    /// `Irq::redrive`.
+    // The x86-64 restore does not exist yet.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(crate) fn redrive_irq(&mut self) {
+        self.irq.redrive(self.irq_level());
+    }
+
+    /// Returns which backend carries the device's frames.
+    #[must_use]
+    pub fn mode(&self) -> NetMode {
+        if self.tap.is_some() {
+            NetMode::Tap
+        } else if self.gw.is_some() {
+            NetMode::Gateway
+        } else {
+            NetMode::Stub
+        }
+    }
+
+    /// Returns what a checkpoint keeps of the device.
+    #[must_use]
+    pub fn state(&self) -> NetState {
+        NetState {
+            version: NET_STATE_VERSION,
+            common: VirtioCommonState {
+                status: self.status,
+                dev_feat_sel: self.dev_feat_sel,
+                queue_sel: self.queue_sel,
+                interrupt_status: self.interrupt_status,
+            },
+            queues: [self.queues[0].state(), self.queues[1].state()],
+            mac: self.mac,
+            mode: self.mode(),
+            tap_write_reported: self.tap_write_reported,
+        }
+    }
+
+    /// Rebuilds the device a checkpoint describes over `backend`, opened on
+    /// this host, and the restored guest RAM `mem`.
+    ///
+    /// The backend must be of the mode the guest ran on. The guest configured
+    /// its address, route and resolver for that network at boot (statically
+    /// for the built-in stack, by DHCP from the gateway, as the container for
+    /// a tap), so a device moved onto another kind of backend leaves the guest
+    /// on a network it has no address in. The MAC comes from the state, since
+    /// the guest already answers to it; a MAC override applied after this
+    /// would change config space under a running driver. The interrupt line
+    /// is connected afterwards, as at boot, and connecting it asserts it when
+    /// the state holds an unacknowledged interrupt.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `backend` is not of the saved mode, or when the state is of
+    /// another version, has a queue the transport would not have accepted, or
+    /// has interrupt bits the device never sets.
+    pub fn restore(backend: NetBackend, mem: &GuestRam, state: &NetState) -> io::Result<Self> {
+        state.check(mem)?;
+        if backend.mode() != state.mode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "virtio-net: the guest ran on a {:?} backend, not {:?}",
+                    state.mode,
+                    backend.mode()
+                ),
+            ));
+        }
+        let queues = [
+            Queue::from_state(mem, &state.queues[0])?,
+            Queue::from_state(mem, &state.queues[1])?,
+        ];
+        let mut dev = match backend {
+            NetBackend::Stub => VirtioNet::new(),
+            NetBackend::Gateway(stream) => VirtioNet::with_gateway(stream),
+            NetBackend::Tap(file) => VirtioNet::with_tap(file),
+        };
+        dev.status = state.common.status;
+        dev.dev_feat_sel = state.common.dev_feat_sel;
+        dev.queue_sel = state.common.queue_sel;
+        dev.interrupt_status = state.common.interrupt_status;
+        dev.queues = queues;
+        dev.mac = state.mac;
+        dev.tap_write_reported = state.tap_write_reported;
+        Ok(dev)
     }
 
     /// Drains the captured flows for the event ledger.
@@ -495,6 +690,10 @@ impl VirtioNet {
         self.dev_feat_sel = 0;
         self.queue_sel = 0;
     }
+
+    /// The device features this device offers, both words: what the machine
+    /// profile records, since a restored driver has negotiated against them.
+    pub const FEATURES: u64 = ((F_VERSION_1_HI as u64) << 32) | F_MAC_LO as u64;
 
     /// Services one MMIO access. On a transmit-queue notify, drains the guest's
     /// TX frames (capturing them) and injects any replies into the RX queue.
@@ -1278,6 +1477,62 @@ mod tests {
             relay.join().expect("thread").expect("relay");
         }
 
+        /// Returns the bytes queued on `socket` that nobody has read.
+        fn unread(socket: &UnixStream) -> i32 {
+            use std::os::fd::AsRawFd;
+            let mut n: libc::c_int = 0;
+            // SAFETY: FIONREAD writes one int through the pointer, which lives
+            // for the call.
+            let rc = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut n) };
+            assert_eq!(rc, 0, "FIONREAD");
+            n
+        }
+
+        // A relay that took whole frames off the socket and then waited at a
+        // closed gate to deliver them would hold them where a checkpoint
+        // cannot see them. Under a pause they must stay in the socket.
+        #[test]
+        fn a_paused_relay_leaves_the_frames_in_the_socket() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+            let source = StopSource::new().expect("pair");
+            let (mut ours, theirs) = UnixStream::pair().expect("pair");
+            let probe = theirs.try_clone().expect("clone");
+            source
+                .gate()
+                .pause(Duration::from_secs(1))
+                .expect("no helper inside");
+            let wire = relayed(&[b"one", b"two"]);
+            ours.write_all(&wire).expect("write");
+            let (tx, rx) = mpsc::channel();
+            let token = source.token();
+            let relay = std::thread::spawn(move || {
+                GatewayRelay::new(theirs)
+                    .run(&token, |frame| tx.send(frame.to_vec()).expect("send"))
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                unread(&probe),
+                wire.len() as i32,
+                "the relay read under a pause"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a frame was delivered under a pause"
+            );
+            source.gate().unpause();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).expect("one"),
+                b"one"
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).expect("two"),
+                b"two"
+            );
+            source.request_stop();
+            relay.join().expect("thread").expect("relay");
+        }
+
         // A framing error ends the relay and shuts the socket down, so the
         // device's writes fail instead of queueing for a peer nobody reads.
         #[test]
@@ -1741,6 +1996,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn features_are_the_two_pages_the_window_offers() {
+        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
+        let mut net = VirtioNet::new();
+        let mut page = |sel| {
+            net.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, sel);
+            net.mmio(&mem, mmio::DEVICE_FEATURES, false, 0)
+        };
+        assert_eq!((page(1) << 32) | page(0), VirtioNet::FEATURES);
+    }
+
     /// After `set_mac`, the guest must read the override from config space
     /// (bytes 0..6) -- and the device must offer VIRTIO_NET_F_MAC, or the
     /// driver would never look at config space and would invent a random
@@ -1882,20 +2148,6 @@ mod tests {
         assert_ne!(checksum16(&h), 0);
     }
 
-    /// A line that holds the level it was last set to.
-    #[derive(Default)]
-    struct LevelLine {
-        /// The level the line was last set to.
-        high: std::sync::atomic::AtomicBool,
-    }
-
-    impl IrqLine for LevelLine {
-        fn set_level(&self, level: bool) -> std::io::Result<()> {
-            self.high.store(level, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     // A vCPU acknowledges the interrupt while a reader delivers the next frame,
     // each under the device lock. The vCPU reposts one RX buffer per
     // acknowledgment, as a guest driver refills its ring. A line that ended low
@@ -1909,7 +2161,7 @@ mod tests {
         const N: u64 = 256;
         let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x100000)]));
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
-        let line = Arc::new(LevelLine::default());
+        let line = Arc::new(crate::devices::irq::test_line::LevelLine::default());
         let mut net = VirtioNet::new();
         net.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
         net.mmio(&mem, mmio::QUEUE_SEL, true, u64::from(RX_QUEUE));
@@ -1961,7 +2213,7 @@ mod tests {
             );
             std::thread::spawn(move || {
                 while !done.load(Ordering::SeqCst) {
-                    if line.high.load(Ordering::SeqCst) {
+                    if line.is_high() {
                         let mut d = dev.lock().unwrap();
                         d.mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
                         let idx = mem.read_u16(avail + 2).unwrap();
@@ -1989,8 +2241,150 @@ mod tests {
             quiet < 20,
             "progress stopped after {} acks: the line is {} over a device level of {}",
             acks.load(Ordering::SeqCst),
-            line.high.load(Ordering::SeqCst),
+            line.is_high(),
             dev.lock().unwrap().irq_level()
         );
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::devices::irq::test_line::LevelLine;
+
+    const BASE: u64 = 0x4000_0000;
+
+    /// Programs `queue` as a driver does, with its rings at `rings`.
+    fn program(net: &mut VirtioNet, mem: &GuestRam, queue: u16, rings: u64) {
+        net.mmio(mem, mmio::QUEUE_SEL, true, u64::from(queue));
+        net.mmio(mem, mmio::QUEUE_NUM, true, 8);
+        net.mmio(mem, mmio::QUEUE_DESC_LOW, true, rings);
+        net.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, rings + 0x100);
+        net.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, rings + 0x200);
+        net.mmio(mem, mmio::QUEUE_READY, true, 1);
+    }
+
+    /// A device with both queues ready, a custom MAC and one transmitted frame
+    /// whose completion the driver has not acknowledged.
+    fn busy(net: &mut VirtioNet, mem: &GuestRam) {
+        net.set_mac([2, 0, 0, 0, 0, 9]);
+        net.mmio(mem, mmio::STATUS, true, 0xf);
+        program(net, mem, RX_QUEUE, BASE);
+        program(net, mem, TX_QUEUE, BASE + 0x1000);
+        // One TX chain: a header and a minimal frame the stub has no answer
+        // for, so the queue completes it and nothing is injected.
+        let frame = BASE + 0x2000;
+        mem.write(frame, &[0u8; NET_HDR_LEN + 14]).unwrap();
+        let desc = BASE + 0x1000;
+        mem.write_u64(desc, frame).unwrap();
+        mem.write_u32(desc + 8, (NET_HDR_LEN + 14) as u32).unwrap();
+        mem.write_u16(desc + 12, 0).unwrap();
+        mem.write_u16(desc + 0x100 + 4, 0).unwrap();
+        mem.write_u16(desc + 0x100 + 2, 1).unwrap();
+        net.mmio(mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+    }
+
+    #[test]
+    fn state_round_trips_through_json_and_a_restored_device() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let mut net = VirtioNet::new();
+        busy(&mut net, &mem);
+        let state = net.state();
+        assert_eq!(state.common.interrupt_status, 1);
+        assert_eq!(state.common.queue_sel, u32::from(TX_QUEUE));
+        assert_eq!(state.queues[1].last_avail, 1);
+        assert_eq!(state.mode, NetMode::Stub);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let back: NetState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+        let mut restored = VirtioNet::restore(NetBackend::Stub, &mem, &back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(
+            restored.mmio(&mem, mmio::CONFIG + 5, false, 0),
+            9,
+            "config space shows the saved MAC"
+        );
+    }
+
+    #[test]
+    fn a_gateway_device_restores_over_a_new_gateway_connection() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut net = VirtioNet::with_gateway(ours);
+        busy(&mut net, &mem);
+        let state = net.state();
+        assert_eq!(state.mode, NetMode::Gateway);
+        assert!(json_has(&state, r#""mode":"gateway""#));
+
+        let (fresh, _peer) = UnixStream::pair().unwrap();
+        let restored = VirtioNet::restore(NetBackend::Gateway(fresh), &mem, &state).unwrap();
+        assert_eq!(restored.state(), state);
+    }
+
+    fn json_has(state: &NetState, needle: &str) -> bool {
+        serde_json::to_string(state).unwrap().contains(needle)
+    }
+
+    /// The guest configured itself for the network it booted on, so a device
+    /// moved onto another kind of backend is refused rather than left without
+    /// an address.
+    #[test]
+    // The host-path ban in clippy.toml is aimed at guest-named paths. A tap
+    // backend is any open file to the device, and this one is fixed.
+    #[allow(clippy::disallowed_methods)]
+    fn a_backend_of_another_mode_is_refused() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let gateway = VirtioNet::with_gateway(ours).state();
+        let stub = VirtioNet::new().state();
+        let tap = || File::open("/dev/null").unwrap();
+        for (backend, state) in [
+            (NetBackend::Stub, &gateway),
+            (NetBackend::Tap(tap()), &gateway),
+            (NetBackend::Tap(tap()), &stub),
+        ] {
+            let err = VirtioNet::restore(backend, &mem, state).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidInput));
+        }
+    }
+
+    #[test]
+    fn a_queue_outside_the_restored_ram_is_refused() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let mut net = VirtioNet::new();
+        busy(&mut net, &mem);
+        let small = GuestRam::from_ranges(&[(BASE, 0x1000)]);
+        let err = VirtioNet::restore(NetBackend::Stub, &small, &net.state()).err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn connecting_a_restored_device_drives_its_line_from_the_interrupt_status() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let mut net = VirtioNet::new();
+        busy(&mut net, &mem);
+        let mut restored = VirtioNet::restore(NetBackend::Stub, &mem, &net.state()).unwrap();
+        let line = Arc::new(LevelLine::default());
+        restored.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert!(line.is_high());
+        assert_eq!(line.raises(), 1);
+
+        let mut quiet =
+            VirtioNet::restore(NetBackend::Stub, &mem, &VirtioNet::new().state()).unwrap();
+        let line = Arc::new(LevelLine::default());
+        quiet.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert_eq!(line.sets(), 0);
+    }
+
+    #[test]
+    fn a_state_of_another_version_is_refused() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let state = NetState {
+            version: 0,
+            ..VirtioNet::new().state()
+        };
+        let err = VirtioNet::restore(NetBackend::Stub, &mem, &state).err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
     }
 }

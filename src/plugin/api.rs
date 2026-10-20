@@ -81,6 +81,11 @@ pub trait VmHandle: Send + Sync {
     fn sandbox_id(&self) -> &str;
 
     /// Accessor over the guest's RAM. Valid for the lifetime of the VM.
+    ///
+    /// Its write accessors record what they write for a live move. A plugin
+    /// that writes through [`GuestRam::host_ptr`], or through a mapping of
+    /// [`ram_fd`](Self::ram_fd), calls [`GuestRam::mark_dirty`] after the
+    /// write, or a live move misses it.
     fn ram(&self) -> &GuestRam;
 
     /// Descriptor of the object backing guest RAM, borrowed from this handle.
@@ -168,7 +173,9 @@ pub trait CpuHandle {
     /// The guest architecture this vCPU is running.
     fn arch(&self) -> GuestArch;
 
-    /// Accessor over the guest's RAM.
+    /// Accessor over the guest's RAM. A write through
+    /// [`GuestRam::host_ptr`] is marked with [`GuestRam::mark_dirty`], as
+    /// for [`VmHandle::ram`].
     fn ram(&self) -> &GuestRam;
 
     /// This vCPU's registers. Cheap: no other vCPU is parked for it, so the
@@ -182,11 +189,12 @@ pub trait CpuHandle {
     /// On macOS a secondary vCPU still waiting for the guest's PSCI `CPU_ON`
     /// has not started, and is not waited for.
     ///
-    /// Returns `false` if they did not all park or the VM stopped during the
-    /// wait. The quiesce is then already released, and the caller has nothing
-    /// to do. On `true` the caller must call [`CpuHandle::resume`] exactly
-    /// once, including on any early return between the two, or the VM stays
-    /// parked forever.
+    /// Returns `false` if they did not all park, if the VM stopped during the
+    /// wait, or if another requester, such as the control socket's `pause`,
+    /// holds the vCPUs. Either way the caller has nothing to release and owes
+    /// nothing, and a [`CpuHandle::resume`] would do nothing. On `true` the
+    /// caller must call [`CpuHandle::resume`] exactly once, including on any
+    /// early return between the two, or the VM stays parked forever.
     fn pause(&self) -> bool;
 
     /// Releases the vCPUs parked by a successful [`CpuHandle::pause`].

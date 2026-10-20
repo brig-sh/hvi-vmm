@@ -91,6 +91,8 @@ before the console is up. hvi supplies the device, so this is a reason the
 device exists rather than something you configure.
 
 On arm64 hvi supplies a PL031 at `0x0c00_1000`, which is the guest's wall clock.
+The portable profile has none: there `hvi-time` gives the guest its wall clock
+(see [portable-profile.md](portable-profile.md#devicetree)).
 A kernel without `CONFIG_RTC_DRV_PL031` boots with the clock at 1970 and no
 `/dev/rtc0`. A kernel with the driver but without `CONFIG_RTC_HCTOSYS` has
 `/dev/rtc0` and still boots at 1970, until `hwclock -s` sets the system clock.

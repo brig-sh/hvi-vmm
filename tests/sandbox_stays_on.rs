@@ -26,6 +26,8 @@ fn config(sandbox: bool) -> BootConfig {
         mem_bytes: 128 << 20,
         cmdline: String::new(),
         disks: Vec::new(),
+        disk_base_sha256: None,
+        disk_written: None,
         fs_shares: Vec::new(),
         fs: Vec::new(),
         net: false,
@@ -36,8 +38,13 @@ fn config(sandbox: bool) -> BootConfig {
         sandbox_id: "sandbox-test".to_string(),
         vcpus: 1,
         agent_sock: None,
+        profile_out: None,
+        control_sock: None,
+        checkpoint_root: None,
         plugin: None,
         sandbox,
+        profile: hvi::config::MachineProfileKind::Native,
+        arch_timer_irq: None,
         stop: None,
     }
 }

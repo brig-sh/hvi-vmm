@@ -3087,7 +3087,16 @@ impl VirtioFs {
         let want = requested.min(capacity).min(MAX_WRITE as usize);
         let (iov, _covered) = build_iov(mem, output, OUT_HEADER_LEN, want).ok()?;
 
-        let n = match preadv_retry(&handle.file, &iov, offset) {
+        let read = preadv_retry(&handle.file, &iov, offset);
+        // `preadv` wrote guest RAM through `host_ptr`, which the RAM's dirty
+        // log does not see. Mark every output descriptor, a superset of
+        // what it wrote, failure included, since a retried read may have
+        // written part before it failed. A live move refuses a guest with
+        // shares today; this keeps the log whole if that ever changes.
+        for &(addr, len) in output {
+            mem.mark_dirty(addr, u64::from(len));
+        }
+        let n = match read {
             Ok(n) => n,
             Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
         };
@@ -7330,20 +7339,22 @@ mod tests {
     /// disk that way.
     #[test]
     fn read_only_export_does_not_sync_the_host() {
-        let (_dir, mut dev) = fixture_with_access(false);
+        let (dir, mut dev) = fixture_with_access(false);
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The same for a writable export the guest has not written to: the cost
     /// is owed to writes, not to holding the share.
     #[test]
     fn writable_export_with_no_writes_does_not_sync_the_host() {
-        let (_dir, mut dev) = fixture_with_access(true);
+        let (dir, mut dev) = fixture_with_access(true);
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// And once a write has landed the sync does happen -- once. A guest
@@ -7351,7 +7362,7 @@ mod tests {
     /// until it writes again.
     #[test]
     fn syncfs_syncs_the_host_once_per_batch_of_writes() {
-        let (_dir, mut dev) = fixture_with_access(true);
+        let (dir, mut dev) = fixture_with_access(true);
         write_and_close(&mut dev, "first", b"hello");
 
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
@@ -7366,6 +7377,7 @@ mod tests {
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A volume sync that fails is reported to the guest, and the writes it
@@ -7398,6 +7410,7 @@ mod tests {
             2,
             "the pending batch was not retried"
         );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A reset drops every handle without flushing it, so writes made before
@@ -7406,7 +7419,7 @@ mod tests {
     /// skips them.
     #[test]
     fn reset_keeps_a_pending_host_sync() {
-        let (_dir, mut dev) = fixture_with_access(true);
+        let (dir, mut dev) = fixture_with_access(true);
         write_and_close(&mut dev, "before-reset", b"hello");
         dev.reset();
         assert_eq!(dev.host_sync_count(), 0);
@@ -7414,6 +7427,7 @@ mod tests {
         let out = dev.handle_fuse(&request(SYNCFS, FUSE_ROOT_ID, &[0u8; 8]), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(dev.host_sync_count(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A guest binding a Unix socket sends MKNOD with S_IFSOCK. It has to
@@ -12569,7 +12583,16 @@ mod tests {
         // remaining 600 payload bytes in a second -- the payload spans both.
         write_desc(&mem, desc, 1, out1, 416, DESC_WRITE | DESC_NEXT, 2);
         write_desc(&mem, desc, 2, out2, 600, DESC_WRITE, 0);
+        mem.dirty_log().clear();
         notify_head(&mut dev, &mem, avail, 0);
+        // Only `preadv` wrote the second descriptor, through a raw pointer:
+        // a live move sees it only if the read marked it.
+        let mut written = crate::memory::DirtyPages::new(&mem.regions());
+        mem.dirty_log().take_into(&mut written).unwrap();
+        assert!(
+            written.contains(0, (out2 - base) / 4096),
+            "the direct read did not mark what it wrote"
+        );
 
         let mut got = vec![0u8; 1000];
         mem.read(out1 + OUT_HEADER_LEN as u64, &mut got[0..400])

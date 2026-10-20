@@ -126,6 +126,293 @@ The boot jobs upload their logs on failure. The two arm64 Linux-guest jobs
 also upload the event ledger. `boot-x86` and `boot-unikraft-hvf` do not pass
 `--events`, so they record none.
 
+## The checkpoint end-to-end test
+
+`tools/checkpoint-e2e.sh` moves a running guest from one hvi process to
+another on the same host, and checks that it carried on rather than
+rebooting. No CI job runs it yet; run it by hand on Apple silicon, with a
+signed release build, or with `--portable` on an arm64 KVM host too:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload \
+    --out target/initramfs-workload.cpio
+tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image \
+    --initramfs target/initramfs-workload.cpio --out /tmp/e2e --cpus 2 --mem 512
+```
+
+The build must be of a commit with no uncommitted changes, since a restore
+refuses a profile whose hvi was built with them. The disk is an ext4 image the
+script makes with `mke2fs` from e2fsprogs, and reads back with `debugfs`; it
+exits 2 when either is missing. `--no-disk` runs without a disk.
+
+The workload is a loop that keeps a count in a shell variable, prints it every
+200 ms with the guest's uptime and wall clock, and holds a file open on fd 3
+after unlinking it. It also writes and syncs a file on `/dev/vda`. Beside it,
+a CPU-bound `awk` at the lowest priority sums 0.25 into a double and prints
+the count and the sum every 500000 additions. Its sums show that the guest's
+floating-point work goes on after a move, but not that a restore loaded the
+registers: busybox `awk` keeps its sum in memory, and a task off the CPU
+keeps its registers in guest RAM, so a restore that lost every SIMD register
+still gave exact sums. Step 5 checks the registers instead. The script:
+
+1. boots the guest with a control socket, a checkpoint root, the disk, the
+   stub network and an agent socket, and gives it the host's wall clock;
+2. checkpoints it with `then: "fence"` and starts `hvi restore` as a second
+   process with its own sockets, then sends `resume` once it reports
+   `restored-paused`;
+3. checks that the count and the `awk` sum go on from the captured ones,
+   that no boot banner appears, that the guest's monotonic and wall clocks
+   go on from the capture, that the fenced source printed nothing more, and
+   that a second restore of the bundle onto the running guest's disk fails
+   on the disk lock;
+4. asks the guest, over the console, to print its count, read fd 3 and the
+   disk file, write and sync another file and time a `sleep 5` against the
+   host;
+5. moves the guest once more, into a third process, holds it
+   `restored-paused` for a second and checks that it printed nothing and its
+   clock did not move. It checkpoints it there with `then: "continue"` and
+   checks that every vCPU register in `cpu.json` and the interrupt
+   controller and timer state in `platform.json` equal the bundle's, less
+   the host's monotonic clock at the capture, and that the guest is still
+   `restored-paused`. Then it resumes it and checks it counts on;
+6. stops every process, checks that the disk generation in `disk.json` grew
+   from the first move to the second, and reads the post-restore file from
+   the image on the host with `debugfs`.
+
+It prints each check and writes `summary.json` with `pause_ms`,
+`capture_ms`, the bundle size, the time from starting `hvi restore` to its
+`restored-paused` reply, and the downtime from the checkpoint request, and
+from its reply, to the `resume` reply. It exits 1 when a check failed.
+[checkpoint.md](checkpoint.md#timings) has the figures.
+
+`--portable` boots the portable profile instead, on the Mac or on a Pi 5,
+with the portable kernel and an initramfs that also holds `el0check`
+(`tools/guest/el0check.c`, the acceptance test of the portable kernel's EL0
+counter patch) and `tfd` (`tools/guest/tfd.c`), both static arm64 binaries.
+Build each with `gcc -O2 -static`:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --out target/initramfs-portable.cpio
+tools/checkpoint-e2e.sh --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-portable.cpio --out /tmp/e2e-p --cpus 1 \
+    --mem 512 --portable
+```
+
+Just before the capture it starts a 6 s `timerfd` and a 6 s `sleep`. Beside
+the checks above, it checks that the clocksource is `hvi-time` and
+`el0check` passes before and after the move, that both timers fire after
+the resume 6 s of guest time after they were armed, that the guest driver
+logged the move once, generation 4, and counts it once (`migrations=1`) on
+any number of vCPUs, and that the guest's wall clock is the host's again.
+Every vCPU takes `GEN_CHANGED`; a portable kernel whose driver handled a
+generation once per vCPU logged and counted the move up to once per vCPU,
+and fails these two checks. Its third patch fixes that; the series is in
+[tools/guest/kernel](../tools/guest/kernel/README.md). The uptime the
+ticks carry is `CLOCK_BOOTTIME`, which
+`hvi-time` moves on by the downtime, so the continuity checks take the
+downtime the restore logged off.
+
+The two timer checks assume the move takes well under 6 s from the
+request. On a host disk that stalls it may not: on rp2 with its drive
+logging I/O timeouts, a `--stream` idle run spent 5611 ms in the sync
+before the pause and 2637 ms in the gate waiting for the guest's
+virtio-blk request in flight, so both timers fired on the source before
+the capture and the run failed those two checks, 48 of 50. Two runs
+right after passed 50 of 50. Read such a failure with the move's
+`disk_sync_ms` and `gate_ms` beside it.
+
+## The live-move end-to-end test
+
+`tools/stream-e2e.sh` is `tools/checkpoint-e2e.sh --stream`: both moves are
+live moves. The script sends the source's control connection a `migrate`
+with `then: "fence"`, relays the stream frame by frame through a Unix
+socket into `hvi restore --from-stream --stream-keep DIR` in the next
+process, and resumes the guest there. The checks are the bundle move's,
+with the documents the restore kept standing in for the bundle, except the
+second restore onto the running guest's disk, which needs a bundle
+directory. Both modes also check that the guest's `boot_id` is the same
+after each move.
+
+With a disk, the disk moves in the stream too. The source boots with
+`--disk-base-sha256` of the fresh image, a copy of which the script keeps
+as the base, and each restore gets a new copy of the base (an APFS clone
+on a Mac, a reflink or a copy elsewhere) as its `--disk`, with the same
+`--disk-base-sha256`. After each fence,
+with the source fenced and the destination restored-paused, the script
+checks that the restored disk hashes as the source's does, and that the
+move took a disk round before each RAM round, the last one paused.
+`--disk-churn` keeps the guest rewriting a 1 MiB file on its disk with
+`fsync` through the moves, so the rounds taken with the guest running carry
+blocks. `--disk-whole` moves the disk the old way: no base, and each
+restore reopens the source's image.
+
+`--dirty-mib N` starts `/dirty` (`tools/guest/dirty.c`, built static) in
+the guest before the move. It rewrites N MiB of pseudo-random pages over
+and over and checks that each page still holds what its last pass wrote,
+so a page a move did not copy again after the guest wrote it prints
+`DIRTY-BAD`. The script checks that none does, and that a pass begun
+after each move found every page as it should. A page rewritten in every
+pass hides a write that a round taken with the guest running lost, since
+the next round sends the page again; only a loss in the final round
+shows. `--dirty-once SECS` makes `/dirty` write each page once per cycle
+of SECS seconds instead, in a shuffled order, and check every page once a
+second, so a write lost in any round leaves a page that fails. Timers
+armed before the move then run 20 s, to outlast the rounds. `summary.json`
+gives each move's RAM and disk rounds, their bytes and compression, dirty
+rates, write faults, the sync before the pause and the one in it, the
+time to hold the I/O threads and park the vCPUs, `paused_ms` and the
+downtime to the resume reply twice: from the end of the last round with
+the guest running (`rounds_end_unix_ms`) and from the end of the sync
+after it, at the pause (`precopy_end_unix_ms`), each also less the time
+the script spent hashing the disks. Before the last check reads the
+third process's disk with `debugfs`, the script replays the disk's
+journal on a copy with `e2fsck -E journal_only`, repairing nothing, and
+requires `e2fsck -fn` to find it clean.
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --add dirty --out target/initramfs-stream.cpio
+tools/stream-e2e.sh --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-stream.cpio --out /tmp/stream --cpus 2 --mem 1024 \
+    --portable --dirty-mib 256 --disk-churn
+```
+
+`dirty`, `el0check` and `tfd` are static arm64 binaries:
+`gcc -O2 -static -o dirty tools/guest/dirty.c` on an arm64 Linux host.
+The results are in [checkpoint.md](checkpoint.md#live-move-timings).
+
+## The migration end-to-end test
+
+`tools/migrate-e2e.sh` moves a running portable guest from one host to
+another, stopped, and checks that it carried on rather than rebooting. It
+was written for a Mac and a Raspberry Pi 5, in either direction, but takes
+any two hosts that run the portable profile, and one host as both. Run it
+from a machine that can reach both hosts over ssh without a password; a
+host given as `local` is that machine. No CI job runs it.
+
+Each host needs hvi built from one commit with no uncommitted changes, or
+the restore refuses the bundle (on macOS, signed), plus python3 and rsync.
+The source needs `mke2fs`, the destination `e2fsck` and `debugfs`. The
+guest is the portable kernel and the checkpoint workload with three static
+helpers: `el0check` (see above), `tfd` (`tools/guest/tfd.c`) and `clk`
+(`tools/guest/clk.c`), which prints the guest's `CLOCK_REALTIME`,
+`CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` in nanoseconds every 250 ms. Build
+the helpers with `gcc -O2 -static` on an arm64 Linux host, and copy one
+initramfs to both hosts:
+
+```sh
+python3 tools/mk-initramfs.py --checkpoint-workload --add el0check --add tfd \
+    --add clk --out target/initramfs-migrate.cpio
+tools/migrate-e2e.sh --src local --dst rp2 \
+    --src-hvi target/release/hvi --dst-hvi /home/pi/hvi/target/release/hvi \
+    --kernel Image-portable --initramfs target/initramfs-migrate.cpio \
+    --src-dir /tmp/mig-src --dst-dir /home/pi/mig --out /tmp/mig-out
+```
+
+`--kernel`, `--initramfs`, `--src-hvi` and `--src-dir` are paths on the
+source host, and `--dst-hvi` and `--dst-dir` on the destination. The script
+empties both directories first. Each host runs its own half of the test, a
+driver the script copies there, so that every console line is stamped
+with the clock of the host whose hvi printed it, never across ssh. The
+script:
+
+1. measures each host's wall clock against its own, over one ssh session;
+2. boots the guest on the source with an ext4 disk and the stub network,
+   starts `clk`, turns off the console's echo, and records the guest's
+   `Features` line and `/proc/interrupts`;
+3. arms a 6 s `timerfd` and a 6 s `sleep`, checkpoints the guest with
+   `then: "fence"`, checks that both timers were still pending, and stops
+   the source;
+4. copies the bundle and the disk with `rsync -S -a --stats`;
+5. restores the bundle on the destination, onto the copied disk, and
+   resumes it.
+
+It then checks on the destination:
+
+- the count goes on by one, the `awk` sums stay exact, and no boot banner
+  appears;
+- the guest driver logs generation 4 at the destination's counter rate, and
+  counts the move once (`migrations=1`);
+- both timers fire after the resume, 6 s of guest time after they were
+  armed;
+- the workload's request: fd 3, the file written before the move, a write
+  after it, `el0check`, the clocksource, and a `sleep 5` against the host;
+- the `Features` line is the source's, and the `hvi-time`, PL011 and
+  virtio-blk interrupt counts go on from the source's and grow;
+- `clk` printed every line across the move, `CLOCK_MONOTONIC` never stepped
+  back, and its gap over the move is one period: the downtime does not
+  show on it;
+- `CLOCK_REALTIME` is within 100 ms of the destination host's clock, over
+  the first 10 s after the driver's fix-up, and again after `--drift-secs`
+  (600 by default), from which it gives the drift in ppm;
+- after the guest unmounts its disk and stops, `e2fsck -fn` finds the image
+  clean and `debugfs` reads the file written after the move.
+
+`summary.json` in `--out` holds the timings: `pause_ms` and `capture_ms`
+from the fence, the copy's time, bytes and rate, the restore's time to
+`restored-paused`, and the downtime three ways (on the script's clock from
+the fence request to the resume reply, from the two hosts' wall clocks, and
+as `hvi-time` moved the guest's wall clock). It exits 1 when a check failed.
+
+`--recapture` checkpoints the restored guest again before it resumes, with
+`then: "continue"`, and checks that its vCPU and platform state equal the
+bundle's. Across backends the registers only HVF has must be 0 there. That
+capture is inside the downtime, so take the timings from a run without it.
+
+`--negative` runs the refusals instead, on the destination, against the
+bundle a run without it left in `--dst-dir`:
+
+- a native bundle of the source, booted with `--profile native`;
+- copies of the portable bundle with the vCPU count or the RAM size changed
+  in `profile.json` and the manifest sealed again, so that the check of
+  the machine fires and not the digest; with one byte of `ram.bin`
+  changed; and with `cpu.json` cut short. Each goes to `checkpoint-verify`
+  and to `restore`;
+- a restore without `--disk`;
+- on a KVM destination, a restore and a portable boot on a host whose KVM
+  offers no vGICv2. An `LD_PRELOAD` shim, built there with `cc`, fails
+  `KVM_CREATE_DEVICE` for `KVM_DEV_TYPE_ARM_VGIC_V2` with `ENODEV`, as a
+  GICv3-only host does.
+
+`--negative` needs `--cpus 1`: its altered bundle sets the vCPU count to
+2, which is no change for a 2-vCPU bundle.
+
+Results and the exact commands are in
+[portable-profile.md](portable-profile.md#measured-results).
+
+A Mac that sleeps stops its guest's clocks, since Hypervisor.framework's
+counter does not run in sleep. hvi publishes `hvi-time` again after the
+sleep, which sets the guest's wall clock to the host's again. The driver
+counts that publish in `host_sleeps`, not in `migrations`, but it is still
+a gap in the drift window. Keep the Mac awake through
+a run (`caffeinate -i`, and the lid open on battery).
+
+## The host-sleep test
+
+`tools/sleep-e2e.py` checks `hvi-time`'s publish after a host sleep on a
+running portable guest, on either host. It boots the portable kernel with
+the initramfs of the migration test, starts `/clk 50`, and stamps each
+console line with the host's wall clock:
+
+```sh
+tools/sleep-e2e.py --mode hook --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-migrate.cpio --out /tmp/sleep-hook
+tools/sleep-e2e.py --mode sigstop --hvi target/release/hvi --kernel Image-portable \
+    --initramfs target/initramfs-migrate.cpio --out /tmp/sleep-stop
+```
+
+`--mode hook` simulates a sleep with `HVI_TIME_TEST_SLEEP` (by default
+`25,30`) and checks that hvi publishes once, that the guest driver logs it
+once and counts it in `host_sleeps` and not in `migrations`, that the
+guest's REALTIME reads the host's plus the simulated sleep within a second
+of the publish and stays there, and that MONOTONIC never goes back.
+`--mode sigstop` stops hvi for 10 s and checks that nothing is published
+and that REALTIME is the host's again. It exits 1 when a check fails;
+`summary.json` in `--out` has the offsets. A real sleep is not tested: no
+automation puts the Mac to sleep. Results are in
+[portable-profile.md](portable-profile.md#host-sleep).
+
 ## Toolchain versions
 
 Four places declare a Rust version. The first two hold the build pin, and the

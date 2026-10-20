@@ -410,6 +410,47 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
+/// The machine a guest is given.
+///
+/// `Native` is the host's own machine: on macOS the in-kernel GICv3 of
+/// Hypervisor.framework and the host CPU's feature registers. A portable
+/// profile is one machine on every host that implements it, so a guest can
+/// move between them; see `docs/portable-profile.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MachineProfileKind {
+    /// The host's own machine.
+    #[default]
+    Native,
+    /// `portable-arm64-v1`: a GICv2, a Cortex-A76 identity with a reduced
+    /// feature set, PSCI 1.1 and SMCCC 1.1 as KVM on a Pi 5 answers them.
+    PortableArm64V1,
+}
+
+impl MachineProfileKind {
+    /// Returns the profile's name, as `--profile` takes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::PortableArm64V1 => "portable-arm64-v1",
+        }
+    }
+
+    /// Returns the profile called `name`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when no profile has that name.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        [Self::Native, Self::PortableArm64V1]
+            .into_iter()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| {
+                format!("unknown machine profile {name:?}; expected native or portable-arm64-v1")
+            })
+    }
+}
+
 /// Most virtio-blk disks one guest can have.
 ///
 /// Each disk is its own virtio-mmio device with its own window and interrupt,
@@ -538,6 +579,12 @@ fn check_serial(serial: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a boot with `--disk-base-sha256` must have exactly one disk, a writable
+/// one: the digest, the dirty bitmap and the disk rounds of a move all name
+/// one disk.
+pub const ONE_DISK_FOR_A_BASE: &str =
+    "--disk-base-sha256 needs exactly one --disk, a writable one: a move carries one disk";
+
 /// Refuses a disk list no backend can attach.
 ///
 /// Every caller's list passes here, the CLI's after it parsed the arguments and
@@ -587,6 +634,21 @@ pub struct BootConfig {
     /// them. The disk at index `N` answers `GET_ID` with its serial, or
     /// [`disk_serial`]`(N)` when it has none.
     pub disks: Vec<DiskConfig>,
+    /// The SHA-256 of the guest's one disk as this boot opens it, before
+    /// this hvi writes it, as 64 lowercase hex digits, which the machine
+    /// profile records (`disk_base_sha256`). hvi tracks only the writes it
+    /// serves from this boot on, so a disk that an earlier boot wrote needs a
+    /// new digest, or no flag. hvi does not hash the disk itself: whoever made
+    /// the image did, and keeps a copy, so a move can send only the blocks the
+    /// guest wrote. It needs exactly one disk in `disks`, a writable one.
+    pub disk_base_sha256: Option<String>,
+    /// The blocks where the disk already differs from that base when this
+    /// boot opens it, as the bitmap a `disk-dirty` reply gives (bit `i` of
+    /// byte `i / 8` for 64 KiB block `i`). They start the blocks written
+    /// since boot, so a move by blocks sends them too. With it,
+    /// `disk_base_sha256` names the base image, not the disk itself. It needs
+    /// `disk_base_sha256`.
+    pub disk_written: Option<Vec<u8>>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
     /// are involved. Access is enforced independently for every export.
@@ -619,6 +681,32 @@ pub struct BootConfig {
     pub vcpus: u32,
     /// Host Unix-socket path bridged to the guest agent's vsock port (exec).
     pub agent_sock: Option<String>,
+    /// Path the machine profile is written to, as one line of canonical JSON
+    /// (see [`crate::checkpoint::profile`]).
+    ///
+    /// The file is created before confinement, which forbids creating one
+    /// later, and written once the profile is complete: before the guest starts
+    /// on KVM, and on hvf by the boot vCPU before the guest's first
+    /// instruction, since only a vCPU's own thread can read `MIDR_EL1` there.
+    /// A reader that finds the file empty waits, or asks the control socket.
+    pub profile_out: Option<String>,
+    /// Host Unix-socket path of the control socket, which pauses, resumes,
+    /// reports and stops the VM (see [`crate::checkpoint::control`]).
+    ///
+    /// It is bound before confinement, as the agent socket is.
+    pub control_sock: Option<String>,
+    /// The directory a `checkpoint` on the control socket may write its
+    /// bundle under, or `None` to refuse every `checkpoint`.
+    ///
+    /// It must exist, and should be private to this sandbox: mode 0700, never
+    /// shared, since a bundle holds guest RAM in clear. It is resolved before
+    /// confinement. On macOS a Seatbelt subtree rule holds every write to it
+    /// and the writable shares. On Linux the control socket's thread gets a
+    /// seccomp filter of its own with the file calls a bundle needs, but
+    /// seccomp cannot filter paths: that thread can write wherever the uid
+    /// can, and only hvi's own path check keeps bundles below the root. It
+    /// needs `control_sock`.
+    pub checkpoint_root: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.
     ///
     /// This is the whole of the VMM's observation surface: see
@@ -639,6 +727,20 @@ pub struct BootConfig {
     /// later run. The backend logs which one it installed, so this is never a
     /// silent "sandboxed" claim on a host that is not.
     pub sandbox: bool,
+    /// The machine the guest is given.
+    pub profile: MachineProfileKind,
+    /// Whether the devicetree gives the architected timer its interrupts, or
+    /// `None` for the profile's default.
+    ///
+    /// The native profile always does. The portable profile does not: its
+    /// `/timer` node carries a fixed `clock-frequency` and no interrupts, so
+    /// the guest's arch-timer driver takes its rate from the node and
+    /// registers no clock event, and the guest's clock and timers come from
+    /// `hvi-time`. `Some(true)` there is a debugging aid: the node gets its
+    /// four PPIs back, so a guest kernel without the `hvi-time` driver still
+    /// ticks. It changes the devicetree, and with it the profile's
+    /// `dtb_sha256`.
+    pub arch_timer_irq: Option<bool>,
     /// The registration of the [`StopHandle`](crate::run::StopHandle) that asks
     /// this run to stop from outside the guest, or `None` when the caller keeps
     /// no handle.
@@ -660,6 +762,132 @@ impl BootConfig {
             None => Ok(crate::run::StopHandle::new_pair()?.0),
         }
     }
+
+    /// Refuses a combination of fields that no backend boots, whichever
+    /// one runs. Every backend's `boot` calls it first, so a library
+    /// caller gets the same answer as the CLI.
+    ///
+    /// # Errors
+    ///
+    /// Errors when `arch_timer_irq` is set on the native profile, when a
+    /// portable profile is given virtio-fs shares or more than one disk, and
+    /// when `disk_base_sha256` is given without exactly one writable disk or
+    /// `disk_written` without `disk_base_sha256`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.arch_timer_irq.is_some() && self.profile == MachineProfileKind::Native {
+            return Err("--arch-timer-irq needs --profile portable-arm64-v1".into());
+        }
+        if self.profile != MachineProfileKind::Native
+            && !(self.fs_shares.is_empty() && self.fs.is_empty())
+        {
+            return Err(format!(
+                "--fs/--share-ro/--share-rw are not part of --profile {}: a portable guest keeps its storage on virtio-blk",
+                self.profile.name()
+            ));
+        }
+        if self.profile != MachineProfileKind::Native && self.disks.len() > 1 {
+            return Err(format!(
+                "a second --disk is not part of --profile {}: a portable guest moves, and a move carries one disk",
+                self.profile.name()
+            ));
+        }
+        if self.disk_base_sha256.is_some()
+            && !matches!(self.disks.as_slice(), [disk] if !disk.read_only)
+        {
+            return Err(ONE_DISK_FOR_A_BASE.into());
+        }
+        if self.disk_written.is_some() && self.disk_base_sha256.is_none() {
+            return Err("--disk-written needs --disk-base-sha256, the base it differs from".into());
+        }
+        Ok(())
+    }
+
+    /// Returns whether the devicetree gives the architected timer its
+    /// interrupts: `arch_timer_irq`, or the profile's default.
+    #[must_use]
+    pub fn arch_timer_irq(&self) -> bool {
+        self.arch_timer_irq
+            .unwrap_or(self.profile == MachineProfileKind::Native)
+    }
+
+    /// Refuses a portable profile on a backend that does not implement one
+    /// yet.
+    ///
+    /// # Errors
+    ///
+    /// Errors naming `backend` when the profile is not native.
+    pub fn require_native_profile(&self, backend: &str) -> Result<(), String> {
+        if self.profile == MachineProfileKind::Native {
+            return Ok(());
+        }
+        Err(format!(
+            "--profile {} is not implemented on the {backend} backend yet",
+            self.profile.name()
+        ))
+    }
+}
+
+/// Inputs for a restore: `hvi restore`, which resumes a checkpoint bundle in
+/// this process instead of booting a kernel. Populated by
+/// `main::restore_guest` and handed to the active backend's `restore()`.
+///
+/// The machine comes from the bundle: its RAM, vCPUs, devices and their
+/// state. What it needs from this host comes from here, and must agree with
+/// the bundle: a disk of the size the guest was given when it had one, a
+/// network of the mode it ran on when it had one, and an agent socket when it
+/// had a vsock device.
+pub struct RestoreConfig {
+    /// The bundle directory, or for a stream a name for it in messages.
+    pub from: String,
+    /// The streamed bundle to read instead of a directory: `-` for stdin,
+    /// or the path of a Unix socket hvi connects to before confinement.
+    pub from_stream: Option<String>,
+    /// A new directory the stream's documents and manifest are kept in,
+    /// without RAM.
+    pub stream_keep: Option<String>,
+    /// The control socket, bound before confinement. The guest waits
+    /// restored-paused until a client sends `resume` on it.
+    pub control_sock: String,
+    /// The directory a later `checkpoint` may write under; see
+    /// [`BootConfig::checkpoint_root`].
+    pub checkpoint_root: Option<String>,
+    /// The disk image to reopen for the guest's virtio-blk device, in
+    /// `--disk`'s syntax. A checkpoint carries one writable disk, and the
+    /// restored disk answers `GET_ID` with the serial the bundle records, so
+    /// a `serial` here must be that one, and `read_only` is refused. A
+    /// stream with disk rounds writes them into it first, so it is then the
+    /// destination's own copy of the guest's base image.
+    pub disk: Option<DiskConfig>,
+    /// For a bundle directory only: the `generation` of the `disk-dirty`
+    /// reply that started the last round of `disk-blocks` the mover applied
+    /// onto its copy of the guest's base image to make `disk`. `None` when
+    /// the disk was copied whole. With it, the restore refuses a disk.json
+    /// with no base, or captured at another generation: the guest wrote
+    /// after that round, and the disk lacks the write. A stream checks its
+    /// own disk rounds the same way.
+    pub disk_generation: Option<u64>,
+    /// For a stream only: the SHA-256 of the base image `disk` is a copy
+    /// of. With it, the restore refuses a stream that is not of a guest
+    /// booted with that base, or that carried no disk rounds, either of
+    /// which would leave `disk` without the guest's writes.
+    pub disk_base_sha256: Option<String>,
+    /// The built-in network stack, for a guest that ran on it.
+    pub net: bool,
+    /// The gateway stream socket, for a guest that ran on a gateway.
+    pub net_gateway: Option<String>,
+    /// The MAC the guest was given. Optional, since the bundle holds it; a
+    /// MAC given here must be that one.
+    pub net_mac: Option<[u8; 6]>,
+    /// The agent socket, for a guest that had a vsock device.
+    pub agent_sock: Option<String>,
+    /// The sandbox id, or `None` for the one the bundle was captured under.
+    pub sandbox_id: Option<String>,
+    /// The event ledger path.
+    pub events: Option<String>,
+    /// Where to write this machine's profile; see [`BootConfig::profile_out`].
+    pub profile_out: Option<String>,
+    /// Confine the process, as [`BootConfig::sandbox`].
+    pub sandbox: bool,
 }
 
 /// Why the run stopped.
@@ -671,7 +899,8 @@ pub enum Stop {
     /// A reset by the guest, which is not restarted.
     SystemReset,
     /// The host asked the run to stop, through a
-    /// [`StopHandle`](crate::run::StopHandle).
+    /// [`StopHandle`](crate::run::StopHandle), or the control socket's `stop`
+    /// op ended it.
     Requested,
 }
 
@@ -741,8 +970,9 @@ impl std::error::Error for BootError {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        check_disks, check_export_overlap, check_fs, disk_serial, BootError, CachePolicy,
-        DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
+        check_disks, check_export_overlap, check_fs, disk_serial, BootConfig, BootError,
+        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, MachineProfileKind, ShareMode,
+        MAX_DISKS,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -870,6 +1100,141 @@ mod tests {
         ]))
         .expect("/srv/ab is a sibling of /srv/a, not a child");
         assert!(!Path::new("/srv/ab").starts_with("/srv/a"));
+    }
+
+    fn boot_config(profile: MachineProfileKind, arch_timer_irq: Option<bool>) -> BootConfig {
+        BootConfig {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 0,
+            cmdline: String::new(),
+            disks: Vec::new(),
+            disk_base_sha256: None,
+            disk_written: None,
+            fs_shares: Vec::new(),
+            fs: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: String::new(),
+            vcpus: 1,
+            agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
+            plugin: None,
+            sandbox: false,
+            profile,
+            arch_timer_irq,
+            stop: None,
+        }
+    }
+
+    #[test]
+    fn validate_refuses_what_no_backend_boots() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        assert_eq!(boot_config(Native, None).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, None).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, Some(true)).validate(), Ok(()));
+        assert_eq!(boot_config(PortableArm64V1, Some(false)).validate(), Ok(()));
+        for timer in [Some(true), Some(false)] {
+            assert_eq!(
+                boot_config(Native, timer).validate(),
+                Err("--arch-timer-irq needs --profile portable-arm64-v1".into())
+            );
+        }
+        let mut cfg = boot_config(PortableArm64V1, None);
+        cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("--share-ro/--share-rw"));
+        let mut cfg = boot_config(PortableArm64V1, None);
+        cfg.fs = vec![socket("tag=a,socket=/run/a.sock")];
+        assert!(cfg.validate().unwrap_err().contains("--fs"));
+        let mut cfg = boot_config(Native, None);
+        cfg.fs_shares = shares(&[("/srv/a", ShareMode::ReadOnly)]);
+        assert_eq!(cfg.validate(), Ok(()));
+        let mut cfg = boot_config(Native, None);
+        cfg.fs = vec![socket("tag=a,socket=/run/a.sock")];
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    // A portable guest is one that moves, and a move carries one writable
+    // disk: its base digest, its dirty blocks and its rounds name that disk.
+    #[test]
+    fn validate_holds_a_moving_guest_to_one_writable_disk() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        let two = vec![DiskConfig::rw("/a.img"), DiskConfig::ro("/b.img")];
+        let mut cfg = boot_config(PortableArm64V1, None);
+        cfg.disks = two.clone();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("a second --disk is not part of --profile"),
+            "{err}"
+        );
+        cfg.disks.truncate(1);
+        assert_eq!(cfg.validate(), Ok(()));
+        let mut cfg = boot_config(Native, None);
+        cfg.disks = two;
+        assert_eq!(cfg.validate(), Ok(()), "a native guest takes four");
+
+        let base = Some("ab".repeat(32));
+        for disks in [
+            Vec::new(),
+            vec![DiskConfig::ro("/a.img")],
+            vec![DiskConfig::rw("/a.img"), DiskConfig::rw("/b.img")],
+        ] {
+            let mut cfg = boot_config(Native, None);
+            cfg.disks = disks;
+            cfg.disk_base_sha256.clone_from(&base);
+            assert_eq!(cfg.validate(), Err(super::ONE_DISK_FOR_A_BASE.into()));
+        }
+        let mut cfg = boot_config(Native, None);
+        cfg.disks = vec![DiskConfig::rw("/a.img")];
+        cfg.disk_base_sha256 = base;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.disk_base_sha256 = None;
+        cfg.disk_written = Some(vec![0]);
+        assert!(cfg.validate().unwrap_err().contains("--disk-written needs"));
+    }
+
+    /// The portable profile's arch timer has no interrupts unless asked;
+    /// the native one always has them.
+    #[test]
+    fn the_arch_timer_interrupts_follow_the_profile() {
+        use MachineProfileKind::{Native, PortableArm64V1};
+        assert!(boot_config(Native, None).arch_timer_irq());
+        assert!(!boot_config(PortableArm64V1, None).arch_timer_irq());
+        assert!(boot_config(PortableArm64V1, Some(true)).arch_timer_irq());
+        assert!(!boot_config(PortableArm64V1, Some(false)).arch_timer_irq());
+    }
+
+    #[test]
+    fn a_backend_without_the_profile_names_the_profile() {
+        let cfg = boot_config(MachineProfileKind::PortableArm64V1, None);
+        assert_eq!(
+            cfg.require_native_profile("KVM"),
+            Err("--profile portable-arm64-v1 is not implemented on the KVM backend yet".into())
+        );
+        assert_eq!(
+            boot_config(MachineProfileKind::Native, None).require_native_profile("KVM"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn profiles_are_found_by_their_names() {
+        for p in [
+            MachineProfileKind::Native,
+            MachineProfileKind::PortableArm64V1,
+        ] {
+            assert_eq!(MachineProfileKind::from_name(p.name()), Ok(p));
+        }
+        assert_eq!(MachineProfileKind::default(), MachineProfileKind::Native);
+        assert!(MachineProfileKind::from_name("portable").is_err());
     }
 
     #[test]

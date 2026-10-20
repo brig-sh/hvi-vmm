@@ -27,8 +27,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm_superio::rtc_pl031::NoEvents;
+use serde::{Deserialize, Serialize};
+use vm_superio::rtc_pl031::{NoEvents, RtcState};
 use vm_superio::Rtc;
+
+use crate::devices::state::{check_version, invalid};
 
 /// Offset of the data register, which reads the current time in seconds.
 const DR: u64 = 0x000;
@@ -36,6 +39,47 @@ const DR: u64 = 0x000;
 const LR: u64 = 0x008;
 /// Offset of the control register.
 const CR: u64 = 0x00c;
+
+/// The [`Pl031State`] format this build writes and reads.
+pub const PL031_STATE_VERSION: u32 = 1;
+
+/// What a checkpoint keeps of the PL031: the registers a guest can set.
+///
+/// The clock is not kept. It reads the host's wall clock, and the load and
+/// control registers that would move it ignore writes, so after a restore the
+/// data register reads the restoring host's time, as the x86-64 CMOS RTC
+/// does. The RTC raises no interrupt, so none is pending.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pl031State {
+    /// [`PL031_STATE_VERSION`] when written by this build.
+    pub version: u32,
+    /// The match register (`RTCMR`), which the crate stores and never matches.
+    pub mr: u32,
+    /// The interrupt mask (`RTCIMSC`), one bit.
+    pub imsc: u32,
+    /// The raw interrupt status (`RTCRIS`), one bit.
+    pub ris: u32,
+}
+
+impl Pl031State {
+    /// Refuses a state this build could not restore.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version, or its interrupt mask or
+    /// status has a bit other than bit 0, which the registers do not hold.
+    pub fn check(&self) -> std::io::Result<()> {
+        check_version("pl031", self.version, PL031_STATE_VERSION)?;
+        if self.imsc > 1 || self.ris > 1 {
+            return Err(invalid(format_args!(
+                "pl031 interrupt mask {:#x} or status {:#x} holds more than bit 0",
+                self.imsc, self.ris
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// A PL031 RTC.
 pub struct Pl031 {
@@ -77,6 +121,41 @@ impl Pl031 {
             self.rtc.read(offset16, &mut buf);
             u64::from(u32::from_le_bytes(buf))
         }
+    }
+}
+
+impl Pl031 {
+    /// Returns what a checkpoint keeps of the RTC.
+    #[must_use]
+    pub fn state(&self) -> Pl031State {
+        let state = self.rtc.state();
+        Pl031State {
+            version: PL031_STATE_VERSION,
+            mr: state.mr,
+            imsc: state.imsc,
+            ris: state.ris,
+        }
+    }
+
+    /// Rebuilds the RTC a checkpoint describes, reading this host's clock.
+    ///
+    /// # Errors
+    ///
+    /// Errors when [`Pl031State::check`] refuses the state.
+    pub fn restore(state: &Pl031State) -> std::io::Result<Self> {
+        state.check()?;
+        // No load and no offset, since a write never sets them: the data
+        // register reads this host's clock.
+        let registers = RtcState {
+            lr: 0,
+            offset: 0,
+            mr: state.mr,
+            imsc: state.imsc,
+            ris: state.ris,
+        };
+        Ok(Pl031 {
+            rtc: Rtc::from_state(&registers, NoEvents),
+        })
     }
 }
 
@@ -168,5 +247,55 @@ mod tests {
         rtc.mmio(IMSC, 4, true, 1);
         assert_eq!(rtc.mmio(IMSC, 4, false, 0), 1);
         assert_eq!(rtc.mmio(0xfe0, 4, false, 0), 0x31);
+    }
+
+    #[test]
+    fn state_round_trips_through_json_and_a_restored_rtc() {
+        const MR: u64 = 0x004;
+        const IMSC: u64 = 0x010;
+        let mut rtc = Pl031::new();
+        rtc.mmio(MR, 4, true, 0x1234_5678);
+        rtc.mmio(IMSC, 4, true, 1);
+        let state = rtc.state();
+        assert_eq!((state.mr, state.imsc, state.ris), (0x1234_5678, 1, 0));
+        let json = serde_json::to_string(&state).unwrap();
+        let back: Pl031State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+        let mut restored = Pl031::restore(&back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(restored.mmio(MR, 4, false, 0), 0x1234_5678);
+        assert_eq!(restored.mmio(IMSC, 4, false, 0), 1);
+        let host = now();
+        let guest = restored.mmio(DR, 4, false, 0);
+        assert!(
+            guest.abs_diff(host) <= 1,
+            "the restored RTC reads {guest}, not the host's {host}"
+        );
+    }
+
+    #[test]
+    fn state_the_rtc_could_not_hold_is_refused() {
+        let good = Pl031::new().state();
+        for bad in [
+            Pl031State {
+                imsc: 2,
+                ..good.clone()
+            },
+            Pl031State {
+                ris: 0x8000_0000,
+                ..good.clone()
+            },
+            Pl031State {
+                version: 2,
+                ..good.clone()
+            },
+        ] {
+            let err = Pl031::restore(&bad).err();
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::InvalidData),
+                "{bad:?}"
+            );
+        }
     }
 }

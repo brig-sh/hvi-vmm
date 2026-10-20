@@ -59,12 +59,19 @@
 //! it matters most: MMIO exits are serviced inline on the vCPU thread, so the
 //! virtio device models -- the code that parses guest descriptors -- run there.
 //! `vmm` covers the thread that calls `boot`, the boot thread below, the
-//! host-side I/O threads (the console reader, the agent bridge and its
-//! per-connection readers, the tap and gateway readers, and the debug watchdog
-//! when it is enabled), the threads a plugin starts with `VmHandle::spawn`, the
-//! thread that receives the stop signals and the ledger writer. The ledger
-//! writer starts with the ledger, before the filters are armed, and installs
-//! `vmm` before its first write after the filters are armed.
+//! host-side I/O threads (the console reader, the virtio-blk worker, which
+//! parses the block device's descriptors and makes its disk calls, the agent
+//! bridge and its per-connection readers, the tap and gateway readers, and the
+//! debug watchdog when it is enabled), the threads a plugin starts with
+//! `VmHandle::spawn`, the thread that receives the stop signals and the ledger
+//! writer. The ledger writer starts with the ledger, before the filters are
+//! armed, and installs `vmm` before its first write after the filters are
+//! armed. `control` is `vmm` plus the file calls a checkpoint bundle needs
+//! (`openat`, `mkdirat`, `renameat`, `unlinkat` and the `stat` family), and
+//! only the control socket's thread installs it, and only when the run has a
+//! checkpoint root. That thread parses the control protocol, never guest data.
+//! seccomp cannot filter the path a call names, so `control` does not hold the
+//! thread to the root: hvi's own path check does, see `docs/security.md`.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
@@ -86,7 +93,8 @@
 //!
 //! Everything acquired during setup is finished by the time any filter is in,
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
-//! absent from both lists. A compromised virtio backend cannot open a file.
+//! absent from `vmm` and `vcpu`. A compromised virtio backend cannot open a
+//! file.
 //!
 //! # The default action, and diagnosing it
 //!
@@ -111,6 +119,9 @@ pub enum Thread {
     Vmm,
     /// A vCPU thread: KVM plus the device models it services inline.
     Vcpu,
+    /// The control socket's thread when a checkpoint root is set: `vmm` plus
+    /// the file calls that write a checkpoint bundle.
+    Control,
 }
 
 impl Thread {
@@ -119,6 +130,7 @@ impl Thread {
         match self {
             Thread::Vmm => "vmm",
             Thread::Vcpu => "vcpu",
+            Thread::Control => "control",
         }
     }
 }
@@ -211,7 +223,7 @@ pub fn install(thread: Thread) -> io::Result<()> {
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
-    /// Whether this thread installed the `vmm` or `vcpu` filter, through
+    /// Whether this thread installed a filter, through
     /// [`install_thread`] or as the thread that calls `boot`.
     ///
     /// A thread that inherited a filter from the thread that started it reads
@@ -239,15 +251,15 @@ pub(crate) fn is_thread_filtered() -> bool {
     INSTALLED.get()
 }
 
-/// Turns filtering on for the threads spawned after this call, and proves both
-/// filters compile first.
+/// Turns filtering on for the threads spawned after this call, and proves every
+/// filter compiles first.
 ///
 /// Compiling here is the point: it turns "this distro's kernel headers spell a
 /// syscall differently" into a boot error on the thread that calls `boot`,
 /// where it can be reported, instead of a `SIGSYS` inside a device thread later
 /// on.
 pub fn arm() -> io::Result<()> {
-    for thread in [Thread::Vmm, Thread::Vcpu] {
+    for thread in [Thread::Vmm, Thread::Vcpu, Thread::Control] {
         program(thread)?;
     }
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -302,6 +314,98 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
     };
     Ok((count("vmm"), count("vcpu")))
 }
+
+/// Keeps glibc's malloc to its main arena, so no thread under a filter ever
+/// makes it open a file.
+///
+/// Call it before any thread starts. The `hvi` binary does, once its arguments
+/// say the run is confined (a boot or restore without `--no-sandbox`, or
+/// `seccomp-selftest`). An embedder that boots with `sandbox` set calls it
+/// first in its own `main`. A KVM boot or restore with `sandbox` set calls it
+/// again before it starts a thread, but a late call does much less. Every arena
+/// that exists stays in use, and glibc hands an exited thread's arena to the
+/// next thread that needs one, which may be filtered. Nor does it stop new
+/// arenas once glibc has fixed its limit: `arena_get2` keeps the limit in a
+/// static that it sets once, the first time a thread needs a new arena while
+/// more than eight exist. Calling it more than once is harmless.
+///
+/// glibc's malloc opens two files on its own, both from a thread that is
+/// allocating or freeing, and either is a `SIGSYS` under the `vmm` filter,
+/// which allows no `openat`:
+///
+/// - `/sys/devices/system/cpu/online`. A thread that allocates gets an arena of
+///   its own. The first time one needs a new arena while more than `arena_test`
+///   (eight on a 64-bit host) exist, `arena_get2` in `malloc/arena.c` fixes the
+///   arena limit: to `M_ARENA_MAX` when it is set, and otherwise from the CPU
+///   count. It counts them with `__get_nprocs`, which reads this file, in every
+///   glibc except the 2.35 to 2.38 releases as first tagged. Those used
+///   `sched_getaffinity`, which the lists allow, until upstream went back to
+///   `__get_nprocs` (472894d2cfee, BZ 30945, in 2.39 and on the 2.35 to 2.38
+///   release branches, which Debian 12's 2.36 takes).
+/// - `/proc/sys/vm/overcommit_memory`. The first time a heap of an arena other
+///   than the main one shrinks, `shrink_heap` reads it, through
+///   `check_may_shrink_heap` in `malloc-sysdep.h`, in every glibc. Capping the
+///   arenas at any number above one leaves this read in place: with a cap of
+///   four, a guest with heavy agent traffic still killed the VMM within a
+///   minute.
+///
+/// With `M_ARENA_MAX` at 1 before any thread allocates, `arena_get2` takes the
+/// limit from it without counting CPUs, and every thread shares the main
+/// arena. No other arena exists, so no other heap exists to shrink. The main
+/// arena grows and trims with `brk` and `mmap`, which the lists allow.
+/// Nothing else in glibc's malloc opens a file after startup: the hugepage
+/// settings are read in `ptmalloc_init`, before `main`, and only when the
+/// `glibc.malloc.hugetlb` tunable asks for them.
+///
+/// The cost is one malloc lock for the whole process, which the per-thread
+/// cache in front of it softens. That is how the musl build always runs,
+/// since musl's malloc has a single lock. musl has no `mallopt`, and musl
+/// 1.2.5's `src/malloc` opens no file and asks for no CPU count, so there this
+/// does nothing. The selftest's allocation probes check both builds.
+///
+/// macOS needs none of this. Its malloc is not glibc's, and Seatbelt answers
+/// an open outside the profile with an error, not a signal, so a library that
+/// tries one carries on.
+///
+/// # Errors
+///
+/// Errors if glibc refuses the setting.
+pub fn one_malloc_arena() -> io::Result<()> {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: mallopt with a positive arena count; it only stores the
+        // value, under the main arena's lock.
+        let set = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+        if set != 1 {
+            return Err(io::Error::other(
+                "glibc refused to keep malloc to one arena",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Keeps the unit test binary's malloc to one arena from the moment it loads.
+///
+/// The tests boot confined runs inside the test binary, whose harness starts
+/// threads, and with them arenas, before a test can call
+/// [`one_malloc_arena`]. Set that late, the cap makes later threads share
+/// those arenas, and a confined thread that exits can be the first to shrink
+/// one of their heaps, read `/proc/sys/vm/overcommit_memory` and die of the
+/// filter. A ledger writer that confines itself and ends with its run was
+/// one. The entry runs before `main`, as `hvi`'s `main` sets the cap before
+/// its first thread.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static ONE_ARENA_IN_TESTS: extern "C" fn() = {
+    extern "C" fn one_arena() {
+        // SAFETY: mallopt with a positive arena count, before any thread
+        // exists; it only stores the value.
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+    }
+    one_arena
+};
 
 /// The seccomp filters of a run, compiled before its I/O and vCPU threads
 /// start.
@@ -606,6 +710,51 @@ fn probes() -> Vec<Probe> {
                 let _ = std::thread::spawn(|| 0u8).join();
             },
         },
+        Probe {
+            what: "create a socket (control)",
+            thread: Thread::Control,
+            expect_ok: false,
+            // SAFETY: socket(2) with constant arguments.
+            run: || {
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            },
+        },
+        // A checkpoint on the control socket's thread: the real bundle writer
+        // and reader, over guest RAM mapped before the filter went in.
+        Probe {
+            what: "write and verify a checkpoint bundle (control)",
+            thread: Thread::Control,
+            expect_ok: true,
+            run: probe_bundle_round_trip,
+        },
+        Probe {
+            what: "write a checkpoint bundle (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: false,
+            run: probe_bundle_round_trip,
+        },
+        // The two files glibc's malloc opens by itself, from whichever thread
+        // allocates or frees (`one_malloc_arena` has the detail). A guest
+        // with busy agent traffic reached both, and the VMM died of SIGSYS
+        // mid-run. Each probe fails unless malloc is kept to one arena, as
+        // `hvi seccomp-selftest` does before it forks them.
+        //
+        // More than eight threads holding arenas at once: glibc's next arena
+        // decision reads /sys/devices/system/cpu/online.
+        Probe {
+            what: "allocate on many threads at once (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            run: probe_many_arenas,
+        },
+        // A thread's own arena giving memory back: the first shrink of its
+        // heap reads /proc/sys/vm/overcommit_memory.
+        Probe {
+            what: "free a thread's heap memory (vmm)",
+            thread: Thread::Vmm,
+            expect_ok: true,
+            run: probe_heap_shrink,
+        },
         // The ledger writer sleeps under the vmm filter before it tries a
         // failed write again. Which syscall a sleep reaches depends on std and
         // the libc.
@@ -618,6 +767,123 @@ fn probes() -> Vec<Probe> {
             },
         },
     ]
+}
+
+/// Guest RAM mapped by the selftest before it forks a probe, for the probes
+/// that write a bundle: a mapping cannot be made under the filters.
+static PROBE_RAM: std::sync::OnceLock<crate::memory::GuestRam> = std::sync::OnceLock::new();
+
+/// The profile the bundle probes record, made before the fork for the same
+/// reason: reading the host's facts needs calls no filter allows.
+static PROBE_PROFILE: std::sync::OnceLock<crate::checkpoint::profile::MachineProfile> =
+    std::sync::OnceLock::new();
+
+/// The exit code of a bundle probe whose round trip failed without a trap.
+const BUNDLE_PROBE_FAILED: i32 = 96;
+
+/// Writes, verifies and removes a bundle of [`PROBE_RAM`] under the temp dir.
+///
+/// A round trip that fails without a trap exits the child with
+/// [`BUNDLE_PROBE_FAILED`], which the runner counts as a mismatch either
+/// way. Ignoring the error let the `control` probe match when an early
+/// `mkdirat` or `openat` failed with `EEXIST` or `EACCES`, so the writer's
+/// later calls never ran and one missing from the filter went unseen.
+fn probe_bundle_round_trip() {
+    let result = match (PROBE_RAM.get(), PROBE_PROFILE.get()) {
+        (Some(ram), Some(profile)) => {
+            let name = format!("hvi-seccomp-bundle-{}", std::process::id());
+            crate::checkpoint::bundle::selftest_round_trip(
+                &std::env::temp_dir(),
+                &name,
+                ram,
+                profile,
+            )
+        }
+        _ => Err(io::Error::other("no guest RAM or profile was made")),
+    };
+    if let Err(e) = result {
+        eprintln!("  (the bundle round trip failed: {e})");
+        // SAFETY: terminating the forked child without running destructors.
+        unsafe { libc::_exit(BUNDLE_PROBE_FAILED) };
+    }
+}
+
+/// Threads the many-arenas probe keeps alive at once. glibc decides its arena
+/// limit when a thread needs a new arena and more than `arena_test` exist, and
+/// `arena_test` is eight on a 64-bit host whatever its core count, so 32 gets
+/// past it on any host.
+const ARENA_PROBE_THREADS: usize = 32;
+
+/// Spawns [`ARENA_PROBE_THREADS`] threads that each allocate and touch a small
+/// buffer and a 1 MiB one, and hold both until every thread has, so no arena
+/// goes back to glibc's free list for the next thread to reuse.
+fn probe_many_arenas() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(ARENA_PROBE_THREADS));
+    let threads: Vec<_> = (0..ARENA_PROBE_THREADS)
+        .map(|i| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // A nonzero fill, so the allocation is written to and does not
+                // come from calloc's already-zero pages.
+                let fill = u8::try_from(i % 255).unwrap_or(0) + 1;
+                let small = vec![fill; 4096];
+                let big = vec![fill; 1 << 20];
+                barrier.wait();
+                std::hint::black_box((&small, &big));
+            })
+        })
+        .collect();
+    for thread in threads {
+        let _ = thread.join();
+    }
+}
+
+/// The mmap and trim thresholds the heap-shrink probe pins: 128 KiB, glibc's
+/// default for both.
+#[cfg(target_env = "gnu")]
+const SHRINK_PROBE_THRESHOLD: libc::c_int = 128 << 10;
+
+/// The exit code of a heap-shrink probe whose thresholds glibc refused.
+#[cfg(target_env = "gnu")]
+const SHRINK_PROBE_UNPINNED: i32 = 95;
+
+/// Allocates 16 MiB on a new thread in 64 KiB pieces, under the mmap threshold
+/// so they come from the thread's arena, and frees them newest first. Each free
+/// joins the top of the heap, and once that top passes the trim threshold glibc
+/// shrinks the heap. In an arena other than the main one, that shrink is where
+/// it reads the overcommit setting.
+///
+/// The probe means nothing unless 64 KiB stays under the mmap threshold and
+/// 16 MiB passes the trim threshold. Both are process state that can move:
+/// glibc raises the mmap threshold when the selftest's parent frees a mapped
+/// chunk, and `GLIBC_TUNABLES` can set either. With the trim threshold at
+/// 32 MiB or the mmap threshold at 32 KiB, the probe ran without ever
+/// shrinking a heap and passed on code that has the bug. So the child pins
+/// both first. `mallopt` also turns off glibc's moving threshold, and it makes
+/// no syscall, so it works under the filter.
+fn probe_heap_shrink() {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: mallopt with positive sizes; it only stores them, under the
+        // main arena's lock.
+        let pinned = unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, SHRINK_PROBE_THRESHOLD) == 1
+                && libc::mallopt(libc::M_TRIM_THRESHOLD, SHRINK_PROBE_THRESHOLD) == 1
+        };
+        if !pinned {
+            eprintln!("  (glibc refused the probe's malloc thresholds)");
+            // SAFETY: terminating the forked child without running destructors.
+            unsafe { libc::_exit(SHRINK_PROBE_UNPINNED) };
+        }
+    }
+    let _ = std::thread::spawn(|| {
+        let mut pieces: Vec<Vec<u8>> = (0..256).map(|_| vec![1u8; 64 << 10]).collect();
+        while let Some(piece) = pieces.pop() {
+            std::hint::black_box(&piece);
+            drop(piece);
+        }
+    })
+    .join();
 }
 
 /// Result of running one probe in a child process.
@@ -702,6 +968,14 @@ pub fn selftest() -> io::Result<usize> {
     }
     let (vmm, vcpu) = allowed_counts()?;
     println!("hvi seccomp selftest: vmm allows {vmm} syscalls, vcpu allows {vcpu}");
+    let shared = crate::memory::SharedRam::new(crate::memory::RamRegion::ALIGN as usize)?;
+    let _ = PROBE_RAM.set(crate::memory::GuestRam::new(
+        &shared,
+        &[shared.region_at(0)],
+    )?);
+    let _ = PROBE_PROFILE.set(crate::checkpoint::profile::MachineProfile::for_this_host(
+        "aarch64", "selftest",
+    ));
     println!("hvi seccomp selftest: each probe runs in a child that installs the real filter\n");
 
     let mut bad = 0usize;
@@ -729,6 +1003,9 @@ pub fn selftest() -> io::Result<usize> {
         let actual = match outcome {
             Outcome::Allowed => "ran".to_string(),
             Outcome::Trapped => "killed by SIGSYS".to_string(),
+            Outcome::Other(s) if s == BUNDLE_PROBE_FAILED << 8 => {
+                "exited: the bundle round trip failed".to_string()
+            }
             Outcome::Other(s) => format!("unexpected wait status {s:#x}"),
         };
         println!(
@@ -750,7 +1027,7 @@ mod tests {
     /// is a test failure on any Linux host.
     #[test]
     fn filters_compile_for_this_arch() {
-        for thread in [Thread::Vmm, Thread::Vcpu] {
+        for thread in [Thread::Vmm, Thread::Vcpu, Thread::Control] {
             let p = program(thread).expect("filter should compile");
             assert!(!p.is_empty(), "{:?} compiled to an empty program", thread);
         }
@@ -761,7 +1038,7 @@ mod tests {
     #[test]
     fn filters_trap_on_mismatch() {
         let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        for key in ["vmm", "vcpu"] {
+        for key in ["vmm", "vcpu", "control"] {
             assert_eq!(
                 doc[key]["default_action"], "trap",
                 "{key} must trap on a syscall outside its list"
@@ -790,6 +1067,55 @@ mod tests {
         let extra: Vec<_> = vcpu.difference(&vmm).collect();
         assert!(extra.is_empty(), "vcpu allows what vmm does not: {extra:?}");
         assert!(vcpu.len() < vmm.len(), "vcpu should be the tighter filter");
+    }
+
+    /// The control filter is `vmm` and the file calls of a bundle, nothing
+    /// else, so a right granted there for another reason stands out, and it
+    /// never gains what would let the thread reach the network or another
+    /// program.
+    #[test]
+    fn control_is_vmm_plus_the_bundle_file_calls() {
+        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
+        let names = |k: &str| -> std::collections::BTreeSet<String> {
+            doc[k]["filter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["syscall"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (vmm, control) = (names("vmm"), names("control"));
+        assert!(vmm.is_subset(&control), "control lacks part of vmm");
+        let file_calls = [
+            "openat",
+            "open",
+            "mkdir",
+            "mkdirat",
+            "rename",
+            "renameat",
+            "renameat2",
+            "unlink",
+            "unlinkat",
+            "rmdir",
+            "newfstatat",
+            "lstat",
+            "statx",
+            "fstat",
+            "getdents64",
+            "readlink",
+            "readlinkat",
+        ];
+        for extra in control.difference(&vmm) {
+            assert!(
+                file_calls.contains(&extra.as_str()),
+                "control allows {extra}, which writing a bundle does not need"
+            );
+        }
+        for forbidden in [
+            "socket", "connect", "execve", "execveat", "ptrace", "seccomp", "prctl",
+        ] {
+            assert!(!control.contains(forbidden), "control allows {forbidden}");
+        }
     }
 
     /// The point of installing after setup is that the process can no longer

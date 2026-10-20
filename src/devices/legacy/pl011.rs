@@ -27,7 +27,10 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::state::{check_version, invalid};
 use crate::terminal::ConsoleFilter;
 
 /// Data register: reads pop the RX FIFO, writes are console bytes.
@@ -53,6 +56,45 @@ const INT_RX: u32 = 1 << 4;
 
 /// Bound so a host that pastes a lot cannot grow the FIFO without limit.
 const RX_CAP: usize = 4096;
+
+/// The [`Pl011State`] format this build writes and reads.
+pub const PL011_STATE_VERSION: u32 = 1;
+
+/// What a checkpoint keeps of the PL011: the bytes the guest has not read and
+/// the interrupt mask.
+///
+/// Transmit is synchronous, so no byte waits on the way out. The console
+/// filter's place in an escape sequence the guest was writing is the host
+/// terminal's, and a restore starts the filter afresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pl011State {
+    /// [`PL011_STATE_VERSION`] when written by this build.
+    pub version: u32,
+    /// Received bytes the guest has not read, oldest first.
+    pub rx: Vec<u8>,
+    /// The interrupt mask (`IMSC`).
+    pub imsc: u32,
+}
+
+impl Pl011State {
+    /// Refuses a state this build could not restore.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version or holds more bytes than
+    /// the FIFO keeps.
+    pub fn check(&self) -> std::io::Result<()> {
+        check_version("pl011", self.version, PL011_STATE_VERSION)?;
+        if self.rx.len() > RX_CAP {
+            return Err(invalid(format_args!(
+                "pl011 holds {} received bytes, the FIFO keeps {RX_CAP}",
+                self.rx.len()
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// A PL011 modelling console TX plus an interrupt-driven RX FIFO.
 pub struct Pl011 {
@@ -81,11 +123,53 @@ impl Pl011 {
         }
     }
 
-    /// Connects the UART to the interrupt line it raises.
+    /// Connects the UART to the interrupt line it raises, and sets the line
+    /// to the UART's level.
+    ///
+    /// A UART built at boot holds no byte, so the line stays low. A restored
+    /// one may hold bytes the guest has not read with RX unmasked, and a line
+    /// left low over them is input the guest never reads.
     // Only the arm64 backends attach a PL011.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
+        self.irq.set(self.irq_level());
+    }
+
+    /// Sets the interrupt line to the device's level, whatever it was last
+    /// set to, after a restore loaded the interrupt controller. See
+    /// `Irq::redrive`.
+    // Only the arm64 backends attach a PL011.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn redrive_irq(&mut self) {
+        self.irq.redrive(self.irq_level());
+    }
+
+    /// Returns what a checkpoint keeps of the UART.
+    #[must_use]
+    pub fn state(&self) -> Pl011State {
+        Pl011State {
+            version: PL011_STATE_VERSION,
+            rx: self.rx.iter().copied().collect(),
+            imsc: self.imsc,
+        }
+    }
+
+    /// Rebuilds the UART a checkpoint describes. The interrupt line is
+    /// connected afterwards, as at boot, and connecting it asserts it when
+    /// unread bytes wait with RX unmasked.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the state is of another version or holds more bytes than
+    /// the FIFO keeps.
+    pub fn restore(state: &Pl011State) -> std::io::Result<Self> {
+        state.check()?;
+        Ok(Pl011 {
+            rx: state.rx.iter().copied().collect(),
+            imsc: state.imsc,
+            ..Pl011::new()
+        })
     }
 
     /// Queues a received byte (from the host). Drops it if the FIFO is full.
@@ -183,4 +267,82 @@ pub fn id_reg(offset: u64) -> Option<u64> {
         .iter()
         .find(|&&(off, _)| off == offset)
         .map(|&(_, v)| u64::from(v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::irq::test_line::LevelLine;
+
+    #[test]
+    fn state_round_trips_through_json_and_a_restored_uart() {
+        let mut uart = Pl011::new();
+        uart.mmio(IMSC, true, u64::from(INT_RX));
+        for b in *b"hi" {
+            uart.push_rx(b);
+        }
+        let state = uart.state();
+        let json = serde_json::to_string(&state).unwrap();
+        // The shape is the format other builds read, so it is pinned.
+        assert_eq!(json, r#"{"version":1,"rx":[104,105],"imsc":16}"#);
+        let back: Pl011State = serde_json::from_str(&json).unwrap();
+        let mut restored = Pl011::restore(&back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(restored.mmio(DR, false, 0), u64::from(b'h'));
+    }
+
+    #[test]
+    fn connecting_a_restored_uart_drives_its_line_from_its_fifo() {
+        let pending = Pl011State {
+            version: PL011_STATE_VERSION,
+            rx: b"x".to_vec(),
+            imsc: INT_RX,
+        };
+        let mut uart = Pl011::restore(&pending).unwrap();
+        let line = Arc::new(LevelLine::default());
+        uart.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        assert!(line.is_high());
+        assert_eq!(line.raises(), 1);
+
+        // Bytes with RX masked, and an unmasked empty FIFO, both leave the
+        // line low.
+        for quiet in [
+            Pl011State {
+                imsc: 0,
+                ..pending.clone()
+            },
+            Pl011State {
+                rx: Vec::new(),
+                ..pending.clone()
+            },
+        ] {
+            let mut uart = Pl011::restore(&quiet).unwrap();
+            let line = Arc::new(LevelLine::default());
+            uart.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+            assert_eq!(line.sets(), 0);
+        }
+    }
+
+    #[test]
+    fn state_the_uart_could_not_hold_is_refused() {
+        let full = Pl011State {
+            version: PL011_STATE_VERSION,
+            rx: vec![0; RX_CAP],
+            imsc: 0,
+        };
+        assert!(Pl011::restore(&full).is_ok());
+        for bad in [
+            Pl011State {
+                rx: vec![0; RX_CAP + 1],
+                ..full.clone()
+            },
+            Pl011State {
+                version: 2,
+                ..full.clone()
+            },
+        ] {
+            let err = Pl011::restore(&bad).err();
+            assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+        }
+    }
 }

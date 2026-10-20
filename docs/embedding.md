@@ -38,9 +38,10 @@ tell one failure from another, and `BootError::into_inner` hands it over.
 
 `Stop` says how the run ended. `SystemOff` and `SystemReset` mean the guest
 powered off or reset. `Requested` means the host asked the run to stop (see
-[Stopping a run from the host](#stopping-a-run-from-the-host)). It is
-`#[non_exhaustive]`, so a `match` on it needs a wildcard arm. When a vCPU fails,
-`boot` returns an error that names the vCPU and says how it failed.
+[Stopping a run from the host](#stopping-a-run-from-the-host)), or that the
+control socket's `stop` ended it. It is `#[non_exhaustive]`, so a `match` on it
+needs a wildcard arm. When a vCPU fails, `boot` returns an error that names the
+vCPU and says how it failed.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,
@@ -57,13 +58,14 @@ installs a no-op handler for it and does not restore the one it replaced. It
 sends that signal to its own threads to interrupt them, so nothing else in the
 process should use it.
 
-Before it returns, the ledger is closed, the agent listener and every accepted
-agent connection are closed, and every thread it started itself has exited, with
-three exceptions. A thread still running at its deadline is left running and
-`boot` returns an error naming the first such thread, a vCPU thread before a
-helper thread. The thread that receives the stop signals runs for the life of
-the process (see [Stopping a run from the host](#stopping-a-run-from-the-host)).
-The ledger's writer thread is not joined. `boot` waits up to one second for the
+Before it returns, the ledger is closed, the agent listener, the control socket
+and every accepted connection are closed, and every thread it started itself has
+exited, with three exceptions. A thread still running at its deadline is left
+running and `boot` returns an error naming the first such thread, a vCPU thread
+before a helper thread. The thread that receives the stop signals runs for the
+life of the process (see [Stopping a run from the
+host](#stopping-a-run-from-the-host)). The ledger's writer thread is not
+joined. `boot` waits up to one second for the
 vCPU threads, then up to one second for the helper threads, and then up to one
 second for the writer to write the `vmm.stop` record, so it returns at most
 three seconds after the stop, with no error for a writer still in a write. The
@@ -92,10 +94,25 @@ allows one VM per process. On either host the handle also holds the disks' image
 locks, so a second `boot` on the same writable image fails with "the image is
 open elsewhere" while it lives.
 
+On macOS the crate root also exports `hvi::restore`, which resumes a
+checkpoint bundle instead of booting a kernel:
+
+```rust
+pub fn restore(cfg: RestoreConfig) -> Result<Stop, Box<dyn std::error::Error>>;
+```
+
+`RestoreConfig` names the bundle, the control socket the guest waits on for
+`resume`, and the host resources the guest's devices need. It returns as
+`boot` does, and the same rules apply to stdin, the kick signal and the
+threads. A restore is a run like a boot: it takes the process's one run, a
+panic during it writes its `vmm.stop` record as [Panics](#panics) says, and
+the sandbox rules that refuse a later `boot` refuse a later restore too. See [checkpoint.md](checkpoint.md#restoring-a-bundle). On arm64
+KVM it restores the portable profile only; there is no x86-64 restore yet.
+
 ## A minimal caller
 
 ```rust
-use hvi::config::BootConfig;
+use hvi::config::{BootConfig, MachineProfileKind};
 
 let cfg = BootConfig {
     kernel: std::fs::read("Image")?,
@@ -103,6 +120,8 @@ let cfg = BootConfig {
     mem_bytes: 1024 << 20,
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
     disks: Vec::new(),
+    disk_base_sha256: None,
+    disk_written: None,
     fs_shares: Vec::new(),
     fs: Vec::new(),
     net: true,
@@ -113,8 +132,13 @@ let cfg = BootConfig {
     sandbox_id: String::from("my-sandbox"),
     vcpus: 2,
     agent_sock: None,
+    profile_out: None,
+    control_sock: None,
+    checkpoint_root: None,
     plugin: None,
     sandbox: true,
+    profile: MachineProfileKind::Native,
+    arch_timer_irq: None,
     stop: None,
 };
 
@@ -141,9 +165,9 @@ cargo build --release --example watch_guest
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
-| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
-| `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
-| `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
+| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. More than one **fails the boot** under `PortableArm64V1`, and a checkpoint or a move takes a guest of exactly one writable disk. |
+| `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. A non-empty vector **fails the boot** under `PortableArm64V1`. |
+| `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. A non-empty vector **fails the boot** under `PortableArm64V1`. |
 | `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |
@@ -152,8 +176,13 @@ cargo build --release --example watch_guest
 | `sandbox_id` | `String` | Written into every ledger record. |
 | `vcpus` | `u32` | 1 or more. Linux/arm64 refuses more than 8 on a GICv2 host and more than 507 on a GICv3 one, and x86-64 more than 254. |
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
+| `profile_out` | `Option<String>` | Where the machine profile is written. Created before confinement. See [cli.md](cli.md#the-control-socket). |
+| `control_sock` | `Option<String>` | The control socket's path. Bound before confinement. See [cli.md](cli.md#the-control-socket). |
+| `checkpoint_root` | `Option<String>` | The directory a `checkpoint` may write bundles under; `None` refuses every checkpoint. Resolved before confinement. Seatbelt holds writes to it on macOS; on Linux only hvi's own path check does. One private root (mode 0700) per sandbox: bundles hold guest RAM in clear. Needs `control_sock`. See [checkpoint.md](checkpoint.md#confinement). |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |
+| `profile` | `MachineProfileKind` | `Native`, or `PortableArm64V1` for one machine on every host: macOS and arm64 KVM. See [portable-profile.md](portable-profile.md). |
+| `arch_timer_irq` | `Option<bool>` | Leave it `None`, the profile's default: interrupts on the native profile, none on the portable one, whose clock is `hvi-time`. `Some(true)` is the `--arch-timer-irq` debugging aid, and only `PortableArm64V1` accepts a value. |
 | `stop` | `Option<StopRegistration>` | Asks the run to stop from the host. See [Stopping a run from the host](#stopping-a-run-from-the-host). |
 
 `FsShare` carries a `path`, a `tag`, a `ShareMode`, a `CachePolicy` and the
@@ -310,7 +339,32 @@ the sandbox the process ends by `SIGSYS`.
 
 ## Configuration outside `BootConfig`
 
-One thing a caller sets is not in the struct.
+Two things a caller sets are not in the struct. Both matter.
+
+**glibc's malloc on Linux.** An embedder that boots with `sandbox: true` must
+call `hvi::sandbox::seccomp::one_malloc_arena()` first in its own `main`, before
+it starts any thread:
+
+```rust
+#[cfg(target_os = "linux")]
+if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
+    eprintln!("{e}");
+    std::process::exit(1);
+}
+```
+
+The `seccomp` module exists on Linux only, hence the `cfg`. On musl the call
+does nothing. Without it, glibc's malloc can open a file from a filtered
+thread, and the seccomp filter kills the process with `SIGSYS`. A confined KVM
+boot sets the same thing before it starts a thread, but by then it may do
+little. An arena one of your threads already made stays in use, and glibc can
+hand it to a filtered thread. If one of your threads has needed a new arena
+while more than eight existed, glibc has also fixed its arena limit, and
+ignores the setting. The setting is process-wide, so your own threads share the
+one arena too. The `hvi` binary and
+[`examples/watch_guest.rs`](../examples/watch_guest.rs) both make this call.
+See [the allowlists'
+README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself).
 
 **Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE` and `HVI_X86_TRACE`
 are read from the process environment, not from `BootConfig`. An embedder that

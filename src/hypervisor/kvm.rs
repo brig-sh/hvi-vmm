@@ -31,6 +31,10 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
+use crate::checkpoint::capture::Console;
+use crate::checkpoint::cpu::{Output, Work};
+use crate::checkpoint::profile::ProfileCell;
+use crate::checkpoint::server::ControlSocket;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::vsock::VsockBridge;
@@ -208,31 +212,81 @@ impl Drop for Registration<'_> {
     }
 }
 
+/// What [`start_io_threads`] needs of a boot's or a restore's
+/// configuration.
+pub(crate) struct IoConfig<'a> {
+    /// The plugin, which attaches before anything runs.
+    pub(crate) plugin: Option<Arc<dyn Plugin>>,
+    /// Whether to confine the threads.
+    pub(crate) sandbox: bool,
+    /// The agent socket to bind.
+    pub(crate) agent_sock: Option<&'a str>,
+    /// The control socket to bind.
+    pub(crate) control_sock: Option<&'a str>,
+    /// The checkpoint root of the control socket.
+    pub(crate) checkpoint_root: Option<&'a str>,
+    /// The path of disk 0, which a capture records: a checkpoint carries
+    /// one disk.
+    pub(crate) disk: Option<String>,
+    /// Whether the guest is one `hvi restore` built: the I/O threads start
+    /// held at the gate, and the control socket reports the VM
+    /// restored-paused until a client resumes it.
+    pub(crate) restored: bool,
+}
+
+impl<'a> From<&'a BootConfig> for IoConfig<'a> {
+    fn from(cfg: &'a BootConfig) -> Self {
+        Self {
+            plugin: cfg.plugin.clone(),
+            sandbox: cfg.sandbox,
+            agent_sock: cfg.agent_sock.as_deref(),
+            control_sock: cfg.control_sock.as_deref(),
+            checkpoint_root: cfg.checkpoint_root.as_deref(),
+            disk: cfg.disks.first().map(|disk| disk.path.clone()),
+            restored: false,
+        }
+    }
+}
+
 /// Starts what runs beside a KVM backend's vCPUs, in the order its seccomp
 /// confinement needs.
 ///
-/// The plugin attaches to the guest before anything runs. The filters are armed
-/// before the first I/O or vCPU thread exists, and a binary's stop-signal
-/// thread starts right after. The agent socket and the stop source's socket
-/// pair are created before any filter goes in, since the allowlists allow
-/// accepting on a listener already held but not creating one. Then the I/O
-/// threads start, with the threads the plugin asked for, each filtering itself
-/// as it begins. It also returns the ledger's [`LedgerCloseGuard`].
+/// A confined run first keeps glibc's malloc to one arena (see
+/// [`seccomp::one_malloc_arena`]). The plugin attaches to the guest before
+/// anything runs. The filters are armed before the first I/O or vCPU thread
+/// exists, and a binary's stop-signal thread starts right after. The agent
+/// socket, the control socket and the stop source's socket pair are created
+/// before any filter goes in, since the allowlists allow accepting on a
+/// listener already held but not creating one. Then the I/O threads start,
+/// with the threads the plugin asked for, each filtering itself as it begins.
+/// The control socket reports `profile`, and a checkpoint captures `console`
+/// beside the guest's virtio devices. It also returns the ledger's
+/// [`LedgerCloseGuard`].
 ///
 /// # Errors
 ///
-/// Errors if the plugin refuses the guest, a filter does not compile, the
-/// stop-signal thread cannot be started or its handlers installed, the agent
-/// socket cannot be bound or the stop source cannot be created.
+/// Errors if glibc refuses the one-arena setting, the plugin refuses the
+/// guest, a filter does not compile, the stop-signal thread cannot be started
+/// or its handlers installed, a socket cannot be bound or the stop source
+/// cannot be created.
 pub(crate) fn start_io_threads(
-    cfg: &BootConfig,
+    cfg: &IoConfig<'_>,
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
     net: Option<NetSource>,
+    profile: Arc<ProfileCell>,
+    console: Console,
 ) -> Result<
     (seccomp::Filters, IoThreads<Kicker>, LedgerCloseGuard),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    // Before `attach`, which may start a thread. The `hvi` binary has set this
+    // already. For an embedder that has not, it is a partial fallback: arenas
+    // its own threads made stay in use, and glibc ignores the setting once it
+    // has fixed its arena limit. So the embedder must call it first in `main`.
+    if cfg.sandbox {
+        seccomp::one_malloc_arena()?;
+    }
     let (plugin_threads, ledger_guard) = guest.attach(cfg.plugin.as_ref())?;
     let filters = seccomp::Filters::arm(cfg.sandbox)?;
     // A binary's stop signals get their handlers, and the thread that receives
@@ -241,7 +295,7 @@ pub(crate) fn start_io_threads(
     // first stop signal stops the run rather than ending the process with the
     // terminal raw.
     crate::signal::start_stop_signal_thread()?;
-    let bridge = match (&cfg.agent_sock, &guest.vsock) {
+    let bridge = match (cfg.agent_sock, &guest.vsock) {
         (Some(path), Some(dev)) => Some(VsockBridge::bind(
             path,
             Arc::clone(dev),
@@ -249,7 +303,27 @@ pub(crate) fn start_io_threads(
         )?),
         _ => None,
     };
+    let control = cfg
+        .control_sock
+        .map(|path| {
+            ControlSocket::bind(path, profile, cfg.checkpoint_root).map(|control| {
+                let control = control.capturing("kvm", cfg.disk.clone(), console);
+                if cfg.restored {
+                    control.restored()
+                } else {
+                    control
+                }
+            })
+        })
+        .transpose()?;
     let source = StopSource::new()?;
+    if cfg.restored {
+        // No I/O thread runs, so nothing is inside the gate.
+        source
+            .gate()
+            .pause(std::time::Duration::ZERO)
+            .map_err(|inside| format!("{inside} I/O thread(s) inside the gate before any ran"))?;
+    }
     let io_threads = IoThreads::start(
         source,
         guest,
@@ -257,6 +331,7 @@ pub(crate) fn start_io_threads(
         deliver,
         bridge,
         net,
+        control,
         plugin_threads,
     );
     Ok((filters, io_threads, ledger_guard))
@@ -310,26 +385,32 @@ pub(crate) fn run_guest<S: Clone + Send + 'static>(
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_to_stop` returned it.
-    run_to_stop(guest, threads, failure, io_threads)
+    run_to_stop(guest, threads, failure, Some(io_threads))
 }
 
 /// Runs vCPU `cpu` on the calling thread until the VM stops.
 ///
 /// Each pass clears the vCPU's `immediate_exit` byte, checks the running flag,
 /// parks at the quiesce checkpoint, lets `plugin` look at the guest from the
-/// boot vCPU, and then enters the guest once. The exits both KVM backends treat
-/// the same are serviced here: a PSCI system event is how the guest asked to
-/// stop, and an entry failure, an internal error and a `KVM_RUN` error are
-/// failures. Every other exit goes to `handle_exit`, which services it and
-/// returns `ControlFlow::Break` with the run's outcome to end the loop. A run a
-/// kick cut short reaches it as [`VcpuExit::Intr`]. A break reports its outcome
-/// through [`Vcpus::report`](crate::hypervisor::vcpus::Vcpus::report).
+/// boot vCPU, runs `before_entry`, and then enters the guest once. The exits
+/// both KVM backends treat the same are serviced here: a PSCI system event is
+/// how the guest asked to stop, and an entry failure, an internal error and a
+/// `KVM_RUN` error are failures. Every other exit goes to `handle_exit`, which
+/// services it and returns `ControlFlow::Break` with the run's outcome to end
+/// the loop. A run a kick cut short reaches it as [`VcpuExit::Intr`]. A break,
+/// from `before_entry` as from `handle_exit`, reports its outcome through
+/// [`Vcpus::report`](crate::hypervisor::vcpus::Vcpus::report). `serve` does
+/// the work the control socket asks of a parked vCPU, on this thread.
+// The three closures are the backend's parts of the one loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_vcpu(
     cpu: u32,
     mut vcpu: VcpuFd,
     kick_handle: VcpuFd,
     guest: &Guest<Kicker>,
     plugin: Option<&dyn Plugin>,
+    mut serve: impl FnMut(&VcpuFd, Work<'_>) -> std::io::Result<Option<Output>>,
+    mut before_entry: impl FnMut() -> ControlFlow<Outcome>,
     mut handle_exit: impl FnMut(VcpuExit<'_>) -> ControlFlow<Outcome>,
 ) {
     // The vCPU filter goes in before this thread touches anything the guest
@@ -360,8 +441,13 @@ pub(crate) fn run_vcpu(
             break;
         }
         // Safe point for every vCPU: park here while vcpu0 lets a plugin look
-        // at the guest.
-        guest.pass_safepoint(&vcpu, plugin);
+        // at the guest, or the control socket captures it, doing on this
+        // thread the work only it can.
+        guest.pass_safepoint(&vcpu, cpu, plugin, |work| serve(&vcpu, work));
+        if let ControlFlow::Break(outcome) = before_entry() {
+            guest.vcpus.report(outcome);
+            break;
+        }
         let run = vcpu.run();
         ran.set(true);
         let flow = match run {
@@ -439,7 +525,7 @@ pub(crate) fn kick_handle(vm: &VmFd, vcpu: &VcpuFd) -> std::io::Result<VcpuFd> {
 #[allow(clippy::disallowed_methods)]
 mod stop_tests {
     use super::*;
-    use crate::config::BootConfig;
+    use crate::config::{BootConfig, MachineProfileKind};
     use crate::plugin::{CpuHandle, VmHandle};
     use crate::run::StopHandle;
     use crate::signal::install_kick_handler;
@@ -551,6 +637,8 @@ mod stop_tests {
             mem_bytes: 128 << 20,
             cmdline: String::new(),
             disks: Vec::new(),
+            disk_base_sha256: None,
+            disk_written: None,
             fs_shares: Vec::new(),
             fs: Vec::new(),
             net: false,
@@ -561,8 +649,13 @@ mod stop_tests {
             sandbox_id: "stop-test".to_string(),
             vcpus: 2,
             agent_sock: None,
+            profile_out: None,
+            control_sock: None,
+            checkpoint_root: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
+            profile: MachineProfileKind::Native,
+            arch_timer_irq: None,
             stop: None,
         }
     }

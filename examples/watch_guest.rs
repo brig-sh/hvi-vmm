@@ -30,6 +30,12 @@
 //!
 //! On Linux the signing step does not apply; the binary needs `/dev/kvm`.
 //!
+//! On Linux, `main` first calls `hvi::sandbox::seccomp::one_malloc_arena()`,
+//! before any thread starts. Keep that call when you copy this file. It boots
+//! with `sandbox: true`, and without the call glibc's malloc can open a file
+//! from a filtered thread, which the seccomp filter answers by killing the
+//! process with `SIGSYS`.
+//!
 //! It demonstrates the six rules that fail quietly:
 //!
 //! 1. `safepoint` runs between guest entries, so the nothing-to-do case is one
@@ -55,7 +61,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use hvi::config::BootConfig;
+use hvi::config::{BootConfig, MachineProfileKind};
 use hvi::plugin::{CpuHandle, IoSink, Plugin, VmHandle};
 
 /// Counts what crosses the devices. Shared with the vCPU thread, so every field
@@ -196,6 +202,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         mem_bytes: 512 << 20,
         cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
         disks: Vec::new(),
+        disk_base_sha256: None,
+        disk_written: None,
         fs_shares: Vec::new(),
         fs: Vec::new(),
         net: true,
@@ -206,8 +214,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sandbox_id: String::from("watch-guest"),
         vcpus: 1,
         agent_sock: None,
+        profile_out: None,
+        control_sock: None,
+        checkpoint_root: None,
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,
+        profile: MachineProfileKind::Native,
+        arch_timer_irq: None,
         stop: None,
     };
 
@@ -217,6 +230,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // First, while this is the only thread: the boot below is confined, and
+    // glibc's malloc must stay on one arena under the seccomp filters.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = hvi::sandbox::seccomp::one_malloc_arena() {
+        eprintln!("watch_guest: {e}");
+        std::process::exit(1);
+    }
     // The example builds with the crate's profiles, which abort on a panic, so
     // it installs the hook that restores the terminal and records the panic.
     hvi::run::set_panic_hook();

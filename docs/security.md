@@ -26,7 +26,7 @@ Everything a hostile guest can touch, it touches through hvi:
 
 | Surface | Exposure |
 | --- | --- |
-| virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. |
+| virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. virtio-blk's descriptor chains are parsed on its worker thread, under the `vmm` filter. |
 | Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. |
 | virtio-blk backing file | Whatever `--disk` names. |
 | virtio-fs shares | The exported tree, read-only or read-write. |
@@ -72,6 +72,24 @@ rule for `file-ioctl` on `/dev/tty`, plus one rule per virtio-fs export by
 resolved root path: `file-read*` for a read-only share, `file-read* file-write*`
 for a writable one.
 
+A run started with `--checkpoint-root` adds one more subtree rule,
+`file-read* file-write*` below the resolved root, so the control socket's
+thread can write checkpoint bundles there. The whole process gets it, as with an
+export. Nothing else outside the exports can be written.
+
+Because the rule is process-wide, a compromised hvi can read and write every
+bundle below its root from any thread, and a bundle holds the guest's RAM in
+clear. Give each hvi process a root of its own, mode 0700, and never share one
+between sandboxes.
+
+`hvi restore` enters the same profile, and reads the whole bundle before it
+does: the manifest and every document, and guest RAM, which it copies into the
+VM. The confined process opens no bundle file, so a restore needs no rule a
+boot does not have. The reader checks every count and size in the bundle
+before it allocates by it, and every hash before it uses a byte. A bundle is
+still a whole guest: its RAM and registers run as the guest. Restore only
+bundles from a source you would run that guest from.
+
 A writable export adds one more: `system-fsctl` for the single command
 `FSIOC_SYNC_VOLUME`, which is how SYNCFS writes out the export's volume
 (`sync_volume_np(3)`). It is a command filter, not a path filter, so the
@@ -85,13 +103,14 @@ touches guest data unconfined.
 
 ### Linux: seccomp-bpf
 
-Two allowlists per architecture, in `resources/seccomp/`, installed by each
+Three allowlists per architecture, in `resources/seccomp/`, installed by each
 thread for itself:
 
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
+| `vmm` | the thread that calls `boot`, the host-side I/O threads (the virtio-blk worker among them), the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
+| `control` | the control socket's thread, in a run started with `--checkpoint-root` | 57 syscalls | 65 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -106,9 +125,24 @@ installs the `vmm` filter once they are, so only a write under way as they are
 armed runs unfiltered. The `vmm.start` record wakes it before any vCPU thread
 starts.
 
-`vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
-action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
+`vcpu` is a strict subset of `vmm`, checked by a test. `control` is `vmm` plus
+the file calls a checkpoint bundle needs (`openat`, `mkdirat`, `renameat`,
+`unlinkat`, the `stat` family, `getdents64`, `readlinkat`), also checked by a
+test. That thread parses the control protocol, never guest data, and without a
+checkpoint root it installs `vmm` like the other I/O threads. All three use a
+default action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
 process.
+
+No list allows `openat` outside `control`, and glibc's malloc would otherwise
+open a sysfs or procfs file from a filtered thread, so on glibc a confined run
+keeps malloc to one arena, set before any thread starts (see
+[the allowlists' README](../resources/seccomp/README.md#no-openat-and-the-files-glibc-opens-by-itself)).
+
+seccomp cannot filter the path a call names. The `control` filter therefore
+lets that one thread read, create, rename and remove files anywhere the user
+hvi runs as can, not only below the checkpoint root. On Linux the rule that a
+bundle goes below the root is hvi's own path check, not the kernel's. The
+advice for macOS above holds here as well: one private root per hvi process.
 
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
@@ -140,8 +174,8 @@ vulnerability report.
 ## The selftests
 
 ```sh
-hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 20 probes, 9 expect a SIGSYS trap, 11 expect success
+hvi sandbox-selftest    # macOS: 27 probes, 16 expect denial, 11 expect success
+hvi seccomp-selftest    # Linux: 25 probes, 11 expect a SIGSYS trap, 14 expect success
 ```
 
 Both install the profile or the filters that actually ship and check both
@@ -171,6 +205,9 @@ sandbox is secure.
 - **It does not constrain syscall arguments.** No rule in either architecture
   file carries an argument condition, so `ioctl` and `sendmsg` are
   unconstrained over every descriptor the process already holds.
+- **It does not hold the checkpoint writer to its root on Linux.** The
+  control socket's thread of a run with `--checkpoint-root` can open files by
+  any path. Only hvi's own path check keeps bundles below the root.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 

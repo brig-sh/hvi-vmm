@@ -18,3 +18,15 @@ controllen = "controllen"
 fter = "fter"
 # O_WRONLY, the Linux open(2) access mode the virtio-fs backend translates.
 wronly = "wronly"
+# SME, the Arm Scalable Matrix Extension, whose state a checkpoint refuses.
+sme = "sme"
+# mke2fs, the e2fsprogs tool that makes the ext4 disk the checkpoint e2e uses.
+mke = "mke"
+# numer, the numerator field of macOS's mach_timebase_info_data_t, which the
+# portable profile's virtual timer converts counter ticks with.
+numer = "numer"
+
+[files]
+# The portable guest kernel's published config: Kconfig symbol names
+# (ACPI_HED, ELF_RELA, DAMON, IP_VS_FO) are not words.
+extend-exclude = ["tools/guest/kernel/guest.config"]

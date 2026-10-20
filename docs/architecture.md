@@ -86,7 +86,8 @@ pub(crate) fn boot(cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + 
 `hvi::boot` calls the one for the host target and returns its error as a
 `BootError`, so the CLI and a linking crate use the same call. `hvi::spawn`
 makes the same call on a thread of its own. `Stop` is `SystemOff`, `SystemReset`
-or `Requested`.
+or `Requested`, the last when the host asks the run to stop or the control socket
+ends it.
 
 `SystemReset` stops the process. hvi never reboots a guest.
 
@@ -134,7 +135,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 | GIC CPU interface (v2) | `0x0801_0000` | `0x1_0000` shared | |
 | GIC redistributor (v3) | `0x080A_0000` | `0x2_0000` per vCPU | |
 | PL011 UART | `0x0c00_0000` | `0x1000` | SPI 1, INTID 33 |
-| PL031 RTC | `0x0c00_1000` | `0x1000` | none |
+| PL031 RTC, native machine only | `0x0c00_1000` | `0x1000` | none |
 | virtio-blk, disk 0 | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
 | virtio-net | `0x0d00_0200` | `0x200` | SPI 3, INTID 35 |
 | virtio-vsock | `0x0d00_0400` | `0x200` | SPI 4, INTID 36 |
@@ -212,7 +213,7 @@ assume a count. It returns one region on arm64, and on x86-64 one region up to
 flowchart TB
     A["Payload::load: linux-loader PE::load(kernel)<br/>magic check, kernel@RAM_BASE+text_offset<br/>image_size read from the header"] --> B
     B["LoadedKernel::plan: GuestLayout::new<br/>dtb@align2M(kernel+image_size)<br/>initrd@align4K(dtb_end)"] --> C
-    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011 /pl031<br/>virtio_mmio@… per device"] --> D
+    C["fdt::build → DTB<br/>/chosen /memory /psci /cpus /timer<br/>/intc (GICv3 or v2) /apb-pclk /pl011<br/>/pl031 (native machine)<br/>virtio_mmio@… per device<br/>hvi-time@d100000 (portable profile)"] --> D
     D["linux-loader load_dtb writes the DTB (2 MiB cap), initrd copied<br/>x0=dtb_addr, pc=kernel_addr<br/>PSTATE=0x3c5 (EL1h, DAIF masked)"]
 ```
 
@@ -220,11 +221,16 @@ flowchart TB
 PSCI with `method = "hvc"`, the interrupt controller the backend chose
 (`arm,gic-v3`, or `arm,cortex-a15-gic` for the compatible QEMU virt advertises
 for its vGICv2), the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock,
-the PL011 console as `stdout-path`, the PL031 RTC as `pl031@c001000`, and one
-`virtio_mmio@…` node per backed device. The PL031 node has no `interrupts`,
-because the `vm-superio` RTC has no alarm. Without an IRQ, Linux's rtc-pl031
-offers no alarm either. The timer node is marked `always-on`, because the
-hypervisor keeps each vCPU's timer while the vCPU is out of the guest.
+the PL011 console as `stdout-path`, on the native machine the PL031 RTC as
+`pl031@c001000`, and one `virtio_mmio@…` node per backed device. The PL031 node
+has no `interrupts`, because the `vm-superio` RTC has no alarm. Without an IRQ,
+Linux's rtc-pl031 offers no alarm either. The timer node is marked `always-on`,
+because the hypervisor keeps each vCPU's timer while the vCPU is out of the
+guest. Under `--profile portable-arm64-v1` both backends take the tree's inputs
+from `portable::devicetree`: `/timer` has a fixed `clock-frequency` and no
+interrupts, an `hvi-time` node describes the clock device, which gives the
+guest its wall clock, and there is no PL031 node, so one configuration gives
+the same tree on both hosts.
 
 `/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
 every boot. Under HVF it is the guest's only entropy source at boot, since the
@@ -259,11 +265,17 @@ On KVM each vCPU starts with PSCI 0.2, and with address and generic pointer
 authentication when KVM supports both. KVM hides pointer authentication from a
 guest whose vCPUs do not ask for it. Under HVF the guest gets the CPU features
 Hypervisor.framework passes through, which on Apple silicon include pointer
-authentication.
+authentication. A `--profile portable-arm64-v1` guest gets it on neither: the
+profile's baseline ID registers show no pointer authentication, and its KVM
+vCPUs do not ask for it.
 
 The GIC version is not a choice. KVM offers the vGIC that matches the host, so
 a GIC-400 host gets v2 and refuses more than 8 vCPUs, and a GICv3 host gets
-v3. The macOS backend is always v3, because Apple's `hv_gic` is one.
+v3. The macOS backend is v3, because Apple's `hv_gic` is one, unless the boot
+asks for `--profile portable-arm64-v1`. That profile creates no `hv_gic` and
+gives the guest hvi's software GICv2 at the v2 addresses. On KVM the same
+profile asks for a vGICv2 alone and refuses a host without one (see
+[portable-profile.md](portable-profile.md)).
 
 A v3 guest on KVM takes at most 507 vCPUs, since each vCPU adds a redistributor
 frame from a fixed base and the frames must end below the UART.
@@ -353,8 +365,12 @@ thing that differs by backend:
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
   line that rises on an I/O thread also kicks the vCPUs. The console UART's line
   never kicks.
+- **macOS/arm64, portable profile**: the line is set in the software GICv2
+  (`devices/gicv2.rs`), and every vCPU the GIC routes it to, other than the
+  calling thread's own, is woken. See [The software GICv2](#the-software-gicv2).
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
-  vGICv2 and vGICv3.
+  vGICv2 and vGICv3. The `hvi-time` timers raise a PPI instead, with the
+  vCPU index in the line number.
 - **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7
   and 9 to 22.
 
@@ -365,7 +381,15 @@ thing that differs by backend:
   sync, adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with
   the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image
   is locked while open, shared for a read-only disk and exclusive for a
-  writable one.
+  writable one. Each disk's requests are served on a worker thread of its own
+  (`block::serve`), not in the vCPU's exit: a notify only wakes the worker,
+  which takes each chain, makes the disk call with no device lock held, and
+  returns the chain, in order and one at a time. A write's data is copied out
+  of guest RAM when the chain is taken, under the lock, so a driver that resets
+  the device while the write is in flight cannot change what lands on the disk.
+  A flush or a write that waits seconds on a busy host disk then stops no vCPU.
+  The worker starts with the I/O threads, runs under the `vmm` seccomp filter
+  and raises the line from its thread, as the network relay does.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
   `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
@@ -378,6 +402,10 @@ thing that differs by backend:
   `virtiofsd`. The daemon is handed the rings and the memfd behind guest RAM
   and serves the requests in its own process. See
   [storage-and-sharing.md](storage-and-sharing.md).
+- **hvi-time** (`devices/hvitime.rs`, portable profile only) is the guest's
+  clock and timers: a read-only pvclock page at `0x0d100000` and one timer
+  block per vCPU at `0x0d110000`, raising PPI 20. See
+  [hvi-time](#hvi-time) below.
 
 A write of 0 to a device's STATUS register resets it: every queue returns to
 its unprogrammed state, the interrupt is withdrawn, and state the driver
@@ -392,6 +420,36 @@ the wrapper tracks THR-empty itself and answers IIR reads. Both write guest
 output to stdout through `terminal::ConsoleFilter`, which drops the escape
 sequences that change host state or make the terminal answer (see
 [security.md](security.md#what-the-guest-can-reach)).
+
+### The software GICv2
+
+`devices/gicv2.rs` is a GICv2 distributor and CPU interface in software, for
+the portable profile on Hypervisor.framework, which has no GIC without
+`hv_gic`. It mirrors what a guest reads from KVM's vGICv2 on a Raspberry Pi 5:
+the identification registers, five priority bits, fixed SGI and PPI
+configuration, and banked read-only targets for interrupts 0-31. It keeps each
+interrupt's enable, line level, software latch and active state apart, so a
+checkpoint can carry all four (`Gicv2::state`, `Gicv2::restore`). On KVM,
+`arch/aarch64/vgicv2.rs` reads and writes the in-kernel vGICv2 in the same
+form, through the vGIC device's register attributes, with the line levels
+from hvi's own devices (see
+[portable-profile.md](portable-profile.md#capture-and-restore-on-kvm)). The
+model knows nothing of the hypervisor:
+
+- The backend routes guest accesses to `GICD` and the first 4 KiB of `GICC` to
+  it. The rest of the `GICC` window reads as zero.
+- Before every guest entry the vCPU thread sets the vCPU's IRQ line from
+  `Gicv2::irq_pending`. Hypervisor.framework drops that line after each run,
+  and only the vCPU's own thread can set it.
+- A change that gives another vCPU an interrupt returns it to be woken: a
+  notify for one asleep in an emulated WFI, and `hv_vcpus_exit` for one in a
+  run.
+- Without `hv_gic` a guest WFI exits at once, so the vCPU thread steps past it
+  and sleeps until the GIC has an interrupt for it, the guest's virtual timer
+  is due, a pause asks it to park, or the VM stops.
+- The virtual timer reaches the guest only as a `VTIMER_ACTIVATED` exit. hvi
+  raises PPI 27 and keeps the timer masked until the guest's `GICC_EOIR` for
+  it. It then lowers the line and unmasks, unless the timer still fires.
 
 ### Used-ring ordering
 
@@ -410,6 +468,28 @@ Every descriptor-chain walker refuses an index outside the ring and caps the
 walk at the ring size, so a cycle runs out of budget. Re-programming any queue
 register clears `ready`.
 
+### hvi-time
+
+`devices/hvitime.rs` gives a portable guest a clock in nanoseconds, so that
+it keeps time at one rate on hosts whose counters do not (24 MHz on Apple
+silicon, 54 MHz on the Pi). It knows nothing of the hypervisor:
+
+- The backend supplies the guest's counter (`GuestCounter`) and the timers'
+  lines (`TimerLine`), maps the page read-only into the guest and routes the
+  timer window to `HviTime::mmio_read` and `mmio_write`.
+- hvi writes the page under a sequence count at boot, at every restore and
+  after a host sleep. The guest reads it without an exit.
+- One thread per VM, started with the I/O threads and ended before them,
+  sleeps until the earliest armed deadline and raises the vCPU's line. It
+  wakes at least once a second to look for a host sleep, and publishes the
+  page again after one (`HostClock`, read from the host by `SystemClock`). On
+  macOS it runs under `THREAD_TIME_CONSTRAINT_POLICY`, on Linux with a 1 ns
+  timer slack and the `vmm` seccomp filter.
+- Lock order: the device's lock, then the GIC's. Wakes of vCPUs happen after
+  the device's lock is released.
+- `HviTime::state` and `HviTime::restore` carry its canonical checkpoint
+  state.
+
 ## 5. Concurrency and failure
 
 `hypervisor/quiesce.rs` parks every vCPU at a safe point so an observation sees
@@ -420,6 +500,50 @@ Every KVM vCPU counts as started once its thread runs, since one the guest has
 not brought up waits inside `KVM_RUN`, where a kick reaches it. On macOS a
 secondary the guest has not brought up waits for `CPU_ON` outside the hypervisor
 and is not waited for.
+
+The control socket (`checkpoint/server.rs`) is the other requester, and it is
+not a vCPU. Its `pause` first closes the I/O threads' `PauseGate`
+(`teardown.rs`): each of the console reader, the network relay, the agent
+bridge and its connections, and the macOS virtio-fs workers passes the gate
+around every call that takes a device mutex or writes guest RAM, so the pause
+waits only for the work in progress, never for traffic. The virtio-blk worker
+holds the gate from taking a chain to returning it, its disk call included,
+so the pause waits for at most one request, with the vCPUs still running,
+and finds no chain half-served. It then calls
+`Vcpus::pause_from_control`, which waits for every started vCPU, since its
+caller parks none. A `pause` waits up to 10 s for the gate and then 2 s for
+the vCPUs; a `migrate`'s two waits share one 10 s deadline. A pause that misses
+its bound is undone and the VM runs on. The agent bridge and the network relays read
+their non-blocking sockets inside the gate, so what they have read is in a
+device by the time a pause completes. Two pieces of input can still be off the
+host and not yet in a device: the start of a gateway frame whose rest has not
+arrived, and one console byte, since the console reader reads stdin, a shared
+terminal, outside the gate. Pause and resume lose neither; a checkpoint taken
+then drops them.
+
+A `checkpoint` (`checkpoint/server.rs`, `checkpoint/capture.rs`) pauses the
+same way, or finds the VM paused already. It then posts an export request to
+the vCPUs through `Vcpus::request_export`. Only a vCPU's own thread may read its
+registers, so each vCPU does the export at its checkpoint, through the closure
+its backend passes to `Vcpus::checkpoint_with`, and stays parked. A vCPU parked
+before the request is woken to do it. A second request, `Vcpus::request_platform`,
+then has vCPU 0 read the interrupt controller and the counter; on HVF that is
+the `hv_gic_state` blob, which the framework gives only with every vCPU
+stopped (`arch/aarch64/hvf_state.rs`). With every vCPU parked and every helper
+outside the gate, the control thread locks each device mutex, collects and
+checks the device states, syncs the disk and writes the bundle
+(`checkpoint/bundle.rs`, `checkpoint/ram.rs`), all before it resumes or fences
+the VM. See [checkpoint.md](checkpoint.md).
+
+`hvi restore` (`arch/aarch64/hvf.rs`, `checkpoint/restore.rs`) builds the same
+machine from a bundle: the VM and GIC as a boot does, RAM copied from the
+bundle, the devices from their state. It holds the gate and the quiesce before
+any vCPU thread starts, then posts three import requests through
+`Vcpus::request_import` and waits for every vCPU between them: each vCPU's
+registers, the GIC blob on vCPU 0, each vCPU's GIC CPU interface. The control
+socket then starts in `restored-paused`, and its `resume` is the first time
+the guest runs on this host. The plugin and the control socket share one quiesce, and whichever
+holds it keeps the other out, so neither can release the other's pause.
 
 On every backend, the thread that called `boot` owns the stop. Once the vCPU
 threads are spawned it waits in `run/supervisor.rs` on a pipe. A guard held by
@@ -493,12 +617,13 @@ how it works.
 | Crate root and backend selection | `lib.rs`, `arch/<arch>/mod.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
 | Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
-| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
+| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `portable.rs`, `profile.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs`; `devices/gicv2.rs`, `devices/hvitime.rs` (portable profile) |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
+| Control socket, checkpoints and restore | `checkpoint/`: `control.rs`, `server.rs`, `profile.rs`, `capture.rs`, `bundle.rs`, `ram.rs`, `cpu.rs`, `platform.rs`, `restore.rs`; `arch/aarch64/hvf_state.rs` for HVF |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
 | Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `run/panic.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 

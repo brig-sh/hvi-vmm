@@ -26,13 +26,14 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::cpu::{Output, Work};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Ledger;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, GuestWriteLog, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::teardown::{StopToken, STOP_TIMEOUT};
 
@@ -86,6 +87,9 @@ pub(crate) struct Guest<K> {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
+    /// The hypervisor's record of the guest's own writes to RAM, which a
+    /// live move reads beside guest RAM's log of hvi's.
+    pub(crate) write_log: Option<Arc<dyn GuestWriteLog>>,
     /// The threads a plugin asks for in `attach`, until the attach is over.
     pub(crate) plugin_threads: PluginThreads,
 }
@@ -198,18 +202,43 @@ impl<K> Guest<K> {
             .find(|disk| (disk.base..disk.base + size).contains(&addr))
             .map(|disk| (&disk.dev, addr - disk.base))
     }
+
+    /// Sets each virtio device's line to the device's level, once a restore
+    /// has loaded the interrupt controller. See `Irq::redrive`.
+    // The HVF restore, which connects the devices before it loads the GIC,
+    // calls it; the KVM one connects and drives each line itself.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn redrive_irqs(&self) {
+        for disk in &self.disks {
+            disk.dev.lock().unwrap().redrive_irq();
+        }
+        if let Some(dev) = &self.net {
+            dev.lock().unwrap().redrive_irq();
+        }
+        if let Some(dev) = &self.vsock {
+            dev.lock().unwrap().redrive_irq();
+        }
+    }
 }
 
 impl<K: Kick> Guest<K> {
-    /// Holds the calling vCPU at its safe point between guest entries.
+    /// Holds the calling vCPU, `cpu`, at its safe point between guest entries.
     ///
-    /// The vCPU parks while a pause is in effect, and then `plugin`, if given,
+    /// The vCPU parks while a pause is in effect, and does through `serve` the
+    /// work the control socket posts to it meanwhile. Then `plugin`, if given,
     /// looks at the guest. Either way the vCPU tells the guest of the time it
     /// sat out. It is on the hot path: with no plugin and no pause, it loads
     /// the quiesce flag and checks a zero duration.
-    pub(crate) fn pass_safepoint<V: SafepointVcpu>(&self, vcpu: &V, plugin: Option<&dyn Plugin>) {
-        // vcpu0 never parks, since a pause parks only the other vCPUs.
-        vcpu.notify_guest_paused(self.vcpus.checkpoint());
+    pub(crate) fn pass_safepoint<V: SafepointVcpu>(
+        &self,
+        vcpu: &V,
+        cpu: u32,
+        plugin: Option<&dyn Plugin>,
+        serve: impl FnMut(Work<'_>) -> std::io::Result<Option<Output>>,
+    ) {
+        // A plugin's pause parks only the other vCPUs, so vcpu0 parks here only
+        // for the control socket's.
+        vcpu.notify_guest_paused(self.vcpus.checkpoint_with(cpu, serve));
         if let Some(plugin) = plugin {
             let cpu = Cpu::new(vcpu, self);
             plugin.safepoint(&cpu);
@@ -435,6 +464,7 @@ pub(crate) mod tests {
                 NoopKicker,
                 StopHandle::new_pair().unwrap().0,
             )),
+            write_log: None,
         }
     }
 
@@ -503,7 +533,7 @@ pub(crate) mod tests {
         // With one vCPU, the boot vCPU, a pause has no other vCPU to wait for.
         let guest = guest(1);
         let vcpu = RecordingVcpu::default();
-        guest.pass_safepoint(&vcpu, Some(&TwoPauses));
+        guest.pass_safepoint(&vcpu, 0, Some(&TwoPauses), |_| Ok(None));
         let notices = vcpu.notices.lock().unwrap();
         assert_eq!(notices.len(), 2, "{notices:?}");
         assert_eq!(

@@ -16,7 +16,11 @@
 //!
 //! A [`Queue`] holds what the driver programs into one queue and checks it
 //! against guest RAM. It also publishes completed buffers to the used ring.
+//! [`QueueState`] is what a checkpoint keeps of one.
 
+use serde::{Deserialize, Serialize};
+
+use crate::devices::state::invalid;
 use crate::memory::GuestRam;
 
 /// Descriptor flags.
@@ -182,6 +186,94 @@ impl Queue {
     }
 }
 
+/// One virtqueue as a checkpoint keeps it.
+///
+/// The rings themselves and `used.idx` are in guest RAM, which the checkpoint
+/// carries on its own, so these six fields are all the host holds of a queue.
+/// Every chain the device consumed (`last_avail`) was completed before the
+/// device lock was released, or, for virtio-blk, whose worker makes the disk
+/// call without the lock, before the worker left the pause gate, so no chain
+/// is ever half-served in a checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueState {
+    /// The queue size the driver programmed, 0 while it has programmed none.
+    pub num: u32,
+    /// Whether the driver marked the queue ready and the rings fit RAM.
+    pub ready: bool,
+    /// The guest address of the descriptor table.
+    pub desc: u64,
+    /// The guest address of the avail (driver) ring.
+    pub avail: u64,
+    /// The guest address of the used (device) ring.
+    pub used: u64,
+    /// The avail index of the next chain the device consumes.
+    pub last_avail: u16,
+}
+
+impl QueueState {
+    /// Refuses a queue the driver could not have programmed, as
+    /// [`Queue::from_state`] does, without keeping the queue.
+    ///
+    /// # Errors
+    ///
+    /// Errors as [`Queue::from_state`] does.
+    pub(crate) fn check(&self, mem: &GuestRam) -> std::io::Result<()> {
+        Queue::from_state(mem, self).map(drop)
+    }
+}
+
+impl Queue {
+    /// Returns what a checkpoint keeps of the queue.
+    pub(crate) fn state(&self) -> QueueState {
+        QueueState {
+            num: self.num,
+            ready: self.ready,
+            desc: self.desc,
+            avail: self.avail,
+            used: self.used,
+            last_avail: self.last_avail,
+        }
+    }
+
+    /// Rebuilds a queue from `state` over the restored guest RAM `mem`.
+    ///
+    /// The state comes from a file, so it is held to the checks the driver's
+    /// own programming passes: a size `set_num` would have refused, or a ready
+    /// queue whose rings `set_ready` would have refused, is refused here. A
+    /// queue taken on trust would let a crafted checkpoint point the device's
+    /// ring walks outside guest RAM, which every later access then assumes
+    /// cannot happen. A queue that is not ready may hold any addresses, since
+    /// the driver can be part way through programming it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the size is not one the driver may program, or when the
+    /// queue is ready and its size is 0 or its rings do not fit `mem`.
+    pub(crate) fn from_state(mem: &GuestRam, state: &QueueState) -> std::io::Result<Queue> {
+        let num = state.num;
+        if num != 0 && !(num <= QUEUE_NUM_MAX && num.is_power_of_two()) {
+            return Err(invalid(format_args!("queue size {num} is not allowed")));
+        }
+        let q = Queue {
+            num,
+            ready: state.ready,
+            desc: state.desc,
+            avail: state.avail,
+            used: state.used,
+            last_avail: state.last_avail,
+        };
+        if q.ready && !q.rings_fit(mem) {
+            return Err(invalid(format_args!(
+                "ready queue of size {num} has rings outside guest RAM \
+                 (desc {:#x}, avail {:#x}, used {:#x})",
+                q.desc, q.avail, q.used
+            )));
+        }
+        Ok(q)
+    }
+}
+
 fn set_lo(v: u64, lo: u32) -> u64 {
     (v & 0xffff_ffff_0000_0000) | u64::from(lo)
 }
@@ -221,6 +313,132 @@ mod tests {
         assert_eq!(q.desc_addr(7), Some(0x1000 + 7 * 16));
         assert_eq!(q.desc_addr(8), None, "index == size is out of the ring");
         assert_eq!(q.desc_addr(u16::MAX), None);
+    }
+
+    /// Programs a ready queue of `num` entries the way a driver does, with its
+    /// rings at the start of `mem`.
+    fn programmed(mem: &GuestRam, num: u32) -> Queue {
+        let mut q = Queue::default();
+        q.set_num(num);
+        q.set_desc_lo(BASE as u32);
+        q.set_avail_lo((BASE + 0x1000) as u32);
+        q.set_used_lo((BASE + 0x2000) as u32);
+        q.set_ready(1, mem);
+        q.set_last_avail(7);
+        q
+    }
+
+    #[test]
+    fn queue_state_round_trips_through_json() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let q = programmed(&mem, 8);
+        assert!(q.is_ready());
+        let state = q.state();
+        let json = serde_json::to_string(&state).unwrap();
+        let back: QueueState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+        let restored = Queue::from_state(&mem, &back).unwrap();
+        assert_eq!(restored.state(), state);
+        assert!(restored.is_ready());
+        assert_eq!(restored.size(), 8);
+    }
+
+    /// The checkpoint format is read by other builds and other tools, so a
+    /// change to its shape has to be a decision, not a side effect of a field
+    /// rename.
+    #[test]
+    fn queue_state_json_shape_is_fixed() {
+        let state = QueueState {
+            num: 256,
+            ready: true,
+            desc: 0x4000_0000,
+            avail: 0x4000_1000,
+            used: 0x4000_2000,
+            last_avail: 65535,
+        };
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            r#"{"num":256,"ready":true,"desc":1073741824,"avail":1073745920,"used":1073750016,"last_avail":65535}"#
+        );
+    }
+
+    #[test]
+    fn queue_state_with_unknown_fields_is_refused() {
+        let json =
+            r#"{"num":8,"ready":false,"desc":0,"avail":0,"used":0,"last_avail":0,"next_used":3}"#;
+        assert!(serde_json::from_str::<QueueState>(json).is_err());
+    }
+
+    /// A checkpoint is a file, so a ready queue in it gets the bounds check
+    /// `set_ready` gives the driver: rings that leave guest RAM are refused,
+    /// whether the RAM is smaller on this side or the file was edited.
+    #[test]
+    fn ready_queue_with_rings_outside_ram_is_refused() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let good = programmed(&mem, 8).state();
+        for bad in [
+            QueueState {
+                desc: BASE + 0x4000 - 16,
+                ..good.clone()
+            },
+            QueueState {
+                avail: 0x1000,
+                ..good.clone()
+            },
+            QueueState {
+                used: u64::MAX - 8,
+                ..good.clone()
+            },
+            QueueState {
+                num: 0,
+                ..good.clone()
+            },
+        ] {
+            let err = Queue::from_state(&mem, &bad).err();
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::InvalidData),
+                "{bad:?} must be refused"
+            );
+        }
+        // The same rings in a RAM too small to hold them.
+        let small = GuestRam::from_ranges(&[(BASE, 0x2000)]);
+        assert!(Queue::from_state(&small, &good).is_err());
+    }
+
+    #[test]
+    fn queue_state_with_a_size_the_driver_cannot_program_is_refused() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        for num in [3, 100, QUEUE_NUM_MAX * 2, 0x1_0000, u32::MAX] {
+            let state = QueueState {
+                num,
+                ready: false,
+                desc: 0,
+                avail: 0,
+                used: 0,
+                last_avail: 0,
+            };
+            assert!(Queue::from_state(&mem, &state).is_err(), "{num}");
+        }
+    }
+
+    /// A driver part way through programming a queue has written addresses it
+    /// has not yet checked by setting READY, and a checkpoint taken then must
+    /// still restore.
+    #[test]
+    fn queue_that_is_not_ready_may_hold_any_address() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let state = QueueState {
+            num: 8,
+            ready: false,
+            desc: u64::MAX,
+            avail: 0,
+            used: 0x1234,
+            last_avail: 3,
+        };
+        let q = Queue::from_state(&mem, &state).unwrap();
+        assert!(!q.is_ready());
+        assert_eq!(q.state(), state);
     }
 
     /// `avail.idx` claiming more than a ring's worth is a bogus ring, not
