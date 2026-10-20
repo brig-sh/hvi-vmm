@@ -111,28 +111,28 @@ pub trait VmHandle: Send + Sync {
     /// Feeds every virtio-blk request, on every disk, to `sink`.
     ///
     /// [`IoSink::on_block`] carries a `disk_id` that tells the disks apart.
-    /// No-op with no disk. Call it once, in [`Plugin::attach`].
+    /// No-op with no disk. Call it once, in [`Plugin::on_attach`].
     fn set_block_sink(&self, sink: Arc<dyn IoSink>);
 
     /// Feeds every virtio-net frame to `sink`. No-op with no net device.
     ///
-    /// Call it once, in [`Plugin::attach`]. A sink set while the guest runs can
-    /// miss the end of a batch, since a batch that fed two sinks ends on the
-    /// first one only.
+    /// Call it once, in [`Plugin::on_attach`]. A sink set while the guest runs
+    /// can miss the end of a batch, since a batch that fed two sinks ends on
+    /// the first one only.
     fn set_net_sink(&self, sink: Arc<dyn IoSink>);
 
-    /// Breaks the vCPU that runs [`Plugin::safepoint`], the boot vCPU, out of
-    /// the hypervisor so it reaches its next safe point promptly.
+    /// Breaks the vCPU that runs [`Plugin::on_safepoint`], the boot vCPU, out
+    /// of the hypervisor so it reaches its next safe point promptly.
     ///
     /// A plugin that sets a pending flag from its own thread **must** call
     /// this afterwards: an idle guest sits in WFI/HLT indefinitely, and
-    /// [`Plugin::safepoint`] is only reached between guest entries. Without
+    /// [`Plugin::on_safepoint`] is only reached between guest entries. Without
     /// the kick a request against an idle guest waits for the next timer tick,
     /// or never lands at all.
     ///
-    /// A kick from the vCPU's own thread, from inside [`Plugin::safepoint`] or
-    /// an [`IoSink`] on its exit path, is dropped. Call it from a thread of the
-    /// plugin's own.
+    /// A kick from the vCPU's own thread, from inside [`Plugin::on_safepoint`]
+    /// or an [`IoSink`] on its exit path, is dropped. Call it from a thread of
+    /// the plugin's own.
     fn kick(&self);
 
     /// Asks the run to stop, as a [`StopHandle`](crate::run::StopHandle) does.
@@ -145,11 +145,12 @@ pub trait VmHandle: Send + Sync {
 
     /// Runs `run` on a thread of the VMM's own, named `name`.
     ///
-    /// The VMM starts the thread once `attach` has returned `Ok` and the
-    /// sandbox is armed, and drops `run` when `attach` fails or `boot` fails
-    /// before it starts the threads. On Linux the thread installs the seccomp
-    /// filter of the VMM's I/O threads, so anything that filter refuses, such
-    /// as opening a file or binding a socket, belongs in `attach`.
+    /// The VMM starts the thread once [`Plugin::on_attach`] has returned `Ok`
+    /// and the sandbox is armed, and drops `run` when `on_attach` fails or
+    /// `boot` fails before it starts the threads. On Linux the thread installs
+    /// the seccomp filter of the VMM's I/O threads, so anything that filter
+    /// refuses, such as opening a file or binding a socket, belongs in
+    /// `on_attach`.
     ///
     /// The thread gets a [`StopToken`] that reports the stop once the vCPUs
     /// have exited or been left running, and it must return then. `boot` waits
@@ -159,15 +160,15 @@ pub trait VmHandle: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Errors when called after `attach` has returned, and for a `name` with a
-    /// NUL byte.
+    /// Errors when called after `on_attach` has returned, and for a `name` with
+    /// a NUL byte.
     fn spawn(&self, name: &'static str, run: Box<dyn FnOnce(StopToken) + Send>) -> io::Result<()>;
 }
 
 /// What the VMM offers a plugin at a vCPU safe point.
 ///
-/// Only the boot vCPU calls [`Plugin::safepoint`], and only between guest
-/// entries — so the vCPU is parked, and reading its registers is sound.
+/// Only the boot vCPU calls [`Plugin::on_safepoint`], and only between guest
+/// entries, so the vCPU is parked and reading its registers is sound.
 pub trait CpuHandle {
     /// The guest architecture this vCPU is running.
     fn arch(&self) -> GuestArch;
@@ -198,7 +199,7 @@ pub trait CpuHandle {
 
     /// Returns whether the run is stopping.
     ///
-    /// A plugin that waits inside [`Plugin::safepoint`] checks it while it
+    /// A plugin that waits inside [`Plugin::on_safepoint`] checks it while it
     /// waits and returns once it is `true`. The stop waits
     /// [`STOP_TIMEOUT`](crate::teardown::STOP_TIMEOUT) for this vCPU, then
     /// leaves its thread running and fails the run.
@@ -210,38 +211,38 @@ pub trait CpuHandle {
 
 /// A tool attached to a running guest.
 ///
-/// Both hooks default to doing nothing, so an implementation takes only what it
-/// needs. The VMM calls [`Plugin::safepoint`] on the boot vCPU between guest
-/// entries; it is on the hot path, so an implementation that has nothing to do
-/// this time round should say so with a single atomic load and return.
+/// All three hooks default to doing nothing, so an implementation takes only
+/// what it needs. The VMM calls [`Plugin::on_safepoint`] on the boot vCPU
+/// between guest entries. That is the hot path, so an implementation with
+/// nothing to do must return after a single atomic load.
 pub trait Plugin: Send + Sync {
-    /// Called once during boot, before any vCPU runs.
+    /// Attaches the plugin to `vmm`, once during boot before any vCPU runs.
     ///
     /// # Errors
     ///
     /// Returning an error fails the boot: a plugin that cannot attach is
     /// reported rather than silently producing nothing.
-    fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+    fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
         let _ = vmm;
         Ok(())
     }
 
-    /// Called on the boot vCPU between guest entries, with the vCPU parked.
-    fn safepoint(&self, cpu: &dyn CpuHandle) {
+    /// Runs on the boot vCPU between guest entries, with the vCPU parked.
+    fn on_safepoint(&self, cpu: &dyn CpuHandle) {
         let _ = cpu;
     }
 
-    /// An out-of-band trigger asked for an observation now — the console's
-    /// interrupt key today. Deciding what "now" means is the plugin's; the
-    /// kick is not, because every backend kicks immediately after this
-    /// returns. A plugin that triggers itself from its own thread still owes
-    /// the [`VmHandle::kick`], since nothing else is about to make one.
+    /// Answers an out-of-band request for an observation now, which today comes
+    /// from the console's interrupt key.
     ///
-    /// Runs on the VMM's console thread and must return promptly. The stop
-    /// waits for that thread; a `request` still running when
+    /// The plugin decides what "now" means. Every backend kicks the boot vCPU
+    /// right after this returns, so the plugin does not kick.
+    ///
+    /// It runs on the VMM's console thread and must return promptly. The stop
+    /// waits for that thread. An `on_request` still running when
     /// [`crate::teardown::STOP_TIMEOUT`] passes leaves its thread running, and
     /// `boot` returns an error naming it.
-    fn request(&self) {}
+    fn on_request(&self) {}
 }
 
 /// A per-request feed of a virtio device's I/O.

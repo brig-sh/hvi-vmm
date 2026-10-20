@@ -71,9 +71,9 @@ writer finishes the ledger if the process keeps running. A write that blocks, as
 on a hung network file system, holds the file and its lock until it returns, so
 a later run needs another ledger path (see [When a record reaches the
 file](observability.md#when-a-record-reaches-the-file)). The waits `boot` cannot
-interrupt are a plugin blocking in `request`, in `safepoint` or on a thread it
-started with `VmHandle::spawn`, and a virtio-fs worker waiting on a host file
-lock. On macOS such a lock wait can also stall a vCPU (see [Known
+interrupt are a plugin blocking in `on_request`, in `on_safepoint` or on a
+thread it started with `VmHandle::spawn`, and a virtio-fs worker waiting on a
+host file lock. On macOS such a lock wait can also stall a vCPU (see [Known
 limits](limitations.md#virtio-fs-resource-limits)).
 
 A plugin that keeps the `Arc<dyn VmHandle>` it was given keeps guest RAM and the

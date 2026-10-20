@@ -300,7 +300,7 @@ byte.
 
 Only `--dump-memory` acts on it. With `--trace-io` alone the key is
 intercepted and nothing happens, because `IoTrace` does not implement the
-request hook.
+`on_request` hook.
 
 ## Startup output
 

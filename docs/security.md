@@ -178,7 +178,7 @@ sandbox is secure.
   anywhere in hvi. The process keeps the identity it was started with.
   Confinement narrows what it may ask the kernel for, nothing else.
 - **It does not cover a thread a plugin starts outside `VmHandle::spawn`.** Such
-  a thread starts in `attach`, before the Linux filters are armed, and stays
+  a thread starts in `on_attach`, before the Linux filters are armed, and stays
   unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
   as it begins, as the memory-dump plugin's `--dump-after` timer does.
 - **It does not constrain syscall arguments.** No rule in either architecture
