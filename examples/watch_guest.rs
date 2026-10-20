@@ -32,12 +32,12 @@
 //!
 //! It demonstrates the six rules that fail quietly:
 //!
-//! 1. `safepoint` runs between guest entries, so the nothing-to-do case is one
-//!    atomic load and a return.
+//! 1. `on_safepoint` runs between guest entries, so the nothing-to-do case is
+//!    one atomic load and a return.
 //! 2. A `pause()` that returns `true` owes exactly one `resume()`, on *every*
-//!    path out -- including the error paths.
+//!    path out, including the error paths.
 //! 3. A thread of your own sets its flag and *then* calls [`VmHandle::kick`].
-//!    An idle guest sits in WFI or HLT and never reaches `safepoint` on its
+//!    An idle guest sits in WFI or HLT and never reaches `on_safepoint` on its
 //!    own.
 //! 4. An [`IoSink`] must not block. [`IoSink::on_block`] and [`IoSink::on_net`]
 //!    are called with the device lock held, on a thread that depends on the
@@ -45,11 +45,11 @@
 //!    A write that can block waits for the safe point. One that cannot, such as
 //!    an eventfd write that wakes a reader, goes in [`IoSink::on_batch_end`],
 //!    which runs after the lock is released.
-//! 5. `request` runs on the console thread, which the stop waits for, so it
+//! 5. `on_request` runs on the console thread, which the stop waits for, so it
 //!    sets a flag and returns.
-//! 6. A thread of your own starts from `attach` with [`VmHandle::spawn`], so it
-//!    runs under the VMM's seccomp filter and is joined when the run stops. It
-//!    returns once its stop token fires.
+//! 6. A thread of your own starts from `on_attach` with [`VmHandle::spawn`], so
+//!    it runs under the VMM's seccomp filter and is joined when the run stops.
+//!    It returns once its stop token fires.
 
 // This example reads the kernel and initramfs it is given, which are the
 // caller's own paths rather than a guest's.
@@ -110,8 +110,8 @@ impl WatchGuest {
 }
 
 impl Plugin for WatchGuest {
-    /// Called once, before any vCPU runs.
-    fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+    /// Installs the counters as the block and net sinks and starts the timer.
+    fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
         eprintln!(
             "[watch] attached to sandbox {:?}, guest arch {:?}, {} RAM region(s)",
             vmm.sandbox_id(),
@@ -144,8 +144,8 @@ impl Plugin for WatchGuest {
         )
     }
 
-    /// Called on the boot vCPU between guest entries.
-    fn safepoint(&self, cpu: &dyn CpuHandle) {
+    /// Takes a sample and writes it to the ledger, when one was asked for.
+    fn on_safepoint(&self, cpu: &dyn CpuHandle) {
         // Rule 1: the hot path is one atomic swap and a return.
         if !self.pending.swap(false, Ordering::SeqCst) {
             return;
@@ -179,10 +179,10 @@ impl Plugin for WatchGuest {
         );
     }
 
-    /// The console's interrupt key (Ctrl-]) reached us, on the console input
-    /// thread. Same flag, and no kick here: every backend kicks immediately
-    /// after it calls this.
-    fn request(&self) {
+    /// Asks for a sample at the next safe point, through the timer's flag.
+    ///
+    /// It does not kick, since every backend kicks right after it calls this.
+    fn on_request(&self) {
         self.pending.store(true, Ordering::SeqCst);
     }
 }

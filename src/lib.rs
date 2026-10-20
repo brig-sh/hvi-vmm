@@ -135,7 +135,7 @@ compile_error!("hvi builds for aarch64 macOS, aarch64 Linux and x86-64 Linux onl
 /// life of the process. The ledger's writer thread is not joined, and it can
 /// outlive the call while a ledger write blocks in the kernel or keeps failing.
 /// What remains of the VM is a `VmHandle` a plugin kept, in a field or on a
-/// thread it started from `attach`.
+/// thread it started from `on_attach`.
 ///
 /// A sandboxed run leaves its confinement in place. On Linux the seccomp filter
 /// stays on the calling thread, refuses opening a file, and passes to every

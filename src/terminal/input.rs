@@ -61,7 +61,7 @@ pub(crate) fn run(
         }
         if byte[0] == REQUEST_KEY {
             if let Some(obs) = &plugin {
-                obs.request();
+                obs.on_request();
                 kick();
                 continue;
             }
