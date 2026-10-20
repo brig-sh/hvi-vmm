@@ -580,7 +580,7 @@ impl VirtioNet {
                 // The ledger records the frame before the write, so a frame the
                 // tap's full send buffer refuses still appears in it.
                 if let Some(sink) = self.sink.as_ref() {
-                    sink.net(&frame, true);
+                    sink.on_net(&frame, true);
                 }
                 if self.tap.is_some() {
                     // Out through the container's NIC; capture the flow too, so
@@ -654,7 +654,7 @@ impl VirtioNet {
         // for the guest is an observation whether or not the guest had a buffer
         // posted to take it.
         if let Some(sink) = self.sink.as_ref() {
-            sink.net(frame, false);
+            sink.on_net(frame, false);
         }
         let rx = &self.queues[RX_QUEUE as usize];
         if !rx.is_ready() {

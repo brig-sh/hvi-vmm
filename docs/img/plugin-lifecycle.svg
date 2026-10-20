@@ -52,7 +52,7 @@
   <line x1="480" y1="238" x2="480" y2="264" stroke="#059669" stroke-width="1.5" marker-end="url(#ag)"/>
 
   <rect x="60" y="268" width="290" height="52" rx="5" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
-  <text x="76" y="288" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="600" fill="#064e3b">IoSink::block() / IoSink::net()</text>
+  <text x="76" y="288" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="600" fill="#064e3b">IoSink::on_block() / IoSink::on_net()</text>
   <text x="76" y="306" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#b91c1c">device lock held &#8212; must not block</text>
 
   <text x="624" y="284" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#4b5563">A <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">false</tspan> owes

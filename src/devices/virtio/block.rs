@@ -178,7 +178,7 @@ fn lock(file: &File, read_only: bool) -> std::io::Result<()> {
 const BLOCK_DEVICE_LOCK_TRIES: u32 = 20;
 const BLOCK_DEVICE_LOCK_PAUSE: Duration = Duration::from_millis(50);
 
-/// Returns the id `IoSink::block` reports for the backing store `meta`
+/// Returns the id `IoSink::on_block` reports for the backing store `meta`
 /// describes, which a reader derives from its own path to the same store.
 ///
 /// For a block device it is the device number, `st_rdev`, so every node for
@@ -621,7 +621,7 @@ impl VirtioBlk {
             // cannot keep up accounts for that itself: a lost record must not
             // fail the guest's I/O.
             if let Some(sink) = self.sink.as_ref() {
-                sink.block(sector, data_bytes, self.disk_id, write);
+                sink.on_block(sector, data_bytes, self.disk_id, write);
             }
         }
         Ok(device_written)
