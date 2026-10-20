@@ -283,8 +283,8 @@ impl<K: Kick> Drop for StopOnUnwind<'_, K> {
 ///
 /// `confined` says whether the run's confinement is on. Call it before the vCPU
 /// threads are spawned, so the record comes before any record the VMM writes
-/// for the run. A plugin can write earlier, from `attach` or from a thread it
-/// started there.
+/// for the run. A plugin can write earlier, from `on_attach` or from a thread
+/// it started there.
 ///
 /// The run is the [`CURRENT_RUN`] from that record on, until the returned guard
 /// drops. Hold the guard until [`run_to_stop`] returns.

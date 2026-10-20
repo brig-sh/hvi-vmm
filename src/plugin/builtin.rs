@@ -25,12 +25,11 @@
 //!
 //! [`Chain`] runs several at once, since a boot takes one plugin.
 //!
-//! These are also the worked examples. Between them they cover the two rules
-//! that are easy to get wrong and fail quietly: a pause you win, you owe (see
-//! `MemoryDump::safepoint`), and set
-//! a flag then kick (see
-//! `MemoryDump::attach`, where the
-//! timer thread would otherwise never fire on an idle guest).
+//! These are also the worked examples of two rules in `docs/plugins.md` that
+//! fail quietly. A pause you win, you owe: see `MemoryDump::on_safepoint`. Set
+//! a flag, then kick: see the timer thread that `MemoryDump::on_attach` starts.
+//! Without its kick an idle guest never reaches the safe point that takes the
+//! dump.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -75,22 +74,22 @@ impl Chain {
 }
 
 impl Plugin for Chain {
-    fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+    fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
         for o in &self.0 {
-            o.attach(Arc::clone(&vmm))?;
+            o.on_attach(Arc::clone(&vmm))?;
         }
         Ok(())
     }
 
-    fn safepoint(&self, cpu: &dyn CpuHandle) {
+    fn on_safepoint(&self, cpu: &dyn CpuHandle) {
         for o in &self.0 {
-            o.safepoint(cpu);
+            o.on_safepoint(cpu);
         }
     }
 
-    fn request(&self) {
+    fn on_request(&self) {
         for o in &self.0 {
-            o.request();
+            o.on_request();
         }
     }
 }
@@ -178,7 +177,7 @@ impl Plugin for MemoryDump {
     /// The view maps `PROT_READ` pages of the object the VMM runs the guest
     /// from, through a type with no write accessor, so nothing the dump does
     /// through it can write the guest.
-    fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+    fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
         let file = Arc::new(File::from(vmm.ram_fd().try_clone_to_owned()?));
         let regions: Vec<_> = vmm
             .ram_regions()
@@ -219,7 +218,7 @@ impl Plugin for MemoryDump {
     /// slow disk is a visible stall. That is the deliberate choice: a dump
     /// taken while the guest runs is torn, and a torn memory image is worse
     /// than a slow one, because nothing about it says so.
-    fn safepoint(&self, cpu: &dyn CpuHandle) {
+    fn on_safepoint(&self, cpu: &dyn CpuHandle) {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -240,7 +239,7 @@ impl Plugin for MemoryDump {
         }
     }
 
-    fn request(&self) {
+    fn on_request(&self) {
         self.pending.store(true, Ordering::SeqCst);
     }
 }
@@ -276,7 +275,7 @@ impl IoTrace {
 }
 
 impl Plugin for IoTrace {
-    fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+    fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
         let sink: Arc<dyn IoSink> = Arc::new(TraceSink {
             out: Arc::clone(&self.out),
             dirty: Arc::clone(&self.dirty),
@@ -295,7 +294,7 @@ impl Plugin for IoTrace {
     /// This is the right place for it: the safe point is where slow things are
     /// allowed, and it is reached often enough that a `kill` loses at most the
     /// last few events rather than the whole trace.
-    fn safepoint(&self, _cpu: &dyn CpuHandle) {
+    fn on_safepoint(&self, _cpu: &dyn CpuHandle) {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -341,7 +340,7 @@ mod tests {
         #[derive(Default)]
         struct Counter(AtomicBool);
         impl Plugin for Counter {
-            fn request(&self) {
+            fn on_request(&self) {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
@@ -351,7 +350,7 @@ mod tests {
             .with(a.clone() as Arc<dyn Plugin>)
             .with(b.clone() as Arc<dyn Plugin>);
         assert!(!chain.is_empty());
-        chain.request();
+        chain.on_request();
         assert!(a.0.load(Ordering::SeqCst) && b.0.load(Ordering::SeqCst));
     }
 

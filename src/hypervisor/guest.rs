@@ -87,7 +87,7 @@ pub(crate) struct Guest<K> {
     pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
-    /// The threads a plugin asks for in `attach`, until the attach is over.
+    /// The threads a plugin asks for in `on_attach`, until the attach is over.
     pub(crate) plugin_threads: PluginThreads,
 }
 
@@ -101,7 +101,7 @@ pub(crate) struct PluginThread {
 
 /// The threads a plugin asks for while it attaches.
 ///
-/// `attach` runs before the seccomp filters are armed, and a thread started
+/// `on_attach` runs before the seccomp filters are armed, and a thread started
 /// then would run unfiltered. So the threads are queued, and the queue is taken
 /// once the attach is over. A request after that is refused.
 pub(crate) struct PluginThreads(Mutex<Option<Vec<PluginThread>>>);
@@ -153,7 +153,7 @@ impl PluginThreads {
                 Ok(())
             }
             None => Err(std::io::Error::other(format!(
-                "plugin thread {}: a plugin starts its threads from attach",
+                "plugin thread {}: cannot start once on_attach has returned",
                 thread.name
             ))),
         }
@@ -249,7 +249,7 @@ impl<K: Kick> Guest<K> {
         vcpu.notify_guest_paused(self.vcpus.checkpoint());
         if let Some(plugin) = plugin {
             let cpu = Cpu::new(vcpu, self);
-            plugin.safepoint(&cpu);
+            plugin.on_safepoint(&cpu);
             // vcpu0 holds each pause rather than parking, so it sat out their
             // time.
             vcpu.notify_guest_paused(cpu.paused_time());
@@ -260,7 +260,7 @@ impl<K: Kick> Guest<K> {
 impl<K: Kick + 'static> Guest<K> {
     /// Hands `plugin` the guest, when there is one.
     ///
-    /// It returns the threads the plugin asked for in `attach`, and a
+    /// It returns the threads the plugin asked for in `on_attach`, and a
     /// [`LedgerCloseGuard`] for the guest's ledger. The queue is taken whether
     /// or not the attach succeeds, so a queued thread, which can hold the
     /// guest, never outlives a failed boot. The ledger is closed when the
@@ -275,7 +275,7 @@ impl<K: Kick + 'static> Guest<K> {
     ) -> std::io::Result<(Vec<PluginThread>, LedgerCloseGuard)> {
         let ledger_guard = LedgerCloseGuard(Some(Arc::clone(&self.ledger)));
         let attached = plugin.map_or(Ok(()), |plugin| {
-            plugin.attach(Arc::clone(self) as Arc<dyn VmHandle>)
+            plugin.on_attach(Arc::clone(self) as Arc<dyn VmHandle>)
         });
         let threads = self.plugin_threads.take();
         attached.map(|()| (threads, ledger_guard))
@@ -366,7 +366,7 @@ pub(crate) trait SafepointVcpu {
 /// The [`CpuHandle`] over the boot vCPU at a safe point.
 ///
 /// It borrows rather than clones, since it lives only for the duration of one
-/// `Plugin::safepoint` call.
+/// [`Plugin::on_safepoint`] call.
 pub(crate) struct Cpu<'a, K, V> {
     /// The boot vCPU, on its own thread.
     vcpu: &'a V,
@@ -500,7 +500,7 @@ pub(crate) mod tests {
     struct TwoPauses;
 
     impl Plugin for TwoPauses {
-        fn safepoint(&self, cpu: &dyn CpuHandle) {
+        fn on_safepoint(&self, cpu: &dyn CpuHandle) {
             for _ in 0..2 {
                 assert!(cpu.pause());
                 std::thread::sleep(Duration::from_millis(10));
@@ -514,7 +514,7 @@ pub(crate) mod tests {
     struct Keeper(Mutex<Option<Arc<dyn VmHandle>>>);
 
     impl Plugin for Keeper {
-        fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+        fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
             *self.0.lock().unwrap() = Some(vmm);
             Ok(())
         }
@@ -555,8 +555,8 @@ pub(crate) mod tests {
         assert!(notices[1] >= Duration::from_millis(20), "{notices:?}");
     }
 
-    // A thread asked for after `attach` would start under no filter and outside
-    // the join, so the request is refused.
+    // A thread asked for after `on_attach` would start under no filter and
+    // outside the join, so the request is refused.
     #[test]
     fn plugin_thread_is_refused_once_the_queue_is_taken() {
         let threads = PluginThreads::new();

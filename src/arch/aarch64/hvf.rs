@@ -173,8 +173,8 @@ impl Kicker {
     /// before the kick.
     fn kick_others(&self, handles: &[Option<VcpuHandle>]) {
         // A cancel a vCPU sends itself stays pending and ends its next run
-        // before the guest ran, so a plugin that kicked from `safepoint` would
-        // run again at once.
+        // before the guest ran, so a plugin that kicked from `on_safepoint`
+        // would run again at once.
         let own = OWN_VCPU.get();
         let others: Vec<VcpuHandle> = handles
             .iter()

@@ -90,7 +90,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
-| A thread a plugin starts outside `VmHandle::spawn` is unfiltered on Linux. | It starts in `attach`, before the filters are armed, and stays unfiltered. | Design |
+| A thread a plugin starts outside `VmHandle::spawn` is unfiltered on Linux. | It starts in `on_attach`, before the filters are armed, and stays unfiltered. | Design |
 | No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. A glibc build still refuses an open, without a record. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |
