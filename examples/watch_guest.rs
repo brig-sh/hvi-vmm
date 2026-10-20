@@ -71,12 +71,12 @@ struct Counters {
 /// or gateway reader thread depending on the mode. Two relaxed adds and nothing
 /// else: no allocation, no `write(2)`, no lock.
 impl IoSink for Counters {
-    fn block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
+    fn on_block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
         self.block_requests.fetch_add(1, Ordering::Relaxed);
         self.block_bytes.fetch_add(length, Ordering::Relaxed);
     }
 
-    fn net(&self, frame: &[u8], _egress: bool) {
+    fn on_net(&self, frame: &[u8], _egress: bool) {
         let _ = frame;
         self.net_frames.fetch_add(1, Ordering::Relaxed);
     }
