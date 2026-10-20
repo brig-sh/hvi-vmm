@@ -170,9 +170,9 @@ impl VcpuThread {
     /// Ends the thread's current or next `KVM_RUN`, unless the caller is the
     /// thread itself.
     fn kick(&mut self) {
-        // A kick from the thread itself, from a plugin's `safepoint` or a sink
-        // on the exit path, would end its next run before the guest ran and
-        // call the hook again at once.
+        // A kick from the thread itself, from a plugin's `on_safepoint` or a
+        // sink on the exit path, would end its next run before the guest ran
+        // and call the hook again at once.
         // SAFETY: pthread_self is always valid on the current thread.
         if self.tid == unsafe { libc::pthread_self() } as u64 {
             return;
@@ -471,29 +471,29 @@ mod stop_tests {
         image
     }
 
-    /// A plugin whose `safepoint` panics on its first call, after recording
+    /// A plugin whose `on_safepoint` panics on its first call, after recording
     /// that it was reached.
     struct PanicAtSafepoint {
-        /// Whether `safepoint` has run.
+        /// Whether `on_safepoint` has run.
         reached: AtomicBool,
     }
 
     impl Plugin for PanicAtSafepoint {
-        fn safepoint(&self, _cpu: &dyn CpuHandle) {
+        fn on_safepoint(&self, _cpu: &dyn CpuHandle) {
             self.reached.store(true, Ordering::SeqCst);
             panic!("plugin failure under test");
         }
     }
 
-    /// A plugin whose `safepoint` waits until the run is stopping, for at most
-    /// five seconds, as one that holds a pause for another process does.
+    /// A plugin whose `on_safepoint` waits until the run is stopping, for at
+    /// most five seconds, as one that holds a pause for another process does.
     struct WaitsInSafepoint {
-        /// Whether `safepoint` has run.
+        /// Whether `on_safepoint` has run.
         reached: AtomicBool,
     }
 
     impl Plugin for WaitsInSafepoint {
-        fn safepoint(&self, cpu: &dyn CpuHandle) {
+        fn on_safepoint(&self, cpu: &dyn CpuHandle) {
             self.reached.store(true, Ordering::SeqCst);
             // `yield_now` rather than a sleep, since the vCPU allowlist has no
             // `clock_nanosleep`.
@@ -504,8 +504,8 @@ mod stop_tests {
         }
     }
 
-    /// A plugin that starts one thread in `attach`, which waits for the stop,
-    /// or panics at once when asked to.
+    /// A plugin that starts one thread in `on_attach`, which waits for the
+    /// stop, or panics at once when asked to.
     struct SpawnsAThread {
         /// Whether the thread panics rather than waiting.
         panics: bool,
@@ -514,7 +514,7 @@ mod stop_tests {
     }
 
     impl Plugin for SpawnsAThread {
-        fn attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
+        fn on_attach(&self, vmm: Arc<dyn VmHandle>) -> std::io::Result<()> {
             let (panics, ended) = (self.panics, Arc::clone(&self.ended));
             vmm.spawn(
                 "plugin-wait",
@@ -699,7 +699,7 @@ mod stop_tests {
         );
     }
 
-    // The boot vCPU waits in its plugin's `safepoint` when the stop is
+    // The boot vCPU waits in its plugin's `on_safepoint` when the stop is
     // requested. The plugin has to see the stop and return, or the stop leaves
     // the vCPU running and fails the run. Ignored by default, as the tests
     // above are.

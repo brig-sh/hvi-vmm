@@ -18,13 +18,13 @@ For constructing the `BootConfig` that carries a plugin, read
 
 ## When each hook runs
 
-<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: attach on the thread that calls boot before any vCPU starts, safepoint on the boot vCPU between guest entries, IoSink on_block and on_net on a device thread with the device lock held and on_batch_end after it is released, and request from the console" width="760">
+<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: on_attach on the thread that calls boot before any vCPU starts, on_safepoint on the boot vCPU between guest entries, IoSink on_block and on_net on a device thread with the device lock held and on_batch_end after it is released, and on_request from the console" width="760">
 
 | Trait | Called | Thread |
 | --- | --- | --- |
-| `Plugin::attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` |
-| `Plugin::safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU |
-| `Plugin::request` | when the console reads `Ctrl-]` (0x1d) | the console input thread |
+| `Plugin::on_attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` |
+| `Plugin::on_safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU |
+| `Plugin::on_request` | when the console reads `Ctrl-]` (0x1d) | the console input thread |
 | `IoSink::on_block`, egress `IoSink::on_net` | per request or frame, device lock held | a vCPU thread |
 | ingress `IoSink::on_net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread |
 | ingress `IoSink::on_net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path |
@@ -35,7 +35,7 @@ what it needs. All three backends call all three hooks.
 
 ## The six rules that fail quietly
 
-**1. `safepoint` is on the hot path.** It sits at the top of the vCPU run
+**1. `on_safepoint` is on the hot path.** It sits at the top of the vCPU run
 loop, so it runs once per guest entry. A tool with nothing to do this time
 round must establish that with one atomic load and return.
 
@@ -63,14 +63,14 @@ guest, and a virtio-fs export answers the requests already on its queue, from
 hvi's worker thread on macOS and from the daemon on Linux. Memory those devices
 own can change under a read the pause holds.
 
-A `safepoint` may hold the pause while it waits, for example for another process
-to finish reading. It checks `cpu.is_stopping()` as it waits. Once that returns
-`true`, it resumes and returns. The stop waits one second for the boot vCPU,
-then leaves its thread running and fails the run. On Linux the vCPU seccomp
-filter refuses `std::thread::sleep`, so a `safepoint` waits with
+An `on_safepoint` may hold the pause while it waits, for example for another
+process to finish reading. It checks `cpu.is_stopping()` as it waits. Once that
+returns `true`, it resumes and returns. The stop waits one second for the boot
+vCPU, then leaves its thread running and fails the run. On Linux the vCPU
+seccomp filter refuses `std::thread::sleep`, so an `on_safepoint` waits with
 `Condvar::wait_timeout` or `std::thread::park_timeout`, which the filter allows.
 
-A `safepoint` that waits a long time holds a pause while it waits. The other
+An `on_safepoint` that waits a long time holds a pause while it waits. The other
 vCPUs then sit out the wait as well, and on x86-64 the guest is notified of it.
 A boot vCPU that waits alone while the others run looks to the guest like a
 stalled CPU, and the guest can report it.
@@ -81,46 +81,47 @@ failure, or a vCPU a guest stop, before `boot` reads how the run ended.
 
 **3. Set a flag, then kick.** If your own thread decides it is time to act,
 set your flag and then call `VmHandle::kick()`. An idle guest sits in WFI on
-arm64 or HLT on x86 and does not reach `safepoint` on its own, so without the
+arm64 or HLT on x86 and does not reach `on_safepoint` on its own, so without the
 kick your request waits for the next unrelated exit, or never lands.
 
-This is the easiest thing to get wrong, and it fails only against idle guests,
-which is to say not on your desk.
+This is the easiest rule to get wrong. It fails only against an idle guest, so a
+test against a busy guest does not catch it.
 
 `kick()` breaks the boot vCPU out of the hypervisor, since it is the one that
-reaches `safepoint`. The other vCPUs keep running.
+reaches `on_safepoint`. The other vCPUs keep running.
 
-A `kick()` from the vCPU's own thread, inside `safepoint` or an `IoSink` on its
-exit path, is dropped. Call it from a thread of your own.
+A `kick()` from the vCPU's own thread, inside `on_safepoint` or an `IoSink` on
+its exit path, is dropped. Call it from a thread of your own.
 
 **4. An `IoSink` must not block.** `on_block` and `on_net` are called with the
 device lock held. No `write(2)` there, and no allocation you can avoid. A write
 that cannot block, such as one to an eventfd or a non-blocking pipe that wakes a
 reader, goes in `on_batch_end`, which runs once per batch with the lock
-released. A write that can block, such as one to a file, waits for `safepoint`:
-count in the sink, set a dirty flag, and write there. `IoTrace` is the worked
-example. A sink must not keep the `VmHandle` either: the device holds the sink
-and the handle holds the device, so the three would keep one another alive after
-`boot` returns. A sink that needs the handle keeps a `Weak` from
-`Arc::downgrade`.
+released. A write that can block, such as one to a file, waits for
+`on_safepoint`: count in the sink, set a dirty flag, and write there. `IoTrace`
+is the worked example. A sink must not keep the `VmHandle` either: the device
+holds the sink and the handle holds the device, so the three would keep one
+another alive after `boot` returns. A sink that needs the handle keeps a `Weak`
+from `Arc::downgrade`.
 
-**5. `request` must return promptly.** It runs on the VMM's console thread, and
-the stop waits for that thread. A `request` still running a second after the
-stop leaves its thread running, and `boot` returns an error naming it. Set a
-flag and return, as `MemoryDump` does; the backend kicks once `request` returns.
+**5. `on_request` must return promptly.** It runs on the VMM's console thread,
+and the stop waits for that thread. An `on_request` still running a second after
+the stop leaves its thread running, and `boot` returns an error naming it. Set a
+flag and return, as `MemoryDump` does; the backend kicks once `on_request`
+returns.
 
-**6. Start your threads with `VmHandle::spawn`.** Call it from `attach`, with a
-name and a boxed closure that takes a `hvi::teardown::StopToken`. The VMM starts
-the thread once the attach has succeeded, under the same seccomp filter as its
-own I/O threads on Linux, and joins it with them when the run stops. The token
-reports the stop once the vCPUs have exited or been left running: wait on it
-with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own `poll`
-set, and return when it fires. A thread still running a second after the token
-reports the stop is left running and fails the run, and a thread that panics
-fails the run and stops it, as [Panics](#panics) says. Open files and bind
-sockets in `attach`, since the filter refuses them. A thread you start any other
-way is neither joined nor filtered, and it keeps the `VmHandle` and the VM it
-holds alive for as long as it runs.
+**6. Start your threads with `VmHandle::spawn`.** Call it from `on_attach`, with
+a name and a boxed closure that takes a `hvi::teardown::StopToken`. The VMM
+starts the thread once the attach has succeeded, under the same seccomp filter
+as its own I/O threads on Linux, and joins it with them when the run stops. The
+token reports the stop once the vCPUs have exited or been left running: wait on
+it with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own
+`poll` set, and return when it fires. A thread still running a second after the
+token reports the stop is left running and fails the run, and a thread that
+panics fails the run and stops it, as [Panics](#panics) says. Open files and
+bind sockets in `on_attach`, since the filter refuses them. A thread you start
+any other way is neither joined nor filtered, and it keeps the `VmHandle` and
+the VM it holds alive for as long as it runs.
 
 ## Reading guest memory
 
@@ -128,18 +129,19 @@ holds alive for as long as it runs.
 tool only reads, build a `GuestRamView` over `VmHandle::ram_fd()` and
 `ram_regions()` instead, as `MemoryDump` does: duplicate the descriptor with
 `try_clone_to_owned()`, pair it with each region, and pass the pairs to
-`GuestRamView::map`. Build it in `attach`: the constructor checks each object's
-length and maps each region, and the seccomp filters that arm after `attach` do
-not allow the length check. The type has no write accessor and its pages are
-`PROT_READ`, so nothing your tool does through the view can write the guest.
-`GuestRam` dereferences to `GuestRamView`, so code written against the view runs
-unchanged on `ram()` inside the VMM. A tool outside the VMM process builds the
-pairs from the descriptors it was sent, one for each region. When one object
-backs every region, the same descriptor pairs with each of them. On Linux the
-view's mappings are marked `MADV_DONTDUMP`, like the VMM's own, so a core file
-of your process leaves guest RAM out. A tool that maps `ram_fd()` itself should
-mark its mapping the same way. So should a vhost-user daemon that serves a
-virtio-fs export on Linux, which maps all of guest RAM in its own process.
+`GuestRamView::map`. Build it in `on_attach`: the constructor checks each
+object's length and maps each region, and the seccomp filters that arm after
+`on_attach` do not allow the length check. The type has no write accessor and
+its pages are `PROT_READ`, so nothing your tool does through the view can write
+the guest. `GuestRam` dereferences to `GuestRamView`, so code written against
+the view runs unchanged on `ram()` inside the VMM. A tool outside the VMM
+process builds the pairs from the descriptors it was sent, one for each region.
+When one object backs every region, the same descriptor pairs with each of them.
+On Linux the view's mappings are marked `MADV_DONTDUMP`, like the VMM's own, so
+a core file of your process leaves guest RAM out. A tool that maps `ram_fd()`
+itself should mark its mapping the same way. So should a vhost-user daemon that
+serves a virtio-fs export on Linux, which maps all of guest RAM in its own
+process.
 
 Guest RAM is not always one span. `ram_regions()` returns one region on arm64.
 On x86-64 it returns one region up to 3328 MiB of guest RAM and two above
@@ -201,8 +203,8 @@ with no records waits for the records added before it. Each call wakes the
 writer and waits for its own write: tens of microseconds, and up to 100 ms when
 the disk stalls. A loop that calls `emit_payload` once per record pays that wait
 once per record, while a batch pays it once, so batch the records of a loop. A
-plugin that pauses the guest in `safepoint` calls `resume` before it writes, so
-the write does not extend the pause.
+plugin that pauses the guest in `on_safepoint` calls `resume` before it writes,
+so the write does not extend the pause.
 
 The envelope is this crate's and its wire shape is pinned by tests. The
 payload is yours, and the VMM never looks inside it. That is the whole of the
@@ -213,7 +215,7 @@ the VMM's own records reach the file.
 
 ## Panics
 
-A panic in `safepoint`, in a sink, or on a thread your tool started with
+A panic in `on_safepoint`, in a sink, or on a thread your tool started with
 `VmHandle::spawn` ends the run. hvi's own binary aborts on any panic. Before the
 abort, its panic hook stops the vCPUs and writes the run's `vmm.stop` record,
 with a report that names the thread, the message and where it happened. The vCPU
@@ -227,17 +229,17 @@ goes in the error. The macOS backend catches it at the loop instead, to add the
 last exit and the program counter. [embedding.md](embedding.md#panics) has what
 each strategy asks of the binary.
 
-Under hvi's own binary, a panic in `attach`, or on a thread it started before
+Under hvi's own binary, a panic in `on_attach`, or on a thread it started before
 the VMM has written `vmm.start`, writes no `vmm.stop` record. The process
 aborts, and the plugin's records still buffered at that point are lost. In a
-binary that unwinds, a panic in `attach` unwinds out of `boot`. A panic on a
+binary that unwinds, a panic in `on_attach` unwinds out of `boot`. A panic on a
 thread started with `VmHandle::spawn` stops the run there, and the teardown
 writes `vmm.stop` with reason `failed`.
 
 ## Running several
 
 A boot takes one plugin. `plugin::builtin::Chain` runs several, forwarding each
-hook to every member in insertion order. `attach` stops at the first error.
+hook to every member in insertion order. `on_attach` stops at the first error.
 
 ## What this is not
 
@@ -246,11 +248,11 @@ hook to every member in insertion order. `attach` stops at the first error.
   compile time.
 - **Not a stable ABI.** There is no released version and no tag. Pin a commit.
 - **Not separately confined.** A plugin runs inside the VMM process, with the
-  same authority. `attach` runs before the confinement is installed. The other
-  hooks, and the threads a plugin starts with `VmHandle::spawn`, run under the
-  same Seatbelt profile or seccomp filters as the VMM. On Linux a thread a
-  plugin starts any other way from `attach` stays unfiltered. A plugin is part
-  of the trusted VMM.
+  same authority. `on_attach` runs before the confinement is installed. The
+  other hooks, and the threads a plugin starts with `VmHandle::spawn`, run under
+  the same Seatbelt profile or seccomp filters as the VMM. On Linux a thread a
+  plugin starts any other way from `on_attach` stays unfiltered. A plugin is
+  part of the trusted VMM.
 
 ## Shipping one out of tree
 

@@ -17,7 +17,7 @@
 //! [`IoThreads`] starts the threads that serve the guest's devices from the
 //! host: the console reader, the agent bridge, and the relay from a gateway or
 //! a tap. Each polls a stop token beside its own descriptor. [`IoThreads`] also
-//! starts the threads a plugin asked for in `attach`. A backend starts the
+//! starts the threads a plugin asked for in `on_attach`. A backend starts the
 //! threads only it has with [`IoThreads::spawn`]. Once the vCPUs have exited or
 //! been left running, [`IoThreads::stop`] requests the stop and joins every
 //! thread, as `teardown` describes.
