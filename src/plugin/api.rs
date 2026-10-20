@@ -110,11 +110,15 @@ pub trait VmHandle: Send + Sync {
 
     /// Feeds every virtio-blk request, on every disk, to `sink`.
     ///
-    /// [`IoSink::block`] carries a `disk_id` that tells the disks apart. No-op
-    /// with no disk.
+    /// [`IoSink::on_block`] carries a `disk_id` that tells the disks apart.
+    /// No-op with no disk. Call it once, in [`Plugin::attach`].
     fn set_block_sink(&self, sink: Arc<dyn IoSink>);
 
     /// Feeds every virtio-net frame to `sink`. No-op with no net device.
+    ///
+    /// Call it once, in [`Plugin::attach`]. A sink set while the guest runs can
+    /// miss the end of a batch, since a batch that fed two sinks ends on the
+    /// first one only.
     fn set_net_sink(&self, sink: Arc<dyn IoSink>);
 
     /// Breaks the vCPU that runs [`Plugin::safepoint`], the boot vCPU, out of
@@ -244,17 +248,33 @@ pub trait Plugin: Send + Sync {
 ///
 /// The VMM already records these in its ledger; a sink is for a tool that wants
 /// them live and unaggregated, as [`crate::plugin::builtin::IoTrace`] does.
-/// Every method is called with the device lock held, so an implementation must
-/// not block. [`IoSink::block`] and the egress side of [`IoSink::net`] always
-/// run on a vCPU thread. An ingress frame reaches [`IoSink::net`] from the tap
-/// or gateway reader thread under those two backends, and from a vCPU thread
-/// under the built-in stack, which generates its replies inside the transmit
-/// path.
+/// [`IoSink::on_block`] and [`IoSink::on_net`] are called with the device lock
+/// held, and [`IoSink::on_batch_end`] after it is released. No method may
+/// block. [`IoSink::on_block`] and the egress side of [`IoSink::on_net`] always
+/// run on a vCPU thread. An ingress frame reaches [`IoSink::on_net`] from the
+/// tap or gateway reader thread under those two backends, and from a vCPU
+/// thread under the built-in stack, which generates its replies inside the
+/// transmit path.
 pub trait IoSink: Send + Sync {
-    /// A virtio-blk request: starting `sector`, `length` data bytes, and
-    /// direction. `disk_id` distinguishes backing devices.
-    fn block(&self, sector: u64, length: u64, disk_id: u64, write: bool);
+    /// Receives a virtio-blk request of `length` data bytes from `sector`, a
+    /// write when `write` is set.
+    ///
+    /// `disk_id` tells the backing stores apart.
+    fn on_block(&self, sector: u64, length: u64, disk_id: u64, write: bool);
 
-    /// A virtio-net frame, as it crosses the device. `egress` is guest-to-host.
-    fn net(&self, frame: &[u8], egress: bool);
+    /// Receives a virtio-net frame as it crosses the device, guest-to-host when
+    /// `egress` is set.
+    fn on_net(&self, frame: &[u8], egress: bool);
+
+    /// Receives the end of a batch of [`IoSink::on_block`] or
+    /// [`IoSink::on_net`] calls.
+    ///
+    /// The VMM calls it once after each device access that called the sink, and
+    /// once after each burst of frames from the tap or gateway reader that did.
+    /// It runs on the thread that made those calls, with the device lock
+    /// released. A write that wakes a reader in another process belongs here,
+    /// so a burst of records costs one write. The write must not block, so it
+    /// goes to a non-blocking descriptor such as an eventfd or a pipe. The
+    /// default does nothing.
+    fn on_batch_end(&self) {}
 }

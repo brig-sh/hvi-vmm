@@ -39,9 +39,12 @@
 //! 3. A thread of your own sets its flag and *then* calls [`VmHandle::kick`].
 //!    An idle guest sits in WFI or HLT and never reaches `safepoint` on its
 //!    own.
-//! 4. An [`IoSink`] is called with the device lock held, so it must not block.
-//!    Which thread it runs on depends on the device and the networking mode, so
-//!    do not assume one. Count in the sink; do the writing at the safe point.
+//! 4. An [`IoSink`] must not block. [`IoSink::on_block`] and [`IoSink::on_net`]
+//!    are called with the device lock held, on a thread that depends on the
+//!    device and the networking mode, so do not assume one. Count in the sink.
+//!    A write that can block waits for the safe point. One that cannot, such as
+//!    an eventfd write that wakes a reader, goes in [`IoSink::on_batch_end`],
+//!    which runs after the lock is released.
 //! 5. `request` runs on the console thread, which the stop waits for, so it
 //!    sets a flag and returns.
 //! 6. A thread of your own starts from `attach` with [`VmHandle::spawn`], so it
@@ -67,16 +70,16 @@ struct Counters {
     net_frames: AtomicU64,
 }
 
-/// Rule 4: called with the device lock held, from a vCPU thread or from a tap
-/// or gateway reader thread depending on the mode. Two relaxed adds and nothing
-/// else: no allocation, no `write(2)`, no lock.
+/// Rule 4: `on_block` and `on_net` are called with the device lock held, from a
+/// vCPU thread or from a tap or gateway reader thread depending on the mode.
+/// Two relaxed adds and nothing else: no allocation, no `write(2)`, no lock.
 impl IoSink for Counters {
-    fn block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
+    fn on_block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
         self.block_requests.fetch_add(1, Ordering::Relaxed);
         self.block_bytes.fetch_add(length, Ordering::Relaxed);
     }
 
-    fn net(&self, frame: &[u8], _egress: bool) {
+    fn on_net(&self, frame: &[u8], _egress: bool) {
         let _ = frame;
         self.net_frames.fetch_add(1, Ordering::Relaxed);
     }

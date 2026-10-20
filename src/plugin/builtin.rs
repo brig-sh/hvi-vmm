@@ -310,7 +310,7 @@ struct TraceSink {
 }
 
 impl IoSink for TraceSink {
-    fn block(&self, sector: u64, length: u64, disk_id: u64, write: bool) {
+    fn on_block(&self, sector: u64, length: u64, disk_id: u64, write: bool) {
         // Called on the vCPU thread with the device lock held: buffered, never
         // flushed here, and a failed write is dropped rather than propagated. A
         // trace that stalls the guest it is tracing is not a trace.
@@ -322,7 +322,7 @@ impl IoSink for TraceSink {
         self.dirty.store(true, Ordering::SeqCst);
     }
 
-    fn net(&self, frame: &[u8], egress: bool) {
+    fn on_net(&self, frame: &[u8], egress: bool) {
         let dir = if egress { "tx" } else { "rx" };
         let _ = writeln!(self.out.lock().unwrap(), "net {dir} len={}", frame.len());
         self.dirty.store(true, Ordering::SeqCst);
@@ -430,9 +430,9 @@ mod tests {
                 out: Arc::clone(&t.out),
                 dirty: Arc::clone(&t.dirty),
             };
-            sink.block(2048, 4096, 0x11, true);
-            sink.net(&[0u8; 64], true);
-            sink.block(8, 512, 0x11, false);
+            sink.on_block(2048, 4096, 0x11, true);
+            sink.on_net(&[0u8; 64], true);
+            sink.on_block(8, 512, 0x11, false);
         }
         let text = std::fs::read_to_string(p).unwrap();
         let _ = std::fs::remove_file(p);
