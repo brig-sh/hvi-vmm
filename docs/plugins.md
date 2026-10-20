@@ -25,9 +25,9 @@ For constructing the `BootConfig` that carries a plugin, read
 | `Plugin::attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` |
 | `Plugin::safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU |
 | `Plugin::request` | when the console reads `Ctrl-]` (0x1d) | the console input thread |
-| `IoSink::block`, egress `IoSink::net` | per request or frame, device lock held | a vCPU thread |
-| ingress `IoSink::net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread |
-| ingress `IoSink::net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path |
+| `IoSink::on_block`, egress `IoSink::on_net` | per request or frame, device lock held | a vCPU thread |
+| ingress `IoSink::on_net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread |
+| ingress `IoSink::on_net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path |
 
 All three methods on `Plugin` are defaulted, so an implementation takes only
 what it needs. All three backends call all three hooks.
