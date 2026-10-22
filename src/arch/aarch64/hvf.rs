@@ -30,6 +30,7 @@
 
 use std::ops::ControlFlow;
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use applevisor::prelude::{
     ExitReason, GicConfig, GicEnabled, Reg, SysReg, Vcpu, VcpuHandle, VirtualMachine,
@@ -310,14 +311,40 @@ impl FsWake {
     /// Clears the wake flag on return and returns `false` once stopped. Must
     /// not be called with the virtio-fs device mutex held.
     fn park(&self) -> bool {
+        self.park_until(None)
+    }
+
+    /// [`FsWake::park`] with a deadline: returns at `timeout` too, as if
+    /// woken. The worker parks this way while a lock waiter is parked on the
+    /// device, so a lock a host process gives up is seen without a notify.
+    fn park_for(&self, timeout: Duration) -> bool {
+        self.park_until(Some(Instant::now() + timeout))
+    }
+
+    fn park_until(&self, deadline: Option<Instant>) -> bool {
         let mut state = self.state.lock().unwrap();
         while !state.woken && !state.stopped {
-            state = self.ready.wait(state).unwrap();
+            match deadline {
+                None => state = self.ready.wait(state).unwrap(),
+                Some(deadline) => {
+                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    state = self.ready.wait_timeout(state, left).unwrap().0;
+                }
+            }
         }
         state.woken = false;
         !state.stopped
     }
 }
+
+/// How often the worker retries a SETLKW parked on a lock, while any is
+/// parked. A holder inside the guest frees its lock through a request on the
+/// device, which retries the waiters in the same pass, so this only bounds
+/// the wait on a lock a host process holds. Short enough that a tool does not
+/// notice, and a tick costs one non-blocking lock call per waiter.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing
 /// the rest to the device's worker thread. Chosen so a single guest syscall's
@@ -1192,7 +1219,10 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// `service_fs` serves a shallow queue on the vCPU and wakes this thread for
 /// the rest, which makes every host syscall those requests need. A deep queue
 /// then never holds a vCPU on the host filesystem, and the guest can keep more
-/// than one request in flight.
+/// than one request in flight. A shallow queue does hold the vCPU for the host
+/// calls its requests make, and no request may make one that blocks: a lock
+/// another holder has parks its request on the device instead, and this thread
+/// retries the parked ones every `LOCK_RETRY_INTERVAL` until none is left.
 ///
 /// Each device has one worker, since a single mutex guards all of its
 /// `VirtioFs` state. `drain_notified` empties every flagged queue under that
@@ -1209,8 +1239,19 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
 /// running, ends the loop at the next `park`. The worker then drains the chains
 /// announced by a wake that arrived with the stop.
 fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake) {
-    while wake.park() {
-        dev.lock().unwrap().drain_notified(mem);
+    let mut waiting = false;
+    loop {
+        let alive = if waiting {
+            wake.park_for(LOCK_RETRY_INTERVAL)
+        } else {
+            wake.park()
+        };
+        if !alive {
+            break;
+        }
+        let mut d = dev.lock().unwrap();
+        d.drain_notified(mem);
+        waiting = d.has_lock_waiters();
     }
     // A wake that arrived with the stop was cleared by that last `park`, and
     // the chains it announced are still in the ring, so one unbounded pass
@@ -1296,6 +1337,35 @@ mod tests {
     use super::*;
     use crate::config::CachePolicy;
     use std::time::{Duration, Instant};
+
+    /// The worker parks with a deadline while a lock waiter is parked on the
+    /// device, so a lock a host process gives up is retried without a notify.
+    /// A wake or a stop still ends the park at once.
+    #[test]
+    fn a_timed_park_ends_at_its_deadline_or_at_a_wake_or_a_stop() {
+        let wake = FsWake::new();
+        let start = Instant::now();
+        assert!(
+            wake.park_for(Duration::from_millis(20)),
+            "a deadline is not a stop"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(20));
+
+        wake.wake();
+        let start = Instant::now();
+        assert!(wake.park_for(Duration::from_secs(10)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a pending wake ends the park at once"
+        );
+        assert!(!wake.state.lock().unwrap().woken, "the park took the wake");
+
+        wake.stop();
+        assert!(
+            !wake.park_for(Duration::from_secs(10)),
+            "a stop ends the park and says so"
+        );
+    }
 
     // A worker stuck in a host call holds the device past the stop deadline.
     // The report must not wait for it, or `boot` never returns the error that
