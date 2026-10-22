@@ -332,14 +332,18 @@ struct PendingLock {
 /// answered.
 ///
 /// Each one keeps its descriptor chain until it is answered, and a ring with
-/// no free chain cannot carry the holder's own unlock, which is the freeze
-/// again with more waiters. So at most [`LockWaiter::cap`] of them wait per
-/// queue, and `handle_chain` answers the next with `ENOLCK`, the error
-/// fcntl(2) gives for too many locks, which a program can report where a
-/// hang cannot be.
+/// no room for the holder's own unlock is the freeze again with more
+/// waiters. So waiters hold at most [`LockWaiter::cap`] entries of a queue,
+/// and `handle_chain` answers the next with `ENOLCK`, the error fcntl(2)
+/// gives for too many locks, which a program can report where a hang cannot
+/// be. `init` sizes the largest request to fit beside them.
 struct LockWaiter {
     queue_idx: usize,
     head: u16,
+    /// How many ring entries the chain takes, which is what the cap counts.
+    /// Linux sends a SETLKW as three: the header, its arguments and the
+    /// reply.
+    descriptors: usize,
     /// The chain's device-writable descriptors, where the reply goes.
     output: Vec<(u64, u32)>,
     unique: u64,
@@ -348,10 +352,11 @@ struct LockWaiter {
 }
 
 impl LockWaiter {
-    /// How many may wait on a queue of `size` entries: a quarter of the ring.
-    /// A chain is at least two entries, since the device offers no indirect
-    /// descriptors, so this leaves at least half the ring for every other
-    /// request, the unlock among them.
+    /// How many entries of a queue of `size` the waiters may hold between
+    /// them: a quarter of the ring. The device offers no indirect
+    /// descriptors, so a chain is as many entries as it has buffers, and the
+    /// three quarters left hold the largest request `init` offers with room
+    /// to spare.
     fn cap(size: u16) -> usize {
         usize::from(size / 4)
     }
@@ -1938,18 +1943,21 @@ impl VirtioFs {
             Reply::Buffered(response) => {
                 if let Some(pending) = self.lock_to_park.take() {
                     let cap = LockWaiter::cap(self.queues[queue_idx].size());
-                    let waiting = self
+                    let held: usize = self
                         .lock_waiters
                         .iter()
                         .filter(|w| w.queue_idx == queue_idx)
-                        .count();
-                    if waiting >= cap {
+                        .map(|w| w.descriptors)
+                        .sum();
+                    let descriptors = input.len() + output.len();
+                    if held + descriptors > cap {
                         let response = error_response(pending.unique, ENOLCK);
                         return Some(Self::write_reply(mem, &output, &response));
                     }
                     self.lock_waiters.push(LockWaiter {
                         queue_idx,
                         head,
+                        descriptors,
                         output,
                         unique: pending.unique,
                         fh: pending.fh,
@@ -2215,6 +2223,31 @@ impl VirtioFs {
         if self.writable && self.cache_policy == CachePolicy::Always {
             supported |= WRITEBACK_CACHE;
         }
+        // The largest request, in pages. Linux sizes it to its ring less four
+        // entries of headers, so a request may take the whole ring, and then
+        // one parked lock waiter leaves it nowhere to go: a holder writing
+        // a megabyte under its lock would wait for the waiter, which waits
+        // for it. What is offered fits beside the waiters' quarter instead.
+        // The queues are programmed before the mount sends INIT, both to the
+        // size this device advertises; the smaller is the safe one should
+        // they differ. No queue programmed yet gets the full size, as before.
+        const FUSE_HEADER_OVERHEAD: u32 = 4;
+        let ring = self
+            .queues
+            .iter()
+            .map(|queue| queue.size())
+            .filter(|&size| size != 0)
+            .min()
+            .unwrap_or(0);
+        let max_pages = if ring == 0 {
+            MAX_WRITE / 4096
+        } else {
+            let beside_waiters = u32::from(ring)
+                .saturating_sub(LockWaiter::cap(ring) as u32)
+                .saturating_sub(FUSE_HEADER_OVERHEAD)
+                .max(1);
+            (MAX_WRITE / 4096).min(beside_waiters)
+        };
         let mut out = Vec::with_capacity(64);
         put_u32(&mut out, 7);
         put_u32(&mut out, minor.min(39));
@@ -2222,9 +2255,9 @@ impl VirtioFs {
         put_u32(&mut out, guest_flags & supported);
         put_u16(&mut out, 64);
         put_u16(&mut out, 48);
-        put_u32(&mut out, MAX_WRITE);
+        put_u32(&mut out, max_pages * 4096);
         put_u32(&mut out, 1); // nanosecond timestamp granularity
-        put_u16(&mut out, (MAX_WRITE / 4096) as u16);
+        put_u16(&mut out, max_pages as u16);
         put_u16(&mut out, 0); // no DAX mapping window
         put_u32(&mut out, 0); // flags2
         out.resize(64, 0);
@@ -11780,9 +11813,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Lays out `req` as one chain at descriptor pair `slot`, with a reply
-    /// descriptor for a bare header at `out`, and publishes it on the avail
-    /// ring. Returns the head.
+    /// Lays out `req` as one chain at descriptor triple `slot`, the way Linux
+    /// sends a request: the in header, its arguments, and a reply descriptor
+    /// for a bare out header at `out`. Publishes it on the avail ring and
+    /// returns the head.
     fn queue_chain(
         mem: &GuestRam,
         desc: u64,
@@ -11792,14 +11826,16 @@ mod tests {
         out: u64,
         req: &[u8],
     ) -> u16 {
-        let head = slot * 2;
-        mem.write(in_buf, req).unwrap();
+        let head = slot * 3;
+        let (header, args) = req.split_at(IN_HEADER_LEN);
+        mem.write(in_buf, header).unwrap();
+        mem.write(in_buf + 0x40, args).unwrap();
         write_desc(
             mem,
             desc,
             head,
             in_buf,
-            req.len() as u32,
+            IN_HEADER_LEN as u32,
             DESC_NEXT,
             head + 1,
         );
@@ -11807,29 +11843,41 @@ mod tests {
             mem,
             desc,
             head + 1,
+            in_buf + 0x40,
+            args.len() as u32,
+            DESC_NEXT,
+            head + 2,
+        );
+        write_desc(
+            mem,
+            desc,
+            head + 2,
             out,
             OUT_HEADER_LEN as u32,
             DESC_WRITE,
             0,
         );
         let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
-            .unwrap();
+        mem.write_u16(avail + 4 + u64::from(idx) * 2, head).unwrap();
         mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
         head
     }
 
-    /// A `fuse_lk_in` for a whole-file write lock through `fh`: flock when
-    /// `flock` is set, an OFD lock otherwise.
-    fn whole_file_write_lock(fh: u64, flock: bool) -> Vec<u8> {
+    /// A `fuse_lk_in` for a whole-file lock of `lock_type` through `fh`:
+    /// flock when `flock` is set, an OFD lock otherwise.
+    fn whole_file_lock(fh: u64, lock_type: u32, flock: bool) -> Vec<u8> {
         let mut lock = vec![0u8; 48];
         lock[0..8].copy_from_slice(&fh.to_le_bytes());
         lock[24..32].copy_from_slice(&(i64::MAX as u64).to_le_bytes());
-        lock[32..36].copy_from_slice(&LINUX_F_WRLCK.to_le_bytes());
+        lock[32..36].copy_from_slice(&lock_type.to_le_bytes());
         if flock {
             lock[40..44].copy_from_slice(&FUSE_LK_FLOCK.to_le_bytes());
         }
         lock
+    }
+
+    fn whole_file_write_lock(fh: u64, flock: bool) -> Vec<u8> {
+        whole_file_lock(fh, LINUX_F_WRLCK, flock)
     }
 
     /// Runs one unbounded drain on another thread and waits up to five
@@ -11858,8 +11906,10 @@ mod tests {
     ) -> (VirtioFs, Arc<GuestRam>, (u64, u64, u64), u64) {
         let base = 0x4000_0000u64;
         let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
+        // A ring of 16: its waiters may hold four entries, one chain of
+        // three.
         let (desc, avail, used) = (base, base + 0x100, base + 0x200);
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        program_queue(&mut dev, &mem, 16, desc, avail, used);
         let out = base + 0x8000;
         let mut req = fuse_in_header(88, SETLKW, 0x77, node);
         req.extend_from_slice(&whole_file_write_lock(waiter, flock));
@@ -11879,6 +11929,11 @@ mod tests {
         assert!(dev.has_lock_waiters());
         assert!(!dev.irq_level(), "nothing completed, so nothing to raise");
         (dev, mem, (desc, avail, used), out)
+    }
+
+    fn get_u16(input: &[u8], offset: usize) -> Option<u16> {
+        let bytes = input.get(offset..offset + 2)?;
+        Some(u16::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn reply_at(mem: &GuestRam, out: u64) -> (i32, u64) {
@@ -12003,9 +12058,10 @@ mod tests {
     }
 
     /// Waiters keep their chains, so a ring could fill with them and have no
-    /// chain left for the holder's unlock: the freeze this change removes,
-    /// with more waiters. A quarter of the ring may wait; the next SETLKW is
-    /// answered ENOLCK, and the ones already parked still get their lock.
+    /// room for the holder's unlock: the freeze this change removes, with
+    /// more waiters. Waiters may hold a quarter of the ring's entries; the
+    /// SETLKW that would take more is answered ENOLCK, and the ones already
+    /// parked still get their lock.
     #[test]
     fn a_ring_a_quarter_full_of_waiters_refuses_the_next_with_enolck() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -12019,13 +12075,13 @@ mod tests {
         );
         assert_eq!(get_u32(&out, 4), Some(0));
 
-        // A ring of 8 entries: two waiters may park, and the three chains
-        // take six entries.
+        // A ring of 32 entries: waiters may hold eight, which is two chains
+        // of three, as Linux lays a SETLKW out. The third would make nine.
         let base = 0x4000_0000u64;
         let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
-        let (desc, avail, used) = (base, base + 0x100, base + 0x200);
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
-        assert_eq!(LockWaiter::cap(8), 2);
+        let (desc, avail, used) = (base, base + 0x400, base + 0x800);
+        program_queue(&mut dev, &mem, 32, desc, avail, used);
+        assert_eq!(LockWaiter::cap(32), 8);
         let outs: Vec<u64> = (0..3).map(|i| base + 0x8000 + i * 0x200).collect();
         for (i, (waiter, out)) in waiters.iter().zip(&outs).enumerate() {
             let mut req = fuse_in_header(88, SETLKW, 0x70 + i as u64, node);
@@ -12072,6 +12128,38 @@ mod tests {
             "the second still waits on the first"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Linux sizes its largest request to the ring less four header entries,
+    /// which is the whole ring. One parked waiter then leaves a holder's
+    /// megabyte write nowhere to go, and the holder waits for the waiter
+    /// that waits for it. INIT offers what fits beside the waiters' quarter.
+    #[test]
+    fn init_offers_a_largest_request_that_fits_beside_the_lock_waiters() {
+        let (dir, mut dev) = fixture();
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::from_ranges(&[(base, 0x20000)]);
+        program_queue(&mut dev, &mem, 256, base, base + 0x1000, base + 0x2000);
+        let out = dev.handle_fuse(&request(INIT, 0, &init_payload_offering_everything()), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        assert_eq!(
+            get_u16(&out, OUT_HEADER_LEN + 28),
+            Some(188),
+            "max_pages: 256 entries, less 64 for waiters, less 4 of headers"
+        );
+        assert_eq!(
+            get_u32(&out, OUT_HEADER_LEN + 20),
+            Some(188 * 4096),
+            "max_write agrees"
+        );
+
+        // No queue programmed yet: the full size, as before.
+        let (dir2, mut bare) = fixture();
+        let out = bare.handle_fuse(&request(INIT, 0, &init_payload_offering_everything()), 4096);
+        assert_eq!(get_u16(&out, OUT_HEADER_LEN + 28), Some(256));
+        assert_eq!(get_u32(&out, OUT_HEADER_LEN + 20), Some(MAX_WRITE));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(dir2);
     }
 
     /// A reset takes the queues down, and the parked chains with them. One
