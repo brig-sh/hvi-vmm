@@ -3927,6 +3927,15 @@ impl VirtioFs {
             Ok(()) => {}
             Err(Some(errno)) => return Err(errno),
             Err(None) if wait => {
+                if let LockCall::Flock(_) = call {
+                    // flock(2) drops the lock a descriptor holds before a
+                    // blocking conversion waits. macOS keeps it after a
+                    // failed LOCK_NB, so two shared holders each asking for
+                    // exclusive would park on each other for good. Give it
+                    // up here, as the wait on Linux does.
+                    // SAFETY: flock on a file the handle owns.
+                    unsafe { libc::flock(handle.file.as_raw_fd(), libc::LOCK_UN) };
+                }
                 self.lock_to_park = Some(PendingLock { unique, fh, call });
                 return Ok(Vec::new());
             }
@@ -12127,6 +12136,71 @@ mod tests {
             dev.has_lock_waiters(),
             "the second still waits on the first"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Two guest processes hold a shared flock and both ask for exclusive,
+    /// blocking. flock(2) drops the shared lock before such a wait, so one of
+    /// them gets exclusive at once. macOS keeps it after a failed `LOCK_NB`,
+    /// so without the unlock before parking they would wait on each other
+    /// for good.
+    #[test]
+    fn two_shared_holders_asking_for_exclusive_do_not_park_each_other() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let a = open_rw(&mut dev, node);
+        let b = open_rw(&mut dev, node);
+        for fh in [a, b] {
+            let out = dev.handle_fuse(
+                &request(SETLK, node, &whole_file_lock(fh, LINUX_F_RDLCK, true)),
+                4096,
+            );
+            assert_eq!(get_u32(&out, 4), Some(0), "both take the shared lock");
+        }
+
+        let base = 0x4000_0000u64;
+        let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
+        let (desc, avail, used) = (base, base + 0x400, base + 0x800);
+        program_queue(&mut dev, &mem, 32, desc, avail, used);
+        let outs = [base + 0x8000, base + 0x8200];
+        for (i, fh) in [a, b].into_iter().enumerate() {
+            let mut req = fuse_in_header(88, SETLKW, 0x80 + i as u64, node);
+            req.extend_from_slice(&whole_file_write_lock(fh, true));
+            queue_chain(
+                &mem,
+                desc,
+                avail,
+                i as u16,
+                base + 0x1000 + i as u64 * 0x200,
+                outs[i],
+                &req,
+            );
+        }
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+
+        let (mut dev, _) = drain_or_hang(dev, &mem);
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            1,
+            "one of the two has exclusive now"
+        );
+        assert_eq!(
+            reply_at(&mem, outs[1]),
+            (0, 0x81),
+            "the second asked once the first let go"
+        );
+        assert!(dev.has_lock_waiters(), "the first waits for the second");
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&b.to_le_bytes());
+        release[12..16].copy_from_slice(&FUSE_RELEASE_FLOCK_UNLOCK.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        dev.drain_notified(&mem);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 2);
+        assert_eq!(reply_at(&mem, outs[0]), (0, 0x80));
+        assert!(!dev.has_lock_waiters());
         let _ = fs::remove_dir_all(dir);
     }
 
