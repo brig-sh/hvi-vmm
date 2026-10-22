@@ -339,11 +339,10 @@ impl FsWake {
     }
 }
 
-/// How often the worker retries a SETLKW parked on a lock, while any is
-/// parked. A holder inside the guest frees its lock through a request on the
-/// device, which retries the waiters in the same pass, so this only bounds
-/// the wait on a lock a host process holds. Short enough that a tool does not
-/// notice, and a tick costs one non-blocking lock call per waiter.
+/// How often the worker retries the SETLKW requests parked on the device
+/// (`LockWaiter` in the server), while any is parked. A guest holder's unlock
+/// retries them in its own drain, so this only bounds the wait on a lock a
+/// host process holds, and a tick costs one non-blocking lock call per waiter.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing
