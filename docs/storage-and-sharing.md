@@ -123,7 +123,9 @@ touch: /mnt/code/new: Read-only file system
 ```
 
 A writable share supports file and directory handles, hard links, the atomic
-rename variants, timestamps, xattrs, advisory locks (OFD locks on the host),
+rename variants, timestamps, xattrs, advisory locks (OFD locks on the host;
+a request for a held lock waits parked on the device, retried without
+blocking, so it holds up no other request),
 allocation, hole punching, zeroing, seek, `copy_file_range`, `statx`,
 `statfs`, FIFOs, tmpfiles and Unix sockets.
 
@@ -260,9 +262,6 @@ tested, not as proven.
 - **The node table has no cap.** `FORGET` is what shrinks it between device
   resets. A guest that never sends one grows the table until it resets the
   device.
-- **`SETLKW` blocks under the device mutex.** A guest waiting on a lock stalls
-  that whole device, and stalls the vCPU that issued the request whenever the
-  queue was shallow enough to be drained inline.
 - **The descriptor budget is per export, the descriptor table is per process.**
   Each export refuses an `OPEN` or `OPENDIR` past its budget with `ENFILE`.
   The budget is the process file limit less a reserve of 128. `CREATE` and

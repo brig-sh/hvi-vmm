@@ -302,6 +302,45 @@ const EOVERFLOW: i32 = 75;
 const ESTALE: i32 = 116;
 const EDQUOT: i32 = 122;
 
+/// The host call that settles a lock request, always non-blocking.
+#[derive(Clone, Copy)]
+enum LockCall {
+    /// `flock(2)` with this operation, `LOCK_NB` included.
+    Flock(libc::c_int),
+    /// `fcntl(2)` `F_OFD_SETLK` with this range and type.
+    Posix(libc::flock),
+}
+
+/// A SETLKW `lock` could not answer because another holder has the lock,
+/// carried from `lock` to `handle_chain`, which parks it with its chain.
+#[derive(Clone, Copy)]
+struct PendingLock {
+    unique: u64,
+    fh: u64,
+    call: LockCall,
+}
+
+/// A SETLKW parked on the device, still owning the chain it arrived in.
+///
+/// The device never blocks for a lock. Every request runs under the one
+/// device mutex, on the vCPU or on the worker, and a holder inside the guest
+/// gives its lock up through a request on this same device. A blocking lock
+/// call therefore waited for an unlock that could not get past the mutex it
+/// held: one `go vet` contending its module cache lock from two processes
+/// froze a guest for good. A waiter keeps its chain instead, and
+/// `retry_lock_waiters` repeats the call without blocking until it is
+/// answered. The queue bounds how many there are: each holds a descriptor
+/// chain the guest cannot reuse until it is completed.
+struct LockWaiter {
+    queue_idx: usize,
+    head: u16,
+    /// The chain's device-writable descriptors, where the reply goes.
+    output: Vec<(u64, u32)>,
+    unique: u64,
+    fh: u64,
+    call: LockCall,
+}
+
 struct FileHandle {
     file: File,
     writable: bool,
@@ -1280,6 +1319,13 @@ pub struct VirtioFs {
     /// host and one that skips it both answer success -- so without a counter
     /// a test cannot tell a working guard from one that never fires.
     host_syncs: AtomicU64,
+    /// SETLKW requests waiting for a lock another holder has, oldest first.
+    /// See [`LockWaiter`].
+    lock_waiters: Vec<LockWaiter>,
+    /// The SETLKW `lock` has just declined to answer. `handle_chain` takes it
+    /// before it returns, with the chain it belongs to; nothing else runs in
+    /// between, since both happen inside one request.
+    lock_to_park: Option<PendingLock>,
 }
 
 impl VirtioFs {
@@ -1380,6 +1426,8 @@ impl VirtioFs {
             op_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             dirs,
             dirty: false,
+            lock_waiters: Vec::new(),
+            lock_to_park: None,
             host_syncs: AtomicU64::new(0),
         })
     }
@@ -1547,6 +1595,9 @@ impl VirtioFs {
         // Node ids restart here, so a descriptor left parked would sit under an
         // id the rebooted guest is handed for a different file.
         self.drain_parked();
+        // Their chains went with the queues.
+        self.lock_waiters.clear();
+        self.lock_to_park = None;
         // `dirty` deliberately survives. The handles above are dropped
         // without a flush, so anything written through them is still only in
         // the host's page cache, and the next SYNCFS after the driver rebinds
@@ -1685,7 +1736,9 @@ impl VirtioFs {
 
     /// Drains every flagged queue, servicing at most `budget` chains from
     /// each. Returns true when work remained, meaning the caller should hand
-    /// the rest to the worker thread instead of finishing it itself.
+    /// the rest to the worker thread instead of finishing it itself. A lock
+    /// waiter left parked counts as work remaining: only the worker can retry
+    /// it on a timer, which a lock a host process holds needs.
     ///
     /// This is what lets the vCPU service a shallow queue in its own exit.
     /// Waking the worker costs a park/unpark and a context switch -- around
@@ -1706,8 +1759,57 @@ impl VirtioFs {
                 remaining = true;
             }
         }
+        // After the new chains: a guest holder's unlock or RELEASE was among
+        // them, so its waiter is answered in the pass that released it.
+        if self.retry_lock_waiters(mem) {
+            remaining = true;
+        }
         self.sync_irq();
         remaining
+    }
+
+    /// Whether a SETLKW is parked waiting for its lock.
+    pub(crate) fn has_lock_waiters(&self) -> bool {
+        !self.lock_waiters.is_empty()
+    }
+
+    /// Repeats every parked SETLKW once, without blocking, and completes
+    /// those that are answered. Returns whether any is still waiting.
+    ///
+    /// A waiter whose handle is gone is answered EBADF, and one whose queue
+    /// the guest took down is dropped with it, as its chain was.
+    fn retry_lock_waiters(&mut self, mem: &GuestRam) -> bool {
+        if self.lock_waiters.is_empty() {
+            return false;
+        }
+        let waiters = std::mem::take(&mut self.lock_waiters);
+        for waiter in waiters {
+            if !self.queues[waiter.queue_idx].is_ready() {
+                continue;
+            }
+            let answer = match self.handles.get(&waiter.fh) {
+                None => Err(EBADF),
+                Some(handle) => match try_lock(&handle.file, waiter.call) {
+                    Ok(()) => Ok(()),
+                    Err(Some(errno)) => Err(errno),
+                    Err(None) => {
+                        self.lock_waiters.push(waiter);
+                        continue;
+                    }
+                },
+            };
+            if answer.is_ok() {
+                self.note_posix_lock(waiter.fh, waiter.call);
+            }
+            let response = match answer {
+                Ok(()) => success_response(waiter.unique, &[]),
+                Err(errno) => error_response(waiter.unique, errno),
+            };
+            let used = Self::write_reply(mem, &waiter.output, &response);
+            self.queues[waiter.queue_idx].push_used(mem, waiter.head, used);
+            self.interrupt_status |= 1;
+        }
+        !self.lock_waiters.is_empty()
     }
 
     /// Services at most `budget` chains from `queue_idx`. Returns true when
@@ -1735,10 +1837,13 @@ impl VirtioFs {
             let Ok(head) = mem.read_u16(slot) else {
                 break;
             };
-            let used = self.handle_chain(mem, queue_idx, head);
-            self.queues[queue_idx].push_used(mem, head, used);
+            // A chain without a reply yet is a SETLKW parked on a held lock,
+            // which `retry_lock_waiters` completes.
+            if let Some(used) = self.handle_chain(mem, queue_idx, head) {
+                self.queues[queue_idx].push_used(mem, head, used);
+                serviced = true;
+            }
             last = last.wrapping_add(1);
-            serviced = true;
         }
         self.queues[queue_idx].set_last_avail(last);
         if serviced {
@@ -1747,7 +1852,9 @@ impl VirtioFs {
         take < pending
     }
 
-    fn handle_chain(&mut self, mem: &GuestRam, queue_idx: usize, head: u16) -> u32 {
+    /// Serves one chain and returns the length of its reply, or `None` for a
+    /// SETLKW that is now parked and will be completed later.
+    fn handle_chain(&mut self, mem: &GuestRam, queue_idx: usize, head: u16) -> Option<u32> {
         let q = &self.queues[queue_idx];
         // Descriptor-lists, not a concatenated buffer: Linux always lays a
         // request out as header(+small fixed args) in the input descriptors
@@ -1760,7 +1867,7 @@ impl VirtioFs {
         let mut desc = head;
         for _ in 0..q.size() {
             let Some(da) = q.desc_addr(desc) else {
-                return 0;
+                return Some(0);
             };
             let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
                 mem.read_u64(da),
@@ -1768,16 +1875,16 @@ impl VirtioFs {
                 mem.read_u16(da + 12),
                 mem.read_u16(da + 14),
             ) else {
-                return 0;
+                return Some(0);
             };
             if flags & DESC_WRITE != 0 {
                 output.push((addr, len));
             } else {
                 let Some(total) = total_in.checked_add(len as usize) else {
-                    return 0;
+                    return Some(0);
                 };
                 if total > MAX_REQUEST {
-                    return 0;
+                    return Some(0);
                 }
                 total_in = total;
                 input.push((addr, len));
@@ -1788,7 +1895,7 @@ impl VirtioFs {
             desc = next;
         }
         if total_in < IN_HEADER_LEN {
-            return 0;
+            return Some(0);
         }
         // A chain with nothing device-writable is not necessarily malformed.
         // FORGET and BATCH_FORGET carry no reply, and Linux sends them with
@@ -1803,33 +1910,52 @@ impl VirtioFs {
         if output.is_empty() {
             let mut opcode = [0u8; 4];
             if gather(mem, &input, 4, &mut opcode).is_err() {
-                return 0;
+                return Some(0);
             }
             if !matches!(u32::from_le_bytes(opcode), FORGET | BATCH_FORGET) {
-                return 0;
+                return Some(0);
             }
         }
         let max_out: usize = output.iter().map(|(_, len)| *len as usize).sum();
         match self.handle_fuse_desc(mem, &input, &output, max_out) {
-            Reply::Direct(n) => n as u32,
+            Reply::Direct(n) => Some(n as u32),
             Reply::Buffered(response) => {
-                if response.len() > max_out {
-                    return 0;
+                if let Some(pending) = self.lock_to_park.take() {
+                    self.lock_waiters.push(LockWaiter {
+                        queue_idx,
+                        head,
+                        output,
+                        unique: pending.unique,
+                        fh: pending.fh,
+                        call: pending.call,
+                    });
+                    return None;
                 }
-                let mut copied = 0usize;
-                for (addr, len) in output {
-                    if copied == response.len() {
-                        break;
-                    }
-                    let n = (len as usize).min(response.len() - copied);
-                    if mem.write(addr, &response[copied..copied + n]).is_err() {
-                        return copied as u32;
-                    }
-                    copied += n;
-                }
-                copied as u32
+                Some(Self::write_reply(mem, &output, &response))
             }
         }
+    }
+
+    /// Copies a reply into a chain's device-writable descriptors and returns
+    /// how much of it landed, which is the chain's used length. A reply the
+    /// descriptors cannot hold is not written at all.
+    fn write_reply(mem: &GuestRam, output: &[(u64, u32)], response: &[u8]) -> u32 {
+        let max_out: usize = output.iter().map(|(_, len)| *len as usize).sum();
+        if response.len() > max_out {
+            return 0;
+        }
+        let mut copied = 0usize;
+        for &(addr, len) in output {
+            if copied == response.len() {
+                break;
+            }
+            let n = (len as usize).min(response.len() - copied);
+            if mem.write(addr, &response[copied..copied + n]).is_err() {
+                return copied as u32;
+            }
+            copied += n;
+        }
+        copied as u32
     }
 
     /// Descriptor-aware dispatch, called from `handle_chain`. `handle_fuse`
@@ -1977,9 +2103,9 @@ impl VirtioFs {
             FLUSH => self.flush(payload),
             FSYNC => self.fsync(payload),
             FSYNCDIR => self.fsync_dir(nodeid, payload),
-            GETLK => self.lock(payload, GETLK),
-            SETLK => self.lock(payload, SETLK),
-            SETLKW => self.lock(payload, SETLKW),
+            GETLK => self.lock(payload, GETLK, unique),
+            SETLK => self.lock(payload, SETLK, unique),
+            SETLKW => self.lock(payload, SETLKW, unique),
             POLL => self.poll(payload),
             FALLOCATE => self.fallocate(payload),
             READDIRPLUS => self.readdir(
@@ -1998,6 +2124,11 @@ impl VirtioFs {
             _ => Err(ENOSYS),
         };
         self.note_op_time(opcode, op_start);
+        if self.lock_to_park.is_some() {
+            // A SETLKW on a held lock: answered from `retry_lock_waiters`
+            // once the lock is free, so there is no reply yet.
+            return Vec::new();
+        }
         match result {
             Ok(payload) => success_response(unique, &payload),
             Err(errno) => error_response(unique, errno),
@@ -3639,7 +3770,7 @@ impl VirtioFs {
         Ok(Vec::new())
     }
 
-    fn lock(&mut self, input: &[u8], opcode: u32) -> Result<Vec<u8>, i32> {
+    fn lock(&mut self, input: &[u8], opcode: u32, unique: u64) -> Result<Vec<u8>, i32> {
         let fh = get_u64(input, 0).ok_or(EINVAL)?;
         let start = get_u64(input, 16).ok_or(EINVAL)?;
         let end = get_u64(input, 24).ok_or(EINVAL)?;
@@ -3657,22 +3788,16 @@ impl VirtioFs {
                 put_u32(&mut out, 0);
                 return Ok(out);
             }
-            let mut operation = match lock_type {
+            let operation = match lock_type {
                 LINUX_F_RDLCK => libc::LOCK_SH,
                 LINUX_F_WRLCK => libc::LOCK_EX,
                 LINUX_F_UNLCK => libc::LOCK_UN,
                 _ => return Err(EINVAL),
             };
-            if opcode == SETLK {
-                operation |= libc::LOCK_NB;
-            }
-            // SAFETY: flock on a file this handle owns, with a valid operation.
-            let result =
-                retry_on_interrupt(|| unsafe { libc::flock(handle.file.as_raw_fd(), operation) });
-            if result != 0 {
-                return Err(io_errno(io::Error::last_os_error()));
-            }
-            return Ok(Vec::new());
+            // Non-blocking for SETLKW too: a held lock parks the request
+            // rather than the thread. See `LockWaiter`.
+            let call = LockCall::Flock(operation | libc::LOCK_NB);
+            return self.settle_lock(fh, unique, call, opcode == SETLKW);
         }
 
         let mut host_lock: libc::flock = unsafe { std::mem::zeroed() };
@@ -3693,27 +3818,23 @@ impl VirtioFs {
         host_lock.l_pid = 0;
         host_lock.l_whence = libc::SEEK_SET as i16;
         host_lock.l_type = linux_lock_to_host(lock_type)?;
-        let command = match opcode {
-            GETLK => libc::F_OFD_GETLK,
-            SETLK => libc::F_OFD_SETLK,
-            SETLKW => libc::F_OFD_SETLKW,
+        match opcode {
+            GETLK => {}
+            // Both non-blocking, as the flock branch: SETLKW parks on a held
+            // lock instead of waiting under the device mutex.
+            SETLK | SETLKW => {
+                let call = LockCall::Posix(host_lock);
+                return self.settle_lock(fh, unique, call, opcode == SETLKW);
+            }
             _ => return Err(EINVAL),
-        };
+        }
         // SAFETY: fcntl on a file this handle owns, with a lock struct that
         // outlives the call.
         let result = retry_on_interrupt(|| unsafe {
-            libc::fcntl(handle.file.as_raw_fd(), command, &mut host_lock)
+            libc::fcntl(handle.file.as_raw_fd(), libc::F_OFD_GETLK, &mut host_lock)
         });
         if result != 0 {
             return Err(io_errno(io::Error::last_os_error()));
-        }
-        if opcode != GETLK {
-            // The lock lives on the host descriptor, so this one is closed at
-            // RELEASE rather than parked for the next open.
-            if let Some(handle) = self.handles.get_mut(&fh) {
-                handle.locked = true;
-            }
-            return Ok(Vec::new());
         }
         let returned_start = host_lock.l_start.max(0) as u64;
         let returned_end = if host_lock.l_len == 0 {
@@ -3729,6 +3850,44 @@ impl VirtioFs {
         put_u32(&mut out, host_lock_to_linux(host_lock.l_type)?);
         put_u32(&mut out, host_lock.l_pid.max(0) as u32);
         Ok(out)
+    }
+
+    /// Makes one non-blocking lock call for a SETLK or SETLKW. A lock another
+    /// holder has fails a SETLK with EAGAIN and parks a SETLKW: the request
+    /// is left in `lock_to_park` for `handle_chain`, and the empty reply here
+    /// is not sent.
+    fn settle_lock(
+        &mut self,
+        fh: u64,
+        unique: u64,
+        call: LockCall,
+        wait: bool,
+    ) -> Result<Vec<u8>, i32> {
+        let handle = self.handles.get(&fh).ok_or(EBADF)?;
+        match try_lock(&handle.file, call) {
+            Ok(()) => {}
+            Err(Some(errno)) => return Err(errno),
+            Err(None) if wait => {
+                self.lock_to_park = Some(PendingLock { unique, fh, call });
+                return Ok(Vec::new());
+            }
+            Err(None) => return Err(EAGAIN),
+        }
+        self.note_posix_lock(fh, call);
+        Ok(Vec::new())
+    }
+
+    /// Records that a POSIX lock request went through `fh`.
+    ///
+    /// The lock lives on the host descriptor, so that descriptor is closed at
+    /// RELEASE rather than parked for the next open. A flock is given up by
+    /// an explicit unlock at RELEASE, so it leaves no mark.
+    fn note_posix_lock(&mut self, fh: u64, call: LockCall) {
+        if let LockCall::Posix(_) = call {
+            if let Some(handle) = self.handles.get_mut(&fh) {
+                handle.locked = true;
+            }
+        }
     }
 
     fn poll(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -7084,10 +7243,39 @@ fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
     }
 }
 
-/// Repeats a blocking lock call that a signal interrupted.
+/// Makes one non-blocking lock call. `Err(None)` means another holder has
+/// the lock; `Err(Some(errno))` is any other failure, as the guest sees it.
+///
+/// A held lock comes back as `EWOULDBLOCK` from `flock` and as `EAGAIN` from
+/// `fcntl`, which are one value on macOS and Linux alike. Linux also answers
+/// an `F_SETLK` conflict with `EACCES`, so a build there is read the same way.
+fn try_lock(file: &File, call: LockCall) -> Result<(), Option<i32>> {
+    let fd = file.as_raw_fd();
+    let result = match call {
+        // SAFETY: flock on a file the handle owns, with a valid operation.
+        LockCall::Flock(operation) => retry_on_interrupt(|| unsafe { libc::flock(fd, operation) }),
+        LockCall::Posix(mut host_lock) => retry_on_interrupt(|| {
+            // SAFETY: fcntl on a file the handle owns, with a lock struct that
+            // outlives the call.
+            unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &mut host_lock) }
+        }),
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    let posix = matches!(call, LockCall::Posix(_));
+    match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Err(None),
+        Some(code) if posix && code == libc::EACCES => Err(None),
+        _ => Err(Some(io_errno(err))),
+    }
+}
+
+/// Repeats a lock call that a signal interrupted.
 ///
 /// The kick signal that ends the console reader's read at stop has a handler,
-/// so a lock wait on the worker thread can return `EINTR` too.
+/// so a lock call on the worker thread can return `EINTR` too.
 fn retry_on_interrupt(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
     loop {
         let result = call();
@@ -11561,6 +11749,285 @@ mod tests {
         lock[32..36].copy_from_slice(&LINUX_F_UNLCK.to_le_bytes());
         let out = dev.handle_fuse(&request(SETLK, issue, &lock), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Lays out `req` as one chain at descriptor pair `slot`, with a reply
+    /// descriptor for a bare header at `out`, and publishes it on the avail
+    /// ring. Returns the head.
+    fn queue_chain(
+        mem: &GuestRam,
+        desc: u64,
+        avail: u64,
+        slot: u16,
+        in_buf: u64,
+        out: u64,
+        req: &[u8],
+    ) -> u16 {
+        let head = slot * 2;
+        mem.write(in_buf, req).unwrap();
+        write_desc(
+            mem,
+            desc,
+            head,
+            in_buf,
+            req.len() as u32,
+            DESC_NEXT,
+            head + 1,
+        );
+        write_desc(
+            mem,
+            desc,
+            head + 1,
+            out,
+            OUT_HEADER_LEN as u32,
+            DESC_WRITE,
+            0,
+        );
+        let idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
+            .unwrap();
+        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        head
+    }
+
+    /// A `fuse_lk_in` for a whole-file write lock through `fh`: flock when
+    /// `flock` is set, an OFD lock otherwise.
+    fn whole_file_write_lock(fh: u64, flock: bool) -> Vec<u8> {
+        let mut lock = vec![0u8; 48];
+        lock[0..8].copy_from_slice(&fh.to_le_bytes());
+        lock[24..32].copy_from_slice(&(i64::MAX as u64).to_le_bytes());
+        lock[32..36].copy_from_slice(&LINUX_F_WRLCK.to_le_bytes());
+        if flock {
+            lock[40..44].copy_from_slice(&FUSE_LK_FLOCK.to_le_bytes());
+        }
+        lock
+    }
+
+    /// Runs one unbounded drain on another thread and waits up to five
+    /// seconds for it. The drain this guards used to block for as long as
+    /// the lock was held, which with a guest holder was forever, so a drain
+    /// that does not come back is the defect and not a slow machine.
+    fn drain_or_hang(mut dev: VirtioFs, mem: &Arc<GuestRam>) -> (VirtioFs, bool) {
+        let mem = Arc::clone(mem);
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let remaining = dev.drain_notified_bounded(&mem, u16::MAX);
+            let _ = send.send((dev, remaining));
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the drain blocked on a held lock instead of parking the request")
+    }
+
+    /// A request ring with one SETLKW chain on it, waiting for the lock
+    /// `holder` has on `node`. Returns the device after the first drain, the
+    /// guest RAM, the ring addresses and the reply address.
+    fn park_a_setlkw(
+        mut dev: VirtioFs,
+        waiter: u64,
+        node: u64,
+        flock: bool,
+    ) -> (VirtioFs, Arc<GuestRam>, (u64, u64, u64), u64) {
+        let base = 0x4000_0000u64;
+        let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
+        let (desc, avail, used) = (base, base + 0x100, base + 0x200);
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        let out = base + 0x8000;
+        let mut req = fuse_in_header(88, SETLKW, 0x77, node);
+        req.extend_from_slice(&whole_file_write_lock(waiter, flock));
+        queue_chain(&mem, desc, avail, 0, base + 0x1000, out, &req);
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+
+        let (dev, remaining) = drain_or_hang(dev, &mem);
+        assert!(
+            remaining,
+            "a parked waiter is work the worker has to keep retrying"
+        );
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            0,
+            "the waiter has no reply yet"
+        );
+        assert!(dev.has_lock_waiters());
+        assert!(!dev.irq_level(), "nothing completed, so nothing to raise");
+        (dev, mem, (desc, avail, used), out)
+    }
+
+    fn reply_at(mem: &GuestRam, out: u64) -> (i32, u64) {
+        let mut header = [0u8; OUT_HEADER_LEN];
+        mem.read(out, &mut header).unwrap();
+        (
+            i32::from_le_bytes(header[4..8].try_into().unwrap()),
+            u64::from_le_bytes(header[8..16].try_into().unwrap()),
+        )
+    }
+
+    /// Two guest processes contend a flock, as `go` does on its module cache.
+    /// The waiter's SETLKW must not hold the device: the holder's RELEASE has
+    /// to get through, and the waiter is then answered in that same drain.
+    #[test]
+    fn a_setlkw_on_a_lock_the_guest_holds_parks_and_is_answered_at_the_release() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let holder = open_rw(&mut dev, node);
+        let waiter = open_rw(&mut dev, node);
+        let out = dev.handle_fuse(
+            &request(SETLK, node, &whole_file_write_lock(holder, true)),
+            4096,
+        );
+        assert_eq!(get_u32(&out, 4), Some(0), "the holder takes the flock");
+
+        let (mut dev, mem, (desc, avail, used), out) = park_a_setlkw(dev, waiter, node, true);
+
+        // The holder closes the file, which is how a flock is given up.
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&holder.to_le_bytes());
+        release[12..16].copy_from_slice(&FUSE_RELEASE_FLOCK_UNLOCK.to_le_bytes());
+        let mut req = fuse_in_header(64, RELEASE, 0x78, node);
+        req.extend_from_slice(&release);
+        let base = 0x4000_0000u64;
+        queue_chain(&mem, desc, avail, 1, base + 0x1400, base + 0x8400, &req);
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+
+        let remaining = dev.drain_notified_bounded(&mem, u16::MAX);
+        assert!(!remaining, "no waiter is left once the lock is taken");
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            2,
+            "the RELEASE and the waiter both completed"
+        );
+        assert_eq!(
+            reply_at(&mem, out),
+            (0, 0x77),
+            "the waiter got its lock, under its own unique"
+        );
+        assert!(!dev.has_lock_waiters());
+        assert!(dev.irq_level());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The OFD path parks the same way. The holder's unlock here comes
+    /// through `handle_fuse` directly, so the drain that answers the waiter
+    /// has no new chain: it is the retry on its own, which is what the
+    /// worker's timed park runs.
+    #[test]
+    fn a_setlkw_on_a_posix_lock_parks_and_a_bare_drain_answers_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let holder = open_rw(&mut dev, node);
+        let waiter = open_rw(&mut dev, node);
+        let out = dev.handle_fuse(
+            &request(SETLK, node, &whole_file_write_lock(holder, false)),
+            4096,
+        );
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let (mut dev, mem, (_, _, used), out) = park_a_setlkw(dev, waiter, node, false);
+
+        // Still held: a tick changes nothing.
+        dev.drain_notified(&mem);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 0);
+        assert!(dev.has_lock_waiters());
+
+        let mut unlock = whole_file_write_lock(holder, false);
+        unlock[32..36].copy_from_slice(&LINUX_F_UNLCK.to_le_bytes());
+        let out_unlock = dev.handle_fuse(&request(SETLK, node, &unlock), 4096);
+        assert_eq!(get_u32(&out_unlock, 4), Some(0));
+
+        dev.drain_notified(&mem);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 1);
+        assert_eq!(reply_at(&mem, out), (0, 0x77));
+        assert!(!dev.has_lock_waiters());
+        assert!(
+            dev.handles[&waiter].locked,
+            "a lock taken on retry marks the handle like one taken at once"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A host process holds the lock. Nothing on the device moves when it
+    /// lets go, so the waiter is answered by whichever drain comes next.
+    #[test]
+    fn a_setlkw_on_a_lock_a_host_process_holds_parks_until_it_is_given_up() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let waiter = open_rw(&mut dev, node);
+        let host = File::open(dir.join("f")).unwrap();
+        // SAFETY: flock on a file this test owns.
+        assert_eq!(
+            unsafe { libc::flock(host.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let (mut dev, mem, (_, _, used), out) = park_a_setlkw(dev, waiter, node, true);
+
+        dev.drain_notified(&mem);
+        assert!(dev.has_lock_waiters(), "still held on the host");
+        drop(host);
+        dev.drain_notified(&mem);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 1);
+        assert_eq!(reply_at(&mem, out), (0, 0x77));
+        assert!(!dev.has_lock_waiters());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A reset takes the queues down, and the parked chains with them. One
+    /// left behind would complete into a ring the rebooted guest laid out
+    /// anew.
+    #[test]
+    fn a_reset_drops_the_parked_lock_waiters() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let holder = open_rw(&mut dev, node);
+        let waiter = open_rw(&mut dev, node);
+        let out = dev.handle_fuse(
+            &request(SETLK, node, &whole_file_write_lock(holder, true)),
+            4096,
+        );
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let (mut dev, mem, (_, _, used), _) = park_a_setlkw(dev, waiter, node, true);
+        dev.mmio(&mem, mmio::STATUS, true, 0);
+        assert!(!dev.has_lock_waiters());
+        dev.drain_notified(&mem);
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            0,
+            "nothing completes after a reset"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The guest never releases a handle with a lock request in flight on it,
+    /// but a waiter whose handle is gone has nothing to lock, and an answer
+    /// beats a chain that is never completed.
+    #[test]
+    fn a_waiter_whose_handle_is_released_is_answered_ebadf() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let holder = open_rw(&mut dev, node);
+        let waiter = open_rw(&mut dev, node);
+        let out = dev.handle_fuse(
+            &request(SETLK, node, &whole_file_write_lock(holder, true)),
+            4096,
+        );
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        let (mut dev, mem, (_, _, used), out) = park_a_setlkw(dev, waiter, node, true);
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&waiter.to_le_bytes());
+        let out_release = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+        assert_eq!(get_u32(&out_release, 4), Some(0));
+
+        dev.drain_notified(&mem);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 1);
+        assert_eq!(reply_at(&mem, out), (-EBADF, 0x77));
+        assert!(!dev.has_lock_waiters());
         let _ = fs::remove_dir_all(dir);
     }
 
