@@ -329,8 +329,14 @@ struct PendingLock {
 /// held: one `go vet` contending its module cache lock from two processes
 /// froze a guest for good. A waiter keeps its chain instead, and
 /// `retry_lock_waiters` repeats the call without blocking until it is
-/// answered. The queue bounds how many there are: each holds a descriptor
-/// chain the guest cannot reuse until it is completed.
+/// answered.
+///
+/// Each one keeps its descriptor chain until it is answered, and a ring with
+/// no free chain cannot carry the holder's own unlock, which is the freeze
+/// again with more waiters. So at most [`LockWaiter::cap`] of them wait per
+/// queue, and `handle_chain` answers the next with `ENOLCK`, the error
+/// fcntl(2) gives for too many locks, which a program can report where a
+/// hang cannot be.
 struct LockWaiter {
     queue_idx: usize,
     head: u16,
@@ -339,6 +345,16 @@ struct LockWaiter {
     unique: u64,
     fh: u64,
     call: LockCall,
+}
+
+impl LockWaiter {
+    /// How many may wait on a queue of `size` entries: a quarter of the ring.
+    /// A chain is at least two entries, since the device offers no indirect
+    /// descriptors, so this leaves at least half the ring for every other
+    /// request, the unlock among them.
+    fn cap(size: u16) -> usize {
+        usize::from(size / 4)
+    }
 }
 
 struct FileHandle {
@@ -1921,6 +1937,16 @@ impl VirtioFs {
             Reply::Direct(n) => Some(n as u32),
             Reply::Buffered(response) => {
                 if let Some(pending) = self.lock_to_park.take() {
+                    let cap = LockWaiter::cap(self.queues[queue_idx].size());
+                    let waiting = self
+                        .lock_waiters
+                        .iter()
+                        .filter(|w| w.queue_idx == queue_idx)
+                        .count();
+                    if waiting >= cap {
+                        let response = error_response(pending.unique, ENOLCK);
+                        return Some(Self::write_reply(mem, &output, &response));
+                    }
                     self.lock_waiters.push(LockWaiter {
                         queue_idx,
                         head,
@@ -7248,7 +7274,9 @@ fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
 ///
 /// A held lock comes back as `EWOULDBLOCK` from `flock` and as `EAGAIN` from
 /// `fcntl`, which are one value on macOS and Linux alike. Linux also answers
-/// an `F_SETLK` conflict with `EACCES`, so a build there is read the same way.
+/// an `F_SETLK` conflict with `EACCES`. This server is built for macOS only,
+/// which never returns that, so the arm is kept for a Linux build of it and
+/// read by none today.
 fn try_lock(file: &File, call: LockCall) -> Result<(), Option<i32>> {
     let fd = file.as_raw_fd();
     let result = match call {
@@ -11971,6 +11999,78 @@ mod tests {
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1);
         assert_eq!(reply_at(&mem, out), (0, 0x77));
         assert!(!dev.has_lock_waiters());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Waiters keep their chains, so a ring could fill with them and have no
+    /// chain left for the holder's unlock: the freeze this change removes,
+    /// with more waiters. A quarter of the ring may wait; the next SETLKW is
+    /// answered ENOLCK, and the ones already parked still get their lock.
+    #[test]
+    fn a_ring_a_quarter_full_of_waiters_refuses_the_next_with_enolck() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let holder = open_rw(&mut dev, node);
+        let waiters: Vec<u64> = (0..3).map(|_| open_rw(&mut dev, node)).collect();
+        let out = dev.handle_fuse(
+            &request(SETLK, node, &whole_file_write_lock(holder, true)),
+            4096,
+        );
+        assert_eq!(get_u32(&out, 4), Some(0));
+
+        // A ring of 8 entries: two waiters may park, and the three chains
+        // take six entries.
+        let base = 0x4000_0000u64;
+        let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
+        let (desc, avail, used) = (base, base + 0x100, base + 0x200);
+        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        assert_eq!(LockWaiter::cap(8), 2);
+        let outs: Vec<u64> = (0..3).map(|i| base + 0x8000 + i * 0x200).collect();
+        for (i, (waiter, out)) in waiters.iter().zip(&outs).enumerate() {
+            let mut req = fuse_in_header(88, SETLKW, 0x70 + i as u64, node);
+            req.extend_from_slice(&whole_file_write_lock(*waiter, true));
+            queue_chain(
+                &mem,
+                desc,
+                avail,
+                i as u16,
+                base + 0x1000 + i as u64 * 0x200,
+                *out,
+                &req,
+            );
+        }
+        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+
+        let (mut dev, _) = drain_or_hang(dev, &mem);
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            1,
+            "only the refused one completed"
+        );
+        assert_eq!(
+            reply_at(&mem, outs[2]),
+            (-ENOLCK, 0x72),
+            "the third is refused, not parked"
+        );
+        assert!(dev.has_lock_waiters());
+
+        let mut release = vec![0u8; 24];
+        release[0..8].copy_from_slice(&holder.to_le_bytes());
+        release[12..16].copy_from_slice(&FUSE_RELEASE_FLOCK_UNLOCK.to_le_bytes());
+        let out = dev.handle_fuse(&request(RELEASE, node, &release), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0));
+        dev.drain_notified(&mem);
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            2,
+            "the first waiter has the lock"
+        );
+        assert_eq!(reply_at(&mem, outs[0]), (0, 0x70));
+        assert!(
+            dev.has_lock_waiters(),
+            "the second still waits on the first"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
