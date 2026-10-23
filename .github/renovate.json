@@ -17,7 +17,7 @@
     {
       "description": "Keep rust-version on the release rust-toolchain.toml pins; the cargo manager does not track it.",
       "customType": "regex",
-      "managerFilePatterns": ["/^Cargo\\.toml$/"],
+      "managerFilePatterns": ["/^(e2e/)?Cargo\\.toml$/"],
       "matchStrings": ["rust-version = \"(?<currentValue>[^\"]+)\""],
       "depNameTemplate": "rust",
       "datasourceTemplate": "rust-version"
@@ -29,9 +29,52 @@
       "matchStrings": ["# renovate: datasource=crate depName=cargo-deny\\s+tool: cargo-deny@(?<currentValue>[0-9.]+)"],
       "datasourceTemplate": "crate",
       "depNameTemplate": "cargo-deny"
+    },
+    {
+      "description": "Bump the cargo-nextest pin the e2e suite runs under. It sits in an action input, which the github-actions manager does not read.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/actions/run-e2e/action\\.yml$/"],
+      "matchStrings": ["# renovate: datasource=crate depName=cargo-nextest\\s+tool: cargo-nextest@(?<currentValue>[0-9.]+)"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "cargo-nextest"
+    },
+    {
+      "description": "Bump the virtiofsd every Linux runner builds for the e2e suite. It sits in a step environment, which the github-actions manager does not read.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/actions/run-e2e/action\\.yml$/"],
+      "matchStrings": ["# renovate: datasource=crate depName=virtiofsd\\s+VIRTIOFSD_VERSION: (?<currentValue>[0-9.]+)"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "virtiofsd"
+    },
+    {
+      "description": "Bump the e2e suite's guest images, pinned by tag and digest in e2e/assets.toml.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^e2e/assets\\.toml$/"],
+      "matchStrings": ["image = \"(?<depName>[^:@\"]+):(?<currentValue>[^@\"]+)@(?<currentDigest>sha256:[0-9a-f]{64})\""],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "Bump the gvproxy release the e2e suite downloads, with the sha256 of each binary, which the datasource reads from the release's sha256sums.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^e2e/assets\\.toml$/"],
+      "matchStrings": ["url = \"https://github\\.com/containers/gvisor-tap-vsock/releases/download/(?<currentValue>v[^/]+)/[^\"]+\"\\nsha256 = \"(?<currentDigest>[0-9a-f]{64})\""],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "containers/gvisor-tap-vsock"
     }
   ],
   "packageRules": [
+    {
+      "description": "Treat the custom managers' crate pins as exact versions, since the crate datasource reads a bare version as a caret range.",
+      "matchManagers": ["custom.regex"],
+      "matchDatasources": ["crate"],
+      "versioning": "semver"
+    },
+    {
+      "description": "Parse the guest kernel's tag as its architecture followed by its kernel version, so a newer kernel for the same architecture shows as an update.",
+      "matchDatasources": ["docker"],
+      "matchDepNames": ["ghcr.io/brig-sh/kernel"],
+      "versioning": "regex:^(?<compatibility>amd64|arm64)-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
     {
       "description": "Keep the SHA-pinned actions bumped.",
       "matchManagers": ["github-actions"],
@@ -46,8 +89,14 @@
     {
       "description": "Keep the toolchain and rust-version bumped together in a pull request of their own.",
       "matchDepNames": ["rust"],
-      "matchFileNames": ["rust-toolchain.toml", "Cargo.toml"],
+      "matchFileNames": ["rust-toolchain.toml", "Cargo.toml", "e2e/Cargo.toml"],
       "groupName": "Rust toolchain"
+    },
+    {
+      "description": "Keep the e2e suite's downloads bumped in a pull request of their own.",
+      "matchFileNames": ["e2e/assets.toml"],
+      "groupName": "e2e assets",
+      "semanticCommitType": "test"
     },
     {
       "description": "Keep the commitlint tooling under .github/linters bumped.",
