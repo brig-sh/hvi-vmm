@@ -15,23 +15,32 @@
 #     --target aarch64-unknown-linux-musl    validate-code / tidy-linux-musl-arm64
 #   cargo test --workspace                   build-and-test / test-portable
 #                                            (or build-and-test-macos)
-#   cargo deny check                         validate-code / check-deps
+#   cargo test --locked --manifest-path e2e/Cargo.toml --lib
+#                                            build-and-test / test-portable
+#   cargo deny check (root and e2e/)         validate-code / check-deps
 #   actionlint -shellcheck=shellcheck        validate-code / lint-workflows
+#     and then shellcheck e2e/tools/*.sh e2e/guest/init
 #   typos --config .github/linters/typos.toml
 #                                            validate-commits / check-spelling
 #
-# tidy.sh and the tests always run. The rest need something the pinned Rust
-# toolchain does not supply: the rustup target for each cross-lint (aarch64
-# glibc, x86-64 musl and aarch64 musl), and the binaries for cargo-deny,
-# actionlint plus shellcheck, and typos. The script skips a check when its tool
-# is absent, and names every skip in the closing line. A run with a skip never
-# reports a plain "ok", because a reader must not take a skipped check for one
-# that passed.
+# tidy.sh and the two cargo test runs always run. The rest need something the
+# pinned Rust toolchain does not supply: the rustup target for each cross-lint
+# (aarch64 glibc, x86-64 musl and aarch64 musl), and the binaries for
+# cargo-deny, actionlint plus shellcheck, and typos. The script skips a check
+# when its tool is absent, and names every skip in the closing line. A run with
+# a skip never reports a plain "ok", because a reader must not take a skipped
+# check for one that passed.
 #
 # The virtio-fs performance gate (build-and-test / perf-virtiofs) is not in
 # that list because it builds the merge base as well as the branch, so it
 # costs more than everything above put together. Pass --with-perf to include
 # it; it is macOS-only, since that is where the device compiles.
+#
+# The e2e suite (test-e2e / test) boots real guests, so it needs /dev/kvm or
+# Hypervisor.framework, cargo-nextest, and the musl rustup target of the host's
+# architecture, such as x86_64-unknown-linux-musl, which its setup builds the
+# guest agent for, and on Linux hvi as well. On Linux it also needs virtiofsd
+# and the tap that e2e/tools/provision.sh creates. --with-e2e includes it.
 #
 # Three CI checks cannot run here on any machine: the backend of the other
 # host, because only the host target compiles; the live boots, which need
@@ -41,10 +50,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 with_perf=no
+with_e2e=no
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-perf) with_perf=yes; shift ;;
-        *) echo "usage: $0 [--with-perf]" >&2; exit 2 ;;
+        --with-e2e) with_e2e=yes; shift ;;
+        *) echo "usage: $0 [--with-perf] [--with-e2e]" >&2; exit 2 ;;
     esac
 done
 
@@ -78,9 +89,11 @@ else
     skipped+=("aarch64-musl lint (rustup target add aarch64-unknown-linux-musl)")
 fi
 
-# The unit suite for this host's backend plus the portable core, and the
-# build-version crate beside them.
+# The unit suite for this host's backend plus the portable core, the
+# build-version crate beside them, and the e2e workspace's unit tests, which
+# need no hypervisor.
 cargo test --workspace
+cargo test --locked --manifest-path e2e/Cargo.toml --lib
 
 # The dependency audit, the command that check-deps runs. Without deny.toml,
 # cargo-deny uses its own defaults and answers a different question, so
@@ -92,14 +105,16 @@ elif [ ! -f deny.toml ]; then
     skipped+=("dependency audit (no deny.toml in this tree)")
 else
     cargo deny check
+    cargo deny --locked --manifest-path e2e/Cargo.toml --workspace --config deny.toml check
 fi
 
 # The workflows themselves. CI pins both binaries and verifies their sha256.
 # Here, the versions on PATH are near enough to find a mistake before a push.
 if command -v actionlint >/dev/null 2>&1 && command -v shellcheck >/dev/null 2>&1; then
     actionlint -shellcheck=shellcheck
+    shellcheck e2e/tools/*.sh e2e/guest/init
 else
-    skipped+=("workflow lint (needs actionlint and shellcheck on PATH)")
+    skipped+=("workflow and script lint (needs actionlint and shellcheck on PATH)")
 fi
 
 # Spelling, over the tree. CI also checks the commit messages that a pull
@@ -117,6 +132,13 @@ else
     skipped+=("virtio-fs performance gate (tools/gates.sh --with-perf)")
 fi
 
+# The e2e suite, opt-in: see the note at the top.
+if [ "$with_e2e" = yes ]; then
+    cargo nextest run --manifest-path e2e/Cargo.toml
+else
+    skipped+=("e2e suite (tools/gates.sh --with-e2e)")
+fi
+
 if [ ${#skipped[@]} -eq 0 ]; then
     echo "gates: ok"
 else
@@ -124,5 +146,5 @@ else
     for item in "${skipped[@]}"; do
         echo "  - $item"
     done
-    echo "gates: CI still runs all of them."
+    echo "gates: CI still runs all of them, but a pull request from a fork skips the self-hosted ones."
 fi

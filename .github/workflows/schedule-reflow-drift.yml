@@ -64,13 +64,18 @@ jobs:
           --component rustfmt --no-self-update
       # The `id` lets the step below tell a real reflow difference from a
       # checkout or installer error, which must not file a pin-bump issue.
-      # The config mirrors the reflow pass in `tools/tidy.sh`; keep them in
-      # step. `cargo fmt` reads only source, so no dependency build is needed.
+      # The config mirrors the reflow pass in `tools/tidy.sh`, over the same two
+      # workspaces; keep them in step. `cargo fmt` reads only source, so no
+      # dependency build is needed.
       - name: Check the tree against the latest nightly's reflow
         id: reflow
-        run: >-
-          cargo +nightly fmt --all --
-          --config wrap_comments=true,comment_width=80 --check
+        run: |
+          status=0
+          for manifest in Cargo.toml e2e/Cargo.toml; do
+            cargo +nightly fmt --all --manifest-path "$manifest" -- \
+              --config wrap_comments=true,comment_width=80 --check || status=1
+          done
+          exit "$status"
       - name: File or update the tracking issue
         if: failure() && steps.reflow.outcome == 'failure'
         env:

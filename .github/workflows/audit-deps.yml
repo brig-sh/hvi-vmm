@@ -70,7 +70,7 @@ jobs:
           # --label` cannot fail on a missing label. Ignores "already exists".
           gh label create "$ISSUE_LABEL" \
             --color BFD4F2 \
-            --description "Weekly cargo-deny failures against the lockfile on main" \
+            --description "Weekly cargo-deny failures against the lockfiles on main" \
             2>/dev/null || true
           # Find an open issue by the fixed marker in its title. The lookup
           # has no `|| true`: a failed or rate-limited query must stop the
@@ -81,12 +81,12 @@ jobs:
             --limit 100 --json number,title \
             --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
           body=$(cat <<EOF
-          The weekly \`cargo deny check\` against the lockfile on \`main\` failed.
+          The weekly \`cargo deny check\` against the lockfiles on \`main\` failed.
 
           - Run: $run_url
           - Config: \`deny.toml\`
 
-          A red run usually means a new RUSTSEC advisory against a crate the
+          A red run usually means a new RUSTSEC advisory against a crate a
           lockfile already holds. The remediation is a dependency update, or
           a justified \`ignore\` entry in \`deny.toml\` when the advisory does
           not apply here.
