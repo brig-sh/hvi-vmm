@@ -1,0 +1,3 @@
+# Clippy reads the nearest clippy.toml above a crate, so without this file the
+# e2e crates would take the repository's. Its host-path bans do not apply to a
+# test harness, which works with host paths throughout.

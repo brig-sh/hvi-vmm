@@ -1,0 +1,12 @@
+[package]
+name = "hvi-e2e-agent"
+version = "0.1.0"
+description = "The program the hvi end-to-end guests run to take commands over vsock"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hvi-e2e-protocol.workspace = true
+libc.workspace = true

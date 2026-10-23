@@ -1,0 +1,39 @@
+# Every file the e2e suite downloads. The setup binary fetches each one once
+# into the cache, checks it against its pin, and refuses one that does not
+# match.
+#
+# An entry is either an OCI image, `image = "registry/name:tag@sha256:digest"`,
+# pinned by the digest of its manifest or index, or a plain download, `url` with
+# its `sha256`. An image's index is resolved to the Linux manifest for the
+# host's architecture, and `layer` names the layer that holds the file when
+# there is more than one. A table's keys name the guest architecture, the host's
+# OS and architecture for a program that runs on the host, or `any`.
+
+# Guest kernels built by kernel/build-kernel.sh in brig-sh/community-images: a
+# bzImage on x86-64 and an `Image` on arm64. Each tag names the kernel version,
+# so a new version shows in the pin.
+[kernel.x86_64]
+image = "ghcr.io/brig-sh/kernel:amd64-6.12.95@sha256:2971e04828d9f68e123850889610778724a3906e25e22eb0699d3ca57886842e"
+layer = "kernel"
+
+[kernel.aarch64]
+image = "ghcr.io/brig-sh/kernel:arm64-6.12.95@sha256:eeff3a14aa70e4a4c0768381d81dec7951a157318beabd7c1c0fee5b77af0e86"
+layer = "kernel"
+
+# The guest's root filesystem: the Alpine image, whose one layer is the Alpine
+# minirootfs.
+[rootfs.any]
+image = "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
+
+# The gvisor-tap-vsock gateway the `--net-gateway` tests run on the host.
+[gvproxy.linux-x86_64]
+url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-linux-amd64"
+sha256 = "95c0ee5b5e5d401094ed58ac2f984ba5e935c2cb416c8752329fcfacb721aa9a"
+
+[gvproxy.linux-aarch64]
+url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-linux-arm64"
+sha256 = "c1ea864636182a774235c8866c70f2a0223dfcd4f08d24e37a7e82d9882beb9c"
+
+[gvproxy.macos-aarch64]
+url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-darwin"
+sha256 = "e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be"
