@@ -1,0 +1,53 @@
+# How the e2e suite runs. See docs/testing.md.
+#
+# The default profile is the set a pull request runs: every test off the
+# probation and nightly lists below. The full profile runs all of them.
+
+# The setup binary runs as a setup script, which nextest still marks
+# experimental.
+experimental = ["setup-scripts"]
+
+[scripts.setup.prepare]
+command = "cargo run --quiet --package hvi-e2e --bin setup"
+# Show downloads and builds as they happen.
+capture-stdout = false
+capture-stderr = false
+slow-timeout = { period = "120s" }
+
+# The `--net-tap` tests share the one tap device the host provisions.
+[test-groups]
+tap = { max-threads = 1 }
+
+[profile.default]
+# The filter leaves out two lists of tests. Each entry names its test exactly,
+# `test(=tap::name) | ...`, and a list is empty while it reads `none()`.
+#
+# - The probation list comes first. Its tests are kept out of pull requests
+#   until they have passed seven nightly runs in a row on every backend that
+#   builds them, counted from the commit that added their entry.
+# - The nightly list holds the tests too slow to run on every pull request.
+default-filter = "not (none()) and not (test(=socket::daemon_that_never_starts_fails_the_boot_after_the_wait))"
+fail-fast = false
+retries = { backoff = "fixed", count = 1, delay = "2s" }
+# The harness's own timeouts, at the largest scale a runner sets, expire before
+# nextest kills a test, so a hung test fails with the harness's report of the
+# run.
+slow-timeout = { period = "60s", terminate-after = 10 }
+leak-timeout = { period = "500ms", result = "fail" }
+junit = { path = "junit.xml" }
+
+# Every profile inherits the default profile's overrides and setup scripts.
+[[profile.default.overrides]]
+filter = "binary(net) and test(/(^|::)tap::/)"
+test-group = "tap"
+
+[[profile.default.scripts]]
+filter = "binary_id(hvi-e2e::*)"
+setup = "prepare"
+
+# Every test, the ones on probation included, which the nightly run reports on.
+# A failure is not retried there, so a flaky test shows as one.
+[profile.full]
+default-filter = "all()"
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 5 }

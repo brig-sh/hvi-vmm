@@ -1,0 +1,17 @@
+#!/bin/sh
+# The e2e guest's init. It mounts the pseudo-filesystems, prints a marker line
+# with its own arguments, and runs the agent. If the agent exits, the guest
+# powers off, so a broken agent ends the run instead of leaving it waiting for a
+# timeout.
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+ip link set lo up
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+echo "hvi-e2e: init [$*]"
+/sbin/hvi-e2e-agent
+echo "hvi-e2e: the agent exited with status $?"
+poweroff -f
