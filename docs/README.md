@@ -33,7 +33,7 @@ Four journeys. Start at the one that matches what you are doing.
 | Page | What it covers |
 | --- | --- |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Branches, commits, pull requests, and the gates to run before you push. |
-| [testing.md](testing.md) | What runs where: the unit suite, the confinement selftests, the live boots, and the gaps. |
+| [testing.md](testing.md) | What runs where: the unit suite, the confinement selftests, the live boots, the e2e suite, and the gaps. |
 | [benchmarking.md](benchmarking.md) | The virtio-fs benchmarks, the performance gate, and how to compare two builds honestly. Tool usage is in [`tools/fsbench/README.md`](../tools/fsbench/README.md). |
 | [../resources/seccomp/README.md](../resources/seccomp/README.md) | Changing a seccomp allowlist safely. |
 

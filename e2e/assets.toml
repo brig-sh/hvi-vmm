@@ -8,6 +8,10 @@
 # host's architecture, and `layer` names the layer that holds the file when
 # there is more than one. A table's keys name the guest architecture, the host's
 # OS and architecture for a program that runs on the host, or `any`.
+#
+# Renovate keeps the pins current, a download's sha256 with its version. Its
+# matchers read the layout below: each value in double quotes, and a download's
+# `sha256` on the line right after its `url`.
 
 # Guest kernels built by kernel/build-kernel.sh in brig-sh/community-images: a
 # bzImage on x86-64 and an `Image` on arm64. Each tag names the kernel version,

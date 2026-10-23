@@ -939,6 +939,8 @@ jobs:
             echo "::warning::cannot create a tap (needs CAP_NET_ADMIN or passwordless sudo) -- skipping the tap network boot"
             exit 0
           fi
+          # The e2e suite's tap, which stays on these runners, takes the next
+          # /24, 172.30.1.0/24; see e2e/tools/provision.sh.
           $NET ip addr add 172.30.0.1/24 dev hvi-ci-tap
           $NET ip link set hvi-ci-tap up
           ip -d link show hvi-ci-tap

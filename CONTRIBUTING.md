@@ -32,7 +32,8 @@ Install that nightly, or CI finds what you missed. `--with-perf` adds the
 virtio-fs performance gate (`tools/perf-gate.sh`, macOS only), which builds the
 merge base as well as the branch and so costs more than every other check
 together. `--with-e2e` adds the e2e suite, which boots real guests. The live
-boots, the other host's backend and the commit-message lint stay CI's job.
+boots, the other host's backend, the e2e filter-name check and the
+commit-message lint stay CI's job.
 
 Only the backend for your host target is compiled: the macOS/hvf one on Apple
 silicon, x86-64/KVM on an x86 Linux box. To lint a backend you have no host for,
@@ -53,10 +54,11 @@ target is installed.
 
 The toolchain is pinned in `rust-toolchain.toml`, so everyone lints against the
 same compiler. `rust-version` in `Cargo.toml` and in `e2e/Cargo.toml` names the
-same release, and `tools/tidy.sh` fails when one differs, so a toolchain bump
-moves all three. The seccomp allowlists hold the syscalls the standard library
-of the pinned release makes. A newer one can make a syscall they do not hold, so
-a bump is checked by the boot jobs, which run the guest under the filters.
+same release, and `tools/tidy.sh` fails when either differs from the pin, so a
+toolchain bump moves all three. The seccomp allowlists hold the syscalls the
+standard library of the pinned release makes. A newer one can make a syscall
+they do not hold, so a bump is checked by the boot jobs, which run the guest
+under the filters.
 
 ## Branches
 
@@ -152,15 +154,20 @@ suites pass (see Releasing below).
   musl on x86-64 and arm64 Linux, the e2e workspace's unit tests on x86 Linux,
   the two confinement selftests, and then the live boots on the self-hosted
   runners.
+- **test-e2e**: the e2e suite in `e2e/` on the self-hosted x86, arm64/KVM and
+  Apple-silicon runners; see [docs/testing.md](docs/testing.md#the-e2e-suite).
 
-`tools/gates.sh` runs everything in that list a developer machine can run.
-Three checks cannot run anywhere but CI: the other host's backend, the live
-boots, and the commit-message lint, which needs a pull request's commit range.
+`tools/gates.sh` runs everything in that list a developer machine can run, and
+the e2e suite with `--with-e2e`. It does not run the e2e probation check, which
+compares a change with its base; run `e2e/tools/check-probation.sh <base>` for
+that. Four checks cannot run anywhere but CI: the other host's backend, the live
+boots, the e2e filter-name check, which needs every backend's test list, and the
+commit-message lint, which needs a pull request's commit range.
 
-The self-hosted lanes, which are the three live boots and the performance
-gate, are withheld from pull requests opened from a fork, because they run on
-persistent machines the project owns rather than ephemeral VMs. A fork still
-gets every hosted job.
+The self-hosted lanes, which are the live boots, the e2e suite and the
+performance gate, are withheld from pull requests opened from a fork, because
+they run on persistent machines the project owns rather than ephemeral VMs. A
+fork still gets every hosted job.
 
 Every job carries a `timeout-minutes` cap. The boot jobs upload their logs as
 artifacts when they fail, and the two arm64 boots also upload the event
@@ -173,15 +180,18 @@ records, and a kick before the run. The suite runs on arm64 Linux, on the
 self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the boot
 runners also run the stop tests.
 
-Three scheduled workflows run outside the two entry points, each reporting
-through a tracking issue so `main` stays green: the weekly dependency audit,
-the weekly used-ring litmus on arm64, and a monthly check that the pinned
-reflow nightly still agrees with the latest one.
+Four scheduled workflows run outside the two entry points, each reporting
+through a tracking issue so `main` stays green: the nightly e2e suite on every
+backend, the weekly dependency audit, the weekly used-ring litmus on arm64, and
+a monthly check that the pinned reflow nightly still agrees with the latest one.
+The nightly e2e run also keeps an issue that lists the tests ready to leave
+probation.
 
 External actions are pinned to commit SHAs, with the version in a comment.
-Renovate keeps those pins, the Cargo dependencies, the Rust toolchain with
-`rust-version`, the cargo-deny pin and the commitlint tooling updated
-(`.github/renovate.json`).
+Renovate (`.github/renovate.json`) updates those pins, the Cargo dependencies,
+the Rust toolchain with `rust-version`, the cargo-deny, cargo-nextest and
+virtiofsd pins, the commitlint tooling and the e2e suite's downloads in
+`e2e/assets.toml`.
 
 ## Releasing
 

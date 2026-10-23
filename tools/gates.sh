@@ -37,10 +37,16 @@
 # it; it is macOS-only, since that is where the device compiles.
 #
 # The e2e suite (test-e2e / test) boots real guests, so it needs /dev/kvm or
-# Hypervisor.framework, cargo-nextest, and the musl rustup target of the host's
-# architecture, such as x86_64-unknown-linux-musl, which its setup builds the
-# guest agent for, and on Linux hvi as well. On Linux it also needs virtiofsd
-# and the tap that e2e/tools/provision.sh creates. --with-e2e includes it.
+# Hypervisor.framework, and cargo-nextest. Its setup builds the guest agent, and
+# on Linux hvi as well, for the musl rustup target of the host's architecture,
+# such as x86_64-unknown-linux-musl. On Linux it also needs virtiofsd and the
+# tap that e2e/tools/provision.sh creates; e2e/README.md says how to set these
+# up. --with-e2e includes it.
+#
+# Two of the suite's checks are not here. e2e/tools/check-filters.sh checks the
+# names in the filters against every backend's tests, which only CI has. The
+# probation check compares a change with the commit it is based on, so run
+# e2e/tools/check-probation.sh <base> for it.
 #
 # Three CI checks cannot run here on any machine: the backend of the other
 # host, because only the host target compiles; the live boots, which need
@@ -134,7 +140,7 @@ fi
 
 # The e2e suite, opt-in: see the note at the top.
 if [ "$with_e2e" = yes ]; then
-    cargo nextest run --manifest-path e2e/Cargo.toml
+    cargo nextest run --locked --manifest-path e2e/Cargo.toml
 else
     skipped+=("e2e suite (tools/gates.sh --with-e2e)")
 fi

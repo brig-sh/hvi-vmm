@@ -1,0 +1,16 @@
+# How cargo-nextest runs this crate's own tests. The e2e suite is a workspace of
+# its own, configured in e2e/.config/nextest.toml.
+
+# The kvm profile runs the vCPU stop tests, which boot synthetic kernels
+# in-process. A plain `cargo test` ignores them, so it needs no hypervisor. They
+# keep the seccomp filters on only in a release build:
+#
+#   cargo nextest run --cargo-profile release --profile kvm --run-ignored only
+#
+# Each test runs in a process of its own, so the two that find a thread by name
+# do not see each other's threads. They run one at a time, since some of them
+# time a stop to within a fraction of a second.
+[profile.kvm]
+default-filter = "test(/::stop_tests::/)"
+fail-fast = false
+test-threads = 1

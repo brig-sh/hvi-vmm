@@ -3,8 +3,7 @@
 # The default profile is the set a pull request runs: every test off the
 # probation and nightly lists below. The full profile runs all of them.
 
-# The setup binary runs as a setup script, which nextest still marks
-# experimental.
+# The setup binary runs as a setup script, a feature nextest marks experimental.
 experimental = ["setup-scripts"]
 
 [scripts.setup.prepare]
@@ -12,23 +11,38 @@ command = "cargo run --quiet --package hvi-e2e --bin setup"
 # Show downloads and builds as they happen.
 capture-stdout = false
 capture-stderr = false
-slow-timeout = { period = "120s" }
+# A cold setup builds hvi and downloads the guest images, so it gets twenty
+# minutes before nextest ends it.
+slow-timeout = { period = "120s", terminate-after = 10 }
 
-# The `--net-tap` tests share the one tap device the host provisions.
 [test-groups]
+# The `--net-tap` tests share the one tap device the host provisions.
 tap = { max-threads = 1 }
+# The guests with many vCPUs, gibibytes of RAM or a gibibyte of disk reads run
+# one at a time, beside the lighter tests, so no two of them load the host at
+# once.
+heavy = { max-threads = 1 }
+# The guest's sync waits while the host writes back every dirty page of the
+# export's filesystem, so the test that bounds it runs one at a time with the
+# tests that write hundreds of mebibytes.
+writeback = { max-threads = 1 }
 
 [profile.default]
 # The filter leaves out two lists of tests. Each entry names its test exactly,
-# `test(=tap::name) | ...`, and a list is empty while it reads `none()`.
+# `test(=tap::name) | ...`, and an empty list reads `none()`.
 #
 # - The probation list comes first. Its tests are kept out of pull requests
 #   until they have passed seven nightly runs in a row on every backend that
 #   builds them, counted from the commit that added their entry.
 # - The nightly list holds the tests too slow to run on every pull request.
+#
+# The filter stays on one line, which is how the tools in `tools/` read it.
 default-filter = "not (none()) and not (test(=socket::daemon_that_never_starts_fails_the_boot_after_the_wait))"
 fail-fast = false
+# A test that fails and then passes on its retry is reported as flaky and still
+# fails the run, so a race in hvi cannot pass a pull request by retrying.
 retries = { backoff = "fixed", count = 1, delay = "2s" }
+flaky-result = "fail"
 # The harness's own timeouts, at the largest scale a runner sets, expire before
 # nextest kills a test, so a hung test fails with the harness's report of the
 # run.
@@ -41,13 +55,34 @@ junit = { path = "junit.xml" }
 filter = "binary(net) and test(/(^|::)tap::/)"
 test-group = "tap"
 
+[[profile.default.overrides]]
+filter = """test(=thirty_two_vcpus_come_online) \
+  | test(=large_direct_reads_complete) \
+  | test(=ram_above_the_mmio_hole_is_a_second_region)"""
+test-group = "heavy"
+
+# A test is in one group only. The export test with RAM above 4 GiB writes
+# hundreds of mebibytes through an export, so it is in this one.
+[[profile.default.overrides]]
+filter = """test(=sync_returns_promptly) \
+  | test(=stop_signal_during_disk_writes_ends_the_run_cleanly) \
+  | test(=socket::stop_signal_during_writes_to_an_export_ends_the_run_and_the_daemon) \
+  | test(=socket::traffic_to_an_export_works_with_ram_above_four_gibibytes)"""
+test-group = "writeback"
+
 [[profile.default.scripts]]
 filter = "binary_id(hvi-e2e::*)"
 setup = "prepare"
 
-# Every test, the ones on probation included, which the nightly run reports on.
-# A failure is not retried there, so a flaky test shows as one.
+# Every test, the probation and nightly lists included. The probation report
+# reads this profile's results. A failure is not retried here, so a flaky test
+# shows as a failure.
 [profile.full]
 default-filter = "all()"
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+# The profile for the ignored tests that pin bugs. It keeps their JUnit report
+# apart from the run's.
+[profile.pinned]
+inherits = "full"

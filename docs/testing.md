@@ -1,6 +1,6 @@
 # What runs where
 
-Six kinds of check guard this repository, and they are not equally strong.
+Seven kinds of check guard this repository, and they are not equally strong.
 Keep them apart when you read a green tick.
 
 | Evidence | What it proves |
@@ -10,6 +10,7 @@ Keep them apart when you read a green tick.
 | Confinement selftests | Specific probes are allowed or denied. Not that the sandbox is secure. |
 | Used-ring litmus | Demonstrates a memory-ordering defect and its fix. Not a reliable regression catcher. |
 | Live boot | A real guest reached a real gate on real hardware. |
+| E2E suite | The release build of hvi, confined, ran a guest that drove a device, and the run stopped as expected. |
 | Performance gate | This branch is not slower than its merge base, by two measures. |
 
 ## Before you push
@@ -21,12 +22,13 @@ tools/gates.sh
 It runs the CI checks a developer machine can run, and names every check it
 skipped so a run with a skip never reports a bare `ok`.
 
-Always runs: `tools/tidy.sh --check` and `cargo test`.
+Always runs: `tools/tidy.sh --check`, `cargo test` and the e2e workspace's unit
+tests.
 
-Skipped when its tool is missing, and named: the three cross-lints, for
-aarch64 glibc and for x86-64 and aarch64 musl (each needs its rustup target),
-`cargo deny check`, the workflow lint (actionlint and shellcheck), and the
-spell check (typos).
+Skipped when its tool is missing, and named: the three cross-lints, for aarch64
+glibc and for x86-64 and aarch64 musl (each needs its rustup target),
+`cargo deny check` over both lockfiles, the workflow and script lint (actionlint
+and shellcheck), and the spell check (typos).
 
 One skip it does not count: `tools/tidy.sh` drops the comment-reflow pass when
 the nightly pinned in `pins.env` is not installed. It says so on stderr, and
@@ -41,9 +43,12 @@ the nightly pinned in `pins.env` is not installed. It says so on stderr, and
 the merge base as well as the branch, so it costs more than everything else
 together.
 
-Three checks cannot run on any developer machine: the other host's backend,
-the live boots, and the commit-message lint, which needs a pull request's
-commit range.
+`--with-e2e` adds the e2e suite, which needs the hypervisor; see [the e2e
+suite](#the-e2e-suite).
+
+Four checks cannot run on any developer machine: the other host's backend, the
+live boots, the e2e filter-name check, which needs every backend's test list,
+and the commit-message lint, which needs a pull request's commit range.
 
 ## The unit suite
 
@@ -73,8 +78,14 @@ The used-ring litmus, the virtio-fs benchmarks and the KVM stop tests are
 `#[ignore]`d and do not run in a normal `cargo test`.
 
 The stop tests boot a guest on the terminal, and two of them find a thread by
-name. Run them one at a time, with stdin redirected, as a user who can open
-`/dev/kvm`:
+name. Run them with the `kvm` profile in `.config/nextest.toml`, which runs each
+in a process of its own, as a user who can open `/dev/kvm`:
+
+```sh
+cargo nextest run --cargo-profile release --profile kvm --run-ignored only
+```
+
+With plain `cargo test`, run them one at a time, with stdin redirected:
 
 ```sh
 cargo test --release kvm::stop_tests:: -- \
@@ -126,6 +137,42 @@ The boot jobs upload their logs on failure. The two arm64 Linux-guest jobs
 also upload the event ledger. `boot-x86` and `boot-unikraft-hvf` do not pass
 `--events`, so they record none.
 
+The e2e suite covers most of what these jobs check, through the exit status and
+the ledger rather than the console.
+
+## The e2e suite
+
+`e2e/` boots real guests under the release `hvi` binary, with its default
+confinement, and checks each run from outside the process: hvi's exit status,
+its `guest stopped:` line and the event ledger. It runs under cargo-nextest.
+[e2e/README.md](../e2e/README.md) covers the setup it needs, running it, its
+layout, and adding a test.
+
+### Tiers
+
+| Profile | What it runs | Where |
+| --- | --- | --- |
+| `default` | Every test off the probation and nightly lists. | Pull requests and `main`. |
+| `full` | Every test. | `schedule-e2e-nightly.yml`. |
+
+A new or flaky test stays on the probation list until it has passed seven
+nightly runs in a row, and a test too slow for every pull request stays on the
+nightly list, so neither runs on a pull request.
+
+The default profile retries a failed test once. One that passes only on its
+retry is reported as flaky and still fails the run, so a race shows up as a
+failure rather than as a pass. A test that pins a bug not fixed yet carries
+`#[ignore]`, and the nightly run reports any that now pass.
+
+### Where it runs in CI
+
+| Where | What runs |
+| --- | --- |
+| Self-hosted x86, arm64/KVM (vGICv2 and vGICv3) and Apple silicon | `test-e2e.yml`: the `default` profile for same-repository pull requests and `main`. `schedule-e2e-nightly.yml` runs the `full` profile there every night. |
+| The same runners, on a pull request | `e2e/tools/check-probation.sh`: every new test is on the probation or nightly list, and a test that leaves the nightly list goes on probation. |
+| `ubuntu-latest`, once every backend has passed | The filter-name check: each exact name in the nextest filters names a test on some backend. |
+| x86-64 Linux (`ubuntu-latest`) | The e2e workspace's unit tests, which need no hypervisor, so a fork's pull request runs them too. |
+
 ## Toolchain versions
 
 Four places declare a Rust version. The first two hold the build pin, and the
@@ -133,7 +180,7 @@ other two step outside it:
 
 | Where | Value | Meaning |
 | --- | --- | --- |
-| `Cargo.toml` `rust-version` | 1.95.0 | The oldest Rust that builds hvi, held to the build pin. `tools/tidy.sh` fails when the two differ. |
+| `Cargo.toml` and `e2e/Cargo.toml` `rust-version` | 1.95.0 | The oldest Rust that builds hvi and its e2e suite, held to the build pin. `tools/tidy.sh` fails when either differs from it. |
 | `rust-toolchain.toml` | 1.95.0 | The build pin. Every job that uses the shared setup gets this. |
 | `pins.env` `RUSTFMT_NIGHTLY` | nightly-2026-08-30 | The nightly whose rustfmt runs the comment reflow. `wrap_comments` is nightly-only. |
 | The cargo-deny lane | `stable` | Steps outside the pin deliberately. |
@@ -161,12 +208,15 @@ See [benchmarking.md](benchmarking.md).
 
 ## Scheduled workflows
 
-Three run outside the two entry workflows. Each reports through a tracking
-issue and leaves `main` green: a failure files or updates one issue, and the
-next green run closes it.
+Four run outside the two entry workflows. Each reports through a tracking issue
+and leaves `main` green: a failure files or updates one issue, and the next
+green run closes it.
 
-- `audit-deps.yml`: `cargo deny check` against the lockfile every Monday, for
+- `audit-deps.yml`: `cargo deny check` against both lockfiles every Monday, for
   advisories that arrive between changes.
+- `schedule-e2e-nightly.yml`: the e2e suite's `full` profile on every backend,
+  every night. It also runs the ignored tests and names any that now pass, and
+  reports the tests ready to leave probation.
 - `stress-weekly.yml`: the `#[ignore]`d used-ring litmus on a self-hosted
   arm64 runner every Monday. It demonstrates the ordering defect and the fence
   that removes it. It is not reliable enough to gate a pull request.
