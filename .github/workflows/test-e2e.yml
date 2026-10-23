@@ -1,0 +1,104 @@
+name: Test e2e
+
+# Runs the e2e suite in e2e/ on each backend. It builds the release hvi binary,
+# boots guests under it with its default confinement, and checks each run from
+# outside the process: exit status, stop line and event ledger. See
+# docs/testing.md.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: >-
+          The e2e profile: `default` for pull requests and main, or `full` for
+          every test.
+        type: string
+        default: default
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Test ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      # The platform names the job and its artifacts, which the nightly report
+      # pairs by platform, so it holds only characters an artifact name allows.
+      # The arm64 boards boot and run guests slower than the other runners, so
+      # every timeout in the suite is doubled on them. The arm64/KVM rows name
+      # their host's vGIC, whose vCPU limit the 32-vCPU test expects.
+      matrix:
+        include:
+          - platform: x86
+            runs-on: [self-hosted, Linux, X64, kvm]
+            guest-target: x86_64-unknown-linux-musl
+            timeout-scale: "1"
+          - platform: arm64-kvm-vGICv2
+            runs-on: [self-hosted, Linux, ARM64, nbfc]
+            guest-target: aarch64-unknown-linux-musl
+            vgic: v2
+            timeout-scale: "2"
+          - platform: arm64-kvm-vGICv3
+            runs-on: [self-hosted, Linux, ARM64, gicv3]
+            guest-target: aarch64-unknown-linux-musl
+            vgic: v3
+            timeout-scale: "2"
+          - platform: arm64-hvf
+            runs-on: [self-hosted, macOS, ARM64]
+            guest-target: aarch64-unknown-linux-musl
+            timeout-scale: "1"
+    # A fork's pull request is untrusted code, and these runners are persistent
+    # machines; see the note on boot-x86 in build-and-test.yml.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    env:
+      HVI_E2E_TIMEOUT_SCALE: ${{ matrix.timeout-scale }}
+      HVI_E2E_VGIC: ${{ matrix.vgic }}
+    steps:
+      # A pull request checks out its merge commit, whose first parent is the
+      # base it is tested against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.guest-target }}
+          cache-key: e2e-${{ matrix.platform }}
+      - uses: ./.github/actions/run-e2e
+        with:
+          profile: ${{ inputs.profile }}
+          base: ${{ github.event_name == 'pull_request' && 'HEAD^1' || '' }}
+          platform: ${{ matrix.platform }}
+
+  # Some tests build on one backend only, so each name in the nextest filters is
+  # checked against the tests of every backend together. A backend job that
+  # failed may have stopped before it listed its tests. The names that only it
+  # builds would then look missing, so the check runs only once every backend
+  # job has passed.
+  check-filter-names:
+    name: Check filter names
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: e2e-tests-*
+          path: test-lists
+      - name: Check filter names against every backend's tests
+        run: e2e/tools/check-filters.sh test-lists/*/test-list.txt

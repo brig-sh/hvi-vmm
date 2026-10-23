@@ -1,0 +1,244 @@
+name: Test e2e (nightly)
+
+# Runs the whole e2e suite, the tests on probation included, on every backend
+# once a night. It reports rather than blocks: a failure files or updates one
+# tracking issue and leaves main green, and the next green run closes it. A
+# second report keeps one issue that lists the tests ready to leave probation.
+
+on:
+  schedule:
+    # 03:17 UTC, clear of the weekly lanes on Monday mornings.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Each report reads the issue tracker and then writes to it, so two runs at once
+# could both file an issue. Queue rather than cancel: a cancelled run would
+# report as red.
+concurrency:
+  group: schedule-e2e-nightly
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test-e2e:
+    name: Test e2e
+    # A fork that enables Actions would otherwise run this on its own schedule,
+    # and fail, since it has none of these runners.
+    if: github.repository == 'brig-sh/hvi-vmm'
+    uses: ./.github/workflows/test-e2e.yml
+    with:
+      profile: full
+
+  report-result:
+    name: Report nightly result
+    needs: test-e2e
+    # Reports every run the fork guard let through, on the default branch only,
+    # since the tracking issue is about that branch. A job that runs past its
+    # time limit ends as cancelled, so anything but success counts as red. A
+    # scheduled run is always on the default branch; a dispatched one may be on
+    # any.
+    if: >-
+      always()
+      && needs.test-e2e.result != 'skipped'
+      && (github.event_name == 'schedule'
+      || github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RESULT: ${{ needs.test-e2e.result }}
+      # The label the tracking issue carries, and the title it is found by.
+      ISSUE_LABEL: e2e-nightly
+      MARKER: "Nightly e2e suite is red"
+    steps:
+      - name: File, update or close tracking issue
+        run: |
+          repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          run_url="$repo_url/actions/runs/$GITHUB_RUN_ID"
+          # The lookup has no fallback. A failed query must stop the step, since
+          # "no result" would then file a duplicate.
+          open=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[].number')
+          if [ "$RESULT" = success ]; then
+            for number in $open; do
+              gh issue close "$number" \
+                --comment "The nightly e2e suite is green again as of $run_url."
+            done
+            exit 0
+          fi
+          gh label create "$ISSUE_LABEL" --color BFD4F2 \
+            --description "Nightly e2e suite failures" 2>/dev/null || true
+          # One line per paragraph, since an issue shows a line break as one.
+          body=$(cat <<EOF
+          The nightly e2e run failed, or did not finish, on at least one backend.
+
+          - Run: $run_url
+
+          Each failed job uploads its run files, the console, hvi's stderr and the event ledger of every run, as an artifact named after the backend. A test that fails here and not on pull requests is on the probation or nightly list in e2e/.config/nextest.toml, or flaky. A flaky test goes on the probation list, and the nightly report says when it may leave.
+
+          This issue closes itself on the next green run.
+          EOF
+          )
+          first=$(echo "$open" | head -n 1)
+          if [ -n "$first" ]; then
+            gh issue comment "$first" --body "$body"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" \
+              --body "$body"
+          fi
+
+  report-probation:
+    name: Report tests ready to leave probation
+    needs: test-e2e
+    # Runs after every run the fork guard let through, as above, and only on the
+    # default branch, whose probation list is the one pull requests run against.
+    # A scheduled run is always on the default branch; a dispatched one may be
+    # on any. A dispatched run reports from the scheduled runs alone and does
+    # not count as one of the nightly runs a test must pass.
+    if: >-
+      always()
+      && needs.test-e2e.result != 'skipped'
+      && (github.event_name == 'schedule'
+      || github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      # The label the issue carries, and the title it is found by.
+      ISSUE_LABEL: e2e-probation
+      MARKER: "Tests ready to leave probation"
+      # How the API names a backend's job: this workflow's test-e2e job, then
+      # test-e2e.yml's "Test <platform>".
+      JOB_PREFIX: "Test e2e / Test "
+    steps:
+      # The script reads when each entry went on the list from the history of
+      # e2e/.config/nextest.toml, which a shallow clone does not have.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # With no test on probation the report reads no results, so nothing is
+      # downloaded.
+      - name: Read the probation list
+        id: list
+        run: |
+          if [ -n "$(e2e/tools/probation-filter.sh --names)" ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download test lists
+        if: github.event_name == 'schedule' && steps.list.outputs.any == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: e2e-tests-*
+          path: runs/0
+      - name: Download JUnit reports
+        if: github.event_name == 'schedule' && steps.list.outputs.any == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: e2e-junit-*
+          path: runs/0
+      # Records each run's platforms, the backend jobs it had, from the API,
+      # which also lists a job that stopped before its first step. Then
+      # downloads each earlier scheduled run of the default branch, newest
+      # first, back to the first whose artifacts have expired. Each artifact is
+      # downloaded on its own, since gh puts a lone match in the target
+      # directory itself rather than in a subdirectory named after it. Each name
+      # is downloaded once, since a re-run of failed jobs uploads its artifacts
+      # again under the same names.
+      - name: Download earlier runs' results
+        if: steps.list.outputs.any == 'true'
+        run: |
+          platforms() {
+            gh api "repos/$GH_REPO/actions/runs/$1/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion != "skipped") | .name
+                | select(startswith(env.JOB_PREFIX))
+                | ltrimstr(env.JOB_PREFIX)' < /dev/null
+          }
+          mkdir -p runs
+          # This run counts only when it is a scheduled one.
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            mkdir -p runs/0
+            gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" \
+              --jq .created_at > runs/0/created-at
+            platforms "$GITHUB_RUN_ID" > runs/0/platforms
+          fi
+          i=1
+          gh run list --workflow schedule-e2e-nightly.yml --branch "$BRANCH" \
+            --event schedule --status completed --limit 30 \
+            --json databaseId,createdAt,conclusion \
+            --jq '.[]
+              | select(.conclusion != "skipped")
+              | "\(.databaseId) \(.createdAt)"' > earlier.txt
+          # Each gh call reads /dev/null, so it leaves the loop's input, the
+          # list of runs, alone.
+          while read -r id created; do
+            artifacts="repos/$GH_REPO/actions/runs/$id/artifacts"
+            gh api "$artifacts?per_page=100" --jq '.artifacts[]
+              | select(.name | test("^e2e-(tests|junit)-"))
+              | "\(.expired) \(.name)"' < /dev/null > artifacts.txt
+            grep -q '^true ' artifacts.txt && break
+            names=$(sed 's/^false //' artifacts.txt | sort -u)
+            mkdir -p "runs/$i"
+            echo "$created" > "runs/$i/created-at"
+            platforms "$id" > "runs/$i/platforms"
+            for name in $names; do
+              gh run download "$id" --name "$name" --dir "runs/$i/$name" \
+                < /dev/null
+            done
+            i=$((i + 1))
+          done < earlier.txt
+          echo "read $((i - 1)) earlier runs"
+      # The issue lists the tests that may leave, and is rewritten on each run
+      # rather than commented on, so it always shows the current set.
+      - name: File, update or close probation issue
+        run: |
+          e2e/tools/report-probation.py runs --ready ready.txt > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          run_url="$repo_url/actions/runs/$GITHUB_RUN_ID"
+          # As above, the lookup has no fallback.
+          open=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[].number')
+          if [ ! -s ready.txt ]; then
+            for number in $open; do
+              gh issue close "$number" --comment \
+                "No test on probation is ready to leave it as of $run_url."
+            done
+            exit 0
+          fi
+          gh label create "$ISSUE_LABEL" --color BFD4F2 \
+            --description "Tests ready to leave e2e probation" \
+            2>/dev/null || true
+          # One line per paragraph, as above.
+          body=$(cat <<EOF
+          $(cat report.md)
+
+          - Run: $run_url
+
+          This issue is rewritten on each nightly run and closes itself once no test is ready.
+          EOF
+          )
+          first=$(echo "$open" | head -n 1)
+          if [ -n "$first" ]; then
+            gh issue edit "$first" --body "$body"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" \
+              --body "$body"
+          fi

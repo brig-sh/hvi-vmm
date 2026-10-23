@@ -36,7 +36,7 @@ needs a runner with /dev/kvm; the macOS jobs need macOS 15. See CONTRIBUTING.md.
 
 - [ ] `tools/tidy.sh` is clean (rust-version, fmt, reflow, clippy, rustdoc)
 - [ ] `cargo test` passes
-- [ ] I have added or updated unit or integration tests covering the change
+- [ ] I have added or updated unit, integration or e2e tests covering the change
 - [ ] For x86/KVM changes: the live boot ran on a /dev/kvm host (or CI)
 - [ ] For macOS/hvf changes: it builds on macOS 15 and ad-hoc signs with the entitlement
 - [ ] I have updated the affected docs (see `docs/README.md` for the index)

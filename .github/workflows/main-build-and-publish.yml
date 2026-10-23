@@ -39,9 +39,13 @@ jobs:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
 
+  test-e2e:
+    name: Test e2e
+    uses: ./.github/workflows/test-e2e.yml
+
   publish:
     name: Publish binaries
-    needs: [validate-code, build-and-test, build-binaries]
+    needs: [validate-code, build-and-test, build-binaries, test-e2e]
     permissions:
       contents: read
       packages: write

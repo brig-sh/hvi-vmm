@@ -1,0 +1,153 @@
+name: Run e2e suite
+description: >-
+  Install the pinned cargo-nextest and, on Linux, the pinned virtiofsd,
+  provision a Linux host, and run the e2e suite in e2e/ with one of its
+  profiles. On a pull request, also check that it puts its new tests on
+  probation. A failed run uploads its run files.
+
+inputs:
+  profile:
+    description: The e2e profile, `default` or `full`.
+    required: false
+    default: default
+  base:
+    description: >-
+      The revision the new tests are found against, such as `HEAD^1` for a
+      pull request's merge commit, which the checkout must hold. Empty skips
+      the check.
+    required: false
+    default: ""
+  platform:
+    description: >-
+      The runner's platform, as its job in test-e2e.yml names it, which also
+      names its artifacts: a failed run's files as `e2e-<platform>`, its test
+      list as `e2e-tests-<platform>`, and a full run's JUnit report as
+      `e2e-junit-<platform>`.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The version pin is an action input, which the github-actions manager of
+    # Renovate does not read. `.github/renovate.json` holds a custom manager for
+    # the line below. Keep the `# renovate:` marker with it.
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      with:
+        # renovate: datasource=crate depName=cargo-nextest
+        tool: cargo-nextest@0.9.149
+
+    - name: Provision host
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends acl libseccomp-dev \
+          libcap-ng-dev
+        sudo e2e/tools/provision.sh "$USER"
+
+    # Every Linux runner builds the same virtiofsd, since distributions ship
+    # different ones or none. Each version goes in a directory of its own, and
+    # the step builds it only when the binary there does not report that
+    # version, so a persistent runner builds each version once, even while it
+    # alternates between two pins, and a job with the binary in place does not
+    # reach crates.io. As for cargo-nextest above, `.github/renovate.json` holds
+    # a custom manager for the pin below. Keep the `# renovate:` marker with it.
+    - name: Install virtiofsd
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        # renovate: datasource=crate depName=virtiofsd
+        VIRTIOFSD_VERSION: 1.14.0
+      run: |
+        root="$HOME/.cache/hvi-e2e/virtiofsd/$VIRTIOFSD_VERSION"
+        virtiofsd="$root/bin/virtiofsd"
+        want="virtiofsd $VIRTIOFSD_VERSION"
+        if [ "$("$virtiofsd" --version 2>/dev/null)" != "$want" ]; then
+          cargo install --locked --force --root "$root" \
+            "virtiofsd@$VIRTIOFSD_VERSION"
+        fi
+        got=$("$virtiofsd" --version 2>&1 || true)
+        if [ "$got" != "$want" ]; then
+          echo "::error::$virtiofsd reports \"$got\", not \"$want\""
+          exit 1
+        fi
+        echo "HVI_E2E_VIRTIOFSD=$virtiofsd" >> "$GITHUB_ENV"
+
+    # The filter-name check in test-e2e.yml and the nightly probation report
+    # read this list.
+    - name: List tests
+      shell: bash
+      run: |
+        mkdir -p e2e/target
+        cargo nextest list --locked --manifest-path e2e/Cargo.toml \
+          --ignore-default-filter --run-ignored all --message-format oneline \
+          --color never > e2e/target/test-list.txt
+
+    - name: Keep test list
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: e2e-tests-${{ inputs.platform }}
+        path: e2e/target/test-list.txt
+        retention-days: 14
+
+    # A new test runs nightly for a while before it runs on pull requests. Every
+    # runner checks its own tests, since some build on one backend only.
+    - name: Check that new tests are on probation
+      if: inputs.base != ''
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+      run: e2e/tools/check-probation.sh "$BASE"
+
+    - name: Run e2e suite
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+      run: >-
+        cargo nextest run --locked --manifest-path e2e/Cargo.toml
+        --profile "$PROFILE"
+
+    # The nightly probation report reads this, so it is kept after a failed run
+    # too.
+    - name: Keep JUnit report
+      if: ${{ !cancelled() && inputs.profile == 'full' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: e2e-junit-${{ inputs.platform }}
+        path: e2e/target/nextest/full/junit.xml
+        retention-days: 14
+        if-no-files-found: ignore
+
+    # The ignored tests pin bugs that are not fixed yet. This step runs them for
+    # information, also after a failed run, and names any that now pass so their
+    # ignore can go. It never fails, since these tests are expected to fail. The
+    # log is uncolored, so a passing test's line starts with its status.
+    - name: Report ignored tests that now pass
+      if: ${{ !cancelled() && inputs.profile == 'full' }}
+      shell: bash
+      run: |
+        cargo nextest run --locked --manifest-path e2e/Cargo.toml \
+          --profile pinned --run-ignored only --no-fail-fast --no-tests=warn \
+          --color never > ignored.log 2>&1 || true
+        cat ignored.log
+        { grep -E '^ +PASS ' ignored.log || true; } | sed -E 's/.*\) //' \
+          | while read -r test; do
+              echo "::warning::$test passes; remove its ignore"
+            done
+
+    - name: Keep run files
+      if: failure()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: e2e-${{ inputs.platform }}
+        # A test's files directory holds its disk images and exports, which can
+        # be gigabytes, and the logs of its daemons.
+        path: |
+          e2e/target/hvi-e2e/tests
+          !e2e/target/hvi-e2e/tests/**/files/**
+          e2e/target/hvi-e2e/tests/**/files/*.log
+          e2e/target/nextest
+        retention-days: 14
+        if-no-files-found: ignore
