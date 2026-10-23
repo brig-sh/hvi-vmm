@@ -14,6 +14,7 @@ runs:
   using: composite
   steps:
     - name: Install cargo-deny
+      id: install
       uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
       with:
         # renovate: datasource=crate depName=cargo-deny
@@ -27,3 +28,15 @@ runs:
       env:
         RUSTUP_TOOLCHAIN: stable
       run: cargo deny check
+    # The e2e suite has a lockfile of its own, and its test dependencies run on
+    # the self-hosted runners. It is audited as committed, against the same
+    # configuration. This step runs even when the check above fails, so both
+    # report, but not when cargo-deny failed to install.
+    - name: Check e2e dependency graph
+      if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      shell: bash
+      env:
+        RUSTUP_TOOLCHAIN: stable
+      run: >-
+        cargo deny --locked --manifest-path e2e/Cargo.toml --workspace
+        --config deny.toml check

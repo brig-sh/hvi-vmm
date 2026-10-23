@@ -13,6 +13,8 @@
 #
 #   tools/tidy.sh --check --target aarch64-unknown-linux-gnu
 #
+# Without --target it also tidies the e2e suite in e2e/, a workspace of its own.
+#
 # Written for the bash 3.2 that ships with macOS.
 
 set -euo pipefail
@@ -63,55 +65,85 @@ pinned() {
   sed -n "s/^$2 = \"\\([^\"]*\\)\".*/\\1/p" "$1"
 }
 
-# rust-version names the release rust-toolchain.toml pins; see Cargo.toml.
-RUST_VERSION=$(pinned Cargo.toml rust-version)
+# rust-version names the release rust-toolchain.toml pins, in the crate's
+# manifest and in the e2e suite's; see Cargo.toml.
 CHANNEL=$(pinned rust-toolchain.toml channel)
-if [ -z "$RUST_VERSION" ] || [ -z "$CHANNEL" ]; then
-  echo "tidy: cannot read rust-version from Cargo.toml or channel from rust-toolchain.toml" >&2
+if [ -z "$CHANNEL" ]; then
+  echo "tidy: cannot read channel from rust-toolchain.toml" >&2
   exit 1
 fi
-if [ "$RUST_VERSION" != "$CHANNEL" ]; then
-  echo "tidy: Cargo.toml sets rust-version $RUST_VERSION but rust-toolchain.toml pins $CHANNEL; set both to the same release" >&2
-  exit 1
-fi
+for manifest in Cargo.toml e2e/Cargo.toml; do
+  version=$(pinned "$manifest" rust-version)
+  if [ -z "$version" ]; then
+    echo "tidy: cannot read rust-version from $manifest" >&2
+    exit 1
+  fi
+  if [ "$version" != "$CHANNEL" ]; then
+    echo "tidy: $manifest sets rust-version $version but rust-toolchain.toml pins $CHANNEL; set both to the same release" >&2
+    exit 1
+  fi
+done
 
 TARGET_ARGS=""
 if [ -n "$TARGET" ]; then
   TARGET_ARGS="--target $TARGET"
 fi
 
-# Formatting is target-independent, so the per-target lint jobs in CI pass
-# --lint-only and let the host job own the one fmt pass over the tree.
-if [ "$LINT_ONLY" = 1 ]; then
-  echo "tidy: --lint-only, skipping fmt and reflow"
-elif [ "$CHECK" = 1 ]; then
-  run cargo fmt --all -- --check
-  if have_nightly; then
-    run cargo "+$RUSTFMT_NIGHTLY" fmt --all -- \
-      --config wrap_comments=true,comment_width=80 --check
+# Formats, reflows, lints and doc-checks the workspace whose manifest is $1. The
+# remaining arguments go to clippy and rustdoc.
+tidy_workspace() {
+  manifest=$1
+  shift
+  # Formatting is target-independent, so the per-target lint jobs in CI pass
+  # --lint-only and let the host job own the one fmt pass over the tree.
+  if [ "$LINT_ONLY" = 1 ]; then
+    echo "tidy: --lint-only, skipping fmt and reflow for $manifest"
+  elif [ "$CHECK" = 1 ]; then
+    run cargo fmt --manifest-path "$manifest" --all -- --check
+    if have_nightly; then
+      run cargo "+$RUSTFMT_NIGHTLY" fmt --manifest-path "$manifest" --all -- \
+        --config wrap_comments=true,comment_width=80 --check
+    else
+      echo "tidy: $RUSTFMT_NIGHTLY not installed, skipping the comment-reflow check" >&2
+    fi
   else
-    echo "tidy: $RUSTFMT_NIGHTLY not installed, skipping the comment-reflow check" >&2
+    run cargo fmt --manifest-path "$manifest" --all
+    if have_nightly; then
+      run cargo "+$RUSTFMT_NIGHTLY" fmt --manifest-path "$manifest" --all -- \
+        --config wrap_comments=true,comment_width=80
+    else
+      echo "tidy: $RUSTFMT_NIGHTLY not installed, skipping the comment reflow" >&2
+    fi
   fi
-else
-  run cargo fmt --all
-  if have_nightly; then
-    run cargo "+$RUSTFMT_NIGHTLY" fmt --all -- \
-      --config wrap_comments=true,comment_width=80
-  else
-    echo "tidy: $RUSTFMT_NIGHTLY not installed, skipping the comment reflow" >&2
-  fi
-fi
 
-# clippy and doc are report-only in both modes: neither writes to the tree, and
-# both are hard errors on any warning. --workspace, so the build-script helper
-# beside the VMM is held to the same lints.
+  # clippy and doc are report-only in both modes: neither writes to the tree,
+  # and both are hard errors on any warning.
+  run cargo clippy --manifest-path "$manifest" --all-targets "$@" -- -D warnings
+
+  # Private items are documented too, because the doc comments on them are held
+  # to the same standard as the public ones; --no-deps keeps the check to this
+  # repo.
+  echo "+ RUSTDOCFLAGS=-D warnings cargo doc --manifest-path $manifest --no-deps --document-private-items $*"
+  RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path "$manifest" --no-deps \
+    --document-private-items "$@"
+}
+
+# --workspace, so the build-script helper beside the VMM is held to the same
+# lints.
 # shellcheck disable=SC2086 # TARGET_ARGS is a deliberate word split
-run cargo clippy --workspace --all-targets $TARGET_ARGS -- -D warnings
+tidy_workspace Cargo.toml --workspace $TARGET_ARGS
 
-# Private items are documented too, because the doc comments on them are held to
-# the same standard as the public ones; --no-deps keeps the check to this repo.
-echo "+ RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --document-private-items $TARGET_ARGS"
-# shellcheck disable=SC2086
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items $TARGET_ARGS
+# The e2e workspace runs on the host, so it is linted for the host only, not
+# once per cross target. Its guest agent runs on the guest's musl target, so a
+# run with a musl --target lints the agent for that target too.
+if [ -z "$TARGET" ]; then
+  tidy_workspace e2e/Cargo.toml --workspace
+fi
+case "$TARGET" in
+  *-unknown-linux-musl)
+    run cargo clippy --manifest-path e2e/Cargo.toml -p hvi-e2e-agent \
+      --all-targets --target "$TARGET" -- -D warnings
+    ;;
+esac
 
 echo "tidy: ok"

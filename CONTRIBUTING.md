@@ -18,18 +18,20 @@ toolchain the script says so and skips that pass, and CI catches what you
 missed.
 
 `tools/gates.sh` runs the CI checks a developer machine can run, in one
-command: `tidy.sh --check`, the aarch64 cross-lint, the two musl lints, `cargo
-test`, `cargo deny check`, the workflow lint and the spell check. `tidy.sh` and
-`cargo test` always run. The rest need something the pinned toolchain does not
-supply (the `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` and
-`aarch64-unknown-linux-musl` targets, `cargo-deny`, `actionlint` plus
-`shellcheck`, `typos`), so each is skipped when it is missing and every skip it
-probes for is named in the closing line. One skip is not counted
-there: `tidy.sh` drops the comment-reflow pass when the pinned nightly is
-missing, says so on stderr, and `gates.sh` still prints `ok`. Install that
-nightly, or CI finds what you missed. `--with-perf` adds the virtio-fs performance
-gate (`tools/perf-gate.sh`, macOS only), which builds the merge base as well
-as the branch and so costs more than every other check together. The live
+command: `tidy.sh --check` over the crate and `e2e/`, the aarch64 cross-lint,
+the two musl lints, `cargo test`, the e2e workspace's unit tests, `cargo deny
+check` over both lockfiles, the workflow and script lint and the spell check.
+`tidy.sh` and the two test runs always run. The rest need something the pinned
+toolchain does not supply (the `aarch64-unknown-linux-gnu`,
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` targets,
+`cargo-deny`, `actionlint` plus `shellcheck`, `typos`), so each is skipped when
+it is missing and every skip it probes for is named in the closing line. One
+skip is not counted there: `tidy.sh` drops the comment-reflow pass when the
+pinned nightly is missing, says so on stderr, and `gates.sh` still prints `ok`.
+Install that nightly, or CI finds what you missed. `--with-perf` adds the
+virtio-fs performance gate (`tools/perf-gate.sh`, macOS only), which builds the
+merge base as well as the branch and so costs more than every other check
+together. `--with-e2e` adds the e2e suite, which boots real guests. The live
 boots, the other host's backend and the commit-message lint stay CI's job.
 
 Only the backend for your host target is compiled: the macOS/hvf one on Apple
@@ -50,11 +52,11 @@ The musl lints work the same way, with `x86_64-unknown-linux-musl` and
 target is installed.
 
 The toolchain is pinned in `rust-toolchain.toml`, so everyone lints against the
-same compiler. `rust-version` in `Cargo.toml` names the same release, and
-`tools/tidy.sh` fails when the two differ, so a toolchain bump moves both. The
-seccomp allowlists hold the syscalls the standard library of the pinned release
-makes. A newer one can make a syscall they do not hold, so a bump is checked by
-the boot jobs, which run the guest under the filters.
+same compiler. `rust-version` in `Cargo.toml` and in `e2e/Cargo.toml` names the
+same release, and `tools/tidy.sh` fails when one differs, so a toolchain bump
+moves all three. The seccomp allowlists hold the syscalls the standard library
+of the pinned release makes. A newer one can make a syscall they do not hold, so
+a bump is checked by the boot jobs, which run the guest under the filters.
 
 ## Branches
 
@@ -144,10 +146,12 @@ suites pass (see Releasing below).
   reaches modules that runner cannot build. Then clippy and rustdoc for the
   arm64/KVM backend cross-checked from the same runner, for both Linux
   backends against musl, and for the hvf backend on `macos-15`, actionlint
-  with shellcheck over the workflows, and `cargo deny check` over the lockfile.
+  with shellcheck over the workflows, shellcheck over the e2e scripts, and
+  `cargo deny check` over the crate's lockfile and the e2e suite's.
 - **build-and-test**: the unit suite on x86 Linux, on `macos-15`, and against
-  musl on x86-64 and arm64 Linux, the two confinement selftests, and then the
-  live boots on the self-hosted runners.
+  musl on x86-64 and arm64 Linux, the e2e workspace's unit tests on x86 Linux,
+  the two confinement selftests, and then the live boots on the self-hosted
+  runners.
 
 `tools/gates.sh` runs everything in that list a developer machine can run.
 Three checks cannot run anywhere but CI: the other host's backend, the live

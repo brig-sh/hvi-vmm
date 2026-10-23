@@ -1,10 +1,11 @@
-# Configuration for cargo-deny. CI runs `cargo deny check` over the
-# lockfile: RUSTSEC advisories, licenses, duplicate versions and registry
-# sources.
+# Configuration for cargo-deny, for the crate's lockfile and for the e2e suite's
+# in e2e/. `cargo deny check` audits both for RUSTSEC advisories, licenses,
+# duplicate versions and registry sources. Both are checked against this one
+# file, so an exception added for the suite relaxes the crate's audit too.
 #
-# The graph holds 21 external crates, and several are inside the trusted
-# computing base: applevisor, kvm-ioctls, seccompiler and libc. A change to
-# this file is therefore a change to what that base can contain.
+# The crate's graph holds 21 external crates, and several are inside the trusted
+# computing base: applevisor, kvm-ioctls, seccompiler and libc. A change to this
+# file is therefore a change to what that base can contain.
 
 [graph]
 # Audit the dependencies of every feature, not of the default set alone.
@@ -24,8 +25,9 @@ ignore = []
 
 [licenses]
 version = 2
-# The list holds what the current tree needs and nothing more. Add a license
-# when a dependency carries it, not before.
+# The list holds what the crate and the e2e suite need, and nothing more. Only
+# the crate's dependencies carry BSD-3-Clause, so the e2e audit warns that it
+# goes unused there. Add a license when a dependency carries it, not before.
 allow = [
     "Apache-2.0",
     "MIT",

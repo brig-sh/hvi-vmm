@@ -107,6 +107,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned shellcheck and actionlint
+        id: install
         run: |
           bin_dir="${RUNNER_TEMP}/lint-bin"
           mkdir -p "$bin_dir"
@@ -142,20 +143,26 @@ jobs:
           # .github/workflows/ by itself, so it covers a new workflow with
           # no change here.
           actionlint -color -shellcheck=shellcheck
+      # actionlint reads only workflows, so the pinned shellcheck checks the e2e
+      # suite's scripts here. This step runs even when the workflow lint fails,
+      # so both report.
+      - name: Check e2e shell scripts
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: shellcheck e2e/tools/*.sh e2e/guest/init
 
   # Examines the dependency graph against deny.toml: RUSTSEC advisories,
   # licenses, duplicate versions and registry sources.
   #
-  # The graph holds 21 external crates, and several are inside the trusted
-  # computing base: applevisor, kvm-ioctls, seccompiler and libc. This job
-  # reports a new advisory, a change of license, or a new transitive crate
+  # The crate's graph holds 21 external crates, and several are inside the
+  # trusted computing base: applevisor, kvm-ioctls, seccompiler and libc. This
+  # job reports a new advisory, a change of license, or a new transitive crate
   # that arrives with an update.
   #
-  # It reads the lockfile and builds nothing, so it needs no cargo cache and
-  # takes well under a minute.
+  # It reads the crate's and the e2e suite's lockfiles and builds nothing, so it
+  # needs no cargo cache and takes well under a minute.
   #
   # The weekly audit-deps.yml lane runs the same composite against the same
-  # lockfile, for advisories that arrive between changes.
+  # lockfiles, for advisories that arrive between changes.
   check-deps:
     name: Audit dependencies
     runs-on: ubuntu-latest
