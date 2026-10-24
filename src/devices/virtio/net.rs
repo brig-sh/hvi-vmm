@@ -1063,7 +1063,7 @@ impl VirtioNet {
             return None;
         }
         let (name, qend) = parse_dns_name(dns, 12)?;
-        stderr!("\r\n[virtio-net] dns query {name}\r\n");
+        stderr!("{}", dns_query_line(&name));
         self.capture(
             IP_UDP,
             GUEST_IP,
@@ -1177,6 +1177,16 @@ fn checksum16(data: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// The stderr line for a guest's DNS query.
+///
+/// The name is the guest's bytes, and stderr is often the operator's
+/// terminal, where an ESC or BEL in a label would act as an escape sequence.
+/// The name is printed escaped, so the line holds printable ASCII and the
+/// CR LF around it. The ledger and the host lookup take the name as is.
+fn dns_query_line(name: &str) -> String {
+    format!("\r\n[virtio-net] dns query {}\r\n", name.escape_default())
 }
 
 /// Parses a DNS name starting at `off`, returning the dotted name and the
@@ -1971,6 +1981,31 @@ mod tests {
             &[10, 0, 2, 15],
             "yiaddr = guest IP"
         );
+    }
+
+    /// A guest chooses the bytes of a DNS label, and the query name is
+    /// printed to stderr. Between its CR LF the line must hold printable ASCII
+    /// only, so a label holding an escape sequence cannot reach the operator's
+    /// terminal as one.
+    #[test]
+    fn dns_name_is_printed_escaped() {
+        let labels: [&[u8]; 4] = [
+            b"\x1b]52;c;ZWNobyBwd25lZA==\x07",
+            b"\x1b]0;title\x07",
+            b"\x1bc\x1b[1;37;41m banner \x1b[0m",
+            b"\xc2\x9b6n\x9d",
+        ];
+        for label in labels {
+            let mut m = vec![0u8; 12];
+            m.push(label.len() as u8);
+            m.extend_from_slice(label);
+            m.push(0);
+            m.extend_from_slice(&[0, 1, 0, 1]);
+            let (name, _) = parse_dns_name(&m, 12).unwrap();
+            let line = dns_query_line(&name);
+            let body = line.trim_matches(['\r', '\n']);
+            assert!(body.bytes().all(|b| (0x20..0x7f).contains(&b)), "{line:?}");
+        }
     }
 
     #[test]
