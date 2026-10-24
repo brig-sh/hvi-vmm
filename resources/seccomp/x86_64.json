@@ -68,7 +68,7 @@
             {"syscall": "fsync", "comment": "safety net: sync_all on the same path"},
             {"syscall": "sendto", "comment": "gateway and vsock TX from the device on an MMIO exit; the stop-signal handler's wake when a vCPU thread takes the signal"},
             {"syscall": "futex", "comment": "the device and ledger locks, and the waits for the ledger's writer"},
-            {"syscall": "poll", "comment": "a plugin's own wait at the safe point on vcpu0, and the panic hook's waits for the lock on the current run and for the other vCPUs to exit"},
+            {"syscall": "poll", "comment": "a plugin's own wait at the safe point on vcpu0, the vsock device's check for a host hangup, which does not wait, and the panic hook's waits for the lock on the current run and for the other vCPUs to exit"},
             {"syscall": "ppoll", "comment": "safety net: glibc may lower poll() to ppoll"},
             {"syscall": "mmap", "comment": "allocator growth inside a device"},
             {"syscall": "munmap", "comment": "allocator release"},

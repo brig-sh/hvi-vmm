@@ -215,8 +215,7 @@ impl StopToken {
         if poll(&mut fds, Some(Instant::now())).is_err() {
             return false;
         }
-        let gone = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-        fds[1].revents == 0 && fds[0].revents & gone == 0
+        fds[1].revents == 0 && fds[0].revents & HANGUP == 0
     }
 
     /// Sleeps for `duration` unless the stop is requested first.
@@ -233,6 +232,9 @@ impl StopToken {
         Ok(fds[0].revents == 0)
     }
 }
+
+/// The `revents` bits that say a descriptor has hung up or failed.
+pub(crate) const HANGUP: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 
 /// Builds a `pollfd` that waits for `fd` to become readable.
 pub(crate) fn pollfd(fd: libc::c_int) -> libc::pollfd {
