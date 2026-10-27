@@ -25,9 +25,14 @@ use std::time::{Duration, Instant};
 use hvi_e2e::{export_dir, pattern, sha256, FsExport, Vm};
 
 /// Mounts the export tagged `tag` at `/mnt/<tag>` in the guest.
+///
+/// Returns only once the export has answered a request. `mount` returns before
+/// the export answers `FUSE_INIT`, and the guest holds back every request until
+/// it does, so the `statfs` after it waits for that answer.
 fn mount(vm: &Vm, tag: &str) {
     vm.sh(&format!(
-        "mkdir -p /mnt/{tag} && mount -t virtiofs {tag} /mnt/{tag}"
+        "mkdir -p /mnt/{tag} && mount -t virtiofs {tag} /mnt/{tag} \
+         && stat -f /mnt/{tag}"
     ))
     .assert_success();
 }
