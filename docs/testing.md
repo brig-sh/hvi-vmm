@@ -70,7 +70,7 @@ Where it actually runs in CI:
 | arm64 Linux, musl (`ubuntu-24.04-arm`) | The full suite for `aarch64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 
 `src/arch/x86_64/kvm/` has unit tests and they run on `ubuntu-latest`, so the
-x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm.rs` has none. The KVM
+x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm/` has none. The KVM
 stop tests in `src/hypervisor/kvm.rs` run on whichever KVM backend the host has,
 and they need `/dev/kvm`.
 
