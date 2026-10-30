@@ -112,9 +112,9 @@ fn get_u64(vcpu: &VcpuFd, id: u64) -> u64 {
     try_get_u64(vcpu, id).unwrap_or(0)
 }
 
-/// State shared across the vCPU threads.
+/// The state a vCPU thread needs beyond its own vCPU.
 #[derive(Clone)]
-struct Shared {
+struct VcpuContext {
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     pl011: Arc<Mutex<Pl011>>,
@@ -351,7 +351,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     set_u64(&vcpus[0], REG_PSTATE, PSTATE_EL1H_DAIF);
 
     let vm = Arc::new(vm);
-    let shared = Shared {
+    let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
             sandbox_id: cfg.sandbox_id.clone(),
@@ -377,20 +377,20 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Each device sets its own interrupt line, from the methods that change its
     // level and so under the lock that decides it.
     let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
-    shared.pl011.lock().unwrap().connect_irq(line(UART_SPI));
-    shared.guest.connect_irqs(
+    context.pl011.lock().unwrap().connect_irq(line(UART_SPI));
+    context.guest.connect_irqs(
         // `open_disks` refused more disks than there are SPIs.
         |index| line(virtio_blk_spi(index).expect("an SPI per disk")),
         line(VIRTIO_NET_SPI),
         line(VIRTIO_VSOCK_SPI),
     );
-    for export in shared.fs.iter() {
+    for export in context.fs.iter() {
         export.dev.lock().unwrap().connect_irq(line(export.irq));
     }
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
-    let fs = Arc::clone(&shared.fs);
-    shared
+    let fs = Arc::clone(&context.fs);
+    context
         .guest
         .vcpus
         .on_stop(move || vhost_user::shut_down(&fs));
@@ -400,14 +400,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // joined after the vCPUs; `teardown` describes the stop.
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
-        &shared.guest,
+        &context.guest,
         {
-            let pl011 = Arc::clone(&shared.pl011);
+            let pl011 = Arc::clone(&context.pl011);
             move |byte| pl011.lock().unwrap().push_rx(byte)
         },
         net_source,
     )?;
-    vhost_user::start_interrupt_threads(&shared.fs, &mut io_threads);
+    vhost_user::start_interrupt_threads(&context.fs, &mut io_threads);
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();
@@ -415,8 +415,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_guest` returned it.
     run_guest(
-        &shared.guest,
-        &shared,
+        &context.guest,
+        &context,
         vcpus,
         kick_handles,
         run_cpu,
@@ -426,22 +426,22 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 }
 
 /// Runs one vCPU until the VM stops, servicing its MMIO exits.
-fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
+fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: VcpuContext) {
     run_vcpu(
         cpu_id,
         vcpu,
         kick_handle,
-        &sh.guest,
-        sh.plugin.as_deref(),
+        &context.guest,
+        context.plugin.as_deref(),
         |exit| {
             match exit {
-                VcpuExit::MmioRead(addr, data) => on_mmio(&sh, addr, true, data),
+                VcpuExit::MmioRead(addr, data) => on_mmio(&context, addr, true, data),
                 VcpuExit::MmioWrite(addr, data) => {
                     // Copy out first: `data` borrows the run struct.
                     let mut buf = [0u8; 8];
                     let n = data.len().min(8);
                     buf[..n].copy_from_slice(&data[..n]);
-                    on_mmio_write(&sh, addr, &buf[..n]);
+                    on_mmio_write(&context, addr, &buf[..n]);
                 }
                 // Kicked for a snapshot or a stop; the loop checks which.
                 VcpuExit::Intr => {}
@@ -471,68 +471,94 @@ impl SafepointVcpu for VcpuFd {
 }
 
 /// Services an MMIO **read**: fills `data` with the addressed device's value.
-fn on_mmio(sh: &Shared, addr: u64, _read: bool, data: &mut [u8]) {
+fn on_mmio(context: &VcpuContext, addr: u64, _read: bool, data: &mut [u8]) {
     let width = data.len();
-    let val = mmio_read(sh, addr, width);
+    let val = mmio_read(context, addr, width);
     let bytes = val.to_le_bytes();
     let n = width.min(8);
     data[..n].copy_from_slice(&bytes[..n]);
 }
 
 /// Reads the device register at `addr`.
-fn mmio_read(sh: &Shared, addr: u64, width: usize) -> u64 {
+fn mmio_read(context: &VcpuContext, addr: u64, width: usize) -> u64 {
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
-        sh.pl011.lock().unwrap().mmio(addr - UART_BASE, false, 0)
+        context
+            .pl011
+            .lock()
+            .unwrap()
+            .mmio(addr - UART_BASE, false, 0)
     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
-        sh.rtc
+        context
+            .rtc
             .lock()
             .unwrap()
             .mmio(addr - RTC_BASE, width, false, 0)
-    } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
-        sh.guest.read_device(dev, off)
+    } else if let Some((dev, off)) = context.guest.disk_at(addr, VIRTIO_SIZE) {
+        context.guest.read_device(dev, off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
         let off = addr - VIRTIO_NET_BASE;
-        sh.guest
+        context
+            .guest
             .net
             .as_ref()
-            .map_or(0, |dev| sh.guest.read_device(dev, off))
+            .map_or(0, |dev| context.guest.read_device(dev, off))
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
         let off = addr - VIRTIO_VSOCK_BASE;
-        sh.guest
+        context
+            .guest
             .vsock
             .as_ref()
-            .map_or(0, |dev| sh.guest.read_device(dev, off))
-    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
-        serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, false, 0)
+            .map_or(0, |dev| context.guest.read_device(dev, off))
+    } else if let Some(export) = export_at(&context.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(
+            &export.dev,
+            &context.guest.ram,
+            addr - export.base,
+            false,
+            0,
+        )
     } else {
         0
     }
 }
 
 /// Services an MMIO **write** to the addressed device.
-fn on_mmio_write(sh: &Shared, addr: u64, data: &[u8]) {
+fn on_mmio_write(context: &VcpuContext, addr: u64, data: &[u8]) {
     let mut b = [0u8; 8];
     b[..data.len()].copy_from_slice(data);
     let val = u64::from_le_bytes(b);
     if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
-        sh.pl011.lock().unwrap().mmio(addr - UART_BASE, true, val);
+        context
+            .pl011
+            .lock()
+            .unwrap()
+            .mmio(addr - UART_BASE, true, val);
     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
-        sh.rtc
+        context
+            .rtc
             .lock()
             .unwrap()
             .mmio(addr - RTC_BASE, data.len(), true, val);
-    } else if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
-        sh.guest.write_device(dev, off, val);
+    } else if let Some((dev, off)) = context.guest.disk_at(addr, VIRTIO_SIZE) {
+        context.guest.write_device(dev, off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        if let Some(dev) = &sh.guest.net {
-            sh.guest.write_device(dev, addr - VIRTIO_NET_BASE, val);
+        if let Some(dev) = &context.guest.net {
+            context.guest.write_device(dev, addr - VIRTIO_NET_BASE, val);
         }
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        if let Some(dev) = &sh.guest.vsock {
-            sh.guest.write_device(dev, addr - VIRTIO_VSOCK_BASE, val);
+        if let Some(dev) = &context.guest.vsock {
+            context
+                .guest
+                .write_device(dev, addr - VIRTIO_VSOCK_BASE, val);
         }
-    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
-        serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, true, val);
+    } else if let Some(export) = export_at(&context.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(
+            &export.dev,
+            &context.guest.ram,
+            addr - export.base,
+            true,
+            val,
+        );
     }
 }
 

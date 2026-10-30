@@ -352,9 +352,9 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// queued deeply still gets serviced off the vCPU.
 const FS_INLINE_BUDGET: u16 = 8;
 
-/// State shared across all vCPU threads.
+/// The state a vCPU thread needs beyond its own vCPU.
 #[derive(Clone)]
-struct Shared {
+struct VcpuContext {
     vm: VmGic,
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
@@ -620,7 +620,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         .collect();
     let kicker = Kicker::new(vm.clone(), num_cpus, secondaries);
 
-    let shared = Shared {
+    let context = VcpuContext {
         vm: vm.clone(),
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -648,27 +648,27 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         Arc::new(HvfIrqLine {
             vm: vm.clone(),
             intid,
-            kick: kick.then(|| Arc::clone(&shared.guest.vcpus)),
+            kick: kick.then(|| Arc::clone(&context.guest.vcpus)),
         })
     };
-    shared
+    context
         .pl011
         .lock()
         .unwrap()
         .connect_irq(line(UART_INTID, false));
-    shared.guest.connect_irqs(
+    context.guest.connect_irqs(
         // `open_disks` refused more disks than there are SPIs.
         |index| line(32 + virtio_blk_spi(index).expect("an SPI per disk"), true),
         line(VIRTIO_NET_INTID, true),
         line(VIRTIO_VSOCK_INTID, true),
     );
-    for fs in &shared.fs {
+    for fs in &context.fs {
         fs.dev.lock().unwrap().connect_irq(line(fs.intid, true));
     }
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
-    let (plugin_threads, ledger_guard) = shared.guest.attach(shared.plugin.as_ref())?;
+    let (plugin_threads, ledger_guard) = context.guest.attach(context.plugin.as_ref())?;
 
     // A binary's stop signals get their handlers, and the thread that receives
     // them starts, before the terminal goes into raw mode, so a first stop
@@ -703,10 +703,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     install_kick_handler();
     let mut io_threads = IoThreads::start(
         stop_source,
-        &shared.guest,
-        shared.plugin.clone(),
+        &context.guest,
+        context.plugin.clone(),
         {
-            let pl011 = Arc::clone(&shared.pl011);
+            let pl011 = Arc::clone(&context.pl011);
             move |byte| pl011.lock().unwrap().push_rx(byte)
         },
         bridge,
@@ -715,10 +715,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     );
     // Each virtio-fs device gets its own worker thread, which serves the
     // requests a vCPU leaves past `FS_INLINE_BUDGET`. See `run_fs_worker`.
-    for fs in &shared.fs {
+    for fs in &context.fs {
         let (dev, ram, wake) = (
             Arc::clone(&fs.dev),
-            Arc::clone(&shared.guest.ram),
+            Arc::clone(&context.guest.ram),
             Arc::clone(&fs.wake),
         );
         io_threads.spawn("virtio-fs worker", move |_| {
@@ -735,21 +735,21 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();
-    let _current = record_start(&shared.guest, cfg.sandbox);
+    let _current = record_start(&context.guest, cfg.sandbox);
     // One thread per vCPU. From here on a failure stops the guest and is
     // reported once every thread has been joined or left running, and the first
     // failure is the one reported.
-    let (threads, spawned) = shared
+    let (threads, spawned) = context
         .guest
         .vcpus
-        .spawn((0..num_cpus).map(|_| shared.clone()), run_cpu);
+        .spawn((0..num_cpus).map(|_| context.clone()), run_cpu);
     let failure: Option<Box<dyn std::error::Error + Send + Sync>> = spawned.err().map(Into::into);
-    let result = run_to_stop(&shared.guest, threads, failure, io_threads);
+    let result = run_to_stop(&context.guest, threads, failure, io_threads);
 
     // What the guest actually spent, reported once on the way out. #34 asks
     // for this number before any limit is tightened: a ceiling picked without
     // knowing what a real build needs is a ceiling that breaks one.
-    for (index, fs) in shared.fs.iter().enumerate() {
+    for (index, fs) in context.fs.iter().enumerate() {
         report_fs_usage(index, &fs.dev);
     }
 
@@ -810,13 +810,13 @@ thread_local! {
 
 /// A single vCPU: create it, position it (boot entry, or wait for CPU_ON), and
 /// run its exit loop until the VM stops.
-fn run_cpu(cpu_id: u32, sh: Shared) {
+fn run_cpu(cpu_id: u32, context: VcpuContext) {
     // The vCPU is in an `Rc` so the panic report below can read it on this
     // thread.
-    let vcpu = match sh.vm.vcpu_create() {
+    let vcpu = match context.vm.vcpu_create() {
         Ok(v) => std::rc::Rc::new(v),
         Err(e) => {
-            sh.guest.vcpus.report(Outcome::Failed(format!(
+            context.guest.vcpus.report(Outcome::Failed(format!(
                 "vcpu{cpu_id}: vcpu_create failed: {e:?}"
             )));
             return;
@@ -828,7 +828,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     let mpidr = 0x8000_0000 | u64::from(mpidr_affinity(cpu_id));
     let _ = vcpu.set_sys_reg(SysReg::MPIDR_EL1, mpidr);
     // Declared after the vCPU, so it drops first.
-    let _registration = sh.guest.vcpus.kicker().register(cpu_id, &vcpu);
+    let _registration = context.guest.vcpus.kicker().register(cpu_id, &vcpu);
     // A panic report names where the guest was and what it last did, so it is
     // usable without a debugger. The exit is left out until a run of the vCPU
     // has returned, since its exit information holds nothing before that.
@@ -847,17 +847,17 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
     });
 
     if cpu_id == 0 {
-        let _ = vcpu.set_reg(Reg::PC, sh.kernel_addr);
-        let _ = vcpu.set_reg(Reg::X0, sh.dtb_addr);
+        let _ = vcpu.set_reg(Reg::PC, context.kernel_addr);
+        let _ = vcpu.set_reg(Reg::X0, context.dtb_addr);
         let _ = vcpu.set_reg(Reg::X1, 0);
         let _ = vcpu.set_reg(Reg::X2, 0);
         let _ = vcpu.set_reg(Reg::X3, 0);
         let _ = vcpu.set_reg(Reg::CPSR, 0x3c5); // EL1h, DAIF masked
     } else {
         // Park until the guest brings this cpu up via PSCI CPU_ON.
-        let sec = &sh.guest.vcpus.kicker().secondaries[cpu_id as usize];
+        let sec = &context.guest.vcpus.kicker().secondaries[cpu_id as usize];
         let mut mbox = sec.mbox.lock().unwrap();
-        while mbox.is_none() && sh.guest.vcpus.is_running() {
+        while mbox.is_none() && context.guest.vcpus.is_running() {
             mbox = sec.cv.wait(mbox).unwrap();
         }
         match mbox.take() {
@@ -871,31 +871,31 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
             None => return, // stopped while waiting
         }
     }
-    sh.guest.vcpus.mark_started(cpu_id);
+    context.guest.vcpus.mark_started(cpu_id);
 
     // The plugin runs on vcpu0, between guest entries, because only this thread
     // can read this vCPU's registers.
-    let plugin = sh.plugin.as_deref().filter(|_| cpu_id == 0);
+    let plugin = context.plugin.as_deref().filter(|_| cpu_id == 0);
     // The loop runs inside `catch_unwind` only for the report. A panic is
     // reported with where the guest was and what it last did, and the thread
     // then reports its exit like any other.
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        while sh.guest.vcpus.is_running() {
+        while context.guest.vcpus.is_running() {
             // Safe point for every vCPU: park here while vcpu0 lets a plugin
             // look at the guest.
-            sh.guest.pass_safepoint(&*vcpu, plugin);
+            context.guest.pass_safepoint(&*vcpu, plugin);
 
             let flow = match vcpu.run() {
                 Ok(()) => {
                     ran.set(true);
-                    handle_exit(&vcpu, &sh, cpu_id)
+                    handle_exit(&vcpu, &context, cpu_id)
                 }
                 Err(e) => ControlFlow::Break(Outcome::Failed(format!(
                     "vcpu{cpu_id}: vcpu run failed: {e:?}"
                 ))),
             };
             if let ControlFlow::Break(outcome) = flow {
-                sh.guest.vcpus.report(outcome);
+                context.guest.vcpus.report(outcome);
                 break;
             }
         }
@@ -905,7 +905,7 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
         let detail = panic_detail()
             .map(|detail| format!("; {detail}"))
             .unwrap_or_default();
-        sh.guest.vcpus.report(Outcome::Failed(format!(
+        context.guest.vcpus.report(Outcome::Failed(format!(
             "vcpu{cpu_id}: panicked ({}){detail}",
             crate::panic_message(payload.as_ref()),
         )));
@@ -917,43 +917,43 @@ fn run_cpu(cpu_id: u32, sh: Shared) {
 /// Returns `ControlFlow::Break` with the run's outcome when the exit ends the
 /// run, and `ControlFlow::Continue` otherwise. The outcome is a guest-requested
 /// stop or a failure.
-fn handle_exit(vcpu: &Vcpu, sh: &Shared, cpu_id: u32) -> ControlFlow<Outcome> {
+fn handle_exit(vcpu: &Vcpu, context: &VcpuContext, cpu_id: u32) -> ControlFlow<Outcome> {
     let exit = vcpu.get_exit_info();
     match exit.reason {
         ExitReason::EXCEPTION => {
             let syn = exit.exception.syndrome;
             match Ec::from_syndrome(syn) {
                 Ec::Hvc | Ec::Smc => {
-                    service_psci(vcpu, sh)?;
+                    service_psci(vcpu, context)?;
                     // Not restartable: the saved PC is already past HVC/SMC.
                 }
                 Ec::DataAbort => {
                     let ipa = exit.exception.physical_address;
                     if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
-                        service_uart(vcpu, sh, ipa - UART_BASE, syn);
+                        service_uart(vcpu, context, ipa - UART_BASE, syn);
                         advance_pc(vcpu);
                     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&ipa) {
-                        service_rtc(vcpu, sh, ipa - RTC_BASE, syn);
+                        service_rtc(vcpu, context, ipa - RTC_BASE, syn);
                         advance_pc(vcpu);
-                    } else if let Some((dev, offset)) = sh.guest.disk_at(ipa, VIRTIO_SIZE) {
-                        service_device(vcpu, sh, dev, offset, syn);
+                    } else if let Some((dev, offset)) = context.guest.disk_at(ipa, VIRTIO_SIZE) {
+                        service_device(vcpu, context, dev, offset, syn);
                         advance_pc(vcpu);
                     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
-                        if let Some(dev) = &sh.guest.net {
-                            service_device(vcpu, sh, dev, ipa - VIRTIO_NET_BASE, syn);
+                        if let Some(dev) = &context.guest.net {
+                            service_device(vcpu, context, dev, ipa - VIRTIO_NET_BASE, syn);
                         }
                         advance_pc(vcpu);
                     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&ipa) {
-                        if let Some(dev) = &sh.guest.vsock {
-                            service_device(vcpu, sh, dev, ipa - VIRTIO_VSOCK_BASE, syn);
+                        if let Some(dev) = &context.guest.vsock {
+                            service_device(vcpu, context, dev, ipa - VIRTIO_VSOCK_BASE, syn);
                         }
                         advance_pc(vcpu);
-                    } else if let Some(fs) = sh
+                    } else if let Some(fs) = context
                         .fs
                         .iter()
                         .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
                     {
-                        service_fs(vcpu, sh, fs, ipa - fs.base, syn);
+                        service_fs(vcpu, context, fs, ipa - fs.base, syn);
                         advance_pc(vcpu);
                     } else {
                         return ControlFlow::Break(Outcome::Failed(format!(
@@ -1017,7 +1017,7 @@ impl SafepointVcpu for Vcpu {
 ///
 /// Returns `ControlFlow::Break` with the stop for `SYSTEM_OFF` and
 /// `SYSTEM_RESET`, and `ControlFlow::Continue` otherwise.
-fn service_psci(vcpu: &Vcpu, sh: &Shared) -> ControlFlow<Outcome> {
+fn service_psci(vcpu: &Vcpu, context: &VcpuContext) -> ControlFlow<Outcome> {
     let fid = vcpu.get_reg(Reg::X0).unwrap_or(0);
     match fid {
         psci::VERSION => {
@@ -1050,7 +1050,7 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> ControlFlow<Outcome> {
             let target = vcpu.get_reg(Reg::X1).unwrap_or(0);
             let entry = vcpu.get_reg(Reg::X2).unwrap_or(0);
             let ctx = vcpu.get_reg(Reg::X3).unwrap_or(0);
-            let secondaries = &sh.guest.vcpus.kicker().secondaries;
+            let secondaries = &context.guest.vcpus.kicker().secondaries;
             let ret = match vcpu_index(target).map(|idx| idx as usize) {
                 Some(idx) if idx != 0 && idx < secondaries.len() => {
                     let sec = &secondaries[idx];
@@ -1075,12 +1075,12 @@ fn service_psci(vcpu: &Vcpu, sh: &Shared) -> ControlFlow<Outcome> {
 }
 
 /// Services a PL011 MMIO access.
-fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
+fn service_uart(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);
     if !da.isv {
         return;
     }
-    let mut p = sh.pl011.lock().unwrap();
+    let mut p = context.pl011.lock().unwrap();
     if da.is_write {
         let v = read_gpr(vcpu, da.reg);
         p.mmio(offset, true, v);
@@ -1091,13 +1091,13 @@ fn service_uart(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
 }
 
 /// Services a PL031 MMIO access at `offset` into the RTC's window.
-fn service_rtc(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
+fn service_rtc(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);
     if !da.isv {
         return;
     }
     let width = usize::from(da.width);
-    let mut rtc = sh.rtc.lock().unwrap();
+    let mut rtc = context.rtc.lock().unwrap();
     if da.is_write {
         rtc.mmio(offset, width, true, read_gpr(vcpu, da.reg));
     } else {
@@ -1109,7 +1109,7 @@ fn service_rtc(vcpu: &Vcpu, sh: &Shared, offset: u64, syndrome: u64) {
 /// Services a virtio-blk, virtio-net or virtio-vsock MMIO access.
 fn service_device<D: VirtioMmio>(
     vcpu: &Vcpu,
-    sh: &Shared,
+    context: &VcpuContext,
     dev: &Mutex<D>,
     offset: u64,
     syndrome: u64,
@@ -1119,9 +1119,11 @@ fn service_device<D: VirtioMmio>(
         return;
     }
     if da.is_write {
-        sh.guest.write_device(dev, offset, read_gpr(vcpu, da.reg));
+        context
+            .guest
+            .write_device(dev, offset, read_gpr(vcpu, da.reg));
     } else {
-        let read = sh.guest.read_device(dev, offset);
+        let read = context.guest.read_device(dev, offset);
         write_gpr(vcpu, da.reg, read & width_mask(da.width));
     }
 }
@@ -1136,7 +1138,7 @@ fn service_device<D: VirtioMmio>(
 /// The device sets its line in `mmio` and at the end of every drain. Both run
 /// under the device mutex, so the line follows the last change to the interrupt
 /// status.
-fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u64) {
+fn service_fs(vcpu: &Vcpu, context: &VcpuContext, fs: &SharedFs, offset: u64, syndrome: u64) {
     let da = DataAbort::from_syndrome(syndrome);
     if !da.isv {
         return;
@@ -1146,9 +1148,9 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
         let mut d = fs.dev.lock().unwrap();
         if da.is_write {
             let v = read_gpr(vcpu, da.reg);
-            d.mmio(&sh.guest.ram, offset, true, v);
+            d.mmio(&context.guest.ram, offset, true, v);
         } else {
-            let v = d.mmio(&sh.guest.ram, offset, false, 0) & width_mask(da.width);
+            let v = d.mmio(&context.guest.ram, offset, false, 0) & width_mask(da.width);
             write_gpr(vcpu, da.reg, v);
         }
     }
@@ -1164,7 +1166,7 @@ fn service_fs(vcpu: &Vcpu, sh: &Shared, fs: &SharedFs, offset: u64, syndrome: u6
             .dev
             .lock()
             .unwrap()
-            .drain_notified_bounded(&sh.guest.ram, FS_INLINE_BUDGET);
+            .drain_notified_bounded(&context.guest.ram, FS_INLINE_BUDGET);
         if remaining {
             fs.wake.wake();
         }
