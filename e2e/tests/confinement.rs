@@ -23,14 +23,14 @@ use hvi_e2e::Vm;
 
 /// The line hvi prints when the confinement is on.
 const CONFINED_LINE: &str = if cfg!(target_os = "macos") {
-    "seatbelt sandbox: on"
+    "seatbelt: on"
 } else {
     "seccomp: on"
 };
 
 /// The line hvi prints when `--no-sandbox` turns the confinement off.
 const UNCONFINED_LINE: &str = if cfg!(target_os = "macos") {
-    "seatbelt sandbox: OFF (--no-sandbox)"
+    "seatbelt: OFF (--no-sandbox)"
 } else {
     "seccomp: OFF (--no-sandbox)"
 };

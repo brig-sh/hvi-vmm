@@ -21,13 +21,16 @@ use std::time::{Duration, Instant};
 use super::server::VirtioFs;
 use crate::memory::GuestRam;
 
-/// One tagged virtio-fs export, its dynamically assigned transport slot, and
-/// the wake signal its dedicated worker thread (`run_fs_worker`) parks on.
+/// One virtio-fs export as the macOS backend wires it.
 #[derive(Clone)]
-pub(crate) struct SharedFs {
+pub(crate) struct Export {
+    /// Guest-physical base of the transport's MMIO window.
     pub(crate) base: u64,
+    /// The INTID the device raises.
     pub(crate) intid: u32,
+    /// The device behind the transport.
     pub(crate) dev: Arc<Mutex<VirtioFs>>,
+    /// The wake signal of the device's worker thread.
     pub(crate) wake: Arc<FsWake>,
 }
 

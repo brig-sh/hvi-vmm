@@ -18,8 +18,9 @@
 //! guest RAM, `fdt` builds the devicetree, and `layout` holds the
 //! guest-physical address map both work from. `kvm` runs the guest on Linux and
 //! `hvf` on macOS. `esr` decodes the exception syndrome that
-//! Hypervisor.framework reports on a guest exit, and `smoke` checks
-//! Hypervisor.framework without a kernel.
+//! Hypervisor.framework reports on a guest exit, `psci` names the PSCI calls
+//! the macOS backend serves, and `smoke` checks Hypervisor.framework without a
+//! kernel.
 
 pub mod esr;
 pub mod fdt;
@@ -30,5 +31,7 @@ pub mod loader;
 pub(crate) mod hvf;
 #[cfg(target_os = "linux")]
 pub(crate) mod kvm;
+#[cfg(target_os = "macos")]
+pub(crate) mod psci;
 #[cfg(target_os = "macos")]
 pub mod smoke;

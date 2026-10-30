@@ -1570,6 +1570,9 @@ impl VirtioFs {
     }
 
     /// Sets the interrupt line to the device's level.
+    ///
+    /// It runs under the device mutex, so the line follows the last change to
+    /// the interrupt status.
     fn sync_irq(&mut self) {
         self.irq.set(self.irq_level());
     }

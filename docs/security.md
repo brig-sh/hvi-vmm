@@ -60,8 +60,8 @@ Each backend prints what it installed, so a host where confinement did not
 happen says so:
 
 ```text
-[hvi] seatbelt sandbox: on (deny default)
-[hvi] seatbelt sandbox: OFF (--no-sandbox) - the VMM keeps full host authority
+[hvi] seatbelt: on (deny default)
+[hvi] seatbelt: OFF (--no-sandbox); the VMM keeps full host authority
 ```
 
 ### macOS: Seatbelt
