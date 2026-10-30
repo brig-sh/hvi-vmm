@@ -192,13 +192,13 @@ jobs:
     # takes the lock must stay under.
     timeout-minutes: 75
     steps:
+      # Cone mode also checks out the top-level files, hvi.entitlements among
+      # them. A self-hosted runner keeps its workspace between jobs. After a
+      # non-cone checkout, the jobs that follow get the same sparse tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: |
-            .github/scripts
-            hvi.entitlements
-          sparse-checkout-cone-mode: false
+          sparse-checkout: .github/scripts
 
       # The hosted image ships jq and a self-hosted Mac does not have to.
       - name: Install jq
