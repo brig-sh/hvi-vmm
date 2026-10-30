@@ -108,9 +108,9 @@ const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
 /// frequent observations.
 const MIN_NOTIFIED_PAUSE: Duration = Duration::from_secs(1);
 
-/// State shared across the vCPU threads.
+/// The state a vCPU thread needs beyond its own vCPU.
 #[derive(Clone)]
-struct Shared {
+struct VcpuContext {
     /// The guest's RAM, virtio devices and vCPUs.
     guest: Arc<Guest<Kicker>>,
     uart: Arc<Mutex<Uart16550>>,
@@ -397,7 +397,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
 
     let vm = Arc::new(vm);
-    let shared = Shared {
+    let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::X86_64,
             sandbox_id: cfg.sandbox_id.clone(),
@@ -424,20 +424,20 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Each device sets its own interrupt line, from the methods that change its
     // level and so under the lock that decides it.
     let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
-    shared.uart.lock().unwrap().connect_irq(line(COM1_GSI));
-    shared.guest.connect_irqs(
+    context.uart.lock().unwrap().connect_irq(line(COM1_GSI));
+    context.guest.connect_irqs(
         // `open_disks` refused more disks than there are GSIs.
         |index| line(virtio_blk_gsi(index).expect("a GSI per disk")),
         line(VIRTIO_NET_GSI),
         line(VIRTIO_VSOCK_GSI),
     );
-    for export in shared.fs.iter() {
+    for export in context.fs.iter() {
         export.dev.lock().unwrap().connect_irq(line(export.irq));
     }
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
-    let fs = Arc::clone(&shared.fs);
-    shared
+    let fs = Arc::clone(&context.fs);
+    context
         .guest
         .vcpus
         .on_stop(move || vhost_user::shut_down(&fs));
@@ -447,17 +447,17 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // joined after the vCPUs; `teardown` describes the stop.
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
-        &shared.guest,
+        &context.guest,
         {
-            let uart = Arc::clone(&shared.uart);
+            let uart = Arc::clone(&context.uart);
             move |byte| uart.lock().unwrap().push_rx(byte)
         },
         net_source,
     )?;
-    vhost_user::start_interrupt_threads(&shared.fs, &mut io_threads);
+    vhost_user::start_interrupt_threads(&context.fs, &mut io_threads);
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
-        let guest = Arc::clone(&shared.guest);
+        let guest = Arc::clone(&context.guest);
         io_threads.spawn("trace watchdog", move |watch| {
             for _ in 0..4 {
                 match watch.sleep(std::time::Duration::from_secs(2)) {
@@ -478,8 +478,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_guest` returned it.
     run_guest(
-        &shared.guest,
-        &shared,
+        &context.guest,
+        &context,
         vcpus,
         kick_handles,
         run_cpu,
@@ -566,21 +566,23 @@ fn write_boot_gdt(ram: &GuestRam) -> Result<(), Box<dyn std::error::Error + Send
 }
 
 /// Runs one vCPU until the VM stops, servicing its port I/O and MMIO exits.
-fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
+fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: VcpuContext) {
     let dbg = std::env::var_os("HVI_X86_TRACE").is_some();
     let mut n_exit = 0u64;
     run_vcpu(
         cpu_id,
         vcpu,
         kick_handle,
-        &sh.guest,
-        sh.plugin.as_deref(),
+        &context.guest,
+        context.plugin.as_deref(),
         |exit| {
             // The trace reads registers through the vCPU's second handle, since
             // the exit borrows the one the run uses.
             let dump = |tag: &str| {
-                let kicker = sh.guest.vcpus.kicker();
-                kicker.with_vcpu(cpu_id, |vcpu| dump_regs(vcpu, &sh.guest.ram, cpu_id, tag));
+                let kicker = context.guest.vcpus.kicker();
+                kicker.with_vcpu(cpu_id, |vcpu| {
+                    dump_regs(vcpu, &context.guest.ram, cpu_id, tag)
+                });
             };
             match exit {
                 VcpuExit::IoIn(port, data) => {
@@ -591,19 +593,19 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     // The PM1 registers are 16 bits wide, so the ACPI block
                     // takes the whole access. Every other port is a byte port.
                     if let Some(offset) = pm_offset(port) {
-                        sh.pm.lock().unwrap().read(offset, data);
+                        context.pm.lock().unwrap().read(offset, data);
                     } else {
                         for b in data.iter_mut() {
-                            *b = pio_read(&sh, port);
+                            *b = pio_read(&context, port);
                         }
                     }
                 }
                 VcpuExit::IoOut(port, data) => {
                     let stop = if let Some(offset) = pm_offset(port) {
-                        sh.pm.lock().unwrap().write(offset, data)
+                        context.pm.lock().unwrap().write(offset, data)
                     } else {
                         for &b in data.iter() {
-                            pio_write(&sh, port, b);
+                            pio_write(&context, port, b);
                         }
                         pio_stop(port, data)
                     };
@@ -625,7 +627,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                         stderrln!("[trace] vcpu{cpu_id} MmioRead {addr:#x}");
                         n_exit += 1;
                     }
-                    let val = mmio_read(&sh, addr);
+                    let val = mmio_read(&context, addr);
                     let n = data.len().min(8);
                     data[..n].copy_from_slice(&val.to_le_bytes()[..n]);
                 }
@@ -637,7 +639,7 @@ fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, sh: Shared) {
                     let mut b = [0u8; 8];
                     let n = data.len().min(8);
                     b[..n].copy_from_slice(&data[..n]);
-                    mmio_write(&sh, addr, u64::from_le_bytes(b));
+                    mmio_write(&context, addr, u64::from_le_bytes(b));
                 }
                 VcpuExit::Shutdown => {
                     if dbg {
@@ -734,83 +736,95 @@ fn pm_offset(port: u16) -> Option<u16> {
 }
 
 /// Services an `in` from `port`.
-fn pio_read(sh: &Shared, port: u16) -> u8 {
-    pio_dispatch_read(&sh.uart, &sh.rtc, port)
+fn pio_read(context: &VcpuContext, port: u16) -> u8 {
+    pio_dispatch_read(&context.uart, &context.rtc, port)
 }
 
 /// Services an `out` of `val` to `port`.
-fn pio_write(sh: &Shared, port: u16, val: u8) {
-    pio_dispatch_write(&sh.uart, &sh.rtc, port, val);
+fn pio_write(context: &VcpuContext, port: u16, val: u8) {
+    pio_dispatch_write(&context.uart, &context.rtc, port, val);
 }
 
 /// Services an MMIO read of the virtio register at `addr`.
-fn mmio_read(sh: &Shared, addr: u64) -> u64 {
-    if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
-        blk_read(sh, dev, off)
+fn mmio_read(context: &VcpuContext, addr: u64) -> u64 {
+    if let Some((dev, off)) = context.guest.disk_at(addr, VIRTIO_SIZE) {
+        blk_read(context, dev, off)
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        net_read(sh, addr - VIRTIO_NET_BASE)
+        net_read(context, addr - VIRTIO_NET_BASE)
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        vsock_read(sh, addr - VIRTIO_VSOCK_BASE)
-    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
-        serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, false, 0)
+        vsock_read(context, addr - VIRTIO_VSOCK_BASE)
+    } else if let Some(export) = export_at(&context.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(
+            &export.dev,
+            &context.guest.ram,
+            addr - export.base,
+            false,
+            0,
+        )
     } else {
         0
     }
 }
 
 /// Services an MMIO write of `val` to the virtio register at `addr`.
-fn mmio_write(sh: &Shared, addr: u64, val: u64) {
-    if let Some((dev, off)) = sh.guest.disk_at(addr, VIRTIO_SIZE) {
-        blk_write(sh, dev, off, val);
+fn mmio_write(context: &VcpuContext, addr: u64, val: u64) {
+    if let Some((dev, off)) = context.guest.disk_at(addr, VIRTIO_SIZE) {
+        blk_write(context, dev, off, val);
     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        net_write(sh, addr - VIRTIO_NET_BASE, val);
+        net_write(context, addr - VIRTIO_NET_BASE, val);
     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        vsock_write(sh, addr - VIRTIO_VSOCK_BASE, val);
-    } else if let Some(export) = export_at(&sh.fs, addr, VIRTIO_SIZE) {
-        serve_mmio(&export.dev, &sh.guest.ram, addr - export.base, true, val);
+        vsock_write(context, addr - VIRTIO_VSOCK_BASE, val);
+    } else if let Some(export) = export_at(&context.fs, addr, VIRTIO_SIZE) {
+        serve_mmio(
+            &export.dev,
+            &context.guest.ram,
+            addr - export.base,
+            true,
+            val,
+        );
     }
 }
 
 /// Services a read of register `off` of the virtio-blk device `dev`.
-fn blk_read(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
-    sh.guest.read_device(dev, off)
+fn blk_read(context: &VcpuContext, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
+    context.guest.read_device(dev, off)
 }
 
 /// Services a write of `val` to register `off` of the virtio-blk device `dev`.
-fn blk_write(sh: &Shared, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
-    sh.guest.write_device(dev, off, val);
+fn blk_write(context: &VcpuContext, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
+    context.guest.write_device(dev, off, val);
 }
 
 /// Services a read of virtio-net register `off`.
-fn net_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.guest.net.as_ref() else {
+fn net_read(context: &VcpuContext, off: u64) -> u64 {
+    let Some(dev) = context.guest.net.as_ref() else {
         return 0;
     };
-    sh.guest.read_device(dev, off)
+    context.guest.read_device(dev, off)
 }
 
 /// Services a write of `val` to virtio-net register `off`.
-fn net_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.guest.net.as_ref() else {
+fn net_write(context: &VcpuContext, off: u64, val: u64) {
+    let Some(dev) = context.guest.net.as_ref() else {
         return;
     };
-    sh.guest.write_device(dev, off, val);
+    context.guest.write_device(dev, off, val);
 }
 
 /// Services a read of virtio-vsock register `off`.
-fn vsock_read(sh: &Shared, off: u64) -> u64 {
-    let Some(dev) = sh.guest.vsock.as_ref() else {
+fn vsock_read(context: &VcpuContext, off: u64) -> u64 {
+    let Some(dev) = context.guest.vsock.as_ref() else {
         return 0;
     };
-    sh.guest.read_device(dev, off)
+    context.guest.read_device(dev, off)
 }
 
 /// Services a write of `val` to virtio-vsock register `off`.
-fn vsock_write(sh: &Shared, off: u64, val: u64) {
-    let Some(dev) = sh.guest.vsock.as_ref() else {
+fn vsock_write(context: &VcpuContext, off: u64, val: u64) {
+    let Some(dev) = context.guest.vsock.as_ref() else {
         return;
     };
-    sh.guest.write_device(dev, off, val);
+    context.guest.write_device(dev, off, val);
 }
 
 #[cfg(test)]
