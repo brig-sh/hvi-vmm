@@ -16,7 +16,7 @@ combinations are built, selected at compile time by target triple.
 
 | Guest | Host | Backend module | Hypervisor API |
 | --- | --- | --- | --- |
-| aarch64 | macOS, Apple silicon | `arch/aarch64/hvf.rs` | Hypervisor.framework (`applevisor`) |
+| aarch64 | macOS, Apple silicon | `arch/aarch64/hvf/` | Hypervisor.framework (`applevisor`) |
 | aarch64 | Linux | `arch/aarch64/kvm/` | KVM (`kvm-ioctls` 0.25) |
 | x86-64 | Linux | `arch/x86_64/kvm/` | KVM (`kvm-ioctls` 0.25) |
 
@@ -37,7 +37,7 @@ usual mistake:
   registers that only x86 needs. The PL031 is `vm-superio`'s, the crate the
   x86-64 UART already wraps.
 
-Porting to a new host backend means a new `arch/<arch>/<hypervisor>.rs` file
+Porting to a new host backend means a new `arch/<arch>/<hypervisor>/` directory
 with a `Kick` and an `IrqLine` implementation and a `Guest` built from them, its
 `mod` line in `arch/<arch>/mod.rs`, its `use ... as backend` line and its target
 in the build guard, both in `lib.rs`, and its dependencies in `Cargo.toml`.
@@ -51,7 +51,7 @@ flowchart TB
         cli["main.rs — CLI<br/>parses flags → BootConfig"]
         subgraph backend["backend boot(BootConfig) → Stop  (one of three, cfg-selected, called by hvi::boot)"]
             direction LR
-            m1["arch/aarch64/hvf.rs<br/>Hypervisor.framework"]
+            m1["arch/aarch64/hvf/<br/>Hypervisor.framework"]
             m2["arch/aarch64/kvm/<br/>KVM / aarch64"]
             m3["arch/x86_64/kvm/<br/>KVM / x86-64"]
         end
@@ -496,8 +496,8 @@ how it works.
 | --- | --- |
 | Crate root and backend selection | `lib.rs`, `arch/<arch>/mod.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
-| Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm/`, `arch/x86_64/kvm/`, `arch/aarch64/smoke.rs` |
-| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
+| Backends | `arch/aarch64/hvf/`, `arch/aarch64/kvm/`, `arch/x86_64/kvm/`, `arch/aarch64/smoke.rs` |
+| arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `psci.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
 | Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
