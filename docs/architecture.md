@@ -500,7 +500,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
+| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

@@ -243,9 +243,9 @@ mod tests {
 }
 
 // A litmus test for the used-ring publish in `Queue::push_used`. It models what
-// `run_fs_worker` in the macOS backend does: a host thread that is not the vCPU
-// thread appends completions to the used ring while the guest is running and
-// consuming that same ring.
+// `run_fs_worker` does on macOS: a host thread that is not the vCPU thread
+// appends completions to the used ring while the guest is running and consuming
+// that same ring.
 #[cfg(test)]
 mod ordering_tests {
     use super::Queue;
