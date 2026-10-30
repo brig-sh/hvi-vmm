@@ -18,7 +18,7 @@ combinations are built, selected at compile time by target triple.
 | --- | --- | --- | --- |
 | aarch64 | macOS, Apple silicon | `arch/aarch64/hvf.rs` | Hypervisor.framework (`applevisor`) |
 | aarch64 | Linux | `arch/aarch64/kvm.rs` | KVM (`kvm-ioctls` 0.25) |
-| x86-64 | Linux | `arch/x86_64/kvm.rs` | KVM (`kvm-ioctls` 0.25) |
+| x86-64 | Linux | `arch/x86_64/kvm/` | KVM (`kvm-ioctls` 0.25) |
 
 Two kinds of difference cut across those three, and conflating them is the
 usual mistake:
@@ -53,7 +53,7 @@ flowchart TB
             direction LR
             m1["arch/aarch64/hvf.rs<br/>Hypervisor.framework"]
             m2["arch/aarch64/kvm.rs<br/>KVM / aarch64"]
-            m3["arch/x86_64/kvm.rs<br/>KVM / x86-64"]
+            m3["arch/x86_64/kvm/<br/>KVM / x86-64"]
         end
         subgraph shared["Shared core"]
             direction LR
@@ -496,7 +496,7 @@ how it works.
 | --- | --- |
 | Crate root and backend selection | `lib.rs`, `arch/<arch>/mod.rs` |
 | CLI and configuration | `main.rs`, `config.rs` |
-| Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm.rs`, `arch/aarch64/smoke.rs` |
+| Backends | `arch/aarch64/hvf.rs`, `arch/aarch64/kvm.rs`, `arch/x86_64/kvm/`, `arch/aarch64/smoke.rs` |
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
