@@ -13,7 +13,7 @@ files follow it, each in the part named beside it:
 
   src/arch/x86_64/loader.rs   mirrors Firecracker's arch::x86_64 kernel loader
   src/arch/x86_64/layout.rs   the same guest memory layout constants
-  src/arch/x86_64/kvm.rs      the same vCPU and VM bring-up shape
+  src/arch/x86_64/kvm/        the same vCPU and VM bring-up shape
   src/arch/x86_64/mptable.rs  an MP table of the same small shape (MP spec 1.4)
   src/devices/virtio/queue.rs the virtio queue and descriptor conventions
   src/sandbox/seatbelt.rs     the confinement goal, by a different mechanism
