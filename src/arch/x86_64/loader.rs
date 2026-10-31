@@ -26,6 +26,9 @@
 //! The vCPU then enters in long mode at the kernel entry with `RSI` pointing
 //! at the zero page: the Linux 64-bit boot protocol.
 //!
+//! `splice_kernel_args` puts hvi's own parameters into a caller's command line
+//! before the loader writes it, ahead of any init arguments.
+//!
 //! This module mirrors Firecracker's `arch::x86_64` loader.
 
 use std::fmt;
@@ -259,6 +262,39 @@ fn add_e820(params: &mut boot_params, addr: u64, size: u64) -> Result<(), String
     };
     params.e820_entries += 1;
     Ok(())
+}
+
+/// Splices hvi's parameters into a caller-supplied kernel command line.
+///
+/// A bare `--` on a Linux command line ends the kernel's own parameters, and
+/// init gets everything after it as argv. A caller that boots a wrapper init
+/// ends its line that way, as in `... rdinit=/init -- <entrypoint>`. A console
+/// parameter appended there would reach init as an argument, and the guest
+/// would boot with no console.
+///
+/// So this inserts ahead of the first standalone `--`, and appends when there
+/// is none. It works on byte offsets rather than tokens, so the caller's
+/// quoting (`bash -lc 'a; b'`) stays intact.
+pub(crate) fn splice_kernel_args(base: &str, extra: &str) -> String {
+    if extra.is_empty() {
+        return base.to_string();
+    }
+    if base.is_empty() {
+        return extra.to_string();
+    }
+    let sep = base.match_indices("--").find(|(i, _)| {
+        let starts_token = *i == 0 || base.as_bytes()[i - 1] == b' ';
+        let end = i + 2;
+        let ends_token = end == base.len() || base.as_bytes()[end] == b' ';
+        starts_token && ends_token
+    });
+    match sep {
+        Some((i, _)) => {
+            let (head, tail) = base.split_at(i);
+            format!("{} {} {}", head.trim_end(), extra, tail)
+        }
+        None => format!("{base} {extra}"),
+    }
 }
 
 #[cfg(test)]
@@ -611,5 +647,73 @@ pub(crate) mod tests {
         let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0)
             .expect_err("nothing at address 0");
         assert!(err.contains("address 0"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod cmdline_tests {
+    use super::splice_kernel_args;
+
+    const OURS: &str = "console=ttyS0";
+
+    // A line that ends with a wrapper's entrypoint after a bare `--` needs the
+    // parameters before it, or the kernel never parses them.
+    #[test]
+    fn inserts_before_the_init_argv_separator() {
+        let base = "panic=-1 console=ttyS0 root=/dev/vda rw rdinit=/init -- bash -lc 'id; echo hi'";
+        let got = splice_kernel_args(base, OURS);
+        assert_eq!(
+            got,
+            "panic=-1 console=ttyS0 root=/dev/vda rw rdinit=/init \
+             console=ttyS0 -- bash -lc 'id; echo hi'"
+        );
+        // Everything hvi adds is a kernel parameter, so none of it may appear
+        // after the separator.
+        let (kernel_part, init_part) = got
+            .split_once(" -- ")
+            .expect("the separator should survive");
+        assert!(kernel_part.ends_with(OURS));
+        assert!(!init_part.contains(OURS));
+    }
+
+    // A token split and rejoin would collapse the entrypoint's embedded spaces.
+    #[test]
+    fn preserves_quoting_in_the_init_argv() {
+        let base = "rdinit=/init -- bash -lc 'sleep 6; echo done'";
+        let got = splice_kernel_args(base, OURS);
+        assert!(got.ends_with("-- bash -lc 'sleep 6; echo done'"), "{got}");
+    }
+
+    #[test]
+    fn splits_on_the_first_separator_only() {
+        let base = "root=/dev/vda -- prog -- --flag";
+        let got = splice_kernel_args(base, "console=ttyS0");
+        assert_eq!(got, "root=/dev/vda console=ttyS0 -- prog -- --flag");
+    }
+
+    #[test]
+    fn appends_when_there_is_no_separator() {
+        let got = splice_kernel_args("root=/dev/vda rw", OURS);
+        assert_eq!(got, format!("root=/dev/vda rw {OURS}"));
+    }
+
+    #[test]
+    fn ignores_dashes_that_are_not_a_bare_token() {
+        for base in ["panic=-1 foo=--bar", "quiet--verbose root=/dev/vda"] {
+            let got = splice_kernel_args(base, "console=ttyS0");
+            assert_eq!(got, format!("{base} console=ttyS0"), "base: {base}");
+        }
+    }
+
+    #[test]
+    fn handles_empty_inputs() {
+        assert_eq!(splice_kernel_args("", OURS), OURS);
+        assert_eq!(splice_kernel_args("root=/dev/vda", ""), "root=/dev/vda");
+    }
+
+    #[test]
+    fn separator_at_the_end_stays_last() {
+        let got = splice_kernel_args("rdinit=/init --", "console=ttyS0");
+        assert_eq!(got, "rdinit=/init console=ttyS0 --");
     }
 }

@@ -1570,6 +1570,9 @@ impl VirtioFs {
     }
 
     /// Sets the interrupt line to the device's level.
+    ///
+    /// It runs under the device mutex, so the line follows the last change to
+    /// the interrupt status.
     fn sync_irq(&mut self) {
         self.irq.set(self.irq_level());
     }
@@ -13479,10 +13482,9 @@ mod tests {
 
     // A `QUEUE_NOTIFY` runs no request. It records the queue index for a drain,
     // which runs on a vCPU up to a budget and on the worker thread past it
-    // (`run_fs_worker` in `arch/aarch64/hvf.rs`). The tests below cover what
-    // this module can check without a live VM: `mmio` does no I/O, a bounded
-    // drain strands nothing, and the notified bitmask is race-free under
-    // concurrent access.
+    // (`run_fs_worker` in `worker.rs`). The tests below cover what this module
+    // can check without a live VM: `mmio` does no I/O, a bounded drain strands
+    // nothing, and the notified bitmask is race-free under concurrent access.
 
     #[test]
     fn queue_notify_only_records_the_index_and_does_no_io() {

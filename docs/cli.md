@@ -319,7 +319,7 @@ booting Image with 1024 MiB ...
 [hvi] open-file limit: 1048576
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)
 [hvi] event ledger: /path/to/ledger.ndjson
-[hvi] seatbelt sandbox: on (deny default)
+[hvi] seatbelt: on (deny default)
 ```
 
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
