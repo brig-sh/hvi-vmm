@@ -882,7 +882,17 @@ impl VirtioNet {
             IP_UDP if l4.len() >= 8 => {
                 let sport = u16::from_be_bytes([l4[0], l4[1]]);
                 let dport = u16::from_be_bytes([l4[2], l4[3]]);
-                self.capture(IP_UDP, src, sport, dst, dport, l4.len() as u64, None);
+                // A query relayed to an outside resolver is recorded with the
+                // name it asks for, as the built-in stack's own queries are.
+                let dns = if dport == 53 {
+                    l4.get(8..)
+                        .filter(|m| m.len() >= 12)
+                        .and_then(|m| parse_dns_name(m, 12))
+                        .map(|(name, _)| name)
+                } else {
+                    None
+                };
+                self.capture(IP_UDP, src, sport, dst, dport, l4.len() as u64, dns);
             }
             IP_ICMP => self.capture(IP_ICMP, src, 0, dst, 0, l4.len() as u64, None),
             _ => {}
@@ -2057,6 +2067,57 @@ mod tests {
 
         let mut net = VirtioNet::new();
         assert_eq!(net.handle_dns(1234, &truncated), None);
+    }
+
+    /// Returns an Ethernet frame carrying one IPv4 UDP datagram to 10.87.0.1.
+    fn udp_frame(dport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&ETH_IPV4.to_be_bytes());
+        let total = 20 + 8 + payload.len();
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, IP_UDP, 0, 0];
+        ip[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        ip.extend_from_slice(&[10, 87, 0, 10]);
+        ip.extend_from_slice(&[10, 87, 0, 1]);
+        f.extend_from_slice(&ip);
+        f.extend_from_slice(&51853u16.to_be_bytes());
+        f.extend_from_slice(&dport.to_be_bytes());
+        f.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Returns the `dns` of the one NetFlow event `net` recorded.
+    fn recorded_dns(net: &mut VirtioNet) -> Option<String> {
+        let events = net.take_events();
+        assert_eq!(events.len(), 1, "one flow recorded");
+        let CapturedEvent::NetFlow { dns, .. } = &events[0] else {
+            panic!("expected a NetFlow event");
+        };
+        dns.clone()
+    }
+
+    // A tap or gateway relays the query to a resolver outside hvi, so only
+    // observe_tx sees it. Its ledger record carried no name before.
+    #[test]
+    fn a_relayed_dns_query_is_recorded_with_its_name() {
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x07example\x03com\x00");
+        query.extend_from_slice(&[0, 1, 0, 1]); // type A, class IN
+
+        let mut net = VirtioNet::new();
+        net.observe_tx(&udp_frame(53, &query));
+        assert_eq!(recorded_dns(&mut net).as_deref(), Some("example.com"));
+
+        // Another port carries no name, even with the same bytes.
+        net.observe_tx(&udp_frame(5353, &query));
+        assert_eq!(recorded_dns(&mut net), None);
+
+        // A malformed query is still recorded, without a name.
+        net.observe_tx(&udp_frame(53, &query[..14]));
+        assert_eq!(recorded_dns(&mut net), None);
+        net.observe_tx(&udp_frame(53, &[]));
+        assert_eq!(recorded_dns(&mut net), None);
     }
 
     #[test]
