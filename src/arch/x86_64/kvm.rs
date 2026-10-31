@@ -32,8 +32,7 @@
 //!
 //! A long-mode entry needs KVM's `set_tss_address` and identity map, which
 //! Intel VMX requires. It also needs `set_cpuid2`, since the guest reads CPUID
-//! for feature detection and early boot triple-faults without it. That CPUID
-//! must advertise RDRAND, or the KASLR entropy path stalls. Set
+//! for feature detection and early boot triple-faults without it. Set
 //! `HVI_X86_TRACE=1` for exit and register tracing.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
@@ -97,12 +96,8 @@ const PDE64_PRESENT_RW: u64 = 0x03; // present | writable (table)
 /// The CPUID leaf 1 ECX bit that says the local APIC timer has a TSC-deadline
 /// mode.
 const CPUID_1_ECX_TSC_DEADLINE_TIMER: u32 = 1 << 24;
-/// The CPUID leaf 1 ECX bit for RDRAND.
-const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
 /// The CPUID leaf 1 ECX bit that says the CPU runs under a hypervisor.
 const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
-/// The CPUID leaf 7, subleaf 0, EBX bit for RDSEED.
-const CPUID_7_0_EBX_RDSEED: u32 = 1 << 18;
 
 /// The shortest pause the guest is notified of.
 ///
@@ -133,22 +128,22 @@ struct Shared {
 /// Returns `supported`, the CPUID KVM supports, with the bits added that the
 /// guest needs.
 ///
-/// RDRAND and RDSEED give the guest's early KASLR and entropy path a source,
-/// which the host must have. The hypervisor bit tells the guest it runs under
-/// KVM, so it reads KVM's leaves from `0x4000_0000` and uses the paravirtual
-/// features they list. The TSC-deadline bit offers the local APIC timer mode
-/// that KVM's in-kernel local APIC emulates. Every KVM that hvi runs on reports
+/// RDRAND and RDSEED are not added. KVM reports them when the host has them,
+/// and a guest told it has them on a host without them takes #UD on first use.
+/// Without RDRAND, the decompressor's KASLR `rdrand` triple-faults, since its
+/// boot IDT has no #UD vector. Without RDSEED, the kernel oopses in
+/// `random_init_early` and hangs.
+///
+/// The hypervisor bit tells the guest it runs under KVM, so it reads KVM's
+/// leaves from `0x4000_0000` and uses the paravirtual features they list. The
+/// TSC-deadline bit offers the local APIC timer mode that KVM's in-kernel local
+/// APIC emulates. Every KVM that hvi runs on reports
 /// `KVM_CAP_TSC_DEADLINE_TIMER`, so the bit is set without a check. Newer KVMs
 /// report the hypervisor and TSC-deadline bits themselves.
 fn guest_cpuid(mut supported: CpuId) -> CpuId {
     for entry in supported.as_mut_slice() {
-        match entry.function {
-            1 => {
-                entry.ecx |=
-                    CPUID_1_ECX_TSC_DEADLINE_TIMER | CPUID_1_ECX_RDRAND | CPUID_1_ECX_HYPERVISOR;
-            }
-            7 if entry.index == 0 => entry.ebx |= CPUID_7_0_EBX_RDSEED,
-            _ => {}
+        if entry.function == 1 {
+            entry.ecx |= CPUID_1_ECX_TSC_DEADLINE_TIMER | CPUID_1_ECX_HYPERVISOR;
         }
     }
     supported
@@ -345,8 +340,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     })?;
 
     // Kernel command line: the caller's args and the ttyS0 console. The devices
-    // are in the DSDT. (KASLR works now that the guest CPUID advertises RDRAND,
-    // so no nokaslr.)
+    // are in the DSDT. (KASLR works without RDRAND, from RDTSC, so no
+    // nokaslr.)
     let ours = "console=ttyS0";
     let cmdline = splice_kernel_args(cfg.cmdline.trim(), ours);
 
@@ -957,10 +952,7 @@ mod vcpu_cap_tests {
 mod cpuid_tests {
     use kvm_bindings::{kvm_cpuid_entry2, CpuId};
 
-    use super::{
-        guest_cpuid, CPUID_1_ECX_HYPERVISOR, CPUID_1_ECX_RDRAND, CPUID_1_ECX_TSC_DEADLINE_TIMER,
-        CPUID_7_0_EBX_RDSEED,
-    };
+    use super::{guest_cpuid, CPUID_1_ECX_HYPERVISOR, CPUID_1_ECX_TSC_DEADLINE_TIMER};
 
     /// Leaf 1 ECX as an older KVM, such as Linux 6.8's, reports it, with SSE3
     /// and x2APIC set and neither the hypervisor bit nor the TSC-deadline bit.
@@ -968,6 +960,10 @@ mod cpuid_tests {
     /// Leaf 7 subleaf 0 EBX as KVM reports it, with FSGSBASE set and RDSEED
     /// clear.
     const LEAF_7_EBX: u32 = 1;
+    /// The leaf 1 ECX bit for RDRAND.
+    const RDRAND: u32 = 1 << 30;
+    /// The leaf 7 subleaf 0 EBX bit for RDSEED.
+    const RDSEED: u32 = 1 << 18;
 
     /// Returns a CPUID entry with the given leaf, subleaf and registers.
     fn entry(function: u32, index: u32, ebx: u32, ecx: u32, edx: u32) -> kvm_cpuid_entry2 {
@@ -983,26 +979,42 @@ mod cpuid_tests {
 
     #[test]
     fn guest_cpuid_adds_its_bits_and_keeps_other_leaves() {
-        // Leaf 7 subleaf 1 and KVM's signature leaf, "KVMKVMKVM", which
-        // `guest_cpuid` must leave alone.
+        // Both subleaves of leaf 7 and KVM's signature leaf, "KVMKVMKVM",
+        // which `guest_cpuid` must leave alone.
         let untouched = [
+            entry(7, 0, LEAF_7_EBX, 0, 0),
             entry(7, 1, 0, 0, 0),
             entry(0x4000_0000, 0, 0x4b4d_564b, 0x564b_4d56, 0x4d),
         ];
-        let mut entries = vec![entry(1, 0, 0, LEAF_1_ECX, 0), entry(7, 0, LEAF_7_EBX, 0, 0)];
+        let mut entries = vec![entry(1, 0, 0, LEAF_1_ECX, 0)];
         entries.extend(untouched);
         let cpuid = guest_cpuid(CpuId::from_entries(&entries).unwrap());
 
         let entries = cpuid.as_slice();
         assert_eq!(
             entries[0].ecx,
-            LEAF_1_ECX
-                | CPUID_1_ECX_TSC_DEADLINE_TIMER
-                | CPUID_1_ECX_RDRAND
-                | CPUID_1_ECX_HYPERVISOR
+            LEAF_1_ECX | CPUID_1_ECX_TSC_DEADLINE_TIMER | CPUID_1_ECX_HYPERVISOR
         );
-        assert_eq!(entries[1].ebx, LEAF_7_EBX | CPUID_7_0_EBX_RDSEED);
-        assert_eq!(entries[2..], untouched);
+        assert_eq!(entries[1..], untouched);
+    }
+
+    #[test]
+    fn guest_cpuid_passes_rdrand_and_rdseed_through() {
+        // A host without them, as under `-cpu kvm64`: advertising them made the
+        // guest triple-fault on its first `rdrand` (#343).
+        let entries = [entry(1, 0, 0, LEAF_1_ECX, 0), entry(7, 0, LEAF_7_EBX, 0, 0)];
+        let cpuid = guest_cpuid(CpuId::from_entries(&entries).unwrap());
+        assert_eq!(cpuid.as_slice()[0].ecx & RDRAND, 0);
+        assert_eq!(cpuid.as_slice()[1].ebx & RDSEED, 0);
+
+        // A host with them keeps them.
+        let entries = [
+            entry(1, 0, 0, LEAF_1_ECX | RDRAND, 0),
+            entry(7, 0, LEAF_7_EBX | RDSEED, 0, 0),
+        ];
+        let cpuid = guest_cpuid(CpuId::from_entries(&entries).unwrap());
+        assert_eq!(cpuid.as_slice()[0].ecx & RDRAND, RDRAND);
+        assert_eq!(cpuid.as_slice()[1].ebx & RDSEED, RDSEED);
     }
 }
 

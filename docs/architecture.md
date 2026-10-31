@@ -283,7 +283,7 @@ flowchart TB
     B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image or synthesized; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
     C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs<br/>acpi::build @0xe0000<br/>RSDP, DSDT (_S5), FACS,<br/>FADT (PM1 @0x600), MADT, XSDT"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
-    E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID +RDRAND +RDSEED<br/>+hypervisor +TSC-deadline"] --> F
+    E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID<br/>+hypervisor +TSC-deadline"] --> F
     F["BSP: rip=entry, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
 ```
 
@@ -292,8 +292,11 @@ a failure:
 
 - `set_tss_address` and `set_identity_map_address` must be set on Intel VMX
   even for a long-mode entry. Without them the guest triple-faults.
-- CPUID must advertise **RDRAND**, or KASLR stalls waiting for entropy. hvi
-  also sets RDSEED.
+- CPUID must not advertise **RDRAND** or **RDSEED** that the host lacks. KVM
+  reports both when the host has them, and hvi passes them through. A guest
+  told it has RDRAND on a host without it triple-faults in the decompressor's
+  KASLR code, before its console is up. One told it has RDSEED on a host
+  without it oopses in `random_init_early` and hangs (#343).
 - The CMOS RTC is not optional. An unimplemented PIO read returns `0xff`, so
   the update-in-progress bit would never clear and a guest polling it with
   interrupts disabled spins forever, before the console is up.
