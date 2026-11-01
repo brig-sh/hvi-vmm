@@ -46,7 +46,9 @@ use crate::devices::virtio::fs::worker::{run_fs_worker, Export, FsTransport, FsW
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Ledger;
-use crate::hypervisor::guest::{insert_virtio_devices, Disk, Guest, PluginThreads};
+use crate::hypervisor::guest::{
+    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
+};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -309,6 +311,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             shared_ram,
             ledger,
             mmio_bus,
+            mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
             vsock,

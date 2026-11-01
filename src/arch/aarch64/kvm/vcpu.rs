@@ -20,8 +20,8 @@ use std::sync::Arc;
 use kvm_ioctls::{VcpuExit, VcpuFd};
 
 use super::regs::{
-    get_u64, REG_PC, REG_PSTATE, REG_SCTLR_EL1, REG_SP_EL0, REG_SP_EL1, REG_TCR_EL1, REG_TTBR0_EL1,
-    REG_TTBR1_EL1,
+    get_u64, try_get_u64, REG_PC, REG_PSTATE, REG_SCTLR_EL1, REG_SP_EL0, REG_SP_EL1, REG_TCR_EL1,
+    REG_TTBR0_EL1, REG_TTBR1_EL1,
 };
 use crate::hypervisor::guest::{Guest, SafepointVcpu};
 use crate::hypervisor::kvm::{run_vcpu, unhandled_exit, Kicker};
@@ -39,6 +39,10 @@ pub(super) struct VcpuContext {
 
 /// Runs one vCPU until the VM stops, servicing its MMIO exits.
 pub(super) fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: VcpuContext) {
+    let pc = || {
+        let read = |vcpu: &VcpuFd| try_get_u64(vcpu, REG_PC).ok();
+        context.guest.vcpus.kicker().with_vcpu(cpu_id, read)?
+    };
     run_vcpu(
         cpu_id,
         vcpu,
@@ -48,12 +52,10 @@ pub(super) fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: V
         |exit| {
             match exit {
                 VcpuExit::MmioRead(addr, data) => {
-                    if context.guest.mmio_bus.read(addr, data).is_err() {
-                        data.fill(0);
-                    }
+                    context.guest.read_mmio(cpu_id, addr, data, pc);
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    if let Ok(Some(stop)) = context.guest.mmio_bus.write(addr, data) {
+                    if let Some(stop) = context.guest.write_mmio(cpu_id, addr, data, pc) {
                         return ControlFlow::Break(Outcome::Stopped(stop));
                     }
                 }

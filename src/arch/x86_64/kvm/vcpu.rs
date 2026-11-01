@@ -59,6 +59,10 @@ pub(super) struct VcpuContext {
 pub(super) fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: VcpuContext) {
     let dbg = std::env::var_os("HVI_X86_TRACE").is_some();
     let mut n_exit = 0u64;
+    let pc = || {
+        let read = |vcpu: &VcpuFd| vcpu.get_regs().ok().map(|regs| regs.rip);
+        context.guest.vcpus.kicker().with_vcpu(cpu_id, read)?
+    };
     run_vcpu(
         cpu_id,
         vcpu,
@@ -109,16 +113,14 @@ pub(super) fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: V
                         stderrln!("[trace] vcpu{cpu_id} MmioRead {addr:#x}");
                         n_exit += 1;
                     }
-                    if context.guest.mmio_bus.read(addr, data).is_err() {
-                        data.fill(0);
-                    }
+                    context.guest.read_mmio(cpu_id, addr, data, pc);
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if dbg && n_exit < 80 {
                         stderrln!("[trace] vcpu{cpu_id} MmioWrite {addr:#x}");
                         n_exit += 1;
                     }
-                    if let Ok(Some(stop)) = context.guest.mmio_bus.write(addr, data) {
+                    if let Some(stop) = context.guest.write_mmio(cpu_id, addr, data, pc) {
                         return ControlFlow::Break(Outcome::Stopped(stop));
                     }
                 }
