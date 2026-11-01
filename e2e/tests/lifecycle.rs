@@ -58,19 +58,28 @@ const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "KVM_RUN error: Function not impleme
 const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "MMIO at 0xd000400";
 
 // A load pair from the vsock device's registers traps with no instruction
-// syndrome, so the hypervisor cannot tell which registers to fill. KVM refuses
-// to run the vCPU on, and hvi fails the run.
+// syndrome, so the hypervisor cannot tell which registers to fill, and hvi
+// fails the run.
 #[cfg(target_arch = "aarch64")]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "fails until HVF fails the run on an MMIO access it cannot decode (#118)"
-)]
 fn mmio_load_without_syndrome_fails_the_run() {
     let vm = Vm::builder().boot();
     trigger(&vm, "hvi-e2e-agent load-pair 0x0d000400");
     vm.wait(Duration::from_secs(30))
         .assert_stopped(Stop::Failed(LOAD_WITHOUT_SYNDROME_FAILURE));
+}
+
+// A cache maintenance instruction on a device's registers has no cached data to
+// act on, so hvi skips it and the run goes on.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn cache_maintenance_on_a_device_range_is_skipped() {
+    let vm = Vm::builder().boot();
+    let cleaned = vm
+        .sh("hvi-e2e-agent clean-cache 0x0d000400")
+        .assert_success();
+    assert_eq!(cleaned.stdout.trim(), "done");
+    vm.power_off();
 }
 
 /// Starts `command` in the guest's background, a moment after the agent

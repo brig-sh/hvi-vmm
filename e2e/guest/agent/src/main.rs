@@ -23,7 +23,8 @@
 //! Run as `hvi-e2e-agent devmem <address>`, it reads 32 bits at a physical
 //! address instead, as busybox's `devmem` does, so a test can make the guest
 //! touch a device's registers or an address that no device claims. On arm64,
-//! `hvi-e2e-agent load-pair <address>` reads two words there with one `ldp`.
+//! `hvi-e2e-agent load-pair <address>` reads two words there with one `ldp`,
+//! and `hvi-e2e-agent clean-cache <address>` runs one `dc civac` there.
 
 #[cfg(target_os = "linux")]
 mod devmem;
@@ -43,6 +44,10 @@ fn main() {
         Some("load-pair") => read_once("load-pair", args.next(), |address| {
             devmem::load_pair(address)
                 .map(|(first, second)| format!("{first:#010x} {second:#010x}"))
+        }),
+        #[cfg(target_arch = "aarch64")]
+        Some("clean-cache") => read_once("clean-cache", args.next(), |address| {
+            devmem::clean_cache(address).map(|()| "done".to_string())
         }),
         _ => {}
     }

@@ -186,24 +186,41 @@ fn handle_exit(vcpu: &Vcpu, context: &VcpuContext, cpu_id: u32) -> ControlFlow<O
                     // Not restartable: the saved PC is already past HVC/SMC.
                 }
                 Ec::DataAbort => {
+                    let da = DataAbort::from_syndrome(syn);
                     let ipa = exit.exception.physical_address;
+                    // Guest RAM never traps, so this address has no cached data
+                    // to act on, and the instruction has nothing to do. A table
+                    // walk that took the abort has no result to give it, so it
+                    // goes on to fail the run below.
+                    if da.cm && !da.s1ptw {
+                        advance_pc(vcpu);
+                        return ControlFlow::Continue(());
+                    }
+                    // Without a syndrome the register and the width are
+                    // unknown, so the access cannot be served.
+                    if !da.isv {
+                        return ControlFlow::Break(Outcome::Failed(format!(
+                            "vcpu{cpu_id}: MMIO at {ipa:#x} without a syndrome (pc {:#x})",
+                            vcpu.get_reg(Reg::PC).unwrap_or(0)
+                        )));
+                    }
                     if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
-                        service_uart(vcpu, context, ipa - UART_BASE, syn);
+                        service_uart(vcpu, context, ipa - UART_BASE, da);
                         advance_pc(vcpu);
                     } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&ipa) {
-                        service_rtc(vcpu, context, ipa - RTC_BASE, syn);
+                        service_rtc(vcpu, context, ipa - RTC_BASE, da);
                         advance_pc(vcpu);
                     } else if let Some((dev, offset)) = context.guest.disk_at(ipa, VIRTIO_SIZE) {
-                        service_device(vcpu, context, dev, offset, syn);
+                        service_device(vcpu, context, dev, offset, da);
                         advance_pc(vcpu);
                     } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
                         if let Some(dev) = &context.guest.net {
-                            service_device(vcpu, context, dev, ipa - VIRTIO_NET_BASE, syn);
+                            service_device(vcpu, context, dev, ipa - VIRTIO_NET_BASE, da);
                         }
                         advance_pc(vcpu);
                     } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&ipa) {
                         if let Some(dev) = &context.guest.vsock {
-                            service_device(vcpu, context, dev, ipa - VIRTIO_VSOCK_BASE, syn);
+                            service_device(vcpu, context, dev, ipa - VIRTIO_VSOCK_BASE, da);
                         }
                         advance_pc(vcpu);
                     } else if let Some(fs) = context
@@ -211,7 +228,7 @@ fn handle_exit(vcpu: &Vcpu, context: &VcpuContext, cpu_id: u32) -> ControlFlow<O
                         .iter()
                         .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
                     {
-                        service_fs(vcpu, context, fs, ipa - fs.base, syn);
+                        service_fs(vcpu, context, fs, ipa - fs.base, da);
                         advance_pc(vcpu);
                     } else {
                         return ControlFlow::Break(Outcome::Failed(format!(
@@ -328,11 +345,7 @@ fn service_psci(vcpu: &Vcpu, context: &VcpuContext) -> ControlFlow<Outcome> {
 }
 
 /// Services a PL011 MMIO access.
-fn service_uart(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
+fn service_uart(vcpu: &Vcpu, context: &VcpuContext, offset: u64, da: DataAbort) {
     let mut p = context.pl011.lock().unwrap();
     if da.is_write {
         let v = read_gpr(vcpu, da.reg);
@@ -344,11 +357,7 @@ fn service_uart(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) 
 }
 
 /// Services a PL031 MMIO access at `offset` into the RTC's window.
-fn service_rtc(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
+fn service_rtc(vcpu: &Vcpu, context: &VcpuContext, offset: u64, da: DataAbort) {
     let width = usize::from(da.width);
     let mut rtc = context.rtc.lock().unwrap();
     if da.is_write {
@@ -365,12 +374,8 @@ fn service_device<D: VirtioMmio>(
     context: &VcpuContext,
     dev: &Mutex<D>,
     offset: u64,
-    syndrome: u64,
+    da: DataAbort,
 ) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
     if da.is_write {
         context
             .guest
@@ -387,11 +392,7 @@ fn service_device<D: VirtioMmio>(
 /// serves a shallow queue at once and wakes the device's worker thread,
 /// `run_fs_worker`, for the rest. The vCPU is held for the host calls the
 /// shallow queue's requests make, so no request may make one that blocks.
-fn service_fs(vcpu: &Vcpu, context: &VcpuContext, fs: &Export, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
+fn service_fs(vcpu: &Vcpu, context: &VcpuContext, fs: &Export, offset: u64, da: DataAbort) {
     let is_notify = da.is_write && offset == mmio::QUEUE_NOTIFY;
     {
         let mut d = fs.dev.lock().unwrap();
