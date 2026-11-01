@@ -19,7 +19,7 @@
 //! RAM at 1 GiB, the GICv3, a PL011 UART and a PL031 RTC in the low MMIO
 //! window beneath it. The PL011 carries first-boot serial output (`earlycon`),
 //! the PL031 gives the guest the wall clock at boot, and the virtio-mmio
-//! devices have a window of their own from [`VIRTIO_BASE`]. The GIC base/size
+//! devices have a range of their own from [`VIRTIO_BASE`]. The GIC base/size
 //! must agree with what `hv_gic` actually claims, so [`GicLayout::QEMU_VIRT`]
 //! is treated as the default and reconciled against `applevisor`'s GIC size
 //! getters when the VM is built.
@@ -38,7 +38,7 @@ pub const RAM_BASE: u64 = 0x4000_0000;
 /// (`plat/kvm/arm/qemu_bpt64.S`), Firecracker maps the low 2 GiB, and
 /// `CONFIG_PAGING` remaps on demand from the device tree
 /// (`drivers/ukbus/platform/platform_bus.c`). The guests we boot are the
-/// first case, so every device window has to sit in the range below; outside
+/// first case, so every device range has to sit in the window below; outside
 /// it the guest faults before it has a console.
 pub const DEVICE_WINDOW_BASE: u64 = 0x0800_0000;
 pub const DEVICE_WINDOW_END: u64 = RAM_BASE;
@@ -70,10 +70,10 @@ pub const UART_SPI: u32 = 1;
 pub const RTC_BASE: u64 = 0x0c00_1000;
 pub const RTC_SIZE: u64 = 0x1000;
 
-/// virtio-mmio device windows and interrupts, above the GIC and clear of the
+/// virtio-mmio device ranges and interrupts, above the GIC and clear of the
 /// UART. Each device is one 0x200 page with its own SPI, in this order:
 ///
-/// | window from `VIRTIO_BASE` | SPI     | device                   |
+/// | range from `VIRTIO_BASE`  | SPI     | device                   |
 /// |---------------------------|---------|--------------------------|
 /// | `+0x0000`                 | 2       | virtio-blk, disk 0       |
 /// | `+0x0200`                 | 3       | virtio-net               |
@@ -81,7 +81,7 @@ pub const RTC_SIZE: u64 = 0x1000;
 /// | `+0x0600` .. `+0x0a00`    | 5 .. 7  | virtio-blk, disks 1 .. 3 |
 /// | `+0x0c00 + i * 0x200`     | `8 + i` | virtio-fs export `i`     |
 ///
-/// The guest learns every window from the devicetree, so none of these is a
+/// The guest learns every range from the devicetree, so none of these is a
 /// contract. Disk 0, net and vsock keep the addresses they had when the disk
 /// was the only one.
 pub const VIRTIO_SIZE: u64 = 0x0200;
@@ -91,7 +91,7 @@ pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
 pub const VIRTIO_NET_SPI: u32 = 3;
 pub const VIRTIO_VSOCK_BASE: u64 = 0x0d00_0400;
 pub const VIRTIO_VSOCK_SPI: u32 = 4;
-/// Window and SPI of disk 1. Disks 2 and 3 follow, one slot each.
+/// Range and SPI of disk 1. Disks 2 and 3 follow, one slot each.
 pub const VIRTIO_BLK_EXTRA_BASE: u64 = 0x0d00_0600;
 pub const VIRTIO_BLK_EXTRA_SPI: u32 = 5;
 pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
@@ -557,7 +557,7 @@ mod tests {
     // larger on Apple than on QEMU, so a share count can walk out of either
     // bound.
     #[test]
-    fn virtio_fs_windows_clear_a_large_gic() {
+    fn virtio_fs_ranges_clear_a_large_gic() {
         // What `hv_gic` reports on this host: a 32 MiB redistributor region,
         // where QEMU virt would have 128 KiB per vCPU.
         let gic = GicLayout {
@@ -566,7 +566,7 @@ mod tests {
         };
         assert!(
             gic.gicr_base + gic.gicr_size < VIRTIO_FS_BASE,
-            "the GIC ends below the fs windows"
+            "the GIC ends below the fs ranges"
         );
         // Every interrupt the KVM backend hands out has to exist in the GIC it
         // creates, which is what GIC_NUM_IRQS is.
@@ -589,12 +589,12 @@ mod tests {
         place_virtio_fs(0, &gic, Some(GIC_NUM_IRQS)).expect("an export");
     }
 
-    // Every disk adds a window and an SPI. Neither may land on another device,
+    // Every disk adds a range and an SPI. Neither may land on another device,
     // and the exports start right after the last disk slot. The RTC has a
-    // window and no SPI.
+    // range and no SPI.
     #[test]
-    fn disk_windows_and_spis_clash_with_no_other_device() {
-        let mut windows = vec![
+    fn disk_ranges_and_spis_clash_with_no_other_device() {
+        let mut ranges = vec![
             ("uart", UART_BASE, UART_SIZE, Some(UART_SPI)),
             ("rtc", RTC_BASE, RTC_SIZE, None),
             ("net", VIRTIO_NET_BASE, VIRTIO_SIZE, Some(VIRTIO_NET_SPI)),
@@ -606,7 +606,7 @@ mod tests {
             ),
         ];
         for i in 0..32 {
-            windows.push((
+            ranges.push((
                 "fs",
                 virtio_fs_base(i).unwrap(),
                 VIRTIO_SIZE,
@@ -614,15 +614,15 @@ mod tests {
             ));
         }
         for i in 0..MAX_DISKS {
-            windows.push((
+            ranges.push((
                 "blk",
                 virtio_blk_base(i).expect("a disk slot"),
                 VIRTIO_SIZE,
                 Some(virtio_blk_spi(i).expect("a disk SPI")),
             ));
         }
-        for (a, (na, base_a, size_a, spi_a)) in windows.iter().enumerate() {
-            for (nb, base_b, size_b, spi_b) in windows.iter().skip(a + 1) {
+        for (a, (na, base_a, size_a, spi_a)) in ranges.iter().enumerate() {
+            for (nb, base_b, size_b, spi_b) in ranges.iter().skip(a + 1) {
                 let overlap = base_a < &(base_b + size_b) && base_b < &(base_a + size_a);
                 assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
                 if spi_a.is_some() {
@@ -671,10 +671,10 @@ mod tests {
         // Not QEMU's per-vCPU frame: the bound that applies on the backend
         // this move is for is the whole region `hv_gic` reports, which is
         // 32 MiB on this host. Sizing the check from `V2_MAX_CPUS` would
-        // check a GIC far smaller than the one the windows must clear.
+        // check a GIC far smaller than the one the ranges must clear.
         let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
         let last_disk = virtio_blk_base(MAX_DISKS - 1).unwrap();
-        let windows = [
+        let ranges = [
             ("uart", UART_BASE, UART_SIZE),
             ("rtc", RTC_BASE, RTC_SIZE),
             ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
@@ -683,7 +683,7 @@ mod tests {
             ("virtio-fs", VIRTIO_FS_BASE, VIRTIO_SIZE),
             ("last virtio-blk", last_disk, VIRTIO_SIZE),
         ];
-        for (name, base, size) in windows {
+        for (name, base, size) in ranges {
             assert!(
                 base >= DEVICE_WINDOW_BASE && base + size <= DEVICE_WINDOW_END,
                 "{name} at {base:#x} escapes the static device map"

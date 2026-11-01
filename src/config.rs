@@ -412,7 +412,7 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
 
 /// Most virtio-blk disks one guest can have.
 ///
-/// Each disk is its own virtio-mmio device with its own window and interrupt,
+/// Each disk is its own virtio-mmio device with its own range and interrupt,
 /// and every backend reserves exactly this many slots for them (see
 /// `virtio_blk_base` in each architecture's layout module).
 pub const MAX_DISKS: usize = 4;

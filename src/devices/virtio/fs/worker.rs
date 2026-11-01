@@ -34,7 +34,7 @@ const FS_INLINE_BUDGET: u16 = 8;
 
 /// One virtio-fs export as the macOS backend wires it.
 pub(crate) struct Export {
-    /// Guest-physical base of the transport's MMIO window.
+    /// Guest-physical base of the transport's MMIO range.
     pub(crate) base: u64,
     /// The INTID the device raises.
     pub(crate) intid: u32,
