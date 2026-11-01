@@ -25,8 +25,10 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::config::Stop;
+use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
 use crate::devices::irq::{Irq, IrqLine};
 use crate::terminal::ConsoleFilter;
 
@@ -183,4 +185,17 @@ pub fn id_reg(offset: u64) -> Option<u64> {
         .iter()
         .find(|&&(off, _)| off == offset)
         .map(|&(_, v)| u64::from(v))
+}
+
+impl bus::Device for Mutex<Pl011> {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        fill_le_bytes(data, self.lock().unwrap().mmio(offset, false, 0));
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
+        self.lock()
+            .unwrap()
+            .mmio(offset, true, u64_from_le_bytes(data));
+        None
+    }
 }

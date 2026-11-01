@@ -25,10 +25,14 @@
 //! and no interrupt. The registers are 32 bits wide, and Linux accesses them 4
 //! bytes at a time. An access of any other width does not reach the crate.
 
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm_superio::rtc_pl031::NoEvents;
 use vm_superio::Rtc;
+
+use crate::config::Stop;
+use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
 
 /// Offset of the data register, which reads the current time in seconds.
 const DR: u64 = 0x000;
@@ -83,6 +87,20 @@ impl Pl031 {
 impl Default for Pl031 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl bus::Device for Mutex<Pl031> {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let value = self.lock().unwrap().mmio(offset, data.len(), false, 0);
+        fill_le_bytes(data, value);
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
+        self.lock()
+            .unwrap()
+            .mmio(offset, data.len(), true, u64_from_le_bytes(data));
+        None
     }
 }
 

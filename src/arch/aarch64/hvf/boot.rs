@@ -35,17 +35,18 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::config::{check_export_overlap, BootConfig, Stop};
+use crate::devices::bus::{self, Bus};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::legacy::rtc_pl031::Pl031;
 use crate::devices::virtio::block;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
-use crate::devices::virtio::fs::worker::{run_fs_worker, Export, FsWake};
+use crate::devices::virtio::fs::worker::{run_fs_worker, Export, FsTransport, FsWake};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Ledger;
-use crate::hypervisor::guest::{Disk, Guest, PluginThreads};
+use crate::hypervisor::guest::{insert_virtio_devices, Disk, Guest, PluginThreads};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::{IoThreads, NetSource};
 use crate::memory::{GuestRam, SharedRam};
@@ -276,6 +277,29 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     let kicker = Kicker::new(vm.clone(), num_cpus);
 
+    let ledger = Arc::new(ledger);
+    let pl011 = Arc::new(Mutex::new(Pl011::new()));
+    let mut mmio_bus = Bus::new();
+    insert_virtio_devices(
+        &mut mmio_bus,
+        &ram,
+        &ledger,
+        VIRTIO_SIZE,
+        &disks,
+        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
+        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
+    )?;
+    mmio_bus.insert(
+        UART_BASE,
+        UART_SIZE,
+        Arc::clone(&pl011) as Arc<dyn bus::Device>,
+    )?;
+    mmio_bus.insert(RTC_BASE, RTC_SIZE, Arc::new(Mutex::new(Pl031::new())))?;
+    for export in &fs {
+        let transport = FsTransport::new(export, &ram);
+        mmio_bus.insert(export.base, VIRTIO_SIZE, Arc::new(transport))?;
+    }
+
     let context = VcpuContext {
         vm: vm.clone(),
         guest: Arc::new(Guest {
@@ -283,16 +307,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
             shared_ram,
-            ledger: Arc::new(ledger),
+            ledger,
+            mmio_bus,
             disks,
             net,
             vsock,
             vcpus: Arc::new(Vcpus::new(num_cpus, kicker, cfg.take_stop_handle()?)),
             plugin_threads: PluginThreads::new(),
         }),
-        pl011: Arc::new(Mutex::new(Pl011::new())),
-        rtc: Arc::new(Mutex::new(Pl031::new())),
-        fs,
         kernel_addr: layout.kernel_addr,
         dtb_addr: layout.dtb_addr,
         plugin: cfg.plugin.clone(),
@@ -305,11 +327,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             kick.then(|| Arc::clone(&context.guest.vcpus)),
         ))
     };
-    context
-        .pl011
-        .lock()
-        .unwrap()
-        .connect_irq(line(UART_INTID, false));
+    pl011.lock().unwrap().connect_irq(line(UART_INTID, false));
     context.guest.connect_irqs(
         // `open_disks` refused more disks than there are SPIs.
         |index| {
@@ -321,8 +339,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         line(VIRTIO_NET_INTID, true),
         line(VIRTIO_VSOCK_INTID, true),
     );
-    for fs in &context.fs {
-        fs.dev.lock().unwrap().connect_irq(line(fs.intid, true));
+    for export in &fs {
+        export
+            .dev
+            .lock()
+            .unwrap()
+            .connect_irq(line(export.intid, true));
     }
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
@@ -361,28 +383,25 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         stop_source,
         &context.guest,
         context.plugin.clone(),
-        {
-            let pl011 = Arc::clone(&context.pl011);
-            move |byte| pl011.lock().unwrap().push_rx(byte)
-        },
+        move |byte| pl011.lock().unwrap().push_rx(byte),
         bridge,
         net_reader.map(NetSource::Gateway),
         plugin_threads,
     );
     // Each virtio-fs device gets its own worker thread, which serves the
     // requests a vCPU leaves past its inline budget. See `run_fs_worker`.
-    for fs in &context.fs {
+    for export in &fs {
         let (dev, ram, wake) = (
-            Arc::clone(&fs.dev),
+            Arc::clone(&export.dev),
             Arc::clone(&context.guest.ram),
-            Arc::clone(&fs.wake),
+            Arc::clone(&export.wake),
         );
         io_threads.spawn("virtio-fs worker", move |_| {
             run_fs_worker(&dev, &ram, &wake);
         });
-        let wake = Arc::clone(&fs.wake);
+        let wake = Arc::clone(&export.wake);
         io_threads.on_stop(move || wake.stop());
-        let (workers, stop) = fs.dev.lock().unwrap().readahead_workers();
+        let (workers, stop) = export.dev.lock().unwrap().readahead_workers();
         for worker in workers {
             io_threads.spawn("virtio-fs readahead", move |_| worker());
         }
@@ -403,8 +422,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let result = run_to_stop(&context.guest, threads, failure, io_threads);
 
     // Report what the guest used, so a limit can be set from a real number.
-    for (index, fs) in context.fs.iter().enumerate() {
-        report_fs_usage(index, &fs.dev);
+    for (index, export) in fs.iter().enumerate() {
+        report_fs_usage(index, &export.dev);
     }
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the

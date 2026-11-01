@@ -336,11 +336,13 @@ host bridge and lets one set of device models serve all three.
 sequenceDiagram
     participant G as Guest vCPU
     participant B as Backend run loop
+    participant R as Bus
     participant D as Device (blk/net/vsock/fs)
     participant M as GuestRam
     participant L as Event ledger
     G->>B: MMIO/PIO exit @ device window
-    B->>D: mmio(off, is_write, value)
+    B->>R: read/write(address, data)
+    R->>D: read/write(offset, data)
     D->>M: read/write descriptors + buffers
     D->>L: CapturedEvent (block / net / SNI)
     D->>G: set its IRQ line (GIC SPI / IOAPIC GSI)
@@ -500,7 +502,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `psci.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
+| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

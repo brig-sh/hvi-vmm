@@ -21,15 +21,11 @@ use std::time::Duration;
 
 use kvm_ioctls::{VcpuExit, VcpuFd};
 
-use crate::arch::x86_64::layout::{
-    ACPI_PM_PORT, COM1_PORT, I8042_COMMAND_PORT, VIRTIO_NET_BASE, VIRTIO_SIZE, VIRTIO_VSOCK_BASE,
-};
+use crate::arch::x86_64::layout::{ACPI_PM_PORT, COM1_PORT, I8042_COMMAND_PORT};
 use crate::config::Stop;
 use crate::devices::legacy::acpi_pm::{PmRegisters, PM_REGISTERS_LEN};
 use crate::devices::legacy::rtc_cmos::{RtcCmos, RTC_DATA_PORT, RTC_INDEX_PORT};
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::virtio::block::VirtioBlk;
-use crate::devices::virtio::fs::vhost_user::{export_at, serve_mmio, Export};
 use crate::hypervisor::guest::{Guest, SafepointVcpu};
 use crate::hypervisor::kvm::{run_vcpu, unhandled_exit, Kicker};
 use crate::hypervisor::vcpus::Outcome;
@@ -68,8 +64,6 @@ pub(super) struct VcpuContext {
     /// The ACPI PM1 and reset registers, which the guest writes to power off or
     /// reset.
     pub(super) pm: Arc<Mutex<PmRegisters>>,
-    /// One entry per virtio-fs export, in the order the exports were given.
-    pub(super) fs: Arc<Vec<Export>>,
     /// The plugin, if the caller supplied one.
     pub(super) plugin: Option<Arc<dyn Plugin>>,
 }
@@ -136,19 +130,18 @@ pub(super) fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: V
                         stderrln!("[trace] vcpu{cpu_id} MmioRead {addr:#x}");
                         n_exit += 1;
                     }
-                    let val = mmio_read(&context, addr);
-                    let n = data.len().min(8);
-                    data[..n].copy_from_slice(&val.to_le_bytes()[..n]);
+                    if context.guest.mmio_bus.read(addr, data).is_err() {
+                        data.fill(0);
+                    }
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if dbg && n_exit < 80 {
                         stderrln!("[trace] vcpu{cpu_id} MmioWrite {addr:#x}");
                         n_exit += 1;
                     }
-                    let mut b = [0u8; 8];
-                    let n = data.len().min(8);
-                    b[..n].copy_from_slice(&data[..n]);
-                    mmio_write(&context, addr, u64::from_le_bytes(b));
+                    if let Ok(Some(stop)) = context.guest.mmio_bus.write(addr, data) {
+                        return ControlFlow::Break(Outcome::Stopped(stop));
+                    }
                 }
                 VcpuExit::Shutdown => {
                     if dbg {
@@ -256,88 +249,6 @@ fn pio_read(context: &VcpuContext, port: u16) -> u8 {
 /// Services an `out` of `val` to `port`.
 fn pio_write(context: &VcpuContext, port: u16, val: u8) {
     pio_dispatch_write(&context.uart, &context.rtc, port, val);
-}
-
-/// Services an MMIO read of the virtio register at `addr`.
-fn mmio_read(context: &VcpuContext, addr: u64) -> u64 {
-    if let Some((dev, off)) = context.guest.disk_at(addr, VIRTIO_SIZE) {
-        blk_read(context, dev, off)
-    } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        net_read(context, addr - VIRTIO_NET_BASE)
-    } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        vsock_read(context, addr - VIRTIO_VSOCK_BASE)
-    } else if let Some(export) = export_at(&context.fs, addr, VIRTIO_SIZE) {
-        serve_mmio(
-            &export.dev,
-            &context.guest.ram,
-            addr - export.base,
-            false,
-            0,
-        )
-    } else {
-        0
-    }
-}
-
-/// Services an MMIO write of `val` to the virtio register at `addr`.
-fn mmio_write(context: &VcpuContext, addr: u64, val: u64) {
-    if let Some((dev, off)) = context.guest.disk_at(addr, VIRTIO_SIZE) {
-        blk_write(context, dev, off, val);
-    } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&addr) {
-        net_write(context, addr - VIRTIO_NET_BASE, val);
-    } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&addr) {
-        vsock_write(context, addr - VIRTIO_VSOCK_BASE, val);
-    } else if let Some(export) = export_at(&context.fs, addr, VIRTIO_SIZE) {
-        serve_mmio(
-            &export.dev,
-            &context.guest.ram,
-            addr - export.base,
-            true,
-            val,
-        );
-    }
-}
-
-/// Services a read of register `off` of the virtio-blk device `dev`.
-fn blk_read(context: &VcpuContext, dev: &Mutex<VirtioBlk>, off: u64) -> u64 {
-    context.guest.read_device(dev, off)
-}
-
-/// Services a write of `val` to register `off` of the virtio-blk device `dev`.
-fn blk_write(context: &VcpuContext, dev: &Mutex<VirtioBlk>, off: u64, val: u64) {
-    context.guest.write_device(dev, off, val);
-}
-
-/// Services a read of virtio-net register `off`.
-fn net_read(context: &VcpuContext, off: u64) -> u64 {
-    let Some(dev) = context.guest.net.as_ref() else {
-        return 0;
-    };
-    context.guest.read_device(dev, off)
-}
-
-/// Services a write of `val` to virtio-net register `off`.
-fn net_write(context: &VcpuContext, off: u64, val: u64) {
-    let Some(dev) = context.guest.net.as_ref() else {
-        return;
-    };
-    context.guest.write_device(dev, off, val);
-}
-
-/// Services a read of virtio-vsock register `off`.
-fn vsock_read(context: &VcpuContext, off: u64) -> u64 {
-    let Some(dev) = context.guest.vsock.as_ref() else {
-        return 0;
-    };
-    context.guest.read_device(dev, off)
-}
-
-/// Services a write of `val` to virtio-vsock register `off`.
-fn vsock_write(context: &VcpuContext, off: u64, val: u64) {
-    let Some(dev) = context.guest.vsock.as_ref() else {
-        return;
-    };
-    context.guest.write_device(dev, off, val);
 }
 
 #[cfg(test)]
