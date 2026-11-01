@@ -34,12 +34,17 @@
 //! guest reading seconds through year never sees a field tear across a second
 //! boundary; the latch refreshes once it is older than `LATCH_MAX_AGE`.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Index register: selects the CMOS offset. Bit 7 is the NMI-disable line.
-pub const RTC_INDEX_PORT: u16 = 0x70;
-/// Data register: reads or writes the selected offset.
-pub const RTC_DATA_PORT: u16 = 0x71;
+use crate::config::Stop;
+use crate::devices::bus;
+
+/// The number of ports the registers take.
+pub const RTC_REGISTERS_LEN: u16 = 2;
+/// The index register, which selects the CMOS offset. Bit 7 is the NMI-disable
+/// line.
+const INDEX_REGISTER: u16 = 0;
 
 // Register file offsets (MC146818).
 const REG_SECONDS: u8 = 0x00;
@@ -109,9 +114,9 @@ impl RtcCmos {
         }
     }
 
-    /// Services an `in` from `port`.
-    pub fn pio_read(&mut self, port: u16) -> u8 {
-        if port == RTC_INDEX_PORT {
+    /// Services an `in` from `register`, an offset from the device's base port.
+    pub fn pio_read(&mut self, register: u16) -> u8 {
+        if register == INDEX_REGISTER {
             // The index register is nominally write-only; real chips read back
             // the last index with the NMI bit masked.
             return self.index;
@@ -142,9 +147,9 @@ impl RtcCmos {
         }
     }
 
-    /// Services an `out` to `port`.
-    pub fn pio_write(&mut self, port: u16, val: u8) {
-        if port == RTC_INDEX_PORT {
+    /// Services an `out` to `register`, an offset from the device's base port.
+    pub fn pio_write(&mut self, register: u16, val: u8) {
+        if register == INDEX_REGISTER {
             // Bit 7 gates NMI, which we do not deliver; the offset is bits 0-6.
             self.index = val & 0x7f;
             return;
@@ -163,6 +168,25 @@ impl RtcCmos {
 impl Default for RtcCmos {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl bus::Device for Mutex<RtcCmos> {
+    /// Reads each byte from the same port, as a `rep insb` does.
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let mut rtc = self.lock().unwrap();
+        for byte in data {
+            *byte = rtc.pio_read(offset as u16);
+        }
+    }
+
+    /// Writes each byte of a wide access to the same port.
+    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
+        let mut rtc = self.lock().unwrap();
+        for &byte in data {
+            rtc.pio_write(offset as u16, byte);
+        }
+        None
     }
 }
 
@@ -211,20 +235,23 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// The data register, which reads or writes the selected offset.
+    const DATA_REGISTER: u16 = 1;
+
     #[test]
     fn uip_is_always_clear() {
         // The whole point: 5.10's mach_get_cmos_time() spins with interrupts
         // off until this bit reads back zero.
         let mut rtc = RtcCmos::new();
-        rtc.pio_write(RTC_INDEX_PORT, REG_A);
-        assert_eq!(rtc.pio_read(RTC_DATA_PORT) & 0x80, 0);
+        rtc.pio_write(INDEX_REGISTER, REG_A);
+        assert_eq!(rtc.pio_read(DATA_REGISTER) & 0x80, 0);
     }
 
     #[test]
     fn reports_bcd_24h() {
         let mut rtc = RtcCmos::new();
-        rtc.pio_write(RTC_INDEX_PORT, REG_B);
-        let b = rtc.pio_read(RTC_DATA_PORT);
+        rtc.pio_write(INDEX_REGISTER, REG_B);
+        let b = rtc.pio_read(DATA_REGISTER);
         assert_eq!(b & 0x04, 0, "DM clear means BCD");
         assert_eq!(b & 0x02, 0x02, "24-hour mode");
     }
@@ -239,8 +266,8 @@ mod tests {
             (REG_DAY, 31),
             (REG_MONTH, 12),
         ] {
-            rtc.pio_write(RTC_INDEX_PORT, idx);
-            let bcd = rtc.pio_read(RTC_DATA_PORT);
+            rtc.pio_write(INDEX_REGISTER, idx);
+            let bcd = rtc.pio_read(DATA_REGISTER);
             let v = (bcd >> 4) * 10 + (bcd & 0x0f);
             assert!(v <= max, "reg {idx:#x} gave {v}, above {max}");
         }
@@ -256,9 +283,9 @@ mod tests {
     #[test]
     fn ram_holds_unsynthesized_offsets() {
         let mut rtc = RtcCmos::new();
-        rtc.pio_write(RTC_INDEX_PORT, 0x0f); // shutdown status byte
-        rtc.pio_write(RTC_DATA_PORT, 0x5a);
-        rtc.pio_write(RTC_INDEX_PORT, 0x0f);
-        assert_eq!(rtc.pio_read(RTC_DATA_PORT), 0x5a);
+        rtc.pio_write(INDEX_REGISTER, 0x0f); // shutdown status byte
+        rtc.pio_write(DATA_REGISTER, 0x5a);
+        rtc.pio_write(INDEX_REGISTER, 0x0f);
+        assert_eq!(rtc.pio_read(DATA_REGISTER), 0x5a);
     }
 }

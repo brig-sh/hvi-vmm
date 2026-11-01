@@ -23,7 +23,7 @@ use kvm_ioctls::{Cap, Kvm};
 
 use super::cpuid::guest_cpuid;
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
-use super::vcpu::{run_cpu, VcpuContext};
+use super::vcpu::{port_bus, run_cpu, VcpuContext};
 use crate::arch::x86_64::acpi::{self, MmioDevice};
 use crate::arch::x86_64::layout::{
     virtio_blk_base, virtio_blk_gsi, virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, COM1_GSI,
@@ -34,8 +34,6 @@ use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::{mptable, MAX_VCPUS};
 use crate::config::{BootConfig, Stop};
 use crate::devices::bus::Bus;
-use crate::devices::legacy::acpi_pm::PmRegisters;
-use crate::devices::legacy::rtc_cmos::RtcCmos;
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::virtio::block;
 use crate::devices::virtio::fs::vhost_user::{self, Export};
@@ -274,6 +272,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
     )?;
     vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
+    let uart = Arc::new(Mutex::new(Uart16550::new()));
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::X86_64,
@@ -292,14 +291,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             )),
             plugin_threads: PluginThreads::new(),
         }),
-        uart: Arc::new(Mutex::new(Uart16550::new())),
-        rtc: Arc::new(Mutex::new(RtcCmos::new())),
-        pm: Arc::new(Mutex::new(PmRegisters::default())),
+        port_bus: Arc::new(port_bus(&uart)?),
         plugin: cfg.plugin.clone(),
     };
 
     let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
-    context.uart.lock().unwrap().connect_irq(line(COM1_GSI));
+    uart.lock().unwrap().connect_irq(line(COM1_GSI));
     context.guest.connect_irqs(
         // `open_disks` refused more disks than there are GSIs.
         |index| line(virtio_blk_gsi(index).expect("every disk should have a GSI")),
@@ -319,10 +316,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
-        {
-            let uart = Arc::clone(&context.uart);
-            move |byte| uart.lock().unwrap().push_rx(byte)
-        },
+        move |byte| uart.lock().unwrap().push_rx(byte),
         net_source,
     )?;
     vhost_user::start_interrupt_threads(&fs, &mut io_threads);
