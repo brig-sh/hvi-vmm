@@ -76,6 +76,11 @@ pub struct DataAbort {
     pub reg: u8,
     /// True if the instruction syndrome is valid (fields above are meaningful).
     pub isv: bool,
+    /// True if a cache maintenance or address translation instruction took the
+    /// abort.
+    pub cm: bool,
+    /// True if the abort came from a stage-1 page table walk.
+    pub s1ptw: bool,
 }
 
 impl DataAbort {
@@ -88,11 +93,15 @@ impl DataAbort {
         let width = 1u8 << sas;
         let is_write = (iss >> 6) & 1 == 1;
         let reg = ((iss >> 16) & 0x1f) as u8; // SRT
+        let cm = (iss >> 8) & 1 == 1;
+        let s1ptw = (iss >> 7) & 1 == 1;
         DataAbort {
             width,
             is_write,
             reg,
             isv,
+            cm,
+            s1ptw,
         }
     }
 }
@@ -100,6 +109,25 @@ impl DataAbort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_maintenance_abort_is_named_with_no_instruction_syndrome() {
+        // `dc civac`: EC=0x24, CM and WnR set, ISV clear.
+        let da = DataAbort::from_syndrome(0x24 << 26 | 1 << 8 | 1 << 6);
+        assert!(da.cm);
+        assert!(!da.isv);
+        assert!(!da.s1ptw);
+        assert!(!DataAbort::from_syndrome(0x24 << 26 | 1 << 24).cm);
+    }
+
+    // `dc civac` through a stage-1 table at an address outside guest RAM: the
+    // walk took the abort, not the instruction's own access.
+    #[test]
+    fn table_walk_abort_is_named_apart_from_the_instruction() {
+        let da = DataAbort::from_syndrome(0x24 << 26 | 1 << 8 | 1 << 7);
+        assert!(da.cm);
+        assert!(da.s1ptw);
+    }
 
     #[test]
     fn hvc_class() {

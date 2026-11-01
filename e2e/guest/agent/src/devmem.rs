@@ -63,6 +63,29 @@ pub(crate) fn load_pair(address: u64) -> io::Result<(u32, u32)> {
     })
 }
 
+/// Runs one `dc civac` on the physical address `address`.
+///
+/// It reaches a hypervisor as a data abort that names a cache maintenance
+/// instruction.
+///
+/// # Errors
+///
+/// Errors if `/dev/mem` cannot be opened or mapped there.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn clean_cache(address: u64) -> io::Result<()> {
+    map(address, |line: *const u8| {
+        // SAFETY: `map` passes a pointer into a mapped page, and the
+        // instruction changes no register or memory contents.
+        unsafe {
+            std::arch::asm!(
+                "dc civac, {line}",
+                line = in(reg) line,
+                options(nostack, preserves_flags),
+            );
+        }
+    })
+}
+
 /// Maps the page around the physical address `address` from `/dev/mem` and
 /// returns what `read` makes of the `W` there.
 ///
