@@ -14,11 +14,11 @@
 
 //! The virtio devices over MMIO, and the split virtqueue they share.
 //!
-//! `block`, `fs`, `net` and `vsock` are the devices. Each decodes
-//! its own register window with the offsets in `mmio` and serves its queues
-//! through `Queue`, which `queue` holds. `tap` attaches virtio-net to a host
-//! tap device and holds the `virtio_net_hdr_v1` framing every tap read and
-//! write carries. `MmioTransport` puts a device on a bus.
+//! `block`, `fs`, `net` and `vsock` are the devices. Each decodes its own
+//! registers with the offsets in `mmio` and serves its queues through `Queue`,
+//! which `queue` holds. `tap` attaches virtio-net to a host tap device and
+//! holds the `virtio_net_hdr_v1` framing every tap read and write carries.
+//! `MmioTransport` puts a device on a bus.
 
 pub mod block;
 pub mod fs;
@@ -41,7 +41,7 @@ use block::VirtioBlk;
 use net::VirtioNet;
 use vsock::VirtioVsock;
 
-/// The register window of a virtio device, and what an access left for the
+/// The registers of a virtio device, and what an access left for the
 /// ledger and for the device's sink.
 pub(crate) trait VirtioMmio {
     /// Serves one access to register `offset` and returns the value read, or 0
