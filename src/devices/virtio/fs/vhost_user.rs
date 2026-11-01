@@ -879,11 +879,11 @@ mod device {
         }
     }
 
-    /// One export as a backend wires it: the device, the window its transport
+    /// One export as a backend wires it: the device, the range its transport
     /// answers in, and the interrupt it raises.
     #[derive(Clone)]
     pub struct Export {
-        /// Guest-physical base of the transport's MMIO window.
+        /// Guest-physical base of the transport's MMIO range.
         pub base: u64,
         /// The interrupt the backend raises for this export, a GSI on x86 and
         /// an SPI on arm64.
@@ -896,12 +896,12 @@ mod device {
 
     /// Connects one export per socket and returns them in order.
     ///
-    /// `place` returns the window base and the interrupt of export `index`,
+    /// `place` returns the range base and the interrupt of export `index`,
     /// or an error when the machine has none left. Each export is attached to
     /// the daemon listening on its socket, which the caller started. The
     /// connect and the handshake happen here, before the seccomp filters go
     /// in. Every export is placed before any is connected, so a machine with
-    /// too few windows is refused before a daemon sees a connection.
+    /// too few ranges is refused before a daemon sees a connection.
     ///
     /// # Errors
     ///

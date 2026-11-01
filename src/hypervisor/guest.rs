@@ -40,21 +40,21 @@ use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, V
 use crate::teardown::{StopToken, STOP_TIMEOUT};
 use crate::LOG_PREFIX;
 
-/// A virtio-blk disk and the guest-physical base of its virtio-mmio window.
+/// A virtio-blk disk and the guest-physical base of its virtio-mmio range.
 pub(crate) struct Disk {
-    /// The first byte of the device's window.
+    /// The first byte of the device's range.
     pub(crate) base: u64,
     /// The device.
     pub(crate) dev: Arc<Mutex<VirtioBlk>>,
 }
 
 impl Disk {
-    /// Returns `devs` as disks, the one at index `i` at the window `base(i)`.
+    /// Returns `devs` as disks, the one at index `i` at the range `base(i)`.
     ///
     /// # Panics
     ///
-    /// Panics if `base` has no window for an index. `block::open_disks` rules
-    /// that out, since it refuses more disks than any backend has windows for.
+    /// Panics if `base` has no range for an index. `block::open_disks` rules
+    /// that out, since it refuses more disks than any backend has ranges for.
     pub(crate) fn place(
         devs: Vec<Arc<Mutex<VirtioBlk>>>,
         base: impl Fn(usize) -> Option<u64>,
@@ -62,7 +62,7 @@ impl Disk {
         devs.into_iter()
             .enumerate()
             .map(|(index, dev)| Disk {
-                base: base(index).expect("a window per disk"),
+                base: base(index).expect("a range per disk"),
                 dev,
             })
             .collect()

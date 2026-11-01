@@ -84,12 +84,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         "{LOG_PREFIX} {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
         gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
     );
-    // Every device window has to clear the GIC, and its end is known only here:
+    // Every device range has to clear the GIC, and its end is known only here:
     // the framework sizes the redistributor region, and it is far larger than
-    // QEMU's. The fixed windows are checked here, and the virtio-fs ones below
+    // QEMU's. The fixed ranges are checked here, and the virtio-fs ones below
     // as each share is placed, because those climb with the share count.
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
-    let disk_windows = (0..cfg.disks.len())
+    let disk_ranges = (0..cfg.disks.len())
         .filter_map(virtio_blk_base)
         .map(|base| ("virtio-blk", base, VIRTIO_SIZE));
     for (name, base, size) in [
@@ -99,7 +99,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
     ]
     .into_iter()
-    .chain(disk_windows)
+    .chain(disk_ranges)
     {
         let end = base.saturating_add(size);
         if base < gic_end || end > DEVICE_WINDOW_END {
@@ -211,7 +211,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         if !fs_tags.insert(share.tag.as_str()) {
             return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
         }
-        // The same two bounds as the fixed windows above.
+        // The same two bounds as the fixed ranges above.
         let (base, spi) = place_virtio_fs(index, &gic, None)?;
         let root = std::fs::canonicalize(&share.path)?;
         let access = if share.mode.writable() {
