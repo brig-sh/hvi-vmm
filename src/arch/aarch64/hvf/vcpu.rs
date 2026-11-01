@@ -27,7 +27,6 @@ use crate::arch::aarch64::esr::{DataAbort, Ec};
 use crate::arch::aarch64::layout::{mpidr_affinity, vcpu_index};
 use crate::arch::aarch64::psci;
 use crate::config::Stop;
-use crate::devices::bus::UnclaimedError;
 use crate::hypervisor::guest::{Guest, SafepointVcpu};
 use crate::hypervisor::vcpus::{panic_detail, report_on_panic, Outcome};
 use crate::plugin::{Plugin, RegsView};
@@ -295,8 +294,8 @@ fn service_psci(vcpu: &Vcpu, context: &VcpuContext) -> ControlFlow<Outcome> {
 
 /// Serves the MMIO access `da` describes at `ipa`.
 ///
-/// Returns `ControlFlow::Break` with the run's outcome when the access ends the
-/// run, and `ControlFlow::Continue` otherwise.
+/// Returns `ControlFlow::Break` with the stop the access asks for, and
+/// `ControlFlow::Continue` otherwise.
 fn service_mmio(
     vcpu: &Vcpu,
     context: &VcpuContext,
@@ -305,29 +304,22 @@ fn service_mmio(
     da: DataAbort,
 ) -> ControlFlow<Outcome> {
     let width = usize::from(da.width);
-    let served = if da.is_write {
+    let pc = || vcpu.get_reg(Reg::PC).ok();
+    let mut bytes = [0u8; 8];
+    let stop = if da.is_write {
         // The register can hold more than the access writes.
-        let bytes = read_gpr(vcpu, da.reg).to_le_bytes();
-        context.guest.mmio_bus.write(ipa, &bytes[..width])
+        bytes = read_gpr(vcpu, da.reg).to_le_bytes();
+        context.guest.write_mmio(cpu_id, ipa, &bytes[..width], pc)
     } else {
-        let mut bytes = [0u8; 8];
         context
             .guest
-            .mmio_bus
-            .read(ipa, &mut bytes[..width])
-            .map(|()| {
-                write_gpr(vcpu, da.reg, u64::from_le_bytes(bytes));
-                None
-            })
+            .read_mmio(cpu_id, ipa, &mut bytes[..width], pc);
+        write_gpr(vcpu, da.reg, u64::from_le_bytes(bytes));
+        None
     };
-    match served {
-        Ok(None) => ControlFlow::Continue(()),
-        Ok(Some(stop)) => ControlFlow::Break(Outcome::Stopped(stop)),
-        Err(UnclaimedError) => ControlFlow::Break(Outcome::Failed(format!(
-            "vcpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
-            vcpu.get_reg(Reg::PC).unwrap_or(0)
-        ))),
-    }
+    stop.map_or(ControlFlow::Continue(()), |stop| {
+        ControlFlow::Break(Outcome::Stopped(stop))
+    })
 }
 
 /// Reads general-purpose register `idx` (31 = XZR, reads as 0).

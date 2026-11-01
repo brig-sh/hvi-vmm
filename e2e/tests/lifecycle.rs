@@ -38,15 +38,43 @@ fn guest_kernel_panic_ends_the_run_as_a_reset() {
     );
 }
 
-// On HVF, a guest access to an address in the MMIO window that no device claims
-// fails the run.
-#[cfg(target_os = "macos")]
+/// An address in the MMIO window that no device claims, and how hvi's report
+/// prints it.
+#[cfg(target_arch = "aarch64")]
+const UNCLAIMED_MMIO_ADDRESS: &str = "0xe000000";
+#[cfg(target_arch = "x86_64")]
+const UNCLAIMED_MMIO_ADDRESS: &str = "0xe0000000";
+
 #[test]
-fn unhandled_mmio_fails_the_run() {
+fn unclaimed_mmio_reads_zero_without_a_report() {
     let vm = Vm::builder().boot();
-    trigger(&vm, "hvi-e2e-agent devmem 0x0e000000");
-    vm.wait(Duration::from_secs(30))
-        .assert_stopped(Stop::Failed("unhandled MMIO at 0xe000000"));
+    let read = vm
+        .sh(&format!("hvi-e2e-agent devmem {UNCLAIMED_MMIO_ADDRESS}"))
+        .assert_success();
+    assert_eq!(read.stdout.trim(), "0x00000000");
+    // The run goes on.
+    vm.sh("true").assert_success();
+    let ended = vm.power_off();
+    assert!(
+        !ended.stderr.contains("no device there"),
+        "hvi reported the access with HVI_MMIO_TRACE unset\n{}",
+        ended.context()
+    );
+}
+
+#[test]
+fn mmio_trace_reports_unclaimed_mmio() {
+    let vm = Vm::builder().env("HVI_MMIO_TRACE", "1").boot();
+    vm.sh(&format!("hvi-e2e-agent devmem {UNCLAIMED_MMIO_ADDRESS}"))
+        .assert_success();
+    assert!(
+        vm.stderr_shows(
+            &format!("4-byte MMIO read at {UNCLAIMED_MMIO_ADDRESS} (pc 0x"),
+            Duration::from_secs(5)
+        ),
+        "hvi's stderr does not report the access"
+    );
+    vm.power_off();
 }
 
 // On KVM the error is the `ENOSYS` that `KVM_RUN` returns for the load.

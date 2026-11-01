@@ -26,7 +26,8 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::devices::bus::Bus;
+use crate::config::Stop;
+use crate::devices::bus::{Bus, ReportLimiter};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
@@ -37,6 +38,7 @@ use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::teardown::{StopToken, STOP_TIMEOUT};
+use crate::LOG_PREFIX;
 
 /// A virtio-blk disk and the guest-physical base of its virtio-mmio window.
 pub(crate) struct Disk {
@@ -120,6 +122,9 @@ pub(crate) struct Guest<K> {
     pub(crate) ledger: Arc<Ledger>,
     /// The devices a vCPU reaches through MMIO.
     pub(crate) mmio_bus: Bus,
+    /// The limit on reports of an MMIO access to an address no device claims,
+    /// or `None` when they are off, as [`mmio_report_limiter`] decides.
+    pub(crate) mmio_report_limiter: Option<ReportLimiter>,
     /// The virtio-blk disks, in the order of `BootConfig::disks`.
     pub(crate) disks: Vec<Disk>,
     /// The virtio-net device, when the VM has a network.
@@ -231,6 +236,82 @@ impl<K> Guest<K> {
             dev.lock().unwrap().connect_irq(vsock);
         }
     }
+
+    /// Fills `data` from the MMIO device whose range holds `address`.
+    ///
+    /// With no such device, `data` reads as 0, and the access is reported for
+    /// vCPU `cpu` when the reports are on. `pc` is called only for a report
+    /// that goes through, since reading the program counter can take a system
+    /// call.
+    pub(crate) fn read_mmio(
+        &self,
+        cpu: u32,
+        address: u64,
+        data: &mut [u8],
+        pc: impl FnOnce() -> Option<u64>,
+    ) {
+        if self.mmio_bus.read(address, data).is_err() {
+            data.fill(0);
+            self.report_unclaimed_mmio(cpu, "read", address, data.len(), pc);
+        }
+    }
+
+    /// Writes `data` to the MMIO device whose range holds `address`.
+    ///
+    /// Returns the stop the write asks for, or `None` when it asks for none.
+    /// With no such device, the write is dropped and reported as
+    /// [`Guest::read_mmio`] says.
+    pub(crate) fn write_mmio(
+        &self,
+        cpu: u32,
+        address: u64,
+        data: &[u8],
+        pc: impl FnOnce() -> Option<u64>,
+    ) -> Option<Stop> {
+        self.mmio_bus.write(address, data).unwrap_or_else(|_| {
+            self.report_unclaimed_mmio(cpu, "write", address, data.len(), pc);
+            None
+        })
+    }
+
+    /// Prints a line about an MMIO access to no device, unless the reports are
+    /// off or their limit drops this one.
+    fn report_unclaimed_mmio(
+        &self,
+        cpu: u32,
+        access: &str,
+        address: u64,
+        width: usize,
+        pc: impl FnOnce() -> Option<u64>,
+    ) {
+        let Some(limiter) = &self.mmio_report_limiter else {
+            return;
+        };
+        let Some(dropped) = limiter.try_take(Instant::now()) else {
+            return;
+        };
+        let pc = pc().map_or_else(|| "unknown".to_string(), |pc| format!("{pc:#x}"));
+        let dropped = match dropped {
+            0 => String::new(),
+            count => format!("; {count} earlier reports dropped"),
+        };
+        stderrln!(
+            "{LOG_PREFIX} vcpu{cpu}: {width}-byte MMIO {access} at {address:#x} (pc {pc}): \
+             no device there{dropped}"
+        );
+    }
+}
+
+/// Returns the limit on the reports of an MMIO access to no device, or `None`
+/// when `HVI_MMIO_TRACE` is unset.
+///
+/// The reports are off by default. A guest can make these accesses at will, and
+/// each report is a write to stderr on the vCPU, which blocks while stderr is
+/// full.
+pub(crate) fn mmio_report_limiter() -> Option<ReportLimiter> {
+    std::env::var_os("HVI_MMIO_TRACE")
+        .is_some()
+        .then(ReportLimiter::new)
 }
 
 impl<K: Kick> Guest<K> {
@@ -448,8 +529,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices and
-    /// a ledger that writes nowhere.
+    /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices, a
+    /// ledger that writes nowhere and the MMIO reports on.
     pub(crate) fn guest(count: u32) -> Guest<NoopKicker> {
         let shared_ram = SharedRam::new(RamRegion::ALIGN as usize).unwrap();
         let ram = GuestRam::new(&shared_ram, &[shared_ram.region_at(0)]).unwrap();
@@ -460,6 +541,7 @@ pub(crate) mod tests {
             shared_ram,
             ledger: Arc::new(Ledger::new(None, "test").unwrap()),
             mmio_bus: Bus::new(),
+            mmio_report_limiter: Some(ReportLimiter::new()),
             disks: Vec::new(),
             net: None,
             vsock: None,
@@ -530,6 +612,46 @@ pub(crate) mod tests {
         let refused = guest.ledger.batch(|_| {}).unwrap_err();
         assert_eq!(refused.kind(), std::io::ErrorKind::Other);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mmio_read_of_no_device_reads_zero_at_its_width() {
+        let guest = guest(1);
+        let mut data = [0xaa; 4];
+        guest.read_mmio(0, 0x1000, &mut data, || Some(0));
+        assert_eq!(data, [0; 4]);
+    }
+
+    #[test]
+    fn mmio_write_to_no_device_asks_for_no_stop() {
+        assert!(guest(1).write_mmio(0, 0x1000, &[1], || Some(0)).is_none());
+    }
+
+    // Reading the program counter can take a system call, so a guest that
+    // repeats an access must not make every exit read it.
+    #[test]
+    fn program_counter_is_read_only_for_a_report_that_goes_through() {
+        let guest = guest(1);
+        let reads = Cell::new(0);
+        for _ in 0..1000 {
+            guest.write_mmio(0, 0x1000, &[1], || {
+                reads.set(reads.get() + 1);
+                None
+            });
+        }
+        assert!((1..1000).contains(&reads.get()), "{} reads", reads.get());
+    }
+
+    #[test]
+    fn program_counter_is_not_read_with_the_reports_off() {
+        let mut guest = guest(1);
+        guest.mmio_report_limiter = None;
+        let reads = Cell::new(0);
+        guest.write_mmio(0, 0x1000, &[1], || {
+            reads.set(reads.get() + 1);
+            None
+        });
+        assert_eq!(reads.get(), 0);
     }
 
     #[test]
