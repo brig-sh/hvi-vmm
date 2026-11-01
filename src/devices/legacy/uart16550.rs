@@ -29,13 +29,18 @@
 //! THR-empty only when that read reports it.
 
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use vm_superio::serial::NoEvents;
 use vm_superio::{Serial, Trigger};
 
+use crate::config::Stop;
+use crate::devices::bus;
 use crate::devices::irq::{Irq, IrqLine};
 use crate::terminal::ConsoleFilter;
+
+/// The number of ports the registers take.
+pub const UART_REGISTERS_LEN: u16 = 8;
 
 /// The register bits the interrupt state is computed from. The crate keeps its
 /// own register bits private.
@@ -229,6 +234,25 @@ impl Uart16550 {
 impl Default for Uart16550 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl bus::Device for Mutex<Uart16550> {
+    /// Reads each byte from the same port, as a `rep insb` does.
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let mut uart = self.lock().unwrap();
+        for byte in data {
+            *byte = uart.pio_read(offset as u16);
+        }
+    }
+
+    /// Writes each byte of a wide access to the same port.
+    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
+        let mut uart = self.lock().unwrap();
+        for &byte in data {
+            uart.pio_write(offset as u16, byte);
+        }
+        None
     }
 }
 
