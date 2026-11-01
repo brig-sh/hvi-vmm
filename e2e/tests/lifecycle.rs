@@ -49,28 +49,43 @@ fn unhandled_mmio_fails_the_run() {
         .assert_stopped(Stop::Failed("unhandled MMIO at 0xe000000"));
 }
 
-/// What hvi's error says when an MMIO load without a syndrome, from the vsock
-/// device's registers, fails the run. On KVM it is the `ENOSYS` that `KVM_RUN`
-/// returns for the load.
+// On KVM the error is the `ENOSYS` that `KVM_RUN` returns for the load.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "KVM_RUN error: Function not implemented (os error 38)";
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "MMIO at 0xd000400";
-
-// A load pair from the vsock device's registers traps with no instruction
-// syndrome, so the hypervisor cannot tell which registers to fill. KVM refuses
-// to run the vCPU on, and hvi fails the run.
-#[cfg(target_arch = "aarch64")]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "fails until HVF fails the run on an MMIO access it cannot decode (#118)"
-)]
 fn mmio_load_without_syndrome_fails_the_run() {
+    load_pair_fails_the_run("KVM_RUN error: Function not implemented (os error 38)");
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn mmio_load_without_syndrome_fails_the_run_on_hvf() {
+    load_pair_fails_the_run("MMIO at 0xd000400");
+}
+
+/// Checks that a load pair from the vsock device's registers fails the run with
+/// an error that contains `failure`.
+///
+/// The load traps with no instruction syndrome, so the hypervisor cannot tell
+/// which registers to fill.
+#[cfg(target_arch = "aarch64")]
+fn load_pair_fails_the_run(failure: &'static str) {
     let vm = Vm::builder().boot();
     trigger(&vm, "hvi-e2e-agent load-pair 0x0d000400");
     vm.wait(Duration::from_secs(30))
-        .assert_stopped(Stop::Failed(LOAD_WITHOUT_SYNDROME_FAILURE));
+        .assert_stopped(Stop::Failed(failure));
+}
+
+// A cache maintenance instruction on a device's registers has no cached data to
+// act on, so hvi skips it and the run goes on.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn cache_maintenance_on_a_device_range_is_skipped() {
+    let vm = Vm::builder().boot();
+    let cleaned = vm
+        .sh("hvi-e2e-agent clean-cache 0x0d000400")
+        .assert_success();
+    assert_eq!(cleaned.stdout.trim(), "done");
+    vm.power_off();
 }
 
 /// Starts `command` in the guest's background, a moment after the agent
