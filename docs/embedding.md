@@ -315,10 +315,10 @@ allow, so under the sandbox the process ends by `SIGSYS`.
 
 One thing a caller sets is not in the struct.
 
-**Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE` and `HVI_X86_TRACE`
-are read from the process environment, not from `BootConfig`. An embedder that
-wants them off must make sure they are unset in the process it runs in. See
-[cli.md](cli.md#environment-variables).
+**Environment variables.** `HVI_SECCOMP`, `HVI_BLK_TRACE`, `HVI_MMIO_TRACE` and
+`HVI_X86_TRACE` are read from the process environment, not from `BootConfig`. An
+embedder that wants them off must make sure they are unset in the process it
+runs in. See [cli.md](cli.md#environment-variables).
 
 ## What the guest agent must provide
 

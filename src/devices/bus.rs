@@ -18,16 +18,23 @@
 //! backend decodes a VM exit into an address and the bytes of the access and
 //! hands them to the bus, which finds the range and calls the device with the
 //! offset. What an access to no range does is the caller's choice, since it
-//! differs between MMIO and port I/O.
+//! differs between MMIO and port I/O. [`ReportLimiter`] bounds the reports of
+//! such accesses.
 //!
 //! The entries are fixed before the first vCPU runs, so a lookup takes no lock.
 //! It scans them in the order they were inserted, so its cost grows with their
 //! number.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::Stop;
+
+/// How many reports a [`ReportLimiter`] lets through at once.
+const REPORT_BURST: u32 = 10;
+/// How long a [`ReportLimiter`] takes to allow one more report.
+const REPORT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A device behind a range of a [`Bus`].
 ///
@@ -136,6 +143,60 @@ impl Bus {
     }
 }
 
+/// A limit on the reports of something a guest can do at will.
+///
+/// It lets a burst through and then one report per interval, so a guest cannot
+/// flood the log and a later fault still shows in a long run.
+pub(crate) struct ReportLimiter {
+    /// The state of the limit.
+    state: Mutex<ReportLimiterState>,
+}
+
+/// The state behind [`ReportLimiter`].
+struct ReportLimiterState {
+    /// How many reports may go through now.
+    allowed: u32,
+    /// When `allowed` was last raised, or when the limit was made if it never
+    /// was.
+    refilled_at: Instant,
+    /// How many reports were dropped since the last one that went through.
+    dropped: u64,
+}
+
+impl ReportLimiter {
+    /// Returns a limit with its whole burst available.
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(ReportLimiterState {
+                allowed: REPORT_BURST,
+                refilled_at: Instant::now(),
+                dropped: 0,
+            }),
+        }
+    }
+
+    /// Returns how many reports were dropped since the last one that went
+    /// through, or `None` when the report made at `now` is dropped too.
+    pub(crate) fn try_take(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock().unwrap();
+        let refills = now.saturating_duration_since(state.refilled_at).as_millis()
+            / REPORT_INTERVAL.as_millis();
+        if refills > 0 {
+            state.allowed = u32::try_from(refills)
+                .unwrap_or(REPORT_BURST)
+                .saturating_add(state.allowed)
+                .min(REPORT_BURST);
+            state.refilled_at = now;
+        }
+        if state.allowed == 0 {
+            state.dropped += 1;
+            return None;
+        }
+        state.allowed -= 1;
+        Some(std::mem::take(&mut state.dropped))
+    }
+}
+
 /// Returns the value of a little-endian access of at most 8 bytes.
 pub(crate) fn u64_from_le_bytes(data: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
@@ -235,6 +296,31 @@ mod tests {
         let mut bus = Bus::new();
         assert!(bus.insert(0x1000, 0, device()).is_err());
         assert!(bus.insert(u64::MAX, 2, device()).is_err());
+    }
+
+    #[test]
+    fn report_limit_lets_a_burst_through_and_then_one_per_interval() {
+        let limit = ReportLimiter::new();
+        let start = Instant::now();
+        for _ in 0..REPORT_BURST {
+            assert_eq!(limit.try_take(start), Some(0));
+        }
+        assert_eq!(limit.try_take(start), None);
+        assert_eq!(limit.try_take(start), None);
+        // The report that goes through says how many were dropped before it.
+        let later = start + REPORT_INTERVAL;
+        assert_eq!(limit.try_take(later), Some(2));
+        assert_eq!(limit.try_take(later), None);
+    }
+
+    #[test]
+    fn report_limit_never_holds_more_than_a_burst() {
+        let limit = ReportLimiter::new();
+        let later = Instant::now() + REPORT_INTERVAL * (REPORT_BURST * 100);
+        for _ in 0..REPORT_BURST {
+            assert!(limit.try_take(later).is_some());
+        }
+        assert_eq!(limit.try_take(later), None);
     }
 
     #[test]

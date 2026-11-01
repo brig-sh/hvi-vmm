@@ -25,6 +25,9 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | At most four virtio-blk disks. | No hotplug, no PCI at all. | Design |
+| An MMIO access to an address no device claims reads 0, and a write there is dropped. | The run goes on. With `HVI_MMIO_TRACE` set, hvi writes a line to stderr with the address, the width and the program counter, at most 10 at once and then one every 500 ms. It is off by default, because the line is written on the vCPU, and a full stderr would stop it. On x86-64, the program counter of a write is the next instruction's, because KVM has finished the instruction by then. | Design |
+| On arm64, an MMIO access with no instruction syndrome, such as a load pair, ends the run. | hvi cannot tell which registers the access names. A cache maintenance instruction on such an address is skipped. | Design |
+| An x86-64 port no device claims reads `0xff`, and a write there is dropped. | hvi reports nothing, because Linux probes absent ports at every boot. | Design |
 | The PL031 has no alarm, and ignores writes. | vm-superio does not implement the match register. The devicetree gives the RTC no interrupt, so the guest's driver offers no alarm: there is no `wakealarm` file, and `rtcwake` fails with EINVAL. The host's clock is authoritative, so `hwclock -w` does not move the RTC. | Design |
 | One virtio-net NIC. | Same. Passing more than one networking flag silently uses the first that matches. | Design |
 | No egress from the built-in `--net-stub` stack. | TCP is seen but never forwarded. Real egress needs `--net-gateway` or `--net-tap`. | Design |

@@ -86,11 +86,9 @@ impl Kicker {
     ///
     /// The handle is a descriptor of the same vCPU, so a register read through
     /// it needs no borrow of the handle the vCPU thread runs.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    pub(crate) fn with_vcpu(&self, cpu: u32, inspect: impl FnOnce(&VcpuFd)) {
-        if let Some(Some(thread)) = self.threads.lock().unwrap().get(cpu as usize) {
-            inspect(&thread.vcpu);
-        }
+    pub(crate) fn with_vcpu<T>(&self, cpu: u32, inspect: impl FnOnce(&VcpuFd) -> T) -> Option<T> {
+        let threads = self.threads.lock().unwrap();
+        Some(inspect(&threads.get(cpu as usize)?.as_ref()?.vcpu))
     }
 
     /// Returns the program counter of vCPU `cpu`, with its last exit reason

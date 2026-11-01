@@ -185,6 +185,7 @@ a real boot would describe.
 | `HVI_SECCOMP=log` | Linux | Install the same allowlists, but let an off-list syscall run and be recorded instead of killing the process. **This turns enforcement off.** A glibc build still refuses an open, without a record. |
 | `HVI_X86_TRACE` | x86-64 | Any value. Print the guest's CPUID leaf 1 and `0x4000_0001` at boot, log the first 80 I/O and MMIO exits of each vCPU, dump registers on shutdown, and kick vcpu0 four times at two-second intervals so a stuck guest still dumps its registers. |
 | `HVI_BLK_TRACE` | all | Any value. Log every virtio-blk request to stderr. Off by default: one synchronous write per request. |
+| `HVI_MMIO_TRACE` | all | Any value. Log an MMIO access to an address no device claims, with its address, width and program counter, at most 10 at once and then one every 500 ms. Off by default: the line is written on the vCPU. |
 | `RUST_BACKTRACE` | all | A value other than `0` prints a backtrace after a panic's line, and `full` prints every frame. Under the seccomp sandbox on Linux hvi prints none, and under `HVI_SECCOMP=log` a glibc build prints the frames unresolved on the threads hvi filters. |
 
 There are no others at run time. `HVI_BLOCK_DEV` appears only inside a test
