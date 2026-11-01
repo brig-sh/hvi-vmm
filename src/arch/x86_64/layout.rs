@@ -58,6 +58,8 @@ pub const COM1_GSI: u32 = 4;
 
 /// The i8042 command and status port.
 pub const I8042_COMMAND_PORT: u16 = 0x64;
+/// The base port of the MC146818 CMOS RTC.
+pub const RTC_PORT: u16 = 0x70;
 /// The base port of the ACPI PM1 event block, the PM1 control block and the
 /// reset register.
 pub const ACPI_PM_PORT: u16 = 0x600;
