@@ -68,9 +68,10 @@ pub struct RegsView {
 ///
 /// It is handed over as an `Arc`, so a plugin that runs its own threads (a
 /// timer, a doorbell) can keep it and call [`VmHandle::kick`] from them. A
-/// handle kept past the end of `boot` keeps guest RAM and the block, net and
-/// vsock devices. The ledger is closed by then, and takes no more records. The
-/// handle also keeps the VM, through the vCPU kicker on macOS and through those
+/// handle kept past the end of `boot` keeps guest RAM and the devices of the
+/// MMIO bus, with their host files and sockets and, on macOS, the guest's file
+/// locks. The ledger is closed by then, and takes no more records. The handle
+/// also keeps the VM, through the vCPU kicker on macOS and through those
 /// devices' interrupt lines on Linux. The vCPUs have exited or been left
 /// running by then, so a kick reaches only a vCPU left running.
 pub trait VmHandle: Send + Sync {
