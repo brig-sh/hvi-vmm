@@ -40,8 +40,7 @@ use crate::devices::legacy::pl011::Pl011;
 use crate::devices::legacy::rtc_pl031::Pl031;
 use crate::devices::virtio::block;
 use crate::devices::virtio::fs::vhost_user;
-use crate::devices::virtio::net::{self, VirtioNet};
-use crate::devices::virtio::tap;
+use crate::devices::virtio::net;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{
@@ -49,7 +48,6 @@ use crate::hypervisor::guest::{
 };
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::Vcpus;
-use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::GuestArch;
 use crate::signal::install_kick_handler;
@@ -103,45 +101,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     ram.register_kvm_slots(&vm)?;
 
     let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    let mut net_source: Option<NetSource> = None;
-    let net_dev = if let Some(ifname) = &cfg.net_tap {
-        // The caller created the tap, so this only attaches to it, which brings
-        // carrier up. An unusable tap fails the boot, because the built-in
-        // stack would put the guest on the wrong network and nothing outside
-        // the guest could tell.
-        let file = tap::open(ifname).map_err(|e| format!("--net-tap {ifname}: {e}"))?;
-        let reader = file
-            .try_clone()
-            .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
-        eprintln!("{LOG_PREFIX} virtio-net: tap {ifname}");
-        net_source = Some(NetSource::Tap(reader));
-        Some(VirtioNet::with_tap(file))
-    } else if let Some(sock) = &cfg.net_gateway {
-        match std::os::unix::net::UnixStream::connect(sock) {
-            Ok(stream) => {
-                let reader = stream
-                    .try_clone()
-                    .map_err(|e| format!("--net-gateway {sock}: cloning the socket: {e}"))?;
-                eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock}");
-                net_source = Some(NetSource::Gateway(reader));
-                Some(VirtioNet::with_gateway(stream))
-            }
-            Err(e) => {
-                eprintln!(
-                    "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    net::stub_stack_line()
-                );
-                Some(VirtioNet::new())
-            }
-        }
-    } else if cfg.net {
-        eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
-        Some(VirtioNet::new())
-    } else {
-        None
-    };
-
-    let net = net::share(net_dev, cfg.net_mac);
+    let (net, net_source) = net::open(&cfg)?.map_or((None, None), |network| {
+        (Some(network.device), network.source)
+    });
 
     let vsock = cfg
         .agent_sock
