@@ -38,7 +38,7 @@ use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::virtio::block;
 use crate::devices::virtio::fs::vhost_user::{self, Export};
 use crate::devices::virtio::net;
-use crate::devices::virtio::vsock::VirtioVsock;
+use crate::devices::virtio::vsock;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{
     insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
@@ -131,10 +131,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         (Some(network.device), network.source)
     });
 
-    let vsock = cfg
-        .agent_sock
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
+    let (vsock, bridge) = vsock::open(cfg.agent_sock.as_deref(), &ram)?
+        .map_or((None, None), |agent| {
+            (Some(agent.device), Some(agent.bridge))
+        });
     // virtio-fs: one transport per export, each served by the caller's daemon.
     let fs = vhost_user::attach(&cfg.fs, shared_ram.as_raw_fd(), |index| {
         match (virtio_fs_base(index), virtio_fs_gsi(index)) {
@@ -261,6 +261,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         &cfg,
         &context.guest,
         move |byte| uart.lock().unwrap().push_rx(byte),
+        bridge,
         net_source,
     )?;
     vhost_user::start_interrupt_threads(&fs, &mut io_threads);
