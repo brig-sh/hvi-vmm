@@ -211,21 +211,23 @@ impl Drop for Registration<'_> {
 ///
 /// The plugin attaches to the guest before anything runs. The filters are armed
 /// before the first I/O or vCPU thread exists, and a binary's stop-signal
-/// thread starts right after. The agent socket and the stop source's socket
-/// pair are created before any filter goes in, since the allowlists allow
-/// accepting on a listener already held but not creating one. Then the I/O
-/// threads start, with the threads the plugin asked for, each filtering itself
-/// as it begins. It also returns the ledger's [`LedgerCloseGuard`].
+/// thread starts right after. The stop source's socket pair is created before
+/// any filter goes in, since the allowlists allow using a socket already held
+/// but not creating one. Then the I/O threads start, with the agent `bridge`,
+/// the network relay reading `net` and the threads the plugin asked for, each
+/// filtering itself as it begins. It also returns the ledger's
+/// [`LedgerCloseGuard`].
 ///
 /// # Errors
 ///
 /// Errors if the plugin refuses the guest, a filter does not compile, the
-/// stop-signal thread cannot be started or its handlers installed, the agent
-/// socket cannot be bound or the stop source cannot be created.
+/// stop-signal thread cannot be started or its handlers installed, or the stop
+/// source cannot be created.
 pub(crate) fn start_io_threads(
     cfg: &BootConfig,
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
+    bridge: Option<VsockBridge>,
     net: Option<NetSource>,
 ) -> Result<
     (seccomp::Filters, IoThreads<Kicker>, LedgerCloseGuard),
@@ -239,14 +241,6 @@ pub(crate) fn start_io_threads(
     // first stop signal stops the run rather than ending the process with the
     // terminal raw.
     crate::signal::start_stop_signal_thread()?;
-    let bridge = match (&cfg.agent_sock, &guest.vsock) {
-        (Some(path), Some(dev)) => Some(VsockBridge::bind(
-            path,
-            Arc::clone(dev),
-            Arc::clone(&guest.ram),
-        )?),
-        _ => None,
-    };
     let source = StopSource::new()?;
     let io_threads = IoThreads::start(
         source,

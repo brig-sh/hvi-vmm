@@ -44,7 +44,7 @@ use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::fs::worker::{run_fs_worker, Export, FsTransport, FsWake};
 use crate::devices::virtio::net;
-use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
+use crate::devices::virtio::vsock;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{
     insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
@@ -137,20 +137,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         (Some(network.device), network.source)
     });
 
-    let vsock = cfg.agent_sock.as_ref().map(|sock| {
-        eprintln!("{LOG_PREFIX} virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
-        Arc::new(Mutex::new(VirtioVsock::new()))
-    });
-    // Bind before Seatbelt is installed. Accepting on this already-open
-    // listener remains allowed afterwards; acquiring a new socket does not.
-    let bridge = match (&cfg.agent_sock, &vsock) {
-        (Some(path), Some(dev)) => {
-            Some(VsockBridge::bind(path, Arc::clone(dev), Arc::clone(&ram))?)
-        }
-        _ => None,
-    };
-    // The stop source's socket pair is created before Seatbelt for the same
-    // reason.
+    let (vsock, bridge) = vsock::open(cfg.agent_sock.as_deref(), &ram)?
+        .map_or((None, None), |agent| {
+            (Some(agent.device), Some(agent.bridge))
+        });
+    // Seatbelt allows using a socket but not creating one, so the agent socket
+    // and the stop source's socket pair exist before it goes in.
     let stop_source = StopSource::new()?;
     let mut fs = Vec::with_capacity(cfg.fs_shares.len());
     let mut fs_access = Vec::with_capacity(cfg.fs_shares.len());
