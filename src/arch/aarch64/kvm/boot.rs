@@ -57,17 +57,6 @@ use crate::LOG_PREFIX;
 
 /// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    // The Linux backends serve only exports a caller's vhost-user daemon
-    // serves, and the caller starts the daemon.
-    if let Some(share) = cfg.fs_shares.first() {
-        return Err(format!(
-            "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
-             virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
-            share.tag
-        )
-        .into());
-    }
-    crate::config::check_fs(&cfg.fs, cfg.vcpus.max(1))?;
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.

@@ -34,7 +34,7 @@ use crate::arch::aarch64::layout::{
     RTC_SIZE, UART_BASE, UART_SIZE, VIRTIO_NET_BASE, VIRTIO_SIZE, VIRTIO_VSOCK_BASE,
 };
 use crate::arch::aarch64::loader;
-use crate::config::{check_export_overlap, BootConfig, Stop};
+use crate::config::{BootConfig, Stop};
 use crate::devices::bus::{self, Bus};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::pl011::Pl011;
@@ -66,17 +66,6 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
     loader::LoadedKernel::from_header(&cfg.kernel)?;
-    // Refuse exports that contradict each other, for the same reason.
-    check_export_overlap(&cfg.fs_shares)?;
-    // This backend serves every export itself, so it refuses a daemon's socket.
-    if let Some(export) = cfg.fs.first() {
-        return Err(format!(
-            "--fs tag={},socket=: vhost-user exports are served on Linux only; \
-             use --fs tag=<tag>,path=<dir>",
-            export.tag
-        )
-        .into());
-    }
     let num_cpus = cfg.vcpus.max(1);
 
     let gic = gic_layout()?;
@@ -147,15 +136,6 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // virtio-net: gateway relay (real egress) when a gateway socket is given,
     // else the built-in user-space stack. `net_reader` carries the gateway read
     // side to the RX reader thread, which starts with the other I/O threads.
-    //
-    // Tap attach needs /dev/net/tun, which macOS does not have. The flag is
-    // refused, because a guest on the wrong network looks like success from the
-    // outside.
-    if let Some(ifname) = &cfg.net_tap {
-        return Err(
-            format!("--net-tap {ifname}: no /dev/net/tun on macOS; use --net-gateway").into(),
-        );
-    }
     let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
     let net_dev = if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
@@ -206,11 +186,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let stop_source = StopSource::new()?;
     let mut fs = Vec::with_capacity(cfg.fs_shares.len());
     let mut fs_access = Vec::with_capacity(cfg.fs_shares.len());
-    let mut fs_tags = std::collections::HashSet::new();
     for (index, share) in cfg.fs_shares.iter().enumerate() {
-        if !fs_tags.insert(share.tag.as_str()) {
-            return Err(format!("duplicate virtio-fs tag {:?}", share.tag).into());
-        }
         // The same two bounds as the fixed ranges above.
         let (base, spi) = place_virtio_fs(index, &gic, None)?;
         let root = std::fs::canonicalize(&share.path)?;
