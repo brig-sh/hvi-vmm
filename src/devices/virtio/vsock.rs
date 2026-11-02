@@ -1334,6 +1334,32 @@ pub(crate) struct VsockBridge {
     mem: Arc<GuestRam>,
 }
 
+/// The guest's agent device and the bridge that serves its host socket.
+pub(crate) struct Agent {
+    /// The device.
+    pub(crate) device: Arc<Mutex<VirtioVsock>>,
+    /// The bridge, bound to the host socket.
+    pub(crate) bridge: VsockBridge,
+}
+
+/// Opens the agent device and binds its host socket at `path`, or returns
+/// `None` when there is no agent socket.
+///
+/// # Errors
+///
+/// Errors if the socket cannot be bound.
+pub(crate) fn open(path: Option<&str>, ram: &Arc<GuestRam>) -> std::io::Result<Option<Agent>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let device = Arc::new(Mutex::new(VirtioVsock::new()));
+    let bridge = VsockBridge::bind(path, Arc::clone(&device), Arc::clone(ram))?;
+    eprintln!(
+        "{LOG_PREFIX} virtio-vsock: agent bridge on {path} (guest cid {GUEST_CID}, port {AGENT_PORT})"
+    );
+    Ok(Some(Agent { device, bridge }))
+}
+
 impl VsockBridge {
     /// Binds the agent socket at `path` for `dev`, first removing a stale
     /// socket a previous run left, which would make `bind` fail with
@@ -1343,8 +1369,8 @@ impl VsockBridge {
     ///
     /// The listener is non-blocking, so the accept loop can poll it beside the
     /// stop token and then accept without blocking. It must be bound before the
-    /// seccomp filters go in, since they allow accepting on a listener already
-    /// held but not creating one.
+    /// sandbox goes in, since the seccomp filters and the Seatbelt profile
+    /// allow accepting on a listener already held but not creating one.
     ///
     /// # Errors
     ///
@@ -1579,6 +1605,26 @@ mod tests {
         assert_eq!(p.op, OP_RW);
         assert_eq!(p.len, 7);
         assert_eq!(p.buf_alloc, OUR_BUF_ALLOC);
+    }
+
+    #[test]
+    fn no_agent_socket_opens_nothing() {
+        let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]));
+        assert!(open(None, &ram).unwrap().is_none());
+    }
+
+    // The test removes the socket it bound; see clippy.toml.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn agent_socket_accepts_once_opened() {
+        let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]));
+        let path = std::env::temp_dir().join(format!("hvi-agent-{}", std::process::id()));
+        let path = path.to_str().expect("a UTF-8 temporary path");
+        let agent = open(Some(path), &ram).unwrap().expect("an agent");
+        let connected = UnixStream::connect(path);
+        let _ = std::fs::remove_file(path);
+        connected.expect("the bound socket");
+        drop(agent);
     }
 
     #[test]
