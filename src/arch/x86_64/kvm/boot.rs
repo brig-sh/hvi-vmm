@@ -31,7 +31,7 @@ use crate::arch::x86_64::layout::{
     VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
 };
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
-use crate::arch::x86_64::{mptable, MAX_VCPUS};
+use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
 use crate::devices::bus::Bus;
 use crate::devices::legacy::uart16550::Uart16550;
@@ -78,23 +78,7 @@ fn mmio_devices(disks: usize, net: bool, vsock: bool, exports: &[Export]) -> Vec
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    // The Linux backends serve only exports a caller's vhost-user daemon
-    // serves, and the caller starts the daemon.
-    if let Some(share) = cfg.fs_shares.first() {
-        return Err(format!(
-            "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
-             virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
-            share.tag
-        )
-        .into());
-    }
-    crate::config::check_fs(&cfg.fs, cfg.vcpus.max(1))?;
     let num_cpus = cfg.vcpus.max(1);
-    if num_cpus > MAX_VCPUS {
-        return Err(
-            format!("x86-64 supports at most {MAX_VCPUS} vCPUs (asked for {num_cpus})").into(),
-        );
-    }
     install_kick_handler();
 
     let kvm = Kvm::new()?;
@@ -356,8 +340,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
 #[cfg(test)]
 mod tests {
-    use super::{boot, mmio_devices, MmioDevice};
-    use crate::config::BootConfig;
+    use super::{mmio_devices, MmioDevice};
 
     // The DSDT lists the disks first, in order, so Linux registers them in argv
     // order.
@@ -386,31 +369,5 @@ mod tests {
                 size: 0x200,
                 gsi: 5
             }));
-    }
-
-    #[test]
-    fn more_vcpus_than_the_cap_are_refused() {
-        let cfg = BootConfig {
-            kernel: Vec::new(),
-            initramfs: None,
-            mem_bytes: 128 << 20,
-            cmdline: String::new(),
-            disks: Vec::new(),
-            fs_shares: Vec::new(),
-            fs: Vec::new(),
-            net: false,
-            net_gateway: None,
-            net_tap: None,
-            net_mac: None,
-            events: None,
-            sandbox_id: "cap-test".to_string(),
-            vcpus: 255,
-            agent_sock: None,
-            plugin: None,
-            sandbox: false,
-            stop: None,
-        };
-        let error = boot(cfg).unwrap_err().to_string();
-        assert_eq!(error, "x86-64 supports at most 254 vCPUs (asked for 255)");
     }
 }

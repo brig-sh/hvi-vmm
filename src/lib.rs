@@ -157,6 +157,7 @@ pub fn boot(cfg: config::BootConfig) -> Result<config::Stop, config::BootError> 
         .claim()
         .map_err(|e| config::BootError::new(e.into()))?;
     sandbox::check_run(cfg.sandbox).map_err(|e| config::BootError::new(e.into()))?;
+    cfg.check().map_err(|e| config::BootError::new(e.into()))?;
     let result = backend::boot(cfg).map_err(|e| {
         if e.is::<run::LeftRunning>() {
             claim.keep();
