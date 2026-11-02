@@ -43,14 +43,14 @@ use crate::devices::virtio::block;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::fs::server::{self, VirtioFs};
 use crate::devices::virtio::fs::worker::{run_fs_worker, Export, FsTransport, FsWake};
-use crate::devices::virtio::net::{self, VirtioNet};
+use crate::devices::virtio::net;
 use crate::devices::virtio::vsock::{VirtioVsock, VsockBridge};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{
     insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
 };
 use crate::hypervisor::vcpus::Vcpus;
-use crate::io_threads::{IoThreads, NetSource};
+use crate::io_threads::IoThreads;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::GuestArch;
 use crate::run::{record_start, run_to_stop};
@@ -133,36 +133,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
 
     let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    // virtio-net: gateway relay (real egress) when a gateway socket is given,
-    // else the built-in user-space stack. `net_reader` carries the gateway read
-    // side to the RX reader thread, which starts with the other I/O threads.
-    let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
-    let net_dev = if let Some(sock) = &cfg.net_gateway {
-        match std::os::unix::net::UnixStream::connect(sock) {
-            Ok(stream) => {
-                let reader = stream
-                    .try_clone()
-                    .map_err(|e| format!("--net-gateway {sock}: cloning the socket: {e}"))?;
-                eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock} (guest 10.87.0.2, gw/DNS 10.87.0.1)");
-                net_reader = Some(reader);
-                Some(VirtioNet::with_gateway(stream))
-            }
-            Err(e) => {
-                eprintln!(
-                    "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    net::stub_stack_line()
-                );
-                Some(VirtioNet::new())
-            }
-        }
-    } else if cfg.net {
-        eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
-        Some(VirtioNet::new())
-    } else {
-        None
-    };
-
-    let net = net::share(net_dev, cfg.net_mac);
+    let (net, net_source) = net::open(&cfg)?.map_or((None, None), |network| {
+        (Some(network.device), network.source)
+    });
 
     let vsock = cfg.agent_sock.as_ref().map(|sock| {
         eprintln!("{LOG_PREFIX} virtio-vsock: agent bridge on {sock} (guest cid 3, port 1024)");
@@ -359,7 +332,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         context.plugin.clone(),
         move |byte| pl011.lock().unwrap().push_rx(byte),
         bridge,
-        net_reader.map(NetSource::Gateway),
+        net_source,
         plugin_threads,
     );
     // Each virtio-fs device gets its own worker thread, which serves the

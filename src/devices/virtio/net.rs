@@ -48,6 +48,7 @@ use std::ops::ControlFlow;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
+use crate::config::BootConfig;
 use crate::memory::GuestRam;
 
 use crate::devices::irq::{Irq, IrqLine};
@@ -55,6 +56,7 @@ use crate::devices::virtio::{
     mmio, tap, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
+use crate::io_threads::NetSource;
 use crate::plugin::IoSink;
 use crate::LOG_PREFIX;
 
@@ -69,11 +71,10 @@ const F_MAC_LO: u32 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 /// guest on it looks online and carries no traffic. The name says so.
 pub const STUB_STACK: &str = "built-in stub stack";
 
-/// Returns the line a backend prints when a guest is on the built-in stack.
+/// Returns the description hvi prints when a guest is on the built-in stack.
 ///
-/// Built from the addressing constants the stack itself uses, so the line
-/// cannot drift from them, and shared by all three backends so the same guest
-/// is announced the same way wherever it runs.
+/// It is built from the addressing constants the stack itself uses, so the line
+/// cannot drift from them.
 #[must_use]
 pub fn stub_stack_line() -> String {
     format!("{STUB_STACK} (guest {GUEST_IP}, gw {GW_IP}, DHCP; no egress, no inbound)")
@@ -124,18 +125,146 @@ const IP_ICMP: u8 = 1;
 const IP_TCP: u8 = 6;
 const IP_UDP: u8 = 17;
 
-/// Wraps a freshly built device for sharing, applying the guest MAC override.
-///
-/// Every backend ends its device selection with this, so the override reaches
-/// the tap, gateway and stub devices alike and the three cannot drift apart.
-/// Applied before the device is shared, while nothing else can hold it.
-pub fn share(dev: Option<VirtioNet>, mac: Option<[u8; 6]>) -> Option<Arc<Mutex<VirtioNet>>> {
-    dev.map(|mut dev| {
-        if let Some(mac) = mac {
-            dev.set_mac(mac);
+/// How the guest's network reaches the host, as [`connect`] set it up.
+#[derive(Debug)]
+pub(crate) enum NetOutcome {
+    /// A tap device, by name.
+    #[cfg(target_os = "linux")]
+    Tap(String),
+    /// A gvisor-tap-vsock gateway, by the path of its socket.
+    Gateway(String),
+    /// The built-in stub stack, as asked for.
+    Stub,
+    /// The built-in stub stack, because the gateway could not be reached.
+    StubAfterGateway {
+        /// The path of the gateway's socket.
+        socket: String,
+        /// Why the connection failed.
+        error: io::Error,
+    },
+}
+
+impl std::fmt::Display for NetOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Tap(ifname) => write!(f, "virtio-net: tap {ifname}"),
+            Self::Gateway(socket) => write!(f, "virtio-net: gvisor-tap gateway relay via {socket}"),
+            Self::Stub => write!(f, "virtio-net: {}", stub_stack_line()),
+            Self::StubAfterGateway { socket, error } => write!(
+                f,
+                "WARNING: gateway {socket} unreachable ({error}); falling back to the {}",
+                stub_stack_line()
+            ),
         }
-        Arc::new(Mutex::new(dev))
-    })
+    }
+}
+
+/// The guest's network, as [`open`] returns it.
+pub(crate) struct Network {
+    /// The device.
+    pub(crate) device: Arc<Mutex<VirtioNet>>,
+    /// Where the relay thread reads the host's frames, or `None` for the stub
+    /// stack.
+    pub(crate) source: Option<NetSource>,
+}
+
+/// A network as [`connect`] sets it up, with the device not yet shared.
+struct Connected {
+    /// The device, not yet shared.
+    device: VirtioNet,
+    /// Where the relay thread reads the host's frames, or `None` for the stub
+    /// stack.
+    source: Option<NetSource>,
+    /// How the network reaches the host.
+    outcome: NetOutcome,
+}
+
+/// Opens the network `cfg` asks for, or returns `None` when it asks for none.
+///
+/// It prints how the network reaches the host. The MAC address in `cfg` applies
+/// to the device whichever way it reaches the host.
+///
+/// # Errors
+///
+/// Errors when the tap does not open or a connection does not clone, as
+/// [`connect`] describes.
+pub(crate) fn open(cfg: &BootConfig) -> Result<Option<Network>, String> {
+    let Some(Connected {
+        mut device,
+        source,
+        outcome,
+    }) = connect(cfg)?
+    else {
+        return Ok(None);
+    };
+    eprintln!("{LOG_PREFIX} {outcome}");
+    if let Some(mac) = cfg.net_mac {
+        device.set_mac(mac);
+    }
+    Ok(Some(Network {
+        device: Arc::new(Mutex::new(device)),
+        source,
+    }))
+}
+
+/// Sets up the network `cfg` asks for, or returns `None` when it asks for none.
+///
+/// A tap takes precedence over a gateway, and a gateway over the stub stack. An
+/// unreachable gateway falls back to the stub stack, which `docs/networking.md`
+/// describes.
+///
+/// # Errors
+///
+/// Errors when the tap does not open, since the stub stack would put the guest
+/// on the wrong network and nothing outside the guest could tell, and when the
+/// tap fd or the gateway connection does not clone for the relay.
+fn connect(cfg: &BootConfig) -> Result<Option<Connected>, String> {
+    // The caller created the tap, so this only attaches to it, which brings
+    // carrier up.
+    #[cfg(target_os = "linux")]
+    if let Some(ifname) = &cfg.net_tap {
+        let file = tap::open(ifname).map_err(|e| format!("--net-tap {ifname}: {e}"))?;
+        let reader = file
+            .try_clone()
+            .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
+        return Ok(Some(Connected {
+            device: VirtioNet::with_tap(file),
+            source: Some(NetSource::Tap(reader)),
+            outcome: NetOutcome::Tap(ifname.clone()),
+        }));
+    }
+    let connected = if let Some(socket) = &cfg.net_gateway {
+        match UnixStream::connect(socket) {
+            Ok(stream) => {
+                let reader = stream
+                    .try_clone()
+                    .map_err(|e| format!("--net-gateway {socket}: cloning the socket: {e}"))?;
+                Connected {
+                    device: VirtioNet::with_gateway(stream),
+                    source: Some(NetSource::Gateway(reader)),
+                    outcome: NetOutcome::Gateway(socket.clone()),
+                }
+            }
+            Err(error) => Connected {
+                device: VirtioNet::new(),
+                source: None,
+                outcome: NetOutcome::StubAfterGateway {
+                    socket: socket.clone(),
+                    error,
+                },
+            },
+        }
+    } else if cfg.net {
+        Connected {
+            device: VirtioNet::new(),
+            source: None,
+            outcome: NetOutcome::Stub,
+        }
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(connected))
 }
 
 /// The frames of the gateway stream, reassembled from whatever each receive
@@ -1268,7 +1397,9 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
     None
 }
 
+// The tests bind and remove gateway sockets of their own; see clippy.toml.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::io::Read;
@@ -2219,5 +2350,73 @@ mod tests {
             line.high.load(Ordering::SeqCst),
             dev.lock().unwrap().irq_level()
         );
+    }
+
+    /// Returns a socket path under the temporary directory that nothing has
+    /// bound, unique to this process and `name`.
+    fn socket_path(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("hvi-net-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path.to_str().expect("a UTF-8 temporary path").to_string()
+    }
+
+    #[test]
+    fn no_network_option_connects_nothing() {
+        assert!(connect(&BootConfig::with_no_devices(1)).unwrap().is_none());
+    }
+
+    // docs/networking.md tells operators to match "falling back to".
+    #[test]
+    fn unreachable_gateway_falls_back_to_the_stub() {
+        let socket = socket_path("unreachable");
+        let cfg = BootConfig {
+            net_gateway: Some(socket.clone()),
+            ..BootConfig::with_no_devices(1)
+        };
+        let connected = connect(&cfg).unwrap().expect("a network");
+        assert!(connected.source.is_none());
+        let text = connected.outcome.to_string();
+        let NetOutcome::StubAfterGateway {
+            socket: named,
+            error,
+        } = connected.outcome
+        else {
+            panic!("{text}");
+        };
+        assert_eq!(named, socket);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            text.contains("falling back to the built-in stub stack"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn reachable_gateway_is_relayed() {
+        let socket = socket_path("reachable");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let cfg = BootConfig {
+            net_gateway: Some(socket.clone()),
+            net: true,
+            ..BootConfig::with_no_devices(1)
+        };
+        let connected = connect(&cfg).unwrap().expect("a network");
+        let _ = std::fs::remove_file(&socket);
+        assert!(matches!(connected.source, Some(NetSource::Gateway(_))));
+        assert!(matches!(connected.outcome, NetOutcome::Gateway(named) if named == socket));
+    }
+
+    // The fallback device answers to the MAC the caller gave too.
+    #[test]
+    fn mac_applies_to_the_stub_after_a_fallback() {
+        let mac = [0x52, 0x54, 0x00, 0xe2, 0xe0, 0x01];
+        let cfg = BootConfig {
+            net_gateway: Some(socket_path("mac")),
+            net_mac: Some(mac),
+            ..BootConfig::with_no_devices(1)
+        };
+        let network = open(&cfg).unwrap().expect("a network");
+        let device = network.device;
+        assert_eq!(device.lock().unwrap().mac, mac);
     }
 }
