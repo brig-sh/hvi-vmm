@@ -648,6 +648,65 @@ pub struct BootConfig {
 }
 
 impl BootConfig {
+    /// Refuses a configuration the host's backend cannot serve.
+    ///
+    /// # Errors
+    ///
+    /// Errors for an option the host has no device for, for two exports with
+    /// one tag, for exports [`check_fs`] or [`check_export_overlap`] refuses,
+    /// and on x86-64 for more vCPUs than `arch::x86_64::MAX_VCPUS`.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            // The Linux backends serve only exports a caller's vhost-user
+            // daemon serves, and the caller starts the daemon.
+            if let Some(share) = self.fs_shares.first() {
+                return Err(format!(
+                    "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
+                     virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
+                    share.tag
+                ));
+            }
+            check_fs(&self.fs, self.vcpus.max(1))?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut tags = std::collections::HashSet::with_capacity(self.fs_shares.len());
+            if let Some(share) = self.fs_shares.iter().find(|share| !tags.insert(&share.tag)) {
+                return Err(format!("duplicate virtio-fs tag {:?}", share.tag));
+            }
+            check_export_overlap(&self.fs_shares)?;
+            // The macOS backend serves every export itself, so it refuses a
+            // daemon's socket.
+            if let Some(export) = self.fs.first() {
+                return Err(format!(
+                    "--fs tag={},socket=: vhost-user exports are served on Linux only; \
+                     use --fs tag=<tag>,path=<dir>",
+                    export.tag
+                ));
+            }
+            // A tap needs /dev/net/tun, which macOS does not have. The flag is
+            // refused, because a guest on the wrong network looks like success
+            // from the outside.
+            if let Some(ifname) = &self.net_tap {
+                return Err(format!(
+                    "--net-tap {ifname}: no /dev/net/tun on macOS; use --net-gateway"
+                ));
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::arch::x86_64::MAX_VCPUS;
+            let vcpus = self.vcpus.max(1);
+            if vcpus > MAX_VCPUS {
+                return Err(format!(
+                    "x86-64 supports at most {MAX_VCPUS} vCPUs (asked for {vcpus})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Takes the run's stop out of [`stop`](Self::stop) as a handle, or returns
     /// a new handle when it is `None`.
     ///
@@ -658,6 +717,34 @@ impl BootConfig {
         match self.stop.take() {
             Some(registration) => Ok(registration.into_handle()),
             None => Ok(crate::run::StopHandle::new_pair()?.0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl BootConfig {
+    /// Returns a configuration with no kernel, no devices and `vcpus` vCPUs,
+    /// for a test to fill in.
+    pub(crate) fn with_no_devices(vcpus: u32) -> Self {
+        Self {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 128 << 20,
+            cmdline: String::new(),
+            disks: Vec::new(),
+            fs_shares: Vec::new(),
+            fs: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: "test".to_string(),
+            vcpus,
+            agent_sock: None,
+            plugin: None,
+            sandbox: false,
+            stop: None,
         }
     }
 }
@@ -741,8 +828,8 @@ impl std::error::Error for BootError {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        check_disks, check_export_overlap, check_fs, disk_serial, BootError, CachePolicy,
-        DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
+        check_disks, check_export_overlap, check_fs, disk_serial, BootConfig, BootError,
+        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -1211,5 +1298,73 @@ mod tests {
             let err = check_fs(&[export], 4).expect_err(why);
             assert!(err.contains(why), "{err}");
         }
+    }
+
+    #[test]
+    fn configuration_with_no_devices_passes() {
+        BootConfig::with_no_devices(1).check().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_export_is_refused_on_linux() {
+        let cfg = BootConfig {
+            fs_shares: shares(&[("/srv", ShareMode::ReadOnly)]),
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = cfg.check().unwrap_err();
+        assert!(
+            err.contains("hvi serves a directory on macOS only"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn daemon_export_is_refused_on_macos() {
+        let cfg = BootConfig {
+            fs: vec![socket("tag=t,socket=/s")],
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = cfg.check().unwrap_err();
+        assert!(
+            err.contains("vhost-user exports are served on Linux only"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_directory_tag_is_refused_on_macos() {
+        let mut fs_shares = shares(&[("/a", ShareMode::ReadOnly), ("/b", ShareMode::ReadOnly)]);
+        fs_shares[1].tag = fs_shares[0].tag.clone();
+        let cfg = BootConfig {
+            fs_shares,
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(cfg.check().unwrap_err(), "duplicate virtio-fs tag \"tag0\"");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tap_is_refused_on_macos() {
+        let cfg = BootConfig {
+            net_tap: Some("tap0".to_string()),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(
+            cfg.check().unwrap_err(),
+            "--net-tap tap0: no /dev/net/tun on macOS; use --net-gateway"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn more_vcpus_than_the_cap_are_refused() {
+        BootConfig::with_no_devices(254).check().unwrap();
+        assert_eq!(
+            BootConfig::with_no_devices(255).check().unwrap_err(),
+            "x86-64 supports at most 254 vCPUs (asked for 255)"
+        );
     }
 }
