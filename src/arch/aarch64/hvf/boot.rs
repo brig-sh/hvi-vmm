@@ -23,14 +23,11 @@ use super::gic::{gic_config, gic_layout, HvfIrqLine};
 use super::kick::Kicker;
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
-use crate::arch::aarch64::layout::{
-    virtio_blk_base, VirtioSlots, DEVICE_WINDOW_END, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE,
-    UART_SIZE, UART_SPI, VIRTIO_NET_BASE, VIRTIO_SIZE, VIRTIO_VSOCK_BASE,
-};
+use crate::arch::aarch64::layout::{VirtioSlots, RAM_BASE, UART_BASE, UART_SPI};
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
-use crate::devices::manager::{DeviceKind, DeviceManager, Devices};
+use crate::devices::manager::{DeviceManager, Devices};
 use crate::devices::virtio::fs::worker::run_fs_worker;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
@@ -58,33 +55,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         "{LOG_PREFIX} {num_cpus} vCPU(s)  GICD {:#x}+{:#x}  GICR {:#x}+{:#x}  UART {:#x}",
         gic.gicd_base, gic.gicd_size, gic.gicr_base, gic.gicr_size, UART_BASE
     );
-    // Every device range has to clear the GIC, and its end is known only here:
-    // the framework sizes the redistributor region, and it is far larger than
-    // QEMU's. The fixed ranges are checked here, and `VirtioSlots` checks each
-    // virtio-fs one as it places it, because those climb with the share count.
+    // Every device range sits above the UART, so the GIC has to end at or below
+    // it. The framework sizes the redistributor region, so the GIC's end is
+    // known only here.
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
-    let disk_ranges = (0..cfg.disks.len())
-        .filter_map(virtio_blk_base)
-        .map(|base| ("virtio-blk", base, VIRTIO_SIZE));
-    for (name, base, size) in [
-        ("UART", UART_BASE, UART_SIZE),
-        ("RTC", RTC_BASE, RTC_SIZE),
-        ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
-        ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
-    ]
-    .into_iter()
-    .chain(disk_ranges)
-    {
-        let end = base.saturating_add(size);
-        if base < gic_end || end > DEVICE_WINDOW_END {
-            return Err(format!(
-                "{name} at {base:#x}..{end:#x} does not fit between the GIC \
-                 (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
-            )
-            .into());
-        }
+    if gic_end > UART_BASE {
+        return Err(format!(
+            "placing the devices: the GIC ends at {gic_end:#x}, past the UART at {UART_BASE:#x}"
+        )
+        .into());
     }
-
     let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config(&gic)?)?;
 
     // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
@@ -146,26 +126,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Seatbelt allows using a socket but not creating one, so the agent socket
     // and the stop source's socket pair exist before it goes in.
     let stop_source = StopSource::new()?;
-    let count = |kind| {
-        devices
-            .records()
-            .iter()
-            .filter(|record| record.kind == kind)
-            .count()
-    };
-    let fdt_devices = fdt::VirtioDevices {
-        blk_count: count(DeviceKind::Block),
-        net: count(DeviceKind::Net) > 0,
-        vsock: count(DeviceKind::Vsock) > 0,
-        fs_count: count(DeviceKind::Fs),
-    };
+    let fdt_devices = fdt::virtio_devices(devices.records());
 
     let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
     }
-    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
+    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, &fdt_devices)?;
 
     let Devices {
         mmio_bus,

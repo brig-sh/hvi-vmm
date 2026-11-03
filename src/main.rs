@@ -38,7 +38,7 @@ use hvi::plugin::builtin::{Chain, IoTrace, MemoryDump};
 use hvi::signal::StopOnSignals;
 
 #[cfg(target_arch = "aarch64")]
-use hvi::arch::aarch64::{fdt, layout, loader};
+use hvi::arch::aarch64::{layout, loader};
 
 /// Runs the subcommand named on the command line.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -206,14 +206,8 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ram_size = mem_mib << 20;
     let gic = GicLayout::QEMU_VIRT;
     let kernel = loader::LoadedKernel::from_header(&kernel_bytes)?;
-    let loader::Plan { layout, dtb } = kernel.plan(
-        ram_size,
-        initrd_size,
-        &gic,
-        1,
-        &cmdline,
-        fdt::VirtioDevices::default(),
-    )?;
+    let loader::Plan { layout, dtb } =
+        kernel.plan(ram_size, initrd_size, &gic, 1, &cmdline, &[])?;
 
     println!(
         "kernel {kernel_path}: kernel@{:#x} reserved_size={:#x} (file {} bytes)",

@@ -35,7 +35,7 @@ use crate::arch::aarch64::layout::{
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
-use crate::devices::manager::{DeviceKind, DeviceManager, Devices};
+use crate::devices::manager::{DeviceManager, Devices};
 use crate::devices::virtio::fs::vhost_user;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
@@ -105,26 +105,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     });
     let pl011 = devices.attach_uart_and_rtc()?;
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
-    let count = |kind| {
-        devices
-            .records()
-            .iter()
-            .filter(|record| record.kind == kind)
-            .count()
-    };
-    let fdt_devices = fdt::VirtioDevices {
-        blk_count: count(DeviceKind::Block),
-        net: count(DeviceKind::Net) > 0,
-        vsock: count(DeviceKind::Vsock) > 0,
-        fs_count: count(DeviceKind::Fs),
-    };
+    let fdt_devices = fdt::virtio_devices(devices.records());
 
     let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
     }
-    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
+    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, &fdt_devices)?;
 
     vgic.set_regions(&gic)?;
 
