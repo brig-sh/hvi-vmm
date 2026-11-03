@@ -103,10 +103,7 @@ pub fn queue_count(request_queues: usize) -> usize {
     request_queues + 1
 }
 
-// The device needs the `vhost` crate and the I/O threads, which exist only for
-// the Linux backends.
-#[cfg(target_os = "linux")]
-pub(crate) use self::device::start_interrupt_threads;
+// The device needs the `vhost` crate, which only the Linux build has.
 #[cfg(target_os = "linux")]
 pub use self::device::{
     attach, connect_waiting, serve_interrupts, shut_down, Export, ShutdownFds, VhostUserFs,
@@ -131,8 +128,7 @@ mod device {
     use crate::devices::irq::{Irq, IrqLine};
     use crate::devices::virtio::{mmio, VirtioMmio};
     use crate::events::CapturedEvent;
-    use crate::hypervisor::vcpus::Kick;
-    use crate::io_threads::IoThreads;
+    use crate::io_threads::HostWork;
     use crate::memory::GuestRam;
     use crate::plugin::IoSink;
     use crate::teardown::StopToken;
@@ -927,30 +923,24 @@ mod device {
         Ok(exports)
     }
 
-    /// Starts one [`serve_interrupts`] thread per queue of every export under
-    /// `io_threads`.
-    ///
-    /// A thread ends when the I/O threads stop. An export whose call
-    /// descriptors cannot be duplicated gets no thread, so its guest never
-    /// sees a used buffer, and the boot says so on stderr.
-    ///
-    /// It has to be called from a thread with no seccomp filter, as
-    /// [`IoThreads::spawn`] says.
-    pub(crate) fn start_interrupt_threads<K: Kick + 'static>(
-        exports: &[Export],
-        io_threads: &mut IoThreads<K>,
-    ) {
-        for export in exports {
-            let calls = match export.dev.lock().unwrap().call_fds() {
+    impl Export {
+        /// Queues in `host` one [`serve_interrupts`] thread per queue of the
+        /// export.
+        ///
+        /// A thread ends when the I/O threads stop. An export whose call
+        /// descriptors cannot be duplicated gets no thread, so its guest never
+        /// sees a used buffer, and the boot says so on stderr.
+        pub(crate) fn queue_interrupts(&self, host: &mut HostWork) {
+            let calls = match self.dev.lock().unwrap().call_fds() {
                 Ok(calls) => calls,
                 Err(e) => {
                     stderrln!("{LOG_PREFIX} virtio-fs: queue interrupts unavailable: {e}");
-                    continue;
+                    return;
                 }
             };
             for call in calls {
-                let dev = Arc::clone(&export.dev);
-                io_threads.spawn("virtio-fs interrupts", move |stop| {
+                let dev = Arc::clone(&self.dev);
+                host.spawn("virtio-fs interrupts", move |stop| {
                     serve_interrupts(&dev, &call, &stop);
                 });
             }
