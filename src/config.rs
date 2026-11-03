@@ -82,8 +82,7 @@ pub struct FsShare {
 ///
 /// The daemon serves the directory it was started with, and it decides whether
 /// the guest may write it. The VMM sees only the socket. Only the Linux
-/// backends serve these. The fields and their defaults are Cloud Hypervisor's
-/// `--fs`.
+/// backends serve these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsConfig {
     /// The tag the guest mounts the export by, 1 to 36 bytes.
@@ -183,8 +182,8 @@ impl FsSpec {
     /// Returns the export `spec` describes, in the syntax of
     /// [`SYNTAX`](Self::SYNTAX).
     ///
-    /// The `socket=` form is Cloud Hypervisor's `--fs`, with its defaults.
-    /// The `path=` form takes what only hvi's own server can honor. A
+    /// The `socket=` form takes a daemon's socket and its queues. The `path=`
+    /// form takes what only hvi's own server can honor. A
     /// `path=` is returned as given; resolving it is the caller's.
     ///
     /// # Errors
@@ -308,7 +307,7 @@ impl FsSpec {
 /// The tag is the whole of what a guest has to name an export by, so a
 /// duplicate makes one of the two unreachable, and which one depends on the
 /// order the guest probes its devices in. A request queue beyond the guest's
-/// `vcpus` has no vCPU to submit on it, which Cloud Hypervisor refuses too.
+/// `vcpus` has no vCPU to submit on it.
 ///
 /// # Errors
 ///
@@ -982,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_specs_take_a_bare_path_or_cloud_hypervisor_keys() {
+    fn disk_specs_take_a_bare_path_or_keys() {
         assert_eq!(
             DiskConfig::parse("up.img").unwrap(),
             DiskConfig::rw("up.img")
@@ -1156,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_socket_takes_cloud_hypervisors_syntax_and_defaults() {
+    fn fs_socket_spec_takes_its_keys_and_defaults() {
         assert_eq!(
             socket("tag=fs0,socket=/run/fs0.sock"),
             FsConfig {

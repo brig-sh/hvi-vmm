@@ -192,8 +192,8 @@ mod device {
         }
     }
 
-    /// How long [`VhostUserFs::connect`] waits for a daemon's socket, which is
-    /// what Cloud Hypervisor waits.
+    /// How long [`VhostUserFs::connect`] waits for a daemon's socket, so a
+    /// daemon started beside hvi has time to listen.
     pub const SOCKET_WAIT: Duration = Duration::from_secs(60);
 
     /// How long [`connect_waiting`] sleeps between two attempts.

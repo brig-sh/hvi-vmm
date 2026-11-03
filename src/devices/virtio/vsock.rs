@@ -97,8 +97,6 @@ const SHUTDOWN_BOTH: u32 = SHUTDOWN_RCV | SHUTDOWN_SEND;
 
 /// Device to guest: the credit we advertise, so how many guest bytes may wait
 /// for the host socket on one connection.
-///
-/// Firecracker and Cloud Hypervisor buffer the same 64 KiB per connection.
 const OUR_BUF_ALLOC: u32 = 64 * 1024;
 /// Device to guest: the most payload we frame into one RW packet before
 /// handing it to `fill_rx`.
