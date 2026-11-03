@@ -24,7 +24,7 @@ use kvm_ioctls::{Cap, Kvm};
 use super::cpuid::guest_cpuid;
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
 use super::vcpu::{port_bus, run_cpu, VcpuContext};
-use crate::arch::x86_64::acpi::{self, MmioDevice};
+use crate::arch::x86_64::acpi;
 use crate::arch::x86_64::layout::{
     VirtioSlots, ACPI_ADDR, COM1_GSI, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE,
 };
@@ -33,7 +33,7 @@ use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::manager::{DeviceManager, DeviceRecord, Devices};
+use crate::devices::manager::{DeviceManager, Devices};
 use crate::devices::virtio::fs::vhost_user;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
@@ -43,22 +43,6 @@ use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, RamRegion};
 use crate::signal::install_kick_handler;
 use crate::LOG_PREFIX;
-
-/// Returns the virtio-mmio devices the DSDT describes, in the order they were
-/// attached.
-///
-/// Linux registers them in this order, so the disks, which are attached first,
-/// keep their argv order. The guest still has to tell them apart by serial.
-fn mmio_devices(records: &[DeviceRecord]) -> Vec<MmioDevice> {
-    records
-        .iter()
-        .map(|record| MmioDevice {
-            base: record.range.start,
-            size: record.range.end - record.range.start,
-            gsi: record.irq,
-        })
-        .collect()
-}
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
@@ -135,7 +119,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
     ram.write(
         ACPI_ADDR,
-        &acpi::build(num_cpus, &mmio_devices(devices.records())),
+        &acpi::build(num_cpus, &acpi::virtio_devices(devices.records())),
     )?;
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
