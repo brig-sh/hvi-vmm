@@ -25,6 +25,7 @@
 //! getters when the VM is built.
 
 use crate::config::MAX_DISKS;
+use crate::devices::manager::{Placement, Slot};
 
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -57,7 +58,7 @@ pub const DEVICE_WINDOW_END: u64 = RAM_BASE;
 /// ever reaches here.
 pub const UART_BASE: u64 = 0x0c00_0000;
 pub const UART_SIZE: u64 = 0x1000;
-/// UART interrupt as a GIC SPI number (INTID = 32 + SPI = 33).
+/// UART interrupt as a GIC SPI number (INTID = [`SPI_BASE`] + SPI = 33).
 pub const UART_SPI: u32 = 1;
 
 /// PL031 RTC MMIO base and size.
@@ -84,7 +85,7 @@ pub const RTC_SIZE: u64 = 0x1000;
 /// The guest learns every range from the devicetree, so none of these is a
 /// contract. Disk 0, net and vsock keep the addresses they had when the disk
 /// was the only one.
-pub const VIRTIO_SIZE: u64 = 0x0200;
+pub const VIRTIO_SIZE: u64 = crate::devices::virtio::mmio::RANGE_SIZE;
 pub const VIRTIO_BASE: u64 = 0x0d00_0000;
 pub const VIRTIO_SPI: u32 = 2;
 pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
@@ -97,11 +98,14 @@ pub const VIRTIO_BLK_EXTRA_SPI: u32 = 5;
 pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
 pub const VIRTIO_FS_SPI: u32 = VIRTIO_BLK_EXTRA_SPI + MAX_DISKS as u32 - 1;
 
+/// The INTID of SPI 0, the first shared peripheral interrupt.
+pub const SPI_BASE: u32 = 32;
+
 /// Number of interrupts the guest's GIC is created with.
 ///
 /// A multiple of 32, and the ceiling every SPI in this layout is checked
-/// against: INTID is `32 + spi`, so an export past it would be advertised in
-/// the devicetree and never delivered.
+/// against: INTID is [`SPI_BASE`] + `spi`, so an export past it would be
+/// advertised in the devicetree and never delivered.
 pub const GIC_NUM_IRQS: u32 = 256;
 
 /// Returns the base of the `index`th virtio-fs device, or `None` on overflow.
@@ -151,7 +155,7 @@ pub fn place_virtio_fs(
         ));
     }
     if let Some(num_irqs) = num_irqs {
-        if 32 + u64::from(spi) >= u64::from(num_irqs) {
+        if u64::from(SPI_BASE) + u64::from(spi) >= u64::from(num_irqs) {
             return Err(format!(
                 "too many virtio-fs devices: device {index} would take SPI {spi}, \
                  past the GIC's {num_irqs} interrupts"
@@ -183,7 +187,43 @@ pub fn virtio_blk_spi(index: usize) -> Option<u32> {
     }
 }
 
-/// GICv3 placement, defaulting to the QEMU virt values.
+/// The slots of the virtio devices on an arm64 machine whose GIC is `gic`.
+pub(crate) struct VirtioSlots {
+    /// The GIC, which every range has to clear.
+    pub(crate) gic: GicLayout,
+    /// The number of interrupts the GIC has, which bounds the exports' SPIs, or
+    /// `None` for no bound.
+    pub(crate) num_irqs: Option<u32>,
+}
+
+impl Placement for VirtioSlots {
+    fn disk(&self, index: usize) -> Option<Slot> {
+        Some(Slot {
+            base: virtio_blk_base(index)?,
+            irq: virtio_blk_spi(index)?,
+        })
+    }
+
+    fn net(&self) -> Slot {
+        Slot {
+            base: VIRTIO_NET_BASE,
+            irq: VIRTIO_NET_SPI,
+        }
+    }
+
+    fn vsock(&self) -> Slot {
+        Slot {
+            base: VIRTIO_VSOCK_BASE,
+            irq: VIRTIO_VSOCK_SPI,
+        }
+    }
+
+    fn export(&self, index: usize) -> Result<Slot, String> {
+        let (base, irq) = place_virtio_fs(index, &self.gic, self.num_irqs)?;
+        Ok(Slot { base, irq })
+    }
+}
+
 /// Which GIC architecture the guest is given.
 ///
 /// This is not a free choice: KVM can only offer a virtual GIC that matches the
@@ -574,7 +614,7 @@ mod tests {
             .take_while(|&index| place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).is_ok())
             .count();
         let last = u32::try_from(fits - 1).unwrap();
-        assert_eq!(32 + VIRTIO_FS_SPI + last, GIC_NUM_IRQS - 1);
+        assert_eq!(SPI_BASE + VIRTIO_FS_SPI + last, GIC_NUM_IRQS - 1);
         let err = place_virtio_fs(fits, &gic, Some(GIC_NUM_IRQS)).unwrap_err();
         assert!(err.contains("too many virtio-fs devices"), "{err}");
         // Without an interrupt count, only the device window bounds them.

@@ -26,23 +26,17 @@ use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
 use super::vcpu::{port_bus, run_cpu, VcpuContext};
 use crate::arch::x86_64::acpi::{self, MmioDevice};
 use crate::arch::x86_64::layout::{
-    virtio_blk_base, virtio_blk_gsi, virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, COM1_GSI,
-    HIGH_RAM_BASE, MAX_FS_DEVICES, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    VirtioSlots, ACPI_ADDR, COM1_GSI, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE,
 };
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
-use crate::devices::bus::Bus;
+use crate::devices::irq::IrqLine;
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::virtio::block;
-use crate::devices::virtio::fs::vhost_user::{self, Export};
-use crate::devices::virtio::net;
-use crate::devices::virtio::vsock;
+use crate::devices::manager::{DeviceManager, DeviceRecord, Devices};
+use crate::devices::virtio::fs::vhost_user;
 use crate::events::Ledger;
-use crate::hypervisor::guest::{
-    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
-};
+use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
@@ -50,28 +44,20 @@ use crate::plugin::{GuestArch, RamRegion};
 use crate::signal::install_kick_handler;
 use crate::LOG_PREFIX;
 
-/// Returns the virtio-mmio devices the DSDT describes, the disks first and in
-/// order, then net, vsock and the exports.
+/// Returns the virtio-mmio devices the DSDT describes, in the order they were
+/// attached.
 ///
-/// Linux registers them in this order, so the disks keep their argv order. The
-/// guest still has to tell them apart by serial.
-fn mmio_devices(disks: usize, net: bool, vsock: bool, exports: &[Export]) -> Vec<MmioDevice> {
-    let device = |base: u64, gsi: u32| MmioDevice {
-        base,
-        size: VIRTIO_SIZE,
-        gsi,
-    };
-    let mut devices: Vec<MmioDevice> = (0..disks)
-        .filter_map(|index| Some(device(virtio_blk_base(index)?, virtio_blk_gsi(index)?)))
-        .collect();
-    if net {
-        devices.push(device(VIRTIO_NET_BASE, VIRTIO_NET_GSI));
-    }
-    if vsock {
-        devices.push(device(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI));
-    }
-    devices.extend(exports.iter().map(|export| device(export.base, export.irq)));
-    devices
+/// Linux registers them in this order, so the disks, which are attached first,
+/// keep their argv order. The guest still has to tell them apart by serial.
+fn mmio_devices(records: &[DeviceRecord]) -> Vec<MmioDevice> {
+    records
+        .iter()
+        .map(|record| MmioDevice {
+            base: record.range.start,
+            size: record.range.end - record.range.start,
+            gsi: record.irq,
+        })
+        .collect()
 }
 
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
@@ -85,7 +71,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     if !kvm.check_extension(Cap::ImmediateExit) {
         return Err("hvi needs KVM_CAP_IMMEDIATE_EXIT, which Linux 4.11 added".into());
     }
-    let vm = kvm.create_vm()?;
+    let vm = Arc::new(kvm.create_vm()?);
 
     // Intel VMX needs a TSS and an identity-map page for guest-mode setup, even
     // though the guest enters directly in long mode. Set them before creating
@@ -126,24 +112,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     vm.create_irq_chip()?;
     vm.create_pit2(kvm_pit_config::default())?;
 
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    let (net, net_source) = net::open(&cfg)?.map_or((None, None), |network| {
-        (Some(network.device), network.source)
+    // The ledger exists first, since each device's transport writes to it.
+    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
+    let mut devices = DeviceManager::new(&ram, &ledger, VirtioSlots, {
+        let vm = Arc::clone(&vm);
+        move |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi)) as Arc<dyn IrqLine>
     });
-
-    let (vsock, bridge) = vsock::open(cfg.agent_sock.as_deref(), &ram)?
-        .map_or((None, None), |agent| {
-            (Some(agent.device), Some(agent.bridge))
-        });
-    // virtio-fs: one transport per export, each served by the caller's daemon.
-    let fs = vhost_user::attach(&cfg.fs, shared_ram.as_raw_fd(), |index| {
-        match (virtio_fs_base(index), virtio_fs_gsi(index)) {
-            (Some(base), Some(gsi)) => Ok((base, gsi)),
-            _ => Err(std::io::Error::other(format!(
-                "virtio-fs export {index}: x86-64 has interrupt lines for {MAX_FS_DEVICES} exports"
-            ))),
-        }
-    })?;
+    devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
 
     // Kernel command line: the caller's args and the ttyS0 console. The devices
     // are in the DSDT.
@@ -160,10 +135,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
     ram.write(
         ACPI_ADDR,
-        &acpi::build(
-            num_cpus,
-            &mmio_devices(disks.len(), net.is_some(), vsock.is_some(), &fs),
-        ),
+        &acpi::build(num_cpus, &mmio_devices(devices.records())),
     )?;
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
@@ -201,20 +173,15 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         vcpus.push(vcpu);
     }
 
-    let vm = Arc::new(vm);
-    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let fs = Arc::new(fs);
-    let mut mmio_bus = Bus::new();
-    insert_virtio_devices(
-        &mut mmio_bus,
-        &ram,
-        &ledger,
-        VIRTIO_SIZE,
-        &disks,
-        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
-        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
-    )?;
-    vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
+    let Devices {
+        mmio_bus,
+        disks,
+        net,
+        net_source,
+        bridge,
+        exports,
+    } = devices.finish();
+    let exports = Arc::new(exports);
     let uart = Arc::new(Mutex::new(Uart16550::new()));
     let context = VcpuContext {
         guest: Arc::new(Guest {
@@ -227,7 +194,6 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
-            vsock,
             vcpus: Arc::new(Vcpus::new(
                 num_cpus,
                 Kicker::new(num_cpus),
@@ -239,22 +205,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
-    uart.lock().unwrap().connect_irq(line(COM1_GSI));
-    context.guest.connect_irqs(
-        // `open_disks` refused more disks than there are GSIs.
-        |index| line(virtio_blk_gsi(index).expect("every disk should have a GSI")),
-        line(VIRTIO_NET_GSI),
-        line(VIRTIO_VSOCK_GSI),
-    );
-    for export in fs.iter() {
-        export.dev.lock().unwrap().connect_irq(line(export.irq));
-    }
+    uart.lock()
+        .unwrap()
+        .connect_irq(Arc::new(KvmIrqLine::new(Arc::clone(&vm), COM1_GSI)));
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
     context.guest.vcpus.on_stop({
-        let fs = Arc::clone(&fs);
-        move || vhost_user::shut_down(&fs)
+        let exports = Arc::clone(&exports);
+        move || vhost_user::shut_down(&exports)
     });
 
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
@@ -264,7 +222,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         bridge,
         net_source,
     )?;
-    vhost_user::start_interrupt_threads(&fs, &mut io_threads);
+    vhost_user::start_interrupt_threads(&exports, &mut io_threads);
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
         let guest = Arc::clone(&context.guest);
@@ -294,38 +252,4 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         filters,
         io_threads,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{mmio_devices, MmioDevice};
-
-    // The DSDT lists the disks first, in order, so Linux registers them in argv
-    // order.
-    #[test]
-    fn mmio_devices_list_every_disk_first_and_in_order() {
-        let gsis = |disks, net, vsock| -> Vec<(u64, u32)> {
-            mmio_devices(disks, net, vsock, &[])
-                .iter()
-                .map(|d| (d.base, d.gsi))
-                .collect()
-        };
-        assert_eq!(
-            gsis(3, true, false),
-            [
-                (0xd000_0000, 5),
-                (0xd000_0600, 9),
-                (0xd000_0800, 10),
-                (0xd000_0200, 6)
-            ]
-        );
-        assert!(gsis(0, false, false).is_empty());
-        assert_eq!(gsis(1, false, true), [(0xd000_0000, 5), (0xd000_0400, 7)]);
-        assert!(mmio_devices(1, false, false, &[]).iter().all(|d| *d
-            == MmioDevice {
-                base: 0xd000_0000,
-                size: 0x200,
-                gsi: 5
-            }));
-    }
 }
