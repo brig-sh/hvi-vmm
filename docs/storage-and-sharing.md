@@ -8,8 +8,7 @@ own.
 
 Each `--disk` backs one block device from one host file or block device. The
 flag is repeatable, at most four disks in all, and takes either a bare path or
-Cloud Hypervisor's `path=<file>[,readonly=on|off][,serial=<id>]`. There is no
-hotplug.
+`path=<file>[,readonly=on|off][,serial=<id>]`. There is no hotplug.
 
 ```sh
 hvi boot --kernel <Image> \
@@ -30,14 +29,13 @@ disk, exclusive for a writable one, with `flock`. A second hvi on a writable
 image fails to boot, and so does an hvi writing an image another hvi reads. Any
 number of guests can read one image, which is how one lower image serves many
 sandboxes. Within one guest, an image may back two read-only disks and nothing
-else. The lock is between hvi processes: Cloud Hypervisor and QEMU lock with
-`fcntl`, which `flock` does not see. A writable block device is also opened
-`O_EXCL` on Linux, so it holds against another device node for the same device
-and against a mount; a read-only open claims nothing, so a reader through
-another node is not held against a writer. The lock on a block device is retried
-for a second while udev holds the device after `losetup`. On a filesystem
-without a lock service, such as NFS without lockd, the lock fails and so does
-the boot.
+else. The lock is between hvi processes: a VMM that locks with `fcntl` takes a
+lock `flock` does not see. A writable block device is also opened `O_EXCL` on
+Linux, so it holds against another device node for the same device and against a
+mount; a read-only open claims nothing, so a reader through another node is not
+held against a writer. The lock on a block device is retried for a second while
+udev holds the device after `losetup`. On a filesystem without a lock service,
+such as NFS without lockd, the lock fails and so does the boot.
 
 The guest sees the disks as `/dev/vda`, `/dev/vdb` and so on, in command-line
 order. That order follows probing and is not a contract. Each disk also has a
@@ -68,7 +66,7 @@ because it costs a synchronous write per request.
 virtio-fs exports a host directory to the guest. Who serves it depends on the
 host.
 
-Every export is one `--fs`, in Cloud Hypervisor's comma-separated syntax.
+Every export is one `--fs`, in a comma-separated syntax.
 
 On **macOS** hvi answers the guest's FUSE requests itself, and
 `--fs tag=<tag>,path=<dir>` names the directory. There is no macFUSE mount, no
@@ -177,9 +175,7 @@ On Linux an export is served by a vhost-user daemon the caller runs, such as
 `virtiofsd` from the virtio-fs project. hvi starts no daemon. It connects to the
 daemon's socket before the guest runs, and the pair speaks vhost-user: hvi sends
 the rings and the memfd that backs guest RAM, and the daemon maps that memory
-and answers the guest's FUSE requests in its own process. Cloud Hypervisor and
-QEMU split the work the same way, and libvirt, Kata and urunc start the daemon
-for them.
+and answers the guest's FUSE requests in its own process.
 
 ```sh
 virtiofsd --socket-path=/run/hvi/fs0.sock --shared-dir /path/to/scratch \
@@ -187,12 +183,11 @@ virtiofsd --socket-path=/run/hvi/fs0.sock --shared-dir /path/to/scratch \
 hvi boot --kernel <bzImage> --fs tag=fs0,socket=/run/hvi/fs0.sock
 ```
 
-`--fs` takes Cloud Hypervisor's syntax,
-`tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]`, with its
-defaults: one request queue and a queue size of 1024. An export may have at most
-one request queue per vCPU, and the daemon has to serve them all. virtiofsd
-serves one, so `num_queues` above 1 needs another daemon. The queue size is a
-power of two up to 32768.
+`--fs` takes `tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]`,
+with one request queue and a queue size of 1024 by default. An export may have
+at most one request queue per vCPU, and the daemon has to serve them all.
+virtiofsd serves one, so `num_queues` above 1 needs another daemon. The queue
+size is a power of two up to 32768.
 
 That is all hvi knows of an export. The directory, whether the guest may write
 it, the cache policy and the daemon's sandbox are all options of the daemon. So
@@ -200,10 +195,9 @@ the Linux backends refuse a `path=` export, and the overlap rule above does not
 apply.
 
 A runtime can start the daemon and hvi at once, as urunc does for its other
-monitors. So hvi waits for the socket, up to 60 seconds, as Cloud Hypervisor
-does. It retries while the socket is missing or refuses the connection, and
-fails the boot on any other error at once. urunc's hvi backend does not attach
-shares yet.
+monitors. So hvi waits for the socket, up to 60 seconds. It retries while the
+socket is missing or refuses the connection, and fails the boot on any other
+error at once. urunc's hvi backend does not attach shares yet.
 
 The guest can mount an export as its root, which is what a container boot
 does: `root=fs0 rw rootfstype=virtiofs` on the kernel command line, with no
