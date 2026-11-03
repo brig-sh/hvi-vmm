@@ -25,6 +25,7 @@
 //! getters when the VM is built.
 
 use crate::config::MAX_DISKS;
+use crate::devices::manager::{Placement, Slot};
 
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -84,7 +85,7 @@ pub const RTC_SIZE: u64 = 0x1000;
 /// The guest learns every range from the devicetree, so none of these is a
 /// contract. Disk 0, net and vsock keep the addresses they had when the disk
 /// was the only one.
-pub const VIRTIO_SIZE: u64 = 0x0200;
+pub const VIRTIO_SIZE: u64 = crate::devices::virtio::mmio::RANGE_SIZE;
 pub const VIRTIO_BASE: u64 = 0x0d00_0000;
 pub const VIRTIO_SPI: u32 = 2;
 pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
@@ -96,6 +97,9 @@ pub const VIRTIO_BLK_EXTRA_BASE: u64 = 0x0d00_0600;
 pub const VIRTIO_BLK_EXTRA_SPI: u32 = 5;
 pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
 pub const VIRTIO_FS_SPI: u32 = VIRTIO_BLK_EXTRA_SPI + MAX_DISKS as u32 - 1;
+
+/// The INTID of SPI 0, the first shared peripheral interrupt.
+pub const SPI_BASE: u32 = 32;
 
 /// Number of interrupts the guest's GIC is created with.
 ///
@@ -183,7 +187,43 @@ pub fn virtio_blk_spi(index: usize) -> Option<u32> {
     }
 }
 
-/// GICv3 placement, defaulting to the QEMU virt values.
+/// The slots of the virtio devices on an arm64 machine whose GIC is `gic`.
+pub(crate) struct VirtioSlots {
+    /// The GIC, which every range has to clear.
+    pub(crate) gic: GicLayout,
+    /// The number of interrupts the GIC has, which bounds the exports' SPIs, or
+    /// `None` for no bound.
+    pub(crate) num_irqs: Option<u32>,
+}
+
+impl Placement for VirtioSlots {
+    fn disk(&self, index: usize) -> Option<Slot> {
+        Some(Slot {
+            base: virtio_blk_base(index)?,
+            irq: virtio_blk_spi(index)?,
+        })
+    }
+
+    fn net(&self) -> Slot {
+        Slot {
+            base: VIRTIO_NET_BASE,
+            irq: VIRTIO_NET_SPI,
+        }
+    }
+
+    fn vsock(&self) -> Slot {
+        Slot {
+            base: VIRTIO_VSOCK_BASE,
+            irq: VIRTIO_VSOCK_SPI,
+        }
+    }
+
+    fn export(&self, index: usize) -> Result<Slot, String> {
+        let (base, irq) = place_virtio_fs(index, &self.gic, self.num_irqs)?;
+        Ok(Slot { base, irq })
+    }
+}
+
 /// Which GIC architecture the guest is given.
 ///
 /// This is not a free choice: KVM can only offer a virtual GIC that matches the

@@ -13,27 +13,19 @@
 // limitations under the License.
 
 //! The in-kernel GIC of an arm64 guest on Hypervisor.framework, with the VM
-//! handle it comes with, the INTIDs of the fixed devices, the interrupt lines
-//! and the GIC's placement.
+//! handle it comes with, the interrupt lines and the GIC's placement.
 
 use std::sync::Arc;
 
 use applevisor::prelude::{GicConfig, GicEnabled, HypervisorError, VirtualMachineInstance};
 
 use super::kick::{on_vcpu_thread, Kicker};
-use crate::arch::aarch64::layout::{
-    GicLayout, GicVersion, UART_SPI, VIRTIO_NET_SPI, VIRTIO_VSOCK_SPI,
-};
+use crate::arch::aarch64::layout::{GicLayout, GicVersion, SPI_BASE};
 use crate::devices::irq::IrqLine;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
 pub(super) type VmGic = VirtualMachineInstance<GicEnabled>;
-
-// The fixed devices' GIC INTIDs, where SPIs start at 32.
-pub(super) const UART_INTID: u32 = 32 + UART_SPI;
-pub(super) const VIRTIO_NET_INTID: u32 = 32 + VIRTIO_NET_SPI;
-pub(super) const VIRTIO_VSOCK_INTID: u32 = 32 + VIRTIO_VSOCK_SPI;
 
 /// A guest interrupt line on the in-kernel GIC.
 ///
@@ -51,9 +43,13 @@ pub(super) struct HvfIrqLine {
 }
 
 impl HvfIrqLine {
-    /// Returns the line `intid` of `vm`, which kicks `kick` on a rise.
-    pub(super) fn new(vm: VmGic, intid: u32, kick: Option<Arc<Vcpus<Kicker>>>) -> Self {
-        Self { vm, intid, kick }
+    /// Returns the line of SPI `spi` of `vm`, which kicks `kick` on a rise.
+    pub(super) fn new(vm: VmGic, spi: u32, kick: Option<Arc<Vcpus<Kicker>>>) -> Self {
+        Self {
+            vm,
+            intid: SPI_BASE + spi,
+            kick,
+        }
     }
 }
 

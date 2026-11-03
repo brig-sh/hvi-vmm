@@ -648,14 +648,28 @@ pub struct BootConfig {
 }
 
 impl BootConfig {
-    /// Refuses a configuration the host's backend cannot serve.
+    /// Refuses a configuration the host's backend cannot boot.
     ///
     /// # Errors
     ///
-    /// Errors for an option the host has no device for, for two exports with
-    /// one tag, for exports [`check_fs`] or [`check_export_overlap`] refuses,
-    /// and on x86-64 for more vCPUs than `arch::x86_64::MAX_VCPUS`.
+    /// Errors for a ledger at a disk's image, for an option the host has no
+    /// device for, for two exports with one tag, for exports [`check_fs`] or
+    /// [`check_export_overlap`] refuses, and on x86-64 for more vCPUs than
+    /// `arch::x86_64::MAX_VCPUS`.
     pub(crate) fn check(&self) -> Result<(), String> {
+        // The ledger is opened, and so truncated, before the disks, so a disk
+        // lock cannot refuse it.
+        if let Some(events) = &self.events {
+            let disk = self
+                .disks
+                .iter()
+                .position(|disk| same_file(events, &disk.path));
+            if let Some(index) = disk {
+                return Err(format!(
+                    "--events {events}: cannot write the ledger to disk {index}'s image"
+                ));
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             // The Linux backends serve only exports a caller's vhost-user
@@ -718,6 +732,18 @@ impl BootConfig {
             Some(registration) => Ok(registration.into_handle()),
             None => Ok(crate::run::StopHandle::new_pair()?.0),
         }
+    }
+}
+
+/// Returns whether the paths `a` and `b` name one existing file.
+// The paths are the operator's, read once before the VM exists; see
+// clippy.toml.
+#[allow(clippy::disallowed_methods)]
+fn same_file(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -1303,6 +1329,25 @@ mod tests {
     #[test]
     fn configuration_with_no_devices_passes() {
         BootConfig::with_no_devices(1).check().unwrap();
+    }
+
+    // The ledger truncates its file when it opens, before any disk is opened.
+    #[test]
+    fn ledger_at_a_disk_image_is_refused() {
+        let image = std::env::temp_dir().join(format!("hvi-config-image-{}", std::process::id()));
+        std::fs::write(&image, b"data").unwrap();
+        let image = image.to_str().expect("a UTF-8 temporary path").to_string();
+        let cfg = BootConfig {
+            disks: vec![DiskConfig::rw("other.img"), DiskConfig::rw(image.clone())],
+            events: Some(image.clone()),
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = cfg.check().unwrap_err();
+        let _ = std::fs::remove_file(&image);
+        assert_eq!(
+            err,
+            format!("--events {image}: cannot write the ledger to disk 1's image")
+        );
     }
 
     #[cfg(target_os = "linux")]

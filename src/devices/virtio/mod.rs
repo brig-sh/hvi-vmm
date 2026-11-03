@@ -34,6 +34,7 @@ use queue::{Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 use crate::config::Stop;
 use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
+use crate::devices::irq::IrqLine;
 use crate::events::{CapturedEvent, Ledger};
 use crate::memory::GuestRam;
 use crate::plugin::IoSink;
@@ -54,6 +55,9 @@ pub(crate) trait VirtioMmio {
     /// Returns the sink the device fed since the last call, or `None` when it
     /// fed none.
     fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>>;
+
+    /// Connects the device to the interrupt line it drives.
+    fn connect_irq(&mut self, line: Arc<dyn IrqLine>);
 }
 
 /// A virtio device as a bus reaches it, with what a register access needs
@@ -154,6 +158,10 @@ impl VirtioMmio for VirtioBlk {
     fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
         VirtioBlk::take_fed_sink(self)
     }
+
+    fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        VirtioBlk::connect_irq(self, line);
+    }
 }
 
 impl VirtioMmio for VirtioNet {
@@ -168,6 +176,10 @@ impl VirtioMmio for VirtioNet {
     fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
         VirtioNet::take_fed_sink(self)
     }
+
+    fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        VirtioNet::connect_irq(self, line);
+    }
 }
 
 impl VirtioMmio for VirtioVsock {
@@ -181,6 +193,10 @@ impl VirtioMmio for VirtioVsock {
 
     fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
         None
+    }
+
+    fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+        VirtioVsock::connect_irq(self, line);
     }
 }
 
@@ -241,6 +257,8 @@ mod tests {
         fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
             self.fed_sink.take()
         }
+
+        fn connect_irq(&mut self, _line: Arc<dyn IrqLine>) {}
     }
 
     /// Returns the transport of a device that feeds a fresh `BatchSink`, and
