@@ -52,6 +52,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -1338,6 +1339,8 @@ impl VsockBridge {
     /// socket a previous run left, which would make `bind` fail with
     /// `EADDRINUSE`.
     ///
+    /// Any other file at `path` stays, and the bind fails on it.
+    ///
     /// The listener is non-blocking, so the accept loop can poll it beside the
     /// stop token and then accept without blocking. It must be bound before the
     /// seccomp filters go in, since they allow accepting on a listener already
@@ -1355,7 +1358,9 @@ impl VsockBridge {
         dev: Arc<Mutex<VirtioVsock>>,
         mem: Arc<GuestRam>,
     ) -> std::io::Result<Self> {
-        let _ = std::fs::remove_file(path);
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+            let _ = std::fs::remove_file(path);
+        }
         let listener = UnixListener::bind(path).map_err(|e| {
             std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
         })?;
@@ -1581,6 +1586,37 @@ mod tests {
         // Keep the event constant referenced. The credit-request one is
         // exercised for real by `credit_request_answers_only_a_live_session`.
         assert_eq!(EVENT_QUEUE, 2);
+    }
+
+    /// Returns the result of binding the agent socket at `path`.
+    fn bind_at(path: &std::path::Path) -> std::io::Result<VsockBridge> {
+        let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]));
+        let dev = Arc::new(Mutex::new(VirtioVsock::new()));
+        VsockBridge::bind(path.to_str().expect("a UTF-8 temporary path"), dev, ram)
+    }
+
+    // The tests make and remove files of their own; see clippy.toml.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn bind_keeps_a_file_that_is_not_a_socket() {
+        let path = std::env::temp_dir().join(format!("hvi-agent-file-{}", std::process::id()));
+        std::fs::write(&path, b"keep").unwrap();
+        let bound = bind_at(&path);
+        let kept = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(bound.is_err());
+        assert_eq!(kept, b"keep");
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn bind_replaces_a_stale_socket() {
+        let path = std::env::temp_dir().join(format!("hvi-agent-stale-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        drop(UnixListener::bind(&path).unwrap());
+        let bound = bind_at(&path);
+        let _ = std::fs::remove_file(&path);
+        bound.expect("the stale socket replaced");
     }
 }
 
