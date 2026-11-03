@@ -139,19 +139,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let mut net_reader: Option<std::os::unix::net::UnixStream> = None;
     let net_dev = if let Some(sock) = &cfg.net_gateway {
         match std::os::unix::net::UnixStream::connect(sock) {
-            Ok(stream) => match stream.try_clone() {
-                Ok(reader) => {
-                    eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock} (guest 10.87.0.2, gw/DNS 10.87.0.1)");
-                    net_reader = Some(reader);
-                    Some(VirtioNet::with_gateway(stream))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{LOG_PREFIX} WARNING: cannot clone gateway socket ({e}); net disabled"
-                    );
-                    None
-                }
-            },
+            Ok(stream) => {
+                let reader = stream
+                    .try_clone()
+                    .map_err(|e| format!("--net-gateway {sock}: cloning the socket: {e}"))?;
+                eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock} (guest 10.87.0.2, gw/DNS 10.87.0.1)");
+                net_reader = Some(reader);
+                Some(VirtioNet::with_gateway(stream))
+            }
             Err(e) => {
                 eprintln!(
                     "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
