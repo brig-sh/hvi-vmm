@@ -141,7 +141,7 @@ cargo build --release --example watch_guest
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
-| `disks` | `Vec<DiskConfig>` | virtio-blk disks, at most `MAX_DISKS` (4), in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
+| `disks` | `Vec<DiskConfig>` | virtio-blk disks, in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
 | `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
 | `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
 | `net` | `bool` | The built-in stub stack. |

@@ -24,8 +24,7 @@
 //! is treated as the default and reconciled against `applevisor`'s GIC size
 //! getters when the VM is built.
 
-use crate::config::MAX_DISKS;
-use crate::devices::manager::{Placement, Slot};
+use crate::devices::manager::SlotAllocator;
 
 /// Base of guest RAM (1 GiB), 2 MiB-aligned as the arm64 boot protocol wants.
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -71,32 +70,14 @@ pub const UART_SPI: u32 = 1;
 pub const RTC_BASE: u64 = 0x0c00_1000;
 pub const RTC_SIZE: u64 = 0x1000;
 
-/// virtio-mmio device ranges and interrupts, above the GIC and clear of the
-/// UART. Each device is one 0x200 page with its own SPI, in this order:
+/// The base of the virtio-mmio window, above the GIC and clear of the UART.
 ///
-/// | range from `VIRTIO_BASE`  | SPI     | device                   |
-/// |---------------------------|---------|--------------------------|
-/// | `+0x0000`                 | 2       | virtio-blk, disk 0       |
-/// | `+0x0200`                 | 3       | virtio-net               |
-/// | `+0x0400`                 | 4       | virtio-vsock             |
-/// | `+0x0600` .. `+0x0a00`    | 5 .. 7  | virtio-blk, disks 1 .. 3 |
-/// | `+0x0c00 + i * 0x200`     | `8 + i` | virtio-fs export `i`     |
-///
-/// The guest learns every range from the devicetree, so none of these is a
-/// contract. Disk 0, net and vsock keep the addresses they had when the disk
-/// was the only one.
-pub const VIRTIO_SIZE: u64 = crate::devices::virtio::mmio::RANGE_SIZE;
+/// `virtio_slots` hands out one range per device from here, and the SPIs from
+/// [`VIRTIO_SPI`]. The guest learns every range from the devicetree, so none of
+/// them is a contract.
 pub const VIRTIO_BASE: u64 = 0x0d00_0000;
+/// The SPI of the first virtio device. The UART holds SPI 1.
 pub const VIRTIO_SPI: u32 = 2;
-pub const VIRTIO_NET_BASE: u64 = 0x0d00_0200;
-pub const VIRTIO_NET_SPI: u32 = 3;
-pub const VIRTIO_VSOCK_BASE: u64 = 0x0d00_0400;
-pub const VIRTIO_VSOCK_SPI: u32 = 4;
-/// Range and SPI of disk 1. Disks 2 and 3 follow, one slot each.
-pub const VIRTIO_BLK_EXTRA_BASE: u64 = 0x0d00_0600;
-pub const VIRTIO_BLK_EXTRA_SPI: u32 = 5;
-pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
-pub const VIRTIO_FS_SPI: u32 = VIRTIO_BLK_EXTRA_SPI + MAX_DISKS as u32 - 1;
 
 /// The INTID of SPI 0, the first shared peripheral interrupt.
 pub const SPI_BASE: u32 = 32;
@@ -108,120 +89,18 @@ pub const SPI_BASE: u32 = 32;
 /// the devicetree and never delivered.
 pub const GIC_NUM_IRQS: u32 = 256;
 
-/// Returns the base of the `index`th virtio-fs device, or `None` on overflow.
+/// Returns the slots of the virtio devices, with ranges from [`VIRTIO_BASE`] up
+/// to [`DEVICE_WINDOW_END`] and SPIs from [`VIRTIO_SPI`] up to the GIC's
+/// `num_irqs` interrupts.
 ///
-/// Each export gets an independent transport and interrupt, because one
-/// virtio-fs device carries exactly one mount tag.
-#[must_use]
-pub fn virtio_fs_base(index: usize) -> Option<u64> {
-    let offset = (index as u64).checked_mul(VIRTIO_SIZE)?;
-    VIRTIO_FS_BASE.checked_add(offset)
-}
-
-/// Returns the interrupt of the `index`th virtio-fs device as a GIC SPI number,
-/// or `None` on overflow.
-#[must_use]
-pub fn virtio_fs_spi(index: usize) -> Option<u32> {
-    VIRTIO_FS_SPI.checked_add(u32::try_from(index).ok()?)
-}
-
-/// Returns the base and the SPI of the `index`th virtio-fs device.
-///
-/// An export whose SPI is past the GIC's interrupts would get a devicetree
-/// entry for an interrupt the controller does not have, and the guest would
-/// mount a device that never raises one. `num_irqs` is that count, where the
-/// backend sets it.
-///
-/// # Errors
-///
-/// Returns why the device does not fit: it would overlap `gic`, run past
-/// [`DEVICE_WINDOW_END`], or take an interrupt at or past `num_irqs`.
-pub fn place_virtio_fs(
-    index: usize,
-    gic: &GicLayout,
-    num_irqs: Option<u32>,
-) -> Result<(u64, u32), String> {
-    let (Some(base), Some(spi)) = (virtio_fs_base(index), virtio_fs_spi(index)) else {
-        return Err(format!("virtio-fs device {index}: address overflow"));
-    };
-    let end = base
-        .checked_add(VIRTIO_SIZE)
-        .ok_or_else(|| format!("virtio-fs device {index}: address overflow"))?;
-    let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
-    if base < gic_end || end > DEVICE_WINDOW_END {
-        return Err(format!(
-            "virtio-fs device {index} at {base:#x}..{end:#x} does not fit \
-             between the GIC (ends {gic_end:#x}) and {DEVICE_WINDOW_END:#x}"
-        ));
-    }
-    if let Some(num_irqs) = num_irqs {
-        if 32 + u64::from(spi) >= u64::from(num_irqs) {
-            return Err(format!(
-                "too many virtio-fs devices: device {index} would take SPI {spi}, \
-                 past the GIC's {num_irqs} interrupts"
-            ));
-        }
-    }
-    Ok((base, spi))
-}
-
-/// Placement of the virtio-blk device for disk `index`, or `None` past
-/// [`MAX_DISKS`].
-#[must_use]
-pub fn virtio_blk_base(index: usize) -> Option<u64> {
-    match index {
-        0 => Some(VIRTIO_BASE),
-        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_BASE + (i as u64 - 1) * VIRTIO_SIZE),
-        _ => None,
-    }
-}
-
-/// The SPI of the virtio-blk device for disk `index`, or `None` past
-/// [`MAX_DISKS`].
-#[must_use]
-pub fn virtio_blk_spi(index: usize) -> Option<u32> {
-    match index {
-        0 => Some(VIRTIO_SPI),
-        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_SPI + (i as u32 - 1)),
-        _ => None,
-    }
-}
-
-/// The slots of the virtio devices on an arm64 machine whose GIC is `gic`.
-pub(crate) struct VirtioSlots {
-    /// The GIC, which every range has to clear.
-    pub(crate) gic: GicLayout,
-    /// The number of interrupts the GIC has, which bounds the exports' SPIs, or
-    /// `None` for no bound.
-    pub(crate) num_irqs: Option<u32>,
-}
-
-impl Placement for VirtioSlots {
-    fn disk(&self, index: usize) -> Option<Slot> {
-        Some(Slot {
-            base: virtio_blk_base(index)?,
-            irq: virtio_blk_spi(index)?,
-        })
-    }
-
-    fn net(&self) -> Slot {
-        Slot {
-            base: VIRTIO_NET_BASE,
-            irq: VIRTIO_NET_SPI,
-        }
-    }
-
-    fn vsock(&self) -> Slot {
-        Slot {
-            base: VIRTIO_VSOCK_BASE,
-            irq: VIRTIO_VSOCK_SPI,
-        }
-    }
-
-    fn export(&self, index: usize) -> Result<Slot, String> {
-        let (base, irq) = place_virtio_fs(index, &self.gic, self.num_irqs)?;
-        Ok(Slot { base, irq })
-    }
+/// A device whose SPI is past the GIC's interrupts would get a devicetree entry
+/// for an interrupt the controller does not have, and the guest would mount a
+/// device that never raises one.
+pub(crate) fn virtio_slots(num_irqs: u32) -> SlotAllocator {
+    SlotAllocator::new(
+        VIRTIO_BASE..DEVICE_WINDOW_END,
+        VIRTIO_SPI..num_irqs.saturating_sub(SPI_BASE),
+    )
 }
 
 /// Which GIC architecture the guest is given.
@@ -593,92 +472,28 @@ mod tests {
         assert!(l.validate().is_err());
     }
 
-    // Shares are placed one after another above a redistributor region far
-    // larger on Apple than on QEMU, so a share count can walk out of either
-    // bound.
+    // The devices are placed one after another above the redistributor region,
+    // which is far larger on Apple than on QEMU. Every interrupt the KVM
+    // backend hands out has to be one of the GIC_NUM_IRQS its GIC has.
     #[test]
-    fn virtio_fs_ranges_clear_a_large_gic() {
+    fn virtio_slots_clear_a_large_gic_and_end_with_its_interrupts() {
         // What `hv_gic` reports on this host: a 32 MiB redistributor region,
         // where QEMU virt would have 128 KiB per vCPU.
         let gic = GicLayout {
             gicr_size: 0x0200_0000,
             ..GicLayout::QEMU_VIRT
         };
-        assert!(
-            gic.gicr_base + gic.gicr_size < VIRTIO_FS_BASE,
-            "the GIC ends below the fs ranges"
-        );
-        // Every interrupt the KVM backend hands out has to exist in the GIC it
-        // creates, which is what GIC_NUM_IRQS is.
-        let fits = (0..)
-            .take_while(|&index| place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).is_ok())
-            .count();
-        let last = u32::try_from(fits - 1).unwrap();
-        assert_eq!(32 + VIRTIO_FS_SPI + last, GIC_NUM_IRQS - 1);
-        let err = place_virtio_fs(fits, &gic, Some(GIC_NUM_IRQS)).unwrap_err();
-        assert!(err.contains("too many virtio-fs devices"), "{err}");
-        // Without an interrupt count, only the device window bounds them.
-        assert!(place_virtio_fs(fits, &gic, None).is_ok());
-    }
-
-    // The GICv3 layout covers every vCPU's redistributor already, so the
-    // exports start right above it at the most vCPUs it takes.
-    #[test]
-    fn virtio_fs_fits_above_the_largest_gicv3() {
-        let gic = GicLayout::for_vcpus(GicVersion::V3, GicLayout::V3_MAX_CPUS).unwrap();
-        place_virtio_fs(0, &gic, Some(GIC_NUM_IRQS)).expect("an export");
-    }
-
-    // Every disk adds a range and an SPI. Neither may land on another device,
-    // and the exports start right after the last disk slot. The RTC has a
-    // range and no SPI.
-    #[test]
-    fn disk_ranges_and_spis_clash_with_no_other_device() {
-        let mut ranges = vec![
-            ("uart", UART_BASE, UART_SIZE, Some(UART_SPI)),
-            ("rtc", RTC_BASE, RTC_SIZE, None),
-            ("net", VIRTIO_NET_BASE, VIRTIO_SIZE, Some(VIRTIO_NET_SPI)),
-            (
-                "vsock",
-                VIRTIO_VSOCK_BASE,
-                VIRTIO_SIZE,
-                Some(VIRTIO_VSOCK_SPI),
-            ),
-        ];
-        for i in 0..32 {
-            ranges.push((
-                "fs",
-                virtio_fs_base(i).unwrap(),
-                VIRTIO_SIZE,
-                Some(virtio_fs_spi(i).unwrap()),
-            ));
-        }
-        for i in 0..MAX_DISKS {
-            ranges.push((
-                "blk",
-                virtio_blk_base(i).expect("a disk slot"),
-                VIRTIO_SIZE,
-                Some(virtio_blk_spi(i).expect("a disk SPI")),
-            ));
-        }
-        for (a, (na, base_a, size_a, spi_a)) in ranges.iter().enumerate() {
-            for (nb, base_b, size_b, spi_b) in ranges.iter().skip(a + 1) {
-                let overlap = base_a < &(base_b + size_b) && base_b < &(base_a + size_a);
-                assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
-                if spi_a.is_some() {
-                    assert_ne!(spi_a, spi_b, "{na} and {nb} share SPI {spi_a:?}");
-                }
-            }
-        }
-        assert_eq!(virtio_blk_base(0), Some(VIRTIO_BASE), "disk 0 stays put");
-        assert_eq!(virtio_blk_spi(0), Some(VIRTIO_SPI));
-        assert_eq!(virtio_blk_base(1), Some(0x0d00_0600));
-        assert_eq!(virtio_blk_spi(1), Some(5));
-        assert_eq!(virtio_blk_spi(3), Some(7));
-        assert_eq!(virtio_blk_base(MAX_DISKS), None);
-        assert_eq!(virtio_blk_spi(MAX_DISKS), None);
-        assert_eq!(virtio_fs_base(0), Some(0x0d00_0c00));
-        assert_eq!(virtio_fs_spi(0), Some(8));
+        assert!(gic.gicr_base + gic.gicr_size <= VIRTIO_BASE);
+        let largest = GicLayout::for_vcpus(GicVersion::V3, GicLayout::V3_MAX_CPUS).unwrap();
+        assert!(largest.gicr_base + largest.gicr_size <= VIRTIO_BASE);
+        let mut slots = virtio_slots(GIC_NUM_IRQS);
+        assert_eq!(slots.capacity(), 222);
+        let taken: Vec<_> = std::iter::from_fn(|| slots.allocate().ok()).collect();
+        assert_eq!(taken.len(), 222);
+        assert_eq!(taken[0].base, VIRTIO_BASE);
+        assert_eq!(taken[0].irq, VIRTIO_SPI);
+        assert_eq!(SPI_BASE + taken[221].irq, GIC_NUM_IRQS - 1);
+        assert!(slots.allocate().unwrap_err().contains("no interrupt left"));
     }
 
     // A ragged initrd range kills a guest that turns it into a
@@ -713,22 +528,28 @@ mod tests {
         // 32 MiB on this host. Sizing the check from `V2_MAX_CPUS` would
         // check a GIC far smaller than the one the ranges must clear.
         let gic_end = GicLayout::QEMU_VIRT.gicr_base + 0x0200_0000;
-        let last_disk = virtio_blk_base(MAX_DISKS - 1).unwrap();
-        let ranges = [
-            ("uart", UART_BASE, UART_SIZE),
-            ("rtc", RTC_BASE, RTC_SIZE),
-            ("virtio-blk", VIRTIO_BASE, VIRTIO_SIZE),
-            ("virtio-net", VIRTIO_NET_BASE, VIRTIO_SIZE),
-            ("virtio-vsock", VIRTIO_VSOCK_BASE, VIRTIO_SIZE),
-            ("virtio-fs", VIRTIO_FS_BASE, VIRTIO_SIZE),
-            ("last virtio-blk", last_disk, VIRTIO_SIZE),
-        ];
-        for (name, base, size) in ranges {
+        let mut slots = virtio_slots(GIC_NUM_IRQS);
+        let virtio: Vec<_> = std::iter::from_fn(|| slots.allocate().ok())
+            .map(|slot| {
+                (
+                    "virtio",
+                    slot.base,
+                    crate::devices::virtio::mmio::RANGE_SIZE,
+                )
+            })
+            .collect();
+        let fixed = [("uart", UART_BASE, UART_SIZE), ("rtc", RTC_BASE, RTC_SIZE)];
+        for (name, base, size) in fixed.into_iter().chain(virtio.iter().copied()) {
             assert!(
                 base >= DEVICE_WINDOW_BASE && base + size <= DEVICE_WINDOW_END,
                 "{name} at {base:#x} escapes the static device map"
             );
             assert!(base >= gic_end, "{name} at {base:#x} overlaps the GIC");
         }
+        let (_, first, _) = virtio[0];
+        assert!(
+            first >= RTC_BASE + RTC_SIZE,
+            "the virtio ranges follow the RTC"
+        );
     }
 }

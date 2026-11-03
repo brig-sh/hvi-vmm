@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use applevisor::prelude::{VirtualMachine, VirtualMachineConfig};
 
-use super::gic::{gic_config, gic_layout, HvfIrqLine};
+use super::gic::{gic_config, gic_layout, gic_num_irqs, HvfIrqLine};
 use super::kick::Kicker;
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
-use crate::arch::aarch64::layout::{VirtioSlots, RAM_BASE, UART_BASE, UART_SPI};
+use crate::arch::aarch64::layout::{virtio_slots, RAM_BASE, UART_BASE, UART_SPI};
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
@@ -64,6 +64,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         )
         .into());
     }
+    // Refuse more virtio devices than the GIC has interrupts for before any of
+    // them opens.
+    let slots = virtio_slots(gic_num_irqs()?);
+    slots.check_room(cfg.virtio_device_count())?;
     let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config(&gic)?)?;
 
     // Guest RAM: one region mapped at RAM_BASE, backed by a shareable object
@@ -110,11 +114,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         Kicker::new(vm.clone(), num_cpus),
         cfg.take_stop_handle()?,
     ));
-    let placement = VirtioSlots {
-        gic,
-        num_irqs: None,
-    };
-    let mut devices = DeviceManager::new(&ram, &ledger, placement, {
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, {
         let (vm, vcpus) = (vm.clone(), Arc::clone(&vcpus));
         move |spi| {
             Arc::new(HvfIrqLine::new(vm.clone(), spi, Some(Arc::clone(&vcpus)))) as Arc<dyn IrqLine>
