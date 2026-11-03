@@ -14,23 +14,19 @@
 
 //! The host-side I/O threads a backend runs beside its vCPUs.
 //!
-//! [`IoThreads`] starts the threads that serve the guest's devices from the
-//! host: the console reader, the agent bridge, and the relay from a gateway or
-//! a tap. Each polls a stop token beside its own descriptor. [`IoThreads`] also
-//! starts the threads a plugin asked for in `on_attach`. A backend starts the
-//! threads only it has with [`IoThreads::spawn`]. Once the vCPUs have exited or
-//! been left running, [`IoThreads::stop`] requests the stop and joins every
-//! thread, as `teardown` describes.
+//! [`IoThreads`] starts the console reader, the threads a plugin asked for in
+//! `on_attach`, and the threads that serve the devices from the host, such as
+//! the agent bridge and the network relay, which each device queues in a
+//! [`HostWork`]. Each thread polls a stop token beside its own descriptor. A
+//! backend starts the threads only it has with [`IoThreads::spawn`]. Once the
+//! vCPUs have exited or been left running, [`IoThreads::stop`] requests the
+//! stop and joins every thread, as `teardown` describes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::devices::virtio::net::GatewayRelay;
-#[cfg(target_os = "linux")]
-use crate::devices::virtio::net::TapRelay;
-use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Guest, PluginThread};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
@@ -40,13 +36,51 @@ use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIME
 use crate::terminal;
 use crate::LOG_PREFIX;
 
-/// Where the network's frames come from, when they come from the host.
-pub(crate) enum NetSource {
-    /// A gvisor-tap-vsock gateway, over a stream socket.
-    Gateway(std::os::unix::net::UnixStream),
-    /// A tap device.
-    #[cfg(target_os = "linux")]
-    Tap(std::fs::File),
+/// The threads and stop actions of the devices on the host, held until the I/O
+/// threads start.
+///
+/// A thread spawned before the seccomp filters are armed would run unfiltered,
+/// so a device queues its threads here and [`IoThreads::start`] spawns them.
+#[derive(Default)]
+pub(crate) struct HostWork {
+    /// The threads, each with its name and what it runs.
+    threads: Vec<PluginThread>,
+    /// The actions the I/O threads' stop runs, for a thread that waits on
+    /// something a stop token cannot reach.
+    io_stops: Vec<Box<dyn FnOnce() + Send>>,
+    /// The hooks the vCPUs' stop runs, for a vCPU that waits outside the
+    /// hypervisor.
+    vcpu_stops: Vec<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl HostWork {
+    /// Queues a thread named `name` that runs `run` with a stop token.
+    pub(crate) fn spawn(
+        &mut self,
+        name: &'static str,
+        run: impl FnOnce(StopToken) + Send + 'static,
+    ) {
+        self.threads.push(PluginThread {
+            name,
+            run: Box::new(run),
+        });
+    }
+
+    /// Queues `action` for the I/O threads' stop, which runs it before it joins
+    /// the threads.
+    ///
+    /// It is for a thread that waits on something a stop token cannot reach,
+    /// such as a condition variable. The action must return at once.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn on_io_stop(&mut self, action: impl FnOnce() + Send + 'static) {
+        self.io_stops.push(Box::new(action));
+    }
+
+    /// Queues `hook` for the vCPUs' stop, as [`Vcpus::on_stop`] describes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn on_vcpu_stop(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.vcpu_stops.push(Box::new(hook));
+    }
 }
 
 /// A guard that, when its I/O thread panics, reports the run failed and asks it
@@ -71,9 +105,7 @@ impl<K: Kick> Drop for StopOnPanic<K> {
 /// The I/O threads of one VM and the stop that ends them.
 ///
 /// They serve the guest's devices from the host. A backend can start a thread
-/// of its own under the same stop, such as the x86 trace watchdog. It can also
-/// add a stop action for a thread that waits on something other than a stop
-/// token.
+/// of its own under the same stop, such as the x86 trace watchdog.
 pub(crate) struct IoThreads<K: Kick> {
     /// The vCPUs of the run, which a thread that panics stops.
     vcpus: Arc<Vcpus<K>>,
@@ -116,8 +148,8 @@ impl Drop for StopPlan {
 }
 
 impl<K: Kick> IoThreads<K> {
-    /// Starts the console reader, then the agent bridge and the network relay
-    /// when the guest has them, then `plugin_threads`.
+    /// Starts the console reader, adds the stop actions and hooks `host` holds,
+    /// then starts `plugin_threads` and the devices' threads in `host`.
     ///
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
@@ -127,9 +159,8 @@ impl<K: Kick> IoThreads<K> {
         guest: &Arc<Guest<K>>,
         plugin: Option<Arc<dyn Plugin>>,
         deliver: impl FnMut(u8) + Send + 'static,
-        bridge: Option<VsockBridge>,
-        net: Option<NetSource>,
         plugin_threads: Vec<PluginThread>,
+        host: HostWork,
     ) -> Self
     where
         K: 'static,
@@ -155,27 +186,19 @@ impl<K: Kick> IoThreads<K> {
             threads: Vec::new(),
             finish_count,
         };
-        if let Some(bridge) = bridge {
-            io_threads.spawn("agent bridge", move |stop| bridge.run(&stop));
+        let HostWork {
+            threads,
+            io_stops,
+            vcpu_stops,
+        } = host;
+        // The stop actions and hooks are added before the plugin's and the
+        // devices' threads start, so when a spawn panics the stop still ends
+        // the threads already started.
+        io_threads.stop.actions.extend(io_stops);
+        for hook in vcpu_stops {
+            guest.vcpus.on_stop(hook);
         }
-        if let (Some(net), Some(dev)) = (net, &guest.net) {
-            let (dev, ram) = (Arc::clone(dev), Arc::clone(&guest.ram));
-            let deliver = move |frame: &[u8]| dev.lock().unwrap().deliver(&ram, frame);
-            match net {
-                NetSource::Gateway(stream) => io_threads.spawn("gateway relay", move |stop| {
-                    if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
-                        stderrln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
-                    }
-                }),
-                #[cfg(target_os = "linux")]
-                NetSource::Tap(file) => io_threads.spawn("tap relay", move |stop| {
-                    if let Err(e) = TapRelay::new(file).run(&stop, deliver) {
-                        stderrln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
-                    }
-                }),
-            }
-        }
-        for PluginThread { name, run } in plugin_threads {
+        for PluginThread { name, run } in plugin_threads.into_iter().chain(threads) {
             io_threads.spawn(name, run);
         }
         io_threads
@@ -185,8 +208,8 @@ impl<K: Kick> IoThreads<K> {
     /// joined with the others.
     ///
     /// [`stop`](Self::stop) only joins the thread, so `body` has to return on
-    /// its own: it watches the token, or an action added with
-    /// [`on_stop`](Self::on_stop) ends it. A panic in `body` fails the run and
+    /// its own: it watches the token, or an action queued with
+    /// [`HostWork::on_io_stop`] ends it. A panic in `body` fails the run and
     /// asks it to stop.
     ///
     /// It has to be called from a thread with no seccomp filter, since naming
@@ -210,16 +233,6 @@ impl<K: Kick> IoThreads<K> {
             body,
         );
         self.threads.push(thread);
-    }
-
-    /// Adds an action that [`stop`](Self::stop) runs before it joins the
-    /// threads.
-    ///
-    /// It is for a thread that waits on something a stop token cannot reach,
-    /// such as a condition variable. The action must return at once.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn on_stop(&mut self, action: impl FnOnce() + Send + 'static) {
-        self.stop.actions.push(Box::new(action));
     }
 
     /// Requests the stop and joins every thread.
@@ -420,7 +433,10 @@ mod tests {
     fn dropping_the_threads_runs_their_stop() {
         let mut threads = IoThreads::idle(vcpus());
         let (ran, has_run) = std::sync::mpsc::channel();
-        threads.on_stop(move || ran.send(()).unwrap());
+        threads
+            .stop
+            .actions
+            .push(Box::new(move || ran.send(()).unwrap()));
         let token = threads.stop.source.token();
         drop(threads);
         assert!(has_run.try_recv().is_ok(), "the stop action did not run");

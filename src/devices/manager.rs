@@ -46,10 +46,10 @@ use crate::devices::virtio::fs::vhost_user;
 use crate::devices::virtio::fs::worker::{self, FsTransport};
 use crate::devices::virtio::mmio::RANGE_SIZE;
 use crate::devices::virtio::net::{self, VirtioNet};
-use crate::devices::virtio::vsock::{self, VsockBridge};
+use crate::devices::virtio::vsock;
 use crate::devices::virtio::{MmioTransport, VirtioMmio};
 use crate::events::Ledger;
-use crate::io_threads::NetSource;
+use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
 
 /// The error an attach returns.
@@ -116,13 +116,8 @@ pub(crate) struct Devices {
     pub(crate) disks: Vec<Arc<Mutex<VirtioBlk>>>,
     /// The virtio-net device, when the VM has a network.
     pub(crate) net: Option<Arc<Mutex<VirtioNet>>>,
-    /// Where the network relay reads the host's frames, when it reads any.
-    pub(crate) net_source: Option<NetSource>,
-    /// The bridge that serves the agent socket, when the VM has one.
-    pub(crate) bridge: Option<VsockBridge>,
-    /// The virtio-fs exports, each served by the caller's daemon.
-    #[cfg(target_os = "linux")]
-    pub(crate) exports: Vec<vhost_user::Export>,
+    /// What the devices run on the host beside the vCPUs.
+    pub(crate) host: HostWork,
     /// The virtio-fs exports, served in this process.
     #[cfg(target_os = "macos")]
     pub(crate) exports: Vec<worker::Export>,
@@ -163,8 +158,8 @@ impl DeviceManager {
                 mmio_bus: Bus::new(),
                 disks: Vec::new(),
                 net: None,
-                net_source: None,
-                bridge: None,
+                host: HostWork::default(),
+                #[cfg(target_os = "macos")]
                 exports: Vec::new(),
             },
         }
@@ -234,8 +229,10 @@ impl DeviceManager {
             return Ok(());
         };
         self.attach_virtio(DeviceKind::Net, self.placement.net(), &network.device)?;
+        if let Some(source) = network.source {
+            source.queue_relay(&network.device, &self.ram, &mut self.devices.host);
+        }
         self.devices.net = Some(network.device);
-        self.devices.net_source = network.source;
         Ok(())
     }
 
@@ -251,7 +248,10 @@ impl DeviceManager {
             return Ok(());
         };
         self.attach_virtio(DeviceKind::Vsock, self.placement.vsock(), &agent.device)?;
-        self.devices.bridge = Some(agent.bridge);
+        let bridge = agent.bridge;
+        self.devices
+            .host
+            .spawn("agent bridge", move |stop| bridge.run(&stop));
         Ok(())
     }
 
@@ -268,10 +268,16 @@ impl DeviceManager {
     #[cfg(target_os = "linux")]
     fn attach_exports(&mut self, exports: &[FsConfig], ram_fd: RawFd) -> Result<(), Error> {
         let slots = self.export_slots(exports.len())?;
-        for (export, slot) in vhost_user::attach(exports, ram_fd)?.into_iter().zip(slots) {
+        let exports = vhost_user::attach(exports, ram_fd)?;
+        for (export, slot) in exports.iter().zip(slots) {
             self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
-            self.devices.exports.push(export);
+            export.queue_interrupts(&mut self.devices.host);
         }
+        // A vCPU in an export's reset waits on its daemon, where no kick
+        // reaches it. Ending the connections at the stop frees it.
+        self.devices
+            .host
+            .on_vcpu_stop(move || vhost_user::shut_down(&exports));
         Ok(())
     }
 
@@ -295,6 +301,7 @@ impl DeviceManager {
                 slot,
                 Arc::new(FsTransport::new(&export, &self.ram)),
             )?;
+            export.queue_threads(&self.ram, &mut self.devices.host);
             self.devices.exports.push(export);
         }
         Ok(())
@@ -487,7 +494,6 @@ mod tests {
         let attached = devices.finish();
         assert_eq!(attached.disks.len(), 2);
         assert!(attached.net.is_some());
-        assert!(attached.bridge.is_some());
         let mut magic = [0; 4];
         attached
             .mmio_bus

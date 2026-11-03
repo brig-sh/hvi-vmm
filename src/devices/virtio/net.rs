@@ -56,7 +56,7 @@ use crate::devices::virtio::{
     mmio, tap, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
-use crate::io_threads::NetSource;
+use crate::io_threads::HostWork;
 use crate::plugin::IoSink;
 use crate::LOG_PREFIX;
 
@@ -156,6 +156,42 @@ impl std::fmt::Display for NetOutcome {
                 "WARNING: gateway {socket} unreachable ({error}); falling back to the {}",
                 stub_stack_line()
             ),
+        }
+    }
+}
+
+/// Where the network's frames come from, when they come from the host.
+pub(crate) enum NetSource {
+    /// A gvisor-tap-vsock gateway, over a stream socket.
+    Gateway(UnixStream),
+    /// A tap device.
+    #[cfg(target_os = "linux")]
+    Tap(File),
+}
+
+impl NetSource {
+    /// Queues in `host` the relay thread that reads the host's frames and
+    /// delivers them to `device`, whose queues are in `ram`.
+    pub(crate) fn queue_relay(
+        self,
+        device: &Arc<Mutex<VirtioNet>>,
+        ram: &Arc<GuestRam>,
+        host: &mut HostWork,
+    ) {
+        let (device, ram) = (Arc::clone(device), Arc::clone(ram));
+        let deliver = move |frame: &[u8]| device.lock().unwrap().deliver(&ram, frame);
+        match self {
+            Self::Gateway(stream) => host.spawn("gateway relay", move |stop| {
+                if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
+                    stderrln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
+                }
+            }),
+            #[cfg(target_os = "linux")]
+            Self::Tap(file) => host.spawn("tap relay", move |stop| {
+                if let Err(e) = TapRelay::new(file).run(&stop, deliver) {
+                    stderrln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
+                }
+            }),
         }
     }
 }
