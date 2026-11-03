@@ -20,6 +20,10 @@
 //! puts it on the MMIO bus, connects its interrupt and records it. The records
 //! describe the virtio devices to the guest's firmware, and
 //! [`DeviceManager::finish`] hands the bus and the devices to the guest.
+//!
+//! The firmware lists the virtio devices in the order they were attached, and
+//! Linux probes them in that order, so the guest probes the disks in argv
+//! order. It still has to tell them apart by serial.
 
 use std::ops::Range;
 #[cfg(target_os = "linux")]

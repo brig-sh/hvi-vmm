@@ -29,7 +29,7 @@ use linux_loader::loader::pe::{arm64_image_header, load_dtb, PE};
 use linux_loader::loader::KernelLoader;
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryBackend};
 
-use crate::arch::aarch64::fdt::{self, VirtioDevices};
+use crate::arch::aarch64::fdt::{self, MmioDevice};
 use crate::arch::aarch64::layout::{GicLayout, GuestLayout, RAM_BASE};
 
 /// arm64 `Image` magic, "ARM\x64" read as a little-endian `u32`.
@@ -134,7 +134,7 @@ impl LoadedKernel {
         gic: &GicLayout,
         num_cpus: u32,
         cmdline: &str,
-        devices: VirtioDevices,
+        devices: &[MmioDevice],
     ) -> Result<Plan, String> {
         let seed = host_entropy::<{ fdt::RNG_SEED_LEN }>("rng-seed")?;
         let kaslr_seed = u64::from_ne_bytes(host_entropy("kaslr-seed")?);
@@ -238,7 +238,7 @@ impl Payload<'_> {
         ram_size: u64,
         gic: &GicLayout,
         num_cpus: u32,
-        devices: VirtioDevices,
+        devices: &[MmioDevice],
     ) -> Result<GuestLayout, String> {
         let kernel = LoadedKernel::load(mem, self.kernel)?;
         let initrd_size = self.initramfs.map_or(0, |v| v.len() as u64);
@@ -389,7 +389,7 @@ pub(crate) mod tests {
                 &GicLayout::QEMU_VIRT,
                 2,
                 "console=ttyAMA0",
-                VirtioDevices::default(),
+                &[],
             )
             .expect("plan");
         assert_eq!(layout.dtb_addr, RAM_BASE + 0x40_0000);
@@ -398,14 +398,7 @@ pub(crate) mod tests {
         assert_eq!(layout.initrd_addr % 0x1000, 0);
         assert!(
             kernel
-                .plan(
-                    4 << 20,
-                    0,
-                    &GicLayout::QEMU_VIRT,
-                    1,
-                    "",
-                    VirtioDevices::default()
-                )
+                .plan(4 << 20, 0, &GicLayout::QEMU_VIRT, 1, "", &[])
                 .is_err(),
             "a kernel larger than RAM does not fit"
         );
@@ -421,13 +414,7 @@ pub(crate) mod tests {
             initramfs: Some(&initramfs),
             cmdline: "console=ttyAMA0",
         }
-        .load(
-            mem.memory(),
-            RAM_LEN as u64,
-            &GicLayout::QEMU_VIRT,
-            1,
-            VirtioDevices::default(),
-        )
+        .load(mem.memory(), RAM_LEN as u64, &GicLayout::QEMU_VIRT, 1, &[])
         .expect("load");
         assert_eq!(layout.kernel_addr, RAM_BASE);
         let mut back = vec![0u8; image.len()];
@@ -452,14 +439,7 @@ pub(crate) mod tests {
         };
         let seeds = || {
             let Plan { dtb, .. } = kernel
-                .plan(
-                    512 << 20,
-                    0,
-                    &GicLayout::QEMU_VIRT,
-                    1,
-                    "",
-                    VirtioDevices::default(),
-                )
+                .plan(512 << 20, 0, &GicLayout::QEMU_VIRT, 1, "", &[])
                 .expect("plan");
             let prop = |name: &str| fdt::tests::prop(&dtb, "chosen", name).expect(name);
             (prop("rng-seed"), prop("kaslr-seed"))

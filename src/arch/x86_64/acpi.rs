@@ -48,6 +48,7 @@ use crate::devices::legacy::acpi_pm::{
     PM1_CONTROL, PM1_CONTROL_LEN, PM1_EVENT_LEN, PM1_STATUS, RESET_REGISTER, RESET_VALUE,
     SLP_TYP_S5,
 };
+use crate::devices::manager::DeviceRecord;
 
 /// The OEM id every table carries.
 const OEM_ID: [u8; 6] = *b"HVI   ";
@@ -77,6 +78,18 @@ pub struct MmioDevice {
     pub size: u64,
     /// The IOAPIC line the device raises.
     pub gsi: u32,
+}
+
+/// Returns the virtio devices of `records`, in their order.
+pub(crate) fn virtio_devices(records: &[DeviceRecord]) -> Vec<MmioDevice> {
+    records
+        .iter()
+        .map(|record| MmioDevice {
+            base: record.range.start,
+            size: record.range.end - record.range.start,
+            gsi: record.irq,
+        })
+        .collect()
 }
 
 /// Builds the tables for `num_cpus` vCPUs and the virtio-mmio `devices`, as the
