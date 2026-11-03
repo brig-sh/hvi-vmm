@@ -359,9 +359,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 });
                 legacy_shares.push(fs_shares.len() - 1);
             }
-            // One virtio-fs export. `socket=` is Cloud Hypervisor's form, for a
-            // daemon the caller runs, which decides what it serves and whether
-            // the guest may write it. `path=` is a directory hvi serves itself.
+            // One virtio-fs export. `socket=` is for a daemon the caller runs,
+            // which decides what it serves and whether the guest may write it.
+            // `path=` is a directory hvi serves itself.
             "--fs" => {
                 let spec = it
                     .next()
