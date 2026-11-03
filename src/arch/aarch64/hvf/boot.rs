@@ -15,40 +15,25 @@
 //! The boot of an arm64 guest on Hypervisor.framework, from the VM and its GIC,
 //! its RAM and devices and the sandbox to the vCPU threads and the run.
 
-// `boot` resolves its paths once, while the VM is built and before any guest
-// request. See clippy.toml.
-#![allow(clippy::disallowed_methods)]
-
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::Arc;
 
 use applevisor::prelude::{VirtualMachine, VirtualMachineConfig};
 
-use super::gic::{
-    gic_config, gic_layout, HvfIrqLine, UART_INTID, VIRTIO_NET_INTID, VIRTIO_VSOCK_INTID,
-};
+use super::gic::{gic_config, gic_layout, HvfIrqLine};
 use super::kick::Kicker;
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    place_virtio_fs, virtio_blk_base, virtio_blk_spi, DEVICE_WINDOW_END, RAM_BASE, RTC_BASE,
-    RTC_SIZE, UART_BASE, UART_SIZE, VIRTIO_NET_BASE, VIRTIO_SIZE, VIRTIO_VSOCK_BASE,
+    virtio_blk_base, VirtioSlots, DEVICE_WINDOW_END, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE,
+    UART_SIZE, UART_SPI, VIRTIO_NET_BASE, VIRTIO_SIZE, VIRTIO_VSOCK_BASE,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::bus::{self, Bus};
 use crate::devices::irq::IrqLine;
-use crate::devices::legacy::pl011::Pl011;
-use crate::devices::legacy::rtc_pl031::Pl031;
-use crate::devices::virtio::block;
-use crate::devices::virtio::fs::fdlimit;
-use crate::devices::virtio::fs::server::{self, VirtioFs};
-use crate::devices::virtio::fs::worker::{run_fs_worker, Export, FsTransport, FsWake};
-use crate::devices::virtio::net;
-use crate::devices::virtio::vsock;
+use crate::devices::manager::{DeviceKind, DeviceManager, Devices};
+use crate::devices::virtio::fs::worker::run_fs_worker;
 use crate::events::Ledger;
-use crate::hypervisor::guest::{
-    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
-};
+use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::IoThreads;
 use crate::memory::{GuestRam, SharedRam};
@@ -75,8 +60,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     );
     // Every device range has to clear the GIC, and its end is known only here:
     // the framework sizes the redistributor region, and it is far larger than
-    // QEMU's. The fixed ranges are checked here, and the virtio-fs ones below
-    // as each share is placed, because those climb with the share count.
+    // QEMU's. The fixed ranges are checked here, and `VirtioSlots` checks each
+    // virtio-fs one as it places it, because those climb with the share count.
     let gic_end = gic.gicr_base.saturating_add(gic.gicr_size);
     let disk_ranges = (0..cfg.disks.len())
         .filter_map(virtio_blk_base)
@@ -132,79 +117,48 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         }
     }
 
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    let (net, net_source) = net::open(&cfg)?.map_or((None, None), |network| {
-        (Some(network.device), network.source)
-    });
-
-    let (vsock, bridge) = vsock::open(cfg.agent_sock.as_deref(), &ram)?
-        .map_or((None, None), |agent| {
-            (Some(agent.device), Some(agent.bridge))
-        });
-    // Seatbelt allows using a socket but not creating one, so the agent socket
-    // and the stop source's socket pair exist before it goes in.
-    let stop_source = StopSource::new()?;
-    let mut fs = Vec::with_capacity(cfg.fs_shares.len());
-    let mut fs_access = Vec::with_capacity(cfg.fs_shares.len());
-    for (index, share) in cfg.fs_shares.iter().enumerate() {
-        // The same two bounds as the fixed ranges above.
-        let (base, spi) = place_virtio_fs(index, &gic, None)?;
-        let root = std::fs::canonicalize(&share.path)?;
-        let access = if share.mode.writable() {
-            "read-write"
-        } else {
-            "read-only"
-        };
-        // Raise the descriptor limit before the first share exists, and log the
-        // result. virtio-fs pins one host descriptor per open guest handle.
-        // macOS gives a process launched outside a terminal 256, which a build
-        // inside the guest exhausts, and the guest then sees I/O errors on
-        // unrelated files.
-        if index == 0 {
-            match fdlimit::raise_open_file_limit() {
-                Ok(limit) => eprintln!("{LOG_PREFIX} open-file limit: {limit}"),
-                Err(e) => eprintln!(
-                    "{LOG_PREFIX} open-file limit: could not raise it ({e}); \
-                     a busy guest may see EMFILE as I/O errors"
-                ),
-            }
-        }
-        eprintln!(
-            "{LOG_PREFIX} virtio-fs[{index}]: {} as {:?} ({access})",
-            root.display(),
-            share.tag
-        );
-        fs_access.push((root.clone(), share.mode.writable()));
-        fs.push(Export {
-            base,
-            intid: 32 + spi,
-            dev: Arc::new(Mutex::new({
-                let mut dev = VirtioFs::new(root, &share.tag, share.mode.writable(), share.cache)?;
-                dev.set_guest_ids(server::GuestIds {
-                    uid: share.uid,
-                    gid: share.gid,
-                });
-                dev
-            })),
-            wake: Arc::new(FsWake::new()),
-        });
-    }
-    let has_net = net.is_some();
-    let has_vsock = vsock.is_some();
-    let fdt_devices = fdt::VirtioDevices {
-        blk_count: disks.len(),
-        net: has_net,
-        vsock: has_vsock,
-        fs_count: fs.len(),
-    };
-
-    let ledger = Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
+    // Each device's transport writes to the ledger, and its line kicks the
+    // vCPUs, so both exist before the devices.
+    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
     if ledger.is_enabled() {
         eprintln!(
             "{LOG_PREFIX} event ledger: {}",
             cfg.events.as_deref().unwrap_or("")
         );
     }
+    let vcpus = Arc::new(Vcpus::new(
+        num_cpus,
+        Kicker::new(vm.clone(), num_cpus),
+        cfg.take_stop_handle()?,
+    ));
+    let placement = VirtioSlots {
+        gic,
+        num_irqs: None,
+    };
+    let mut devices = DeviceManager::new(&ram, &ledger, placement, {
+        let (vm, vcpus) = (vm.clone(), Arc::clone(&vcpus));
+        move |spi| {
+            Arc::new(HvfIrqLine::new(vm.clone(), spi, Some(Arc::clone(&vcpus)))) as Arc<dyn IrqLine>
+        }
+    });
+    let pl011 = devices.attach_uart_and_rtc()?;
+    devices.attach_virtio_devices(&cfg)?;
+    // Seatbelt allows using a socket but not creating one, so the agent socket
+    // and the stop source's socket pair exist before it goes in.
+    let stop_source = StopSource::new()?;
+    let count = |kind| {
+        devices
+            .records()
+            .iter()
+            .filter(|record| record.kind == kind)
+            .count()
+    };
+    let fdt_devices = fdt::VirtioDevices {
+        blk_count: count(DeviceKind::Block),
+        net: count(DeviceKind::Net) > 0,
+        vsock: count(DeviceKind::Vsock) > 0,
+        fs_count: count(DeviceKind::Fs),
+    };
 
     let layout = loader::Payload {
         kernel: &cfg.kernel,
@@ -213,31 +167,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
     .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
 
-    let kicker = Kicker::new(vm.clone(), num_cpus);
-
-    let ledger = Arc::new(ledger);
-    let pl011 = Arc::new(Mutex::new(Pl011::new()));
-    let mut mmio_bus = Bus::new();
-    insert_virtio_devices(
-        &mut mmio_bus,
-        &ram,
-        &ledger,
-        VIRTIO_SIZE,
-        &disks,
-        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
-        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
-    )?;
-    mmio_bus.insert(
-        UART_BASE,
-        UART_SIZE,
-        Arc::clone(&pl011) as Arc<dyn bus::Device>,
-    )?;
-    mmio_bus.insert(RTC_BASE, RTC_SIZE, Arc::new(Mutex::new(Pl031::new())))?;
-    for export in &fs {
-        let transport = FsTransport::new(export, &ram);
-        mmio_bus.insert(export.base, VIRTIO_SIZE, Arc::new(transport))?;
-    }
-
+    let Devices {
+        mmio_bus,
+        disks,
+        net,
+        net_source,
+        bridge,
+        exports,
+    } = devices.finish();
     let context = VcpuContext {
         vm: vm.clone(),
         guest: Arc::new(Guest {
@@ -250,41 +187,17 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
-            vsock,
-            vcpus: Arc::new(Vcpus::new(num_cpus, kicker, cfg.take_stop_handle()?)),
+            vcpus,
             plugin_threads: PluginThreads::new(),
         }),
         kernel_addr: layout.kernel_addr,
         dtb_addr: layout.dtb_addr,
         plugin: cfg.plugin.clone(),
     };
-
-    let line = |intid, kick: bool| -> Arc<dyn IrqLine> {
-        Arc::new(HvfIrqLine::new(
-            vm.clone(),
-            intid,
-            kick.then(|| Arc::clone(&context.guest.vcpus)),
-        ))
-    };
-    pl011.lock().unwrap().connect_irq(line(UART_INTID, false));
-    context.guest.connect_irqs(
-        // `open_disks` refused more disks than there are SPIs.
-        |index| {
-            line(
-                32 + virtio_blk_spi(index).expect("every disk should have an SPI"),
-                true,
-            )
-        },
-        line(VIRTIO_NET_INTID, true),
-        line(VIRTIO_VSOCK_INTID, true),
-    );
-    for export in &fs {
-        export
-            .dev
-            .lock()
-            .unwrap()
-            .connect_irq(line(export.intid, true));
-    }
+    pl011
+        .lock()
+        .unwrap()
+        .connect_irq(Arc::new(HvfIrqLine::new(vm.clone(), UART_SPI, None)));
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.
@@ -308,6 +221,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // A profile that does not install fails the boot, because continuing would
     // leave a guest-facing process with the host's full authority.
     if cfg.sandbox {
+        let fs_access: Vec<_> = exports
+            .iter()
+            .map(|export| (export.root.clone(), export.writable))
+            .collect();
         seatbelt::enter_with_shares(&fs_access)
             .map_err(|e| format!("{e}; re-run with --no-sandbox to boot unconfined"))?;
         stderrln!("{LOG_PREFIX} seatbelt: on (deny default)");
@@ -329,7 +246,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     );
     // Each virtio-fs device gets its own worker thread, which serves the
     // requests a vCPU leaves past its inline budget. See `run_fs_worker`.
-    for export in &fs {
+    for export in &exports {
         let (dev, ram, wake) = (
             Arc::clone(&export.dev),
             Arc::clone(&context.guest.ram),
@@ -361,102 +278,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let result = run_to_stop(&context.guest, threads, failure, io_threads);
 
     // Report what the guest used, so a limit can be set from a real number.
-    for (index, export) in fs.iter().enumerate() {
-        report_fs_usage(index, &export.dev);
+    for (index, export) in exports.iter().enumerate() {
+        export.report_usage(index);
     }
 
     // `boot` keeps the run's claim when it sees a `LeftRunning` error, so the
     // error goes back as `run_to_stop` returned it.
     result
-}
-
-/// Prints the peak handle count, the operation counts and times, and the
-/// readahead counts of virtio-fs device `index`.
-///
-/// A worker left running at the stop deadline can still hold the device, stuck
-/// in a host call, so the lock is only tried. When the device is held, or a
-/// panic poisoned its lock, one line says so and the statistics are skipped.
-fn report_fs_usage(index: usize, dev: &Mutex<VirtioFs>) {
-    let dev = match dev.try_lock() {
-        Ok(dev) => dev,
-        Err(TryLockError::Poisoned(_)) => {
-            stderrln!("{LOG_PREFIX} virtio-fs[{index}]: statistics skipped after a panic");
-            return;
-        }
-        Err(TryLockError::WouldBlock) => {
-            stderrln!(
-                "{LOG_PREFIX} virtio-fs[{index}]: statistics skipped, the device is still in use"
-            );
-            return;
-        }
-    };
-    stderrln!(
-        "{LOG_PREFIX} virtio-fs[{index}]: peak {} of {} guest handles",
-        dev.peak_handles(),
-        dev.handle_limit()
-    );
-    let hist: Vec<String> = dev
-        .op_stats()
-        .into_iter()
-        .map(|(o, c, n)| {
-            format!(
-                "{}({})={}/{:.1}ms",
-                server::opcode_name(o),
-                o,
-                c,
-                n as f64 / 1e6
-            )
-        })
-        .collect();
-    stderrln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
-    let (hits, waits, misses) = dev.readahead_stats();
-    stderrln!(
-        "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::CachePolicy;
-    use std::time::{Duration, Instant};
-
-    // A worker stuck in a host call holds the device past the stop deadline.
-    // The report must not wait for it, or `boot` never returns the error that
-    // names the worker.
-    #[test]
-    fn report_fs_usage_skips_a_device_another_thread_holds() {
-        let dir = std::env::temp_dir().join(format!("hvi-fs-usage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = std::fs::canonicalize(&dir).unwrap();
-        let dev = Arc::new(Mutex::new(
-            VirtioFs::new(root, "share", false, CachePolicy::Auto).unwrap(),
-        ));
-        let (held, holding) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let worker = {
-            let dev = Arc::clone(&dev);
-            std::thread::spawn(move || {
-                let _device = dev.lock().unwrap();
-                held.send(()).unwrap();
-                let _ = released.recv();
-            })
-        };
-        holding.recv().unwrap();
-        let report = {
-            let dev = Arc::clone(&dev);
-            std::thread::spawn(move || report_fs_usage(0, &dev))
-        };
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !report.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let finished = report.is_finished();
-        release.send(()).unwrap();
-        worker.join().unwrap();
-        report.join().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(finished, "the report waited for the device");
-    }
 }

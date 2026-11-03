@@ -24,12 +24,12 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{DeviceFd, VmFd};
 
-use crate::arch::aarch64::layout::{GicLayout, GicVersion};
+use crate::arch::aarch64::layout::{GicLayout, GicVersion, SPI_BASE};
 use crate::LOG_PREFIX;
 
-/// Returns the KVM GSI of SPI `spi`, whose INTID is `32 + spi`.
+/// Returns the KVM GSI of SPI `spi`, whose INTID is [`SPI_BASE`] + `spi`.
 pub(super) fn spi_gsi(spi: u32) -> u32 {
-    (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | (32 + spi)
+    (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | (SPI_BASE + spi)
 }
 
 /// A VM's in-kernel vGIC, and the version KVM created.

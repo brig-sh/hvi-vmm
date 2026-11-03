@@ -16,7 +16,7 @@
 //! devices to the vCPUs and the run.
 
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kvm_bindings::{
     kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PTRAUTH_ADDRESS,
@@ -29,23 +29,16 @@ use super::regs::{setup_boot_regs, try_get_u64, REG_MPIDR_EL1};
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
-    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE,
-    UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    mpidr_affinity, GicLayout, GicVersion, VirtioSlots, GIC_NUM_IRQS, MPIDR_AFFINITY_MASK,
+    RAM_BASE, UART_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::bus::{self, Bus};
-use crate::devices::legacy::pl011::Pl011;
-use crate::devices::legacy::rtc_pl031::Pl031;
-use crate::devices::virtio::block;
+use crate::devices::irq::IrqLine;
+use crate::devices::manager::{DeviceKind, DeviceManager, Devices};
 use crate::devices::virtio::fs::vhost_user;
-use crate::devices::virtio::net;
-use crate::devices::virtio::vsock;
 use crate::events::Ledger;
-use crate::hypervisor::guest::{
-    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
-};
+use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::memory::{GuestRam, SharedRam};
@@ -68,7 +61,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     if !kvm.check_extension(Cap::ImmediateExit) {
         return Err("hvi needs KVM_CAP_IMMEDIATE_EXIT, which Linux 4.11 added".into());
     }
-    let vm = kvm.create_vm()?;
+    let vm = Arc::new(kvm.create_vm()?);
 
     // The guest GIC has to exist before the DTB is built, because the version
     // KVM creates decides what the DTB describes.
@@ -100,30 +93,32 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     )?);
     ram.register_kvm_slots(&vm)?;
 
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    let (net, net_source) = net::open(&cfg)?.map_or((None, None), |network| {
-        (Some(network.device), network.source)
+    // The ledger exists first, since each device's transport writes to it.
+    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
+    let placement = VirtioSlots {
+        gic,
+        num_irqs: Some(GIC_NUM_IRQS),
+    };
+    let mut devices = DeviceManager::new(&ram, &ledger, placement, {
+        let vm = Arc::clone(&vm);
+        move |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi))) as Arc<dyn IrqLine>
     });
-
-    let (vsock, bridge) = vsock::open(cfg.agent_sock.as_deref(), &ram)?
-        .map_or((None, None), |agent| {
-            (Some(agent.device), Some(agent.bridge))
-        });
-    // virtio-fs: one transport per export, each served by the caller's daemon.
-    let fs = vhost_user::attach(&cfg.fs, shared_ram.as_raw_fd(), |index| {
-        place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).map_err(std::io::Error::other)
-    })?;
-
-    let has_net = net.is_some();
-    let has_vsock = vsock.is_some();
+    let pl011 = devices.attach_uart_and_rtc()?;
+    devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
+    let count = |kind| {
+        devices
+            .records()
+            .iter()
+            .filter(|record| record.kind == kind)
+            .count()
+    };
     let fdt_devices = fdt::VirtioDevices {
-        blk_count: disks.len(),
-        net: has_net,
-        vsock: has_vsock,
-        fs_count: fs.len(),
+        blk_count: count(DeviceKind::Block),
+        net: count(DeviceKind::Net) > 0,
+        vsock: count(DeviceKind::Vsock) > 0,
+        fs_count: count(DeviceKind::Fs),
     };
 
-    let ledger = Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
     let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
@@ -170,27 +165,15 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     setup_boot_regs(&vcpus[0], layout.kernel_addr, layout.dtb_addr);
 
-    let vm = Arc::new(vm);
-    let ledger = Arc::new(ledger);
-    let pl011 = Arc::new(Mutex::new(Pl011::new()));
-    let fs = Arc::new(fs);
-    let mut mmio_bus = Bus::new();
-    insert_virtio_devices(
-        &mut mmio_bus,
-        &ram,
-        &ledger,
-        VIRTIO_SIZE,
-        &disks,
-        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
-        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
-    )?;
-    mmio_bus.insert(
-        UART_BASE,
-        UART_SIZE,
-        Arc::clone(&pl011) as Arc<dyn bus::Device>,
-    )?;
-    mmio_bus.insert(RTC_BASE, RTC_SIZE, Arc::new(Mutex::new(Pl031::new())))?;
-    vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
+    let Devices {
+        mmio_bus,
+        disks,
+        net,
+        net_source,
+        bridge,
+        exports,
+    } = devices.finish();
+    let exports = Arc::new(exports);
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -202,7 +185,6 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
-            vsock,
             vcpus: Arc::new(Vcpus::new(
                 num_cpus,
                 Kicker::new(num_cpus),
@@ -213,22 +195,15 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
-    pl011.lock().unwrap().connect_irq(line(UART_SPI));
-    context.guest.connect_irqs(
-        // `open_disks` refused more disks than there are SPIs.
-        |index| line(virtio_blk_spi(index).expect("every disk should have an SPI")),
-        line(VIRTIO_NET_SPI),
-        line(VIRTIO_VSOCK_SPI),
-    );
-    for export in fs.iter() {
-        export.dev.lock().unwrap().connect_irq(line(export.irq));
-    }
+    pl011.lock().unwrap().connect_irq(Arc::new(KvmIrqLine::new(
+        Arc::clone(&vm),
+        spi_gsi(UART_SPI),
+    )));
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
     context.guest.vcpus.on_stop({
-        let fs = Arc::clone(&fs);
-        move || vhost_user::shut_down(&fs)
+        let exports = Arc::clone(&exports);
+        move || vhost_user::shut_down(&exports)
     });
 
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
@@ -238,7 +213,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         bridge,
         net_source,
     )?;
-    vhost_user::start_interrupt_threads(&fs, &mut io_threads);
+    vhost_user::start_interrupt_threads(&exports, &mut io_threads);
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();

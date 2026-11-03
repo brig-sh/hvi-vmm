@@ -648,7 +648,7 @@ pub struct BootConfig {
 }
 
 impl BootConfig {
-    /// Refuses a configuration the host's backend cannot serve.
+    /// Refuses a configuration the host's backend cannot boot.
     ///
     /// # Errors
     ///

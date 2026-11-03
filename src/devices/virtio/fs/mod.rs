@@ -18,8 +18,8 @@
 //! device and answers the guest's FUSE requests against the exported host
 //! directories. The server holds a host descriptor for every handle the guest
 //! has open, so `fdlimit` raises the process's open-file limit and derives from
-//! it how many handles the guest may hold. `worker` runs each device's worker
-//! thread, which serves the requests a vCPU leaves to it.
+//! it how many handles the guest may hold. `worker` builds the exports and runs
+//! each device's worker thread, which serves the requests a vCPU leaves to it.
 //!
 //! On Linux a vhost-user daemon the caller runs, such as `virtiofsd`, serves
 //! each export. `vhost_user` holds the register file the guest talks to and
