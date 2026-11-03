@@ -33,10 +33,9 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
-use crate::devices::virtio::vsock::VsockBridge;
 use crate::hypervisor::guest::{Guest, LedgerCloseGuard, SafepointVcpu};
 use crate::hypervisor::vcpus::{report_on_panic, Kick, Outcome};
-use crate::io_threads::{IoThreads, NetSource};
+use crate::io_threads::{HostWork, IoThreads};
 use crate::plugin::Plugin;
 use crate::run::{record_start, run_to_stop};
 use crate::sandbox::seccomp;
@@ -213,10 +212,9 @@ impl Drop for Registration<'_> {
 /// before the first I/O or vCPU thread exists, and a binary's stop-signal
 /// thread starts right after. The stop source's socket pair is created before
 /// any filter goes in, since the allowlists allow using a socket already held
-/// but not creating one. Then the I/O threads start, with the agent `bridge`,
-/// the network relay reading `net` and the threads the plugin asked for, each
-/// filtering itself as it begins. It also returns the ledger's
-/// [`LedgerCloseGuard`].
+/// but not creating one. Then the I/O threads start, with the threads the
+/// plugin asked for and the devices' `host` work, each filtering itself as it
+/// begins. It also returns the ledger's [`LedgerCloseGuard`].
 ///
 /// # Errors
 ///
@@ -227,8 +225,7 @@ pub(crate) fn start_io_threads(
     cfg: &BootConfig,
     guest: &Arc<Guest<Kicker>>,
     deliver: impl FnMut(u8) + Send + 'static,
-    bridge: Option<VsockBridge>,
-    net: Option<NetSource>,
+    host: HostWork,
 ) -> Result<
     (seccomp::Filters, IoThreads<Kicker>, LedgerCloseGuard),
     Box<dyn std::error::Error + Send + Sync>,
@@ -247,9 +244,8 @@ pub(crate) fn start_io_threads(
         guest,
         cfg.plugin.clone(),
         deliver,
-        bridge,
-        net,
         plugin_threads,
+        host,
     );
     Ok((filters, io_threads, ledger_guard))
 }

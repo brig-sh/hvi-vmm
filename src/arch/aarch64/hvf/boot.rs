@@ -28,7 +28,6 @@ use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::manager::{DeviceManager, Devices};
-use crate::devices::virtio::fs::worker::run_fs_worker;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::vcpus::Vcpus;
@@ -139,8 +138,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         mmio_bus,
         disks,
         net,
-        net_source,
-        bridge,
+        host,
         exports,
     } = devices.finish();
     let context = VcpuContext {
@@ -203,35 +201,14 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // The I/O threads, which are joined after the vCPUs. `teardown` describes
     // the stop.
     install_kick_handler();
-    let mut io_threads = IoThreads::start(
+    let io_threads = IoThreads::start(
         stop_source,
         &context.guest,
         context.plugin.clone(),
         move |byte| pl011.lock().unwrap().push_rx(byte),
-        bridge,
-        net_source,
         plugin_threads,
+        host,
     );
-    // Each virtio-fs device gets its own worker thread, which serves the
-    // requests a vCPU leaves past its inline budget. See `run_fs_worker`.
-    for export in &exports {
-        let (dev, ram, wake) = (
-            Arc::clone(&export.dev),
-            Arc::clone(&context.guest.ram),
-            Arc::clone(&export.wake),
-        );
-        io_threads.spawn("virtio-fs worker", move |_| {
-            run_fs_worker(&dev, &ram, &wake);
-        });
-        let wake = Arc::clone(&export.wake);
-        io_threads.on_stop(move || wake.stop());
-        let (workers, stop) = export.dev.lock().unwrap().readahead_workers();
-        for worker in workers {
-            io_threads.spawn("virtio-fs readahead", move |_| worker());
-        }
-        io_threads.on_stop(move || stop.stop());
-    }
-
     // The run closes the ledger from here on.
     ledger_guard.disarm();
     let _current = record_start(&context.guest, cfg.sandbox);

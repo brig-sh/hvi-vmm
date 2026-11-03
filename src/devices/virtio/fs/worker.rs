@@ -28,6 +28,7 @@ use super::server::{self, VirtioFs};
 use crate::config::{FsShare, Stop};
 use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
 use crate::devices::virtio::mmio;
+use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
 
@@ -99,6 +100,29 @@ pub(crate) fn attach(shares: &[FsShare]) -> io::Result<Vec<Export>> {
 }
 
 impl Export {
+    /// Queues in `host` the device's worker thread and its readahead workers,
+    /// with the stop actions that end them.
+    ///
+    /// The worker serves the requests a vCPU leaves past its inline budget; see
+    /// [`run_fs_worker`]. Its queues are in `ram`.
+    pub(crate) fn queue_threads(&self, ram: &Arc<GuestRam>, host: &mut HostWork) {
+        let (dev, ram, wake) = (
+            Arc::clone(&self.dev),
+            Arc::clone(ram),
+            Arc::clone(&self.wake),
+        );
+        host.spawn("virtio-fs worker", move |_| {
+            run_fs_worker(&dev, &ram, &wake)
+        });
+        let wake = Arc::clone(&self.wake);
+        host.on_io_stop(move || wake.stop());
+        let (workers, stop) = self.dev.lock().unwrap().readahead_workers();
+        for worker in workers {
+            host.spawn("virtio-fs readahead", move |_| worker());
+        }
+        host.on_io_stop(move || stop.stop());
+    }
+
     /// Prints the peak handle count, the operation counts and times, and the
     /// readahead counts of the device, as export `index`.
     ///

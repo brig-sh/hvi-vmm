@@ -36,7 +36,6 @@ use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
 use crate::devices::irq::IrqLine;
 use crate::devices::manager::{DeviceManager, Devices};
-use crate::devices::virtio::fs::vhost_user;
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
@@ -157,11 +156,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         mmio_bus,
         disks,
         net,
-        net_source,
-        bridge,
-        exports,
+        host,
     } = devices.finish();
-    let exports = Arc::new(exports);
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -187,21 +183,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         Arc::clone(&vm),
         spi_gsi(UART_SPI),
     )));
-    // A vCPU in an export's reset waits on its daemon, where no kick reaches
-    // it. Ending the connections at the stop frees it.
-    context.guest.vcpus.on_stop({
-        let exports = Arc::clone(&exports);
-        move || vhost_user::shut_down(&exports)
-    });
-
-    let (filters, mut io_threads, ledger_guard) = start_io_threads(
+    let (filters, io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
         move |byte| pl011.lock().unwrap().push_rx(byte),
-        bridge,
-        net_source,
+        host,
     )?;
-    vhost_user::start_interrupt_threads(&exports, &mut io_threads);
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();
