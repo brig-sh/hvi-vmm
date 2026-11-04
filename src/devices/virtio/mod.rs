@@ -32,6 +32,7 @@ pub mod vsock;
 
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 
 use mmio::Interrupt;
 use queue::{Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -119,6 +120,16 @@ pub(crate) trait Device: Send {
     fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
         None
     }
+
+    /// Returns the waker of the thread the device left queue work to since the
+    /// last call, or `None` when it left none.
+    ///
+    /// [`notify`](Self::notify) runs with the device locked. A thread woken
+    /// there would start by waiting for that lock, so the device returns its
+    /// waker here instead.
+    fn take_pending_wake(&mut self) -> Option<Waker> {
+        None
+    }
 }
 
 /// The activation state of a device, with the interrupt it raises while active.
@@ -141,6 +152,12 @@ impl DeviceState {
         if let Self::Active(interrupt) = self {
             interrupt.signal_used_buffer();
         }
+    }
+
+    /// Returns whether the device has a notification pending.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn is_raised(&self) -> bool {
+        matches!(self, Self::Active(interrupt) if interrupt.is_raised())
     }
 }
 
