@@ -200,6 +200,12 @@ impl Interrupt {
         self.state.lock().unwrap().status
     }
 
+    /// Returns whether a notification is pending.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn is_raised(&self) -> bool {
+        self.status() != 0
+    }
+
     /// Clears the notification `bits` and lowers the line once none is left,
     /// when the interrupt is enabled.
     fn acknowledge(&self, bits: u32) {
@@ -553,16 +559,25 @@ impl<D: virtio::Device> Transport<D> {
 
     /// Returns the result of `serve` run on the device.
     ///
-    /// Once the device lock is released, the batch of the sink the call fed
-    /// ends, and then the events the device captured go to the ledger. The
-    /// batch ends first, so a reader that waits on the sink does not also wait
-    /// for the ledger.
+    /// Three steps follow once the device lock is released. The thread the
+    /// device left queue work to is woken, so it runs during the other two. The
+    /// sink the device fed ends its batch. The captured events go to the
+    /// ledger. The batch ends before the ledger write, so a reader that waits
+    /// on the sink does not also wait for the ledger.
     fn access_device<R>(&self, serve: impl FnOnce(&mut D, &GuestRam) -> R) -> R {
-        let (served, events, sink) = {
+        let (served, wake, events, sink) = {
             let mut device = self.device.lock().unwrap();
             let served = serve(&mut device, &self.ram);
-            (served, device.take_events(), device.take_fed_sink())
+            (
+                served,
+                device.take_pending_wake(),
+                device.take_events(),
+                device.take_fed_sink(),
+            )
         };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
         if let Some(sink) = sink {
             sink.on_batch_end();
         }

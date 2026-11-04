@@ -15,29 +15,20 @@
 //! The exports of the macOS virtio-fs devices, as [`attach`] builds them.
 //!
 //! Each device has a worker thread, which serves the requests a vCPU leaves
-//! past its inline budget, a wake signal the worker parks on, and a transport
-//! on the bus.
+//! past its inline budget, and a wake signal the worker parks on.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
 use super::fdlimit;
 use super::server::{self, VirtioFs};
-use crate::config::{FsShare, Stop};
-use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
-use crate::devices::virtio::mmio;
+use crate::config::FsShare;
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
-
-/// How many virtio-fs chains a vCPU services in its own exit before handing the
-/// rest to the device's worker thread.
-///
-/// A single guest syscall's requests stay on the vCPU, and a deep queue goes to
-/// the worker.
-const FS_INLINE_BUDGET: u16 = 8;
 
 /// One virtio-fs export as the macOS backend wires it.
 pub(crate) struct Export {
@@ -89,9 +80,11 @@ pub(crate) fn attach(shares: &[FsShare]) -> io::Result<Vec<Export>> {
             uid: share.uid,
             gid: share.gid,
         });
+        let wake = Arc::new(FsWake::new());
+        dev.set_waker(Waker::from(Arc::clone(&wake)));
         exports.push(Export {
             dev: Arc::new(Mutex::new(dev)),
-            wake: Arc::new(FsWake::new()),
+            wake,
             root,
             writable,
         });
@@ -167,61 +160,6 @@ impl Export {
         stderrln!(
             "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
         );
-    }
-}
-
-/// A virtio-fs device as a bus reaches it, with what a register access needs
-/// beyond the device.
-pub(crate) struct FsTransport {
-    /// The device.
-    device: Arc<Mutex<VirtioFs>>,
-    /// The wake signal of the device's worker thread.
-    wake: Arc<FsWake>,
-    /// The guest RAM its queues are in.
-    ram: Arc<GuestRam>,
-}
-
-impl FsTransport {
-    /// Returns the transport of `export`.
-    pub(crate) fn new(export: &Export, ram: &Arc<GuestRam>) -> Self {
-        Self {
-            device: Arc::clone(&export.dev),
-            wake: Arc::clone(&export.wake),
-            ram: Arc::clone(ram),
-        }
-    }
-}
-
-impl bus::Device for FsTransport {
-    fn read(&self, offset: u64, data: &mut [u8]) {
-        let value = self
-            .device
-            .lock()
-            .unwrap()
-            .mmio(&self.ram, offset, false, 0);
-        fill_le_bytes(data, value);
-    }
-
-    /// Applies the write, and on a `QUEUE_NOTIFY` serves a shallow queue at
-    /// once and wakes the device's worker thread, `run_fs_worker`, for the
-    /// rest.
-    ///
-    /// `mmio` only records the queue index of a notify. Waking the worker takes
-    /// longer than the host work of a small request, and a deep queue goes to
-    /// the worker so the vCPU can run the guest while the worker drains it. The
-    /// vCPU is held for the host calls the shallow queue's requests make, so no
-    /// request may make one that blocks.
-    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
-        let remaining = {
-            let mut device = self.device.lock().unwrap();
-            device.mmio(&self.ram, offset, true, u64_from_le_bytes(data));
-            offset == mmio::QUEUE_NOTIFY
-                && device.drain_notified_bounded(&self.ram, FS_INLINE_BUDGET)
-        };
-        if remaining {
-            self.wake.wake();
-        }
-        None
     }
 }
 
@@ -306,6 +244,12 @@ impl FsWake {
     }
 }
 
+impl Wake for FsWake {
+    fn wake(self: Arc<Self>) {
+        FsWake::wake(&self);
+    }
+}
+
 /// How often the worker retries the SETLKW requests parked on the device
 /// (`LockWaiter` in the server), while any is parked.
 ///
@@ -324,8 +268,7 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// `LOCK_RETRY_INTERVAL` until none is left.
 ///
 /// Each device has one worker, since a single mutex guards all of its
-/// `VirtioFs` state. A pass under that mutex raises the line and kicks the
-/// vCPUs at most once, however many requests it served.
+/// `VirtioFs` state.
 ///
 /// `wake.park()` waits on a predicate and a `Condvar` (see `FsWake`). A notify
 /// that races the loop is either served by the drain in progress, since both
@@ -351,7 +294,7 @@ pub(crate) fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake
     // A wake that arrived with the stop was cleared by that last `park`, and
     // the chains it announced are still in the ring, so one unbounded pass
     // drains them. A vCPU left running at its join deadline that is still in
-    // `FsTransport::write` can leave chains past its inline budget after this
+    // the device's `notify` can leave chains past its inline budget after this
     // pass, with no worker to serve them. Only a run that already fails does
     // that.
     dev.lock().unwrap().drain_notified(mem);
