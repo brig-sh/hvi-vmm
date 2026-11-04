@@ -964,6 +964,16 @@ mod device {
         }
 
         #[test]
+        fn common_registers_follow_virtio_1_2() {
+            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (ram, mem) = guest_ram();
+            let dev =
+                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
+            testing::assert_common_registers(dev, &mem, rings(BASE));
+            daemon.requests();
+        }
+
+        #[test]
         fn more_request_queues_than_the_daemon_serves_are_refused() {
             let (daemon, stream) = Daemon::spawn(VringBase::Answer);
             let (ram, _mem) = guest_ram();

@@ -22,12 +22,10 @@
 //! [`Interrupt`] holds the interrupt status and the line, which the transport
 //! and the device share.
 //!
-//! The offsets come from `virtio-bindings`, which is bindgen output from the
-//! kernel headers, so they match the kernel's. They are re-exported as `u64`
-//! because that is what an MMIO dispatch matches on, and under our own names
-//! where the kernel's differ: the spec calls the second and third rings
-//! *driver* and *device*, which is what the register names say, while the
-//! kernel header still calls them *avail* and *used*.
+//! The offsets come from `virtio-bindings`, which bindgen generates from the
+//! kernel headers. They are `u64`, the offset type an MMIO dispatch matches on.
+//! The second and third ring registers take the spec's names, *driver* and
+//! *device*, where the kernel header names them *avail* and *used*.
 
 use std::sync::{Arc, Mutex};
 
@@ -49,37 +47,40 @@ use crate::LOG_PREFIX;
 
 /// The size of one device's register range, which holds the common registers
 /// below `0x100` and the device's configuration space from there.
-pub const RANGE_SIZE: u64 = 0x200;
+pub(crate) const RANGE_SIZE: u64 = 0x200;
 
-pub const MAGIC: u64 = VIRTIO_MMIO_MAGIC_VALUE as u64; // "virt"
-pub const VERSION: u64 = VIRTIO_MMIO_VERSION as u64; // 2
-pub const DEVICE_ID: u64 = VIRTIO_MMIO_DEVICE_ID as u64;
-pub const VENDOR_ID: u64 = VIRTIO_MMIO_VENDOR_ID as u64;
-pub const DEVICE_FEATURES: u64 = VIRTIO_MMIO_DEVICE_FEATURES as u64;
-pub const DEVICE_FEATURES_SEL: u64 = VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64;
-pub const DRIVER_FEATURES: u64 = VIRTIO_MMIO_DRIVER_FEATURES as u64;
-pub const DRIVER_FEATURES_SEL: u64 = VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64;
-pub const QUEUE_SEL: u64 = VIRTIO_MMIO_QUEUE_SEL as u64;
-pub const QUEUE_NUM_MAX: u64 = VIRTIO_MMIO_QUEUE_NUM_MAX as u64;
-pub const QUEUE_NUM: u64 = VIRTIO_MMIO_QUEUE_NUM as u64;
-pub const QUEUE_READY: u64 = VIRTIO_MMIO_QUEUE_READY as u64;
-pub const QUEUE_NOTIFY: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
-pub const INTERRUPT_STATUS: u64 = VIRTIO_MMIO_INTERRUPT_STATUS as u64;
-pub const INTERRUPT_ACK: u64 = VIRTIO_MMIO_INTERRUPT_ACK as u64;
-pub const STATUS: u64 = VIRTIO_MMIO_STATUS as u64;
-pub const QUEUE_DESC_LOW: u64 = VIRTIO_MMIO_QUEUE_DESC_LOW as u64;
-pub const QUEUE_DESC_HIGH: u64 = VIRTIO_MMIO_QUEUE_DESC_HIGH as u64;
-pub const QUEUE_DRIVER_LOW: u64 = VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
-pub const QUEUE_DRIVER_HIGH: u64 = VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
-pub const QUEUE_DEVICE_LOW: u64 = VIRTIO_MMIO_QUEUE_USED_LOW as u64;
-pub const QUEUE_DEVICE_HIGH: u64 = VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
+pub(crate) const MAGIC: u64 = VIRTIO_MMIO_MAGIC_VALUE as u64;
+const VERSION: u64 = VIRTIO_MMIO_VERSION as u64;
+const DEVICE_ID: u64 = VIRTIO_MMIO_DEVICE_ID as u64;
+const VENDOR_ID: u64 = VIRTIO_MMIO_VENDOR_ID as u64;
+const DEVICE_FEATURES: u64 = VIRTIO_MMIO_DEVICE_FEATURES as u64;
+const DEVICE_FEATURES_SEL: u64 = VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64;
+const DRIVER_FEATURES: u64 = VIRTIO_MMIO_DRIVER_FEATURES as u64;
+const DRIVER_FEATURES_SEL: u64 = VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64;
+pub(crate) const QUEUE_SEL: u64 = VIRTIO_MMIO_QUEUE_SEL as u64;
+pub(crate) const QUEUE_NUM_MAX: u64 = VIRTIO_MMIO_QUEUE_NUM_MAX as u64;
+const QUEUE_NUM: u64 = VIRTIO_MMIO_QUEUE_NUM as u64;
+pub(crate) const QUEUE_READY: u64 = VIRTIO_MMIO_QUEUE_READY as u64;
+const QUEUE_NOTIFY: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
+pub(crate) const INTERRUPT_STATUS: u64 = VIRTIO_MMIO_INTERRUPT_STATUS as u64;
+pub(crate) const INTERRUPT_ACK: u64 = VIRTIO_MMIO_INTERRUPT_ACK as u64;
+pub(crate) const STATUS: u64 = VIRTIO_MMIO_STATUS as u64;
+const QUEUE_DESC_LOW: u64 = VIRTIO_MMIO_QUEUE_DESC_LOW as u64;
+const QUEUE_DESC_HIGH: u64 = VIRTIO_MMIO_QUEUE_DESC_HIGH as u64;
+const QUEUE_DRIVER_LOW: u64 = VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
+const QUEUE_DRIVER_HIGH: u64 = VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
+const QUEUE_DEVICE_LOW: u64 = VIRTIO_MMIO_QUEUE_USED_LOW as u64;
+const QUEUE_DEVICE_HIGH: u64 = VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
 // Shared memory regions (virtio 1.2).
-pub const SHM_LEN_LOW: u64 = VIRTIO_MMIO_SHM_LEN_LOW as u64;
-pub const SHM_LEN_HIGH: u64 = VIRTIO_MMIO_SHM_LEN_HIGH as u64;
-pub const SHM_BASE_LOW: u64 = VIRTIO_MMIO_SHM_BASE_LOW as u64;
-pub const SHM_BASE_HIGH: u64 = VIRTIO_MMIO_SHM_BASE_HIGH as u64;
-pub const CONFIG_GENERATION: u64 = VIRTIO_MMIO_CONFIG_GENERATION as u64;
-pub const CONFIG: u64 = VIRTIO_MMIO_CONFIG as u64;
+const SHM_LEN_LOW: u64 = VIRTIO_MMIO_SHM_LEN_LOW as u64;
+const SHM_LEN_HIGH: u64 = VIRTIO_MMIO_SHM_LEN_HIGH as u64;
+const SHM_BASE_LOW: u64 = VIRTIO_MMIO_SHM_BASE_LOW as u64;
+const SHM_BASE_HIGH: u64 = VIRTIO_MMIO_SHM_BASE_HIGH as u64;
+#[cfg(test)]
+const SHM_SEL: u64 = VIRTIO_MMIO_SHM_SEL as u64;
+
+const CONFIG_GENERATION: u64 = VIRTIO_MMIO_CONFIG_GENERATION as u64;
+const CONFIG: u64 = VIRTIO_MMIO_CONFIG as u64;
 
 /// The magic value, "virt" little-endian.
 const MAGIC_VALUE: u32 = 0x7472_6976;
@@ -690,6 +691,43 @@ pub(crate) mod testing {
         (interrupt, line)
     }
 
+    /// Checks the common registers a driver probes on the transport of
+    /// `device`, with queue 0 programmed at `rings`.
+    ///
+    /// A missing shared memory region reads a length and a base of all ones,
+    /// which Linux `vm_get_shm_region` takes as no region. A feature word past
+    /// the second reads 0. A queue past the device's last reads a size of 0 and
+    /// not ready, since Linux `vm_setup_vq` refuses a queue whose `QUEUE_READY`
+    /// reads non-zero. It takes no write.
+    pub(crate) fn assert_common_registers<D: virtio::Device>(
+        device: D,
+        ram: &Arc<GuestRam>,
+        rings: Rings,
+    ) {
+        let driver = Driver::new(device, ram);
+        driver.write(SHM_SEL, 0);
+        for register in [SHM_LEN_LOW, SHM_LEN_HIGH, SHM_BASE_LOW, SHM_BASE_HIGH] {
+            assert_eq!(driver.read(register), u32::MAX, "register {register:#x}");
+        }
+        for word in 2..5 {
+            driver.write(DEVICE_FEATURES_SEL, word);
+            assert_eq!(driver.read(DEVICE_FEATURES), 0, "feature word {word}");
+        }
+        let missing = driver.transport.queue_max_sizes.len() as u32;
+        driver.negotiate();
+        driver.program_queue(0, rings);
+        driver.write(QUEUE_SEL, missing);
+        assert_eq!(driver.read(QUEUE_NUM_MAX), 0, "the size of queue {missing}");
+        assert_eq!(
+            driver.read(QUEUE_READY),
+            0,
+            "queue {missing} reads not ready"
+        );
+        driver.write(QUEUE_NUM, 8);
+        driver.write(QUEUE_SEL, 0);
+        assert_eq!(driver.read(QUEUE_READY), 1, "queue 0 kept its programming");
+    }
+
     /// A guest driver of one device, which programs its transport in the order
     /// Linux's `virtio_mmio` driver does.
     pub(crate) struct Driver<D> {
@@ -790,7 +828,7 @@ mod tests {
     use std::sync::Weak;
     use std::time::Duration;
 
-    use super::testing::{Driver, Rings};
+    use super::testing::{self, Driver, Rings};
     use super::*;
     use crate::devices::bus::Device as _;
     use crate::devices::virtio::{read_config_bytes, DeviceState};
@@ -956,15 +994,15 @@ mod tests {
     // virtio 1.2 section 4.2.2: word `sel` carries bits `sel * 32` to `sel * 32
     // + 31`.
     #[test]
-    fn device_features_carry_version_1_and_read_zero_past_word_1() {
+    fn device_features_carry_version_1() {
         let driver = driver();
-        let words: Vec<u32> = (0..4)
+        let words: Vec<u32> = (0..2)
             .map(|word| {
                 driver.write(DEVICE_FEATURES_SEL, word);
                 driver.read(DEVICE_FEATURES)
             })
             .collect();
-        assert_eq!(words, [1 << 5, 1 << 3 | 1, 0, 0]);
+        assert_eq!(words, [1 << 5, 1 << 3 | 1]);
     }
 
     #[test]
@@ -1097,17 +1135,10 @@ mod tests {
         assert_eq!(read(0), (256, 0), "a reset clears READY");
     }
 
-    // Linux `vm_setup_vq` refuses a queue whose `QUEUE_READY` reads non-zero.
     #[test]
-    fn missing_queue_reads_not_ready_and_takes_no_write() {
-        let driver = driver();
-        driver.negotiate();
-        driver.program_queue(0, RINGS);
-        driver.write(QUEUE_SEL, 2);
-        assert_eq!(driver.read(QUEUE_READY), 0);
-        driver.write(QUEUE_NUM, 8);
-        driver.write(QUEUE_SEL, 0);
-        assert_eq!(driver.read(QUEUE_READY), 1, "queue 0 kept its programming");
+    fn common_registers_follow_virtio_1_2() {
+        let ram = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        testing::assert_common_registers(Stub::new(), &ram, RINGS);
     }
 
     #[test]
@@ -1337,19 +1368,6 @@ mod tests {
         assert_eq!(half, [0, 0]);
         driver.transport.write(STATUS, &[1, 0]);
         assert_eq!(driver.read(STATUS), 0);
-    }
-
-    // Linux `vm_get_shm_region` selects a region and reads its length and base.
-    #[test]
-    fn shm_registers_report_no_region() {
-        let driver = driver();
-        driver.write(u64::from(VIRTIO_MMIO_SHM_SEL), 0);
-        let registers = [SHM_LEN_LOW, SHM_LEN_HIGH, SHM_BASE_LOW, SHM_BASE_HIGH];
-        let read: Vec<u32> = registers
-            .iter()
-            .map(|&register| driver.read(register))
-            .collect();
-        assert_eq!(read, [u32::MAX; 4]);
     }
 
     #[test]
