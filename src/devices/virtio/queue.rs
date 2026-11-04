@@ -105,14 +105,30 @@ impl Queue {
         *self = Queue::new(self.max_size);
     }
 
-    /// Split-virtqueue ring extents: descriptor table `16*n`, avail ring
-    /// `6+2*n`, used ring `6+8*n` (each includes the 2-byte event suffix).
-    fn rings_fit(&self, mem: &GuestRam) -> bool {
+    /// Returns the address and the length in bytes of the descriptor table, the
+    /// avail ring and the used ring, in that order.
+    ///
+    /// The lengths are those of a split virtqueue of `n` entries, the
+    /// programmed size: `16*n` for the descriptor table, `6+2*n` for the avail
+    /// ring and `6+8*n` for the used ring, each ring with its 2-byte event
+    /// suffix.
+    pub(crate) fn ring_extents(&self) -> [(u64, u64); 3] {
         let n = u64::from(self.num);
-        n != 0
-            && mem.contains(self.desc, 16 * n)
-            && mem.contains(self.avail, 6 + 2 * n)
-            && mem.contains(self.used, 6 + 8 * n)
+        [
+            (self.desc, 16 * n),
+            (self.avail, 6 + 2 * n),
+            (self.used, 6 + 8 * n),
+        ]
+    }
+
+    /// Returns whether the queue has a size and its three rings are in guest
+    /// RAM.
+    fn rings_fit(&self, mem: &GuestRam) -> bool {
+        self.num != 0
+            && self
+                .ring_extents()
+                .iter()
+                .all(|&(address, len)| mem.contains(address, len))
     }
 
     /// Address of descriptor `d`, or `None` if the driver referenced an index
