@@ -2239,6 +2239,19 @@ mod tests {
         assert_ne!(checksum16(&h), 0);
     }
 
+    #[test]
+    fn common_registers_follow_virtio_1_2() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let rings = Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        testing::assert_common_registers(VirtioNet::new(), &mem, rings);
+    }
+
     // A vCPU acknowledges the interrupt through the transport, without the
     // device lock, while a reader delivers the next frame under it. The vCPU
     // reposts one RX buffer per acknowledgment, as a guest driver refills its

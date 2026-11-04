@@ -60,7 +60,7 @@ flowchart TB
         subgraph shared["Shared core"]
             direction LR
             arch_["arch/aarch64: loader / layout / fdt<br/>arch/x86_64: loader / layout / mptable / acpi"]
-            dev["devices/virtio: queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos / rtc_pl031 / acpi_pm"]
+            dev["devices/virtio: mmio / queue / block / net / tap<br/>vsock / fs<br/>devices/legacy: pl011 / uart16550 / rtc_cmos / rtc_pl031 / acpi_pm"]
             obs["plugin: the seam<br/>plugin::builtin · events ledger"]
             vm["hypervisor: vcpus / guest / kvm / quiesce"]
             rt["run: spawn / stop / supervisor<br/>io_threads · signal<br/>terminal: filter / raw / input"]
@@ -340,23 +340,34 @@ sequenceDiagram
     participant G as Guest vCPU
     participant B as Backend run loop
     participant R as Bus
+    participant T as virtio-mmio transport
     participant D as Device (blk/net/vsock/fs)
     participant M as GuestRam
     participant L as Event ledger
     G->>B: MMIO/PIO exit @ device range
     B->>R: read/write(address, data)
-    R->>D: read/write(offset, data)
+    R->>T: read/write(offset, data)
+    T->>D: notify(queue) / configuration space
     D->>M: read/write descriptors + buffers
-    D->>L: CapturedEvent (block / net / SNI)
-    D->>G: set its IRQ line (GIC SPI / IOAPIC GSI)
+    D->>G: raise its interrupt (GIC SPI / IOAPIC GSI)
+    T->>L: CapturedEvent (block / net / SNI)
     B->>G: resume
 ```
 
-Each device sets its own interrupt line, from the methods that change its
-interrupt level, so the line is set under the device's lock. A device sets the
-line only when the level differs from the one the line last took, so it tries
-again after a failure. How the line reaches the guest is the one device-facing
-thing that differs by backend:
+Every virtio device sits behind the virtio-mmio transport in
+`devices/virtio/mmio.rs`, which decodes the common registers as virtio 1.2
+specifies them: the feature words, the device status in the order a driver sets
+it, the queue registers, and the interrupt status and its acknowledgment. It
+offers `VIRTIO_F_VERSION_1` for every device. At DRIVER_OK it hands the device
+its queues and its interrupt, and from then on passes it each queue
+notification. The device holds its configuration space and serves its queues.
+
+A virtio device's interrupt holds the status bits and the line under a lock of
+its own, so a vCPU reads and acknowledges the interrupt without the device's
+lock. A legacy device sets its line under its own lock. Either way the line is
+set only when the level changes. The level is recorded only when the set
+succeeds, so a failed set is tried again. How the line reaches the guest is the
+one device-facing thing that differs by backend:
 
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
   line that rises on an I/O thread also kicks the vCPUs. The console UART's line
@@ -375,16 +386,16 @@ thing that differs by backend:
   is locked while open, shared for a read-only disk and exclusive for a
   writable one.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
-  [networking.md](networking.md). It offers `VIRTIO_F_VERSION_1` and
-  `VIRTIO_NET_F_MAC` and no offloads. Queue 0 is RX, queue 1 is TX.
+  [networking.md](networking.md). It offers `VIRTIO_NET_F_MAC` and no offloads.
+  Queue 0 is RX, queue 1 is TX.
 - **virtio-vsock** (`devices/virtio/vsock.rs`, id 19) is the exec channel. Host
   CID 2, guest CID 3, port 1024.
 - **virtio-fs** (`devices/virtio/fs/`, id 26) has one device per export, each
   with a hiprio and a request queue. On macOS (`fs/server.rs`) the VMM answers
-  the guest's FUSE messages itself. On Linux (`fs/vhost_user.rs`) the device
-  is a transport in front of a vhost-user daemon the caller runs, such as
-  `virtiofsd`. The daemon is handed the rings and the memfd behind guest RAM
-  and serves the requests in its own process. See
+  the guest's FUSE messages itself. On Linux (`fs/vhost_user.rs`) the device is
+  the vhost-user frontend of a daemon the caller runs, such as `virtiofsd`. The
+  daemon is handed the rings and the memfd behind guest RAM and serves the
+  requests in its own process. See
   [storage-and-sharing.md](storage-and-sharing.md).
 
 A write of 0 to a device's STATUS register resets it: every queue returns to
@@ -509,7 +520,7 @@ how it works.
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
-| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `run/panic.rs`, `teardown.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
+| Concurrency | `hypervisor/vcpus.rs`, `hypervisor/kvm.rs`, `run/supervisor.rs`, `run/stop.rs`, `run/spawn.rs`, `io_threads.rs`, `signal.rs`, `hypervisor/quiesce.rs`, `run/panic.rs`, `teardown.rs`, `devices/virtio/mmio.rs`, `devices/virtio/queue.rs` (`ordering_tests`) |
 
 Feature bits, device ids, the virtio-mmio register map and the
 `virtio_net_hdr_v1` layout come from `virtio-bindings`, which is bindgen

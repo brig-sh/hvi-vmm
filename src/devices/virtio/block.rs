@@ -741,6 +741,18 @@ mod queue_tests {
         blk
     }
 
+    #[test]
+    fn common_registers_follow_virtio_1_2() {
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let rings = Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        testing::assert_common_registers(dev(), &mem, rings);
+    }
+
     /// A chain that points back at itself must run out of budget rather than
     /// spin. The only bound on the walk is the ring size, so the shape to
     /// test is a cycle of *writable* descriptors: nothing accumulates, so
