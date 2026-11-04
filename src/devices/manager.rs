@@ -17,9 +17,10 @@
 //! A backend makes a [`DeviceManager`] with the machine's [`SlotAllocator`] and
 //! a maker of its interrupt lines, and attaches the virtio devices the
 //! configuration asks for in one call. An attach opens the device, places it,
-//! puts it on the MMIO bus, connects its interrupt and records it. The records
-//! describe the virtio devices to the guest's firmware, and
-//! [`DeviceManager::finish`] hands the bus and the devices to the guest.
+//! puts it on the MMIO bus behind a transport, gives it an interrupt on its
+//! slot's line and records it. The records describe the virtio devices to the
+//! guest's firmware, and [`DeviceManager::finish`] hands the bus and the
+//! devices to the guest.
 //!
 //! The firmware lists the virtio devices in the order they were attached, and
 //! Linux probes them in that order, so the guest probes the disks in argv
@@ -44,10 +45,10 @@ use crate::devices::virtio::block::{self, VirtioBlk};
 use crate::devices::virtio::fs::vhost_user;
 #[cfg(target_os = "macos")]
 use crate::devices::virtio::fs::worker::{self, FsTransport};
-use crate::devices::virtio::mmio::RANGE_SIZE;
+use crate::devices::virtio::mmio::{self, Interrupt, RANGE_SIZE};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock;
-use crate::devices::virtio::{MmioTransport, VirtioMmio};
+use crate::devices::virtio::{self, MmioTransport, VirtioMmio};
 use crate::events::Ledger;
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
@@ -280,7 +281,7 @@ impl DeviceManager {
             .slots
             .allocate()
             .map_err(|e| format!("virtio-net: {e}"))?;
-        self.attach_virtio(DeviceKind::Net, slot, &network.device)?;
+        self.attach_virtio_mmio(DeviceKind::Net, slot, &network.device)?;
         if let Some(source) = network.source {
             source.queue_relay(&network.device, &self.ram, &mut self.devices.host);
         }
@@ -303,7 +304,7 @@ impl DeviceManager {
             .slots
             .allocate()
             .map_err(|e| format!("virtio-vsock: {e}"))?;
-        self.attach_virtio(DeviceKind::Vsock, slot, &agent.device)?;
+        self.attach_virtio_mmio(DeviceKind::Vsock, slot, &agent.device)?;
         let bridge = agent.bridge;
         self.devices
             .host
@@ -326,7 +327,7 @@ impl DeviceManager {
         let slots = self.export_slots(exports.len())?;
         let exports = vhost_user::attach(exports, ram_fd)?;
         for (export, slot) in exports.iter().zip(slots) {
-            self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
+            self.attach_virtio_mmio(DeviceKind::Fs, slot, &export.dev)?;
             export.queue_interrupts(&mut self.devices.host);
         }
         // A vCPU in an export's reset waits on its daemon, where no kick
@@ -398,9 +399,30 @@ impl DeviceManager {
         Ok(pl011)
     }
 
-    /// Connects the virtio `device` of `kind` to the line of `slot`, puts it on
-    /// the bus there and records it.
-    fn attach_virtio<D: VirtioMmio + Send + 'static>(
+    /// Puts the virtio `device` of `kind` on the bus at `slot` behind a
+    /// transport that raises the interrupt of the slot, and records it.
+    fn attach_virtio<D: virtio::Device + 'static>(
+        &mut self,
+        kind: DeviceKind,
+        slot: Slot,
+        device: &Arc<Mutex<D>>,
+    ) -> Result<(), String> {
+        let interrupt = Arc::new(Interrupt::new((self.line)(slot.irq)));
+        self.insert(
+            kind,
+            slot,
+            Arc::new(mmio::Transport::new(
+                device,
+                &interrupt,
+                &self.ram,
+                &self.ledger,
+            )),
+        )
+    }
+
+    /// Connects the virtio `device` of `kind`, which decodes its own registers,
+    /// to the line of `slot`, puts it on the bus there and records it.
+    fn attach_virtio_mmio<D: VirtioMmio + Send + 'static>(
         &mut self,
         kind: DeviceKind,
         slot: Slot,
@@ -414,7 +436,8 @@ impl DeviceManager {
         )
     }
 
-    /// Puts the virtio `device` of `kind` on the bus at `slot` and records it.
+    /// Puts `device`, the transport of a virtio device of `kind`, on the bus at
+    /// `slot` and records it.
     fn insert(
         &mut self,
         kind: DeviceKind,

@@ -14,11 +14,13 @@
 
 //! The virtio devices over MMIO, and the split virtqueue they share.
 //!
-//! `block`, `fs`, `net` and `vsock` are the devices. Each decodes its own
-//! registers with the offsets in `mmio` and serves its queues through `Queue`,
-//! which `queue` holds. `tap` attaches virtio-net to a host tap device and
-//! holds the `virtio_net_hdr_v1` framing every tap read and write carries.
-//! `MmioTransport` puts a device on a bus.
+//! `block`, `fs`, `net` and `vsock` are the devices, and they serve their
+//! queues through `Queue`, which `queue` holds. `mmio` holds the virtio-mmio
+//! transport, which decodes the common registers of a `Device` and hands it its
+//! queues at activation. A device the transport does not serve decodes its own
+//! registers with the offsets in `mmio`, and `MmioTransport` puts it on a bus.
+//! `tap` attaches virtio-net to a host tap device and holds the
+//! `virtio_net_hdr_v1` framing every tap read and write carries.
 
 pub mod block;
 pub mod fs;
@@ -28,8 +30,10 @@ mod queue;
 pub mod tap;
 pub mod vsock;
 
+use std::io;
 use std::sync::{Arc, Mutex};
 
+use mmio::Interrupt;
 use queue::{Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 use crate::config::Stop;
@@ -38,9 +42,121 @@ use crate::devices::irq::IrqLine;
 use crate::events::{CapturedEvent, Ledger};
 use crate::memory::GuestRam;
 use crate::plugin::IoSink;
-use block::VirtioBlk;
 use net::VirtioNet;
 use vsock::VirtioVsock;
+
+/// A virtio device that [`mmio::Transport`] serves.
+///
+/// [`activate`](Self::activate) runs when the driver sets DRIVER_OK, and
+/// [`notify`](Self::notify) runs only after a successful activation.
+/// [`device_type`](Self::device_type), [`features`](Self::features) and
+/// [`queue_max_sizes`](Self::queue_max_sizes) return the same value on every
+/// call.
+///
+/// A device captures I/O only in [`notify`](Self::notify). A device thread that
+/// feeds the sink outside `notify` ends the batch itself.
+pub(crate) trait Device: Send {
+    /// Returns the device type, a `VIRTIO_ID_*` value.
+    fn device_type(&self) -> u32;
+
+    /// Returns the feature bits the device offers, which need not include
+    /// `VIRTIO_F_VERSION_1`.
+    fn features(&self) -> u64;
+
+    /// Returns whether the device supports `driver_features`, the features the
+    /// driver accepted.
+    ///
+    /// `driver_features` holds only bits of [`features`](Self::features) and
+    /// `VIRTIO_F_VERSION_1`.
+    fn accepts_features(&self, _driver_features: u64) -> bool {
+        true
+    }
+
+    /// Returns the largest size of each of the device's queues, in queue order.
+    fn queue_max_sizes(&self) -> &[u16];
+
+    /// Fills `data` from the configuration space at `offset`.
+    fn read_config(&self, offset: u64, data: &mut [u8]);
+
+    /// Applies a write of `data` to the configuration space at `offset`.
+    fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
+
+    /// Starts serving `queues`, one per entry of
+    /// [`queue_max_sizes`](Self::queue_max_sizes).
+    ///
+    /// `driver_features` holds the features the driver accepted. The device
+    /// signals its notifications through `interrupt`. `queues` includes any
+    /// queue the driver did not make ready.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the device cannot serve the queues. The error names the
+    /// device. A device that fails partway undoes what it started.
+    fn activate(
+        &mut self,
+        ram: &GuestRam,
+        driver_features: u64,
+        queues: Vec<Queue>,
+        interrupt: Arc<Interrupt>,
+    ) -> io::Result<()>;
+
+    /// Serves a notification of `queue`, an index into
+    /// [`queue_max_sizes`](Self::queue_max_sizes).
+    ///
+    /// A [`reset`](Self::reset) on another vCPU can run just before this call,
+    /// so the device serves the queue only while it is active.
+    fn notify(&mut self, ram: &GuestRam, queue: u16);
+
+    /// Resets the device to the state it was built in.
+    fn reset(&mut self);
+
+    /// Returns the I/O the device captured since the last call.
+    fn take_events(&mut self) -> Vec<CapturedEvent> {
+        Vec::new()
+    }
+
+    /// Returns the sink the device fed since the last call, or `None` when it
+    /// fed none.
+    fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+        None
+    }
+}
+
+/// The activation state of a device, with the interrupt it raises while active.
+pub(crate) enum DeviceState {
+    /// The state from build or reset until a successful activation.
+    Inactive,
+    /// The state after a successful activation, with the interrupt the device
+    /// raises.
+    Active(Arc<Interrupt>),
+}
+
+impl DeviceState {
+    /// Returns whether the device serves its queues.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+
+    /// Raises a used-buffer notification, when the device is active.
+    pub(crate) fn signal_used_buffer(&self) {
+        if let Self::Active(interrupt) = self {
+            interrupt.signal_used_buffer();
+        }
+    }
+}
+
+/// Fills `data` from the bytes of `config` at `offset`, and with zeros past the
+/// end of `config`.
+pub(crate) fn read_config_bytes(config: &[u8], offset: u64, data: &mut [u8]) {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = start
+            .checked_add(i)
+            .and_then(|index| config.get(index))
+            .copied()
+            .unwrap_or(0);
+    }
+}
 
 /// The registers of a virtio device, and what an access left for the
 /// ledger and for the device's sink.
@@ -143,24 +259,6 @@ impl SinkSlot {
     /// Returns the sink fed since the last call, or `None` when none was.
     pub(crate) fn take_fed(&mut self) -> Option<Arc<dyn IoSink>> {
         self.fed.take()
-    }
-}
-
-impl VirtioMmio for VirtioBlk {
-    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        VirtioBlk::mmio(self, mem, offset, is_write, value)
-    }
-
-    fn take_events(&mut self) -> Vec<CapturedEvent> {
-        VirtioBlk::take_events(self)
-    }
-
-    fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
-        VirtioBlk::take_fed_sink(self)
-    }
-
-    fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-        VirtioBlk::connect_irq(self, line);
     }
 }
 
