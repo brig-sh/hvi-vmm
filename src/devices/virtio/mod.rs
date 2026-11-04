@@ -42,7 +42,6 @@ use crate::devices::irq::IrqLine;
 use crate::events::{CapturedEvent, Ledger};
 use crate::memory::GuestRam;
 use crate::plugin::IoSink;
-use net::VirtioNet;
 use vsock::VirtioVsock;
 
 /// A virtio device that [`mmio::Transport`] serves.
@@ -259,24 +258,6 @@ impl SinkSlot {
     /// Returns the sink fed since the last call, or `None` when none was.
     pub(crate) fn take_fed(&mut self) -> Option<Arc<dyn IoSink>> {
         self.fed.take()
-    }
-}
-
-impl VirtioMmio for VirtioNet {
-    fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        VirtioNet::mmio(self, mem, offset, is_write, value)
-    }
-
-    fn take_events(&mut self) -> Vec<CapturedEvent> {
-        VirtioNet::take_events(self)
-    }
-
-    fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
-        VirtioNet::take_fed_sink(self)
-    }
-
-    fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-        VirtioNet::connect_irq(self, line);
     }
 }
 
