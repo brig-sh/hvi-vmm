@@ -27,7 +27,7 @@ pub(super) const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_D
 /// register.
 pub(super) const QUEUE_MAX_SIZE: u16 = 256;
 
-/// One virtqueue's driver-programmed state.
+/// One virtqueue's driver-programmed state, and the largest size it takes.
 ///
 /// Every field but `max_size` is driver-controlled, so the fields are private
 /// and the validation lives in the setters: this is the single place where a
@@ -35,7 +35,7 @@ pub(super) const QUEUE_MAX_SIZE: u16 = 256;
 /// it is a non-zero power of two no greater than `max_size`, so [`Queue::size`]
 /// is a `u16` that can be used as a modulus. The check runs on the `u32` the
 /// driver wrote, since `0x10000` is non-zero as a `u32` and zero as a `u16`.
-pub(super) struct Queue {
+pub(crate) struct Queue {
     /// The largest size the driver may program.
     max_size: u16,
     /// The queue size, or 0 until the driver programs a valid one.

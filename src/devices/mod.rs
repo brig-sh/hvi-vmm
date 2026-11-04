@@ -17,9 +17,9 @@
 //! `virtio` holds the virtio devices over MMIO and the split virtqueue they
 //! share. `legacy` holds the serial ports and the RTCs. A backend attaches the
 //! devices its guest needs: the PL011 and the PL031 RTC on arm64, the 16550 and
-//! the CMOS RTC on x86-64. `irq` holds the interrupt line each device sets
-//! itself. `bus` routes a guest's accesses to the devices, and `manager`
-//! attaches each device and records it for the guest's firmware.
+//! the CMOS RTC on x86-64. `irq` holds the interrupt line a device drives.
+//! `bus` routes a guest's accesses to the devices, and `manager` attaches each
+//! device and records it for the guest's firmware.
 
 pub(crate) mod bus;
 pub(crate) mod irq;
