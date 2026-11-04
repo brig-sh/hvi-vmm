@@ -22,8 +22,8 @@
 //! each device's worker thread, which serves the requests a vCPU leaves to it.
 //!
 //! On Linux a vhost-user daemon the caller runs, such as `virtiofsd`, serves
-//! each export. `vhost_user` holds the register file the guest talks to and
-//! hands the queues to the daemon.
+//! each export. `vhost_user` holds the device, which hands the queues to the
+//! daemon.
 
 #[cfg(target_os = "macos")]
 pub mod fdlimit;
