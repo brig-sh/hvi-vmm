@@ -94,17 +94,6 @@ impl Queue {
         self.ready && self.num != 0
     }
 
-    /// Clears the size, ready flag, ring addresses and consumed index, and
-    /// keeps the maximum size.
-    ///
-    /// A driver initializing the device again programs fresh rings whose
-    /// `avail.idx` starts at 0. A consumed index kept from the previous
-    /// programming would make [`Queue::pending`] refuse every notify, and a
-    /// ready flag kept from it would make the driver's probe refuse the queue.
-    pub(crate) fn reset(&mut self) {
-        *self = Queue::new(self.max_size);
-    }
-
     /// Returns the address and the length in bytes of the descriptor table, the
     /// avail ring and the used ring, in that order.
     ///

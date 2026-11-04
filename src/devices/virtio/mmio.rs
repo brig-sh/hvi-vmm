@@ -300,6 +300,11 @@ struct TransportState {
 impl TransportState {
     /// Returns the state of a new or reset device, with a fresh queue of each
     /// size.
+    ///
+    /// A driver initializing the device again programs rings whose `avail.idx`
+    /// starts at 0. A consumed index kept from the previous programming would
+    /// make the device refuse every notification, and a ready flag kept from it
+    /// would make the driver's probe refuse the queue.
     fn new(queue_max_sizes: &[u16]) -> Self {
         Self {
             status: DeviceStatus::default(),

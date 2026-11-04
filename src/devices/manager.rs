@@ -40,6 +40,7 @@ use crate::devices::bus::{self, Bus};
 use crate::devices::irq::IrqLine;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::{pl011::Pl011, rtc_pl031::Pl031};
+use crate::devices::virtio;
 use crate::devices::virtio::block::{self, VirtioBlk};
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::fs::vhost_user;
@@ -48,7 +49,6 @@ use crate::devices::virtio::fs::worker;
 use crate::devices::virtio::mmio::{self, Interrupt, RANGE_SIZE};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock;
-use crate::devices::virtio::{self, MmioTransport, VirtioMmio};
 use crate::events::Ledger;
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
@@ -304,7 +304,7 @@ impl DeviceManager {
             .slots
             .allocate()
             .map_err(|e| format!("virtio-vsock: {e}"))?;
-        self.attach_virtio_mmio(DeviceKind::Vsock, slot, &agent.device)?;
+        self.attach_virtio(DeviceKind::Vsock, slot, &agent.device)?;
         let bridge = agent.bridge;
         self.devices
             .host
@@ -416,22 +416,6 @@ impl DeviceManager {
             )),
         )?;
         Ok(interrupt)
-    }
-
-    /// Connects the virtio `device` of `kind`, which decodes its own registers,
-    /// to the line of `slot`, puts it on the bus there and records it.
-    fn attach_virtio_mmio<D: VirtioMmio + Send + 'static>(
-        &mut self,
-        kind: DeviceKind,
-        slot: Slot,
-        device: &Arc<Mutex<D>>,
-    ) -> Result<(), String> {
-        device.lock().unwrap().connect_irq((self.line)(slot.irq));
-        self.insert(
-            kind,
-            slot,
-            Arc::new(MmioTransport::new(device, &self.ram, &self.ledger)),
-        )
     }
 
     /// Puts `device`, the transport of a virtio device of `kind`, on the bus at
