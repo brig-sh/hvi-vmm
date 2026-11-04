@@ -44,7 +44,7 @@ use crate::devices::virtio::block::{self, VirtioBlk};
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::fs::vhost_user;
 #[cfg(target_os = "macos")]
-use crate::devices::virtio::fs::worker::{self, FsTransport};
+use crate::devices::virtio::fs::worker;
 use crate::devices::virtio::mmio::{self, Interrupt, RANGE_SIZE};
 use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::vsock;
@@ -348,16 +348,7 @@ impl DeviceManager {
     fn attach_exports(&mut self, shares: &[FsShare]) -> Result<(), Error> {
         let slots = self.export_slots(shares.len())?;
         for (export, slot) in worker::attach(shares)?.into_iter().zip(slots) {
-            export
-                .dev
-                .lock()
-                .unwrap()
-                .connect_irq((self.line)(slot.irq));
-            self.insert(
-                DeviceKind::Fs,
-                slot,
-                Arc::new(FsTransport::new(&export, &self.ram)),
-            )?;
+            self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
             export.queue_threads(&self.ram, &mut self.devices.host);
             self.devices.exports.push(export);
         }
