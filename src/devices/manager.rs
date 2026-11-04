@@ -281,7 +281,7 @@ impl DeviceManager {
             .slots
             .allocate()
             .map_err(|e| format!("virtio-net: {e}"))?;
-        self.attach_virtio_mmio(DeviceKind::Net, slot, &network.device)?;
+        self.attach_virtio(DeviceKind::Net, slot, &network.device)?;
         if let Some(source) = network.source {
             source.queue_relay(&network.device, &self.ram, &mut self.devices.host);
         }
