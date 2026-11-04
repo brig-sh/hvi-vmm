@@ -21,9 +21,9 @@
 //!
 //! On Linux an export is served by a vhost-user daemon the caller runs, such as
 //! `virtiofsd`. The daemon maps guest RAM through the memfd that backs it and
-//! walks the virtqueues in its own process. What stays here is the part the
-//! guest talks to -- the virtio-mmio register file, feature negotiation, and
-//! the handshake that hands the rings to the daemon.
+//! walks the virtqueues in its own process. What stays here is the device the
+//! virtio-mmio transport serves: the features the daemon offers, the
+//! configuration space, and the handshake that hands the rings to the daemon.
 //!
 //! The split costs one thing. A request the daemon serves never crosses this
 //! process, so the file-level events the macOS device captures have no
@@ -35,17 +35,13 @@ pub const TAG_LEN: usize = 36;
 /// Size of the virtio-fs config space, the tag and the request-queue count.
 pub const CONFIG_LEN: usize = TAG_LEN + 4;
 
-/// Largest ring a split virtqueue can have, and so the largest queue size an
-/// export can be given.
-pub const MAX_QUEUE_SIZE: u16 = crate::config::FsConfig::MAX_QUEUE_SIZE;
-
 /// Feature bits the guest may negotiate, before intersecting with what the
 /// daemon offers.
 ///
-/// Bit 32 is `VIRTIO_F_VERSION_1`, bit 28 `VIRTIO_RING_F_INDIRECT_DESC` and
-/// bit 29 `VIRTIO_RING_F_EVENT_IDX`. The rings belong to the daemon, so how
-/// it walks them is its business.
-pub const TRANSPORT_FEATURES: u64 = (1 << 32) | (1 << 28) | (1 << 29);
+/// Bit 28 is `VIRTIO_RING_F_INDIRECT_DESC` and bit 29
+/// `VIRTIO_RING_F_EVENT_IDX`, which the daemon serves, since it walks the
+/// rings.
+pub const GUEST_FEATURES: u64 = (1 << 28) | (1 << 29);
 
 /// Returns the virtio-fs config space for `tag`, which is the NUL-padded
 /// mount tag followed by the request-queue count.
@@ -62,37 +58,6 @@ pub fn config_space(tag: &str, request_queues: u32) -> Vec<u8> {
     out
 }
 
-/// Returns the feature word to record when the driver writes `value` with
-/// `select` in `DRIVER_FEATURES_SEL`, masked to what the device offered.
-///
-/// The driver may write any bit. What reaches the daemon has to be a subset
-/// of what was advertised, because the daemon acts on bits this transport
-/// never implemented: `VHOST_F_LOG_ALL` asks it to log writes to a region no
-/// `SET_LOG_BASE` ever named.
-#[must_use]
-pub fn ack_features(current: u64, value: u32, select: u32, offered: u64) -> u64 {
-    let word = u64::from(value) << (32 * u64::from(select & 1));
-    current | (word & offered)
-}
-
-/// Returns the byte extents of the three rings of a virtqueue of `size`
-/// descriptors, in descriptor, available and used order, or `None` when `size`
-/// is not a legal queue size.
-///
-/// The layout is the split-virtqueue one: 16 bytes per descriptor, and two
-/// rings that carry a flags and an index field, `size` entries and an event
-/// suppression field. A size that is zero, above `max` or not a power of two
-/// is not a queue, and the extents of one are what says whether the addresses
-/// the driver programmed are backed by guest RAM.
-#[must_use]
-pub fn ring_extents(size: u16, max: u16) -> Option<(usize, usize, usize)> {
-    if size == 0 || size > max || !size.is_power_of_two() {
-        return None;
-    }
-    let size = usize::from(size);
-    Some((16 * size, 6 + 2 * size, 6 + 8 * size))
-}
-
 /// Returns the virtqueue count for a device with `request_queues` request
 /// queues, counting the hiprio queue the spec puts first.
 #[must_use]
@@ -103,8 +68,7 @@ pub fn queue_count(request_queues: usize) -> usize {
 // The device needs the `vhost` crate, which only the Linux build has.
 #[cfg(target_os = "linux")]
 pub use self::device::{
-    attach, connect_waiting, serve_interrupts, shut_down, Export, ShutdownFds, VhostUserFs,
-    SOCKET_WAIT,
+    attach, connect_waiting, shut_down, Export, ShutdownFds, VhostUserFs, SOCKET_WAIT,
 };
 
 #[cfg(target_os = "linux")]
@@ -119,48 +83,18 @@ mod device {
     use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
     use vhost::vhost_user::{Frontend, VhostUserFrontend};
     use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
+    use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
     use vmm_sys_util::eventfd::EventFd;
 
     use crate::config::FsConfig;
-    use crate::devices::irq::{Irq, IrqLine};
-    use crate::devices::virtio::{mmio, VirtioMmio};
-    use crate::events::CapturedEvent;
+    use crate::devices::virtio::mmio::Interrupt;
+    use crate::devices::virtio::{self, read_config_bytes, Queue};
     use crate::io_threads::HostWork;
     use crate::memory::GuestRam;
-    use crate::plugin::IoSink;
     use crate::teardown::StopToken;
     use crate::LOG_PREFIX;
 
-    use super::{ack_features, config_space, queue_count, ring_extents, TRANSPORT_FEATURES};
-
-    const MAGIC_VALUE: u64 = 0x7472_6976; // "virt"
-    const VENDOR: u64 = 0x4649_4f4e; // "NOIF"
-    const VIRTIO_FS_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_FS as u64;
-
-    /// `VIRTIO_CONFIG_S_DRIVER_OK`, the status bit that says the rings are
-    /// programmed and the guest is ready to use the device.
-    const STATUS_DRIVER_OK: u32 = 4;
-
-    /// Ring addresses and size as the guest programmed them.
-    #[derive(Default, Clone, Copy)]
-    struct Ring {
-        /// Number of descriptors, from `QUEUE_NUM`.
-        size: u16,
-        /// Whether the guest has set `QUEUE_READY`.
-        ready: bool,
-        /// Guest-physical address of the descriptor table.
-        desc: u64,
-        /// Guest-physical address of the available ring.
-        avail: u64,
-        /// Guest-physical address of the used ring.
-        used: u64,
-        /// Whether the daemon was sent this ring, set before its first
-        /// message.
-        ///
-        /// A reset takes back the rings that have it set. `ready` is the
-        /// guest's, and the guest can change it after `DRIVER_OK`.
-        handed_over: bool,
-    }
+    use super::{config_space, queue_count, GUEST_FEATURES};
 
     /// What a shutdown needs from a device, taken once while it is being
     /// built.
@@ -288,8 +222,8 @@ mod device {
         )
     }
 
-    /// One virtio-fs device, holding the guest's virtio-mmio transport and the
-    /// vhost-user connection to the daemon that serves it.
+    /// One virtio-fs device behind the virtio-mmio transport, holding the
+    /// vhost-user connection to the daemon that serves its queues.
     ///
     /// A message waits on the daemon until it answers. A daemon that stops
     /// answering holds the thread that sent the message until
@@ -301,48 +235,24 @@ mod device {
         peer: Peer,
         /// The memfd behind guest RAM, which the daemon maps.
         ram_fd: RawFd,
-        /// One entry per queue, the hiprio queue first.
-        rings: Vec<Ring>,
-        /// The eventfd per queue that a `QUEUE_NOTIFY` writes for the daemon.
+        /// Whether the daemon was sent each queue, the hiprio queue first.
+        ///
+        /// A queue counts as sent from its first message on, including one
+        /// whose handover failed partway.
+        handed_over: Vec<bool>,
+        /// The eventfd per queue that a queue notification writes for the
+        /// daemon.
         kick: Vec<EventFd>,
         /// The eventfd per queue the daemon writes once it has used a buffer.
         call: Vec<EventFd>,
         /// The device config space, which [`config_space`] builds.
         config: Vec<u8>,
-        /// What the daemon offers, already intersected with
-        /// [`TRANSPORT_FEATURES`].
+        /// What the daemon offers, already intersected with [`GUEST_FEATURES`].
         device_features: u64,
-        /// What the guest has written to `DRIVER_FEATURES`.
-        acked_features: u64,
-        /// The largest ring the guest may program, which `QUEUE_MAX_SIZE`
-        /// reads.
-        queue_size: u16,
-        /// Whether the peer offered `VHOST_USER_F_PROTOCOL_FEATURES`, which
-        /// [`hand_over`](Self::hand_over) then acknowledges.
-        ///
-        /// Acknowledging it to a peer that did not offer it is what
-        /// [`super::ack_features`] stops the guest doing in the other
-        /// direction. With it acknowledged, every ring starts disabled until
-        /// `SET_VRING_ENABLE`. virtiofsd and QEMU always offer it; a peer
-        /// named with `--fs` is whatever the caller runs.
+        /// The largest size of each queue, the hiprio queue first.
+        queue_max_sizes: Vec<u16>,
+        /// Whether the peer offered `VHOST_USER_F_PROTOCOL_FEATURES`.
         protocol_features_offered: bool,
-        /// The `DEVICE_FEATURES_SEL` word the guest selected.
-        dev_feat_sel: u32,
-        /// The `DRIVER_FEATURES_SEL` word the guest selected.
-        drv_feat_sel: u32,
-        /// The queue the guest selected through `QUEUE_SEL`.
-        queue_sel: u32,
-        /// The device status the guest wrote, zero after a reset.
-        status: u32,
-        /// The pending `INTERRUPT_STATUS` bits.
-        interrupt_status: u32,
-        /// The interrupt line the device drives.
-        irq: Irq,
-        /// Whether a `DRIVER_OK` has started a handover since the last reset.
-        ///
-        /// It is set before the first message, so a handover that failed
-        /// partway counts too, and the next one waits for a reset.
-        handover_attempted: bool,
     }
 
     impl VhostUserFs {
@@ -357,9 +267,9 @@ mod device {
         ///
         /// # Errors
         ///
-        /// Errors if the socket cannot be reached in time, if the daemon
-        /// refuses the feature handshake, or if it serves fewer queues than
-        /// `request_queues` needs.
+        /// Errors if the socket cannot be reached in time, if the daemon does
+        /// not offer `VIRTIO_F_VERSION_1` or refuses the feature handshake, or
+        /// if it serves fewer queues than `request_queues` needs.
         pub fn connect(
             socket: &Path,
             tag: &str,
@@ -377,8 +287,9 @@ mod device {
         ///
         /// # Errors
         ///
-        /// Errors if the daemon refuses the feature handshake, or if it serves
-        /// fewer queues than `request_queues` needs.
+        /// Errors if the daemon does not offer `VIRTIO_F_VERSION_1` or refuses
+        /// the feature handshake, or if it serves fewer queues than
+        /// `request_queues` needs.
         pub fn from_stream(
             stream: UnixStream,
             tag: &str,
@@ -407,6 +318,13 @@ mod device {
             let offered = frontend
                 .get_features()
                 .map_err(|e| io::Error::other(format!("vhost-user: GET_FEATURES: {e}")))?;
+            // The transport offers `VIRTIO_F_VERSION_1` to every driver, so a
+            // daemon without it cannot serve the guest.
+            if offered & (1 << VIRTIO_F_VERSION_1) == 0 {
+                return Err(io::Error::other(format!(
+                    "virtio-fs {tag:?}: the daemon does not offer VIRTIO_F_VERSION_1"
+                )));
+            }
 
             // Protocol features are a vhost-user negotiation, not a virtio
             // one. MQ is the only one we need, for GET_QUEUE_NUM. Acking
@@ -447,9 +365,9 @@ mod device {
             let mut kick = Vec::with_capacity(queues);
             let mut call = Vec::with_capacity(queues);
             for _ in 0..queues {
-                // The kick side is only written, from the vCPU thread
-                // servicing a QUEUE_NOTIFY. The call side is read by a thread
-                // per queue, which blocks on it.
+                // The kick side is only written, from the vCPU thread that
+                // passes the device a queue notification. The call side is read
+                // by a thread per queue, which blocks on it.
                 kick.push(EventFd::new(libc::EFD_NONBLOCK)?);
                 call.push(EventFd::new(0)?);
             }
@@ -461,21 +379,13 @@ mod device {
                     broken: false,
                 },
                 ram_fd,
-                rings: vec![Ring::default(); queues],
+                handed_over: vec![false; queues],
                 kick,
                 call,
                 config: config_space(tag, request_queues as u32),
-                device_features: offered & TRANSPORT_FEATURES,
-                acked_features: 0,
-                queue_size,
+                device_features: offered & GUEST_FEATURES,
+                queue_max_sizes: vec![queue_size; queues],
                 protocol_features_offered,
-                dev_feat_sel: 0,
-                drv_feat_sel: 0,
-                queue_sel: 0,
-                status: 0,
-                interrupt_status: 0,
-                irq: Irq::default(),
-                handover_attempted: false,
             })
         }
 
@@ -489,7 +399,7 @@ mod device {
         /// descriptors a caller has to wait on.
         #[must_use]
         pub fn queues(&self) -> usize {
-            self.rings.len()
+            self.queue_max_sizes.len()
         }
 
         /// Returns a duplicate of the call descriptor for queue `index`, or
@@ -505,7 +415,7 @@ mod device {
         /// Returns the call descriptors of every queue, duplicated.
         ///
         /// A caller waits on these to learn that the daemon has used buffers;
-        /// see [`serve_interrupts`].
+        /// see `serve_interrupts`.
         ///
         /// # Errors
         ///
@@ -528,152 +438,6 @@ mod device {
             }
         }
 
-        /// Records that the daemon has used buffers, so the guest's next read
-        /// of `INTERRUPT_STATUS` sees a used-buffer notification, and raises
-        /// the line.
-        pub fn signal_used(&mut self) {
-            self.interrupt_status |= 1;
-            self.sync_irq();
-        }
-
-        /// Returns whether the device's interrupt line is asserted.
-        #[must_use]
-        pub fn irq_level(&self) -> bool {
-            self.interrupt_status != 0
-        }
-
-        /// Connects the device to the interrupt line it raises.
-        pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-            self.irq.connect(line);
-        }
-
-        /// Sets the interrupt line to the device's level.
-        fn sync_irq(&mut self) {
-            self.irq.set(self.irq_level());
-        }
-
-        /// Services one virtio-mmio register access, sets the line to the
-        /// level it leaves, and returns the value a read takes.
-        pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-            let v = value as u32;
-            let read = if is_write {
-                self.write_reg(mem, offset, v);
-                0
-            } else {
-                self.read_reg(offset)
-            };
-            self.sync_irq();
-            read
-        }
-
-        fn write_reg(&mut self, mem: &GuestRam, offset: u64, v: u32) {
-            match offset {
-                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                mmio::DRIVER_FEATURES_SEL => self.drv_feat_sel = v,
-                mmio::DRIVER_FEATURES => {
-                    self.acked_features = ack_features(
-                        self.acked_features,
-                        v,
-                        self.drv_feat_sel,
-                        self.device_features,
-                    );
-                }
-                mmio::QUEUE_SEL => self.queue_sel = v,
-                mmio::QUEUE_NUM => self.ring_mut(|r| r.size = v as u16),
-                mmio::QUEUE_READY => self.ring_mut(|r| r.ready = v & 1 != 0),
-                mmio::QUEUE_NOTIFY => self.kick_queue(v as usize),
-                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
-                mmio::STATUS if v == 0 => self.reset(),
-                mmio::STATUS => {
-                    self.status = v;
-                    if v & STATUS_DRIVER_OK != 0 && !self.handover_attempted {
-                        self.start(mem);
-                    }
-                }
-                mmio::QUEUE_DESC_LOW => self.ring_mut(|r| r.desc = set_lo(r.desc, v)),
-                mmio::QUEUE_DESC_HIGH => self.ring_mut(|r| r.desc = set_hi(r.desc, v)),
-                mmio::QUEUE_DRIVER_LOW => self.ring_mut(|r| r.avail = set_lo(r.avail, v)),
-                mmio::QUEUE_DRIVER_HIGH => self.ring_mut(|r| r.avail = set_hi(r.avail, v)),
-                mmio::QUEUE_DEVICE_LOW => self.ring_mut(|r| r.used = set_lo(r.used, v)),
-                mmio::QUEUE_DEVICE_HIGH => self.ring_mut(|r| r.used = set_hi(r.used, v)),
-                _ => {}
-            }
-        }
-
-        fn read_reg(&self, offset: u64) -> u64 {
-            match offset {
-                mmio::MAGIC => MAGIC_VALUE,
-                mmio::VERSION => 2,
-                mmio::DEVICE_ID => VIRTIO_FS_ID,
-                mmio::VENDOR_ID => VENDOR,
-                mmio::DEVICE_FEATURES => {
-                    let shift = 32 * u64::from(self.dev_feat_sel & 1);
-                    (self.device_features >> shift) & 0xffff_ffff
-                }
-                mmio::QUEUE_NUM_MAX => u64::from(self.queue_size),
-                mmio::QUEUE_READY => u64::from(self.ring().is_some_and(|r| r.ready)),
-                // The device has no shared memory region, which virtio 1.2
-                // reads as all ones. A guest built with FUSE_DAX fails its
-                // probe on a zero length.
-                mmio::SHM_LEN_LOW
-                | mmio::SHM_LEN_HIGH
-                | mmio::SHM_BASE_LOW
-                | mmio::SHM_BASE_HIGH => 0xffff_ffff,
-                mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                mmio::STATUS => u64::from(self.status),
-                _ if offset >= mmio::CONFIG => {
-                    let field = (offset - mmio::CONFIG) as usize;
-                    let mut word = [0u8; 8];
-                    for (i, b) in word.iter_mut().enumerate() {
-                        if let Some(&c) = self.config.get(field + i) {
-                            *b = c;
-                        }
-                    }
-                    u64::from_le_bytes(word)
-                }
-                _ => 0,
-            }
-        }
-
-        fn ring(&self) -> Option<&Ring> {
-            self.rings.get(self.queue_sel as usize)
-        }
-
-        fn ring_mut(&mut self, edit: impl FnOnce(&mut Ring)) {
-            if let Some(ring) = self.rings.get_mut(self.queue_sel as usize) {
-                edit(ring);
-            }
-        }
-
-        fn kick_queue(&self, index: usize) {
-            if let Some(fd) = self.kick.get(index) {
-                let _ = fd.write(1);
-            }
-        }
-
-        /// Resets the device, as a write of 0 to STATUS requests.
-        ///
-        /// The daemon is told first. It walks the rings in its own process, so
-        /// a reset that only cleared this side would leave it enabled on ring
-        /// addresses the driver has released, writing used entries into pages
-        /// the guest has given to something else.
-        fn reset(&mut self) {
-            // The flag is set before a handover's first message, so one that
-            // failed partway still has the queues it got through taken back.
-            if self.handover_attempted {
-                self.stop_rings();
-            }
-            for ring in &mut self.rings {
-                *ring = Ring::default();
-            }
-            self.interrupt_status = 0;
-            self.status = 0;
-            self.acked_features = 0;
-            self.dev_feat_sel = 0;
-            self.drv_feat_sel = 0;
-            self.handover_attempted = false;
-        }
-
         /// Takes every ring back from the daemon.
         ///
         /// `SET_VRING_ENABLE(false)` stops it serving, and `GET_VRING_BASE` is
@@ -682,11 +446,11 @@ mod device {
         /// daemon answers, so the guest can initialize the device again. A
         /// broken connection is sent neither; see [`Peer::broken`].
         fn stop_rings(&mut self) {
-            for index in 0..self.rings.len() {
+            for index in 0..self.handed_over.len() {
                 if self.peer.broken {
                     return;
                 }
-                if !self.rings[index].handed_over {
+                if !self.handed_over[index] {
                     continue;
                 }
                 if self.protocol_features_offered {
@@ -706,20 +470,19 @@ mod device {
             }
         }
 
-        /// Hands the programmed rings and guest RAM to the daemon.
+        /// Hands the features the driver accepted, `driver_features`, guest RAM
+        /// and the ready `queues` to the daemon.
         ///
-        /// A failure here leaves the device without a backend, so the mount
-        /// the guest is about to attempt fails. The boot continues: an export
-        /// that cannot be served is not a reason to take the guest down.
-        fn start(&mut self, mem: &GuestRam) {
-            self.handover_attempted = true;
-            if let Err(e) = self.hand_over(mem) {
-                stderrln!("{LOG_PREFIX} virtio-fs {}: {e}", self.tag);
-            }
-        }
-
-        fn hand_over(&mut self, mem: &GuestRam) -> io::Result<()> {
-            let mut features = self.acked_features;
+        /// Each ready queue has a size and rings in guest RAM, which
+        /// [`Queue::set_ready`] checks. A queue that is not ready is left
+        /// disabled, which the guest sees as a queue that does not answer.
+        fn hand_over(
+            &mut self,
+            mem: &GuestRam,
+            driver_features: u64,
+            queues: &[Queue],
+        ) -> io::Result<()> {
+            let mut features = driver_features;
             if self.protocol_features_offered {
                 features |= VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
             }
@@ -730,55 +493,31 @@ mod device {
             self.peer
                 .send("SET_MEM_TABLE", |f| f.set_mem_table(&regions))?;
 
-            for index in 0..self.rings.len() {
-                let ring = self.rings[index];
-                if !ring.ready {
-                    continue;
-                }
-                // The addresses and the size are the driver's, and the daemon
-                // walks them in its own process against a memory table it maps
-                // itself. A ring that is not backed by guest RAM for its whole
-                // extent, or whose size is not a queue size, is refused here
-                // and left un-enabled, which the guest sees as a device that
-                // does not answer.
-                let Some((desc_len, avail_len, used_len)) =
-                    ring_extents(ring.size, self.queue_size)
-                else {
+            for (index, queue) in queues.iter().enumerate() {
+                if !queue.is_ready() {
                     stderrln!(
-                        "{LOG_PREFIX} virtio-fs {}: queue {index} has size {}, which is not a \
-                         queue size; leaving it disabled",
-                        self.tag,
-                        ring.size
+                        "{LOG_PREFIX} virtio-fs {}: queue {index} is not ready; leaving it disabled",
+                        self.tag
                     );
                     continue;
-                };
-                let (desc, avail, used) = match (
-                    host_addr(mem, ring.desc, desc_len),
-                    host_addr(mem, ring.avail, avail_len),
-                    host_addr(mem, ring.used, used_len),
-                ) {
-                    (Ok(desc), Ok(avail), Ok(used)) => (desc, avail, used),
-                    _ => {
-                        stderrln!(
-                            "{LOG_PREFIX} virtio-fs {}: queue {index} is programmed outside guest \
-                             RAM; leaving it disabled",
-                            self.tag
-                        );
-                        continue;
-                    }
-                };
+                }
+                // The daemon is sent each ring's address in this process, which
+                // its memory table maps.
+                let [desc, avail, used] = queue
+                    .ring_extents()
+                    .map(|(address, len)| host_addr(mem, address, len));
                 let config = VringConfigData {
-                    queue_max_size: self.queue_size,
-                    queue_size: ring.size,
+                    queue_max_size: self.queue_max_sizes[index],
+                    queue_size: queue.size(),
                     flags: 0,
-                    desc_table_addr: desc,
-                    used_ring_addr: used,
-                    avail_ring_addr: avail,
+                    desc_table_addr: desc?,
+                    used_ring_addr: used?,
+                    avail_ring_addr: avail?,
                     log_addr: None,
                 };
-                self.rings[index].handed_over = true;
+                self.handed_over[index] = true;
                 self.peer
-                    .send("SET_VRING_NUM", |f| f.set_vring_num(index, ring.size))?;
+                    .send("SET_VRING_NUM", |f| f.set_vring_num(index, queue.size()))?;
                 self.peer
                     .send("SET_VRING_ADDR", |f| f.set_vring_addr(index, &config))?;
                 self.peer
@@ -795,8 +534,8 @@ mod device {
             // disabled and SET_VRING_ENABLE turns it on. Without it, the daemon
             // starts serving on SET_VRING_KICK.
             if self.protocol_features_offered {
-                for index in 0..self.rings.len() {
-                    if !self.rings[index].handed_over {
+                for index in 0..self.handed_over.len() {
+                    if !self.handed_over[index] {
                         continue;
                     }
                     self.peer
@@ -828,33 +567,66 @@ mod device {
         }
     }
 
-    impl VirtioMmio for VhostUserFs {
-        fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-            VhostUserFs::mmio(self, mem, offset, is_write, value)
+    impl virtio::Device for VhostUserFs {
+        fn device_type(&self) -> u32 {
+            virtio_bindings::virtio_ids::VIRTIO_ID_FS
         }
 
-        fn take_events(&mut self) -> Vec<CapturedEvent> {
-            Vec::new()
+        fn features(&self) -> u64 {
+            self.device_features
         }
 
-        fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
-            None
+        fn queue_max_sizes(&self) -> &[u16] {
+            &self.queue_max_sizes
         }
 
-        fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-            VhostUserFs::connect_irq(self, line);
+        fn read_config(&self, offset: u64, data: &mut [u8]) {
+            read_config_bytes(&self.config, offset, data);
+        }
+
+        fn activate(
+            &mut self,
+            ram: &GuestRam,
+            driver_features: u64,
+            queues: Vec<Queue>,
+            _interrupt: Arc<Interrupt>,
+        ) -> io::Result<()> {
+            if let Err(e) = self.hand_over(ram, driver_features, &queues) {
+                // The daemon may already serve the queues sent before the
+                // failure.
+                virtio::Device::reset(self);
+                return Err(io::Error::other(format!("virtio-fs {}: {e}", self.tag)));
+            }
+            Ok(())
+        }
+
+        fn notify(&mut self, _ram: &GuestRam, queue: u16) {
+            let queue = usize::from(queue);
+            if self.handed_over.get(queue) == Some(&true) {
+                if let Some(fd) = self.kick.get(queue) {
+                    let _ = fd.write(1);
+                }
+            }
+        }
+
+        // The daemon walks the rings in its own process. Left enabled on rings
+        // the driver has released, it would write used entries into pages the
+        // guest has given to something else.
+        fn reset(&mut self) {
+            self.stop_rings();
+            self.handed_over.fill(false);
         }
     }
 
-    /// Raises the guest's interrupt for `dev` each time the daemon signals
-    /// `call`, until `stop` is requested.
+    /// Raises `interrupt` each time the daemon signals `call`, until `stop` is
+    /// requested.
     ///
     /// The daemon walks the rings in its own process, so the only thing left
     /// for this side is delivery. A signal on a queue's call descriptor says
-    /// buffers were used, and the guest learns it from the device's interrupt
-    /// status. The device raises its line under its lock, so a register access
-    /// that lowers the line cannot interleave with the raise.
-    pub fn serve_interrupts(dev: &Mutex<VhostUserFs>, call: &EventFd, stop: &StopToken) {
+    /// buffers were used, and the guest learns it from the interrupt status. It
+    /// takes neither the device lock nor the transport lock, so a reset that
+    /// waits on the daemon does not delay a delivery.
+    pub(crate) fn serve_interrupts(interrupt: &Interrupt, call: &EventFd, stop: &StopToken) {
         // SAFETY: `call` stays open for the whole call, which outlives the
         // borrow.
         let fd = unsafe { BorrowedFd::borrow_raw(call.as_raw_fd()) };
@@ -871,7 +643,7 @@ mod device {
                 stderrln!("{LOG_PREFIX} virtio-fs: queue interrupts stopped: {e}");
                 return;
             }
-            dev.lock().unwrap().signal_used();
+            interrupt.signal_used_buffer();
         }
     }
 
@@ -893,8 +665,8 @@ mod device {
     ///
     /// # Errors
     ///
-    /// Errors if a socket cannot be reached in time, or if a daemon refuses the
-    /// vhost-user handshake.
+    /// Errors if a socket cannot be reached in time, or if a daemon does not
+    /// offer `VIRTIO_F_VERSION_1` or refuses the vhost-user handshake.
     pub fn attach(sockets: &[FsConfig], ram_fd: RawFd) -> io::Result<Vec<Export>> {
         let mut exports = Vec::with_capacity(sockets.len());
         for (index, export) in sockets.iter().enumerate() {
@@ -921,13 +693,13 @@ mod device {
     }
 
     impl Export {
-        /// Queues in `host` one [`serve_interrupts`] thread per queue of the
-        /// export.
+        /// Queues in `host` a [`serve_interrupts`] thread on `interrupt` for
+        /// each queue of the export.
         ///
         /// A thread ends when the I/O threads stop. An export whose call
         /// descriptors cannot be duplicated gets no thread, so its guest never
         /// sees a used buffer, and the boot says so on stderr.
-        pub(crate) fn queue_interrupts(&self, host: &mut HostWork) {
+        pub(crate) fn queue_interrupts(&self, interrupt: &Arc<Interrupt>, host: &mut HostWork) {
             let calls = match self.dev.lock().unwrap().call_fds() {
                 Ok(calls) => calls,
                 Err(e) => {
@@ -936,9 +708,9 @@ mod device {
                 }
             };
             for call in calls {
-                let dev = Arc::clone(&self.dev);
+                let interrupt = Arc::clone(interrupt);
                 host.spawn("virtio-fs interrupts", move |stop| {
-                    serve_interrupts(&dev, &call, &stop);
+                    serve_interrupts(&interrupt, &call, &stop);
                 });
             }
         }
@@ -958,18 +730,9 @@ mod device {
 
     /// Returns the address `gpa` has in this process, once `len` bytes from it
     /// are known to be backed by guest RAM.
-    fn host_addr(mem: &GuestRam, gpa: u64, len: usize) -> io::Result<u64> {
+    fn host_addr(mem: &GuestRam, gpa: u64, len: u64) -> io::Result<u64> {
+        let len = usize::try_from(len).map_err(io::Error::other)?;
         mem.host_ptr(gpa, len).map(|p| p as u64)
-    }
-
-    /// Returns `current` with its low 32 bits replaced by `v`.
-    fn set_lo(current: u64, v: u32) -> u64 {
-        (current & 0xffff_ffff_0000_0000) | u64::from(v)
-    }
-
-    /// Returns `current` with its high 32 bits replaced by `v`.
-    fn set_hi(current: u64, v: u32) -> u64 {
-        (current & 0xffff_ffff) | (u64::from(v) << 32)
     }
 
     #[cfg(test)]
@@ -978,26 +741,31 @@ mod device {
         use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
+        use std::sync::{mpsc, Arc, Mutex};
         use std::thread::JoinHandle;
         use std::time::Duration;
 
         use vhost::vhost_user::message::{
             FrontendReq, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
         };
+        use virtio_bindings::virtio_config::{
+            VIRTIO_CONFIG_S_FAILED as FAILED, VIRTIO_CONFIG_S_NEEDS_RESET as NEEDS_RESET,
+            VIRTIO_F_VERSION_1,
+        };
 
-        use super::{connect_waiting, serve_interrupts, set_hi, set_lo, VhostUserFs};
-        use crate::devices::irq::IrqLine;
-        use crate::devices::virtio::mmio;
+        use super::{connect_waiting, serve_interrupts, VhostUserFs};
+        use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
+        use crate::devices::virtio::mmio::{QUEUE_NUM_MAX, QUEUE_READY, QUEUE_SEL, STATUS};
         use crate::memory::{GuestRam, RamRegion, SharedRam};
         use crate::teardown::StopSource;
 
         /// Guest-physical address of the RAM the tests map.
         const BASE: u64 = 0x4000_0000;
 
-        /// `ACKNOWLEDGE | DRIVER | DRIVER_OK | FEATURES_OK`, which a driver
-        /// writes once its rings are programmed.
-        const STATUS_LIVE: u64 = 0xf;
+        /// The features a daemon offers by default, `VIRTIO_F_VERSION_1` and
+        /// `VHOST_USER_F_PROTOCOL_FEATURES`.
+        const OFFERED: u64 =
+            (1 << VIRTIO_F_VERSION_1) | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
 
         /// How the stand-in daemon answers `GET_VRING_BASE`.
         #[derive(Clone, Copy)]
@@ -1017,17 +785,19 @@ mod device {
         impl Daemon {
             /// Starts the stand-in and returns it with the frontend's end.
             fn spawn(vring_base: VringBase) -> (Self, UnixStream) {
-                Self::spawn_offering(vring_base, VhostUserProtocolFeatures::MQ)
+                Self::spawn_offering(vring_base, OFFERED, VhostUserProtocolFeatures::MQ)
             }
 
-            /// Starts a stand-in that offers `protocol` as its protocol
-            /// features, and returns it with the frontend's end.
+            /// Starts a stand-in that offers `features`, with `protocol` as its
+            /// protocol features, and returns it with the frontend's end.
             fn spawn_offering(
                 vring_base: VringBase,
+                features: u64,
                 protocol: VhostUserProtocolFeatures,
             ) -> (Self, UnixStream) {
                 let (ours, theirs) = UnixStream::pair().expect("socket pair");
-                let thread = std::thread::spawn(move || serve(theirs, vring_base, protocol));
+                let thread =
+                    std::thread::spawn(move || serve(theirs, vring_base, features, protocol));
                 (Self(thread), ours)
             }
 
@@ -1038,12 +808,13 @@ mod device {
             }
         }
 
-        /// Reads requests from `socket` until it closes, answers them as a
-        /// daemon that offers `VERSION_1` and the `protocol` features and
-        /// serves two queues, and returns them.
+        /// Answers the requests on `socket` until it closes, as a daemon of two
+        /// queues that offers `features` and the `protocol` features, and
+        /// returns them.
         fn serve(
             mut socket: UnixStream,
             vring_base: VringBase,
+            features: u64,
             protocol: VhostUserProtocolFeatures,
         ) -> Vec<FrontendReq> {
             let mut seen = Vec::new();
@@ -1059,11 +830,7 @@ mod device {
                 }
                 seen.push(request);
                 let reply = match request {
-                    FrontendReq::GET_FEATURES => {
-                        let offered =
-                            (1u64 << 32) | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-                        Some((request, offered.to_le_bytes().to_vec()))
-                    }
+                    FrontendReq::GET_FEATURES => Some((request, features.to_le_bytes().to_vec())),
                     FrontendReq::GET_PROTOCOL_FEATURES => {
                         Some((request, protocol.bits().to_le_bytes().to_vec()))
                     }
@@ -1098,32 +865,27 @@ mod device {
         }
 
         /// Returns 1 MiB of shareable guest RAM, mapped at [`BASE`].
-        fn guest_ram() -> (SharedRam, GuestRam) {
+        fn guest_ram() -> (SharedRam, Arc<GuestRam>) {
             let ram = SharedRam::new(RamRegion::ALIGN as usize).expect("allocate");
             let mem = GuestRam::new(&ram, &[ram.region_at(BASE)]).expect("map");
-            (ram, mem)
+            (ram, Arc::new(mem))
         }
 
-        /// Programs queue `index` with a ring of 8 descriptors at `at`, as a
-        /// driver does before it writes `DRIVER_OK`.
-        fn program_queue(dev: &mut VhostUserFs, mem: &GuestRam, index: u64, at: u64) {
-            for (offset, value) in [
-                (mmio::QUEUE_SEL, index),
-                (mmio::QUEUE_NUM, 8),
-                (mmio::QUEUE_DESC_LOW, at),
-                (mmio::QUEUE_DRIVER_LOW, at + 0x100),
-                (mmio::QUEUE_DEVICE_LOW, at + 0x200),
-                (mmio::QUEUE_READY, 1),
-            ] {
-                dev.mmio(mem, offset, true, value);
+        /// Returns a ring of 8 descriptors at `at`.
+        fn rings(at: u64) -> Rings {
+            Rings {
+                size: 8,
+                desc_table: at,
+                avail_ring: at + 0x100,
+                used_ring: at + 0x200,
             }
         }
 
-        #[test]
-        fn ring_address_is_assembled_from_two_writes() {
-            let addr = set_hi(set_lo(0, 0x1000_2000), 0xff);
-            assert_eq!(addr, 0x0000_00ff_1000_2000);
-            assert_eq!(set_lo(addr, 0), 0x0000_00ff_0000_0000);
+        /// Returns a driver of an export over `stream`, with one request queue
+        /// of up to 1024 entries, whose daemon maps guest RAM through `ram_fd`.
+        fn driver(stream: UnixStream, mem: &Arc<GuestRam>, ram_fd: i32) -> Driver<VhostUserFs> {
+            let dev = VhostUserFs::from_stream(stream, "t", 1, 1024, ram_fd).expect("handshake");
+            Driver::new(dev, mem)
         }
 
         // A reply to another request leaves the frontend unable to say which
@@ -1132,16 +894,12 @@ mod device {
         fn connection_that_failed_is_sent_nothing_more() {
             let (daemon, stream) = Daemon::spawn(VringBase::WrongReplyFirst);
             let (ram, mem) = guest_ram();
-            let mut dev =
-                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
-            program_queue(&mut dev, &mem, 0, BASE);
-            program_queue(&mut dev, &mem, 1, BASE + 0x1000);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
             // The reset reads the wrong reply to queue 0's GET_VRING_BASE.
-            dev.mmio(&mem, mmio::STATUS, true, 0);
-            program_queue(&mut dev, &mem, 0, BASE);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
-            drop(dev);
+            driver.reset();
+            driver.start(&[rings(BASE)]);
+            drop(driver);
 
             let seen = daemon.requests();
             let failed = seen
@@ -1163,18 +921,18 @@ mod device {
         // frontend before it sends anything, after SET_FEATURES went out, so
         // the handover fails partway on a connection that is still sound. A
         // driver marks a device failed by adding FAILED to the status it reads
-        // back, which keeps DRIVER_OK set. No ring was sent, so the reset
-        // takes none back.
+        // back. No ring was sent, so the reset takes none back.
         #[test]
         fn failed_handover_is_not_run_again_before_a_reset() {
             let (daemon, stream) = Daemon::spawn(VringBase::Answer);
             let (_ram, mem) = guest_ram();
-            let mut dev = VhostUserFs::from_stream(stream, "t", 1, 1024, -1).expect("handshake");
-            program_queue(&mut dev, &mem, 0, BASE);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE | 0x80);
-            dev.mmio(&mem, mmio::STATUS, true, 0);
-            drop(dev);
+            let driver = driver(stream, &mem, -1);
+            driver.start(&[rings(BASE)]);
+            assert_ne!(driver.read(STATUS) & NEEDS_RESET, 0, "NEEDS_RESET is set");
+            driver.write(STATUS, driver.read(STATUS) | FAILED);
+            driver.driver_ok();
+            driver.reset();
+            drop(driver);
 
             assert_eq!(
                 daemon.requests(),
@@ -1186,6 +944,22 @@ mod device {
                     FrontendReq::GET_QUEUE_NUM,
                     FrontendReq::SET_FEATURES,
                 ]
+            );
+        }
+
+        #[test]
+        fn daemon_without_version_1_is_refused_at_attach() {
+            let offered = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+            let (daemon, stream) =
+                Daemon::spawn_offering(VringBase::Answer, offered, VhostUserProtocolFeatures::MQ);
+            let (ram, _mem) = guest_ram();
+            let error = VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd())
+                .err()
+                .expect("the attach should fail");
+            assert!(error.to_string().contains("VIRTIO_F_VERSION_1"), "{error}");
+            assert_eq!(
+                daemon.requests(),
+                [FrontendReq::SET_OWNER, FrontendReq::GET_FEATURES]
             );
         }
 
@@ -1208,10 +982,11 @@ mod device {
         fn queue_num_max_is_the_exports_queue_size() {
             let (daemon, stream) = Daemon::spawn(VringBase::Answer);
             let (ram, mem) = guest_ram();
-            let mut dev =
+            let dev =
                 VhostUserFs::from_stream(stream, "t", 1, 256, ram.as_raw_fd()).expect("handshake");
-            assert_eq!(dev.mmio(&mem, mmio::QUEUE_NUM_MAX, false, 0), 256);
-            drop(dev);
+            let driver = Driver::new(dev, &mem);
+            assert_eq!(driver.read(QUEUE_NUM_MAX), 256);
+            drop(driver);
             daemon.requests();
         }
 
@@ -1219,17 +994,15 @@ mod device {
         fn shutdown_frees_a_reset_waiting_on_a_silent_daemon() {
             let (daemon, stream) = Daemon::spawn(VringBase::Silent);
             let (ram, mem) = guest_ram();
-            let mut dev =
-                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
-            program_queue(&mut dev, &mem, 0, BASE);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
-            let stop = dev.shutdown_fds();
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE)]);
+            let stop = driver.device.lock().unwrap().shutdown_fds();
 
             let (tx, rx) = mpsc::channel();
             let resetting = std::thread::spawn(move || {
-                dev.mmio(&mem, mmio::STATUS, true, 0);
+                driver.reset();
                 tx.send(()).expect("the test is waiting");
-                dev
+                driver
             });
             assert!(
                 rx.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -1242,90 +1015,36 @@ mod device {
             daemon.requests();
         }
 
-        /// A line that sends each level it is set to, with whether its device
-        /// was locked at the time.
-        struct ProbeLine {
-            /// The device, set once it exists.
-            dev: OnceLock<Weak<Mutex<VhostUserFs>>>,
-            /// Where each level goes.
-            seen: Mutex<mpsc::Sender<(bool, bool)>>,
-        }
-
-        impl IrqLine for ProbeLine {
-            fn set_level(&self, level: bool) -> std::io::Result<()> {
-                let locked = self
-                    .dev
-                    .get()
-                    .and_then(Weak::upgrade)
-                    .is_some_and(|dev| dev.try_lock().is_err());
-                let _ = self.seen.lock().expect("the sender").send((level, locked));
-                Ok(())
-            }
-        }
-
-        /// Returns a device on `stream` connected to a [`ProbeLine`], and the
-        /// receiving end of the line.
-        fn probed(
-            stream: UnixStream,
-            ram: &SharedRam,
-        ) -> (Arc<Mutex<VhostUserFs>>, mpsc::Receiver<(bool, bool)>) {
-            let (tx, rx) = mpsc::channel();
-            let line = Arc::new(ProbeLine {
-                dev: OnceLock::new(),
-                seen: Mutex::new(tx),
-            });
-            let mut dev =
-                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
-            dev.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
-            let dev = Arc::new(Mutex::new(dev));
-            let _ = line.dev.set(Arc::downgrade(&dev));
-            (dev, rx)
-        }
-
+        // A reset that waits on the daemon holds the device, and the guest
+        // still learns of the buffers the daemon used.
         #[test]
-        fn register_access_sets_the_line_under_the_device_lock() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
-            let (ram, mem) = guest_ram();
-            let (dev, rx) = probed(stream, &ram);
-            dev.lock().expect("the device").signal_used();
-            assert_eq!(rx.recv().expect("the raise"), (true, true));
-            dev.lock()
-                .expect("the device")
-                .mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
-            assert_eq!(
-                rx.recv_timeout(Duration::from_secs(5))
-                    .expect("the access lowered the line"),
-                (false, true),
-                "the line was lowered after the lock was released"
-            );
-            drop(dev);
-            daemon.requests();
-        }
-
-        #[test]
-        fn used_buffer_raises_the_line_under_the_device_lock() {
+        fn used_buffer_raises_the_interrupt_while_the_device_is_held() {
             let (daemon, stream) = Daemon::spawn(VringBase::Answer);
             let (ram, _mem) = guest_ram();
-            let (dev, rx) = probed(stream, &ram);
+            let dev = Arc::new(Mutex::new(
+                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake"),
+            ));
             let call = dev
                 .lock()
                 .expect("the device")
                 .call_fd(0)
                 .expect("queue 0")
                 .expect("a call descriptor");
+            let (interrupt, line) = testing::enabled_interrupt();
             let stop = StopSource::new().expect("a stop pair");
             let serving = {
-                let (dev, call, token) =
-                    (Arc::clone(&dev), call.try_clone().unwrap(), stop.token());
-                std::thread::spawn(move || serve_interrupts(&dev, &call, &token))
+                let (call, token) = (call.try_clone().unwrap(), stop.token());
+                std::thread::spawn(move || serve_interrupts(&interrupt, &call, &token))
             };
 
+            let held = dev.lock().expect("the device");
             call.write(1).expect("signal a used buffer");
-            let (level, locked) = rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the line was raised");
-            assert!(level, "a used buffer left the line low");
-            assert!(locked, "the line was raised after the lock was released");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !line.is_high() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(held);
+            assert!(line.is_high(), "a used buffer left the line low");
 
             stop.request_stop();
             serving.join().expect("the stop ended the thread");
@@ -1404,15 +1123,12 @@ mod device {
         fn reset_takes_back_a_ring_the_guest_cleared_after_driver_ok() {
             let (daemon, stream) = Daemon::spawn(VringBase::Answer);
             let (ram, mem) = guest_ram();
-            let mut dev =
-                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
-            program_queue(&mut dev, &mem, 0, BASE);
-            program_queue(&mut dev, &mem, 1, BASE + 0x1000);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
-            dev.mmio(&mem, mmio::QUEUE_SEL, true, 1);
-            dev.mmio(&mem, mmio::QUEUE_READY, true, 0);
-            dev.mmio(&mem, mmio::STATUS, true, 0);
-            drop(dev);
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
+            driver.write(QUEUE_SEL, 1);
+            driver.write(QUEUE_READY, 0);
+            driver.reset();
+            drop(driver);
 
             let seen = daemon.requests();
             let taken_back = seen
@@ -1425,19 +1141,17 @@ mod device {
             );
         }
 
-        // The handover refuses a ring outside guest RAM before sending any of
-        // it, so the daemon has nothing to enable and nothing to give back.
+        // The transport refuses a ring outside guest RAM at QUEUE_READY, so the
+        // handover sends none of it, and the daemon has nothing to enable and
+        // nothing to give back.
         #[test]
         fn refused_ring_is_neither_enabled_nor_taken_back() {
             let (daemon, stream) = Daemon::spawn(VringBase::Answer);
             let (ram, mem) = guest_ram();
-            let mut dev =
-                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
-            program_queue(&mut dev, &mem, 0, BASE);
-            program_queue(&mut dev, &mem, 1, BASE + 0x20_0000);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
-            dev.mmio(&mem, mmio::STATUS, true, 0);
-            drop(dev);
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x20_0000)]);
+            driver.reset();
+            drop(driver);
 
             assert_eq!(
                 daemon.requests(),
@@ -1467,15 +1181,16 @@ mod device {
         // guest's first request hung.
         #[test]
         fn rings_are_enabled_on_a_daemon_without_mq() {
-            let (daemon, stream) =
-                Daemon::spawn_offering(VringBase::Answer, VhostUserProtocolFeatures::empty());
+            let (daemon, stream) = Daemon::spawn_offering(
+                VringBase::Answer,
+                OFFERED,
+                VhostUserProtocolFeatures::empty(),
+            );
             let (ram, mem) = guest_ram();
-            let mut dev =
-                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
-            program_queue(&mut dev, &mem, 0, BASE);
-            dev.mmio(&mem, mmio::STATUS, true, STATUS_LIVE);
-            dev.mmio(&mem, mmio::STATUS, true, 0);
-            drop(dev);
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE)]);
+            driver.reset();
+            drop(driver);
 
             assert_eq!(
                 daemon.requests(),
@@ -1527,51 +1242,5 @@ mod tests {
     fn the_hiprio_queue_is_counted() {
         assert_eq!(queue_count(1), 2);
         assert_eq!(queue_count(4), 5);
-    }
-
-    // A driver may write any bit; what reaches the daemon may not be one the
-    // device never offered, such as VHOST_F_LOG_ALL with no log region.
-    #[test]
-    fn unoffered_feature_bit_is_not_acked() {
-        let offered = TRANSPORT_FEATURES;
-        let acked = ack_features(0, 0xffff_ffff, 1, offered);
-        assert_eq!(acked, offered & 0xffff_ffff_0000_0000);
-        let acked = ack_features(acked, 0xffff_ffff, 0, offered);
-        assert_eq!(acked, offered);
-        assert_eq!(acked & (1 << 26), 0, "VHOST_F_LOG_ALL reached the daemon");
-    }
-
-    #[test]
-    fn each_feature_word_lands_where_its_selector_says() {
-        assert_eq!(ack_features(0, 1 << 0, 1, 1 << 32), 1 << 32);
-        assert_eq!(ack_features(0, 1 << 28, 0, 1 << 28), 1 << 28);
-    }
-
-    #[test]
-    fn ring_size_that_is_not_a_queue_size_has_no_extents() {
-        assert_eq!(ring_extents(0, 1024), None);
-        assert_eq!(ring_extents(3, 1024), None);
-        assert_eq!(ring_extents(2048, 1024), None);
-        assert_eq!(
-            ring_extents(512, 256),
-            None,
-            "above the export's queue size"
-        );
-    }
-
-    #[test]
-    fn ring_extents_cover_the_whole_split_virtqueue() {
-        assert_eq!(ring_extents(1, 1024), Some((16, 8, 14)));
-        assert_eq!(ring_extents(256, 1024), Some((4096, 518, 2054)));
-        let (desc, avail, used) =
-            ring_extents(MAX_QUEUE_SIZE, MAX_QUEUE_SIZE).expect("a queue size");
-        assert_eq!(desc, 16 * 32768);
-        assert_eq!(avail, 6 + 2 * 32768);
-        assert_eq!(used, 6 + 8 * 32768);
-    }
-
-    #[test]
-    fn version_1_is_offered() {
-        assert_ne!(TRANSPORT_FEATURES & (1 << 32), 0);
     }
 }

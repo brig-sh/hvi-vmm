@@ -327,8 +327,8 @@ impl DeviceManager {
         let slots = self.export_slots(exports.len())?;
         let exports = vhost_user::attach(exports, ram_fd)?;
         for (export, slot) in exports.iter().zip(slots) {
-            self.attach_virtio_mmio(DeviceKind::Fs, slot, &export.dev)?;
-            export.queue_interrupts(&mut self.devices.host);
+            let interrupt = self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
+            export.queue_interrupts(&interrupt, &mut self.devices.host);
         }
         // A vCPU in an export's reset waits on its daemon, where no kick
         // reaches it. Ending the connections at the stop frees it.
@@ -400,13 +400,19 @@ impl DeviceManager {
     }
 
     /// Puts the virtio `device` of `kind` on the bus at `slot` behind a
-    /// transport that raises the interrupt of the slot, and records it.
+    /// transport and records it.
+    ///
+    /// Returns the device's interrupt, which drives the line of `slot`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the range of `slot` overlaps one already on the bus.
     fn attach_virtio<D: virtio::Device + 'static>(
         &mut self,
         kind: DeviceKind,
         slot: Slot,
         device: &Arc<Mutex<D>>,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<Interrupt>, String> {
         let interrupt = Arc::new(Interrupt::new((self.line)(slot.irq)));
         self.insert(
             kind,
@@ -417,7 +423,8 @@ impl DeviceManager {
                 &self.ram,
                 &self.ledger,
             )),
-        )
+        )?;
+        Ok(interrupt)
     }
 
     /// Connects the virtio `device` of `kind`, which decodes its own registers,
