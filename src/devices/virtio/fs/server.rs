@@ -41,7 +41,10 @@ use std::task::Waker;
 use crate::config::CachePolicy;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::mmio::Interrupt;
-use crate::devices::virtio::{self, read_config_bytes, DeviceState, Queue, QUEUE_MAX_SIZE};
+use crate::devices::virtio::{
+    self, read_config_bytes, DeviceState, Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
+};
 use crate::memory::GuestRam;
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing the
@@ -56,9 +59,6 @@ const TAG_LEN: usize = 36;
 const CONFIG_LEN: usize = TAG_LEN + 4;
 const MAX_REQUEST: usize = 2 << 20;
 const MAX_WRITE: u32 = 1 << 20;
-
-const DESC_NEXT: u16 = 1;
-const DESC_WRITE: u16 = 2;
 
 /// Largest iovec count a single `preadv`/`pwritev` may carry. `libc::IOV_MAX`
 /// is only defined for BSD-family targets in the `libc` crate; on Linux this
@@ -1800,7 +1800,7 @@ impl VirtioFs {
             ) else {
                 return Some(0);
             };
-            if flags & DESC_WRITE != 0 {
+            if flags & VIRTQ_DESC_F_WRITE != 0 {
                 output.push((addr, len));
             } else {
                 let Some(total) = total_in.checked_add(len as usize) else {
@@ -1812,7 +1812,7 @@ impl VirtioFs {
                 total_in = total;
                 input.push((addr, len));
             }
-            if flags & DESC_NEXT == 0 {
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             desc = next;
@@ -11632,6 +11632,21 @@ mod tests {
     }
 
     #[test]
+    fn common_registers_follow_virtio_1_2() {
+        let (dir, dev) = fixture();
+        let base = 0x4000_0000u64;
+        let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x4000)]));
+        let rings = Rings {
+            size: 8,
+            desc_table: base,
+            avail_ring: base + 0x1000,
+            used_ring: base + 0x2000,
+        };
+        testing::assert_common_registers(dev, &mem, rings);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn readdirplus_reports_correct_attributes_for_each_type() {
         let (dir, mut dev) = fixture_with_access(true);
         fs::create_dir(dir.join("etc/sub")).unwrap();
@@ -11790,7 +11805,7 @@ mod tests {
             head,
             in_buf,
             IN_HEADER_LEN as u32,
-            DESC_NEXT,
+            VIRTQ_DESC_F_NEXT,
             head + 1,
         );
         write_desc(
@@ -11799,7 +11814,7 @@ mod tests {
             head + 1,
             in_buf + 0x40,
             args.len() as u32,
-            DESC_NEXT,
+            VIRTQ_DESC_F_NEXT,
             head + 2,
         );
         write_desc(
@@ -11808,7 +11823,7 @@ mod tests {
             head + 2,
             out,
             OUT_HEADER_LEN as u32,
-            DESC_WRITE,
+            VIRTQ_DESC_F_WRITE,
             0,
         );
         let idx = mem.read_u16(avail + 2).unwrap();
@@ -12507,7 +12522,8 @@ mod tests {
         req.extend_from_slice(&1u64.to_le_bytes());
         mem.write(in_buf, &req).unwrap();
 
-        // One descriptor, readable only. No DESC_WRITE anywhere in the chain.
+        // One descriptor, readable only. No VIRTQ_DESC_F_WRITE anywhere in the
+        // chain.
         write_desc(&mem, desc, 0, in_buf, req.len() as u32, 0, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
@@ -13243,11 +13259,27 @@ mod tests {
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
 
-        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            in_buf,
+            req.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
         // Header (16) + the first 400 payload bytes in one descriptor, the
         // remaining 600 payload bytes in a second -- the payload spans both.
-        write_desc(&mem, desc, 1, out1, 416, DESC_WRITE | DESC_NEXT, 2);
-        write_desc(&mem, desc, 2, out2, 600, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            1,
+            out1,
+            416,
+            VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+            2,
+        );
+        write_desc(&mem, desc, 2, out2, 600, VIRTQ_DESC_F_WRITE, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
         let mut got = vec![0u8; 1000];
@@ -13294,14 +13326,22 @@ mod tests {
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
 
-        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            in_buf,
+            req.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
         write_desc(
             &mem,
             desc,
             1,
             out,
             OUT_HEADER_LEN as u32 + 100,
-            DESC_WRITE,
+            VIRTQ_DESC_F_WRITE,
             0,
         );
         notify_head(&mut dev, &mem, avail, 0);
@@ -13352,10 +13392,34 @@ mod tests {
         mem.write(payload1, &part1).unwrap();
         mem.write(payload2, &part2).unwrap();
 
-        write_desc(&mem, desc, 0, hdr_buf, hdr.len() as u32, DESC_NEXT, 1);
-        write_desc(&mem, desc, 1, payload1, part1.len() as u32, DESC_NEXT, 2);
-        write_desc(&mem, desc, 2, payload2, part2.len() as u32, DESC_NEXT, 3);
-        write_desc(&mem, desc, 3, out, 64, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            hdr_buf,
+            hdr.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(
+            &mem,
+            desc,
+            1,
+            payload1,
+            part1.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            2,
+        );
+        write_desc(
+            &mem,
+            desc,
+            2,
+            payload2,
+            part2.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            3,
+        );
+        write_desc(&mem, desc, 3, out, 64, VIRTQ_DESC_F_WRITE, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
         let mut expected = part1;
@@ -13409,9 +13473,17 @@ mod tests {
         mem.write(payload, &vec![0xaau8; actual_payload as usize])
             .unwrap();
 
-        write_desc(&mem, desc, 0, hdr_buf, hdr.len() as u32, DESC_NEXT, 1);
-        write_desc(&mem, desc, 1, payload, actual_payload, DESC_NEXT, 2);
-        write_desc(&mem, desc, 2, out, 64, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            hdr_buf,
+            hdr.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(&mem, desc, 1, payload, actual_payload, VIRTQ_DESC_F_NEXT, 2);
+        write_desc(&mem, desc, 2, out, 64, VIRTQ_DESC_F_WRITE, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
         assert_eq!(mem.read_u32(out).unwrap(), OUT_HEADER_LEN as u32);
@@ -13455,8 +13527,24 @@ mod tests {
         args[16..20].copy_from_slice(&5u32.to_le_bytes());
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
-        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
-        write_desc(&mem, desc, 1, out, OUT_HEADER_LEN as u32 + 5, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            in_buf,
+            req.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(
+            &mem,
+            desc,
+            1,
+            out,
+            OUT_HEADER_LEN as u32 + 5,
+            VIRTQ_DESC_F_WRITE,
+            0,
+        );
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = head 0
 
@@ -13565,7 +13653,7 @@ mod tests {
                 i * 2,
                 in_buf,
                 req.len() as u32,
-                DESC_NEXT,
+                VIRTQ_DESC_F_NEXT,
                 i * 2 + 1,
             );
             write_desc(
@@ -13574,7 +13662,7 @@ mod tests {
                 i * 2 + 1,
                 out,
                 OUT_HEADER_LEN as u32 + 5,
-                DESC_WRITE,
+                VIRTQ_DESC_F_WRITE,
                 0,
             );
             mem.write_u16(avail + 4 + u64::from(i) * 2, i * 2).unwrap();
@@ -13666,7 +13754,7 @@ mod tests {
                 head,
                 in_buf,
                 req.len() as u32,
-                DESC_NEXT,
+                VIRTQ_DESC_F_NEXT,
                 head + 1,
             );
             write_desc(
@@ -13675,7 +13763,7 @@ mod tests {
                 head + 1,
                 out_buf,
                 (STRIDE / 2) as u32,
-                DESC_WRITE,
+                VIRTQ_DESC_F_WRITE,
                 0,
             );
         }

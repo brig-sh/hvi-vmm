@@ -17,6 +17,7 @@ files follow it, each in the part named beside it:
   src/arch/x86_64/mptable.rs  an MP table of the same small shape (MP spec 1.4)
   src/devices/bus.rs          the device bus shape, and the limit on its reports
   src/devices/manager.rs      one attach and one record per device
+  src/devices/virtio/mmio.rs  the virtio-mmio transport and its status steps
   src/devices/virtio/queue.rs the virtio queue and descriptor conventions
   src/sandbox/seatbelt.rs     the confinement goal, by a different mechanism
 

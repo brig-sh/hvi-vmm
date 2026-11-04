@@ -1709,6 +1709,19 @@ mod session_tests {
         mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
     }
 
+    #[test]
+    fn common_registers_follow_virtio_1_2() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = Arc::new(mem_of(0x4000));
+        let rings = Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        testing::assert_common_registers(VirtioVsock::new(), &mem, rings);
+    }
+
     // A packet queued before the reset must not reach the ring the guest
     // programs after it.
     #[test]
