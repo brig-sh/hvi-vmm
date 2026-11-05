@@ -53,7 +53,7 @@ use crate::memory::GuestRam;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{
-    mmio, tap, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    mmio, tap, Queue, SinkSlot, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::io_threads::HostWork;
@@ -608,7 +608,7 @@ impl VirtioNet {
             status: 0,
             dev_feat_sel: 0,
             queue_sel: 0,
-            queues: [Queue::default(), Queue::default()],
+            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
             interrupt_status: 0,
             irq: Irq::default(),
             events: Vec::new(),
@@ -759,7 +759,7 @@ impl VirtioNet {
                 mmio::VENDOR_ID => 0x4649_4f4e,
                 mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
                 mmio::DEVICE_FEATURES => u64::from(F_MAC_LO),
-                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
+                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_MAX_SIZE),
                 mmio::QUEUE_READY => {
                     u64::from(self.queues[(self.queue_sel & 1) as usize].is_ready())
                 }
