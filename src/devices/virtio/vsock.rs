@@ -59,7 +59,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::devices::irq::{Irq, IrqLine};
-use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::devices::virtio::{mmio, Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::memory::GuestRam;
 use crate::teardown::{poll, pollfd, StopToken, HANGUP};
 use crate::LOG_PREFIX;
@@ -444,7 +444,7 @@ impl VirtioVsock {
             status: 0,
             dev_feat_sel: 0,
             queue_sel: 0,
-            queues: [Queue::default(), Queue::default(), Queue::default()],
+            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
             interrupt_status: 0,
             irq: Irq::default(),
             pending: VecDeque::new(),
@@ -929,7 +929,7 @@ impl VirtioVsock {
                 mmio::DEVICE_ID => VIRTIO_VSOCK_ID,
                 mmio::VENDOR_ID => 0x4649_4f4e,
                 mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
+                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_MAX_SIZE),
                 mmio::QUEUE_READY => {
                     u64::from(self.queues[(self.queue_sel % 3) as usize].is_ready())
                 }

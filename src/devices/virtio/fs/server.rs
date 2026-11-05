@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::CachePolicy;
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::fs::fdlimit;
-use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
+use crate::devices::virtio::{mmio, Queue, QUEUE_MAX_SIZE};
 use crate::memory::GuestRam;
 
 const MAGIC_VALUE: u64 = 0x7472_6976;
@@ -1412,7 +1412,7 @@ impl VirtioFs {
             status: 0,
             dev_feat_sel: 0,
             queue_sel: 0,
-            queues: std::array::from_fn(|_| Queue::default()),
+            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
             interrupt_status: 0,
             irq: Irq::default(),
             ids: GuestIds::default(),
@@ -1709,7 +1709,7 @@ impl VirtioFs {
             mmio::VENDOR_ID => VENDOR,
             mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
             mmio::QUEUE_NUM_MAX if (self.queue_sel as usize) < NUM_QUEUES => {
-                u64::from(QUEUE_NUM_MAX)
+                u64::from(QUEUE_MAX_SIZE)
             }
             mmio::QUEUE_READY => self
                 .queues

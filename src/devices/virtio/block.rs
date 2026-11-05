@@ -41,7 +41,7 @@ use crate::LOG_PREFIX;
 
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{
-    mmio, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    mmio, Queue, SinkSlot, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
@@ -290,7 +290,7 @@ impl VirtioBlk {
             capacity_sectors,
             status: 0,
             dev_feat_sel: 0,
-            queue: Queue::default(),
+            queue: Queue::new(QUEUE_MAX_SIZE),
             interrupt_status: 0,
             irq: Irq::default(),
             events: Vec::new(),
@@ -383,7 +383,7 @@ impl VirtioBlk {
                 // read-only disk. High word: VIRTIO_F_VERSION_1.
                 mmio::DEVICE_FEATURES if self.dev_feat_sel == 0 => u64::from(self.features_lo()),
                 mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
+                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_MAX_SIZE),
                 mmio::QUEUE_READY => u64::from(self.queue.is_ready()),
                 mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
                 mmio::STATUS => u64::from(self.status),
