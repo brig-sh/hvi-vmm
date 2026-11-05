@@ -37,9 +37,6 @@ pub const CONFIG_LEN: usize = TAG_LEN + 4;
 
 /// Largest ring a split virtqueue can have, and so the largest queue size an
 /// export can be given.
-///
-/// Named for the value rather than for the register, because
-/// `virtio::QUEUE_NUM_MAX` is a different number for a different device.
 pub const MAX_QUEUE_SIZE: u16 = crate::config::FsConfig::MAX_QUEUE_SIZE;
 
 /// Feature bits the guest may negotiate, before intersecting with what the
@@ -317,7 +314,7 @@ mod device {
         device_features: u64,
         /// What the guest has written to `DRIVER_FEATURES`.
         acked_features: u64,
-        /// The largest ring the guest may program, which `QUEUE_NUM_MAX`
+        /// The largest ring the guest may program, which `QUEUE_MAX_SIZE`
         /// reads.
         queue_size: u16,
         /// Whether the peer offered `VHOST_USER_F_PROTOCOL_FEATURES`, which

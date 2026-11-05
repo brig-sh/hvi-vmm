@@ -30,7 +30,7 @@ pub mod vsock;
 
 use std::sync::{Arc, Mutex};
 
-use queue::{Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use queue::{Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 use crate::config::Stop;
 use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
