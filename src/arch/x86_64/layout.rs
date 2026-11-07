@@ -20,8 +20,7 @@
 //! RAM, the MP table in the EBDA and the ACPI tables in the BIOS area. The
 //! virtio-mmio window is in the sub-4 GiB MMIO hole.
 
-use crate::config::MAX_DISKS;
-use crate::devices::manager::{Placement, Slot};
+use crate::devices::manager::SlotAllocator;
 
 /// Guest RAM base (x86 RAM starts at physical 0).
 pub const RAM_BASE: u64 = 0x0;
@@ -80,117 +79,30 @@ pub const IOAPIC_ADDR: u32 = 0xfec0_0000;
 /// device.
 pub const IOAPIC_INPUTS: u8 = 24;
 
-/// virtio-mmio window in the sub-4 GiB MMIO hole: one 0x200 page per device,
-/// each on its own IOAPIC GSI. The guest learns them from the ACPI DSDT (see
-/// `acpi.rs`), so none of these is a contract.
+/// The GSI of the CMOS RTC, ISA IRQ 8, which the guest's rtc-cmos driver
+/// claims.
+pub const RTC_GSI: u32 = 8;
+
+/// The base of the virtio-mmio window in the sub-4 GiB MMIO hole.
 ///
-/// | range from `VIRTIO_MMIO_BASE`  | GSI      | device                   |
-/// |--------------------------------|----------|--------------------------|
-/// | `+0x000`                       | 5        | virtio-blk, disk 0       |
-/// | `+0x200`                       | 6        | virtio-net               |
-/// | `+0x400`                       | 7        | virtio-vsock             |
-/// | `+0x600` .. `+0xa00`           | 9 .. 11  | virtio-blk, disks 1 .. 3 |
-/// | `+0xc00 + i * 0x200`           | `12 + i` | virtio-fs export `i`     |
-///
-/// COM1 holds GSI 4 and the guest's rtc-cmos driver claims 8, so the disks
-/// after the first start at 9. The exports run up to the ACPI SCI on the
-/// IOAPIC's last line, [`SCI_GSI`], which bounds them at [`MAX_FS_DEVICES`].
-/// Lines 16 to 22 have no ISA IRQ, so a guest reaches a device on one only
-/// through the DSDT.
+/// `virtio_slots` hands out one range per device from here. The guest learns
+/// them from the ACPI DSDT (see `acpi.rs`), so none of them is a contract.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
-pub const VIRTIO_SIZE: u64 = crate::devices::virtio::mmio::RANGE_SIZE;
-pub const VIRTIO_BLK_BASE: u64 = VIRTIO_MMIO_BASE;
-pub const VIRTIO_NET_BASE: u64 = VIRTIO_MMIO_BASE + 0x200;
-pub const VIRTIO_VSOCK_BASE: u64 = VIRTIO_MMIO_BASE + 0x400;
-pub const VIRTIO_BLK_GSI: u32 = 5;
-pub const VIRTIO_NET_GSI: u32 = 6;
-pub const VIRTIO_VSOCK_GSI: u32 = 7;
-/// Range and GSI of disk 1. Disks 2 and 3 follow, one slot each.
-pub const VIRTIO_BLK_EXTRA_BASE: u64 = VIRTIO_MMIO_BASE + 0x600;
-pub const VIRTIO_BLK_EXTRA_GSI: u32 = 9;
-/// Range and GSI of export 0. The others follow, one slot each.
-pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
-pub const VIRTIO_FS_GSI: u32 = VIRTIO_BLK_EXTRA_GSI + MAX_DISKS as u32 - 1;
-/// How many virtio-fs exports this machine has interrupt lines for: the lines
-/// from [`VIRTIO_FS_GSI`] up to the SCI.
-pub const MAX_FS_DEVICES: usize = (SCI_GSI - VIRTIO_FS_GSI) as usize;
+/// The GSI of the first virtio device. COM1 holds GSI 4.
+pub const VIRTIO_GSI: u32 = 5;
 
-/// Placement of the virtio-blk device for disk `index`, or `None` past
-/// [`MAX_DISKS`].
-#[must_use]
-pub fn virtio_blk_base(index: usize) -> Option<u64> {
-    match index {
-        0 => Some(VIRTIO_BLK_BASE),
-        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_BASE + (i as u64 - 1) * VIRTIO_SIZE),
-        _ => None,
-    }
-}
-
-/// The GSI of the virtio-blk device for disk `index`, or `None` past
-/// [`MAX_DISKS`].
-#[must_use]
-pub fn virtio_blk_gsi(index: usize) -> Option<u32> {
-    match index {
-        0 => Some(VIRTIO_BLK_GSI),
-        i if i < MAX_DISKS => Some(VIRTIO_BLK_EXTRA_GSI + i as u32 - 1),
-        _ => None,
-    }
-}
-
-/// Returns the range base of the `index`th virtio-fs export, or `None` when
-/// the machine has no line left for it.
-#[must_use]
-pub fn virtio_fs_base(index: usize) -> Option<u64> {
-    if index >= MAX_FS_DEVICES {
-        return None;
-    }
-    Some(VIRTIO_FS_BASE + index as u64 * VIRTIO_SIZE)
-}
-
-/// Returns the GSI of the `index`th virtio-fs export, or `None` when the
-/// machine has no line left for it.
-#[must_use]
-pub fn virtio_fs_gsi(index: usize) -> Option<u32> {
-    if index >= MAX_FS_DEVICES {
-        return None;
-    }
-    Some(VIRTIO_FS_GSI + index as u32)
-}
-
-/// The slots of the virtio devices on the x86-64 machine, from the functions
-/// and constants above.
-pub(crate) struct VirtioSlots;
-
-impl Placement for VirtioSlots {
-    fn disk(&self, index: usize) -> Option<Slot> {
-        Some(Slot {
-            base: virtio_blk_base(index)?,
-            irq: virtio_blk_gsi(index)?,
-        })
-    }
-
-    fn net(&self) -> Slot {
-        Slot {
-            base: VIRTIO_NET_BASE,
-            irq: VIRTIO_NET_GSI,
-        }
-    }
-
-    fn vsock(&self) -> Slot {
-        Slot {
-            base: VIRTIO_VSOCK_BASE,
-            irq: VIRTIO_VSOCK_GSI,
-        }
-    }
-
-    fn export(&self, index: usize) -> Result<Slot, String> {
-        match (virtio_fs_base(index), virtio_fs_gsi(index)) {
-            (Some(base), Some(irq)) => Ok(Slot { base, irq }),
-            _ => Err(format!(
-                "virtio-fs export {index}: x86-64 has interrupt lines for {MAX_FS_DEVICES} exports"
-            )),
-        }
-    }
+/// Returns the slots of the virtio devices, with ranges from
+/// [`VIRTIO_MMIO_BASE`] up to the IOAPIC and GSIs from [`VIRTIO_GSI`] up to the
+/// ACPI SCI on the IOAPIC's last line, [`SCI_GSI`].
+///
+/// The GSIs skip [`RTC_GSI`], which leaves 17 for the virtio devices of all
+/// kinds. Lines 16 to 22 have no ISA IRQ, so a guest reaches a device on one
+/// only through the DSDT.
+pub(crate) fn virtio_slots() -> SlotAllocator {
+    SlotAllocator::new(
+        VIRTIO_MMIO_BASE..u64::from(IOAPIC_ADDR),
+        (VIRTIO_GSI..SCI_GSI).filter(|&gsi| gsi != RTC_GSI),
+    )
 }
 
 /// Base of the sub-4 GiB MMIO hole: guest RAM stops here and the remainder,
@@ -218,79 +130,29 @@ pub const HIGH_RAM_BASE: u64 = 0x1_0000_0000; // 4 GiB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::virtio::mmio::RANGE_SIZE;
 
-    // Every device adds a range and a GSI. Neither may land on another device,
-    // every range has to sit in the MMIO hole, and every GSI has to be an
-    // IOAPIC input no legacy device claims.
+    // Every device adds a range and a GSI. The ranges follow one another in the
+    // MMIO hole, below the IOAPIC, and every GSI is an IOAPIC input no legacy
+    // device claims.
     #[test]
-    fn no_device_shares_a_range_or_a_gsi_with_another() {
-        let rtc_gsi = 8;
-        let mut devices = vec![
-            ("net".to_string(), VIRTIO_NET_BASE, VIRTIO_NET_GSI),
-            ("vsock".to_string(), VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI),
-        ];
-        for i in 0..MAX_DISKS {
-            devices.push((
-                format!("disk {i}"),
-                virtio_blk_base(i).expect("a disk slot"),
-                virtio_blk_gsi(i).expect("a disk GSI"),
-            ));
-        }
-        for i in 0..MAX_FS_DEVICES {
-            devices.push((
-                format!("export {i}"),
-                virtio_fs_base(i).expect("an export slot"),
-                virtio_fs_gsi(i).expect("an export GSI"),
-            ));
-        }
-        for (a, (na, base_a, gsi_a)) in devices.iter().enumerate() {
-            assert!(
-                *gsi_a < u32::from(IOAPIC_INPUTS),
-                "{na} GSI {gsi_a} is not an IOAPIC input"
-            );
-            assert!(
-                ![COM1_GSI, rtc_gsi, SCI_GSI].contains(gsi_a),
-                "{na} takes another device's GSI {gsi_a}"
-            );
-            assert!(*base_a >= MMIO_GAP_START, "{na} is in RAM");
-            assert!(
-                base_a + VIRTIO_SIZE <= MMIO_GAP_START + 0x4000,
-                "{na} escapes the hole"
-            );
-            for (nb, base_b, gsi_b) in devices.iter().skip(a + 1) {
-                let overlap = base_a < &(base_b + VIRTIO_SIZE) && base_b < &(base_a + VIRTIO_SIZE);
-                assert!(!overlap, "{na} at {base_a:#x} overlaps {nb} at {base_b:#x}");
-                assert_ne!(gsi_a, gsi_b, "{na} and {nb} share GSI {gsi_a}");
-            }
-        }
-    }
-
-    // Disk 0 keeps the range and the GSI it had when it was the only disk, the
-    // others follow vsock, and the exports follow the disks up to the IOAPIC's
-    // last line.
-    #[test]
-    fn disks_and_exports_take_fixed_slots_in_order() {
+    fn virtio_slots_take_every_free_gsi_in_order() {
+        let mut slots = virtio_slots();
+        let taken: Vec<_> = std::iter::from_fn(|| slots.allocate().ok()).collect();
+        let gsis: Vec<u32> = taken.iter().map(|slot| slot.irq).collect();
         assert_eq!(
-            virtio_blk_base(0),
-            Some(VIRTIO_BLK_BASE),
-            "disk 0 stays put"
+            gsis,
+            [5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
         );
-        assert_eq!(virtio_blk_gsi(0), Some(VIRTIO_BLK_GSI));
-        assert_eq!(virtio_blk_base(1), Some(0xd000_0600));
-        assert_eq!(virtio_blk_gsi(1), Some(9));
-        assert_eq!(virtio_blk_base(3), Some(0xd000_0a00));
-        assert_eq!(virtio_blk_gsi(3), Some(11));
-        assert_eq!(virtio_blk_base(MAX_DISKS), None);
-        assert_eq!(virtio_blk_gsi(MAX_DISKS), None);
-        assert_eq!(virtio_fs_base(0), Some(0xd000_0c00));
-        assert_eq!(virtio_fs_gsi(0), Some(12));
-        assert_eq!(MAX_FS_DEVICES, 11);
-        assert_eq!(
-            virtio_fs_gsi(MAX_FS_DEVICES - 1),
-            Some(22),
-            "the SCI holds 23"
-        );
-        assert_eq!(virtio_fs_base(MAX_FS_DEVICES), None);
-        assert_eq!(virtio_fs_gsi(MAX_FS_DEVICES), None);
+        for (index, slot) in taken.iter().enumerate() {
+            assert_eq!(slot.base, VIRTIO_MMIO_BASE + index as u64 * RANGE_SIZE);
+            assert!(slot.irq < u32::from(IOAPIC_INPUTS));
+            assert!(![COM1_GSI, RTC_GSI, SCI_GSI].contains(&slot.irq));
+            assert!(slot.base >= MMIO_GAP_START, "slot {index} is in RAM");
+        }
+        assert!(slots
+            .allocate()
+            .unwrap_err()
+            .contains("after 17 virtio devices"));
     }
 }

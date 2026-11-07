@@ -14,8 +14,8 @@
 
 //! The devices of a VM, attached one call per device.
 //!
-//! A backend makes a [`DeviceManager`] with the machine's [`Placement`] and a
-//! maker of its interrupt lines, and attaches the virtio devices the
+//! A backend makes a [`DeviceManager`] with the machine's [`SlotAllocator`] and
+//! a maker of its interrupt lines, and attaches the virtio devices the
 //! configuration asks for in one call. An attach opens the device, places it,
 //! puts it on the MMIO bus, connects its interrupt and records it. The records
 //! describe the virtio devices to the guest's firmware, and
@@ -65,23 +65,72 @@ pub(crate) struct Slot {
     pub(crate) irq: u32,
 }
 
-/// Where each virtio device sits on one machine.
-pub(crate) trait Placement {
-    /// Returns the slot of disk `index`, or `None` past the last one.
-    fn disk(&self, index: usize) -> Option<Slot>;
+/// The slots of a machine's virtio devices, handed out in order.
+///
+/// Each slot takes the next range of [`RANGE_SIZE`] addresses from the start of
+/// a window, and the next interrupt from a list. Every kind of virtio device
+/// takes its slot from the same allocator.
+pub(crate) struct SlotAllocator {
+    /// The addresses the ranges come from.
+    window: Range<u64>,
+    /// The interrupts, in the order they are handed out.
+    irqs: Vec<u32>,
+    /// How many slots have been handed out.
+    taken: usize,
+}
 
-    /// Returns the slot of the network device.
-    fn net(&self) -> Slot;
+impl SlotAllocator {
+    /// Returns an allocator that hands out the ranges of `window` with the
+    /// interrupts of `irqs`, in order.
+    pub(crate) fn new(window: Range<u64>, irqs: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            window,
+            irqs: irqs.into_iter().collect(),
+            taken: 0,
+        }
+    }
 
-    /// Returns the slot of the vsock device.
-    fn vsock(&self) -> Slot;
+    /// Returns how many slots the machine has in all.
+    pub(crate) fn capacity(&self) -> usize {
+        let ranges = (self.window.end.saturating_sub(self.window.start) / RANGE_SIZE) as usize;
+        ranges.min(self.irqs.len())
+    }
 
-    /// Returns the slot of virtio-fs export `index`.
+    /// Refuses `count` virtio devices when the machine has fewer slots.
     ///
     /// # Errors
     ///
-    /// Errors when the machine has no slot left for it.
-    fn export(&self, index: usize) -> Result<Slot, String>;
+    /// Errors when `count` is past [`capacity`](Self::capacity).
+    pub(crate) fn check_room(&self, count: usize) -> Result<(), String> {
+        let capacity = self.capacity();
+        if count > capacity {
+            return Err(format!(
+                "{count} virtio devices given; at most {capacity} fit"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the next slot.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the window has no range left or the list no interrupt.
+    pub(crate) fn allocate(&mut self) -> Result<Slot, String> {
+        let base = self.window.start + self.taken as u64 * RANGE_SIZE;
+        if base.saturating_add(RANGE_SIZE) > self.window.end {
+            return Err(format!(
+                "no address range left below {:#x} after {} virtio devices",
+                self.window.end, self.taken
+            ));
+        }
+        let irq = *self
+            .irqs
+            .get(self.taken)
+            .ok_or_else(|| format!("no interrupt left after {} virtio devices", self.taken))?;
+        self.taken += 1;
+        Ok(Slot { base, irq })
+    }
 }
 
 /// What a virtio device is, as the guest's firmware describes it.
@@ -129,8 +178,8 @@ pub(crate) struct DeviceManager {
     ram: Arc<GuestRam>,
     /// The ledger the devices' events go to.
     ledger: Arc<Ledger>,
-    /// Where each device sits.
-    placement: Box<dyn Placement>,
+    /// The slots the virtio devices take.
+    slots: SlotAllocator,
     /// Makes the line for an interrupt, numbered as in [`Slot::irq`].
     line: Box<dyn Fn(u32) -> Arc<dyn IrqLine>>,
     /// A record per virtio device, in the order they were attached.
@@ -140,18 +189,18 @@ pub(crate) struct DeviceManager {
 }
 
 impl DeviceManager {
-    /// Returns a manager with no devices, which places them by `placement` and
+    /// Returns a manager with no devices, which places them in `slots` and
     /// connects them to the lines `line` makes.
     pub(crate) fn new(
         ram: &Arc<GuestRam>,
         ledger: &Arc<Ledger>,
-        placement: impl Placement + 'static,
+        slots: SlotAllocator,
         line: impl Fn(u32) -> Arc<dyn IrqLine> + 'static,
     ) -> Self {
         Self {
             ram: Arc::clone(ram),
             ledger: Arc::clone(ledger),
-            placement: Box::new(placement),
+            slots,
             line: Box::new(line),
             records: Vec::new(),
             devices: Devices {
@@ -203,15 +252,14 @@ impl DeviceManager {
     ///
     /// # Errors
     ///
-    /// Errors when `block::open_disks` refuses the disks, or a range overlaps
-    /// one already on the bus.
+    /// Errors when `block::open_disks` refuses the disks, no slot is left for a
+    /// disk, or a range overlaps one already on the bus.
     fn attach_disks(&mut self, disks: &[DiskConfig]) -> Result<(), Error> {
         for (index, disk) in block::open_disks(disks)?.into_iter().enumerate() {
-            // `open_disks` refuses more disks than any machine has slots for.
             let slot = self
-                .placement
-                .disk(index)
-                .expect("every disk should have a slot");
+                .slots
+                .allocate()
+                .map_err(|e| format!("virtio-blk disk {index}: {e}"))?;
             self.attach_virtio(DeviceKind::Block, slot, &disk)?;
             self.devices.disks.push(disk);
         }
@@ -222,13 +270,17 @@ impl DeviceManager {
     ///
     /// # Errors
     ///
-    /// Errors when `net::open` does, or the range overlaps one already on the
-    /// bus.
+    /// Errors when `net::open` does, no slot is left, or the range overlaps one
+    /// already on the bus.
     fn attach_net(&mut self, cfg: &BootConfig) -> Result<(), Error> {
         let Some(network) = net::open(cfg)? else {
             return Ok(());
         };
-        self.attach_virtio(DeviceKind::Net, self.placement.net(), &network.device)?;
+        let slot = self
+            .slots
+            .allocate()
+            .map_err(|e| format!("virtio-net: {e}"))?;
+        self.attach_virtio(DeviceKind::Net, slot, &network.device)?;
         if let Some(source) = network.source {
             source.queue_relay(&network.device, &self.ram, &mut self.devices.host);
         }
@@ -241,13 +293,17 @@ impl DeviceManager {
     ///
     /// # Errors
     ///
-    /// Errors when the socket cannot be bound, or the range overlaps one
-    /// already on the bus.
+    /// Errors when the socket cannot be bound, no slot is left, or the range
+    /// overlaps one already on the bus.
     fn attach_vsock(&mut self, path: Option<&str>) -> Result<(), Error> {
         let Some(agent) = vsock::open(path, &self.ram)? else {
             return Ok(());
         };
-        self.attach_virtio(DeviceKind::Vsock, self.placement.vsock(), &agent.device)?;
+        let slot = self
+            .slots
+            .allocate()
+            .map_err(|e| format!("virtio-vsock: {e}"))?;
+        self.attach_virtio(DeviceKind::Vsock, slot, &agent.device)?;
         let bridge = agent.bridge;
         self.devices
             .host
@@ -263,8 +319,8 @@ impl DeviceManager {
     ///
     /// # Errors
     ///
-    /// Errors when the machine has no slot for an export, `vhost_user::attach`
-    /// fails, or a range overlaps one already on the bus.
+    /// Errors when no slot is left for an export, `vhost_user::attach` fails,
+    /// or a range overlaps one already on the bus.
     #[cfg(target_os = "linux")]
     fn attach_exports(&mut self, exports: &[FsConfig], ram_fd: RawFd) -> Result<(), Error> {
         let slots = self.export_slots(exports.len())?;
@@ -285,8 +341,8 @@ impl DeviceManager {
     ///
     /// # Errors
     ///
-    /// Errors when the machine has no slot for an export, `worker::attach`
-    /// fails, or a range overlaps one already on the bus.
+    /// Errors when no slot is left for an export, `worker::attach` fails, or a
+    /// range overlaps one already on the bus.
     #[cfg(target_os = "macos")]
     fn attach_exports(&mut self, shares: &[FsShare]) -> Result<(), Error> {
         let slots = self.export_slots(shares.len())?;
@@ -312,9 +368,13 @@ impl DeviceManager {
     /// # Errors
     ///
     /// Errors when the machine has no slot left for one.
-    fn export_slots(&self, count: usize) -> Result<Vec<Slot>, String> {
+    fn export_slots(&mut self, count: usize) -> Result<Vec<Slot>, String> {
         (0..count)
-            .map(|index| self.placement.export(index))
+            .map(|index| {
+                self.slots
+                    .allocate()
+                    .map_err(|e| format!("virtio-fs export {index}: {e}"))
+            })
             .collect()
     }
 
@@ -380,40 +440,6 @@ impl DeviceManager {
 mod tests {
     use super::*;
 
-    /// A placement that puts each device on a page of its own, numbered by
-    /// kind, with the interrupt equal to the page.
-    struct Pages {
-        /// Whether vsock takes the network's slot.
-        vsock_on_net: bool,
-    }
-
-    impl Pages {
-        fn slot(page: u64) -> Slot {
-            Slot {
-                base: page * 0x1000,
-                irq: page as u32,
-            }
-        }
-    }
-
-    impl Placement for Pages {
-        fn disk(&self, index: usize) -> Option<Slot> {
-            Some(Self::slot(10 + index as u64))
-        }
-
-        fn net(&self) -> Slot {
-            Self::slot(20)
-        }
-
-        fn vsock(&self) -> Slot {
-            Self::slot(if self.vsock_on_net { 20 } else { 30 })
-        }
-
-        fn export(&self, index: usize) -> Result<Slot, String> {
-            Ok(Self::slot(40 + index as u64))
-        }
-    }
-
     /// A line that sets nothing.
     struct NoLine;
 
@@ -423,13 +449,13 @@ mod tests {
         }
     }
 
-    /// Returns a manager on `placement` and the interrupts it made lines for.
-    fn manager(placement: Pages) -> (DeviceManager, Arc<Mutex<Vec<u32>>>) {
+    /// Returns a manager on `slots` and the interrupts it made lines for.
+    fn manager(slots: SlotAllocator) -> (DeviceManager, Arc<Mutex<Vec<u32>>>) {
         let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x10000)]));
         let ledger = Arc::new(Ledger::new(None, "manager-test").unwrap());
         let lines = Arc::new(Mutex::new(Vec::new()));
         let made = Arc::clone(&lines);
-        let manager = DeviceManager::new(&ram, &ledger, placement, move |irq| {
+        let manager = DeviceManager::new(&ram, &ledger, slots, move |irq| {
             made.lock().unwrap().push(irq);
             Arc::new(NoLine) as Arc<dyn IrqLine>
         });
@@ -458,11 +484,11 @@ mod tests {
         }
     }
 
+    // The interrupt list skips 8, as the x86-64 one skips the CMOS RTC's line.
     #[test]
     fn devices_take_their_slots_and_lines_in_attach_order() {
-        let (mut devices, lines) = manager(Pages {
-            vsock_on_net: false,
-        });
+        let (mut devices, lines) =
+            manager(SlotAllocator::new(0x10_0000..0x10_1000, [5, 6, 7, 9, 10]));
         let disks = vec![disk("disk0"), disk("disk1")];
         let agent = scratch("agent");
         let cfg = BootConfig {
@@ -475,21 +501,21 @@ mod tests {
         devices.attach_virtio_devices(&cfg, -1).unwrap();
         #[cfg(target_os = "macos")]
         devices.attach_virtio_devices(&cfg).unwrap();
-        let page = |page: u64, kind| DeviceRecord {
+        let slot = |base: u64, irq, kind| DeviceRecord {
             kind,
-            range: page * 0x1000..page * 0x1000 + RANGE_SIZE,
-            irq: page as u32,
+            range: base..base + RANGE_SIZE,
+            irq,
         };
         assert_eq!(
             devices.records(),
             [
-                page(10, DeviceKind::Block),
-                page(11, DeviceKind::Block),
-                page(20, DeviceKind::Net),
-                page(30, DeviceKind::Vsock),
+                slot(0x10_0000, 5, DeviceKind::Block),
+                slot(0x10_0200, 6, DeviceKind::Block),
+                slot(0x10_0400, 7, DeviceKind::Net),
+                slot(0x10_0600, 9, DeviceKind::Vsock),
             ]
         );
-        assert_eq!(*lines.lock().unwrap(), [10, 11, 20, 30]);
+        assert_eq!(*lines.lock().unwrap(), [5, 6, 7, 9]);
 
         let attached = devices.finish();
         assert_eq!(attached.disks.len(), 2);
@@ -497,10 +523,7 @@ mod tests {
         let mut magic = [0; 4];
         attached
             .mmio_bus
-            .read(
-                11 * 0x1000 + crate::devices::virtio::mmio::MAGIC,
-                &mut magic,
-            )
+            .read(0x10_0200 + crate::devices::virtio::mmio::MAGIC, &mut magic)
             .unwrap();
         assert_eq!(&magic, b"virt");
         for path in disks.iter().map(|disk| &disk.path).chain([&agent]) {
@@ -509,9 +532,9 @@ mod tests {
     }
 
     #[test]
-    fn device_on_a_taken_slot_is_refused() {
-        let (mut devices, _) = manager(Pages { vsock_on_net: true });
-        let agent = scratch("taken");
+    fn device_past_the_last_interrupt_is_refused() {
+        let (mut devices, _) = manager(SlotAllocator::new(0x10_0000..0x10_1000, [5]));
+        let agent = scratch("refused");
         devices
             .attach_net(&BootConfig {
                 net: true,
@@ -520,7 +543,47 @@ mod tests {
             .unwrap();
         let err = devices.attach_vsock(Some(&agent)).unwrap_err().to_string();
         let _ = std::fs::remove_file(&agent);
-        assert!(err.contains("overlaps"), "{err}");
+        assert_eq!(
+            err,
+            "virtio-vsock: no interrupt left after 1 virtio devices"
+        );
         assert_eq!(devices.records().len(), 1);
+    }
+
+    #[test]
+    fn slots_end_with_the_window() {
+        let mut slots = SlotAllocator::new(0x1000..0x1400, 0..4);
+        assert_eq!(
+            slots.allocate(),
+            Ok(Slot {
+                base: 0x1000,
+                irq: 0
+            })
+        );
+        assert_eq!(
+            slots.allocate(),
+            Ok(Slot {
+                base: 0x1200,
+                irq: 1
+            })
+        );
+        assert_eq!(
+            slots.allocate(),
+            Err("no address range left below 0x1400 after 2 virtio devices".to_string())
+        );
+    }
+
+    // The window holds two ranges and the list four interrupts, so the window
+    // decides.
+    #[test]
+    fn room_is_the_smaller_of_the_ranges_and_the_interrupts() {
+        let slots = SlotAllocator::new(0x1000..0x1400, 0..4);
+        assert_eq!(slots.capacity(), 2);
+        slots.check_room(2).unwrap();
+        assert_eq!(
+            slots.check_room(3),
+            Err("3 virtio devices given; at most 2 fit".to_string())
+        );
+        assert_eq!(SlotAllocator::new(0x1000..0x2000, [7]).capacity(), 1);
     }
 }

@@ -86,6 +86,13 @@ pub(super) fn gic_layout() -> Result<GicLayout, HypervisorError> {
     })
 }
 
+/// Returns how many interrupts the framework's GIC has, from INTID 0 up to its
+/// last SPI.
+pub(super) fn gic_num_irqs() -> Result<u32, HypervisorError> {
+    let (base, count) = GicConfig::get_spi_interrupt_range()?;
+    Ok(base + count)
+}
+
 /// Returns the GIC configuration that places the distributor and the
 /// redistributors where `layout` puts them.
 ///

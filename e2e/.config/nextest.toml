@@ -37,7 +37,7 @@ writeback = { max-threads = 1 }
 # - The nightly list holds the tests too slow to run on every pull request.
 #
 # The filter stays on one line, which is how the tools in `tools/` read it.
-default-filter = "not (test(=cache_maintenance_on_a_device_range_is_skipped) | test(=mmio_load_without_syndrome_fails_the_run_on_hvf) | test(=mmio_trace_reports_unclaimed_mmio) | test(=unclaimed_mmio_reads_zero_without_a_report)) and not (test(=socket::daemon_that_never_starts_fails_the_boot_after_the_wait))"
+default-filter = "not (test(=cache_maintenance_on_a_device_range_is_skipped) | test(=mmio_load_without_syndrome_fails_the_run_on_hvf) | test(=mmio_trace_reports_unclaimed_mmio) | test(=socket::sixteen_exports_mount_and_a_seventeenth_is_refused) | test(=unclaimed_mmio_reads_zero_without_a_report)) and not (test(=socket::daemon_that_never_starts_fails_the_boot_after_the_wait))"
 fail-fast = false
 # A test that fails and then passes on its retry is reported as flaky and still
 # fails the run, so a race in hvi cannot pass a pull request by retrying.

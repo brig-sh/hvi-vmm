@@ -409,10 +409,12 @@ mod socket {
         );
     }
 
+    // x86-64 has 17 interrupt lines for the virtio devices of all kinds, and
+    // the agent's vsock device takes one.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn eleven_exports_mount_and_a_twelfth_is_refused() {
-        let exports: Vec<(FsExport, String)> = (0..11)
+    fn sixteen_exports_mount_and_a_seventeenth_is_refused() {
+        let exports: Vec<(FsExport, String)> = (0..16)
             .map(|n| {
                 let tag = format!("export{n}");
                 let dir = export_dir(&tag);
@@ -420,11 +422,11 @@ mod socket {
                 (FsExport::new(&dir, &tag), tag)
             })
             .collect();
-        let mut eleven = Vm::builder();
+        let mut sixteen = Vm::builder();
         for (export, _) in &exports {
-            eleven = eleven.fs(export);
+            sixteen = sixteen.fs(export);
         }
-        let vm = eleven.boot();
+        let vm = sixteen.boot();
         for (_, tag) in &exports {
             mount(&vm, tag);
             let name = vm
@@ -435,17 +437,17 @@ mod socket {
         }
         vm.power_off();
 
-        let exports: Vec<FsExport> = (0..12)
+        let exports: Vec<FsExport> = (0..17)
             .map(|n| FsExport::new(&export_dir(&format!("again{n}")), &format!("again{n}")))
             .collect();
-        let mut twelve = Vm::builder();
+        let mut seventeen = Vm::builder();
         for export in &exports {
-            twelve = twelve.fs(export);
+            seventeen = seventeen.fs(export);
         }
-        twelve
+        seventeen
             .spawn()
             .wait(Duration::from_secs(30))
-            .assert_refused("x86-64 has interrupt lines for 11 exports");
+            .assert_refused("18 virtio devices given; at most 17 fit");
     }
 
     #[test]

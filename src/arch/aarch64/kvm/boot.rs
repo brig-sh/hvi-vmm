@@ -29,7 +29,7 @@ use super::regs::{setup_boot_regs, try_get_u64, REG_MPIDR_EL1};
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    mpidr_affinity, GicLayout, GicVersion, VirtioSlots, GIC_NUM_IRQS, MPIDR_AFFINITY_MASK,
+    mpidr_affinity, virtio_slots, GicLayout, GicVersion, GIC_NUM_IRQS, MPIDR_AFFINITY_MASK,
     RAM_BASE, UART_SPI,
 };
 use crate::arch::aarch64::loader;
@@ -53,6 +53,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     loader::LoadedKernel::from_header(&cfg.kernel)?;
 
     let num_cpus = cfg.vcpus.max(1);
+    // Refuse more virtio devices than the GIC has interrupts for before any of
+    // them opens.
+    let slots = virtio_slots(GIC_NUM_IRQS);
+    slots.check_room(cfg.virtio_device_count())?;
 
     let kvm = Kvm::new()?;
     // A kick relies on `kvm_run.immediate_exit`. Without it, one that lands
@@ -94,11 +98,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The ledger exists first, since each device's transport writes to it.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let placement = VirtioSlots {
-        gic,
-        num_irqs: Some(GIC_NUM_IRQS),
-    };
-    let mut devices = DeviceManager::new(&ram, &ledger, placement, {
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, {
         let vm = Arc::clone(&vm);
         move |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi))) as Arc<dyn IrqLine>
     });

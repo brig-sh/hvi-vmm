@@ -223,8 +223,8 @@ hvi boot --kernel <bzImage> --disk rootfs.img \
          --cmdline "console=ttyS0 root=/dev/vda rw panic=-1"
 ```
 
-The guest sees the disk as `/dev/vda`. No partition table is required. Up to
-four disks attach, and no hotplug; see
+The guest sees the disk as `/dev/vda`. No partition table is required. More
+disks attach in order, and there is no hotplug; see
 [storage-and-sharing.md](storage-and-sharing.md).
 
 ### A virtio-fs share, on macOS

@@ -104,18 +104,6 @@ fn four_disks_keep_their_order_size_and_serial() {
     assert_eq!(listing.lines().collect::<Vec<_>>(), expected);
 }
 
-#[test]
-fn fifth_disk_is_refused() {
-    let mut builder = Vm::builder();
-    for index in 0..5 {
-        builder = builder.disk(sparse_file(&format!("disk{index}.img"), MIB));
-    }
-    builder
-        .spawn()
-        .wait(Duration::from_secs(10))
-        .assert_refused("5 disks given; at most 4 fit");
-}
-
 // virtio-blk gives the capacity in whole 512-byte sectors.
 #[test]
 fn image_not_a_multiple_of_five_hundred_twelve_bytes_loses_only_its_tail() {

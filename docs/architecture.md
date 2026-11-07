@@ -126,7 +126,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
 ### Guest memory maps
 
-<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, PL031 RTC at 0x0c001000, virtio-mmio window from 0x0d000000 with disk 0, net, vsock, disks 1 to 3 and the virtio-fs shares, RAM at 0x40000000" width="720">
+<img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, PL031 RTC at 0x0c001000, virtio-mmio window from 0x0d000000 with one page per device in attach order, RAM at 0x40000000" width="720">
 
 **aarch64** (`arch/aarch64/layout.rs`). Devices sit above the GIC, RAM at 1 GiB.
 
@@ -137,12 +137,15 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 | GIC redistributor (v3) | `0x080A_0000` | `0x2_0000` per vCPU | |
 | PL011 UART | `0x0c00_0000` | `0x1000` | SPI 1, INTID 33 |
 | PL031 RTC | `0x0c00_1000` | `0x1000` | none |
-| virtio-blk, disk 0 | `0x0d00_0000` | `0x200` | SPI 2, INTID 34 |
-| virtio-net | `0x0d00_0200` | `0x200` | SPI 3, INTID 35 |
-| virtio-vsock | `0x0d00_0400` | `0x200` | SPI 4, INTID 36 |
-| virtio-blk, disk `i` from 1 to 3 | `0x0d00_0600 + (i - 1) * 0x200` | `0x200` | SPI `4 + i`, INTID `36 + i` |
-| virtio-fs share `i` | `0x0d00_0c00 + i * 0x200` | `0x200` | SPI `8 + i`, INTID `40 + i` |
+| virtio device `i`, in attach order | `0x0d00_0000 + i * 0x200` | `0x200` | SPI `2 + i`, INTID `34 + i` |
 | RAM | `0x4000_0000` | `--mem-mib` | |
+
+The virtio devices take their slots in the order they are attached: the disks in
+argv order, then net, vsock and the virtio-fs shares. A device the guest does
+not have takes no slot. On KVM the SPIs end with the GIC's 256 interrupts, which
+leaves 222 for the virtio devices of all kinds. On macOS they end with the SPIs
+Hypervisor.framework's GIC has. A configuration with more virtio devices than
+slots is refused before the VM exists.
 
 INTID is `32 + SPI` on both backends. Every device range sits inside
 `DEVICE_WINDOW_BASE`..`DEVICE_WINDOW_END` (`0x0800_0000`..`0x4000_0000`),
@@ -177,9 +180,7 @@ logs a redistributor region that does not match the table:
 | ACPI tables: RSDP, DSDT, FACS, FADT, MADT, XSDT | `0xe_0000` |
 | `bzImage` load / 64-bit entry | `0x10_0000` / `0x10_0200` (a `vmlinux` enters at its `e_entry`) |
 | RAM, low half | `0x0` to `0xd000_0000` |
-| virtio-blk disk 0 / net / vsock | `0xd000_0000` / `0xd000_0200` / `0xd000_0400`, GSIs 5 / 6 / 7 |
-| virtio-blk disks 1 / 2 / 3 | `0xd000_0600` / `0xd000_0800` / `0xd000_0a00`, GSIs 9 / 10 / 11 |
-| virtio-fs export `i`, up to 11 | `0xd000_0c00 + i * 0x200`, GSI `12 + i` |
+| virtio device `i`, in attach order, up to 17 | `0xd000_0000 + i * 0x200`, the `i`th of GSIs 5 to 7 and 9 to 22 |
 | COM1 UART | PIO `0x3f8`, GSI 4 |
 | CMOS RTC | PIO `0x70` / `0x71` |
 | i8042 status and reset command | PIO `0x64` |
