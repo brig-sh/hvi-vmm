@@ -257,10 +257,8 @@ pub fn build(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::arch::aarch64::layout::{
-        virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, VIRTIO_FS_BASE,
-        VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE,
-    };
+    use crate::arch::aarch64::layout::{VIRTIO_BASE, VIRTIO_SPI};
+    use crate::devices::virtio::mmio::RANGE_SIZE;
 
     /// A fixed seed, so a test blob is the same every run.
     const SEED: [u8; RNG_SEED_LEN] = [0xa5; RNG_SEED_LEN];
@@ -306,19 +304,19 @@ pub(crate) mod tests {
         assert_eq!(&blob[0..4], &[0xd0, 0x0d, 0xfe, 0xed]);
     }
 
-    /// Returns the device at `base` and `spi`, which the layout gives.
-    fn device(base: Option<u64>, spi: Option<u32>) -> MmioDevice {
+    /// Returns the device in the `index`th virtio slot.
+    fn device(index: u32) -> MmioDevice {
         MmioDevice {
-            base: base.unwrap(),
-            size: VIRTIO_SIZE,
-            spi: spi.unwrap(),
+            base: VIRTIO_BASE + u64::from(index) * RANGE_SIZE,
+            size: RANGE_SIZE,
+            spi: VIRTIO_SPI + index,
         }
     }
 
     #[test]
     fn advertises_virtio_fs_only_when_backed() {
         let l = sample_layout(0);
-        let fs = |index| device(virtio_fs_base(index), virtio_fs_spi(index));
+        let fs = |index: u32| device(4 + index);
         let absent = build(&l, &GicLayout::QEMU_VIRT, 1, "", &[], &SEED, KASLR_SEED).unwrap();
         let present = build(
             &l,
@@ -330,8 +328,8 @@ pub(crate) mod tests {
             KASLR_SEED,
         )
         .unwrap();
-        let first = format!("virtio_mmio@{:x}", VIRTIO_FS_BASE);
-        let second = format!("virtio_mmio@{:x}", VIRTIO_FS_BASE + VIRTIO_SIZE);
+        let first = format!("virtio_mmio@{:x}", fs(0).base);
+        let second = format!("virtio_mmio@{:x}", fs(1).base);
         assert!(!contains(&absent, &first));
         assert!(contains(&present, &first));
         assert!(contains(&present, &second));
@@ -340,8 +338,8 @@ pub(crate) mod tests {
     #[test]
     fn emits_one_node_per_device_in_order() {
         let l = sample_layout(0);
-        let disk = |index| device(virtio_blk_base(index), virtio_blk_spi(index));
-        let net = device(Some(VIRTIO_NET_BASE), Some(VIRTIO_NET_SPI));
+        let disk = |index: usize| device(index as u32);
+        let net = device(3);
         let blob = build(
             &l,
             &GicLayout::QEMU_VIRT,
@@ -353,7 +351,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let at = |index: usize| {
-            let name = format!("virtio_mmio@{:x}\0", virtio_blk_base(index).unwrap());
+            let name = format!("virtio_mmio@{:x}\0", disk(index).base);
             blob.windows(name.len())
                 .position(|w| w == name.as_bytes())
                 .unwrap_or_else(|| panic!("no node for disk {index}"))
@@ -361,9 +359,9 @@ pub(crate) mod tests {
         assert!(at(0) < at(1) && at(1) < at(2), "disks in argv order");
         // Each node carries its own SPI as <SPI type, number, level-high>,
         // written out as the spec's cell values.
-        for (index, spi) in [2u32, 5, 6].into_iter().enumerate() {
-            let node = format!("virtio_mmio@{:x}", virtio_blk_base(index).unwrap());
-            let cells: Vec<u8> = [0u32, spi, 4]
+        for index in 0..3 {
+            let node = format!("virtio_mmio@{:x}", disk(index).base);
+            let cells: Vec<u8> = [0u32, disk(index).spi, 4]
                 .iter()
                 .flat_map(|c| c.to_be_bytes())
                 .collect();
@@ -373,9 +371,9 @@ pub(crate) mod tests {
                 "disk {index} interrupts"
             );
         }
-        let fourth = format!("virtio_mmio@{:x}", virtio_blk_base(3).unwrap());
-        assert!(!contains(&blob, &fourth), "only the disks that exist");
-        let net = format!("virtio_mmio@{VIRTIO_NET_BASE:x}");
+        let fifth = format!("virtio_mmio@{:x}", device(4).base);
+        assert!(!contains(&blob, &fifth), "only the devices given");
+        let net = format!("virtio_mmio@{:x}", net.base);
         assert!(contains(&blob, &net));
     }
 

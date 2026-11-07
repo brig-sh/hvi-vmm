@@ -26,9 +26,9 @@
   <!-- the hole -->
   <rect x="24" y="210" width="400" height="96" rx="6" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 4"/>
   <text x="40" y="232" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#4b5563">MMIO hole — no RAM</text>
-  <text x="40" y="253" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0000  virtio-blk    GSI 5</text>
-  <text x="40" y="271" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0200  virtio-net    GSI 6</text>
-  <text x="40" y="289" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0400  virtio-vsock  GSI 7</text>
+  <text x="40" y="253" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">0xd000_0000  first device  GSI 5</text>
+  <text x="40" y="271" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">+ i * 0x200  device i      GSIs 5-7, 9-22</text>
+  <text x="40" y="289" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" fill="#6b7280">in attach order, up to 17 devices</text>
 
   <text x="440" y="240" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#b91c1c" font-weight="600">RAM here is worse: silent</text>
   <text x="440" y="257" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#4b5563">RAM shadows the registers, so</text>

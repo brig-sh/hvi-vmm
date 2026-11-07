@@ -87,7 +87,7 @@ fn mmio_load_without_syndrome_fails_the_run() {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
 fn mmio_load_without_syndrome_fails_the_run_on_hvf() {
-    load_pair_fails_the_run("MMIO at 0xd000400");
+    load_pair_fails_the_run("MMIO at 0xd000000");
 }
 
 /// Checks that a load pair from the vsock device's registers fails the run with
@@ -98,7 +98,7 @@ fn mmio_load_without_syndrome_fails_the_run_on_hvf() {
 #[cfg(target_arch = "aarch64")]
 fn load_pair_fails_the_run(failure: &'static str) {
     let vm = Vm::builder().boot();
-    trigger(&vm, "hvi-e2e-agent load-pair 0x0d000400");
+    trigger(&vm, "hvi-e2e-agent load-pair 0x0d000000");
     vm.wait(Duration::from_secs(30))
         .assert_stopped(Stop::Failed(failure));
 }
@@ -110,7 +110,7 @@ fn load_pair_fails_the_run(failure: &'static str) {
 fn cache_maintenance_on_a_device_range_is_skipped() {
     let vm = Vm::builder().boot();
     let cleaned = vm
-        .sh("hvi-e2e-agent clean-cache 0x0d000400")
+        .sh("hvi-e2e-agent clean-cache 0x0d000000")
         .assert_success();
     assert_eq!(cleaned.stdout.trim(), "done");
     vm.power_off();
