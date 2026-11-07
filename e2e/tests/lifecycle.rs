@@ -38,15 +38,43 @@ fn guest_kernel_panic_ends_the_run_as_a_reset() {
     );
 }
 
-// On HVF, a guest access to an address in the MMIO window that no device claims
-// fails the run.
-#[cfg(target_os = "macos")]
+/// An address in the MMIO window that no device claims, and how hvi's report
+/// prints it.
+#[cfg(target_arch = "aarch64")]
+const UNCLAIMED_MMIO_ADDRESS: &str = "0xe000000";
+#[cfg(target_arch = "x86_64")]
+const UNCLAIMED_MMIO_ADDRESS: &str = "0xe0000000";
+
 #[test]
-fn unhandled_mmio_fails_the_run() {
+fn unclaimed_mmio_reads_zero_without_a_report() {
     let vm = Vm::builder().boot();
-    trigger(&vm, "hvi-e2e-agent devmem 0x0e000000");
-    vm.wait(Duration::from_secs(30))
-        .assert_stopped(Stop::Failed("unhandled MMIO at 0xe000000"));
+    let read = vm
+        .sh(&format!("hvi-e2e-agent devmem {UNCLAIMED_MMIO_ADDRESS}"))
+        .assert_success();
+    assert_eq!(read.stdout.trim(), "0x00000000");
+    // The run goes on.
+    vm.sh("true").assert_success();
+    let ended = vm.power_off();
+    assert!(
+        !ended.stderr.contains("no device there"),
+        "hvi reported the access with HVI_MMIO_TRACE unset\n{}",
+        ended.context()
+    );
+}
+
+#[test]
+fn mmio_trace_reports_unclaimed_mmio() {
+    let vm = Vm::builder().env("HVI_MMIO_TRACE", "1").boot();
+    vm.sh(&format!("hvi-e2e-agent devmem {UNCLAIMED_MMIO_ADDRESS}"))
+        .assert_success();
+    assert!(
+        vm.stderr_shows(
+            &format!("4-byte MMIO read at {UNCLAIMED_MMIO_ADDRESS} (pc 0x"),
+            Duration::from_secs(5)
+        ),
+        "hvi's stderr does not report the access"
+    );
+    vm.power_off();
 }
 
 /// What hvi's error says when an MMIO load without a syndrome, from the vsock
@@ -58,19 +86,28 @@ const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "KVM_RUN error: Function not impleme
 const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "MMIO at 0xd000400";
 
 // A load pair from the vsock device's registers traps with no instruction
-// syndrome, so the hypervisor cannot tell which registers to fill. KVM refuses
-// to run the vCPU on, and hvi fails the run.
+// syndrome, so the hypervisor cannot tell which registers to fill, and hvi
+// fails the run.
 #[cfg(target_arch = "aarch64")]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "fails until HVF fails the run on an MMIO access it cannot decode (#118)"
-)]
 fn mmio_load_without_syndrome_fails_the_run() {
     let vm = Vm::builder().boot();
     trigger(&vm, "hvi-e2e-agent load-pair 0x0d000400");
     vm.wait(Duration::from_secs(30))
         .assert_stopped(Stop::Failed(LOAD_WITHOUT_SYNDROME_FAILURE));
+}
+
+// A cache maintenance instruction on a device's registers has no cached data to
+// act on, so hvi skips it and the run goes on.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn cache_maintenance_on_a_device_range_is_skipped() {
+    let vm = Vm::builder().boot();
+    let cleaned = vm
+        .sh("hvi-e2e-agent clean-cache 0x0d000400")
+        .assert_success();
+    assert_eq!(cleaned.stdout.trim(), "done");
+    vm.power_off();
 }
 
 /// Starts `command` in the guest's background, a moment after the agent

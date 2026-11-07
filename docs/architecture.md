@@ -142,7 +142,7 @@ file offset are multiples of 1 MiB, so they are page-aligned on any host.
 | virtio-fs share `i` | `0x0d00_0c00 + i * 0x200` | `0x200` | SPI `8 + i`, INTID `40 + i` |
 | RAM | `0x4000_0000` | `--mem-mib` | |
 
-INTID is `32 + SPI` on both backends. Every device window sits inside
+INTID is `32 + SPI` on both backends. Every device range sits inside
 `DEVICE_WINDOW_BASE`..`DEVICE_WINDOW_END` (`0x0800_0000`..`0x4000_0000`),
 because a guest whose boot page table is fixed at link time maps only that
 range as device memory and cannot reach MMIO outside it. They sit above the
@@ -324,7 +324,7 @@ INIT-SIPI-SIPI serviced by the in-kernel LAPIC.
 hvi appends `console=ttyS0` to the command line, spliced in before the first
 standalone `--`, so arguments meant for `init` are not read by the kernel. The
 devices are not on the command line. Each virtio-mmio device is an `LNRO0005`
-entry in the ACPI DSDT with its window and its GSI, as on Firecracker. A guest
+entry in the ACPI DSDT with its range and its GSI, as on Firecracker. A guest
 that does not read ACPI finds no device.
 
 ## 4. Device model
@@ -336,11 +336,13 @@ host bridge and lets one set of device models serve all three.
 sequenceDiagram
     participant G as Guest vCPU
     participant B as Backend run loop
+    participant R as Bus
     participant D as Device (blk/net/vsock/fs)
     participant M as GuestRam
     participant L as Event ledger
-    G->>B: MMIO/PIO exit @ device window
-    B->>D: mmio(off, is_write, value)
+    G->>B: MMIO/PIO exit @ device range
+    B->>R: read/write(address, data)
+    R->>D: read/write(offset, data)
     D->>M: read/write descriptors + buffers
     D->>L: CapturedEvent (block / net / SNI)
     D->>G: set its IRQ line (GIC SPI / IOAPIC GSI)
@@ -500,7 +502,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `psci.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`; `devices/irq.rs` |
+| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

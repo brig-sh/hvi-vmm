@@ -17,35 +17,20 @@
 //! exits it serves.
 
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use applevisor::prelude::{ExitReason, Reg, SysReg, Vcpu};
 
 use super::gic::VmGic;
 use super::kick::Kicker;
 use crate::arch::aarch64::esr::{DataAbort, Ec};
-use crate::arch::aarch64::layout::{
-    mpidr_affinity, vcpu_index, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE, VIRTIO_NET_BASE,
-    VIRTIO_SIZE, VIRTIO_VSOCK_BASE,
-};
+use crate::arch::aarch64::layout::{mpidr_affinity, vcpu_index};
 use crate::arch::aarch64::psci;
 use crate::config::Stop;
-use crate::devices::legacy::pl011::Pl011;
-use crate::devices::legacy::rtc_pl031::Pl031;
-use crate::devices::virtio::fs::worker::Export;
-use crate::devices::virtio::mmio;
-use crate::devices::virtio::VirtioMmio;
 use crate::hypervisor::guest::{Guest, SafepointVcpu};
 use crate::hypervisor::vcpus::{panic_detail, report_on_panic, Outcome};
 use crate::plugin::{Plugin, RegsView};
 use crate::LOG_PREFIX;
-
-/// How many virtio-fs chains a vCPU services in its own exit before handing the
-/// rest to the device's worker thread.
-///
-/// A single guest syscall's requests stay on the vCPU, and a deep queue goes to
-/// the worker.
-const FS_INLINE_BUDGET: u16 = 8;
 
 /// The state a vCPU thread needs beyond its own vCPU.
 #[derive(Clone)]
@@ -54,13 +39,6 @@ pub(super) struct VcpuContext {
     pub(super) vm: VmGic,
     /// The guest's RAM, virtio devices and vCPUs.
     pub(super) guest: Arc<Guest<Kicker>>,
-    /// The console UART.
-    pub(super) pl011: Arc<Mutex<Pl011>>,
-    /// The PL031 RTC, which has no interrupt line because the alarm never
-    /// fires.
-    pub(super) rtc: Arc<Mutex<Pl031>>,
-    /// One entry per virtio-fs export, in the order the exports were given.
-    pub(super) fs: Vec<Export>,
     /// The kernel entry the boot vCPU starts at.
     pub(super) kernel_addr: u64,
     /// The devicetree address the boot vCPU gets in `X0`.
@@ -186,39 +164,26 @@ fn handle_exit(vcpu: &Vcpu, context: &VcpuContext, cpu_id: u32) -> ControlFlow<O
                     // Not restartable: the saved PC is already past HVC/SMC.
                 }
                 Ec::DataAbort => {
+                    let da = DataAbort::from_syndrome(syn);
                     let ipa = exit.exception.physical_address;
-                    if (UART_BASE..UART_BASE + UART_SIZE).contains(&ipa) {
-                        service_uart(vcpu, context, ipa - UART_BASE, syn);
+                    // Guest RAM never traps, so this address has no cached data
+                    // to act on, and the instruction has nothing to do. A table
+                    // walk that took the abort has no result to give it, so it
+                    // goes on to fail the run below.
+                    if da.cm && !da.s1ptw {
                         advance_pc(vcpu);
-                    } else if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&ipa) {
-                        service_rtc(vcpu, context, ipa - RTC_BASE, syn);
-                        advance_pc(vcpu);
-                    } else if let Some((dev, offset)) = context.guest.disk_at(ipa, VIRTIO_SIZE) {
-                        service_device(vcpu, context, dev, offset, syn);
-                        advance_pc(vcpu);
-                    } else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_SIZE).contains(&ipa) {
-                        if let Some(dev) = &context.guest.net {
-                            service_device(vcpu, context, dev, ipa - VIRTIO_NET_BASE, syn);
-                        }
-                        advance_pc(vcpu);
-                    } else if (VIRTIO_VSOCK_BASE..VIRTIO_VSOCK_BASE + VIRTIO_SIZE).contains(&ipa) {
-                        if let Some(dev) = &context.guest.vsock {
-                            service_device(vcpu, context, dev, ipa - VIRTIO_VSOCK_BASE, syn);
-                        }
-                        advance_pc(vcpu);
-                    } else if let Some(fs) = context
-                        .fs
-                        .iter()
-                        .find(|fs| (fs.base..fs.base + VIRTIO_SIZE).contains(&ipa))
-                    {
-                        service_fs(vcpu, context, fs, ipa - fs.base, syn);
-                        advance_pc(vcpu);
-                    } else {
+                        return ControlFlow::Continue(());
+                    }
+                    // Without a syndrome the register and the width are
+                    // unknown, so the access cannot be served.
+                    if !da.isv {
                         return ControlFlow::Break(Outcome::Failed(format!(
-                            "vcpu{cpu_id}: unhandled MMIO at {ipa:#x} (pc {:#x})",
+                            "vcpu{cpu_id}: MMIO at {ipa:#x} without a syndrome (pc {:#x})",
                             vcpu.get_reg(Reg::PC).unwrap_or(0)
                         )));
                     }
+                    service_mmio(vcpu, context, cpu_id, ipa, da)?;
+                    advance_pc(vcpu);
                 }
                 Ec::SysReg => {
                     // RAZ/WI: unmodeled system register.
@@ -327,104 +292,34 @@ fn service_psci(vcpu: &Vcpu, context: &VcpuContext) -> ControlFlow<Outcome> {
     }
 }
 
-/// Services a PL011 MMIO access.
-fn service_uart(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
-    let mut p = context.pl011.lock().unwrap();
-    if da.is_write {
-        let v = read_gpr(vcpu, da.reg);
-        p.mmio(offset, true, v);
-    } else {
-        let v = p.mmio(offset, false, 0) & width_mask(da.width);
-        write_gpr(vcpu, da.reg, v);
-    }
-}
-
-/// Services a PL031 MMIO access at `offset` into the RTC's window.
-fn service_rtc(vcpu: &Vcpu, context: &VcpuContext, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
-    let width = usize::from(da.width);
-    let mut rtc = context.rtc.lock().unwrap();
-    if da.is_write {
-        rtc.mmio(offset, width, true, read_gpr(vcpu, da.reg));
-    } else {
-        let v = rtc.mmio(offset, width, false, 0);
-        write_gpr(vcpu, da.reg, v);
-    }
-}
-
-/// Services a virtio-blk, virtio-net or virtio-vsock MMIO access.
-fn service_device<D: VirtioMmio>(
+/// Serves the MMIO access `da` describes at `ipa`.
+///
+/// Returns `ControlFlow::Break` with the stop the access asks for, and
+/// `ControlFlow::Continue` otherwise.
+fn service_mmio(
     vcpu: &Vcpu,
     context: &VcpuContext,
-    dev: &Mutex<D>,
-    offset: u64,
-    syndrome: u64,
-) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
-    if da.is_write {
+    cpu_id: u32,
+    ipa: u64,
+    da: DataAbort,
+) -> ControlFlow<Outcome> {
+    let width = usize::from(da.width);
+    let pc = || vcpu.get_reg(Reg::PC).ok();
+    let mut bytes = [0u8; 8];
+    let stop = if da.is_write {
+        // The register can hold more than the access writes.
+        bytes = read_gpr(vcpu, da.reg).to_le_bytes();
+        context.guest.write_mmio(cpu_id, ipa, &bytes[..width], pc)
+    } else {
         context
             .guest
-            .write_device(dev, offset, read_gpr(vcpu, da.reg));
-    } else {
-        let read = context.guest.read_device(dev, offset);
-        write_gpr(vcpu, da.reg, read & width_mask(da.width));
-    }
-}
-
-/// Services a virtio-fs MMIO transport access.
-///
-/// `mmio` only records a `QUEUE_NOTIFY` write's queue index, so this then
-/// serves a shallow queue at once and wakes the device's worker thread,
-/// `run_fs_worker`, for the rest. The vCPU is held for the host calls the
-/// shallow queue's requests make, so no request may make one that blocks.
-fn service_fs(vcpu: &Vcpu, context: &VcpuContext, fs: &Export, offset: u64, syndrome: u64) {
-    let da = DataAbort::from_syndrome(syndrome);
-    if !da.isv {
-        return;
-    }
-    let is_notify = da.is_write && offset == mmio::QUEUE_NOTIFY;
-    {
-        let mut d = fs.dev.lock().unwrap();
-        if da.is_write {
-            let v = read_gpr(vcpu, da.reg);
-            d.mmio(&context.guest.ram, offset, true, v);
-        } else {
-            let v = d.mmio(&context.guest.ram, offset, false, 0) & width_mask(da.width);
-            write_gpr(vcpu, da.reg, v);
-        }
-    }
-    if is_notify {
-        // Serve a shallow queue here, because waking the worker takes longer
-        // than the host work of a small request. A deep queue goes to the
-        // worker, so the vCPU can run the guest while the worker drains it.
-        let remaining = fs
-            .dev
-            .lock()
-            .unwrap()
-            .drain_notified_bounded(&context.guest.ram, FS_INLINE_BUDGET);
-        if remaining {
-            fs.wake.wake();
-        }
-    }
-}
-
-/// Returns the zero-extension mask for a load of `width` bytes.
-fn width_mask(width: u8) -> u64 {
-    if width >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (width * 8)) - 1
-    }
+            .read_mmio(cpu_id, ipa, &mut bytes[..width], pc);
+        write_gpr(vcpu, da.reg, u64::from_le_bytes(bytes));
+        None
+    };
+    stop.map_or(ControlFlow::Continue(()), |stop| {
+        ControlFlow::Break(Outcome::Stopped(stop))
+    })
 }
 
 /// Reads general-purpose register `idx` (31 = XZR, reads as 0).

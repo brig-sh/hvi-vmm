@@ -30,10 +30,12 @@ use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
     mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
-    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, UART_SPI, VIRTIO_NET_SPI, VIRTIO_VSOCK_SPI,
+    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE,
+    UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
+use crate::devices::bus::{self, Bus};
 use crate::devices::legacy::pl011::Pl011;
 use crate::devices::legacy::rtc_pl031::Pl031;
 use crate::devices::virtio::block;
@@ -42,7 +44,9 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Ledger;
-use crate::hypervisor::guest::{Disk, Guest, PluginThreads};
+use crate::hypervisor::guest::{
+    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
+};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::io_threads::NetSource;
@@ -221,13 +225,35 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     setup_boot_regs(&vcpus[0], layout.kernel_addr, layout.dtb_addr);
 
     let vm = Arc::new(vm);
+    let ledger = Arc::new(ledger);
+    let pl011 = Arc::new(Mutex::new(Pl011::new()));
+    let fs = Arc::new(fs);
+    let mut mmio_bus = Bus::new();
+    insert_virtio_devices(
+        &mut mmio_bus,
+        &ram,
+        &ledger,
+        VIRTIO_SIZE,
+        &disks,
+        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
+        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
+    )?;
+    mmio_bus.insert(
+        UART_BASE,
+        UART_SIZE,
+        Arc::clone(&pl011) as Arc<dyn bus::Device>,
+    )?;
+    mmio_bus.insert(RTC_BASE, RTC_SIZE, Arc::new(Mutex::new(Pl031::new())))?;
+    vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
             shared_ram,
-            ledger: Arc::new(ledger),
+            ledger,
+            mmio_bus,
+            mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
             vsock,
@@ -238,41 +264,34 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             )),
             plugin_threads: PluginThreads::new(),
         }),
-        pl011: Arc::new(Mutex::new(Pl011::new())),
-        rtc: Arc::new(Mutex::new(Pl031::new())),
-        fs: Arc::new(fs),
         plugin: cfg.plugin.clone(),
     };
 
     let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
-    context.pl011.lock().unwrap().connect_irq(line(UART_SPI));
+    pl011.lock().unwrap().connect_irq(line(UART_SPI));
     context.guest.connect_irqs(
         // `open_disks` refused more disks than there are SPIs.
         |index| line(virtio_blk_spi(index).expect("every disk should have an SPI")),
         line(VIRTIO_NET_SPI),
         line(VIRTIO_VSOCK_SPI),
     );
-    for export in context.fs.iter() {
+    for export in fs.iter() {
         export.dev.lock().unwrap().connect_irq(line(export.irq));
     }
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
-    let fs = Arc::clone(&context.fs);
-    context
-        .guest
-        .vcpus
-        .on_stop(move || vhost_user::shut_down(&fs));
+    context.guest.vcpus.on_stop({
+        let fs = Arc::clone(&fs);
+        move || vhost_user::shut_down(&fs)
+    });
 
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
-        {
-            let pl011 = Arc::clone(&context.pl011);
-            move |byte| pl011.lock().unwrap().push_rx(byte)
-        },
+        move |byte| pl011.lock().unwrap().push_rx(byte),
         net_source,
     )?;
-    vhost_user::start_interrupt_threads(&context.fs, &mut io_threads);
+    vhost_user::start_interrupt_threads(&fs, &mut io_threads);
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();

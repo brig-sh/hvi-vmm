@@ -18,8 +18,9 @@
 //! share. `legacy` holds the serial ports and the RTCs. A backend attaches the
 //! devices its guest needs: the PL011 and the PL031 RTC on arm64, the 16550 and
 //! the CMOS RTC on x86-64. `irq` holds the interrupt line each device sets
-//! itself.
+//! itself. `bus` routes a guest's accesses to the devices.
 
+pub(crate) mod bus;
 pub(crate) mod irq;
 pub mod legacy;
 pub mod virtio;

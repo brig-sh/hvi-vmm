@@ -58,6 +58,8 @@ pub const COM1_GSI: u32 = 4;
 
 /// The i8042 command and status port.
 pub const I8042_COMMAND_PORT: u16 = 0x64;
+/// The base port of the MC146818 CMOS RTC.
+pub const RTC_PORT: u16 = 0x70;
 /// The base port of the ACPI PM1 event block, the PM1 control block and the
 /// reset register.
 pub const ACPI_PM_PORT: u16 = 0x600;
@@ -81,7 +83,7 @@ pub const IOAPIC_INPUTS: u8 = 24;
 /// each on its own IOAPIC GSI. The guest learns them from the ACPI DSDT (see
 /// `acpi.rs`), so none of these is a contract.
 ///
-/// | window from `VIRTIO_MMIO_BASE` | GSI      | device                   |
+/// | range from `VIRTIO_MMIO_BASE`  | GSI      | device                   |
 /// |--------------------------------|----------|--------------------------|
 /// | `+0x000`                       | 5        | virtio-blk, disk 0       |
 /// | `+0x200`                       | 6        | virtio-net               |
@@ -102,10 +104,10 @@ pub const VIRTIO_VSOCK_BASE: u64 = VIRTIO_MMIO_BASE + 0x400;
 pub const VIRTIO_BLK_GSI: u32 = 5;
 pub const VIRTIO_NET_GSI: u32 = 6;
 pub const VIRTIO_VSOCK_GSI: u32 = 7;
-/// Window and GSI of disk 1. Disks 2 and 3 follow, one slot each.
+/// Range and GSI of disk 1. Disks 2 and 3 follow, one slot each.
 pub const VIRTIO_BLK_EXTRA_BASE: u64 = VIRTIO_MMIO_BASE + 0x600;
 pub const VIRTIO_BLK_EXTRA_GSI: u32 = 9;
-/// Window and GSI of export 0. The others follow, one slot each.
+/// Range and GSI of export 0. The others follow, one slot each.
 pub const VIRTIO_FS_BASE: u64 = VIRTIO_BLK_EXTRA_BASE + (MAX_DISKS as u64 - 1) * VIRTIO_SIZE;
 pub const VIRTIO_FS_GSI: u32 = VIRTIO_BLK_EXTRA_GSI + MAX_DISKS as u32 - 1;
 /// How many virtio-fs exports this machine has interrupt lines for: the lines
@@ -134,7 +136,7 @@ pub fn virtio_blk_gsi(index: usize) -> Option<u32> {
     }
 }
 
-/// Returns the window base of the `index`th virtio-fs export, or `None` when
+/// Returns the range base of the `index`th virtio-fs export, or `None` when
 /// the machine has no line left for it.
 #[must_use]
 pub fn virtio_fs_base(index: usize) -> Option<u64> {
@@ -180,11 +182,11 @@ pub const HIGH_RAM_BASE: u64 = 0x1_0000_0000; // 4 GiB
 mod tests {
     use super::*;
 
-    // Every device adds a window and a GSI. Neither may land on another device,
-    // every window has to sit in the MMIO hole, and every GSI has to be an
+    // Every device adds a range and a GSI. Neither may land on another device,
+    // every range has to sit in the MMIO hole, and every GSI has to be an
     // IOAPIC input no legacy device claims.
     #[test]
-    fn no_device_shares_a_window_or_a_gsi_with_another() {
+    fn no_device_shares_a_range_or_a_gsi_with_another() {
         let rtc_gsi = 8;
         let mut devices = vec![
             ("net".to_string(), VIRTIO_NET_BASE, VIRTIO_NET_GSI),
@@ -226,7 +228,7 @@ mod tests {
         }
     }
 
-    // Disk 0 keeps the window and the GSI it had when it was the only disk, the
+    // Disk 0 keeps the range and the GSI it had when it was the only disk, the
     // others follow vsock, and the exports follow the disks up to the IOAPIC's
     // last line.
     #[test]

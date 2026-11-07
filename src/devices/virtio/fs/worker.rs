@@ -13,18 +13,28 @@
 // limitations under the License.
 
 //! The worker thread of a virtio-fs device on macOS, which serves the requests
-//! a vCPU leaves past its inline budget, and the wake signal it parks on.
+//! a vCPU leaves past its inline budget, the wake signal it parks on, and the
+//! device's transport on a bus.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::server::VirtioFs;
+use crate::config::Stop;
+use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
+use crate::devices::virtio::mmio;
 use crate::memory::GuestRam;
 
+/// How many virtio-fs chains a vCPU services in its own exit before handing the
+/// rest to the device's worker thread.
+///
+/// A single guest syscall's requests stay on the vCPU, and a deep queue goes to
+/// the worker.
+const FS_INLINE_BUDGET: u16 = 8;
+
 /// One virtio-fs export as the macOS backend wires it.
-#[derive(Clone)]
 pub(crate) struct Export {
-    /// Guest-physical base of the transport's MMIO window.
+    /// Guest-physical base of the transport's MMIO range.
     pub(crate) base: u64,
     /// The INTID the device raises.
     pub(crate) intid: u32,
@@ -32,6 +42,61 @@ pub(crate) struct Export {
     pub(crate) dev: Arc<Mutex<VirtioFs>>,
     /// The wake signal of the device's worker thread.
     pub(crate) wake: Arc<FsWake>,
+}
+
+/// A virtio-fs device as a bus reaches it, with what a register access needs
+/// beyond the device.
+pub(crate) struct FsTransport {
+    /// The device.
+    device: Arc<Mutex<VirtioFs>>,
+    /// The wake signal of the device's worker thread.
+    wake: Arc<FsWake>,
+    /// The guest RAM its queues are in.
+    ram: Arc<GuestRam>,
+}
+
+impl FsTransport {
+    /// Returns the transport of `export`.
+    pub(crate) fn new(export: &Export, ram: &Arc<GuestRam>) -> Self {
+        Self {
+            device: Arc::clone(&export.dev),
+            wake: Arc::clone(&export.wake),
+            ram: Arc::clone(ram),
+        }
+    }
+}
+
+impl bus::Device for FsTransport {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let value = self
+            .device
+            .lock()
+            .unwrap()
+            .mmio(&self.ram, offset, false, 0);
+        fill_le_bytes(data, value);
+    }
+
+    /// Applies the write, and on a `QUEUE_NOTIFY` serves a shallow queue at
+    /// once and wakes the device's worker thread, `run_fs_worker`, for the
+    /// rest.
+    ///
+    /// `mmio` only records the queue index of a notify. Waking the worker takes
+    /// longer than the host work of a small request, and a deep queue goes to
+    /// the worker so the vCPU can run the guest while the worker drains it. The
+    /// vCPU is held for the host calls the shallow queue's requests make, so no
+    /// request may make one that blocks.
+    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
+        let remaining = {
+            let mut device = self.device.lock().unwrap();
+            device.mmio(&self.ram, offset, true, u64_from_le_bytes(data));
+            offset == mmio::QUEUE_NOTIFY
+                && device.drain_notified_bounded(&self.ram, FS_INLINE_BUDGET)
+        };
+        if remaining {
+            self.wake.wake();
+        }
+        None
+    }
 }
 
 /// A virtio-fs device's coalescing wake signal, which its worker thread parks
@@ -160,8 +225,9 @@ pub(crate) fn run_fs_worker(dev: &Mutex<VirtioFs>, mem: &GuestRam, wake: &FsWake
     // A wake that arrived with the stop was cleared by that last `park`, and
     // the chains it announced are still in the ring, so one unbounded pass
     // drains them. A vCPU left running at its join deadline that is still in
-    // `service_fs` can leave chains past its inline budget after this pass,
-    // with no worker to serve them. Only a run that already fails does that.
+    // `FsTransport::write` can leave chains past its inline budget after this
+    // pass, with no worker to serve them. Only a run that already fails does
+    // that.
     dev.lock().unwrap().drain_notified(mem);
 }
 

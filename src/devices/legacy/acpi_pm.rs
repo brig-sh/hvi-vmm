@@ -25,7 +25,10 @@
 //! the hardware has it. PM1 control reads `SCI_EN`, which tells the guest the
 //! machine is in ACPI mode.
 
+use std::sync::Mutex;
+
 use crate::config::Stop;
+use crate::devices::bus;
 
 /// The offset of PM1 status, the first half of the PM1 event block.
 pub const PM1_STATUS: u16 = 0;
@@ -106,6 +109,16 @@ impl PmRegisters {
         let control = usize::from(PM1_CONTROL);
         bytes[control..control + 2].copy_from_slice(&SCI_EN.to_le_bytes());
         bytes
+    }
+}
+
+impl bus::Device for Mutex<PmRegisters> {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        self.lock().unwrap().read(offset as u16, data);
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
+        self.lock().unwrap().write(offset as u16, data)
     }
 }
 

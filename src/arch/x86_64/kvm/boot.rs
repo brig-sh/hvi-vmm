@@ -23,7 +23,7 @@ use kvm_ioctls::{Cap, Kvm};
 
 use super::cpuid::guest_cpuid;
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
-use super::vcpu::{run_cpu, VcpuContext};
+use super::vcpu::{port_bus, run_cpu, VcpuContext};
 use crate::arch::x86_64::acpi::{self, MmioDevice};
 use crate::arch::x86_64::layout::{
     virtio_blk_base, virtio_blk_gsi, virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, COM1_GSI,
@@ -33,8 +33,7 @@ use crate::arch::x86_64::layout::{
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::{mptable, MAX_VCPUS};
 use crate::config::{BootConfig, Stop};
-use crate::devices::legacy::acpi_pm::PmRegisters;
-use crate::devices::legacy::rtc_cmos::RtcCmos;
+use crate::devices::bus::Bus;
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::virtio::block;
 use crate::devices::virtio::fs::vhost_user::{self, Export};
@@ -42,7 +41,9 @@ use crate::devices::virtio::net::{self, VirtioNet};
 use crate::devices::virtio::tap;
 use crate::devices::virtio::vsock::VirtioVsock;
 use crate::events::Ledger;
-use crate::hypervisor::guest::{Disk, Guest, PluginThreads};
+use crate::hypervisor::guest::{
+    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
+};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::io_threads::NetSource;
@@ -260,13 +261,29 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
 
     let vm = Arc::new(vm);
+    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
+    let fs = Arc::new(fs);
+    let mut mmio_bus = Bus::new();
+    insert_virtio_devices(
+        &mut mmio_bus,
+        &ram,
+        &ledger,
+        VIRTIO_SIZE,
+        &disks,
+        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
+        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
+    )?;
+    vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
+    let uart = Arc::new(Mutex::new(Uart16550::new()));
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::X86_64,
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
             shared_ram,
-            ledger: Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?),
+            ledger,
+            mmio_bus,
+            mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
             vsock,
@@ -277,42 +294,35 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             )),
             plugin_threads: PluginThreads::new(),
         }),
-        uart: Arc::new(Mutex::new(Uart16550::new())),
-        rtc: Arc::new(Mutex::new(RtcCmos::new())),
-        pm: Arc::new(Mutex::new(PmRegisters::default())),
-        fs: Arc::new(fs),
+        port_bus: Arc::new(port_bus(&uart)?),
         plugin: cfg.plugin.clone(),
     };
 
     let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
-    context.uart.lock().unwrap().connect_irq(line(COM1_GSI));
+    uart.lock().unwrap().connect_irq(line(COM1_GSI));
     context.guest.connect_irqs(
         // `open_disks` refused more disks than there are GSIs.
         |index| line(virtio_blk_gsi(index).expect("every disk should have a GSI")),
         line(VIRTIO_NET_GSI),
         line(VIRTIO_VSOCK_GSI),
     );
-    for export in context.fs.iter() {
+    for export in fs.iter() {
         export.dev.lock().unwrap().connect_irq(line(export.irq));
     }
     // A vCPU in an export's reset waits on its daemon, where no kick reaches
     // it. Ending the connections at the stop frees it.
-    let fs = Arc::clone(&context.fs);
-    context
-        .guest
-        .vcpus
-        .on_stop(move || vhost_user::shut_down(&fs));
+    context.guest.vcpus.on_stop({
+        let fs = Arc::clone(&fs);
+        move || vhost_user::shut_down(&fs)
+    });
 
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
-        {
-            let uart = Arc::clone(&context.uart);
-            move |byte| uart.lock().unwrap().push_rx(byte)
-        },
+        move |byte| uart.lock().unwrap().push_rx(byte),
         net_source,
     )?;
-    vhost_user::start_interrupt_threads(&context.fs, &mut io_threads);
+    vhost_user::start_interrupt_threads(&fs, &mut io_threads);
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
         let guest = Arc::clone(&context.guest);

@@ -71,9 +71,9 @@ const VIRTIO_MMIO_HID: &str = "LNRO0005";
 /// One virtio-mmio device the DSDT describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MmioDevice {
-    /// Guest-physical base of the device's register window.
+    /// Guest-physical base of the device's registers.
     pub base: u64,
-    /// Size of the window.
+    /// Size of the range.
     pub size: u64,
     /// The IOAPIC line the device raises.
     pub gsi: u32,
@@ -90,7 +90,7 @@ pub struct MmioDevice {
 /// # Panics
 ///
 /// Panics if `num_cpus` exceeds [`MAX_VCPUS`], if there are 100 devices or
-/// more, or if a device's window does not fit in 32 bits.
+/// more, or if a device's range does not fit in 32 bits.
 #[must_use]
 pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     assert!(
@@ -106,8 +106,8 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     let resources: Vec<(Memory32Fixed, Interrupt)> = devices
         .iter()
         .map(|device| {
-            let base = u32::try_from(device.base).expect("a window under 4 GiB");
-            let size = u32::try_from(device.size).expect("a window under 4 GiB");
+            let base = u32::try_from(device.base).expect("a range under 4 GiB");
+            let size = u32::try_from(device.size).expect("a range under 4 GiB");
             (
                 Memory32Fixed::new(true, base, size),
                 Interrupt::new(true, true, false, false, device.gsi),
@@ -445,7 +445,7 @@ mod tests {
     }
 
     // The guest's virtio_mmio driver binds to LNRO0005 devices under \_SB_, and
-    // takes each one's window and line from its _CRS.
+    // takes each one's range and line from its _CRS.
     #[test]
     fn dsdt_describes_every_virtio_mmio_device() {
         let devices = [
@@ -471,7 +471,7 @@ mod tests {
             let mut memory = vec![0x86, 9, 0, 1];
             memory.extend((device.base as u32).to_le_bytes());
             memory.extend((device.size as u32).to_le_bytes());
-            assert_eq!(count(&memory), 1, "window of {device:?}");
+            assert_eq!(count(&memory), 1, "range of {device:?}");
             // Extended IRQ: tag 0x89, length 6, consumer edge high exclusive,
             // one line.
             let mut irq = vec![0x89, 6, 0, 0b11, 1];

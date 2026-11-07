@@ -16,42 +16,45 @@
 //!
 //! [`Guest`] holds what each backend keeps about the VM it runs, apart from the
 //! hypervisor's own handle and the devices not every backend has: guest RAM and
-//! the object behind it, the event ledger, the virtio devices, the vCPUs, the
-//! threads a plugin asked for and the identity of the run. It is the
-//! [`VmHandle`] a plugin gets at attach. [`Cpu`] is the [`CpuHandle`] it gets
-//! at a safe point, where only the registers depend on the backend.
+//! the object behind it, the event ledger, the MMIO bus, the virtio devices,
+//! the vCPUs, the threads a plugin asked for and the identity of the run. It is
+//! the [`VmHandle`] a plugin gets at attach. [`Cpu`] is the [`CpuHandle`] it
+//! gets at a safe point, where only the registers depend on the backend.
 
 use std::cell::Cell;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::config::Stop;
+use crate::devices::bus::{Bus, ReportLimiter};
 use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
 use crate::devices::virtio::vsock::VirtioVsock;
-use crate::devices::virtio::VirtioMmio;
+use crate::devices::virtio::MmioTransport;
 use crate::events::Ledger;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::teardown::{StopToken, STOP_TIMEOUT};
+use crate::LOG_PREFIX;
 
-/// A virtio-blk disk and the guest-physical base of its virtio-mmio window.
+/// A virtio-blk disk and the guest-physical base of its virtio-mmio range.
 pub(crate) struct Disk {
-    /// The first byte of the device's window.
+    /// The first byte of the device's range.
     pub(crate) base: u64,
     /// The device.
     pub(crate) dev: Arc<Mutex<VirtioBlk>>,
 }
 
 impl Disk {
-    /// Returns `devs` as disks, the one at index `i` at the window `base(i)`.
+    /// Returns `devs` as disks, the one at index `i` at the range `base(i)`.
     ///
     /// # Panics
     ///
-    /// Panics if `base` has no window for an index. `block::open_disks` rules
-    /// that out, since it refuses more disks than any backend has windows for.
+    /// Panics if `base` has no range for an index. `block::open_disks` rules
+    /// that out, since it refuses more disks than any backend has ranges for.
     pub(crate) fn place(
         devs: Vec<Arc<Mutex<VirtioBlk>>>,
         base: impl Fn(usize) -> Option<u64>,
@@ -59,11 +62,49 @@ impl Disk {
         devs.into_iter()
             .enumerate()
             .map(|(index, dev)| Disk {
-                base: base(index).expect("a window per disk"),
+                base: base(index).expect("a range per disk"),
                 dev,
             })
             .collect()
     }
+}
+
+/// Puts each virtio device the backends share on `bus`, at a range of `size`
+/// addresses.
+///
+/// `net` and `vsock` carry the base of their range.
+///
+/// # Errors
+///
+/// Errors if two ranges overlap.
+pub(crate) fn insert_virtio_devices(
+    bus: &mut Bus,
+    ram: &Arc<GuestRam>,
+    ledger: &Arc<Ledger>,
+    size: u64,
+    disks: &[Disk],
+    net: Option<(u64, &Arc<Mutex<VirtioNet>>)>,
+    vsock: Option<(u64, &Arc<Mutex<VirtioVsock>>)>,
+) -> Result<(), String> {
+    for disk in disks {
+        let transport = MmioTransport::new(&disk.dev, ram, ledger);
+        bus.insert(disk.base, size, Arc::new(transport))?;
+    }
+    if let Some((base, device)) = net {
+        bus.insert(
+            base,
+            size,
+            Arc::new(MmioTransport::new(device, ram, ledger)),
+        )?;
+    }
+    if let Some((base, device)) = vsock {
+        bus.insert(
+            base,
+            size,
+            Arc::new(MmioTransport::new(device, ram, ledger)),
+        )?;
+    }
+    Ok(())
 }
 
 /// The guest a backend runs, apart from the hypervisor's handle to it.
@@ -79,6 +120,11 @@ pub(crate) struct Guest<K> {
     pub(crate) shared_ram: SharedRam,
     /// The `RawEvent` ledger.
     pub(crate) ledger: Arc<Ledger>,
+    /// The devices a vCPU reaches through MMIO.
+    pub(crate) mmio_bus: Bus,
+    /// The limit on reports of an MMIO access to an address no device claims,
+    /// or `None` when they are off, as [`mmio_report_limiter`] decides.
+    pub(crate) mmio_report_limiter: Option<ReportLimiter>,
     /// The virtio-blk disks, in the order of `BootConfig::disks`.
     pub(crate) disks: Vec<Disk>,
     /// The virtio-net device, when the VM has a network.
@@ -191,50 +237,81 @@ impl<K> Guest<K> {
         }
     }
 
-    /// Returns the value of register `offset` of `dev`.
-    pub(crate) fn read_device<D: VirtioMmio>(&self, dev: &Mutex<D>, offset: u64) -> u64 {
-        self.access_device(dev, offset, false, 0)
-    }
-
-    /// Writes `value` to register `offset` of `dev`.
-    pub(crate) fn write_device<D: VirtioMmio>(&self, dev: &Mutex<D>, offset: u64, value: u64) {
-        self.access_device(dev, offset, true, value);
-    }
-
-    /// Serves one access to register `offset` of `dev` and returns the value
-    /// read, or 0 for a write.
+    /// Fills `data` from the MMIO device whose range holds `address`.
     ///
-    /// Once the device lock is released, the batch of the sink the access fed
-    /// ends, and then the events the device captured go to the ledger. The
-    /// batch ends first, so a reader that waits on the sink does not also wait
-    /// for the ledger.
-    fn access_device<D: VirtioMmio>(
+    /// With no such device, `data` reads as 0, and the access is reported for
+    /// vCPU `cpu` when the reports are on. `pc` is called only for a report
+    /// that goes through, since reading the program counter can take a system
+    /// call.
+    pub(crate) fn read_mmio(
         &self,
-        dev: &Mutex<D>,
-        offset: u64,
-        is_write: bool,
-        value: u64,
-    ) -> u64 {
-        let (read, events, sink) = {
-            let mut device = dev.lock().unwrap();
-            let read = device.mmio(&self.ram, offset, is_write, value);
-            (read, device.take_events(), device.take_fed_sink())
-        };
-        if let Some(sink) = sink {
-            sink.on_batch_end();
+        cpu: u32,
+        address: u64,
+        data: &mut [u8],
+        pc: impl FnOnce() -> Option<u64>,
+    ) {
+        if self.mmio_bus.read(address, data).is_err() {
+            data.fill(0);
+            self.report_unclaimed_mmio(cpu, "read", address, data.len(), pc);
         }
-        self.ledger.captured(&events);
-        read
     }
 
-    /// Returns the disk whose `size`-byte window holds `addr`, and the offset
-    /// of `addr` in it, or `None` when no disk window holds it.
-    pub(crate) fn disk_at(&self, addr: u64, size: u64) -> Option<(&Arc<Mutex<VirtioBlk>>, u64)> {
-        self.disks
-            .iter()
-            .find(|disk| (disk.base..disk.base + size).contains(&addr))
-            .map(|disk| (&disk.dev, addr - disk.base))
+    /// Writes `data` to the MMIO device whose range holds `address`.
+    ///
+    /// Returns the stop the write asks for, or `None` when it asks for none.
+    /// With no such device, the write is dropped and reported as
+    /// [`Guest::read_mmio`] says.
+    pub(crate) fn write_mmio(
+        &self,
+        cpu: u32,
+        address: u64,
+        data: &[u8],
+        pc: impl FnOnce() -> Option<u64>,
+    ) -> Option<Stop> {
+        self.mmio_bus.write(address, data).unwrap_or_else(|_| {
+            self.report_unclaimed_mmio(cpu, "write", address, data.len(), pc);
+            None
+        })
     }
+
+    /// Prints a line about an MMIO access to no device, unless the reports are
+    /// off or their limit drops this one.
+    fn report_unclaimed_mmio(
+        &self,
+        cpu: u32,
+        access: &str,
+        address: u64,
+        width: usize,
+        pc: impl FnOnce() -> Option<u64>,
+    ) {
+        let Some(limiter) = &self.mmio_report_limiter else {
+            return;
+        };
+        let Some(dropped) = limiter.try_take(Instant::now()) else {
+            return;
+        };
+        let pc = pc().map_or_else(|| "unknown".to_string(), |pc| format!("{pc:#x}"));
+        let dropped = match dropped {
+            0 => String::new(),
+            count => format!("; {count} earlier reports dropped"),
+        };
+        stderrln!(
+            "{LOG_PREFIX} vcpu{cpu}: {width}-byte MMIO {access} at {address:#x} (pc {pc}): \
+             no device there{dropped}"
+        );
+    }
+}
+
+/// Returns the limit on the reports of an MMIO access to no device, or `None`
+/// when `HVI_MMIO_TRACE` is unset.
+///
+/// The reports are off by default. A guest can make these accesses at will, and
+/// each report is a write to stderr on the vCPU, which blocks while stderr is
+/// full.
+pub(crate) fn mmio_report_limiter() -> Option<ReportLimiter> {
+    std::env::var_os("HVI_MMIO_TRACE")
+        .is_some()
+        .then(ReportLimiter::new)
 }
 
 impl<K: Kick> Guest<K> {
@@ -436,11 +513,7 @@ impl<K: Kick, V: SafepointVcpu> CpuHandle for Cpu<'_, K, V> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Weak;
-
     use super::*;
-    use crate::events::CapturedEvent;
     use crate::run::StopHandle;
 
     /// A kicker that reaches no thread.
@@ -456,8 +529,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices and
-    /// a ledger that writes nowhere.
+    /// Returns a guest with `count` vCPUs, one megabyte of RAM, no devices, a
+    /// ledger that writes nowhere and the MMIO reports on.
     pub(crate) fn guest(count: u32) -> Guest<NoopKicker> {
         let shared_ram = SharedRam::new(RamRegion::ALIGN as usize).unwrap();
         let ram = GuestRam::new(&shared_ram, &[shared_ram.region_at(0)]).unwrap();
@@ -467,6 +540,8 @@ pub(crate) mod tests {
             ram: Arc::new(ram),
             shared_ram,
             ledger: Arc::new(Ledger::new(None, "test").unwrap()),
+            mmio_bus: Bus::new(),
+            mmio_report_limiter: Some(ReportLimiter::new()),
             disks: Vec::new(),
             net: None,
             vsock: None,
@@ -540,6 +615,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mmio_read_of_no_device_reads_zero_at_its_width() {
+        let guest = guest(1);
+        let mut data = [0xaa; 4];
+        guest.read_mmio(0, 0x1000, &mut data, || Some(0));
+        assert_eq!(data, [0; 4]);
+    }
+
+    #[test]
+    fn mmio_write_to_no_device_asks_for_no_stop() {
+        assert!(guest(1).write_mmio(0, 0x1000, &[1], || Some(0)).is_none());
+    }
+
+    // Reading the program counter can take a system call, so a guest that
+    // repeats an access must not make every exit read it.
+    #[test]
+    fn program_counter_is_read_only_for_a_report_that_goes_through() {
+        let guest = guest(1);
+        let reads = Cell::new(0);
+        for _ in 0..1000 {
+            guest.write_mmio(0, 0x1000, &[1], || {
+                reads.set(reads.get() + 1);
+                None
+            });
+        }
+        assert!((1..1000).contains(&reads.get()), "{} reads", reads.get());
+    }
+
+    #[test]
+    fn program_counter_is_not_read_with_the_reports_off() {
+        let mut guest = guest(1);
+        guest.mmio_report_limiter = None;
+        let reads = Cell::new(0);
+        guest.write_mmio(0, 0x1000, &[1], || {
+            reads.set(reads.get() + 1);
+            None
+        });
+        assert_eq!(reads.get(), 0);
+    }
+
+    #[test]
     fn boot_vcpu_is_told_of_the_pauses_its_safepoint_held() {
         // With one vCPU, the boot vCPU, a pause has no other vCPU to wait for.
         let guest = guest(1);
@@ -594,93 +709,5 @@ pub(crate) mod tests {
             .expect_err("a name with a NUL byte was queued");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(threads.take().is_empty());
-    }
-
-    /// A sink that counts the batches that end, and records whether its device
-    /// was locked at the end of each.
-    struct BatchSink {
-        device: Weak<Mutex<FeedingDevice>>,
-        batches: AtomicUsize,
-        locked_at_end: AtomicBool,
-    }
-
-    impl IoSink for BatchSink {
-        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {}
-
-        fn on_net(&self, _frame: &[u8], _egress: bool) {}
-
-        fn on_batch_end(&self) {
-            self.batches.fetch_add(1, Ordering::SeqCst);
-            let locked = self
-                .device
-                .upgrade()
-                .is_some_and(|device| device.try_lock().is_err());
-            self.locked_at_end.fetch_or(locked, Ordering::SeqCst);
-        }
-    }
-
-    /// A device whose every register write feeds its sink three requests, as a
-    /// queue notify with three requests on the queue does, and whose reads feed
-    /// nothing.
-    struct FeedingDevice {
-        sink: Arc<BatchSink>,
-        fed_sink: Option<Arc<dyn IoSink>>,
-    }
-
-    impl VirtioMmio for FeedingDevice {
-        fn mmio(&mut self, _mem: &GuestRam, _offset: u64, is_write: bool, _value: u64) -> u64 {
-            if is_write {
-                for sector in 0..3 {
-                    self.sink.on_block(sector, 512, 0, false);
-                }
-                self.fed_sink = Some(Arc::clone(&self.sink) as Arc<dyn IoSink>);
-            }
-            0
-        }
-
-        fn take_events(&mut self) -> Vec<CapturedEvent> {
-            Vec::new()
-        }
-
-        fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
-            self.fed_sink.take()
-        }
-    }
-
-    /// Returns a device that feeds a fresh `BatchSink`, and that sink.
-    fn feeding_device() -> (Arc<Mutex<FeedingDevice>>, Arc<BatchSink>) {
-        let device = Arc::new_cyclic(|device| {
-            Mutex::new(FeedingDevice {
-                sink: Arc::new(BatchSink {
-                    device: device.clone(),
-                    batches: AtomicUsize::new(0),
-                    locked_at_end: AtomicBool::new(false),
-                }),
-                fed_sink: None,
-            })
-        });
-        let sink = Arc::clone(&device.lock().unwrap().sink);
-        (device, sink)
-    }
-
-    #[test]
-    fn access_that_feeds_the_sink_ends_one_batch_with_the_device_unlocked() {
-        let guest = guest(1);
-        let (device, sink) = feeding_device();
-        guest.write_device(&device, 0, 0);
-        assert_eq!(
-            sink.batches.load(Ordering::SeqCst),
-            1,
-            "one batch per access"
-        );
-        assert!(!sink.locked_at_end.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn access_that_feeds_no_sink_ends_no_batch() {
-        let guest = guest(1);
-        let (device, sink) = feeding_device();
-        guest.read_device(&device, 0);
-        assert_eq!(sink.batches.load(Ordering::SeqCst), 0);
     }
 }

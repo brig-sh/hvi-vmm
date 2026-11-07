@@ -106,12 +106,12 @@ pub fn queue_count(request_queues: usize) -> usize {
 // The device needs the `vhost` crate and the I/O threads, which exist only for
 // the Linux backends.
 #[cfg(target_os = "linux")]
-pub(crate) use self::device::start_interrupt_threads;
-#[cfg(target_os = "linux")]
 pub use self::device::{
-    attach, connect_waiting, export_at, serve_interrupts, serve_mmio, shut_down, Export,
-    ShutdownFds, VhostUserFs, SOCKET_WAIT,
+    attach, connect_waiting, serve_interrupts, shut_down, Export, ShutdownFds, VhostUserFs,
+    SOCKET_WAIT,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use self::device::{insert_exports, start_interrupt_threads};
 
 #[cfg(target_os = "linux")]
 mod device {
@@ -128,11 +128,14 @@ mod device {
     use vmm_sys_util::eventfd::EventFd;
 
     use crate::config::FsConfig;
+    use crate::devices::bus::Bus;
     use crate::devices::irq::{Irq, IrqLine};
-    use crate::devices::virtio::mmio;
+    use crate::devices::virtio::{mmio, MmioTransport, VirtioMmio};
+    use crate::events::{CapturedEvent, Ledger};
     use crate::hypervisor::vcpus::Kick;
     use crate::io_threads::IoThreads;
     use crate::memory::GuestRam;
+    use crate::plugin::IoSink;
     use crate::teardown::StopToken;
     use crate::LOG_PREFIX;
 
@@ -833,19 +836,18 @@ mod device {
         }
     }
 
-    /// Services one register access on `dev` and returns the value a read
-    /// takes.
-    ///
-    /// The device sets its line under the lock the access holds, as it does
-    /// for [`serve_interrupts`].
-    pub fn serve_mmio(
-        dev: &Mutex<VhostUserFs>,
-        mem: &GuestRam,
-        offset: u64,
-        is_write: bool,
-        value: u64,
-    ) -> u64 {
-        dev.lock().unwrap().mmio(mem, offset, is_write, value)
+    impl VirtioMmio for VhostUserFs {
+        fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
+            VhostUserFs::mmio(self, mem, offset, is_write, value)
+        }
+
+        fn take_events(&mut self) -> Vec<CapturedEvent> {
+            Vec::new()
+        }
+
+        fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+            None
+        }
     }
 
     /// Raises the guest's interrupt for `dev` each time the daemon signals
@@ -877,11 +879,11 @@ mod device {
         }
     }
 
-    /// One export as a backend wires it: the device, the window its transport
+    /// One export as a backend wires it: the device, the range its transport
     /// answers in, and the interrupt it raises.
     #[derive(Clone)]
     pub struct Export {
-        /// Guest-physical base of the transport's MMIO window.
+        /// Guest-physical base of the transport's MMIO range.
         pub base: u64,
         /// The interrupt the backend raises for this export, a GSI on x86 and
         /// an SPI on arm64.
@@ -894,12 +896,12 @@ mod device {
 
     /// Connects one export per socket and returns them in order.
     ///
-    /// `place` returns the window base and the interrupt of export `index`,
+    /// `place` returns the range base and the interrupt of export `index`,
     /// or an error when the machine has none left. Each export is attached to
     /// the daemon listening on its socket, which the caller started. The
     /// connect and the handshake happen here, before the seccomp filters go
     /// in. Every export is placed before any is connected, so a machine with
-    /// too few windows is refused before a daemon sees a connection.
+    /// too few ranges is refused before a daemon sees a connection.
     ///
     /// # Errors
     ///
@@ -939,13 +941,23 @@ mod device {
         Ok(exports)
     }
 
-    /// Returns the export whose window of `size` bytes holds `addr`, or `None`
-    /// when no export's window does.
-    #[must_use]
-    pub fn export_at(exports: &[Export], addr: u64, size: u64) -> Option<&Export> {
-        exports
-            .iter()
-            .find(|export| (export.base..export.base + size).contains(&addr))
+    /// Puts each export on `bus`, at a range of `size` addresses.
+    ///
+    /// # Errors
+    ///
+    /// Errors if a range overlaps one already on `bus`.
+    pub(crate) fn insert_exports(
+        exports: &[Export],
+        bus: &mut Bus,
+        size: u64,
+        ram: &Arc<GuestRam>,
+        ledger: &Arc<Ledger>,
+    ) -> Result<(), String> {
+        for export in exports {
+            let transport = MmioTransport::new(&export.dev, ram, ledger);
+            bus.insert(export.base, size, Arc::new(transport))?;
+        }
+        Ok(())
     }
 
     /// Starts one [`serve_interrupts`] thread per queue of every export under
@@ -1020,7 +1032,7 @@ mod device {
             FrontendReq, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
         };
 
-        use super::{connect_waiting, serve_interrupts, serve_mmio, set_hi, set_lo, VhostUserFs};
+        use super::{connect_waiting, serve_interrupts, set_hi, set_lo, VhostUserFs};
         use crate::devices::irq::IrqLine;
         use crate::devices::virtio::mmio;
         use crate::memory::{GuestRam, RamRegion, SharedRam};
@@ -1323,7 +1335,9 @@ mod device {
             let (dev, rx) = probed(stream, &ram);
             dev.lock().expect("the device").signal_used();
             assert_eq!(rx.recv().expect("the raise"), (true, true));
-            serve_mmio(&dev, &mem, mmio::INTERRUPT_ACK, true, 1);
+            dev.lock()
+                .expect("the device")
+                .mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
             assert_eq!(
                 rx.recv_timeout(Duration::from_secs(5))
                     .expect("the access lowered the line"),

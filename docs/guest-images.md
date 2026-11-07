@@ -153,12 +153,12 @@ Then:
 hvi boot --kernel httpreply_qemu-arm64 --mem-mib 256 --net-stub --cmdline httpreply
 ```
 
-There is one more constraint on the hvi side, and it is why the device windows
+There is one more constraint on the hvi side, and it is why the device ranges
 sit where they do. A Unikraft/arm64 build without `CONFIG_PAGING` enables the
 MMU from a page table written at link time; the QEMU-virt one maps
 `0x0800_0000`-`0x4000_0000` as device memory, which is the range that has to
 hold for the guests here. Linux builds its early map from the devicetree and
-accepts MMIO anywhere. Every hvi device window is inside that range, so this
+accepts MMIO anywhere. Every hvi device range is inside it, so this
 costs a Linux guest nothing (see `DEVICE_WINDOW_BASE` in
 `src/arch/aarch64/layout.rs`).
 
