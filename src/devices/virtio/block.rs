@@ -1410,6 +1410,20 @@ mod capacity_tests {
         VirtioBlk::open_as(path, true, "").expect("the lock went with the writer");
     }
 
+    #[test]
+    fn disk_at_the_ledger_path_is_refused_and_left_as_it_was() {
+        let (r, blk) = rig("ledger");
+        drop(blk);
+        let path = r.path.to_str().unwrap();
+        let ledger = crate::events::Ledger::new(Some(path), "vm1").unwrap();
+        let err = open_disks(&[config::DiskConfig::rw(path)]).err().unwrap();
+        assert!(err.ends_with("the image is open elsewhere"), "{err}");
+        ledger
+            .close(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(std::fs::read(&r.path).unwrap(), [0xabu8; 512]);
+    }
+
     // One image may back two read-only disks of a guest. With a writer among
     // them the message names the other disk, where the lock alone would say
     // "elsewhere".

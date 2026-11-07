@@ -202,13 +202,14 @@ impl Ledger {
     /// Opens the ledger at `path` and starts its writer, or returns a disabled
     /// ledger when `path` is `None`.
     ///
-    /// The file is created when missing and truncated. A symbolic link as the
-    /// last component of `path` is refused. Anything else at `path` other than
-    /// a regular file is refused too, since the writer writes at an offset. The
-    /// writer holds a lock on the file until it exits, so a second ledger at
-    /// `path`, in this process or another, is refused while the first writer
-    /// still writes it. On a file system that cannot lock files, the ledger
-    /// goes without the lock.
+    /// The file is created when missing, and emptied when the first record is
+    /// written, so a ledger closed before then leaves it as it was. A symbolic
+    /// link as the last component of `path` is refused. Anything else at `path`
+    /// other than a regular file is refused too, since the writer writes at an
+    /// offset. The writer holds a lock on the file until it exits, so a second
+    /// ledger at `path`, in this process or another, is refused while the first
+    /// writer still writes it. On a file system that cannot lock files, the
+    /// ledger goes without the lock.
     ///
     /// # Errors
     ///
@@ -218,7 +219,7 @@ impl Ledger {
     pub fn new(path: Option<&str>, sandbox_id: &str) -> io::Result<Self> {
         let shared = match path {
             Some(path) => {
-                let file = open(path).map_err(|e| {
+                let (file, len) = open(path).map_err(|e| {
                     io::Error::new(e.kind(), format!("opening the ledger {path}: {e}"))
                 })?;
                 let shared = Arc::new(Shared {
@@ -229,7 +230,7 @@ impl Ledger {
                 let writer = Arc::clone(&shared);
                 std::thread::Builder::new()
                     .name("ledger writer".to_string())
-                    .spawn(move || writer.run_writer(file))
+                    .spawn(move || writer.run_writer(file, len))
                     .map_err(|e| {
                         io::Error::new(e.kind(), format!("spawning the ledger writer thread: {e}"))
                     })?;
@@ -796,12 +797,15 @@ impl Shared {
     ///
     /// The thread can start before a run's seccomp filters are armed, so it
     /// calls [`crate::sandbox::confine_io_thread`] before each write.
-    fn run_writer(&self, file: File) {
+    fn run_writer(&self, file: File, len: u64) {
         WRITER_THREAD.set(true);
         let mut taken = Vec::new();
-        // The file was truncated as it was opened, and this thread is the only
-        // one that writes it.
+        // The file is emptied before the first write, and this thread is the
+        // only one that writes it. An empty file is left as it is, since on
+        // ext4 a truncate makes the close of the file flush it, which delays
+        // the stop.
         let mut offset = 0;
+        let mut to_empty = len > 0;
         let mut failing = false;
         let mut give_up_at = None;
         let mut wrote = false;
@@ -843,8 +847,12 @@ impl Shared {
             let added = state.added;
             drop(state);
 
-            crate::sandbox::confine_io_thread();
-            let written = self.write_all_at(&file, &taken, offset);
+            // The file is emptied before the thread confines itself, since its
+            // filter does not allow `ftruncate`.
+            let written = empty_once(&file, &mut to_empty).and_then(|()| {
+                crate::sandbox::confine_io_thread();
+                self.write_all_at(&file, &taken, offset)
+            });
             // The line is printed before the lock is taken, so a stderr that
             // blocks holds up no thread that adds a record.
             match &written {
@@ -1021,13 +1029,14 @@ fn closed_error() -> io::Error {
     io::Error::other("the ledger is closed")
 }
 
-/// Opens the ledger file at `path` for writing and locks it.
+/// Returns the ledger file at `path`, opened for writing and locked, with its
+/// length.
 ///
-/// The file is truncated once it is known to be a regular file. `O_NOFOLLOW`
+/// The file is checked to be a regular file and left as it is. `O_NOFOLLOW`
 /// refuses a symbolic link as the last component of `path`. `O_NONBLOCK` keeps
 /// the open of a FIFO from waiting for a reader, so the open of one with no
 /// reader fails. `O_NOCTTY` keeps a terminal from becoming the controlling one.
-fn open(path: &str) -> io::Result<File> {
+fn open(path: &str) -> io::Result<(File, u64)> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -1056,7 +1065,8 @@ fn open(path: &str) -> io::Result<File> {
         Err(TryLockError::Error(_)) => {}
     }
     // The length is read once the lock is held, since another ledger's writer
-    // can grow the file until then.
+    // can grow the file until then. It is read here, before any confinement,
+    // since the macOS sandbox refuses `fstat` on a held descriptor.
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -1064,12 +1074,18 @@ fn open(path: &str) -> io::Result<File> {
             "not a regular file",
         ));
     }
-    // An empty file is left as it is, since on ext4 a truncate makes the close
-    // of the file flush it, which delays the stop.
-    if metadata.len() > 0 {
+    Ok((file, metadata.len()))
+}
+
+/// Empties `file` once, when `to_empty` says it holds an earlier run's records.
+///
+/// `to_empty` is cleared once the file is empty, so a later call does nothing.
+fn empty_once(file: &File, to_empty: &mut bool) -> io::Result<()> {
+    if *to_empty {
         file.set_len(0)?;
+        *to_empty = false;
     }
-    Ok(file)
+    Ok(())
 }
 
 /// Returns whether `error` says the file system cannot lock files.
@@ -1848,14 +1864,28 @@ mod tests {
     }
 
     #[test]
-    fn ledger_empties_an_existing_file() {
-        let path = temp_path("existing");
+    fn ledger_keeps_an_existing_file_until_its_first_record() {
+        let path = temp_path("kept");
         std::fs::write(&path, "a line from an earlier run\n").unwrap();
         let ledger = Ledger::new(path.to_str(), "vm1").unwrap();
         ledger
             .close(Instant::now() + Duration::from_secs(5))
             .unwrap();
-        assert!(take_lines(&path).is_empty());
+        assert_eq!(take_lines(&path), ["a line from an earlier run"]);
+    }
+
+    // The earlier run's lines are longer than the new record, so a write over
+    // them alone would leave their tail behind.
+    #[test]
+    fn first_record_empties_an_existing_file() {
+        let path = temp_path("existing");
+        std::fs::write(&path, "a line from an earlier run\n".repeat(100)).unwrap();
+        let ledger = Ledger::new(path.to_str(), "vm1").unwrap();
+        ledger.captured(&[block()]);
+        ledger
+            .close(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(take_lines(&path).len(), 1);
     }
 
     #[test]
