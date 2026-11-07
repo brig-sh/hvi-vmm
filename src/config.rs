@@ -82,8 +82,7 @@ pub struct FsShare {
 ///
 /// The daemon serves the directory it was started with, and it decides whether
 /// the guest may write it. The VMM sees only the socket. Only the Linux
-/// backends serve these. The fields and their defaults are Cloud Hypervisor's
-/// `--fs`.
+/// backends serve these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsConfig {
     /// The tag the guest mounts the export by, 1 to 36 bytes.
@@ -183,8 +182,8 @@ impl FsSpec {
     /// Returns the export `spec` describes, in the syntax of
     /// [`SYNTAX`](Self::SYNTAX).
     ///
-    /// The `socket=` form is Cloud Hypervisor's `--fs`, with its defaults.
-    /// The `path=` form takes what only hvi's own server can honor. A
+    /// The `socket=` form takes a daemon's socket and its queues. The `path=`
+    /// form takes what only hvi's own server can honor. A
     /// `path=` is returned as given; resolving it is the caller's.
     ///
     /// # Errors
@@ -308,7 +307,7 @@ impl FsSpec {
 /// The tag is the whole of what a guest has to name an export by, so a
 /// duplicate makes one of the two unreachable, and which one depends on the
 /// order the guest probes its devices in. A request queue beyond the guest's
-/// `vcpus` has no vCPU to submit on it, which Cloud Hypervisor refuses too.
+/// `vcpus` has no vCPU to submit on it.
 ///
 /// # Errors
 ///
@@ -648,6 +647,79 @@ pub struct BootConfig {
 }
 
 impl BootConfig {
+    /// Refuses a configuration the host's backend cannot boot.
+    ///
+    /// # Errors
+    ///
+    /// Errors for a ledger at a disk's image, for an option the host has no
+    /// device for, for two exports with one tag, for exports [`check_fs`] or
+    /// [`check_export_overlap`] refuses, and on x86-64 for more vCPUs than
+    /// `arch::x86_64::MAX_VCPUS`.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        // The ledger is opened, and so truncated, before the disks, so a disk
+        // lock cannot refuse it.
+        if let Some(events) = &self.events {
+            let disk = self
+                .disks
+                .iter()
+                .position(|disk| same_file(events, &disk.path));
+            if let Some(index) = disk {
+                return Err(format!(
+                    "--events {events}: cannot write the ledger to disk {index}'s image"
+                ));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // The Linux backends serve only exports a caller's vhost-user
+            // daemon serves, and the caller starts the daemon.
+            if let Some(share) = self.fs_shares.first() {
+                return Err(format!(
+                    "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
+                     virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
+                    share.tag
+                ));
+            }
+            check_fs(&self.fs, self.vcpus.max(1))?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut tags = std::collections::HashSet::with_capacity(self.fs_shares.len());
+            if let Some(share) = self.fs_shares.iter().find(|share| !tags.insert(&share.tag)) {
+                return Err(format!("duplicate virtio-fs tag {:?}", share.tag));
+            }
+            check_export_overlap(&self.fs_shares)?;
+            // The macOS backend serves every export itself, so it refuses a
+            // daemon's socket.
+            if let Some(export) = self.fs.first() {
+                return Err(format!(
+                    "--fs tag={},socket=: vhost-user exports are served on Linux only; \
+                     use --fs tag=<tag>,path=<dir>",
+                    export.tag
+                ));
+            }
+            // A tap needs /dev/net/tun, which macOS does not have. The flag is
+            // refused, because a guest on the wrong network looks like success
+            // from the outside.
+            if let Some(ifname) = &self.net_tap {
+                return Err(format!(
+                    "--net-tap {ifname}: no /dev/net/tun on macOS; use --net-gateway"
+                ));
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::arch::x86_64::MAX_VCPUS;
+            let vcpus = self.vcpus.max(1);
+            if vcpus > MAX_VCPUS {
+                return Err(format!(
+                    "x86-64 supports at most {MAX_VCPUS} vCPUs (asked for {vcpus})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Takes the run's stop out of [`stop`](Self::stop) as a handle, or returns
     /// a new handle when it is `None`.
     ///
@@ -658,6 +730,46 @@ impl BootConfig {
         match self.stop.take() {
             Some(registration) => Ok(registration.into_handle()),
             None => Ok(crate::run::StopHandle::new_pair()?.0),
+        }
+    }
+}
+
+/// Returns whether the paths `a` and `b` name one existing file.
+// The paths are the operator's, read once before the VM exists; see
+// clippy.toml.
+#[allow(clippy::disallowed_methods)]
+fn same_file(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+impl BootConfig {
+    /// Returns a configuration with no kernel, no devices and `vcpus` vCPUs,
+    /// for a test to fill in.
+    pub(crate) fn with_no_devices(vcpus: u32) -> Self {
+        Self {
+            kernel: Vec::new(),
+            initramfs: None,
+            mem_bytes: 128 << 20,
+            cmdline: String::new(),
+            disks: Vec::new(),
+            fs_shares: Vec::new(),
+            fs: Vec::new(),
+            net: false,
+            net_gateway: None,
+            net_tap: None,
+            net_mac: None,
+            events: None,
+            sandbox_id: "test".to_string(),
+            vcpus,
+            agent_sock: None,
+            plugin: None,
+            sandbox: false,
+            stop: None,
         }
     }
 }
@@ -741,8 +853,8 @@ impl std::error::Error for BootError {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        check_disks, check_export_overlap, check_fs, disk_serial, BootError, CachePolicy,
-        DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
+        check_disks, check_export_overlap, check_fs, disk_serial, BootConfig, BootError,
+        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -895,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_specs_take_a_bare_path_or_cloud_hypervisor_keys() {
+    fn disk_specs_take_a_bare_path_or_keys() {
         assert_eq!(
             DiskConfig::parse("up.img").unwrap(),
             DiskConfig::rw("up.img")
@@ -1069,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_socket_takes_cloud_hypervisors_syntax_and_defaults() {
+    fn fs_socket_spec_takes_its_keys_and_defaults() {
         assert_eq!(
             socket("tag=fs0,socket=/run/fs0.sock"),
             FsConfig {
@@ -1211,5 +1323,92 @@ mod tests {
             let err = check_fs(&[export], 4).expect_err(why);
             assert!(err.contains(why), "{err}");
         }
+    }
+
+    #[test]
+    fn configuration_with_no_devices_passes() {
+        BootConfig::with_no_devices(1).check().unwrap();
+    }
+
+    // The ledger truncates its file when it opens, before any disk is opened.
+    #[test]
+    fn ledger_at_a_disk_image_is_refused() {
+        let image = std::env::temp_dir().join(format!("hvi-config-image-{}", std::process::id()));
+        std::fs::write(&image, b"data").unwrap();
+        let image = image.to_str().expect("a UTF-8 temporary path").to_string();
+        let cfg = BootConfig {
+            disks: vec![DiskConfig::rw("other.img"), DiskConfig::rw(image.clone())],
+            events: Some(image.clone()),
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = cfg.check().unwrap_err();
+        let _ = std::fs::remove_file(&image);
+        assert_eq!(
+            err,
+            format!("--events {image}: cannot write the ledger to disk 1's image")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_export_is_refused_on_linux() {
+        let cfg = BootConfig {
+            fs_shares: shares(&[("/srv", ShareMode::ReadOnly)]),
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = cfg.check().unwrap_err();
+        assert!(
+            err.contains("hvi serves a directory on macOS only"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn daemon_export_is_refused_on_macos() {
+        let cfg = BootConfig {
+            fs: vec![socket("tag=t,socket=/s")],
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = cfg.check().unwrap_err();
+        assert!(
+            err.contains("vhost-user exports are served on Linux only"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_directory_tag_is_refused_on_macos() {
+        let mut fs_shares = shares(&[("/a", ShareMode::ReadOnly), ("/b", ShareMode::ReadOnly)]);
+        fs_shares[1].tag = fs_shares[0].tag.clone();
+        let cfg = BootConfig {
+            fs_shares,
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(cfg.check().unwrap_err(), "duplicate virtio-fs tag \"tag0\"");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tap_is_refused_on_macos() {
+        let cfg = BootConfig {
+            net_tap: Some("tap0".to_string()),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(
+            cfg.check().unwrap_err(),
+            "--net-tap tap0: no /dev/net/tun on macOS; use --net-gateway"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn more_vcpus_than_the_cap_are_refused() {
+        BootConfig::with_no_devices(254).check().unwrap();
+        assert_eq!(
+            BootConfig::with_no_devices(255).check().unwrap_err(),
+            "x86-64 supports at most 254 vCPUs (asked for 255)"
+        );
     }
 }

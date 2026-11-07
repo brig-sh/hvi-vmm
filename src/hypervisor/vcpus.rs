@@ -139,7 +139,6 @@ impl<K: Kick> Vcpus<K> {
     /// kick reaches, such as a vhost-user daemon that has not answered a
     /// device reset. The hook must return at once, and it runs again on each
     /// later stop.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn on_stop(&self, hook: impl Fn() + Send + Sync + 'static) {
         self.stop_hooks.lock().unwrap().push(Box::new(hook));
     }

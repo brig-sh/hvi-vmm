@@ -16,7 +16,7 @@
 //! devices to the vCPUs and the run.
 
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kvm_bindings::{
     kvm_vcpu_init, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PTRAUTH_ADDRESS,
@@ -29,27 +29,17 @@ use super::regs::{setup_boot_regs, try_get_u64, REG_MPIDR_EL1};
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{
-    mpidr_affinity, place_virtio_fs, virtio_blk_base, virtio_blk_spi, GicLayout, GicVersion,
-    GIC_NUM_IRQS, MPIDR_AFFINITY_MASK, RAM_BASE, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE,
-    UART_SPI, VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    mpidr_affinity, GicLayout, GicVersion, VirtioSlots, GIC_NUM_IRQS, MPIDR_AFFINITY_MASK,
+    RAM_BASE, UART_SPI,
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::bus::{self, Bus};
-use crate::devices::legacy::pl011::Pl011;
-use crate::devices::legacy::rtc_pl031::Pl031;
-use crate::devices::virtio::block;
-use crate::devices::virtio::fs::vhost_user;
-use crate::devices::virtio::net::{self, VirtioNet};
-use crate::devices::virtio::tap;
-use crate::devices::virtio::vsock::VirtioVsock;
+use crate::devices::irq::IrqLine;
+use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
-use crate::hypervisor::guest::{
-    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
-};
+use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::Vcpus;
-use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::GuestArch;
 use crate::signal::install_kick_handler;
@@ -57,17 +47,6 @@ use crate::LOG_PREFIX;
 
 /// Boots `cfg` on KVM (arm64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    // The Linux backends serve only exports a caller's vhost-user daemon
-    // serves, and the caller starts the daemon.
-    if let Some(share) = cfg.fs_shares.first() {
-        return Err(format!(
-            "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
-             virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
-            share.tag
-        )
-        .into());
-    }
-    crate::config::check_fs(&cfg.fs, cfg.vcpus.max(1))?;
     install_kick_handler();
     // Refuse a kernel that is not a flat Image before the VM, its RAM, the
     // devices and the event ledger exist.
@@ -81,7 +60,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     if !kvm.check_extension(Cap::ImmediateExit) {
         return Err("hvi needs KVM_CAP_IMMEDIATE_EXIT, which Linux 4.11 added".into());
     }
-    let vm = kvm.create_vm()?;
+    let vm = Arc::new(kvm.create_vm()?);
 
     // The guest GIC has to exist before the DTB is built, because the version
     // KVM creates decides what the DTB describes.
@@ -113,77 +92,26 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     )?);
     ram.register_kvm_slots(&vm)?;
 
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    let mut net_source: Option<NetSource> = None;
-    let net_dev = if let Some(ifname) = &cfg.net_tap {
-        // The caller created the tap, so this only attaches to it, which brings
-        // carrier up. An unusable tap fails the boot, because the built-in
-        // stack would put the guest on the wrong network and nothing outside
-        // the guest could tell.
-        let file = tap::open(ifname).map_err(|e| format!("--net-tap {ifname}: {e}"))?;
-        let reader = file
-            .try_clone()
-            .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
-        eprintln!("{LOG_PREFIX} virtio-net: tap {ifname}");
-        net_source = Some(NetSource::Tap(reader));
-        Some(VirtioNet::with_tap(file))
-    } else if let Some(sock) = &cfg.net_gateway {
-        match std::os::unix::net::UnixStream::connect(sock) {
-            Ok(stream) => match stream.try_clone() {
-                Ok(reader) => {
-                    eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock}");
-                    net_source = Some(NetSource::Gateway(reader));
-                    Some(VirtioNet::with_gateway(stream))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{LOG_PREFIX} WARNING: cannot clone gateway socket ({e}); net disabled"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    net::stub_stack_line()
-                );
-                Some(VirtioNet::new())
-            }
-        }
-    } else if cfg.net {
-        eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
-        Some(VirtioNet::new())
-    } else {
-        None
+    // The ledger exists first, since each device's transport writes to it.
+    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
+    let placement = VirtioSlots {
+        gic,
+        num_irqs: Some(GIC_NUM_IRQS),
     };
+    let mut devices = DeviceManager::new(&ram, &ledger, placement, {
+        let vm = Arc::clone(&vm);
+        move |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi))) as Arc<dyn IrqLine>
+    });
+    let pl011 = devices.attach_uart_and_rtc()?;
+    devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
+    let fdt_devices = fdt::virtio_devices(devices.records());
 
-    let net = net::share(net_dev, cfg.net_mac);
-
-    let vsock = cfg
-        .agent_sock
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
-    // virtio-fs: one transport per export, each served by the caller's daemon.
-    let fs = vhost_user::attach(&cfg.fs, shared_ram.as_raw_fd(), |index| {
-        place_virtio_fs(index, &gic, Some(GIC_NUM_IRQS)).map_err(std::io::Error::other)
-    })?;
-
-    let has_net = net.is_some();
-    let has_vsock = vsock.is_some();
-    let fdt_devices = fdt::VirtioDevices {
-        blk_count: disks.len(),
-        net: has_net,
-        vsock: has_vsock,
-        fs_count: fs.len(),
-    };
-
-    let ledger = Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?;
     let layout = loader::Payload {
         kernel: &cfg.kernel,
         initramfs: cfg.initramfs.as_deref(),
         cmdline: &cfg.cmdline,
     }
-    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, fdt_devices)?;
+    .load(ram.memory(), cfg.mem_bytes, &gic, num_cpus, &fdt_devices)?;
 
     vgic.set_regions(&gic)?;
 
@@ -224,27 +152,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     setup_boot_regs(&vcpus[0], layout.kernel_addr, layout.dtb_addr);
 
-    let vm = Arc::new(vm);
-    let ledger = Arc::new(ledger);
-    let pl011 = Arc::new(Mutex::new(Pl011::new()));
-    let fs = Arc::new(fs);
-    let mut mmio_bus = Bus::new();
-    insert_virtio_devices(
-        &mut mmio_bus,
-        &ram,
-        &ledger,
-        VIRTIO_SIZE,
-        &disks,
-        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
-        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
-    )?;
-    mmio_bus.insert(
-        UART_BASE,
-        UART_SIZE,
-        Arc::clone(&pl011) as Arc<dyn bus::Device>,
-    )?;
-    mmio_bus.insert(RTC_BASE, RTC_SIZE, Arc::new(Mutex::new(Pl031::new())))?;
-    vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
+    let Devices {
+        mmio_bus,
+        disks,
+        net,
+        host,
+    } = devices.finish();
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::Aarch64,
@@ -256,7 +169,6 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
-            vsock,
             vcpus: Arc::new(Vcpus::new(
                 num_cpus,
                 Kicker::new(num_cpus),
@@ -267,31 +179,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    let line = |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi)));
-    pl011.lock().unwrap().connect_irq(line(UART_SPI));
-    context.guest.connect_irqs(
-        // `open_disks` refused more disks than there are SPIs.
-        |index| line(virtio_blk_spi(index).expect("every disk should have an SPI")),
-        line(VIRTIO_NET_SPI),
-        line(VIRTIO_VSOCK_SPI),
-    );
-    for export in fs.iter() {
-        export.dev.lock().unwrap().connect_irq(line(export.irq));
-    }
-    // A vCPU in an export's reset waits on its daemon, where no kick reaches
-    // it. Ending the connections at the stop frees it.
-    context.guest.vcpus.on_stop({
-        let fs = Arc::clone(&fs);
-        move || vhost_user::shut_down(&fs)
-    });
-
-    let (filters, mut io_threads, ledger_guard) = start_io_threads(
+    pl011.lock().unwrap().connect_irq(Arc::new(KvmIrqLine::new(
+        Arc::clone(&vm),
+        spi_gsi(UART_SPI),
+    )));
+    let (filters, io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
         move |byte| pl011.lock().unwrap().push_rx(byte),
-        net_source,
+        host,
     )?;
-    vhost_user::start_interrupt_threads(&fs, &mut io_threads);
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();

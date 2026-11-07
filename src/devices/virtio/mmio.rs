@@ -23,6 +23,10 @@
 
 use virtio_bindings::virtio_mmio::*;
 
+/// The size of one device's register range, which holds the common registers
+/// below `0x100` and the device's configuration space from there.
+pub const RANGE_SIZE: u64 = 0x200;
+
 pub const MAGIC: u64 = VIRTIO_MMIO_MAGIC_VALUE as u64; // "virt"
 pub const VERSION: u64 = VIRTIO_MMIO_VERSION as u64; // 2
 pub const DEVICE_ID: u64 = VIRTIO_MMIO_DEVICE_ID as u64;

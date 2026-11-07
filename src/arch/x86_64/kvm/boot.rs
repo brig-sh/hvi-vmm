@@ -24,77 +24,28 @@ use kvm_ioctls::{Cap, Kvm};
 use super::cpuid::guest_cpuid;
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
 use super::vcpu::{port_bus, run_cpu, VcpuContext};
-use crate::arch::x86_64::acpi::{self, MmioDevice};
+use crate::arch::x86_64::acpi;
 use crate::arch::x86_64::layout::{
-    virtio_blk_base, virtio_blk_gsi, virtio_fs_base, virtio_fs_gsi, ACPI_ADDR, COM1_GSI,
-    HIGH_RAM_BASE, MAX_FS_DEVICES, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE, VIRTIO_NET_BASE,
-    VIRTIO_NET_GSI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI,
+    VirtioSlots, ACPI_ADDR, COM1_GSI, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE,
 };
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
-use crate::arch::x86_64::{mptable, MAX_VCPUS};
+use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
-use crate::devices::bus::Bus;
+use crate::devices::irq::IrqLine;
 use crate::devices::legacy::uart16550::Uart16550;
-use crate::devices::virtio::block;
-use crate::devices::virtio::fs::vhost_user::{self, Export};
-use crate::devices::virtio::net::{self, VirtioNet};
-use crate::devices::virtio::tap;
-use crate::devices::virtio::vsock::VirtioVsock;
+use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
-use crate::hypervisor::guest::{
-    insert_virtio_devices, mmio_report_limiter, Disk, Guest, PluginThreads,
-};
+use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
-use crate::io_threads::NetSource;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, RamRegion};
 use crate::signal::install_kick_handler;
 use crate::LOG_PREFIX;
 
-/// Returns the virtio-mmio devices the DSDT describes, the disks first and in
-/// order, then net, vsock and the exports.
-///
-/// Linux registers them in this order, so the disks keep their argv order. The
-/// guest still has to tell them apart by serial.
-fn mmio_devices(disks: usize, net: bool, vsock: bool, exports: &[Export]) -> Vec<MmioDevice> {
-    let device = |base: u64, gsi: u32| MmioDevice {
-        base,
-        size: VIRTIO_SIZE,
-        gsi,
-    };
-    let mut devices: Vec<MmioDevice> = (0..disks)
-        .filter_map(|index| Some(device(virtio_blk_base(index)?, virtio_blk_gsi(index)?)))
-        .collect();
-    if net {
-        devices.push(device(VIRTIO_NET_BASE, VIRTIO_NET_GSI));
-    }
-    if vsock {
-        devices.push(device(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_GSI));
-    }
-    devices.extend(exports.iter().map(|export| device(export.base, export.irq)));
-    devices
-}
-
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
-    // The Linux backends serve only exports a caller's vhost-user daemon
-    // serves, and the caller starts the daemon.
-    if let Some(share) = cfg.fs_shares.first() {
-        return Err(format!(
-            "virtio-fs {:?}: hvi serves a directory on macOS only; on Linux, run \
-             virtiofsd for it and pass --fs tag=<tag>,socket=<socket>",
-            share.tag
-        )
-        .into());
-    }
-    crate::config::check_fs(&cfg.fs, cfg.vcpus.max(1))?;
     let num_cpus = cfg.vcpus.max(1);
-    if num_cpus > MAX_VCPUS {
-        return Err(
-            format!("x86-64 supports at most {MAX_VCPUS} vCPUs (asked for {num_cpus})").into(),
-        );
-    }
     install_kick_handler();
 
     let kvm = Kvm::new()?;
@@ -103,7 +54,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     if !kvm.check_extension(Cap::ImmediateExit) {
         return Err("hvi needs KVM_CAP_IMMEDIATE_EXIT, which Linux 4.11 added".into());
     }
-    let vm = kvm.create_vm()?;
+    let vm = Arc::new(kvm.create_vm()?);
 
     // Intel VMX needs a TSS and an identity-map page for guest-mode setup, even
     // though the guest enters directly in long mode. Set them before creating
@@ -144,65 +95,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     vm.create_irq_chip()?;
     vm.create_pit2(kvm_pit_config::default())?;
 
-    let disks = Disk::place(block::open_disks(&cfg.disks)?, virtio_blk_base);
-    let mut net_source: Option<NetSource> = None;
-    let net_dev = if let Some(ifname) = &cfg.net_tap {
-        // The caller created the tap, so this only attaches to it, which brings
-        // carrier up. An unusable tap fails the boot, because the built-in
-        // stack would put the guest on the wrong network and nothing outside
-        // the guest could tell.
-        let file = tap::open(ifname).map_err(|e| format!("--net-tap {ifname}: {e}"))?;
-        let reader = file
-            .try_clone()
-            .map_err(|e| format!("--net-tap {ifname}: cloning the tap fd: {e}"))?;
-        eprintln!("{LOG_PREFIX} virtio-net: tap {ifname}");
-        net_source = Some(NetSource::Tap(reader));
-        Some(VirtioNet::with_tap(file))
-    } else if let Some(sock) = &cfg.net_gateway {
-        match std::os::unix::net::UnixStream::connect(sock) {
-            Ok(stream) => match stream.try_clone() {
-                Ok(reader) => {
-                    eprintln!("{LOG_PREFIX} virtio-net: gvisor-tap gateway relay via {sock}");
-                    net_source = Some(NetSource::Gateway(reader));
-                    Some(VirtioNet::with_gateway(stream))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{LOG_PREFIX} WARNING: cannot clone gateway socket ({e}); net disabled"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "{LOG_PREFIX} WARNING: gateway {sock} unreachable ({e}); falling back to the {}",
-                    net::stub_stack_line()
-                );
-                Some(VirtioNet::new())
-            }
-        }
-    } else if cfg.net {
-        eprintln!("{LOG_PREFIX} virtio-net: {}", net::stub_stack_line());
-        Some(VirtioNet::new())
-    } else {
-        None
-    };
-
-    let net = net::share(net_dev, cfg.net_mac);
-
-    let vsock = cfg
-        .agent_sock
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(VirtioVsock::new())));
-    // virtio-fs: one transport per export, each served by the caller's daemon.
-    let fs = vhost_user::attach(&cfg.fs, shared_ram.as_raw_fd(), |index| {
-        match (virtio_fs_base(index), virtio_fs_gsi(index)) {
-            (Some(base), Some(gsi)) => Ok((base, gsi)),
-            _ => Err(std::io::Error::other(format!(
-                "virtio-fs export {index}: x86-64 has interrupt lines for {MAX_FS_DEVICES} exports"
-            ))),
-        }
-    })?;
+    // The ledger exists first, since each device's transport writes to it.
+    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
+    let mut devices = DeviceManager::new(&ram, &ledger, VirtioSlots, {
+        let vm = Arc::clone(&vm);
+        move |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi)) as Arc<dyn IrqLine>
+    });
+    devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
 
     // Kernel command line: the caller's args and the ttyS0 console. The devices
     // are in the DSDT.
@@ -219,10 +118,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
     ram.write(
         ACPI_ADDR,
-        &acpi::build(
-            num_cpus,
-            &mmio_devices(disks.len(), net.is_some(), vsock.is_some(), &fs),
-        ),
+        &acpi::build(num_cpus, &acpi::virtio_devices(devices.records())),
     )?;
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
@@ -260,20 +156,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         vcpus.push(vcpu);
     }
 
-    let vm = Arc::new(vm);
-    let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let fs = Arc::new(fs);
-    let mut mmio_bus = Bus::new();
-    insert_virtio_devices(
-        &mut mmio_bus,
-        &ram,
-        &ledger,
-        VIRTIO_SIZE,
-        &disks,
-        net.as_ref().map(|device| (VIRTIO_NET_BASE, device)),
-        vsock.as_ref().map(|device| (VIRTIO_VSOCK_BASE, device)),
-    )?;
-    vhost_user::insert_exports(&fs, &mut mmio_bus, VIRTIO_SIZE, &ram, &ledger)?;
+    let Devices {
+        mmio_bus,
+        disks,
+        net,
+        host,
+    } = devices.finish();
     let uart = Arc::new(Mutex::new(Uart16550::new()));
     let context = VcpuContext {
         guest: Arc::new(Guest {
@@ -286,7 +174,6 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             mmio_report_limiter: mmio_report_limiter(),
             disks,
             net,
-            vsock,
             vcpus: Arc::new(Vcpus::new(
                 num_cpus,
                 Kicker::new(num_cpus),
@@ -298,31 +185,15 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    let line = |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi));
-    uart.lock().unwrap().connect_irq(line(COM1_GSI));
-    context.guest.connect_irqs(
-        // `open_disks` refused more disks than there are GSIs.
-        |index| line(virtio_blk_gsi(index).expect("every disk should have a GSI")),
-        line(VIRTIO_NET_GSI),
-        line(VIRTIO_VSOCK_GSI),
-    );
-    for export in fs.iter() {
-        export.dev.lock().unwrap().connect_irq(line(export.irq));
-    }
-    // A vCPU in an export's reset waits on its daemon, where no kick reaches
-    // it. Ending the connections at the stop frees it.
-    context.guest.vcpus.on_stop({
-        let fs = Arc::clone(&fs);
-        move || vhost_user::shut_down(&fs)
-    });
-
+    uart.lock()
+        .unwrap()
+        .connect_irq(Arc::new(KvmIrqLine::new(Arc::clone(&vm), COM1_GSI)));
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
         move |byte| uart.lock().unwrap().push_rx(byte),
-        net_source,
+        host,
     )?;
-    vhost_user::start_interrupt_threads(&fs, &mut io_threads);
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
         let guest = Arc::clone(&context.guest);
@@ -352,65 +223,4 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         filters,
         io_threads,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{boot, mmio_devices, MmioDevice};
-    use crate::config::BootConfig;
-
-    // The DSDT lists the disks first, in order, so Linux registers them in argv
-    // order.
-    #[test]
-    fn mmio_devices_list_every_disk_first_and_in_order() {
-        let gsis = |disks, net, vsock| -> Vec<(u64, u32)> {
-            mmio_devices(disks, net, vsock, &[])
-                .iter()
-                .map(|d| (d.base, d.gsi))
-                .collect()
-        };
-        assert_eq!(
-            gsis(3, true, false),
-            [
-                (0xd000_0000, 5),
-                (0xd000_0600, 9),
-                (0xd000_0800, 10),
-                (0xd000_0200, 6)
-            ]
-        );
-        assert!(gsis(0, false, false).is_empty());
-        assert_eq!(gsis(1, false, true), [(0xd000_0000, 5), (0xd000_0400, 7)]);
-        assert!(mmio_devices(1, false, false, &[]).iter().all(|d| *d
-            == MmioDevice {
-                base: 0xd000_0000,
-                size: 0x200,
-                gsi: 5
-            }));
-    }
-
-    #[test]
-    fn more_vcpus_than_the_cap_are_refused() {
-        let cfg = BootConfig {
-            kernel: Vec::new(),
-            initramfs: None,
-            mem_bytes: 128 << 20,
-            cmdline: String::new(),
-            disks: Vec::new(),
-            fs_shares: Vec::new(),
-            fs: Vec::new(),
-            net: false,
-            net_gateway: None,
-            net_tap: None,
-            net_mac: None,
-            events: None,
-            sandbox_id: "cap-test".to_string(),
-            vcpus: 255,
-            agent_sock: None,
-            plugin: None,
-            sandbox: false,
-            stop: None,
-        };
-        let error = boot(cfg).unwrap_err().to_string();
-        assert_eq!(error, "x86-64 supports at most 254 vCPUs (asked for 255)");
-    }
 }

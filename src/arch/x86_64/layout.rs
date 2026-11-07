@@ -21,6 +21,7 @@
 //! virtio-mmio window is in the sub-4 GiB MMIO hole.
 
 use crate::config::MAX_DISKS;
+use crate::devices::manager::{Placement, Slot};
 
 /// Guest RAM base (x86 RAM starts at physical 0).
 pub const RAM_BASE: u64 = 0x0;
@@ -97,7 +98,7 @@ pub const IOAPIC_INPUTS: u8 = 24;
 /// Lines 16 to 22 have no ISA IRQ, so a guest reaches a device on one only
 /// through the DSDT.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
-pub const VIRTIO_SIZE: u64 = 0x200;
+pub const VIRTIO_SIZE: u64 = crate::devices::virtio::mmio::RANGE_SIZE;
 pub const VIRTIO_BLK_BASE: u64 = VIRTIO_MMIO_BASE;
 pub const VIRTIO_NET_BASE: u64 = VIRTIO_MMIO_BASE + 0x200;
 pub const VIRTIO_VSOCK_BASE: u64 = VIRTIO_MMIO_BASE + 0x400;
@@ -154,6 +155,42 @@ pub fn virtio_fs_gsi(index: usize) -> Option<u32> {
         return None;
     }
     Some(VIRTIO_FS_GSI + index as u32)
+}
+
+/// The slots of the virtio devices on the x86-64 machine, from the functions
+/// and constants above.
+pub(crate) struct VirtioSlots;
+
+impl Placement for VirtioSlots {
+    fn disk(&self, index: usize) -> Option<Slot> {
+        Some(Slot {
+            base: virtio_blk_base(index)?,
+            irq: virtio_blk_gsi(index)?,
+        })
+    }
+
+    fn net(&self) -> Slot {
+        Slot {
+            base: VIRTIO_NET_BASE,
+            irq: VIRTIO_NET_GSI,
+        }
+    }
+
+    fn vsock(&self) -> Slot {
+        Slot {
+            base: VIRTIO_VSOCK_BASE,
+            irq: VIRTIO_VSOCK_GSI,
+        }
+    }
+
+    fn export(&self, index: usize) -> Result<Slot, String> {
+        match (virtio_fs_base(index), virtio_fs_gsi(index)) {
+            (Some(base), Some(irq)) => Ok(Slot { base, irq }),
+            _ => Err(format!(
+                "virtio-fs export {index}: x86-64 has interrupt lines for {MAX_FS_DEVICES} exports"
+            )),
+        }
+    }
 }
 
 /// Base of the sub-4 GiB MMIO hole: guest RAM stops here and the remainder,

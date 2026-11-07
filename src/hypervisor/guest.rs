@@ -28,84 +28,14 @@ use std::time::{Duration, Instant};
 
 use crate::config::Stop;
 use crate::devices::bus::{Bus, ReportLimiter};
-use crate::devices::irq::IrqLine;
 use crate::devices::virtio::block::VirtioBlk;
 use crate::devices::virtio::net::VirtioNet;
-use crate::devices::virtio::vsock::VirtioVsock;
-use crate::devices::virtio::MmioTransport;
 use crate::events::Ledger;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{CpuHandle, GuestArch, IoSink, Plugin, RamRegion, RegsView, VmHandle};
 use crate::teardown::{StopToken, STOP_TIMEOUT};
 use crate::LOG_PREFIX;
-
-/// A virtio-blk disk and the guest-physical base of its virtio-mmio range.
-pub(crate) struct Disk {
-    /// The first byte of the device's range.
-    pub(crate) base: u64,
-    /// The device.
-    pub(crate) dev: Arc<Mutex<VirtioBlk>>,
-}
-
-impl Disk {
-    /// Returns `devs` as disks, the one at index `i` at the range `base(i)`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `base` has no range for an index. `block::open_disks` rules
-    /// that out, since it refuses more disks than any backend has ranges for.
-    pub(crate) fn place(
-        devs: Vec<Arc<Mutex<VirtioBlk>>>,
-        base: impl Fn(usize) -> Option<u64>,
-    ) -> Vec<Disk> {
-        devs.into_iter()
-            .enumerate()
-            .map(|(index, dev)| Disk {
-                base: base(index).expect("a range per disk"),
-                dev,
-            })
-            .collect()
-    }
-}
-
-/// Puts each virtio device the backends share on `bus`, at a range of `size`
-/// addresses.
-///
-/// `net` and `vsock` carry the base of their range.
-///
-/// # Errors
-///
-/// Errors if two ranges overlap.
-pub(crate) fn insert_virtio_devices(
-    bus: &mut Bus,
-    ram: &Arc<GuestRam>,
-    ledger: &Arc<Ledger>,
-    size: u64,
-    disks: &[Disk],
-    net: Option<(u64, &Arc<Mutex<VirtioNet>>)>,
-    vsock: Option<(u64, &Arc<Mutex<VirtioVsock>>)>,
-) -> Result<(), String> {
-    for disk in disks {
-        let transport = MmioTransport::new(&disk.dev, ram, ledger);
-        bus.insert(disk.base, size, Arc::new(transport))?;
-    }
-    if let Some((base, device)) = net {
-        bus.insert(
-            base,
-            size,
-            Arc::new(MmioTransport::new(device, ram, ledger)),
-        )?;
-    }
-    if let Some((base, device)) = vsock {
-        bus.insert(
-            base,
-            size,
-            Arc::new(MmioTransport::new(device, ram, ledger)),
-        )?;
-    }
-    Ok(())
-}
 
 /// The guest a backend runs, apart from the hypervisor's handle to it.
 pub(crate) struct Guest<K> {
@@ -126,11 +56,9 @@ pub(crate) struct Guest<K> {
     /// or `None` when they are off, as [`mmio_report_limiter`] decides.
     pub(crate) mmio_report_limiter: Option<ReportLimiter>,
     /// The virtio-blk disks, in the order of `BootConfig::disks`.
-    pub(crate) disks: Vec<Disk>,
+    pub(crate) disks: Vec<Arc<Mutex<VirtioBlk>>>,
     /// The virtio-net device, when the VM has a network.
     pub(crate) net: Option<Arc<Mutex<VirtioNet>>>,
-    /// The virtio-vsock device, when the VM has an agent socket.
-    pub(crate) vsock: Option<Arc<Mutex<VirtioVsock>>>,
     /// The vCPU threads, the stop and the quiesce that parks them.
     pub(crate) vcpus: Arc<Vcpus<K>>,
     /// The threads a plugin asks for in `on_attach`, until the attach is over.
@@ -214,29 +142,6 @@ impl PluginThreads {
 }
 
 impl<K> Guest<K> {
-    /// Connects the virtio devices the VM has to their interrupt lines.
-    ///
-    /// It takes a line for each virtio device a guest can hold, whether or not
-    /// this VM has it, so a backend that leaves one out does not build. The
-    /// line of a device the VM does not have is dropped. `block` returns the
-    /// line of the disk at the index it is given.
-    pub(crate) fn connect_irqs(
-        &self,
-        block: impl Fn(usize) -> Arc<dyn IrqLine>,
-        net: Arc<dyn IrqLine>,
-        vsock: Arc<dyn IrqLine>,
-    ) {
-        for (index, disk) in self.disks.iter().enumerate() {
-            disk.dev.lock().unwrap().connect_irq(block(index));
-        }
-        if let Some(dev) = &self.net {
-            dev.lock().unwrap().connect_irq(net);
-        }
-        if let Some(dev) = &self.vsock {
-            dev.lock().unwrap().connect_irq(vsock);
-        }
-    }
-
     /// Fills `data` from the MMIO device whose range holds `address`.
     ///
     /// With no such device, `data` reads as 0, and the access is reported for
@@ -398,7 +303,7 @@ impl<K: Kick> VmHandle for Guest<K> {
 
     fn set_block_sink(&self, sink: Arc<dyn IoSink>) {
         for disk in &self.disks {
-            disk.dev.lock().unwrap().set_io_sink(Arc::clone(&sink));
+            disk.lock().unwrap().set_io_sink(Arc::clone(&sink));
         }
     }
 
@@ -544,7 +449,6 @@ pub(crate) mod tests {
             mmio_report_limiter: Some(ReportLimiter::new()),
             disks: Vec::new(),
             net: None,
-            vsock: None,
             plugin_threads: PluginThreads::new(),
             vcpus: Arc::new(Vcpus::new(
                 count,

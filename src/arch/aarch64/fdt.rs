@@ -29,10 +29,10 @@
 use vm_fdt::{Error, FdtWriter};
 
 use crate::arch::aarch64::layout::{
-    mpidr_affinity, virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, GicLayout,
-    GicVersion, GuestLayout, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE, UART_SPI, VIRTIO_NET_BASE,
-    VIRTIO_NET_SPI, VIRTIO_SIZE, VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI,
+    mpidr_affinity, GicLayout, GicVersion, GuestLayout, RTC_BASE, RTC_SIZE, UART_BASE, UART_SIZE,
+    UART_SPI,
 };
+use crate::devices::manager::DeviceRecord;
 
 const PHANDLE_GIC: u32 = 1;
 const PHANDLE_CLK: u32 = 2;
@@ -47,21 +47,35 @@ const IRQ_LEVEL_HIGH: u32 = 4;
 /// the kernel needs before it calls its CRNG initialised.
 pub const RNG_SEED_LEN: usize = 64;
 
-/// The virtio-mmio nodes backed by this boot.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct VirtioDevices {
-    /// Number of virtio-blk disks, at most [`crate::config::MAX_DISKS`].
-    pub blk_count: usize,
-    pub net: bool,
-    pub vsock: bool,
-    pub fs_count: usize,
+/// A virtio-mmio device the devicetree describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioDevice {
+    /// Guest-physical base of the device's registers.
+    pub base: u64,
+    /// Size of the range.
+    pub size: u64,
+    /// The SPI the device raises.
+    pub spi: u32,
 }
 
-/// Builds the DTB for `layout` with `num_cpus` vCPUs and the given kernel
-/// command line. When `layout.initrd_size` is non-zero, `/chosen` gets the
-/// initramfs range. `rng_seed` and `kaslr_seed` go into `/chosen/rng-seed`
-/// and `/chosen/kaslr-seed` as they are; the caller draws both fresh for
-/// every boot.
+/// Returns the virtio devices of `records`, in their order.
+pub(crate) fn virtio_devices(records: &[DeviceRecord]) -> Vec<MmioDevice> {
+    records
+        .iter()
+        .map(|record| MmioDevice {
+            base: record.range.start,
+            size: record.range.end - record.range.start,
+            spi: record.irq,
+        })
+        .collect()
+}
+
+/// Builds the DTB for `layout` with `num_cpus` vCPUs, the virtio `devices` and
+/// the kernel command line `bootargs`.
+///
+/// When `layout.initrd_size` is non-zero, `/chosen` gets the initramfs range.
+/// `rng_seed` and `kaslr_seed` go into `/chosen/rng-seed` and
+/// `/chosen/kaslr-seed` as they are, so each boot needs fresh ones.
 ///
 /// # Errors
 ///
@@ -72,7 +86,7 @@ pub fn build(
     gic: &GicLayout,
     num_cpus: u32,
     bootargs: &str,
-    devices: VirtioDevices,
+    devices: &[MmioDevice],
     rng_seed: &[u8; RNG_SEED_LEN],
     kaslr_seed: u64,
 ) -> Result<Vec<u8>, Error> {
@@ -226,35 +240,14 @@ pub fn build(
     fdt.property_string_list("clock-names", vec!["apb_pclk".into()])?;
     fdt.end_node(rtc)?;
 
-    // /virtio_mmio slots the guest probes, one per backed device. Omitted when
-    // absent so the guest never touches an unbacked MMIO region.
-    let mut virtio_node = |base: u64, spi: u32| -> Result<(), Error> {
-        let node = fdt.begin_node(&format!("virtio_mmio@{base:x}"))?;
+    // /virtio_mmio: one node per device, in the order of `devices`, which is
+    // the order Linux probes them in.
+    for device in devices {
+        let node = fdt.begin_node(&format!("virtio_mmio@{:x}", device.base))?;
         fdt.property_string("compatible", "virtio,mmio")?;
-        fdt.property_array_u64("reg", &[base, VIRTIO_SIZE])?;
-        fdt.property_array_u32("interrupts", &[IRQ_SPI, spi, IRQ_LEVEL_HIGH])?;
-        fdt.end_node(node)
-    };
-    // The disks come first and in order, so Linux probes them in that order.
-    // The guest still has to tell them apart by serial.
-    for index in 0..devices.blk_count {
-        if let (Some(base), Some(spi)) = (virtio_blk_base(index), virtio_blk_spi(index)) {
-            virtio_node(base, spi)?;
-        }
-    }
-    if devices.net {
-        virtio_node(VIRTIO_NET_BASE, VIRTIO_NET_SPI)?;
-    }
-    if devices.vsock {
-        virtio_node(VIRTIO_VSOCK_BASE, VIRTIO_VSOCK_SPI)?;
-    }
-    for index in 0..devices.fs_count {
-        // The hypervisor backend validates these placements before it builds
-        // the devicetree. The checked helpers keep a pathological library
-        // caller from wrapping.
-        if let (Some(base), Some(spi)) = (virtio_fs_base(index), virtio_fs_spi(index)) {
-            virtio_node(base, spi)?;
-        }
+        fdt.property_array_u64("reg", &[device.base, device.size])?;
+        fdt.property_array_u32("interrupts", &[IRQ_SPI, device.spi, IRQ_LEVEL_HIGH])?;
+        fdt.end_node(node)?;
     }
 
     fdt.end_node(root)?;
@@ -264,7 +257,10 @@ pub fn build(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::arch::aarch64::layout::VIRTIO_FS_BASE;
+    use crate::arch::aarch64::layout::{
+        virtio_blk_base, virtio_blk_spi, virtio_fs_base, virtio_fs_spi, VIRTIO_FS_BASE,
+        VIRTIO_NET_BASE, VIRTIO_NET_SPI, VIRTIO_SIZE,
+    };
 
     /// A fixed seed, so a test blob is the same every run.
     const SEED: [u8; RNG_SEED_LEN] = [0xa5; RNG_SEED_LEN];
@@ -282,7 +278,7 @@ pub(crate) mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             "earlycon=pl011,0x09000000",
-            VirtioDevices::default(),
+            &[],
             &SEED,
             KASLR_SEED,
         )
@@ -302,7 +298,7 @@ pub(crate) mod tests {
             &GicLayout::QEMU_VIRT,
             2,
             "console=ttyAMA0",
-            VirtioDevices::default(),
+            &[],
             &SEED,
             KASLR_SEED,
         )
@@ -310,28 +306,26 @@ pub(crate) mod tests {
         assert_eq!(&blob[0..4], &[0xd0, 0x0d, 0xfe, 0xed]);
     }
 
+    /// Returns the device at `base` and `spi`, which the layout gives.
+    fn device(base: Option<u64>, spi: Option<u32>) -> MmioDevice {
+        MmioDevice {
+            base: base.unwrap(),
+            size: VIRTIO_SIZE,
+            spi: spi.unwrap(),
+        }
+    }
+
     #[test]
     fn advertises_virtio_fs_only_when_backed() {
         let l = sample_layout(0);
-        let absent = build(
-            &l,
-            &GicLayout::QEMU_VIRT,
-            1,
-            "",
-            VirtioDevices::default(),
-            &SEED,
-            KASLR_SEED,
-        )
-        .unwrap();
+        let fs = |index| device(virtio_fs_base(index), virtio_fs_spi(index));
+        let absent = build(&l, &GicLayout::QEMU_VIRT, 1, "", &[], &SEED, KASLR_SEED).unwrap();
         let present = build(
             &l,
             &GicLayout::QEMU_VIRT,
             1,
             "",
-            VirtioDevices {
-                fs_count: 2,
-                ..VirtioDevices::default()
-            },
+            &[fs(0), fs(1)],
             &SEED,
             KASLR_SEED,
         )
@@ -344,18 +338,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn emits_one_node_per_disk_in_order() {
+    fn emits_one_node_per_device_in_order() {
         let l = sample_layout(0);
+        let disk = |index| device(virtio_blk_base(index), virtio_blk_spi(index));
+        let net = device(Some(VIRTIO_NET_BASE), Some(VIRTIO_NET_SPI));
         let blob = build(
             &l,
             &GicLayout::QEMU_VIRT,
             1,
             "",
-            VirtioDevices {
-                blk_count: 3,
-                net: true,
-                ..VirtioDevices::default()
-            },
+            &[disk(0), disk(1), disk(2), net],
             &SEED,
             KASLR_SEED,
         )
@@ -402,7 +394,7 @@ pub(crate) mod tests {
             &GicLayout::for_vcpus(GicVersion::V3, 17).unwrap(),
             17,
             "",
-            VirtioDevices::default(),
+            &[],
             &SEED,
             KASLR_SEED,
         )
@@ -428,7 +420,7 @@ pub(crate) mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             "",
-            VirtioDevices::default(),
+            &[],
             &SEED,
             KASLR_SEED,
         )
@@ -441,29 +433,11 @@ pub(crate) mod tests {
     #[test]
     fn intc_compatible_follows_gic_version() {
         let l = sample_layout(0);
-        let v3 = build(
-            &l,
-            &GicLayout::QEMU_VIRT,
-            1,
-            "",
-            VirtioDevices::default(),
-            &SEED,
-            KASLR_SEED,
-        )
-        .unwrap();
+        let v3 = build(&l, &GicLayout::QEMU_VIRT, 1, "", &[], &SEED, KASLR_SEED).unwrap();
         assert!(contains(&v3, "arm,gic-v3"));
         assert!(!contains(&v3, "arm,cortex-a15-gic"));
 
-        let v2 = build(
-            &l,
-            &GicLayout::QEMU_VIRT_V2,
-            1,
-            "",
-            VirtioDevices::default(),
-            &SEED,
-            KASLR_SEED,
-        )
-        .unwrap();
+        let v2 = build(&l, &GicLayout::QEMU_VIRT_V2, 1, "", &[], &SEED, KASLR_SEED).unwrap();
         assert!(contains(&v2, "arm,cortex-a15-gic"));
         assert!(!contains(&v2, "arm,gic-v3"));
     }
@@ -474,7 +448,7 @@ pub(crate) mod tests {
     fn v2_reg_describes_dist_and_cpu_interface() {
         let l = sample_layout(0);
         let g = GicLayout::QEMU_VIRT_V2;
-        let blob = build(&l, &g, 1, "", VirtioDevices::default(), &SEED, KASLR_SEED).unwrap();
+        let blob = build(&l, &g, 1, "", &[], &SEED, KASLR_SEED).unwrap();
         let mut want = Vec::new();
         for v in [g.gicd_base, g.gicd_size, g.gicr_base, g.gicr_size] {
             want.extend_from_slice(&v.to_be_bytes());
@@ -494,7 +468,7 @@ pub(crate) mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             "",
-            VirtioDevices::default(),
+            &[],
             &SEED,
             KASLR_SEED,
         )
@@ -559,7 +533,7 @@ pub(crate) mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             "",
-            VirtioDevices::default(),
+            &[],
             &seed,
             KASLR_SEED,
         )
@@ -576,7 +550,7 @@ pub(crate) mod tests {
             &GicLayout::QEMU_VIRT,
             1,
             "",
-            VirtioDevices::default(),
+            &[],
             &SEED,
             0x0123_4567_89ab_cdef,
         )

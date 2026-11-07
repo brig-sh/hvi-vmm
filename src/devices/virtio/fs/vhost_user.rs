@@ -103,15 +103,12 @@ pub fn queue_count(request_queues: usize) -> usize {
     request_queues + 1
 }
 
-// The device needs the `vhost` crate and the I/O threads, which exist only for
-// the Linux backends.
+// The device needs the `vhost` crate, which only the Linux build has.
 #[cfg(target_os = "linux")]
 pub use self::device::{
     attach, connect_waiting, serve_interrupts, shut_down, Export, ShutdownFds, VhostUserFs,
     SOCKET_WAIT,
 };
-#[cfg(target_os = "linux")]
-pub(crate) use self::device::{insert_exports, start_interrupt_threads};
 
 #[cfg(target_os = "linux")]
 mod device {
@@ -128,12 +125,10 @@ mod device {
     use vmm_sys_util::eventfd::EventFd;
 
     use crate::config::FsConfig;
-    use crate::devices::bus::Bus;
     use crate::devices::irq::{Irq, IrqLine};
-    use crate::devices::virtio::{mmio, MmioTransport, VirtioMmio};
-    use crate::events::{CapturedEvent, Ledger};
-    use crate::hypervisor::vcpus::Kick;
-    use crate::io_threads::IoThreads;
+    use crate::devices::virtio::{mmio, VirtioMmio};
+    use crate::events::CapturedEvent;
+    use crate::io_threads::HostWork;
     use crate::memory::GuestRam;
     use crate::plugin::IoSink;
     use crate::teardown::StopToken;
@@ -197,8 +192,8 @@ mod device {
         }
     }
 
-    /// How long [`VhostUserFs::connect`] waits for a daemon's socket, which is
-    /// what Cloud Hypervisor waits.
+    /// How long [`VhostUserFs::connect`] waits for a daemon's socket, so a
+    /// daemon started beside hvi has time to listen.
     pub const SOCKET_WAIT: Duration = Duration::from_secs(60);
 
     /// How long [`connect_waiting`] sleeps between two attempts.
@@ -848,6 +843,10 @@ mod device {
         fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
             None
         }
+
+        fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+            VhostUserFs::connect_irq(self, line);
+        }
     }
 
     /// Raises the guest's interrupt for `dev` each time the daemon signals
@@ -883,11 +882,6 @@ mod device {
     /// answers in, and the interrupt it raises.
     #[derive(Clone)]
     pub struct Export {
-        /// Guest-physical base of the transport's MMIO range.
-        pub base: u64,
-        /// The interrupt the backend raises for this export, a GSI on x86 and
-        /// an SPI on arm64.
-        pub irq: u32,
         /// The device behind the transport.
         pub dev: Arc<Mutex<VhostUserFs>>,
         /// The descriptors a shutdown uses, so it never has to take `dev`.
@@ -896,27 +890,17 @@ mod device {
 
     /// Connects one export per socket and returns them in order.
     ///
-    /// `place` returns the range base and the interrupt of export `index`,
-    /// or an error when the machine has none left. Each export is attached to
-    /// the daemon listening on its socket, which the caller started. The
-    /// connect and the handshake happen here, before the seccomp filters go
-    /// in. Every export is placed before any is connected, so a machine with
-    /// too few ranges is refused before a daemon sees a connection.
+    /// Each export is attached to the daemon listening on its socket, which the
+    /// caller started. The connect and the handshake happen here, before the
+    /// seccomp filters go in.
     ///
     /// # Errors
     ///
-    /// Errors if `place` does, if a socket cannot be reached in time, or if a
-    /// daemon refuses the vhost-user handshake.
-    pub fn attach(
-        sockets: &[FsConfig],
-        ram_fd: RawFd,
-        place: impl FnMut(usize) -> io::Result<(u64, u32)>,
-    ) -> io::Result<Vec<Export>> {
-        let placed = (0..sockets.len())
-            .map(place)
-            .collect::<io::Result<Vec<_>>>()?;
+    /// Errors if a socket cannot be reached in time, or if a daemon refuses the
+    /// vhost-user handshake.
+    pub fn attach(sockets: &[FsConfig], ram_fd: RawFd) -> io::Result<Vec<Export>> {
         let mut exports = Vec::with_capacity(sockets.len());
-        for (index, (export, (base, irq))) in sockets.iter().zip(placed).enumerate() {
+        for (index, export) in sockets.iter().enumerate() {
             // The directory and the mode are the daemon's, which hvi never
             // sees, so the line names the socket alone.
             stderrln!(
@@ -932,8 +916,6 @@ mod device {
                 ram_fd,
             )?;
             exports.push(Export {
-                base,
-                irq,
                 stop: dev.shutdown_fds(),
                 dev: Arc::new(Mutex::new(dev)),
             });
@@ -941,49 +923,24 @@ mod device {
         Ok(exports)
     }
 
-    /// Puts each export on `bus`, at a range of `size` addresses.
-    ///
-    /// # Errors
-    ///
-    /// Errors if a range overlaps one already on `bus`.
-    pub(crate) fn insert_exports(
-        exports: &[Export],
-        bus: &mut Bus,
-        size: u64,
-        ram: &Arc<GuestRam>,
-        ledger: &Arc<Ledger>,
-    ) -> Result<(), String> {
-        for export in exports {
-            let transport = MmioTransport::new(&export.dev, ram, ledger);
-            bus.insert(export.base, size, Arc::new(transport))?;
-        }
-        Ok(())
-    }
-
-    /// Starts one [`serve_interrupts`] thread per queue of every export under
-    /// `io_threads`.
-    ///
-    /// A thread ends when the I/O threads stop. An export whose call
-    /// descriptors cannot be duplicated gets no thread, so its guest never
-    /// sees a used buffer, and the boot says so on stderr.
-    ///
-    /// It has to be called from a thread with no seccomp filter, as
-    /// [`IoThreads::spawn`] says.
-    pub(crate) fn start_interrupt_threads<K: Kick + 'static>(
-        exports: &[Export],
-        io_threads: &mut IoThreads<K>,
-    ) {
-        for export in exports {
-            let calls = match export.dev.lock().unwrap().call_fds() {
+    impl Export {
+        /// Queues in `host` one [`serve_interrupts`] thread per queue of the
+        /// export.
+        ///
+        /// A thread ends when the I/O threads stop. An export whose call
+        /// descriptors cannot be duplicated gets no thread, so its guest never
+        /// sees a used buffer, and the boot says so on stderr.
+        pub(crate) fn queue_interrupts(&self, host: &mut HostWork) {
+            let calls = match self.dev.lock().unwrap().call_fds() {
                 Ok(calls) => calls,
                 Err(e) => {
                     stderrln!("{LOG_PREFIX} virtio-fs: queue interrupts unavailable: {e}");
-                    continue;
+                    return;
                 }
             };
             for call in calls {
-                let dev = Arc::clone(&export.dev);
-                io_threads.spawn("virtio-fs interrupts", move |stop| {
+                let dev = Arc::clone(&self.dev);
+                host.spawn("virtio-fs interrupts", move |stop| {
                     serve_interrupts(&dev, &call, &stop);
                 });
             }
