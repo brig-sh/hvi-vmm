@@ -83,7 +83,7 @@ fn mmio_trace_reports_unclaimed_mmio() {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "KVM_RUN error: Function not implemented (os error 38)";
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "MMIO at 0xd000400";
+const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "MMIO at 0xd000000";
 
 // A load pair from the vsock device's registers traps with no instruction
 // syndrome, so the hypervisor cannot tell which registers to fill, and hvi
@@ -92,7 +92,7 @@ const LOAD_WITHOUT_SYNDROME_FAILURE: &str = "MMIO at 0xd000400";
 #[test]
 fn mmio_load_without_syndrome_fails_the_run() {
     let vm = Vm::builder().boot();
-    trigger(&vm, "hvi-e2e-agent load-pair 0x0d000400");
+    trigger(&vm, "hvi-e2e-agent load-pair 0x0d000000");
     vm.wait(Duration::from_secs(30))
         .assert_stopped(Stop::Failed(LOAD_WITHOUT_SYNDROME_FAILURE));
 }
@@ -104,7 +104,7 @@ fn mmio_load_without_syndrome_fails_the_run() {
 fn cache_maintenance_on_a_device_range_is_skipped() {
     let vm = Vm::builder().boot();
     let cleaned = vm
-        .sh("hvi-e2e-agent clean-cache 0x0d000400")
+        .sh("hvi-e2e-agent clean-cache 0x0d000000")
         .assert_success();
     assert_eq!(cleaned.stdout.trim(), "done");
     vm.power_off();

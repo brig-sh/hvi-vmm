@@ -184,7 +184,7 @@ hvi is young. Read these before you build on it.
   queried name, then asks the host to resolve it. The default sandbox denies
   the socket that needs, so the guest gets a reply with no addresses in it.
   Only `--no-sandbox` resolves.
-- **Four disks and one NIC.** No hotplug, and no PCI at all.
+- **Disks and one NIC, attached at boot.** No hotplug, and no PCI at all.
 - **virtio-fs** is served in-process on macOS. On Linux it is served by a
   vhost-user daemon the caller runs, such as `virtiofsd`. One request queue per
   share on macOS, no DAX window, and no file-level events on the Linux path.

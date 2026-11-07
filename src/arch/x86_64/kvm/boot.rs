@@ -26,7 +26,7 @@ use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
 use super::vcpu::{port_bus, run_cpu, VcpuContext};
 use crate::arch::x86_64::acpi;
 use crate::arch::x86_64::layout::{
-    VirtioSlots, ACPI_ADDR, COM1_GSI, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE,
+    virtio_slots, ACPI_ADDR, COM1_GSI, HIGH_RAM_BASE, MMIO_GAP_START, MPTABLE_ADDR, RAM_BASE,
 };
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::mptable;
@@ -46,6 +46,10 @@ use crate::LOG_PREFIX;
 /// Boots `cfg` on KVM (x86-64), as [`crate::boot`] describes.
 pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Error + Send + Sync>> {
     let num_cpus = cfg.vcpus.max(1);
+    // Refuse more virtio devices than the IOAPIC has lines for before any of
+    // them opens.
+    let slots = virtio_slots();
+    slots.check_room(cfg.virtio_device_count())?;
     install_kick_handler();
 
     let kvm = Kvm::new()?;
@@ -97,7 +101,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The ledger exists first, since each device's transport writes to it.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let mut devices = DeviceManager::new(&ram, &ledger, VirtioSlots, {
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, {
         let vm = Arc::clone(&vm);
         move |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi)) as Arc<dyn IrqLine>
     });

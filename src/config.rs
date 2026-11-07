@@ -409,13 +409,6 @@ pub fn check_export_overlap(shares: &[FsShare]) -> Result<(), String> {
     Ok(())
 }
 
-/// Most virtio-blk disks one guest can have.
-///
-/// Each disk is its own virtio-mmio device with its own range and interrupt,
-/// and every backend reserves exactly this many slots for them (see
-/// `virtio_blk_base` in each architecture's layout module).
-pub const MAX_DISKS: usize = 4;
-
 /// One host file or block device backing a virtio-blk disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskConfig {
@@ -537,7 +530,7 @@ fn check_serial(serial: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuses a disk list no backend can attach.
+/// Refuses a disk list whose serials the guest could not read or tell apart.
 ///
 /// Every caller's list passes here, the CLI's after it parsed the arguments and
 /// a library caller's in `open_disks`, so a serial set without
@@ -545,17 +538,10 @@ fn check_serial(serial: &str) -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// Returns a message naming the limit when there are more than [`MAX_DISKS`],
-/// the disk whose serial the `GET_ID` field cannot carry, and the serial when
-/// two disks would answer `GET_ID` the same way, which is what the serial is
-/// for.
+/// Returns the disk whose serial the `GET_ID` field cannot carry, and the
+/// serial when two disks would answer `GET_ID` the same way, which is what the
+/// serial is for.
 pub fn check_disks(disks: &[DiskConfig]) -> Result<(), String> {
-    if disks.len() > MAX_DISKS {
-        return Err(format!(
-            "{} disks given; at most {MAX_DISKS} fit",
-            disks.len()
-        ));
-    }
     for (index, disk) in disks.iter().enumerate() {
         if let Some(serial) = &disk.serial {
             check_serial(serial).map_err(|why| format!("disk {index} ({}): {why}", disk.path))?;
@@ -582,9 +568,9 @@ pub struct BootConfig {
     pub initramfs: Option<Vec<u8>>,
     pub mem_bytes: u64,
     pub cmdline: String,
-    /// virtio-blk disks, at most [`MAX_DISKS`], in the order the guest sees
-    /// them. The disk at index `N` answers `GET_ID` with its serial, or
-    /// [`disk_serial`]`(N)` when it has none.
+    /// virtio-blk disks, in the order the guest sees them. Each takes one of
+    /// the slots every virtio device shares. The disk at index `N` answers
+    /// `GET_ID` with its serial, or [`disk_serial`]`(N)` when it has none.
     pub disks: Vec<DiskConfig>,
     /// Unpacked directories shared with the guest through independent
     /// virtio-fs devices. The Linux guest mounts each by `tag`; no block images
@@ -718,6 +704,16 @@ impl BootConfig {
             }
         }
         Ok(())
+    }
+
+    /// Returns how many virtio devices the configuration asks for.
+    pub(crate) fn virtio_device_count(&self) -> usize {
+        let net = self.net || self.net_gateway.is_some() || self.net_tap.is_some();
+        self.disks.len()
+            + usize::from(net)
+            + usize::from(self.agent_sock.is_some())
+            + self.fs.len()
+            + self.fs_shares.len()
     }
 
     /// Takes the run's stop out of [`stop`](Self::stop) as a handle, or returns
@@ -854,7 +850,7 @@ impl std::error::Error for BootError {
 mod tests {
     use super::{
         check_disks, check_export_overlap, check_fs, disk_serial, BootConfig, BootError,
-        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, ShareMode, MAX_DISKS,
+        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, ShareMode,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -985,22 +981,11 @@ mod tests {
     }
 
     #[test]
-    fn five_disks_are_refused() {
-        let mut disks: Vec<DiskConfig> = (0..MAX_DISKS)
-            .map(|i| DiskConfig::rw(format!("d{i}.img")))
-            .collect();
-        check_disks(&disks).expect("four disks fit");
-        disks.push(DiskConfig::ro("e.img"));
-        let err = check_disks(&disks).unwrap_err();
-        assert!(err.contains("at most 4"), "{err}");
-    }
-
-    #[test]
     fn default_serials_fit_the_virtio_blk_id_field() {
         assert_eq!(disk_serial(0), "disk0");
         assert_eq!(disk_serial(3), "disk3");
-        // VIRTIO_BLK_ID_BYTES.
-        assert!(disk_serial(MAX_DISKS - 1).len() <= DiskConfig::MAX_SERIAL_LEN);
+        // VIRTIO_BLK_ID_BYTES, for more disks than any machine has slots.
+        assert!(disk_serial(9999).len() <= DiskConfig::MAX_SERIAL_LEN);
         assert_eq!(DiskConfig::rw("a.img").serial_at(2), "disk2");
         let named = DiskConfig::parse("path=a.img,serial=lower").unwrap();
         assert_eq!(named.serial_at(2), "lower");
@@ -1328,6 +1313,19 @@ mod tests {
     #[test]
     fn configuration_with_no_devices_passes() {
         BootConfig::with_no_devices(1).check().unwrap();
+    }
+
+    #[test]
+    fn virtio_device_count_takes_one_per_disk_export_network_and_agent() {
+        assert_eq!(BootConfig::with_no_devices(1).virtio_device_count(), 0);
+        let cfg = BootConfig {
+            disks: vec![DiskConfig::rw("a.img"), DiskConfig::rw("b.img")],
+            net_gateway: Some("/gateway".to_string()),
+            agent_sock: Some("/agent".to_string()),
+            fs: vec![socket("tag=t,socket=/s")],
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(cfg.virtio_device_count(), 5);
     }
 
     // The ledger truncates its file when it opens, before any disk is opened.

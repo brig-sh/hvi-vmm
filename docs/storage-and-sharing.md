@@ -1,14 +1,15 @@
 # Disks and directory shares
 
-A guest gets storage two ways: up to four virtio-blk disks, and any number of
-virtio-fs directory shares. A guest can have both at once, and either on its
-own.
+A guest gets storage two ways: virtio-blk disks and virtio-fs directory
+shares, which take the interrupt lines every virtio device shares. A guest can
+have both at once, and either on its own.
 
 ## virtio-blk: `--disk <file>` and `--disk path=<file>,...`
 
 Each `--disk` backs one block device from one host file or block device. The
-flag is repeatable, at most four disks in all, and takes either a bare path or
-`path=<file>[,readonly=on|off][,serial=<id>]`. There is no hotplug.
+flag is repeatable and takes either a bare path or
+`path=<file>[,readonly=on|off][,serial=<id>]`. Each disk takes one of the
+interrupt lines every virtio device shares. There is no hotplug.
 
 ```sh
 hvi boot --kernel <Image> \
