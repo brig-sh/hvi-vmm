@@ -522,9 +522,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Bind before Seatbelt is installed. Accepting on this already-open
     // listener remains allowed afterwards; acquiring a new socket does not.
     let bridge = match (&cfg.agent_sock, &vsock) {
-        (Some(path), Some(dev)) => {
-            Some(VsockBridge::bind(path, Arc::clone(dev), Arc::clone(&ram))?)
-        }
+        (Some(path), Some(dev)) => Some(VsockBridge::bind(
+            path,
+            Arc::clone(dev),
+            Arc::clone(&ram),
+            cfg.sandbox,
+        )?),
         _ => None,
     };
     // The stop source's socket pair is created before Seatbelt for the same

@@ -246,6 +246,7 @@ pub(crate) fn start_io_threads(
             path,
             Arc::clone(dev),
             Arc::clone(&guest.ram),
+            cfg.sandbox,
         )?),
         _ => None,
     };

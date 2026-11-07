@@ -57,6 +57,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::agent_socket::{self, Node, PeerGate};
 use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::memory::GuestRam;
@@ -1327,6 +1328,10 @@ impl Default for VirtioVsock {
 pub(crate) struct VsockBridge {
     /// The agent socket, non-blocking.
     listener: UnixListener,
+    /// The check every accepted connection passes before it reaches `dev`.
+    gate: PeerGate,
+    /// The socket node, kept when the run may remove it on its stop.
+    node: Option<Node>,
     /// The device the connections are relayed to.
     dev: Arc<Mutex<VirtioVsock>>,
     /// Guest RAM, which the device's queues are in.
@@ -1334,42 +1339,50 @@ pub(crate) struct VsockBridge {
 }
 
 impl VsockBridge {
-    /// Binds the agent socket at `path` for `dev`, first removing a stale
-    /// socket a previous run left, which would make `bind` fail with
-    /// `EADDRINUSE`.
+    /// Binds the agent socket at `path` for `dev`, through
+    /// [`agent_socket::bind`], which replaces only a stale socket and sets
+    /// the node to mode 0600.
     ///
     /// The listener is non-blocking, so the accept loop can poll it beside the
-    /// stop token and then accept without blocking. It must be bound before the
-    /// seccomp filters go in, since they allow accepting on a listener already
-    /// held but not creating one.
+    /// stop token and then accept without blocking. It must be bound before
+    /// confinement, which allows accepting on a listener already held but not
+    /// creating one. With `sandbox` off, [`run`](Self::run) removes the node
+    /// when it returns. A confined process may not, as [`Node::remove`] says.
     ///
     /// # Errors
     ///
-    /// Errors if the socket cannot be bound.
-    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
-    // every component of a path comes from the guest. This path is the
-    // operator's.
-    #[allow(clippy::disallowed_methods)]
+    /// Errors if [`agent_socket::bind`] refuses what is at `path`, or the bind
+    /// fails.
     pub(crate) fn bind(
         path: &str,
         dev: Arc<Mutex<VirtioVsock>>,
         mem: Arc<GuestRam>,
+        sandbox: bool,
     ) -> std::io::Result<Self> {
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
-        })?;
-        listener.set_nonblocking(true)?;
-        Ok(Self { listener, dev, mem })
+        let bound = agent_socket::bind(path)?;
+        Ok(Self {
+            listener: bound.listener,
+            gate: bound.gate,
+            node: (!sandbox).then_some(bound.node),
+            dev,
+            mem,
+        })
     }
 
     /// Accepts and relays agent connections until `stop` is requested.
     ///
+    /// A connection the gate refuses is closed before it reaches the device.
     /// The per-connection threads poll the same token, and this thread joins
     /// the ones still running before it returns. On Linux they inherit the
     /// seccomp filter of the thread that runs this.
     pub(crate) fn run(self, stop: &StopToken) {
-        let Self { listener, dev, mem } = self;
+        let Self {
+            listener,
+            mut gate,
+            node,
+            dev,
+            mem,
+        } = self;
         let mut relays: Vec<JoinHandle<()>> = Vec::new();
         let mut gates = WriterGates(Vec::new());
         loop {
@@ -1384,6 +1397,9 @@ impl VsockBridge {
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
+            if !gate.admits(&stream) {
+                continue;
+            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
@@ -1422,6 +1438,9 @@ impl VsockBridge {
         dev.lock().unwrap().drop_conns();
         for relay in relays {
             let _ = relay.join();
+        }
+        if let Some(node) = node {
+            node.remove();
         }
     }
 
