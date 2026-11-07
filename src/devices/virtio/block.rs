@@ -19,9 +19,7 @@
 //! virtqueue and capturing the guest's disk I/O are the same act (see the
 //! `[virtio-blk]` log lines).
 //!
-//! The transport is modern virtio-mmio (version 2), enough for the Linux
-//! `virtio_mmio` and `virtio_blk` drivers to negotiate `VIRTIO_F_VERSION_1`,
-//! set up one queue, and read and write.
+//! The device has one queue, served on the vCPU that notifies it.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -39,27 +37,21 @@ use crate::config;
 use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
 
-use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    mmio, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, DeviceState, Queue, SinkSlot, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
 
-const MAGIC_VALUE: u64 = 0x7472_6976; // "virt" little-endian
-const VIRTIO_BLK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK as u64;
-const VENDOR: u64 = 0x4649_4f4e; // "NOIF"
-
-/// `VIRTIO_F_VERSION_1` -- required for a modern device. It is feature bit 32,
-/// so it lands in bit 0 of the high 32-bit word the driver selects.
-const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
-/// `VIRTIO_BLK_F_FLUSH` (low word): the guest may issue explicit cache-flush
-/// requests. Advertising and honouring it gives correct durability semantics
-/// for `fsync`/`end_fsync` workloads instead of the guest guessing.
-const F_BLK_FLUSH_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
-/// `VIRTIO_BLK_F_RO` (low word): the disk is read-only, and Linux marks the
-/// guest's block device read-only to match.
-const F_BLK_RO_LO: u32 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
+/// `VIRTIO_BLK_F_FLUSH`: the guest may issue explicit cache-flush requests.
+///
+/// With it, an `fsync` in the guest reaches stable storage on the host.
+const F_FLUSH: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
+/// `VIRTIO_BLK_F_RO`: the disk is read-only, and Linux marks the guest's block
+/// device read-only to match.
+const F_RO: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
 
 /// virtio-blk request types.
 const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
@@ -82,14 +74,14 @@ const SECTOR: u64 = 512;
 
 /// A virtio-blk device behind a virtio-mmio transport.
 pub struct VirtioBlk {
+    /// The backing file.
     file: File,
+    /// The disk's size in 512-byte sectors.
     capacity_sectors: u64,
-    status: u32,
-    dev_feat_sel: u32,
+    /// The request queue.
     queue: Queue,
-    interrupt_status: u32,
-    /// The interrupt line the device drives.
-    irq: Irq,
+    /// The activation state, with the interrupt once active.
+    state: DeviceState,
     /// Captured requests, drained by the hypervisor backend into the event
     /// ledger.
     events: Vec<CapturedEvent>,
@@ -288,11 +280,8 @@ impl VirtioBlk {
         Ok(VirtioBlk {
             file,
             capacity_sectors,
-            status: 0,
-            dev_feat_sel: 0,
-            queue: Queue::default(),
-            interrupt_status: 0,
-            irq: Irq::default(),
+            queue: Queue::new(QUEUE_MAX_SIZE),
+            state: DeviceState::Inactive,
             events: Vec::new(),
             sink: SinkSlot::default(),
             disk_id,
@@ -312,116 +301,6 @@ impl VirtioBlk {
     /// Feeds each request to `sink` as well as the ledger.
     pub fn set_io_sink(&mut self, sink: Arc<dyn IoSink>) {
         self.sink.set(sink);
-    }
-
-    /// The interrupt line level: asserted while an unacknowledged used-buffer
-    /// notification is pending.
-    #[must_use]
-    pub fn irq_level(&self) -> bool {
-        self.interrupt_status != 0
-    }
-
-    /// Connects the device to the interrupt line it raises.
-    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-        self.irq.connect(line);
-    }
-
-    /// Sets the interrupt line to the device's level.
-    fn sync_irq(&mut self) {
-        self.irq.set(self.irq_level());
-    }
-
-    /// Drains the captured requests for the event ledger.
-    pub(crate) fn take_events(&mut self) -> Vec<CapturedEvent> {
-        std::mem::take(&mut self.events)
-    }
-
-    /// Returns the sink fed a request since the last call, or `None` when no
-    /// request reached one.
-    pub(crate) fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
-        self.sink.take_fed()
-    }
-
-    /// Services one MMIO access. Returns the read value (0 for writes). When
-    /// the driver notifies a queue, the virtqueue is processed inline.
-    pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let read = self.serve_mmio(mem, offset, is_write, value);
-        self.sync_irq();
-        read
-    }
-
-    /// Reads or writes register `offset`, running a queue the write notifies.
-    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let v = value as u32;
-        if is_write {
-            match offset {
-                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
-                mmio::QUEUE_SEL => {} // only queue 0
-                mmio::QUEUE_NUM => self.queue.set_num(v),
-                mmio::QUEUE_READY => self.queue.set_ready(v, mem),
-                mmio::QUEUE_NOTIFY => self.process_queue(mem),
-                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
-                mmio::STATUS if v == 0 => self.reset(),
-                mmio::STATUS => self.status = v,
-                mmio::QUEUE_DESC_LOW => self.queue.set_desc_lo(v),
-                mmio::QUEUE_DESC_HIGH => self.queue.set_desc_hi(v),
-                mmio::QUEUE_DRIVER_LOW => self.queue.set_avail_lo(v),
-                mmio::QUEUE_DRIVER_HIGH => self.queue.set_avail_hi(v),
-                mmio::QUEUE_DEVICE_LOW => self.queue.set_used_lo(v),
-                mmio::QUEUE_DEVICE_HIGH => self.queue.set_used_hi(v),
-                _ => {}
-            }
-            0
-        } else {
-            match offset {
-                mmio::MAGIC => MAGIC_VALUE,
-                mmio::VERSION => 2,
-                mmio::DEVICE_ID => VIRTIO_BLK_ID,
-                mmio::VENDOR_ID => VENDOR,
-                // Low word: VIRTIO_BLK_F_FLUSH, and VIRTIO_BLK_F_RO on a
-                // read-only disk. High word: VIRTIO_F_VERSION_1.
-                mmio::DEVICE_FEATURES if self.dev_feat_sel == 0 => u64::from(self.features_lo()),
-                mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
-                mmio::QUEUE_READY => u64::from(self.queue.is_ready()),
-                mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                mmio::STATUS => u64::from(self.status),
-                // Config space: capacity (in 512-byte sectors) at offset 0.
-                // Return the 8-byte little-endian window starting at the field
-                // so a sized (byte/half/word) read takes the right low bytes;
-                // the caller masks to the access width.
-                _ if offset >= mmio::CONFIG => {
-                    let field = (offset - mmio::CONFIG) as usize;
-                    let cap = self.capacity_sectors.to_le_bytes();
-                    let mut w = [0u8; 8];
-                    for (i, b) in w.iter_mut().enumerate() {
-                        if let Some(&c) = cap.get(field + i) {
-                            *b = c;
-                        }
-                    }
-                    u64::from_le_bytes(w)
-                }
-                _ => 0,
-            }
-        }
-    }
-
-    /// Returns the low 32 feature bits the device offers.
-    fn features_lo(&self) -> u32 {
-        if self.read_only {
-            F_BLK_FLUSH_LO | F_BLK_RO_LO
-        } else {
-            F_BLK_FLUSH_LO
-        }
-    }
-
-    /// Resets the device, as a write of 0 to STATUS requests.
-    fn reset(&mut self) {
-        self.queue.reset();
-        self.interrupt_status = 0;
-        self.status = 0;
-        self.dev_feat_sel = 0;
     }
 
     /// Processes every buffer the driver has made available on queue 0.
@@ -448,8 +327,7 @@ impl VirtioBlk {
         }
         self.queue.set_last_avail(last);
         if serviced {
-            // Used-buffer notification.
-            self.interrupt_status |= 1;
+            self.state.signal_used_buffer();
         }
     }
 
@@ -635,6 +513,62 @@ impl VirtioBlk {
     }
 }
 
+impl virtio::Device for VirtioBlk {
+    fn device_type(&self) -> u32 {
+        virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK
+    }
+
+    fn features(&self) -> u64 {
+        if self.read_only {
+            F_FLUSH | F_RO
+        } else {
+            F_FLUSH
+        }
+    }
+
+    fn queue_max_sizes(&self) -> &[u16] {
+        &[QUEUE_MAX_SIZE]
+    }
+
+    // The configuration space starts with the capacity, in 512-byte sectors.
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        read_config_bytes(&self.capacity_sectors.to_le_bytes(), offset, data);
+    }
+
+    fn activate(
+        &mut self,
+        _ram: &GuestRam,
+        _driver_features: u64,
+        queues: Vec<Queue>,
+        interrupt: Arc<Interrupt>,
+    ) -> std::io::Result<()> {
+        if let Ok([queue]) = <[Queue; 1]>::try_from(queues) {
+            self.queue = queue;
+        }
+        self.state = DeviceState::Active(interrupt);
+        Ok(())
+    }
+
+    fn notify(&mut self, ram: &GuestRam, _queue: u16) {
+        if self.state.is_active() {
+            self.process_queue(ram);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.queue = Queue::new(QUEUE_MAX_SIZE);
+        self.state = DeviceState::Inactive;
+    }
+
+    fn take_events(&mut self) -> Vec<CapturedEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+        self.sink.take_fed()
+    }
+}
+
 /// Opens every disk in `disks` in order, each with the [`serial_at`] its
 /// position, and logs each one.
 ///
@@ -771,28 +705,10 @@ mod backing_len_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
+    use crate::devices::virtio::Device as _;
 
     const BASE: u64 = 0x4000_0000;
-
-    /// Programs a queue the way the Linux virtio-mmio driver does: size, then
-    /// the three ring addresses, then READY last.
-    fn program_queue(
-        blk: &mut VirtioBlk,
-        mem: &GuestRam,
-        num: u32,
-        desc: u64,
-        avail: u64,
-        used: u64,
-    ) {
-        blk.mmio(mem, mmio::QUEUE_NUM, true, u64::from(num));
-        blk.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        blk.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
-        blk.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        blk.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        blk.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        blk.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
-        blk.mmio(mem, mmio::QUEUE_READY, true, 1);
-    }
 
     /// A device over an empty image, so every sector is past the capacity.
     ///
@@ -809,87 +725,32 @@ mod queue_tests {
         blk
     }
 
-    /// Regression for the guest-triggerable panic: `0x10000` is non-zero as a
-    /// `u32` and zero as a `u16`, so the old code divided by zero on notify.
-    #[test]
-    fn queue_num_65536_is_rejected_instead_of_panicking() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+    /// Returns a fresh device activated with a 4-entry queue at the start of
+    /// `mem`.
+    fn activated(mem: &GuestRam) -> VirtioBlk {
         let mut blk = dev();
-        program_queue(&mut blk, &mem, 0x10000, BASE, BASE + 0x1000, BASE + 0x2000);
-        mem.write_u16(BASE + 0x1000 + 2, 1).unwrap(); // avail.idx = 1
-
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 0, "not ready");
-        blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0); // must not panic
-        assert_eq!(blk.queue.size(), 0, "the size was refused");
+        let rings = Rings {
+            size: 4,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        let queue = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
+        let (interrupt, _) = testing::enabled_interrupt();
+        blk.activate(mem, 0, vec![queue], interrupt).unwrap();
+        blk
     }
 
-    /// The rings must fit in guest RAM before we will service the queue, so a
-    /// driver cannot point them at unbacked addresses.
     #[test]
-    fn queue_rejects_rings_outside_guest_ram() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-
-        // desc table for 256 entries is 4 KiB, so this one runs off the end.
-        program_queue(
-            &mut blk,
-            &mem,
-            256,
-            BASE + 0x3800,
-            BASE + 0x1000,
-            BASE + 0x2000,
-        );
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 0);
-
-        // Below the RAM base is refused too.
-        program_queue(
-            &mut blk,
-            &mem,
-            256,
-            BASE - 0x1000,
-            BASE + 0x1000,
-            BASE + 0x2000,
-        );
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 0);
-
-        // The same size, in bounds, is accepted.
-        program_queue(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 1);
-    }
-
-    /// A driver that has validated its rings must not be able to move them and
-    /// keep the queue live. Every setter that feeds `rings_fit` drops `ready`,
-    /// so the bounds are re-checked before the device services anything; this
-    /// pins that, because otherwise a guest could pass the check on one set of
-    /// addresses and then be serviced on another.
-    #[test]
-    fn re_programming_a_ready_queue_clears_ready() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-
-        // Each value is deliberately a legal one, and for QUEUE_NUM a
-        // non-zero one: `is_ready` is false whenever the size is zero, so
-        // writing 0 there would pass this test without `ready` ever being
-        // cleared. What has to drop the queue is the write itself.
-        for (r, v) in [
-            (mmio::QUEUE_NUM, 128),
-            (mmio::QUEUE_DESC_LOW, 0),
-            (mmio::QUEUE_DESC_HIGH, 0),
-            (mmio::QUEUE_DRIVER_LOW, 0),
-            (mmio::QUEUE_DRIVER_HIGH, 0),
-            (mmio::QUEUE_DEVICE_LOW, 0),
-            (mmio::QUEUE_DEVICE_HIGH, 0),
-        ] {
-            let mut blk = dev();
-            program_queue(&mut blk, &mem, 256, BASE, BASE + 0x1000, BASE + 0x2000);
-            assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 1);
-
-            blk.mmio(&mem, r, true, v);
-            assert_eq!(
-                blk.mmio(&mem, mmio::QUEUE_READY, false, 0),
-                0,
-                "writing {r:#05x} left the queue ready"
-            );
-        }
+    fn common_registers_follow_virtio_1_2() {
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let rings = Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        testing::assert_common_registers(dev(), &mem, rings);
     }
 
     /// A chain that points back at itself must run out of budget rather than
@@ -899,8 +760,7 @@ mod queue_tests {
     #[test]
     fn a_descriptor_cycle_runs_out_of_budget() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
+        let mut blk = activated(&mem);
 
         // desc[0] -> desc[0]: a one-hop cycle, writable and F_NEXT set.
         mem.write_u64(BASE, BASE + 0x3000).unwrap();
@@ -924,8 +784,7 @@ mod queue_tests {
     #[test]
     fn a_next_index_outside_the_ring_ends_the_walk() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 4, BASE, BASE + 0x1000, BASE + 0x2000);
+        let mut blk = activated(&mem);
 
         // desc[0]: readable, chaining to index 4 -- one past a 4-entry ring.
         mem.write_u64(BASE, BASE + 0x3000).unwrap();
@@ -953,24 +812,27 @@ mod queue_tests {
         let mut disk = vec![0u8; 1024];
         disk[..5].copy_from_slice(b"HELLO");
         std::fs::write(&path, &disk).unwrap();
-        let mut blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
+        let blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
 
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x8000)]));
         let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
         let buffers = BASE + 0x4000;
+        let driver = Driver::new(blk, &mem);
+        driver.start(&[Rings {
+            size: 8,
+            desc_table: desc,
+            avail_ring: avail,
+            used_ring: used,
+        }]);
         publish_read(&mem, desc, avail, buffers);
-        let data = buffers + 0x100;
-
-        program_queue(&mut blk, &mem, 8, desc, avail, used);
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 1, "ready");
-        blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        driver.notify(0);
         let _ = std::fs::remove_file(&path);
 
         let mut got = [0u8; 5];
-        mem.read(data, &mut got).unwrap();
+        mem.read(buffers + 0x100, &mut got).unwrap();
         assert_eq!(&got, b"HELLO", "the sector reached guest memory");
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "used.idx advanced");
-        assert!(blk.irq_level(), "used-buffer interrupt asserted");
+        assert!(driver.line.is_high(), "used-buffer interrupt asserted");
     }
 
     /// Publishes one read of sector 0 on `avail`, as the next entry of an
@@ -1003,91 +865,51 @@ mod queue_tests {
     // at 0.
     #[test]
     fn status_reset_lets_the_re_programmed_queue_service_a_request() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x8000)]));
+        let driver = Driver::new(dev(), &mem);
 
-        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
+        driver.start(&[Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        }]);
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
-        blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        driver.notify(0);
         assert_eq!(
             mem.read_u16(BASE + 0x2000 + 2).unwrap(),
             1,
             "used.idx before the reset"
         );
 
-        blk.mmio(&mem, mmio::STATUS, true, 0);
-        program_queue(
-            &mut blk,
-            &mem,
-            8,
-            BASE + 0x3000,
-            BASE + 0x4000,
-            BASE + 0x5000,
-        );
+        driver.reset();
+        driver.start(&[Rings {
+            size: 8,
+            desc_table: BASE + 0x3000,
+            avail_ring: BASE + 0x4000,
+            used_ring: BASE + 0x5000,
+        }]);
         publish_read(&mem, BASE + 0x3000, BASE + 0x4000, BASE + 0x7000);
-        blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
+        driver.notify(0);
         assert_eq!(
             mem.read_u16(BASE + 0x5000 + 2).unwrap(),
             1,
             "the request published after the reset was serviced"
         );
-        // `dev()` backs the disk with `/dev/null`, so the read fails with
+        // `dev()` backs the disk with an empty image, so the read fails with
         // IOERR. A written status byte shows the chain was walked.
         assert_eq!(
             mem.read_u16(BASE + 0x7000 + 0x400).unwrap() as u8,
             VIRTIO_BLK_S_IOERR
         );
     }
-
-    // Linux `vm_setup_vq` refuses a queue whose QUEUE_READY reads non-zero, so
-    // a stale bit fails the probe that follows a reset.
-    #[test]
-    fn status_reset_clears_queue_ready() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 1);
-
-        blk.mmio(&mem, mmio::STATUS, true, 0);
-        assert_eq!(blk.mmio(&mem, mmio::QUEUE_READY, false, 0), 0);
-        assert_eq!(blk.mmio(&mem, mmio::STATUS, false, 0), 0);
-    }
-
-    #[test]
-    fn status_reset_selects_the_first_feature_page() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-        blk.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, 1);
-        assert_eq!(
-            blk.mmio(&mem, mmio::DEVICE_FEATURES, false, 0),
-            u64::from(F_VERSION_1_HI)
-        );
-
-        blk.mmio(&mem, mmio::STATUS, true, 0);
-        assert_eq!(
-            blk.mmio(&mem, mmio::DEVICE_FEATURES, false, 0),
-            u64::from(F_BLK_FLUSH_LO)
-        );
-    }
-
-    #[test]
-    fn status_reset_clears_the_pending_interrupt() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut blk = dev();
-        program_queue(&mut blk, &mem, 8, BASE, BASE + 0x1000, BASE + 0x2000);
-        publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
-        blk.mmio(&mem, mmio::QUEUE_NOTIFY, true, 0);
-        assert!(blk.irq_level());
-
-        blk.mmio(&mem, mmio::STATUS, true, 0);
-        assert!(!blk.irq_level());
-        assert_eq!(blk.mmio(&mem, mmio::INTERRUPT_STATUS, false, 0), 0);
-    }
 }
 
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
+    use crate::devices::virtio::mmio::testing::{self, Rings};
+    use crate::devices::virtio::Device as _;
 
     const BASE: u64 = 0x4000_0000;
 
@@ -1142,7 +964,8 @@ mod capacity_tests {
         }
     }
 
-    /// A 1-sector disk and a queue programmed the way Linux does it.
+    /// Returns a writable 1-sector disk over an image of `0xab` bytes, and the
+    /// guard that removes the image.
     fn rig(tag: &str) -> (Rig, VirtioBlk) {
         let path = std::env::temp_dir().join(format!("hvi-cap-{tag}-{}.img", std::process::id()));
         std::fs::write(&path, [0xabu8; 512]).unwrap();
@@ -1151,8 +974,22 @@ mod capacity_tests {
     }
 
     /// Submits one request and returns the status byte the device wrote.
+    ///
+    /// The first request activates the device with a 256-entry queue, and each
+    /// request takes the next entry of the avail ring.
     fn submit(blk: &mut VirtioBlk, mem: &GuestRam, typ: u32, sector: u64, len: u32) -> u8 {
         let (desc, avail, used) = (BASE, BASE + 0x2000, BASE + 0x3000);
+        if !blk.state.is_active() {
+            let rings = Rings {
+                size: 256,
+                desc_table: desc,
+                avail_ring: avail,
+                used_ring: used,
+            };
+            let queue = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
+            let (interrupt, _) = testing::enabled_interrupt();
+            blk.activate(mem, 0, vec![queue], interrupt).unwrap();
+        }
         let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
         mem.write_u32(hdr, typ).unwrap();
         mem.write_u64(hdr + 8, sector).unwrap();
@@ -1179,15 +1016,7 @@ mod capacity_tests {
             .unwrap();
         mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
 
-        blk.mmio(mem, mmio::QUEUE_NUM, true, 256);
-        blk.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        blk.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
-        blk.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        blk.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        blk.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        blk.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
-        blk.mmio(mem, mmio::QUEUE_READY, true, 1);
-        blk.mmio(mem, mmio::QUEUE_NOTIFY, true, 0);
+        blk.notify(mem, 0);
         mem.read_u16(status).unwrap() as u8
     }
 
@@ -1341,16 +1170,13 @@ mod capacity_tests {
 
     #[test]
     fn read_only_disk_advertises_f_ro() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let (_r, mut ro) = ro_rig("feat", "");
+        let (_r, ro) = ro_rig("feat", "");
         // The spec's bit numbers, not the constants the device uses:
         // VIRTIO_BLK_F_FLUSH is bit 9, VIRTIO_BLK_F_RO bit 5.
-        let features = ro.mmio(&mem, mmio::DEVICE_FEATURES, false, 0) as u32;
-        assert_eq!(features, (1 << 9) | (1 << 5));
+        assert_eq!(ro.features(), (1 << 9) | (1 << 5));
 
-        let (_w, mut rw) = rig("feat");
-        let features = rw.mmio(&mem, mmio::DEVICE_FEATURES, false, 0) as u32;
-        assert_eq!(features, 1 << 9, "a writable disk is not ro");
+        let (_w, rw) = rig("feat");
+        assert_eq!(rw.features(), 1 << 9, "a writable disk is not ro");
     }
 
     #[test]

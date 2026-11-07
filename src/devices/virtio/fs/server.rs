@@ -36,26 +36,29 @@ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 
 use crate::config::CachePolicy;
-use crate::devices::irq::{Irq, IrqLine};
 use crate::devices::virtio::fs::fdlimit;
-use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX};
+use crate::devices::virtio::mmio::Interrupt;
+use crate::devices::virtio::{
+    self, read_config_bytes, DeviceState, Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
+};
 use crate::memory::GuestRam;
 
-const MAGIC_VALUE: u64 = 0x7472_6976;
-const VIRTIO_FS_ID: u64 = 26;
-const VENDOR: u64 = 0x4649_4f4e;
-const F_VERSION_1_HI: u32 = 1;
+/// How many virtio-fs chains a vCPU services in its own exit before handing the
+/// rest to the device's worker thread.
+///
+/// A single guest syscall's requests stay on the vCPU, and a deep queue goes to
+/// the worker.
+const INLINE_BUDGET: u16 = 8;
 
 const NUM_QUEUES: usize = 2;
 const TAG_LEN: usize = 36;
 const CONFIG_LEN: usize = TAG_LEN + 4;
 const MAX_REQUEST: usize = 2 << 20;
 const MAX_WRITE: u32 = 1 << 20;
-
-const DESC_NEXT: u16 = 1;
-const DESC_WRITE: u16 = 2;
 
 /// Largest iovec count a single `preadv`/`pwritev` may carry. `libc::IOV_MAX`
 /// is only defined for BSD-family targets in the `libc` crate; on Linux this
@@ -1201,34 +1204,41 @@ pub(crate) fn sync_volume(path: &Path) -> io::Result<()> {
 
 /// A virtio-fs device exporting exactly one canonical host directory.
 pub struct VirtioFs {
+    /// The canonical host directory the export serves.
     root: PathBuf,
+    /// Whether the guest may change the export.
     writable: bool,
+    /// How long the guest may keep metadata and page-cache contents.
     cache_policy: CachePolicy,
     /// The guest identity the host user's files carry in this export.
     ids: GuestIds,
+    /// The mount tag, zero-padded, which the configuration space holds.
     tag: [u8; TAG_LEN],
-    status: u32,
-    dev_feat_sel: u32,
-    queue_sel: u32,
+    /// The hiprio and request queues, in that order.
     queues: [Queue; NUM_QUEUES],
-    interrupt_status: u32,
-    /// The interrupt line the device drives.
-    irq: Irq,
+    /// The activation state, with the interrupt once active.
+    state: DeviceState,
+    /// The waker of the device's worker thread, or `None` until one is set.
+    waker: Option<Waker>,
+    /// A clone of `waker` when a notify left queue work for the worker, or
+    /// `None` when it left none.
+    pending_wake: Option<Waker>,
     /// Bitmask of the queues notified since the last drain, with bit `i` set
     /// for queue `i`.
     ///
-    /// `mmio` sets a bit on a `QUEUE_NOTIFY`. A drain takes the whole mask
-    /// through `take_notified` and sets a bit again for a queue it leaves work
-    /// on. `reset` clears it. A bit is a flag rather than a count, so a queue
-    /// notified twice before a drain gets one pass.
+    /// A bit is a flag rather than a count, so a queue notified twice before a
+    /// drain gets one pass.
     ///
     /// The set is a release and the take an acquire, so a drain on another
     /// thread sees the descriptor table and avail ring the guest wrote before
     /// the notify. Every access also holds the device mutex, but the orderings
     /// keep the field sound without it.
     notified: AtomicU32,
+    /// The nodes the guest looked up, by node id.
     nodes: HashMap<u64, Node>,
+    /// The node id of each host inode, by its `(dev, ino)`.
     inode_ids: HashMap<(u64, u64), u64>,
+    /// The node id the next new node gets.
     next_node: u64,
     /// Unix sockets the guest has bound inside a share, by path.
     ///
@@ -1247,8 +1257,11 @@ pub struct VirtioFs {
     /// host filesystem, which is what the device refused them for to begin
     /// with.
     sockets: HashMap<PathBuf, SocketNode>,
+    /// The inode number the next bound socket gets.
     next_socket_ino: u64,
+    /// The open file handles, by fh.
     handles: HashMap<u64, FileHandle>,
+    /// The open directory handles, by fh.
     dir_handles: HashMap<u64, DirHandle>,
     /// Listings guests page through with fh 0, by node. A guest that
     /// stopped opening directories pages through a listing over several
@@ -1263,7 +1276,9 @@ pub struct VirtioFs {
     fh0_order: VecDeque<u64>,
     /// The nodes in `fh0_listings` whose listing a page has read to the end.
     fh0_finished: HashSet<u64>,
+    /// The directory listings prepared ahead of the guest.
     readahead: Readahead,
+    /// The fh the next open gets.
     next_handle: u64,
     /// Most guest handles this export will hold open at once (#34).
     ///
@@ -1300,9 +1315,11 @@ pub struct VirtioFs {
     /// like any other, so this comes out of the same budget as the guest's own
     /// handles (#34) rather than adding to it.
     parked_limit: usize,
-    /// Opens served from `parked`, and opens that had to reach the host.
+    /// Opens served from `parked`.
     parked_hits: u64,
+    /// Opens that had to reach the host.
     parked_misses: u64,
+    /// The id in the name of the next unlinked tmpfile.
     next_tmpfile: u64,
     /// How many READs and WRITEs took the zero-copy `preadv`/`pwritev` path.
     ///
@@ -1316,9 +1333,13 @@ pub struct VirtioFs {
     /// diagnostics rather than a synchronisation signal -- nothing reads them
     /// to decide anything -- so relaxed is enough.
     zero_copy_reads: AtomicU64,
+    /// How many WRITEs took the zero-copy `pwritev` path, counted as
+    /// `zero_copy_reads` is.
     zero_copy_writes: AtomicU64,
     /// FUSE requests received, by opcode. Diagnostic only.
     op_counts: [AtomicU64; 64],
+    /// Time spent serving FUSE requests, in nanoseconds, by opcode. Diagnostic
+    /// only.
     op_nanos: [AtomicU64; 64],
     /// Directory descriptors for resolving without paths (#30). Read
     /// operations resolve through this; the rest of the device still joins
@@ -1409,12 +1430,10 @@ impl VirtioFs {
             writable,
             cache_policy,
             tag: tag_buf,
-            status: 0,
-            dev_feat_sel: 0,
-            queue_sel: 0,
-            queues: std::array::from_fn(|_| Queue::default()),
-            interrupt_status: 0,
-            irq: Irq::default(),
+            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
+            state: DeviceState::Inactive,
+            waker: None,
+            pending_wake: None,
             ids: GuestIds::default(),
             notified: AtomicU32::new(0),
             nodes,
@@ -1553,14 +1572,10 @@ impl VirtioFs {
         &self.root
     }
 
-    #[must_use]
-    pub fn irq_level(&self) -> bool {
-        self.interrupt_status != 0
-    }
-
-    /// Connects the device to the interrupt line it raises.
-    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-        self.irq.connect(line);
+    /// Sets the waker of the worker thread that serves the queue work a vCPU
+    /// leaves.
+    pub(crate) fn set_waker(&mut self, waker: Waker) {
+        self.waker = Some(waker);
     }
 
     /// Sets the guest identity the host user's files carry in this export.
@@ -1569,34 +1584,18 @@ impl VirtioFs {
         self.ids = ids;
     }
 
-    /// Sets the interrupt line to the device's level.
+    /// Ends the FUSE session.
     ///
-    /// It runs under the device mutex, so the line follows the last change to
-    /// the interrupt status.
-    fn sync_irq(&mut self) {
-        self.irq.set(self.irq_level());
-    }
-
-    fn queue(&mut self) -> Option<&mut Queue> {
-        self.queues.get_mut(self.queue_sel as usize)
-    }
-
-    /// Resets the device, as a write of 0 to STATUS requests.
-    ///
-    /// The FUSE session ends with the queues. Open handles, the nodes the guest
-    /// looked up and the sockets it bound exist only for the driver that
-    /// created them, so they are dropped; the root node stays, since every
-    /// session starts from `FUSE_ROOT_ID`. Closing the handles and removing
-    /// unlinked tmpfiles touches the host filesystem on the vCPU thread, once
-    /// per reset and bounded by the handle limit.
-    fn reset(&mut self) {
-        for queue in &mut self.queues {
-            queue.reset();
-        }
-        self.interrupt_status = 0;
-        self.status = 0;
-        self.dev_feat_sel = 0;
-        self.queue_sel = 0;
+    /// The queues are dropped with it. Open handles, the nodes the guest looked
+    /// up and the sockets it bound exist only for the driver that created them,
+    /// so they are dropped; the root node stays, since every session starts
+    /// from `FUSE_ROOT_ID`. Closing the handles and removing unlinked tmpfiles
+    /// touches the host filesystem on the vCPU thread, once per reset and
+    /// bounded by the handle limit.
+    fn end_session(&mut self) {
+        self.queues = std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE));
+        self.state = DeviceState::Inactive;
+        self.pending_wake = None;
         self.notified.store(0, Ordering::Release);
         // Drained first: removing each tmpfile resolves through the
         // descriptor cache, which is this device's to borrow.
@@ -1630,126 +1629,19 @@ impl VirtioFs {
         // guest resets a device it never wrote to.
     }
 
-    /// Services a virtio-mmio register access.
-    ///
-    /// A `QUEUE_NOTIFY` records the queue index in `notified` and runs no FUSE
-    /// request. The requests run in a later drain, `drain_notified_bounded` on
-    /// the vCPU thread or `drain_notified` on the worker thread. Every other
-    /// register is handled here, and only `reset` does work that reaches the
-    /// host filesystem.
-    pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let read = self.serve_mmio(mem, offset, is_write, value);
-        self.sync_irq();
-        read
-    }
-
-    /// Reads or writes register `offset`.
-    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let v = value as u32;
-        if is_write {
-            match offset {
-                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
-                mmio::QUEUE_SEL => self.queue_sel = v,
-                mmio::QUEUE_NUM => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_num(v);
-                    }
-                }
-                mmio::QUEUE_READY => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_ready(v, mem);
-                    }
-                }
-                mmio::QUEUE_NOTIFY if (v as usize) < NUM_QUEUES => {
-                    self.notified.fetch_or(1 << v, Ordering::Release);
-                }
-                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
-                mmio::STATUS if v == 0 => self.reset(),
-                mmio::STATUS => self.status = v,
-                mmio::QUEUE_DESC_LOW => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_desc_lo(v);
-                    }
-                }
-                mmio::QUEUE_DESC_HIGH => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_desc_hi(v);
-                    }
-                }
-                mmio::QUEUE_DRIVER_LOW => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_avail_lo(v);
-                    }
-                }
-                mmio::QUEUE_DRIVER_HIGH => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_avail_hi(v);
-                    }
-                }
-                mmio::QUEUE_DEVICE_LOW => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_used_lo(v);
-                    }
-                }
-                mmio::QUEUE_DEVICE_HIGH => {
-                    if let Some(queue) = self.queue() {
-                        queue.set_used_hi(v);
-                    }
-                }
-                _ => {}
-            }
-            return 0;
+    /// Flags `queue` as notified, for the next drain to serve.
+    fn mark_notified(&self, queue: u16) {
+        if usize::from(queue) < NUM_QUEUES {
+            self.notified.fetch_or(1 << queue, Ordering::Release);
         }
-
-        match offset {
-            mmio::MAGIC => MAGIC_VALUE,
-            mmio::VERSION => 2,
-            mmio::DEVICE_ID => VIRTIO_FS_ID,
-            mmio::VENDOR_ID => VENDOR,
-            mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-            mmio::QUEUE_NUM_MAX if (self.queue_sel as usize) < NUM_QUEUES => {
-                u64::from(QUEUE_NUM_MAX)
-            }
-            mmio::QUEUE_READY => self
-                .queues
-                .get(self.queue_sel as usize)
-                .map_or(0, |queue| u64::from(queue.is_ready())),
-            mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-            mmio::STATUS => u64::from(self.status),
-            // The device has no shared memory region, which virtio 1.2 reads
-            // as all ones. A guest built with FUSE_DAX fails its probe on a
-            // zero length.
-            mmio::SHM_LEN_LOW | mmio::SHM_LEN_HIGH | mmio::SHM_BASE_LOW | mmio::SHM_BASE_HIGH => {
-                0xffff_ffff
-            }
-            _ if offset >= mmio::CONFIG => self.read_config((offset - mmio::CONFIG) as usize),
-            _ => 0,
-        }
-    }
-
-    fn read_config(&self, offset: usize) -> u64 {
-        let mut cfg = [0u8; CONFIG_LEN];
-        cfg[..TAG_LEN].copy_from_slice(&self.tag);
-        cfg[TAG_LEN..].copy_from_slice(&1u32.to_le_bytes());
-        let mut word = [0u8; 8];
-        for (i, byte) in word.iter_mut().enumerate() {
-            if let Some(value) = cfg.get(offset + i) {
-                *byte = *value;
-            }
-        }
-        u64::from_le_bytes(word)
     }
 
     /// Clears and returns the set of queues notified since the last call.
-    ///
-    /// Only `drain_notified_bounded` calls it. It is a separate method so a
-    /// test can read the bitmask `mmio` left without draining it.
-    pub(crate) fn take_notified(&mut self) -> u32 {
+    fn take_notified(&mut self) -> u32 {
         self.notified.swap(0, Ordering::Acquire)
     }
 
-    /// Drains every queue flagged by a `QUEUE_NOTIFY` since the last drain.
+    /// Drains every queue marked notified since the last drain.
     ///
     /// The worker thread calls it, with the device mutex held, to serve every
     /// chain on each flagged queue with no budget. A vCPU thread never calls
@@ -1774,9 +1666,15 @@ impl VirtioFs {
     /// overlap with the guest is what matters.
     pub(crate) fn drain_notified_bounded(&mut self, mem: &GuestRam, budget: u16) -> bool {
         let mask = self.take_notified();
+        let mut served = false;
         let mut remaining = false;
         for idx in 0..NUM_QUEUES {
-            if mask & (1 << idx) != 0 && self.process_queue_bounded(mem, idx, budget) {
+            if mask & (1 << idx) == 0 {
+                continue;
+            }
+            let (queue_served, queue_remaining) = self.process_queue_bounded(mem, idx, budget);
+            served |= queue_served;
+            if queue_remaining {
                 // Re-flag: the queue still has chains the budget did not
                 // cover, and `take_notified` has already cleared the bit.
                 self.notified.fetch_or(1 << idx, Ordering::Release);
@@ -1785,11 +1683,13 @@ impl VirtioFs {
         }
         // After the new chains: a guest holder's unlock or RELEASE was among
         // them, so its waiter is answered in the pass that released it.
-        if self.retry_lock_waiters(mem) {
-            remaining = true;
+        let (answered, waiting) = self.retry_lock_waiters(mem);
+        // One raise covers the whole pass, so the guest takes one interrupt for
+        // everything the pass served.
+        if served || answered {
+            self.state.signal_used_buffer();
         }
-        self.sync_irq();
-        remaining
+        remaining || waiting
     }
 
     /// Whether a SETLKW is parked waiting for its lock.
@@ -1797,15 +1697,16 @@ impl VirtioFs {
         !self.lock_waiters.is_empty()
     }
 
-    /// Repeats every parked SETLKW once, without blocking, and completes
-    /// those that are answered. Returns whether any is still waiting.
+    /// Repeats every parked SETLKW once, without blocking.
     ///
-    /// A waiter whose handle is gone is answered EBADF, and one whose queue
-    /// the guest took down is dropped with it, as its chain was.
-    fn retry_lock_waiters(&mut self, mem: &GuestRam) -> bool {
+    /// Returns whether it answered a waiter, and whether one is still waiting.
+    /// A waiter whose handle is gone is answered EBADF, and one whose queue the
+    /// guest took down is dropped with it, as its chain was.
+    fn retry_lock_waiters(&mut self, mem: &GuestRam) -> (bool, bool) {
         if self.lock_waiters.is_empty() {
-            return false;
+            return (false, false);
         }
+        let mut answered = false;
         let waiters = std::mem::take(&mut self.lock_waiters);
         for waiter in waiters {
             if !self.queues[waiter.queue_idx].is_ready() {
@@ -1831,29 +1732,30 @@ impl VirtioFs {
             };
             let used = Self::write_reply(mem, &waiter.output, &response);
             self.queues[waiter.queue_idx].push_used(mem, waiter.head, used);
-            self.interrupt_status |= 1;
+            answered = true;
         }
-        !self.lock_waiters.is_empty()
+        (answered, !self.lock_waiters.is_empty())
     }
 
-    /// Services at most `budget` chains from `queue_idx`. Returns true when
-    /// the queue still had work left over, so a bounded caller knows to hand
-    /// the remainder on rather than dropping it.
+    /// Services at most `budget` chains from `queue_idx`.
+    ///
+    /// Returns whether it pushed a used buffer, and whether the queue still had
+    /// chains past the budget.
     pub(crate) fn process_queue_bounded(
         &mut self,
         mem: &GuestRam,
         queue_idx: usize,
         budget: u16,
-    ) -> bool {
+    ) -> (bool, bool) {
         if !self.queues[queue_idx].is_ready() {
-            return false;
+            return (false, false);
         }
         let Some(pending) = self.queues[queue_idx].pending(mem) else {
-            return false;
+            return (false, false);
         };
         let take = pending.min(budget);
         let mut last = self.queues[queue_idx].last_avail();
-        let mut serviced = false;
+        let mut served = false;
         for _ in 0..take {
             let Some(slot) = self.queues[queue_idx].avail_slot(last) else {
                 break;
@@ -1865,15 +1767,12 @@ impl VirtioFs {
             // which `retry_lock_waiters` completes.
             if let Some(used) = self.handle_chain(mem, queue_idx, head) {
                 self.queues[queue_idx].push_used(mem, head, used);
-                serviced = true;
+                served = true;
             }
             last = last.wrapping_add(1);
         }
         self.queues[queue_idx].set_last_avail(last);
-        if serviced {
-            self.interrupt_status |= 1;
-        }
-        take < pending
+        (served, take < pending)
     }
 
     /// Serves one chain and returns the length of its reply, or `None` for a
@@ -1901,7 +1800,7 @@ impl VirtioFs {
             ) else {
                 return Some(0);
             };
-            if flags & DESC_WRITE != 0 {
+            if flags & VIRTQ_DESC_F_WRITE != 0 {
                 output.push((addr, len));
             } else {
                 let Some(total) = total_in.checked_add(len as usize) else {
@@ -1913,7 +1812,7 @@ impl VirtioFs {
                 total_in = total;
                 input.push((addr, len));
             }
-            if flags & DESC_NEXT == 0 {
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             desc = next;
@@ -5890,23 +5789,79 @@ fn mkfifo_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), i32> {
     Ok(())
 }
 
+impl virtio::Device for VirtioFs {
+    fn device_type(&self) -> u32 {
+        virtio_bindings::virtio_ids::VIRTIO_ID_FS
+    }
+
+    fn features(&self) -> u64 {
+        0
+    }
+
+    fn queue_max_sizes(&self) -> &[u16] {
+        &[QUEUE_MAX_SIZE; NUM_QUEUES]
+    }
+
+    // The configuration space holds the tag and the request queue count, 1.
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        let mut config = [0u8; CONFIG_LEN];
+        config[..TAG_LEN].copy_from_slice(&self.tag);
+        config[TAG_LEN..].copy_from_slice(&1u32.to_le_bytes());
+        read_config_bytes(&config, offset, data);
+    }
+
+    fn activate(
+        &mut self,
+        _ram: &GuestRam,
+        _driver_features: u64,
+        queues: Vec<Queue>,
+        interrupt: Arc<Interrupt>,
+    ) -> io::Result<()> {
+        if let Ok(queues) = <[Queue; NUM_QUEUES]>::try_from(queues) {
+            self.queues = queues;
+        }
+        self.state = DeviceState::Active(interrupt);
+        Ok(())
+    }
+
+    // The vCPU is held for the host calls of the chains it serves here, so no
+    // request may make one that blocks.
+    fn notify(&mut self, ram: &GuestRam, queue: u16) {
+        if !self.state.is_active() {
+            return;
+        }
+        self.mark_notified(queue);
+        if self.drain_notified_bounded(ram, INLINE_BUDGET) {
+            self.pending_wake = self.waker.clone();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.end_session();
+    }
+
+    fn take_pending_wake(&mut self) -> Option<Waker> {
+        self.pending_wake.take()
+    }
+}
+
 // Counts the host operations that the device spends to find something:
 // metadata, directory entries or a descriptor. A test pins this count for a
 // known workload, which catches a change that makes the device do more host
-// work per request. Time cannot do that job, because a shared runner adds
-// more noise than a real regression does.
+// work per request. Time cannot do that job, because a shared runner adds more
+// noise than a real regression does.
 //
-// Every site that reaches the host filesystem to find something must count:
-// the `Stat` forms, including `Stat::of_fd` and the listing's `stat_listed`,
-// the entry and directory opens, and `read_dir_at`. If a site does not count,
-// extra work routed through it stays invisible to the test.
+// Every site that reaches the host filesystem to find something must count: the
+// `Stat` forms, including `Stat::of_fd` and the listing's `stat_listed`, the
+// entry and directory opens, and `read_dir_at`. If a site does not count, extra
+// work routed through it stays invisible to the test.
 //
 // Each site counts after the work that can fail without a syscall, so a
 // rejected name or a bad flag does not add to the total.
 //
-// The count is thread-local, so a test under the parallel harness sees only
-// the requests it drives. It compiles to nothing outside `cfg(test)`: this
-// is the device's per-request path, and the count is a test hook.
+// The count is thread-local, so a test under the parallel harness sees only the
+// requests it drives. It compiles to nothing outside `cfg(test)`: this is the
+// device's per-request path, and the count is a test hook.
 #[cfg(test)]
 thread_local! {
     static HOST_META_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -7517,6 +7472,10 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::Wake;
+
+    use crate::devices::virtio::mmio::testing::{self, Rings};
+    use crate::devices::virtio::Device as _;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -11657,7 +11616,7 @@ mod tests {
     // The listings are keyed by node, and a reset restarts node ids. What the
     // readahead queued and prepared was for the session that walked into it.
     #[test]
-    fn status_reset_drops_the_fh0_listings() {
+    fn reset_drops_the_fh0_listings() {
         let (dir, mut dev) = fixture_with_access(true);
         let etc = lookup_node(&mut dev, FUSE_ROOT_ID, b"etc");
         read_fh0_page(&mut dev, etc, 0);
@@ -11665,27 +11624,25 @@ mod tests {
         let etc_path = fs::canonicalize(&dir).unwrap().join("etc");
         dev.readahead.prepare_now(&etc_path);
 
-        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
-        dev.mmio(&mem, mmio::STATUS, true, 0);
+        dev.reset();
         assert!(dev.fh0_listings.is_empty());
         assert!(dev.fh0_order.is_empty());
         assert!(dev.readahead.take(&etc_path).is_none(), "prepared survived");
         let _ = fs::remove_dir_all(dir);
     }
 
-    // A guest built with FUSE_DAX fails its probe on a zero length (#251).
     #[test]
-    fn shm_registers_report_no_region() {
-        let (dir, mut dev) = fixture();
-        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
-        for offset in [
-            mmio::SHM_LEN_LOW,
-            mmio::SHM_LEN_HIGH,
-            mmio::SHM_BASE_LOW,
-            mmio::SHM_BASE_HIGH,
-        ] {
-            assert_eq!(dev.mmio(&mem, offset, false, 0), 0xffff_ffff, "{offset:#x}");
-        }
+    fn common_registers_follow_virtio_1_2() {
+        let (dir, dev) = fixture();
+        let base = 0x4000_0000u64;
+        let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x4000)]));
+        let rings = Rings {
+            size: 8,
+            desc_table: base,
+            avail_ring: base + 0x1000,
+            used_ring: base + 0x2000,
+        };
+        testing::assert_common_registers(dev, &mem, rings);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11848,7 +11805,7 @@ mod tests {
             head,
             in_buf,
             IN_HEADER_LEN as u32,
-            DESC_NEXT,
+            VIRTQ_DESC_F_NEXT,
             head + 1,
         );
         write_desc(
@@ -11857,7 +11814,7 @@ mod tests {
             head + 1,
             in_buf + 0x40,
             args.len() as u32,
-            DESC_NEXT,
+            VIRTQ_DESC_F_NEXT,
             head + 2,
         );
         write_desc(
@@ -11866,7 +11823,7 @@ mod tests {
             head + 2,
             out,
             OUT_HEADER_LEN as u32,
-            DESC_WRITE,
+            VIRTQ_DESC_F_WRITE,
             0,
         );
         let idx = mem.read_u16(avail + 2).unwrap();
@@ -11921,12 +11878,12 @@ mod tests {
         // A ring of 16: its waiters may hold four entries, one chain of
         // three.
         let (desc, avail, used) = (base, base + 0x100, base + 0x200);
-        program_queue(&mut dev, &mem, 16, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 16, desc, avail, used);
         let out = base + 0x8000;
         let mut req = fuse_in_header(88, SETLKW, 0x77, node);
         req.extend_from_slice(&whole_file_write_lock(waiter, flock));
         queue_chain(&mem, desc, avail, 0, base + 0x1000, out, &req);
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
 
         let (dev, remaining) = drain_or_hang(dev, &mem);
         assert!(
@@ -11939,7 +11896,10 @@ mod tests {
             "the waiter has no reply yet"
         );
         assert!(dev.has_lock_waiters());
-        assert!(!dev.irq_level(), "nothing completed, so nothing to raise");
+        assert!(
+            !dev.state.is_raised(),
+            "nothing completed, so nothing to raise"
+        );
         (dev, mem, (desc, avail, used), out)
     }
 
@@ -11983,7 +11943,7 @@ mod tests {
         req.extend_from_slice(&release);
         let base = 0x4000_0000u64;
         queue_chain(&mem, desc, avail, 1, base + 0x1400, base + 0x8400, &req);
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
 
         let remaining = dev.drain_notified_bounded(&mem, u16::MAX);
         assert!(!remaining, "no waiter is left once the lock is taken");
@@ -11998,7 +11958,7 @@ mod tests {
             "the waiter got its lock, under its own unique"
         );
         assert!(!dev.has_lock_waiters());
-        assert!(dev.irq_level());
+        assert!(dev.state.is_raised());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -12092,7 +12052,7 @@ mod tests {
         let base = 0x4000_0000u64;
         let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
         let (desc, avail, used) = (base, base + 0x400, base + 0x800);
-        program_queue(&mut dev, &mem, 32, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 32, desc, avail, used);
         assert_eq!(LockWaiter::cap(32), 8);
         let outs: Vec<u64> = (0..3).map(|i| base + 0x8000 + i * 0x200).collect();
         for (i, (waiter, out)) in waiters.iter().zip(&outs).enumerate() {
@@ -12108,7 +12068,7 @@ mod tests {
                 &req,
             );
         }
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
 
         let (mut dev, _) = drain_or_hang(dev, &mem);
         assert_eq!(
@@ -12165,7 +12125,7 @@ mod tests {
         let base = 0x4000_0000u64;
         let mem = Arc::new(GuestRam::from_ranges(&[(base, 0x20000)]));
         let (desc, avail, used) = (base, base + 0x400, base + 0x800);
-        program_queue(&mut dev, &mem, 32, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 32, desc, avail, used);
         let outs = [base + 0x8000, base + 0x8200];
         for (i, fh) in [a, b].into_iter().enumerate() {
             let mut req = fuse_in_header(88, SETLKW, 0x80 + i as u64, node);
@@ -12180,7 +12140,7 @@ mod tests {
                 &req,
             );
         }
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
 
         let (mut dev, _) = drain_or_hang(dev, &mem);
         assert_eq!(
@@ -12216,7 +12176,7 @@ mod tests {
         let (dir, mut dev) = fixture();
         let base = 0x4000_0000u64;
         let mem = GuestRam::from_ranges(&[(base, 0x20000)]);
-        program_queue(&mut dev, &mem, 256, base, base + 0x1000, base + 0x2000);
+        set_ready_queue(&mut dev, &mem, 256, base, base + 0x1000, base + 0x2000);
         let out = dev.handle_fuse(&request(INIT, 0, &init_payload_offering_everything()), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(
@@ -12256,7 +12216,7 @@ mod tests {
         assert_eq!(get_u32(&out, 4), Some(0));
 
         let (mut dev, mem, (_, _, used), _) = park_a_setlkw(dev, waiter, node, true);
-        dev.mmio(&mem, mmio::STATUS, true, 0);
+        dev.reset();
         assert!(!dev.has_lock_waiters());
         dev.drain_notified(&mem);
         assert_eq!(
@@ -12461,14 +12421,17 @@ mod tests {
     // backed by a plain `Vec<u8>`, the same pattern `virtio::net` uses.
     // Everything above this point exercises `handle_fuse` with no guest memory,
     // which is the buffered path. These tests go through
-    // `mmio`/`drain_notified`/`handle_chain` instead, so the READ/WRITE direct
-    // path in `handle_fuse_desc` is what runs.
+    // `mark_notified`/`drain_notified`/`handle_chain` instead, so the
+    // READ/WRITE direct path in `handle_fuse_desc` is what runs.
 
-    const REQ_QUEUE: u32 = 0;
+    const REQ_QUEUE: u16 = 0;
 
-    /// Programs a queue the way the Linux virtio-mmio driver does: select,
-    /// size, the three ring addresses, then READY last.
-    fn program_queue(
+    /// Puts the request queue into `dev`, ready at the given rings and `size`
+    /// entries deep.
+    ///
+    /// The first call also makes `dev` active, with an interrupt the tests read
+    /// through `DeviceState::is_raised`.
+    fn set_ready_queue(
         dev: &mut VirtioFs,
         mem: &GuestRam,
         size: u32,
@@ -12476,15 +12439,16 @@ mod tests {
         avail: u64,
         used: u64,
     ) {
-        dev.mmio(mem, mmio::QUEUE_SEL, true, u64::from(REQ_QUEUE));
-        dev.mmio(mem, mmio::QUEUE_NUM, true, u64::from(size));
-        dev.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        dev.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
-        dev.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        dev.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        dev.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        dev.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
-        dev.mmio(mem, mmio::QUEUE_READY, true, 1);
+        let rings = Rings {
+            size,
+            desc_table: desc,
+            avail_ring: avail,
+            used_ring: used,
+        };
+        dev.queues[usize::from(REQ_QUEUE)] = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
+        if !dev.state.is_active() {
+            dev.state = DeviceState::Active(testing::enabled_interrupt().0);
+        }
     }
 
     fn write_desc(
@@ -12503,17 +12467,16 @@ mod tests {
         mem.write_u16(da + 14, next).unwrap();
     }
 
-    /// Publishes `head` as the one available buffer, notifies the device, then
-    /// drains it.
+    /// Publishes `head` as the one available buffer, marks the request queue
+    /// notified, then drains it.
     ///
     /// The drain stands in for the one that follows a notify in production, on
-    /// a vCPU or the worker.
-    /// `queue_notify_only_records_the_index_and_does_no_io` tests `mmio`'s half
-    /// on its own.
+    /// a vCPU or the worker. `marking_a_queue_records_the_index_and_does_no_io`
+    /// tests the first half on its own.
     fn notify_head(dev: &mut VirtioFs, mem: &GuestRam, avail: u64, head: u16) {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, head).unwrap(); // avail.ring[0]
-        dev.mmio(mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
         dev.drain_notified(mem);
     }
 
@@ -12552,14 +12515,15 @@ mod tests {
         let base = 0x4000_0000u64;
         let mem = GuestRam::from_ranges(&[(base, 0x10000)]);
         let (desc, avail, used, in_buf) = (base, base + 0x100, base + 0x200, base + 0x1000);
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
         // fuse_forget_in is one u64, so the request is header + 8 bytes.
         let mut req = fuse_in_header((IN_HEADER_LEN + 8) as u32, FORGET, 0xf0, issue);
         req.extend_from_slice(&1u64.to_le_bytes());
         mem.write(in_buf, &req).unwrap();
 
-        // One descriptor, readable only. No DESC_WRITE anywhere in the chain.
+        // One descriptor, readable only. No VIRTQ_DESC_F_WRITE anywhere in the
+        // chain.
         write_desc(&mem, desc, 0, in_buf, req.len() as u32, 0, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
@@ -12580,7 +12544,7 @@ mod tests {
         write_desc(&mem, desc, 0, in_buf, req.len() as u32, 0, 0);
         mem.write_u16(avail + 2, 2).unwrap();
         mem.write_u16(avail + 6, 0).unwrap();
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
         dev.drain_notified(&mem);
         assert_eq!(dev.nodes.len(), before, "the reply-less LOOKUP was refused");
 
@@ -12590,7 +12554,7 @@ mod tests {
     // Includes an unlinked tmpfile, which must leave the host with its handle,
     // and a lookup by the next session against the surviving root node.
     #[test]
-    fn status_reset_releases_handles_and_nodes() {
+    fn reset_releases_handles_and_nodes() {
         let (dir, mut dev) = fixture_with_access(true);
         fs::write(dir.join("f"), b"x").unwrap();
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
@@ -12608,8 +12572,7 @@ mod tests {
         assert!(temporary.exists());
         assert_eq!(dev.open_handle_count(), 2);
 
-        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
-        dev.mmio(&mem, mmio::STATUS, true, 0);
+        dev.reset();
         assert_eq!(dev.open_handle_count(), 0, "the handles were released");
         assert!(!temporary.exists(), "the unlinked tmpfile was removed");
         assert!(!dev.nodes.contains_key(&node), "the node was dropped");
@@ -13287,7 +13250,7 @@ mod tests {
             base + 0x2000,
             base + 0x3000,
         );
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
         let mut req = fuse_in_header(80, READ, 0xabcd, node);
         let mut args = vec![0u8; 40];
@@ -13296,11 +13259,27 @@ mod tests {
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
 
-        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            in_buf,
+            req.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
         // Header (16) + the first 400 payload bytes in one descriptor, the
         // remaining 600 payload bytes in a second -- the payload spans both.
-        write_desc(&mem, desc, 1, out1, 416, DESC_WRITE | DESC_NEXT, 2);
-        write_desc(&mem, desc, 2, out2, 600, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            1,
+            out1,
+            416,
+            VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+            2,
+        );
+        write_desc(&mem, desc, 2, out2, 600, VIRTQ_DESC_F_WRITE, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
         let mut got = vec![0u8; 1000];
@@ -13337,7 +13316,7 @@ mod tests {
             base + 0x1000,
             base + 0x2000,
         );
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
         let mut req = fuse_in_header(80, READ, 0x55, node);
         let mut args = vec![0u8; 40];
@@ -13347,14 +13326,22 @@ mod tests {
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
 
-        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            in_buf,
+            req.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
         write_desc(
             &mem,
             desc,
             1,
             out,
             OUT_HEADER_LEN as u32 + 100,
-            DESC_WRITE,
+            VIRTQ_DESC_F_WRITE,
             0,
         );
         notify_head(&mut dev, &mem, avail, 0);
@@ -13390,7 +13377,7 @@ mod tests {
             base + 0x3000,
             base + 0x4000,
         );
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
         let size = 1000u32;
         let mut hdr = fuse_in_header(40 + 40 + size, WRITE, 0x99, node);
@@ -13405,10 +13392,34 @@ mod tests {
         mem.write(payload1, &part1).unwrap();
         mem.write(payload2, &part2).unwrap();
 
-        write_desc(&mem, desc, 0, hdr_buf, hdr.len() as u32, DESC_NEXT, 1);
-        write_desc(&mem, desc, 1, payload1, part1.len() as u32, DESC_NEXT, 2);
-        write_desc(&mem, desc, 2, payload2, part2.len() as u32, DESC_NEXT, 3);
-        write_desc(&mem, desc, 3, out, 64, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            hdr_buf,
+            hdr.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(
+            &mem,
+            desc,
+            1,
+            payload1,
+            part1.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            2,
+        );
+        write_desc(
+            &mem,
+            desc,
+            2,
+            payload2,
+            part2.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            3,
+        );
+        write_desc(&mem, desc, 3, out, 64, VIRTQ_DESC_F_WRITE, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
         let mut expected = part1;
@@ -13449,7 +13460,7 @@ mod tests {
             base + 0x2000,
             base + 0x3000,
         );
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
         let claimed_size = 1000u32;
         let actual_payload = 100u32;
@@ -13462,9 +13473,17 @@ mod tests {
         mem.write(payload, &vec![0xaau8; actual_payload as usize])
             .unwrap();
 
-        write_desc(&mem, desc, 0, hdr_buf, hdr.len() as u32, DESC_NEXT, 1);
-        write_desc(&mem, desc, 1, payload, actual_payload, DESC_NEXT, 2);
-        write_desc(&mem, desc, 2, out, 64, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            hdr_buf,
+            hdr.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(&mem, desc, 1, payload, actual_payload, VIRTQ_DESC_F_NEXT, 2);
+        write_desc(&mem, desc, 2, out, 64, VIRTQ_DESC_F_WRITE, 0);
         notify_head(&mut dev, &mem, avail, 0);
 
         assert_eq!(mem.read_u32(out).unwrap(), OUT_HEADER_LEN as u32);
@@ -13480,14 +13499,12 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // A `QUEUE_NOTIFY` runs no request. It records the queue index for a drain,
-    // which runs on a vCPU up to a budget and on the worker thread past it
-    // (`run_fs_worker` in `worker.rs`). The tests below cover what this module
-    // can check without a live VM: `mmio` does no I/O, a bounded drain strands
-    // nothing, and the notified bitmask is race-free under concurrent access.
+    // Marking a queue runs no request. It records the queue index for a drain.
+    // `notify` drains up to a budget on the vCPU, and the worker thread
+    // (`run_fs_worker` in `worker.rs`) drains the rest.
 
     #[test]
-    fn queue_notify_only_records_the_index_and_does_no_io() {
+    fn marking_a_queue_records_the_index_and_does_no_io() {
         let (dir, mut dev) = fixture_with_access(true);
         fs::write(dir.join("f"), b"hello").unwrap();
         let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
@@ -13502,7 +13519,7 @@ mod tests {
             base + 0x1000,
             base + 0x2000,
         );
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
         let mut req = fuse_in_header(80, READ, 0x1234, node);
         let mut args = vec![0u8; 40];
@@ -13510,36 +13527,51 @@ mod tests {
         args[16..20].copy_from_slice(&5u32.to_le_bytes());
         req.extend_from_slice(&args);
         mem.write(in_buf, &req).unwrap();
-        write_desc(&mem, desc, 0, in_buf, req.len() as u32, DESC_NEXT, 1);
-        write_desc(&mem, desc, 1, out, OUT_HEADER_LEN as u32 + 5, DESC_WRITE, 0);
+        write_desc(
+            &mem,
+            desc,
+            0,
+            in_buf,
+            req.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(
+            &mem,
+            desc,
+            1,
+            out,
+            OUT_HEADER_LEN as u32 + 5,
+            VIRTQ_DESC_F_WRITE,
+            0,
+        );
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx
         mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = head 0
 
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        dev.mark_notified(REQ_QUEUE);
 
         assert_eq!(
             mem.read_u16(used + 2).unwrap(),
             0,
-            "QUEUE_NOTIFY must not touch the used ring synchronously"
+            "marking a queue must not touch the used ring"
         );
         assert!(
-            !dev.irq_level(),
-            "QUEUE_NOTIFY must not raise an interrupt synchronously -- no \
-             request has run yet"
+            !dev.state.is_raised(),
+            "marking a queue must not raise an interrupt, since no request has run"
         );
 
         // The worker's side of the split: draining now must service exactly
-        // the request the vCPU thread queued.
+        // the request that was marked.
         dev.drain_notified(&mem);
         assert_eq!(
             mem.read_u16(used + 2).unwrap(),
             1,
-            "drain_notified must service the request the notify flagged"
+            "drain_notified should service the marked request"
         );
         let mut got = [0u8; 5];
         mem.read(out + OUT_HEADER_LEN as u64, &mut got).unwrap();
         assert_eq!(&got, b"hello");
-        assert!(dev.irq_level());
+        assert!(dev.state.is_raised());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -13558,43 +13590,11 @@ mod tests {
         let base = 0x4000_0000u64;
         let mem = GuestRam::from_ranges(&[(base, 0x20000)]);
         let (desc, avail, used) = (base, base + 0x100, base + 0x200);
-        program_queue(&mut dev, &mem, 8, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, 8, desc, avail, used);
 
-        // Four independent READ chains, each a request descriptor followed by
-        // a writable reply descriptor.
         const CHAINS: u16 = 4;
-        for i in 0..CHAINS {
-            let in_buf = base + 0x1000 + u64::from(i) * 0x200;
-            let out = base + 0x8000 + u64::from(i) * 0x200;
-            let mut req = fuse_in_header(80, READ, 0x100 + u64::from(i), node);
-            let mut args = vec![0u8; 40];
-            args[0..8].copy_from_slice(&fh.to_le_bytes());
-            args[16..20].copy_from_slice(&5u32.to_le_bytes());
-            req.extend_from_slice(&args);
-            mem.write(in_buf, &req).unwrap();
-            write_desc(
-                &mem,
-                desc,
-                i * 2,
-                in_buf,
-                req.len() as u32,
-                DESC_NEXT,
-                i * 2 + 1,
-            );
-            write_desc(
-                &mem,
-                desc,
-                i * 2 + 1,
-                out,
-                OUT_HEADER_LEN as u32 + 5,
-                DESC_WRITE,
-                0,
-            );
-            mem.write_u16(avail + 4 + u64::from(i) * 2, i * 2).unwrap();
-        }
-        mem.write_u16(avail + 2, CHAINS).unwrap();
-
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+        publish_reads(&mem, (desc, avail), base, node, fh, CHAINS);
+        dev.mark_notified(REQ_QUEUE);
 
         let remaining = dev.drain_notified_bounded(&mem, 2);
         assert!(
@@ -13624,6 +13624,100 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Publishes `count` independent READ chains of 5 bytes of `fh` on the ring
+    /// at `desc` and `avail`.
+    ///
+    /// Each chain is a request descriptor followed by a writable reply
+    /// descriptor. Chain `i` reads its request from `base + 0x1000 + i * 0x200`
+    /// and writes its reply to `base + 0x8000 + i * 0x200`.
+    fn publish_reads(
+        mem: &GuestRam,
+        (desc, avail): (u64, u64),
+        base: u64,
+        node: u64,
+        fh: u64,
+        count: u16,
+    ) {
+        for i in 0..count {
+            let in_buf = base + 0x1000 + u64::from(i) * 0x200;
+            let out = base + 0x8000 + u64::from(i) * 0x200;
+            let mut req = fuse_in_header(80, READ, 0x100 + u64::from(i), node);
+            let mut args = vec![0u8; 40];
+            args[0..8].copy_from_slice(&fh.to_le_bytes());
+            args[16..20].copy_from_slice(&5u32.to_le_bytes());
+            req.extend_from_slice(&args);
+            mem.write(in_buf, &req).unwrap();
+            write_desc(
+                mem,
+                desc,
+                i * 2,
+                in_buf,
+                req.len() as u32,
+                VIRTQ_DESC_F_NEXT,
+                i * 2 + 1,
+            );
+            write_desc(
+                mem,
+                desc,
+                i * 2 + 1,
+                out,
+                OUT_HEADER_LEN as u32 + 5,
+                VIRTQ_DESC_F_WRITE,
+                0,
+            );
+            mem.write_u16(avail + 4 + u64::from(i) * 2, i * 2).unwrap();
+        }
+        mem.write_u16(avail + 2, count).unwrap();
+    }
+
+    /// A waker that counts its wakes.
+    #[derive(Default)]
+    struct CountingWake(AtomicU32);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn notify_serves_the_budget_and_leaves_the_rest_to_the_worker() {
+        let (dir, mut dev) = fixture_with_access(true);
+        fs::write(dir.join("f"), b"hello").unwrap();
+        let node = lookup_node(&mut dev, FUSE_ROOT_ID, b"f");
+        let fh = open_rw(&mut dev, node);
+        let wake = Arc::new(CountingWake::default());
+        dev.set_waker(Waker::from(Arc::clone(&wake)));
+
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::from_ranges(&[(base, 0x20000)]);
+        // Two descriptors a chain, so the ring of 32 holds every chain below.
+        let (desc, avail, used) = (base, base + 0x400, base + 0x600);
+        set_ready_queue(&mut dev, &mem, 32, desc, avail, used);
+        let chains = INLINE_BUDGET + 2;
+        publish_reads(&mem, (desc, avail), base, node, fh, chains);
+
+        dev.notify(&mem, REQ_QUEUE);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), INLINE_BUDGET);
+        dev.take_pending_wake()
+            .expect("a queue deeper than the budget should leave a wake")
+            .wake();
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert!(dev.take_pending_wake().is_none(), "the wake is taken once");
+
+        dev.drain_notified(&mem);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), chains);
+
+        publish_reads(&mem, (desc, avail), base, node, fh, chains + 1);
+        dev.notify(&mem, REQ_QUEUE);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), chains + 1);
+        assert!(
+            dev.take_pending_wake().is_none(),
+            "a shallow queue leaves no wake"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn concurrent_notifies_during_a_drain_leave_nothing_stranded() {
         const REQS: u16 = 64;
@@ -13642,7 +13736,7 @@ mod tests {
 
         {
             let mut d = dev.lock().unwrap();
-            program_queue(&mut d, &mem, QUEUE_SIZE, desc, avail, used);
+            set_ready_queue(&mut d, &mem, QUEUE_SIZE, desc, avail, used);
         }
 
         // Lay out REQS independent 2-descriptor chains up front -- guest
@@ -13660,7 +13754,7 @@ mod tests {
                 head,
                 in_buf,
                 req.len() as u32,
-                DESC_NEXT,
+                VIRTQ_DESC_F_NEXT,
                 head + 1,
             );
             write_desc(
@@ -13669,7 +13763,7 @@ mod tests {
                 head + 1,
                 out_buf,
                 (STRIDE / 2) as u32,
-                DESC_WRITE,
+                VIRTQ_DESC_F_WRITE,
                 0,
             );
         }
@@ -13677,7 +13771,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
 
         // Stands in for the vCPU thread: publishes one request at a time and
-        // rings the doorbell after each.
+        // marks the queue notified after each.
         let producer = {
             let dev = Arc::clone(&dev);
             let mem = Arc::clone(&mem);
@@ -13685,9 +13779,7 @@ mod tests {
                 for i in 0..REQS {
                     mem.write_u16(avail + 4 + u64::from(i) * 2, i * 2).unwrap();
                     mem.write_u16(avail + 2, i + 1).unwrap(); // avail.idx
-                    dev.lock()
-                        .unwrap()
-                        .mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(REQ_QUEUE));
+                    dev.lock().unwrap().mark_notified(REQ_QUEUE);
                     std::thread::yield_now();
                 }
             })

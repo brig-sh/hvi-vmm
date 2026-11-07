@@ -23,34 +23,53 @@ use crate::memory::GuestRam;
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
 
-/// Largest queue size we advertise in `QUEUE_NUM_MAX`, and so the largest a
-/// driver may legally program.
-pub(super) const QUEUE_NUM_MAX: u32 = 256;
+/// The largest queue size the in-process devices offer in the `QUEUE_NUM_MAX`
+/// register.
+pub(super) const QUEUE_MAX_SIZE: u16 = 256;
 
-/// One virtqueue's driver-programmed state.
+/// One virtqueue's driver-programmed state, and the largest size it takes.
 ///
-/// Every field here is driver-controlled, so the fields are private and the
-/// validation lives in the setters: this is the single place where a hostile
-/// queue programming is rejected. In particular `num` is only ever stored if it
-/// is a non-zero power of two no greater than [`QUEUE_NUM_MAX`], which is what
-/// makes [`Queue::size`] a `u16` that can be used as a modulus. Storing the raw
-/// `u32` and truncating at the point of use was a guest-triggerable panic
-/// (`0x10000` is non-zero as a `u32` and zero as a `u16`).
-#[derive(Default)]
-pub(super) struct Queue {
+/// Every field but `max_size` is driver-controlled, so the fields are private
+/// and the validation lives in the setters: this is the single place where a
+/// hostile queue programming is rejected. In particular `num` is stored only if
+/// it is a non-zero power of two no greater than `max_size`, so [`Queue::size`]
+/// is a `u16` that can be used as a modulus. The check runs on the `u32` the
+/// driver wrote, since `0x10000` is non-zero as a `u32` and zero as a `u16`.
+pub(crate) struct Queue {
+    /// The largest size the driver may program.
+    max_size: u16,
+    /// The queue size, or 0 until the driver programs a valid one.
     num: u32,
+    /// Whether the driver set READY with rings that fit in guest RAM.
     ready: bool,
+    /// The guest address of the descriptor table.
     desc: u64,
+    /// The guest address of the avail ring.
     avail: u64,
+    /// The guest address of the used ring.
     used: u64,
+    /// The avail ring index of the next chain the device serves.
     last_avail: u16,
 }
 
 impl Queue {
+    /// Returns an unprogrammed queue that takes sizes up to `max_size`.
+    pub(crate) fn new(max_size: u16) -> Self {
+        Self {
+            max_size,
+            num: 0,
+            ready: false,
+            desc: 0,
+            avail: 0,
+            used: 0,
+            last_avail: 0,
+        }
+    }
+
     /// Records the driver's queue size, ignoring anything the spec does not
     /// allow. A rejected size leaves the queue unusable rather than trusted.
     pub(crate) fn set_num(&mut self, v: u32) {
-        self.num = if v != 0 && v <= QUEUE_NUM_MAX && v.is_power_of_two() {
+        self.num = if v != 0 && v <= u32::from(self.max_size) && v.is_power_of_two() {
             v
         } else {
             0
@@ -61,7 +80,7 @@ impl Queue {
     /// The validated ring size. Zero means the driver has not programmed a
     /// usable queue, and every caller must treat it as "do nothing".
     pub(crate) fn size(&self) -> u16 {
-        self.num as u16 // <= QUEUE_NUM_MAX by construction in `set_num`
+        self.num as u16 // <= max_size by construction in `set_num`
     }
 
     /// Marks the queue ready, but only once the size is valid and all three
@@ -75,24 +94,30 @@ impl Queue {
         self.ready && self.num != 0
     }
 
-    /// Clears the size, ready flag, ring addresses and consumed index.
+    /// Returns the address and the length in bytes of the descriptor table, the
+    /// avail ring and the used ring, in that order.
     ///
-    /// A driver initializing the device again programs fresh rings whose
-    /// `avail.idx` starts at 0. A consumed index kept from the previous
-    /// programming would make [`Queue::pending`] refuse every notify, and a
-    /// ready flag kept from it would make the driver's probe refuse the queue.
-    pub(crate) fn reset(&mut self) {
-        *self = Queue::default();
+    /// The lengths are those of a split virtqueue of `n` entries, the
+    /// programmed size: `16*n` for the descriptor table, `6+2*n` for the avail
+    /// ring and `6+8*n` for the used ring, each ring with its 2-byte event
+    /// suffix.
+    pub(crate) fn ring_extents(&self) -> [(u64, u64); 3] {
+        let n = u64::from(self.num);
+        [
+            (self.desc, 16 * n),
+            (self.avail, 6 + 2 * n),
+            (self.used, 6 + 8 * n),
+        ]
     }
 
-    /// Split-virtqueue ring extents: descriptor table `16*n`, avail ring
-    /// `6+2*n`, used ring `6+8*n` (each includes the 2-byte event suffix).
+    /// Returns whether the queue has a size and its three rings are in guest
+    /// RAM.
     fn rings_fit(&self, mem: &GuestRam) -> bool {
-        let n = u64::from(self.num);
-        n != 0
-            && mem.contains(self.desc, 16 * n)
-            && mem.contains(self.avail, 6 + 2 * n)
-            && mem.contains(self.used, 6 + 8 * n)
+        self.num != 0
+            && self
+                .ring_extents()
+                .iter()
+                .all(|&(address, len)| mem.contains(address, len))
     }
 
     /// Address of descriptor `d`, or `None` if the driver referenced an index
@@ -198,15 +223,15 @@ mod tests {
     #[test]
     fn queue_rejects_zero_non_power_of_two_and_over_max() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        for bad in [0, 3, 100, QUEUE_NUM_MAX + 1, 0x1_0000, u32::MAX] {
-            let mut q = Queue::default();
+        for bad in [0, 3, 100, u32::from(QUEUE_MAX_SIZE) + 1, 0x1_0000, u32::MAX] {
+            let mut q = Queue::new(QUEUE_MAX_SIZE);
             q.set_num(bad);
             assert_eq!(q.size(), 0, "{bad} should be refused");
             q.set_ready(1, &mem);
             assert!(!q.is_ready(), "{bad} must not become ready");
         }
-        for good in [1, 2, 4, 128, QUEUE_NUM_MAX] {
-            let mut q = Queue::default();
+        for good in [1, 2, 4, 128, u32::from(QUEUE_MAX_SIZE)] {
+            let mut q = Queue::new(QUEUE_MAX_SIZE);
             q.set_num(good);
             assert_eq!(u32::from(q.size()), good, "{good} should be accepted");
         }
@@ -214,7 +239,7 @@ mod tests {
 
     #[test]
     fn descriptor_index_outside_the_ring_is_refused() {
-        let mut q = Queue::default();
+        let mut q = Queue::new(QUEUE_MAX_SIZE);
         q.set_num(8);
         q.set_desc_lo(0x1000);
         assert_eq!(q.desc_addr(0), Some(0x1000));
@@ -228,7 +253,7 @@ mod tests {
     #[test]
     fn avail_idx_beyond_the_ring_is_refused() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut q = Queue::default();
+        let mut q = Queue::new(QUEUE_MAX_SIZE);
         q.set_num(8);
         q.set_avail_lo((BASE + 0x1000) as u32);
         q.set_avail_hi(((BASE + 0x1000) >> 32) as u32);
@@ -326,7 +351,7 @@ mod ordering_tests {
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let used = BASE + 0x1000;
 
-        let mut q = Queue::default();
+        let mut q = Queue::new(N as u16);
         q.set_num(N);
         q.set_used_lo(used as u32);
         q.set_used_hi((used >> 32) as u32);

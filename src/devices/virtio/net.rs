@@ -51,19 +51,18 @@ use std::sync::{Arc, Mutex};
 use crate::config::BootConfig;
 use crate::memory::GuestRam;
 
-use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    mmio, tap, Queue, SinkSlot, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, tap, DeviceState, Queue, SinkSlot, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::io_threads::HostWork;
 use crate::plugin::IoSink;
 use crate::LOG_PREFIX;
 
-const VIRTIO_NET_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_NET as u64;
-/// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
-const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
-const F_MAC_LO: u32 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+/// `VIRTIO_NET_F_MAC`: the configuration space carries the guest's MAC.
+const F_MAC: u64 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 
 /// Name the built-in stack goes by on the console.
 ///
@@ -576,13 +575,10 @@ impl TapRelay {
 
 /// A virtio-net device with a user-space capture backend.
 pub struct VirtioNet {
-    status: u32,
-    dev_feat_sel: u32,
-    queue_sel: u32,
+    /// The RX and TX queues, in that order.
     queues: [Queue; 2],
-    interrupt_status: u32,
-    /// The interrupt line the device drives.
-    irq: Irq,
+    /// The activation state, with the interrupt once active.
+    state: DeviceState,
     /// Captured flows, drained by the hypervisor backend into the event ledger.
     events: Vec<CapturedEvent>,
     /// The QEMU stream socket to the gvisor-tap-vsock gateway, when frames go
@@ -605,12 +601,8 @@ impl VirtioNet {
     #[must_use]
     pub fn new() -> Self {
         VirtioNet {
-            status: 0,
-            dev_feat_sel: 0,
-            queue_sel: 0,
-            queues: [Queue::default(), Queue::default()],
-            interrupt_status: 0,
-            irq: Irq::default(),
+            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
+            state: DeviceState::Inactive,
             events: Vec::new(),
             gw: None,
             tap_write_reported: false,
@@ -655,32 +647,6 @@ impl VirtioNet {
         self.mac = mac;
     }
 
-    #[must_use]
-    pub fn irq_level(&self) -> bool {
-        self.interrupt_status != 0
-    }
-
-    /// Connects the device to the interrupt line it raises.
-    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-        self.irq.connect(line);
-    }
-
-    /// Sets the interrupt line to the device's level.
-    fn sync_irq(&mut self) {
-        self.irq.set(self.irq_level());
-    }
-
-    /// Drains the captured flows for the event ledger.
-    pub(crate) fn take_events(&mut self) -> Vec<CapturedEvent> {
-        std::mem::take(&mut self.events)
-    }
-
-    /// Returns the sink fed a frame since it was last taken, or `None` when no
-    /// frame reached one.
-    pub(crate) fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
-        self.sink.take_fed()
-    }
-
     /// Records one observed IPv4 flow for the ledger.
     #[allow(clippy::too_many_arguments)]
     fn capture(
@@ -703,76 +669,6 @@ impl VirtioNet {
             dns,
             sni: None,
         });
-    }
-
-    fn queue(&mut self) -> &mut Queue {
-        &mut self.queues[(self.queue_sel & 1) as usize]
-    }
-
-    /// Resets the device, as a write of 0 to STATUS requests.
-    fn reset(&mut self) {
-        for queue in &mut self.queues {
-            queue.reset();
-        }
-        self.interrupt_status = 0;
-        self.status = 0;
-        self.dev_feat_sel = 0;
-        self.queue_sel = 0;
-    }
-
-    /// Services one MMIO access. On a transmit-queue notify, drains the guest's
-    /// TX frames (capturing them) and injects any replies into the RX queue.
-    pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let read = self.serve_mmio(mem, offset, is_write, value);
-        self.sync_irq();
-        read
-    }
-
-    /// Reads or writes register `offset`, running a queue the write notifies.
-    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let v = value as u32;
-        if is_write {
-            match offset {
-                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
-                mmio::QUEUE_SEL => self.queue_sel = v,
-                mmio::QUEUE_NUM => self.queue().set_num(v),
-                mmio::QUEUE_READY => self.queue().set_ready(v, mem),
-                mmio::QUEUE_NOTIFY if v as u16 == TX_QUEUE => self.process_tx(mem),
-                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
-                mmio::STATUS if v == 0 => self.reset(),
-                mmio::STATUS => self.status = v,
-                mmio::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
-                mmio::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
-                mmio::QUEUE_DRIVER_LOW => self.queue().set_avail_lo(v),
-                mmio::QUEUE_DRIVER_HIGH => self.queue().set_avail_hi(v),
-                mmio::QUEUE_DEVICE_LOW => self.queue().set_used_lo(v),
-                mmio::QUEUE_DEVICE_HIGH => self.queue().set_used_hi(v),
-                _ => {}
-            }
-            0
-        } else {
-            match offset {
-                mmio::MAGIC => 0x7472_6976,
-                mmio::VERSION => 2,
-                mmio::DEVICE_ID => VIRTIO_NET_ID,
-                mmio::VENDOR_ID => 0x4649_4f4e,
-                mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                mmio::DEVICE_FEATURES => u64::from(F_MAC_LO),
-                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
-                mmio::QUEUE_READY => {
-                    u64::from(self.queues[(self.queue_sel & 1) as usize].is_ready())
-                }
-                mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                mmio::STATUS => u64::from(self.status),
-                // Config space: the 6-byte MAC we assign the guest.
-                _ if offset >= mmio::CONFIG => {
-                    let f = (offset - mmio::CONFIG) as usize;
-                    self.mac.get(f).map_or(0, |&b| u64::from(b))
-                }
-                _ => 0,
-            }
-        }
     }
 
     /// Drains the transmit queue: read each frame, capture it, and inject any
@@ -814,6 +710,8 @@ impl VirtioNet {
                     self.observe_tx(&frame);
                     self.relay_to_gateway(&frame);
                 } else {
+                    // The TX pass's used-buffer notification covers the
+                    // replies.
                     for reply in self.handle_frame(&frame) {
                         self.inject_rx(mem, &reply);
                     }
@@ -825,7 +723,7 @@ impl VirtioNet {
         }
         self.queues[TX_QUEUE as usize].set_last_avail(last);
         if serviced {
-            self.interrupt_status |= 1;
+            self.state.signal_used_buffer();
         }
     }
 
@@ -868,30 +766,31 @@ impl VirtioNet {
         Some(buf[NET_HDR_LEN..].to_vec())
     }
 
-    /// Writes one frame into a receive-queue buffer (prefixed with a zeroed
-    /// virtio-net header) and completes it, so the guest sees an incoming
-    /// packet.
-    fn inject_rx(&mut self, mem: &GuestRam, frame: &[u8]) {
+    /// Writes one frame, behind a virtio-net header with `num_buffers` 1, into
+    /// a receive-queue buffer and puts the buffer on the used ring.
+    ///
+    /// Returns whether it put a buffer on the used ring.
+    fn inject_rx(&mut self, mem: &GuestRam, frame: &[u8]) -> bool {
         // Ingress, published before the queue check: what the device was handed
         // for the guest is an observation whether or not the guest had a buffer
         // posted to take it.
         self.sink.feed(|sink| sink.on_net(frame, false));
         let rx = &self.queues[RX_QUEUE as usize];
         if !rx.is_ready() {
-            return;
+            return false;
         }
         let last = rx.last_avail();
         match rx.pending(mem) {
             // No RX buffer posted; drop silently (TCP/UDP recover). Logging here
             // would flood under gateway-relay load.
-            Some(0) | None => return,
+            Some(0) | None => return false,
             Some(_) => {}
         }
         let Some(slot) = rx.avail_slot(last) else {
-            return;
+            return false;
         };
         let Ok(head) = mem.read_u16(slot) else {
-            return;
+            return false;
         };
         let mut out = vec![0u8; NET_HDR_LEN];
         out[10] = 1; // num_buffers = 1
@@ -906,7 +805,7 @@ impl VirtioNet {
         let mut d = head;
         for _ in 0..rx.size() {
             let Some(da) = rx.desc_addr(d) else {
-                return;
+                return false;
             };
             let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
                 mem.read_u64(da),
@@ -914,12 +813,12 @@ impl VirtioNet {
                 mem.read_u16(da + 12),
                 mem.read_u16(da + 14),
             ) else {
-                return;
+                return false;
             };
             if flags & VIRTQ_DESC_F_WRITE != 0 && written < out.len() {
                 let n = (len as usize).min(out.len() - written);
                 if mem.write(addr, &out[written..written + n]).is_err() {
-                    return;
+                    return false;
                 }
                 written += n;
             }
@@ -939,11 +838,11 @@ impl VirtioNet {
         // completing it with a used length of 0 is the escape hatch if some
         // driver ever does.
         if written < out.len() {
-            return;
+            return false;
         }
         self.queues[RX_QUEUE as usize].push_used(mem, head, written as u32);
         self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
-        self.interrupt_status |= 1;
+        true
     }
 
     // --- gateway relay mode -------------------------------------------------
@@ -1004,11 +903,12 @@ impl VirtioNet {
     ///
     /// Public so the gateway or tap relay thread that `IoThreads` starts can
     /// call it under the device lock. The sink is handed over rather than kept,
-    /// so the device's next access does not end its batch.
+    /// so the device's next notification does not end its batch.
     #[must_use = "the caller ends the batch of the sink the frame fed"]
     pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) -> Option<Arc<dyn IoSink>> {
-        self.inject_rx(mem, frame);
-        self.sync_irq();
+        if self.inject_rx(mem, frame) {
+            self.state.signal_used_buffer();
+        }
         self.sink.take_fed()
     }
 
@@ -1290,6 +1190,60 @@ impl Default for VirtioNet {
     }
 }
 
+impl virtio::Device for VirtioNet {
+    fn device_type(&self) -> u32 {
+        virtio_bindings::virtio_ids::VIRTIO_ID_NET
+    }
+
+    fn features(&self) -> u64 {
+        F_MAC
+    }
+
+    fn queue_max_sizes(&self) -> &[u16] {
+        &[QUEUE_MAX_SIZE; 2]
+    }
+
+    // The configuration space starts with the MAC the guest takes.
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        read_config_bytes(&self.mac, offset, data);
+    }
+
+    fn activate(
+        &mut self,
+        _ram: &GuestRam,
+        _driver_features: u64,
+        queues: Vec<Queue>,
+        interrupt: Arc<Interrupt>,
+    ) -> io::Result<()> {
+        if let Ok(queues) = <[Queue; 2]>::try_from(queues) {
+            self.queues = queues;
+        }
+        self.state = DeviceState::Active(interrupt);
+        Ok(())
+    }
+
+    // The receive queue is filled when a frame arrives, so only a notification
+    // of the transmit queue has work.
+    fn notify(&mut self, ram: &GuestRam, queue: u16) {
+        if self.state.is_active() && queue == TX_QUEUE {
+            self.process_tx(ram);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.queues = std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE));
+        self.state = DeviceState::Inactive;
+    }
+
+    fn take_events(&mut self) -> Vec<CapturedEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
+        self.sink.take_fed()
+    }
+}
+
 // --- packet construction helpers ---------------------------------------------
 
 fn eth_frame(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8]) -> Vec<u8> {
@@ -1438,6 +1392,9 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::devices::virtio::mmio::testing::{self, Driver, LevelLine, Rings};
+    use crate::devices::virtio::mmio::{INTERRUPT_ACK, INTERRUPT_STATUS};
+    use crate::devices::virtio::Device as _;
     use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1778,8 +1735,6 @@ mod tests {
         assert_eq!(try_recv(&theirs, &mut buf).expect("queued"), 3);
     }
 
-    /// Programs a queue the way the Linux virtio-mmio driver does: select it,
-    /// size it, set the three ring addresses, then READY last.
     // A minimal BOOTP DISCOVER: op/htype/hlen, the client's chaddr, the magic
     // cookie, and option 53 = 1. Shared so the two DHCP tests cannot drift
     // apart the first time one of them grows an option.
@@ -1794,27 +1749,39 @@ mod tests {
         bootp
     }
 
-    fn program_queue(
+    /// Activates `net` with an 8-entry queue `index` ready at the given rings.
+    ///
+    /// Returns the line the device's interrupt drives.
+    fn activate_with_queue(
         net: &mut VirtioNet,
         mem: &GuestRam,
-        sel: u16,
+        index: u16,
         desc: u64,
         avail: u64,
         used: u64,
-    ) {
-        net.mmio(mem, mmio::QUEUE_SEL, true, u64::from(sel));
-        net.mmio(mem, mmio::QUEUE_NUM, true, 8);
-        net.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        net.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
-        net.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        net.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        net.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        net.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
-        net.mmio(mem, mmio::QUEUE_READY, true, 1);
+    ) -> Arc<LevelLine> {
+        let rings = Rings {
+            size: 8,
+            desc_table: desc,
+            avail_ring: avail,
+            used_ring: used,
+        };
+        let queues = (0..2)
+            .map(|queue| {
+                if queue == index {
+                    testing::ready_queue(QUEUE_MAX_SIZE, rings, mem)
+                } else {
+                    Queue::new(QUEUE_MAX_SIZE)
+                }
+            })
+            .collect();
+        let (interrupt, line) = testing::enabled_interrupt();
+        net.activate(mem, 0, queues, interrupt).unwrap();
+        line
     }
 
     // The built-in stack answers the DISCOVER inside the transmit path, so the
-    // frame and its reply feed the sink in one access.
+    // frame and its reply feed the sink in one notification.
     #[test]
     fn transmitted_frame_and_its_reply_feed_the_sink_in_one_batch() {
         const BASE: u64 = 0x4000_0000;
@@ -1823,7 +1790,7 @@ mod tests {
         let sink = Arc::new(CountingSink::default());
         net.set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
-        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+        activate_with_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
         assert!(net.take_fed_sink().is_none(), "queue setup feeds no sink");
 
         let udp = udp_datagram(68, 67, &bootp_discover(GUEST_MAC));
@@ -1837,7 +1804,7 @@ mod tests {
         mem.write_u16(desc + 14, 0).unwrap();
         mem.write_u16(avail + 2, 1).unwrap();
         mem.write_u16(avail + 4, 0).unwrap();
-        net.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+        net.notify(&mem, TX_QUEUE);
 
         assert_eq!(
             sink.frames.load(Ordering::SeqCst),
@@ -1849,8 +1816,8 @@ mod tests {
         assert!(net.take_fed_sink().is_none(), "the sink is taken once");
     }
 
-    // A vCPU's next access must not end the relay's batch, so the device keeps
-    // no fed sink after the frame.
+    // A vCPU's next notification must not end the relay's batch, so the device
+    // keeps no fed sink after the frame.
     #[test]
     fn delivered_frame_returns_the_sink_it_fed() {
         let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
@@ -1872,7 +1839,7 @@ mod tests {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut net = VirtioNet::new();
-        program_queue(&mut net, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
 
         // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
@@ -1905,7 +1872,7 @@ mod tests {
         let mut net = VirtioNet::new();
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
         let (hdr_buf, data_buf) = (BASE + 0x3000, BASE + 0x4000);
-        program_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
+        activate_with_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
 
         // desc[0]: NET_HDR_LEN bytes for the header, chained to desc[1].
         mem.write_u64(desc, hdr_buf).unwrap();
@@ -1946,7 +1913,7 @@ mod tests {
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut net = VirtioNet::new();
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
-        program_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
+        activate_with_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
 
         // A single writable descriptor with room for the header alone.
         mem.write_u64(desc, BASE + 0x3000).unwrap();
@@ -1980,7 +1947,7 @@ mod tests {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
-        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+        let line = activate_with_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
 
         // A UDP frame the flow plugin records (10.0.2.15:1234 -> 1.2.3.4:9999).
         let udp = udp_datagram(1234, 9999, b"payload");
@@ -2000,7 +1967,7 @@ mod tests {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
         mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
 
-        net.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+        net.notify(&mem, TX_QUEUE);
 
         // (a) The tap saw one write: a zero virtio_net_hdr_v1, then the frame.
         let mut got = vec![0u8; NET_HDR_LEN + frame.len()];
@@ -2023,7 +1990,7 @@ mod tests {
         assert_eq!(*proto, IP_UDP);
         assert_eq!(*dst, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(*dst_port, 9999);
-        assert!(net.irq_level(), "the used-buffer interrupt was raised");
+        assert!(line.is_high(), "the used-buffer interrupt was raised");
     }
 
     /// A guest cannot hand the host kernel checksum or segmentation metadata
@@ -2044,7 +2011,7 @@ mod tests {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
-        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+        activate_with_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
 
         // A 20-byte IPv4 header and 8 bytes of UDP: the first-fragment shape
         // the disclosure used, behind 14 bytes of Ethernet.
@@ -2072,7 +2039,7 @@ mod tests {
         mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
         mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
 
-        net.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(TX_QUEUE));
+        net.notify(&mem, TX_QUEUE);
 
         let mut got = vec![0u8; NET_HDR_LEN + frame.len()];
         (&tap_host).read_exact(&mut got).unwrap();
@@ -2116,24 +2083,20 @@ mod tests {
     /// address, dropping every redirected reply in tap mode.
     #[test]
     fn config_space_reports_the_override_mac() {
-        let mem = GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]);
         let mut net = VirtioNet::new();
         let mac = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
         net.set_mac(mac);
-
-        net.mmio(&mem, mmio::DEVICE_FEATURES_SEL, true, 0);
-        let feat = net.mmio(&mem, mmio::DEVICE_FEATURES, false, 0);
-        assert_ne!(feat & u64::from(F_MAC_LO), 0, "VIRTIO_NET_F_MAC is offered");
+        assert_ne!(net.features() & F_MAC, 0, "VIRTIO_NET_F_MAC is offered");
 
         for (i, &b) in mac.iter().enumerate() {
-            assert_eq!(
-                net.mmio(&mem, mmio::CONFIG + i as u64, false, 0),
-                u64::from(b),
-                "config-space byte {i}"
-            );
+            let mut byte = [0];
+            net.read_config(i as u64, &mut byte);
+            assert_eq!(byte, [b], "config-space byte {i}");
         }
         // Past the MAC, config space reads as zero rather than leaking state.
-        assert_eq!(net.mmio(&mem, mmio::CONFIG + 6, false, 0), 0);
+        let mut past = [0xff];
+        net.read_config(6, &mut past);
+        assert_eq!(past, [0]);
     }
 
     #[test]
@@ -2199,7 +2162,7 @@ mod tests {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x20000)]);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
-        program_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+        activate_with_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
 
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
@@ -2276,25 +2239,24 @@ mod tests {
         assert_ne!(checksum16(&h), 0);
     }
 
-    /// A line that holds the level it was last set to.
-    #[derive(Default)]
-    struct LevelLine {
-        /// The level the line was last set to.
-        high: std::sync::atomic::AtomicBool,
+    #[test]
+    fn common_registers_follow_virtio_1_2() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let rings = Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        testing::assert_common_registers(VirtioNet::new(), &mem, rings);
     }
 
-    impl IrqLine for LevelLine {
-        fn set_level(&self, level: bool) -> std::io::Result<()> {
-            self.high.store(level, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    // A vCPU acknowledges the interrupt while a reader delivers the next frame,
-    // each under the device lock. The vCPU reposts one RX buffer per
-    // acknowledgment, as a guest driver refills its ring. A line that ended low
-    // over a completed buffer would stop both: the vCPU waits for the line and
-    // the reader waits for the acknowledgment.
+    // A vCPU acknowledges the interrupt through the transport, without the
+    // device lock, while a reader delivers the next frame under it. The vCPU
+    // reposts one RX buffer per acknowledgment, as a guest driver refills its
+    // ring. A line that ended low over a completed buffer would stop both: the
+    // vCPU waits for the line and the reader waits for the acknowledgment.
     #[test]
     fn line_never_ends_low_over_a_completed_buffer() {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -2303,18 +2265,13 @@ mod tests {
         const N: u64 = 256;
         let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x100000)]));
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
-        let line = Arc::new(LevelLine::default());
-        let mut net = VirtioNet::new();
-        net.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
-        net.mmio(&mem, mmio::QUEUE_SEL, true, u64::from(RX_QUEUE));
-        net.mmio(&mem, mmio::QUEUE_NUM, true, N);
-        net.mmio(&mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        net.mmio(&mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
-        net.mmio(&mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        net.mmio(&mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        net.mmio(&mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        net.mmio(&mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
-        net.mmio(&mem, mmio::QUEUE_READY, true, 1);
+        let driver = Driver::new(VirtioNet::new(), &mem);
+        driver.start(&[Rings {
+            size: N as u32,
+            desc_table: desc,
+            avail_ring: avail,
+            used_ring: used,
+        }]);
         for i in 0..N {
             let d = desc + i * 16;
             mem.write_u64(d, BASE + 0x4000 + i * 0x800).unwrap();
@@ -2328,63 +2285,48 @@ mod tests {
         let udp = udp_datagram(9999, 1234, b"x");
         let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
         let frame = eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip);
-        let dev = Arc::new(Mutex::new(net));
-        let done = Arc::new(AtomicBool::new(false));
-        let acks = Arc::new(AtomicU32::new(0));
-
-        // The reader delivers as soon as the vCPU's acknowledgment has dropped
-        // the level, the moment the two used to race for the line.
-        let reader = {
-            let (dev, mem, done) = (Arc::clone(&dev), Arc::clone(&mem), Arc::clone(&done));
-            std::thread::spawn(move || {
+        let done = AtomicBool::new(false);
+        let acks = AtomicU32::new(0);
+        let (mut seen, mut quiet) = (0, 0);
+        std::thread::scope(|scope| {
+            // The reader delivers as soon as the vCPU's acknowledgment has
+            // dropped the level, the moment the two race for the line.
+            scope.spawn(|| {
                 while !done.load(Ordering::SeqCst) {
-                    let mut d = dev.lock().unwrap();
-                    if !d.irq_level() {
-                        let _ = d.deliver(&mem, &frame);
+                    let mut net = driver.device.lock().unwrap();
+                    if !driver.line.is_high() {
+                        let _ = net.deliver(&mem, &frame);
                     }
                 }
-            })
-        };
-        let vcpu = {
-            let (dev, mem, line, done, acks) = (
-                Arc::clone(&dev),
-                Arc::clone(&mem),
-                Arc::clone(&line),
-                Arc::clone(&done),
-                Arc::clone(&acks),
-            );
-            std::thread::spawn(move || {
+            });
+            scope.spawn(|| {
                 while !done.load(Ordering::SeqCst) {
-                    if line.high.load(Ordering::SeqCst) {
-                        let mut d = dev.lock().unwrap();
-                        d.mmio(&mem, mmio::INTERRUPT_ACK, true, 1);
+                    if driver.line.is_high() {
+                        driver.write(INTERRUPT_ACK, 1);
                         let idx = mem.read_u16(avail + 2).unwrap();
                         mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
                         acks.fetch_add(1, Ordering::SeqCst);
                     }
                 }
-            })
-        };
-        let start = Instant::now();
-        let (mut seen, mut quiet) = (0, 0);
-        while acks.load(Ordering::SeqCst) < 20_000 && start.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(10));
-            let now = acks.load(Ordering::SeqCst);
-            quiet = if now == seen { quiet + 1 } else { 0 };
-            seen = now;
-            if quiet >= 20 {
-                break;
+            });
+            let start = Instant::now();
+            while acks.load(Ordering::SeqCst) < 20_000 && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+                let now = acks.load(Ordering::SeqCst);
+                quiet = if now == seen { quiet + 1 } else { 0 };
+                seen = now;
+                if quiet >= 20 {
+                    break;
+                }
             }
-        }
-        done.store(true, Ordering::SeqCst);
-        reader.join().unwrap();
-        vcpu.join().unwrap();
+            done.store(true, Ordering::SeqCst);
+        });
         assert!(
             quiet < 20,
-            "progress stopped after {} acks: the line is {} over a device level of {}",
+            "progress stopped after {} acks: the line is {} over an interrupt status of {}",
             acks.load(Ordering::SeqCst),
-            line.high.load(Ordering::SeqCst),
-            dev.lock().unwrap().irq_level()
+            driver.line.is_high(),
+            driver.read(INTERRUPT_STATUS)
         );
     }
 

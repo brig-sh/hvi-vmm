@@ -58,15 +58,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::devices::irq::{Irq, IrqLine};
-use crate::devices::virtio::{mmio, Queue, QUEUE_NUM_MAX, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::devices::virtio::mmio::Interrupt;
+use crate::devices::virtio::{
+    self, read_config_bytes, DeviceState, Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
+};
 use crate::memory::GuestRam;
 use crate::teardown::{poll, pollfd, StopToken, HANGUP};
 use crate::LOG_PREFIX;
-
-const VIRTIO_VSOCK_ID: u64 = virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK as u64;
-/// `VIRTIO_F_VERSION_1` is feature bit 32, so bit 0 of the high word.
-const F_VERSION_1_HI: u32 = 1 << (virtio_bindings::virtio_config::VIRTIO_F_VERSION_1 - 32);
 
 pub const HOST_CID: u64 = 2;
 pub const GUEST_CID: u64 = 3;
@@ -414,18 +413,10 @@ impl Drop for Conn {
 
 /// A virtio-vsock device bridged to a host Unix socket.
 pub struct VirtioVsock {
-    /// The device status the driver last wrote.
-    status: u32,
-    /// The device feature word the driver selected.
-    dev_feat_sel: u32,
-    /// The queue the driver selected.
-    queue_sel: u32,
     /// The RX, TX and event queues, in that order.
     queues: [Queue; 3],
-    /// The interrupt bits the driver has not acknowledged yet.
-    interrupt_status: u32,
-    /// The interrupt line the device drives.
-    irq: Irq,
+    /// The activation state, with the interrupt once active.
+    state: DeviceState,
     /// Host-to-guest packets waiting for an RX buffer.
     pending: VecDeque<Vec<u8>>,
     /// The live connections, keyed by host port.
@@ -441,52 +432,13 @@ impl VirtioVsock {
     #[must_use]
     pub fn new() -> Self {
         VirtioVsock {
-            status: 0,
-            dev_feat_sel: 0,
-            queue_sel: 0,
-            queues: [Queue::default(), Queue::default(), Queue::default()],
-            interrupt_status: 0,
-            irq: Irq::default(),
+            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
+            state: DeviceState::Inactive,
             pending: VecDeque::new(),
             conns: HashMap::new(),
             next_port: 40000,
             next_turn: 0,
         }
-    }
-
-    #[must_use]
-    pub fn irq_level(&self) -> bool {
-        self.interrupt_status != 0
-    }
-
-    /// Connects the device to the interrupt line it raises.
-    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
-        self.irq.connect(line);
-    }
-
-    /// Sets the interrupt line to the device's level.
-    fn sync_irq(&mut self) {
-        self.irq.set(self.irq_level());
-    }
-
-    fn queue(&mut self) -> &mut Queue {
-        &mut self.queues[(self.queue_sel % 3) as usize]
-    }
-
-    /// Resets the device, as a write of 0 to STATUS requests.
-    ///
-    /// Every session is dropped with the queues, since the guest agent that
-    /// initializes the device again has never seen their `OP_REQUEST`.
-    fn reset(&mut self) {
-        for queue in &mut self.queues {
-            queue.reset();
-        }
-        self.interrupt_status = 0;
-        self.status = 0;
-        self.dev_feat_sel = 0;
-        self.queue_sel = 0;
-        self.pending.clear();
-        self.conns.clear();
     }
 
     /// Registers a new host connection, returning its assigned local port.
@@ -888,64 +840,6 @@ impl VirtioVsock {
         true
     }
 
-    /// Services one MMIO access.
-    pub fn mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let read = self.serve_mmio(mem, offset, is_write, value);
-        self.sync_irq();
-        read
-    }
-
-    /// Reads or writes register `offset`, running a queue the write notifies.
-    fn serve_mmio(&mut self, mem: &GuestRam, offset: u64, is_write: bool, value: u64) -> u64 {
-        let v = value as u32;
-        if is_write {
-            match offset {
-                mmio::DEVICE_FEATURES_SEL => self.dev_feat_sel = v,
-                mmio::DRIVER_FEATURES_SEL | mmio::DRIVER_FEATURES => {}
-                mmio::QUEUE_SEL => self.queue_sel = v,
-                mmio::QUEUE_NUM => self.queue().set_num(v),
-                mmio::QUEUE_READY => self.queue().set_ready(v, mem),
-                mmio::QUEUE_NOTIFY => match v as u16 {
-                    TX_QUEUE => self.process_tx(mem),
-                    RX_QUEUE => self.fill_rx(mem),
-                    _ => {}
-                },
-                mmio::INTERRUPT_ACK => self.interrupt_status &= !v,
-                mmio::STATUS if v == 0 => self.reset(),
-                mmio::STATUS => self.status = v,
-                mmio::QUEUE_DESC_LOW => self.queue().set_desc_lo(v),
-                mmio::QUEUE_DESC_HIGH => self.queue().set_desc_hi(v),
-                mmio::QUEUE_DRIVER_LOW => self.queue().set_avail_lo(v),
-                mmio::QUEUE_DRIVER_HIGH => self.queue().set_avail_hi(v),
-                mmio::QUEUE_DEVICE_LOW => self.queue().set_used_lo(v),
-                mmio::QUEUE_DEVICE_HIGH => self.queue().set_used_hi(v),
-                _ => {}
-            }
-            0
-        } else {
-            match offset {
-                mmio::MAGIC => 0x7472_6976,
-                mmio::VERSION => 2,
-                mmio::DEVICE_ID => VIRTIO_VSOCK_ID,
-                mmio::VENDOR_ID => 0x4649_4f4e,
-                mmio::DEVICE_FEATURES if self.dev_feat_sel == 1 => u64::from(F_VERSION_1_HI),
-                mmio::QUEUE_NUM_MAX => u64::from(QUEUE_NUM_MAX),
-                mmio::QUEUE_READY => {
-                    u64::from(self.queues[(self.queue_sel % 3) as usize].is_ready())
-                }
-                mmio::INTERRUPT_STATUS => u64::from(self.interrupt_status),
-                mmio::STATUS => u64::from(self.status),
-                // Config space: guest CID (u64) at offset 0.
-                _ if offset >= mmio::CONFIG => {
-                    let f = (offset - mmio::CONFIG) as usize;
-                    let cid = GUEST_CID.to_le_bytes();
-                    cid.get(f).map_or(0, |&b| u64::from(b))
-                }
-                _ => 0,
-            }
-        }
-    }
-
     /// Drains the guest's transmit queue: connection responses, RW data
     /// (written to the host socket), credit, and shutdowns.
     fn process_tx(&mut self, mem: &GuestRam) {
@@ -957,6 +851,7 @@ impl VirtioVsock {
             return;
         };
         let mut last = tx.last_avail();
+        let mut serviced = false;
         for _ in 0..pending {
             let Some(slot) = self.queues[TX_QUEUE as usize].avail_slot(last) else {
                 break;
@@ -969,9 +864,12 @@ impl VirtioVsock {
             }
             self.queues[TX_QUEUE as usize].push_used(mem, head, 0);
             last = last.wrapping_add(1);
-            self.interrupt_status |= 1;
+            serviced = true;
         }
         self.queues[TX_QUEUE as usize].set_last_avail(last);
+        if serviced {
+            self.state.signal_used_buffer();
+        }
     }
 
     /// Reads one packet (header + payload) from a TX descriptor chain.
@@ -1163,8 +1061,9 @@ impl VirtioVsock {
             _ => {}
         }
         // A reply may be waiting, and an accept or new credit may let backlog
-        // out.
-        self.fill_rx(mem);
+        // out. The TX pass's used-buffer notification covers the buffers filled
+        // here.
+        self.fill_rx_buffers(mem);
     }
 
     /// Queues an `OP_CREDIT_UPDATE` for `host_port` that advertises `fwd_cnt`.
@@ -1236,34 +1135,41 @@ impl VirtioVsock {
 
     /// Delivers pending host -> guest packets into the guest's RX buffers.
     ///
+    /// One used-buffer notification covers every buffer it filled.
+    fn fill_rx(&mut self, mem: &GuestRam) {
+        if self.fill_rx_buffers(mem) {
+            self.state.signal_used_buffer();
+        }
+    }
+
+    /// Moves pending packets into the guest's RX buffers while packets wait and
+    /// the guest has buffers posted.
+    ///
     /// Packets in `pending` go out in order. Backlog is framed one packet at a
     /// time, only when `pending` is empty, so at most one RW packet waits for
     /// an RX buffer.
-    fn fill_rx(&mut self, mem: &GuestRam) {
-        self.fill_rx_buffers(mem);
-        self.sync_irq();
-    }
-
-    /// Moves pending packets into the guest's RX buffers while both last.
-    fn fill_rx_buffers(&mut self, mem: &GuestRam) {
+    ///
+    /// Returns whether it filled a buffer.
+    fn fill_rx_buffers(&mut self, mem: &GuestRam) -> bool {
         if !self.queues[RX_QUEUE as usize].is_ready() {
-            return;
+            return false;
         }
+        let mut filled = false;
         loop {
             if self.pending.is_empty() && !self.frame_backlog() {
-                return;
+                return filled;
             }
             let rx = &self.queues[RX_QUEUE as usize];
             let last = rx.last_avail();
             match rx.pending(mem) {
-                Some(0) | None => return, // no guest RX buffer; keep it pending
+                Some(0) | None => return filled, // no guest RX buffer; keep it pending
                 Some(_) => {}
             }
             let Some(slot) = rx.avail_slot(last) else {
-                return;
+                return filled;
             };
             let Ok(head) = mem.read_u16(slot) else {
-                return;
+                return filled;
             };
             // A chain this walk refuses is malformed, so the guest cannot
             // repost its way out of it: this head stays at the front of the
@@ -1271,7 +1177,7 @@ impl VirtioVsock {
             // used length of zero would keep the queue moving; only a guest
             // that posted a cycle reaches it.
             let Some(segs) = self.rx_chain(mem, head) else {
-                return;
+                return filled;
             };
             let cap: usize = segs.iter().map(|&(_, l)| l as usize).sum();
             let waiting = self.pending.front().map_or(0, Vec::len);
@@ -1284,7 +1190,7 @@ impl VirtioVsock {
             // guest reposts one that can; leave the queue alone rather than
             // complete it with a partial packet.
             if cap < HDR_LEN || (waiting > cap && cap == HDR_LEN) {
-                return;
+                return filled;
             }
             let pkt = self.pending.pop_front().unwrap();
             let pkt = if pkt.len() > cap {
@@ -1299,13 +1205,13 @@ impl VirtioVsock {
                 }
                 let n = (pkt.len() - off).min(len as usize);
                 if mem.write(addr, &pkt[off..off + n]).is_err() {
-                    return;
+                    return filled;
                 }
                 off += n;
             }
             self.queues[RX_QUEUE as usize].push_used(mem, head, off as u32);
             self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
-            self.interrupt_status |= 1;
+            filled = true;
         }
     }
 }
@@ -1313,6 +1219,59 @@ impl VirtioVsock {
 impl Default for VirtioVsock {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl virtio::Device for VirtioVsock {
+    fn device_type(&self) -> u32 {
+        virtio_bindings::virtio_ids::VIRTIO_ID_VSOCK
+    }
+
+    fn features(&self) -> u64 {
+        0
+    }
+
+    fn queue_max_sizes(&self) -> &[u16] {
+        &[QUEUE_MAX_SIZE; 3]
+    }
+
+    // The configuration space holds the guest's CID, a `u64`.
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        read_config_bytes(&GUEST_CID.to_le_bytes(), offset, data);
+    }
+
+    fn activate(
+        &mut self,
+        _ram: &GuestRam,
+        _driver_features: u64,
+        queues: Vec<Queue>,
+        interrupt: Arc<Interrupt>,
+    ) -> std::io::Result<()> {
+        if let Ok(queues) = <[Queue; 3]>::try_from(queues) {
+            self.queues = queues;
+        }
+        self.state = DeviceState::Active(interrupt);
+        Ok(())
+    }
+
+    fn notify(&mut self, ram: &GuestRam, queue: u16) {
+        if !self.state.is_active() {
+            return;
+        }
+        match queue {
+            TX_QUEUE => self.process_tx(ram),
+            RX_QUEUE => self.fill_rx(ram),
+            _ => {}
+        }
+    }
+
+    // Every session is dropped with the queues, since the guest agent that
+    // initializes the device again has never seen their `OP_REQUEST`.
+    fn reset(&mut self) {
+        self.queues = std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE));
+        self.state = DeviceState::Inactive;
+        self.pending.clear();
+        self.conns.clear();
     }
 }
 
@@ -1667,9 +1626,11 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    use crate::devices::virtio::Device as _;
     use std::io::Read;
     use std::time::{Duration, Instant};
 
+    use crate::devices::virtio::mmio::testing::{self, Rings};
     use crate::devices::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     fn mem_of(len: usize) -> GuestRam {
@@ -1711,25 +1672,27 @@ mod session_tests {
         p
     }
 
-    /// Programs `queue` the way the Linux virtio-mmio driver does: select,
-    /// size, the three ring addresses, then READY last.
-    fn program_queue(
+    /// Puts an 8-entry queue `index` into `dev`, ready at the given rings.
+    ///
+    /// The first call also makes `dev` active, with an interrupt no test reads.
+    fn set_ready_queue(
         dev: &mut VirtioVsock,
         mem: &GuestRam,
-        queue: u16,
+        index: u16,
         desc: u64,
         avail: u64,
         used: u64,
     ) {
-        dev.mmio(mem, mmio::QUEUE_SEL, true, u64::from(queue));
-        dev.mmio(mem, mmio::QUEUE_NUM, true, 8);
-        dev.mmio(mem, mmio::QUEUE_DESC_LOW, true, desc & 0xffff_ffff);
-        dev.mmio(mem, mmio::QUEUE_DESC_HIGH, true, desc >> 32);
-        dev.mmio(mem, mmio::QUEUE_DRIVER_LOW, true, avail & 0xffff_ffff);
-        dev.mmio(mem, mmio::QUEUE_DRIVER_HIGH, true, avail >> 32);
-        dev.mmio(mem, mmio::QUEUE_DEVICE_LOW, true, used & 0xffff_ffff);
-        dev.mmio(mem, mmio::QUEUE_DEVICE_HIGH, true, used >> 32);
-        dev.mmio(mem, mmio::QUEUE_READY, true, 1);
+        let rings = Rings {
+            size: 8,
+            desc_table: desc,
+            avail_ring: avail,
+            used_ring: used,
+        };
+        dev.queues[usize::from(index)] = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
+        if !dev.state.is_active() {
+            dev.state = DeviceState::Active(testing::enabled_interrupt().0);
+        }
     }
 
     /// Posts descriptor `idx`, a 64-byte writable buffer at `buffer`, as the
@@ -1746,14 +1709,27 @@ mod session_tests {
         mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
     }
 
+    #[test]
+    fn common_registers_follow_virtio_1_2() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = Arc::new(mem_of(0x4000));
+        let rings = Rings {
+            size: 8,
+            desc_table: BASE,
+            avail_ring: BASE + 0x1000,
+            used_ring: BASE + 0x2000,
+        };
+        testing::assert_common_registers(VirtioVsock::new(), &mem, rings);
+    }
+
     // A packet queued before the reset must not reach the ring the guest
     // programs after it.
     #[test]
-    fn status_reset_drops_the_sessions_and_closes_their_host_ends() {
+    fn reset_drops_the_sessions_and_closes_their_host_ends() {
         const BASE: u64 = 0x4000_0000;
         let mem = mem_of(0x8000);
         let mut dev = VirtioVsock::new();
-        program_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+        set_ready_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
         post_rx_buffer(&mem, BASE, BASE + 0x1000, 0, BASE + 0x3000);
 
         let (first, mut first_peer) = UnixStream::pair().unwrap();
@@ -1779,7 +1755,7 @@ mod session_tests {
         let second_port = dev.add_conn(second).unwrap();
         dev.connect(&mem, second_port);
 
-        dev.mmio(&mem, mmio::STATUS, true, 0);
+        dev.reset();
         for socket in [
             &mut first_reader,
             &mut second_reader,
@@ -1789,7 +1765,7 @@ mod session_tests {
             assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0, "the socket saw EOF");
         }
 
-        program_queue(
+        set_ready_queue(
             &mut dev,
             &mem,
             RX_QUEUE,
@@ -1799,7 +1775,7 @@ mod session_tests {
         );
         post_rx_buffer(&mem, BASE + 0x4000, BASE + 0x5000, 0, BASE + 0x7000);
         post_rx_buffer(&mem, BASE + 0x4000, BASE + 0x5000, 1, BASE + 0x7100);
-        dev.mmio(&mem, mmio::QUEUE_NOTIFY, true, u64::from(RX_QUEUE));
+        dev.notify(&mem, RX_QUEUE);
         dev.host_data(&mem, first_port, b"late");
         assert_eq!(
             mem.read_u16(BASE + 0x6000 + 2).unwrap(),
@@ -1827,7 +1803,7 @@ mod session_tests {
         let mut dev = VirtioVsock::new();
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
 
-        program_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
 
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
@@ -1854,7 +1830,7 @@ mod session_tests {
         let mut dev = VirtioVsock::new();
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
 
-        program_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
 
         let full = pkt(OP_RW, 40000, &vec![0xa5u8; PAYLOAD]);
         assert_eq!(full.len(), HDR_LEN + PAYLOAD);
@@ -1878,7 +1854,7 @@ mod session_tests {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut dev = VirtioVsock::new();
-        program_queue(&mut dev, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
 
         // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
@@ -2110,7 +2086,7 @@ mod session_tests {
             mem.write_u16(avail + 4 + i * 2, i as u16).unwrap();
         }
         mem.write_u16(avail + 2, n).unwrap(); // avail.idx
-        program_queue(dev, mem, RX_QUEUE, desc, avail, used);
+        set_ready_queue(dev, mem, RX_QUEUE, desc, avail, used);
     }
 
     /// Reads back the packet the device wrote into RX buffer `i`, using the
@@ -2193,7 +2169,7 @@ mod session_tests {
         const BASE: u64 = 0x4000_0000;
         let mem = mem_of(0x8000);
         let mut dev = VirtioVsock::new();
-        program_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+        set_ready_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
 
         // desc[0] -> desc[0], writable and carrying NEXT.
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
@@ -2270,7 +2246,7 @@ mod session_tests {
             mem.write_u16(avail + 4 + i * 2, (i * 2) as u16).unwrap();
         }
         mem.write_u16(avail + 2, 2).unwrap();
-        program_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
+        set_ready_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();

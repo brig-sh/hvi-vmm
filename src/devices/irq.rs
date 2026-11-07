@@ -14,13 +14,12 @@
 
 //! The interrupt line a device drives.
 //!
-//! A device sets its own line from the methods that change its interrupt level,
-//! so the line is set under the lock that decided the level, and only when the
-//! level changes. Two threads that change one device's level, a vCPU that
-//! acknowledges the interrupt and an I/O thread that delivers a packet, then
-//! cannot leave the line at a level the device no longer has. Each backend
-//! supplies the line, since how it reaches the guest's interrupt controller is
-//! the hypervisor's.
+//! The line is set under the lock that decided the level, and only when the
+//! level changes. Two threads that change one device's level then cannot leave
+//! the line at a level the device no longer has. A virtio device's level is
+//! held by its [`Interrupt`](crate::devices::virtio::mmio::Interrupt). Each
+//! backend supplies the line, since how it reaches the guest's interrupt
+//! controller is the hypervisor's.
 
 use std::sync::Arc;
 
@@ -34,7 +33,7 @@ pub(crate) trait IrqLine: Send + Sync {
     fn set_level(&self, level: bool) -> std::io::Result<()>;
 }
 
-/// A device's interrupt, which it drives through the line its backend connects.
+/// A device's interrupt line, with the level it was last set to.
 #[derive(Default)]
 pub(crate) struct Irq {
     /// The line, once the backend has connected one.
@@ -44,7 +43,7 @@ pub(crate) struct Irq {
 }
 
 impl Irq {
-    /// Connects the device to `line`.
+    /// Connects the backend's `line`.
     pub(crate) fn connect(&mut self, line: Arc<dyn IrqLine>) {
         self.line = Some(line);
     }
