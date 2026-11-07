@@ -123,6 +123,13 @@ const ETH_IPV4: u16 = 0x0800;
 const IP_ICMP: u8 = 1;
 const IP_TCP: u8 = 6;
 const IP_UDP: u8 = 17;
+/// DHCP message types, option 53.
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
+const DHCP_RELEASE: u8 = 7;
 
 /// Wraps a freshly built device for sharing, applying the guest MAC override.
 ///
@@ -430,6 +437,12 @@ pub struct VirtioNet {
     tap: Option<File>,
     /// MAC handed to the guest through config space.
     mac: [u8; 6],
+    /// The address the DHCP ACK that answered the guest's request leased to
+    /// `mac`, under a gateway or a tap. A NAK, a RELEASE or a reset clears it.
+    lease: Option<Ipv4Addr>,
+    /// The transaction id of the guest's DHCP DISCOVER or REQUEST that no ACK
+    /// or NAK has answered yet.
+    dhcp_xid: Option<[u8; 4]>,
     /// Live feed of every frame to a plugin, when one asked for it.
     /// Every L2 frame crossing the device goes in raw and unparsed, whichever
     /// backend carries it, so the reader decodes it with its own stack.
@@ -451,6 +464,8 @@ impl VirtioNet {
             tap_write_reported: false,
             tap: None,
             mac: GUEST_MAC,
+            lease: None,
+            dhcp_xid: None,
             sink: SinkSlot::default(),
         }
     }
@@ -506,6 +521,16 @@ impl VirtioNet {
     }
 
     /// Drains the captured flows for the event ledger.
+    /// Whether `src` is the address DHCP leased to the guest. The unspecified
+    /// address is what a DHCP client sends from before it has a lease, so it
+    /// is neither leased nor forged and gets no flag.
+    fn src_leased(&self, src: Ipv4Addr) -> Option<bool> {
+        if src.is_unspecified() {
+            return None;
+        }
+        self.leased().map(|a| a == src)
+    }
+
     pub(crate) fn take_events(&mut self) -> Vec<CapturedEvent> {
         std::mem::take(&mut self.events)
     }
@@ -537,7 +562,21 @@ impl VirtioNet {
             bytes,
             dns,
             sni: None,
+            src_leased: self.src_leased(src),
         });
+    }
+
+    /// Returns the address leased to the guest, or `None` while the device has
+    /// seen no lease.
+    ///
+    /// The built-in stack leases [`GUEST_IP`] itself. Under a gateway or a tap
+    /// the lease is the one the DHCP ACK the guest received carried.
+    fn leased(&self) -> Option<Ipv4Addr> {
+        if self.gw.is_none() && self.tap.is_none() {
+            Some(GUEST_IP)
+        } else {
+            self.lease
+        }
     }
 
     fn queue(&mut self) -> &mut Queue {
@@ -553,6 +592,8 @@ impl VirtioNet {
         self.status = 0;
         self.dev_feat_sel = 0;
         self.queue_sel = 0;
+        self.dhcp_xid = None;
+        self.lease = None;
     }
 
     /// Services one MMIO access. On a transmit-queue notify, drains the guest's
@@ -705,28 +746,28 @@ impl VirtioNet {
 
     /// Writes one frame into a receive-queue buffer (prefixed with a zeroed
     /// virtio-net header) and completes it, so the guest sees an incoming
-    /// packet.
-    fn inject_rx(&mut self, mem: &GuestRam, frame: &[u8]) {
+    /// packet. Returns whether the frame reached a buffer the guest posted.
+    fn inject_rx(&mut self, mem: &GuestRam, frame: &[u8]) -> bool {
         // Ingress, published before the queue check: what the device was handed
         // for the guest is an observation whether or not the guest had a buffer
         // posted to take it.
         self.sink.feed(|sink| sink.on_net(frame, false));
         let rx = &self.queues[RX_QUEUE as usize];
         if !rx.is_ready() {
-            return;
+            return false;
         }
         let last = rx.last_avail();
         match rx.pending(mem) {
             // No RX buffer posted; drop silently (TCP/UDP recover). Logging here
             // would flood under gateway-relay load.
-            Some(0) | None => return,
+            Some(0) | None => return false,
             Some(_) => {}
         }
         let Some(slot) = rx.avail_slot(last) else {
-            return;
+            return false;
         };
         let Ok(head) = mem.read_u16(slot) else {
-            return;
+            return false;
         };
         let mut out = vec![0u8; NET_HDR_LEN];
         out[10] = 1; // num_buffers = 1
@@ -741,7 +782,7 @@ impl VirtioNet {
         let mut d = head;
         for _ in 0..rx.size() {
             let Some(da) = rx.desc_addr(d) else {
-                return;
+                return false;
             };
             let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
                 mem.read_u64(da),
@@ -749,12 +790,12 @@ impl VirtioNet {
                 mem.read_u16(da + 12),
                 mem.read_u16(da + 14),
             ) else {
-                return;
+                return false;
             };
             if flags & VIRTQ_DESC_F_WRITE != 0 && written < out.len() {
                 let n = (len as usize).min(out.len() - written);
                 if mem.write(addr, &out[written..written + n]).is_err() {
-                    return;
+                    return false;
                 }
                 written += n;
             }
@@ -774,11 +815,12 @@ impl VirtioNet {
         // completing it with a used length of 0 is the escape hatch if some
         // driver ever does.
         if written < out.len() {
-            return;
+            return false;
         }
         self.queues[RX_QUEUE as usize].push_used(mem, head, written as u32);
         self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
         self.interrupt_status |= 1;
+        true
     }
 
     // --- gateway relay mode -------------------------------------------------
@@ -842,14 +884,45 @@ impl VirtioNet {
     /// so the device's next access does not end its batch.
     #[must_use = "the caller ends the batch of the sink the frame fed"]
     pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) -> Option<Arc<dyn IoSink>> {
-        self.inject_rx(mem, frame);
+        let reply = self
+            .dhcp_xid
+            .and_then(|xid| dhcp_reply_to(frame, self.mac, xid));
+        if self.inject_rx(mem, frame) {
+            // The guest has the answer, so the transaction is over. A later
+            // ACK that echoes the xid, which every host on the segment saw
+            // broadcast, leases nothing.
+            match reply {
+                Some((DHCP_ACK, addr)) if !addr.is_unspecified() => {
+                    self.lease = Some(addr);
+                    self.dhcp_xid = None;
+                }
+                Some((DHCP_NAK, _)) => {
+                    self.lease = None;
+                    self.dhcp_xid = None;
+                }
+                _ => {}
+            }
+        }
         self.sync_irq();
         self.sink.take_fed()
     }
 
-    /// Captures a transmitted frame for the ledger without generating a reply:
-    /// the five-tuple, and — for a TLS ClientHello — the SNI.
+    /// Captures a transmitted frame for the ledger without generating a reply,
+    /// and follows the guest's DHCP client for the lease.
     fn observe_tx(&mut self, frame: &[u8]) {
+        self.capture_tx(frame);
+        match dhcp_from_guest(frame, self.mac) {
+            Some((DHCP_DISCOVER | DHCP_REQUEST, xid)) => self.dhcp_xid = Some(xid),
+            // The RELEASE itself is sent from the leased address, so it is
+            // captured before the lease goes.
+            Some((DHCP_RELEASE, _)) => self.lease = None,
+            _ => {}
+        }
+    }
+
+    /// Captures a transmitted frame for the ledger: the five-tuple, and for a
+    /// TLS ClientHello the SNI.
+    fn capture_tx(&mut self, frame: &[u8]) {
         if frame.len() < 14 || u16::from_be_bytes([frame[12], frame[13]]) != ETH_IPV4 {
             return;
         }
@@ -877,6 +950,7 @@ impl VirtioNet {
                     bytes: l4.len() as u64,
                     dns: None,
                     sni,
+                    src_leased: self.src_leased(src),
                 });
             }
             IP_UDP if l4.len() >= 8 => {
@@ -954,7 +1028,7 @@ impl VirtioNet {
                     self.capture(IP_UDP, src, sport, dst, dport, payload.len() as u64, None);
                     self.handle_dhcp(&payload[8..])
                 } else if dport == 53 && dst == DNS_IP {
-                    self.handle_dns(sport, &payload[8..])
+                    self.handle_dns(src, sport, &payload[8..])
                 } else {
                     stderr!("\r\n[virtio-net] udp {src}:{sport} -> {dst}:{dport}\r\n");
                     self.capture(IP_UDP, src, sport, dst, dport, payload.len() as u64, None);
@@ -997,37 +1071,22 @@ impl VirtioNet {
     /// address (10.0.2.15) so an `ip=dhcp` boot (as a container runtime
     /// configures) lands on an address consistent with our ARP/DNS/gateway.
     fn handle_dhcp(&mut self, bootp: &[u8]) -> Option<Vec<u8>> {
-        if bootp.len() < 240 || bootp[0] != 1 || bootp[236..240] != [0x63, 0x82, 0x53, 0x63] {
-            return None; // not a BOOTP request with the DHCP magic cookie
+        if bootp.first() != Some(&1) {
+            return None; // not a BOOTP request
         }
-        // Find option 53 (message type): 1=DISCOVER, 3=REQUEST.
-        let mut msg_type = 0u8;
-        let mut i = 240;
-        while i < bootp.len() {
-            match bootp[i] {
-                255 => break, // end
-                0 => i += 1,  // pad
-                code => {
-                    let len = *bootp.get(i + 1)? as usize;
-                    let data = i + 2;
-                    if data + len > bootp.len() {
-                        break;
-                    }
-                    if code == 53 && len >= 1 {
-                        msg_type = bootp[data];
-                    }
-                    i = data + len;
-                }
-            }
-        }
+        let msg_type = dhcp_message_type(bootp)?;
         let reply_type = match msg_type {
-            1 => 2, // DISCOVER -> OFFER
-            3 => 5, // REQUEST  -> ACK
+            DHCP_DISCOVER => DHCP_OFFER,
+            DHCP_REQUEST => DHCP_ACK,
             _ => return None,
         };
         stderr!(
             "\r\n[virtio-net] dhcp {} -> {GUEST_IP}\r\n",
-            if msg_type == 1 { "discover" } else { "request" }
+            if msg_type == DHCP_DISCOVER {
+                "discover"
+            } else {
+                "request"
+            }
         );
 
         let mut r = vec![0u8; 240];
@@ -1058,7 +1117,7 @@ impl VirtioNet {
     }
 
     /// Captures the queried name, resolves it through the host, and replies.
-    fn handle_dns(&mut self, client_port: u16, dns: &[u8]) -> Option<Vec<u8>> {
+    fn handle_dns(&mut self, src: Ipv4Addr, client_port: u16, dns: &[u8]) -> Option<Vec<u8>> {
         if dns.len() < 12 {
             return None;
         }
@@ -1066,7 +1125,7 @@ impl VirtioNet {
         stderr!("{}", dns_query_line(&name));
         self.capture(
             IP_UDP,
-            GUEST_IP,
+            src,
             client_port,
             DNS_IP,
             53,
@@ -1221,6 +1280,73 @@ fn parse_dns_name(msg: &[u8], off: usize) -> Option<(String, usize)> {
         return None;
     }
     Some((name, qend))
+}
+
+/// Returns the DHCP message type (option 53) of a BOOTP message, or `None`
+/// when it has no DHCP magic cookie or no message type.
+fn dhcp_message_type(bootp: &[u8]) -> Option<u8> {
+    if bootp.len() < 240 || bootp[236..240] != [0x63, 0x82, 0x53, 0x63] {
+        return None;
+    }
+    let mut msg_type = None;
+    let mut i = 240;
+    while i < bootp.len() {
+        match bootp[i] {
+            255 => break, // end
+            0 => i += 1,  // pad
+            code => {
+                let len = *bootp.get(i + 1)? as usize;
+                let data = i + 2;
+                if data + len > bootp.len() {
+                    break;
+                }
+                if code == 53 && len >= 1 {
+                    msg_type = Some(bootp[data]);
+                }
+                i = data + len;
+            }
+        }
+    }
+    msg_type
+}
+
+/// Returns the BOOTP payload of an Ethernet frame that carries UDP from
+/// `sport` to `dport`.
+fn bootp_in_frame(frame: &[u8], sport: u16, dport: u16) -> Option<&[u8]> {
+    if u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]) != ETH_IPV4 {
+        return None;
+    }
+    let ip = &frame[14..];
+    if ip.len() < 20 || ip[9] != IP_UDP {
+        return None;
+    }
+    let udp = ip.get(((ip[0] & 0x0f) as usize) * 4..)?;
+    let ports = [sport.to_be_bytes(), dport.to_be_bytes()].concat();
+    if udp.get(0..4)? != ports.as_slice() {
+        return None;
+    }
+    udp.get(8..)
+}
+
+/// Returns the message type and transaction id of a DHCP message `frame`
+/// carries from the client `mac`, or `None` when it carries none.
+fn dhcp_from_guest(frame: &[u8], mac: [u8; 6]) -> Option<(u8, [u8; 4])> {
+    let bootp = bootp_in_frame(frame, 68, 67)?;
+    if bootp.first() != Some(&1) || bootp.get(28..34)? != mac {
+        return None;
+    }
+    Some((dhcp_message_type(bootp)?, bootp.get(4..8)?.try_into().ok()?))
+}
+
+/// Returns the message type and `yiaddr` of a DHCP reply `frame` carries to
+/// the client `mac` for the transaction `xid`, or `None` when it carries none.
+fn dhcp_reply_to(frame: &[u8], mac: [u8; 6], xid: [u8; 4]) -> Option<(u8, Ipv4Addr)> {
+    let bootp = bootp_in_frame(frame, 67, 68)?;
+    if bootp.first() != Some(&2) || bootp.get(4..8)? != xid || bootp.get(28..34)? != mac {
+        return None;
+    }
+    let addr = Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19]);
+    Some((dhcp_message_type(bootp)?, addr))
 }
 
 /// Best-effort TLS SNI from a TCP payload that begins with a TLS ClientHello.
@@ -1611,11 +1737,9 @@ mod tests {
         assert_eq!(try_recv(&theirs, &mut buf).expect("queued"), 3);
     }
 
-    /// Programs a queue the way the Linux virtio-mmio driver does: select it,
-    /// size it, set the three ring addresses, then READY last.
-    // A minimal BOOTP DISCOVER: op/htype/hlen, the client's chaddr, the magic
-    // cookie, and option 53 = 1. Shared so the two DHCP tests cannot drift
-    // apart the first time one of them grows an option.
+    /// Returns a minimal BOOTP DISCOVER: op, htype and hlen, the client's
+    /// `chaddr`, the magic cookie and option 53 = 1. The DHCP tests share it
+    /// so they cannot drift apart once one of them grows an option.
     fn bootp_discover(chaddr: [u8; 6]) -> Vec<u8> {
         let mut bootp = vec![0u8; 240];
         bootp[0] = 1; // op = request
@@ -1623,10 +1747,12 @@ mod tests {
         bootp[2] = 6; // hlen
         bootp[28..34].copy_from_slice(&chaddr);
         bootp[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
-        bootp.extend_from_slice(&[53, 1, 1, 255]);
+        bootp.extend_from_slice(&[53, 1, DHCP_DISCOVER, 255]);
         bootp
     }
 
+    /// Programs a queue the way the Linux virtio-mmio driver does: select it,
+    /// size it, set the three ring addresses, then READY last.
     fn program_queue(
         net: &mut VirtioNet,
         mem: &GuestRam,
@@ -1726,6 +1852,262 @@ mod tests {
         mem.write_u16(BASE + 142, 0).unwrap();
         assert_eq!(net.read_tx_frame(&mem, 0), None);
         assert_eq!(net.read_tx_frame(&mem, 8), None, "an out-of-ring head");
+    }
+
+    #[test]
+    fn dhcp_client_traffic_from_the_unspecified_address_has_no_lease_flag() {
+        let mut net = VirtioNet::new();
+        let udp = udp_datagram(68, 67, &bootp_discover(GUEST_MAC));
+        let ip = ipv4_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, IP_UDP, &udp);
+        net.handle_frame(&eth_frame(OUR_MAC, GUEST_MAC, ETH_IPV4, &ip));
+        let flags: Vec<Option<bool>> = net
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                CapturedEvent::NetFlow { src_leased, .. } => Some(src_leased),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![None], "stub flags its own DHCP DISCOVER");
+    }
+
+    /// Returns the ledger's lease flag for one UDP frame from `src`, run
+    /// through the stub stack or, in a relay mode, through `observe_tx`.
+    fn lease_flag(net: &mut VirtioNet, src: Ipv4Addr, relay: bool) -> Option<bool> {
+        let udp = udp_datagram(1234, 9999, b"x");
+        let ip = ipv4_packet(src, Ipv4Addr::new(1, 2, 3, 4), IP_UDP, &udp);
+        let frame = eth_frame(OUR_MAC, GUEST_MAC, ETH_IPV4, &ip);
+        if relay {
+            net.observe_tx(&frame);
+        } else {
+            net.handle_frame(&frame);
+        }
+        match net.take_events().pop() {
+            Some(CapturedEvent::NetFlow {
+                src: got,
+                src_leased,
+                ..
+            }) => {
+                assert_eq!(got, src, "the record keeps the source on the wire");
+                src_leased
+            }
+            _ => panic!("expected a NetFlow event"),
+        }
+    }
+
+    #[test]
+    fn the_stub_ledger_flags_a_source_it_did_not_lease() {
+        let mut net = VirtioNet::new();
+        assert_eq!(lease_flag(&mut net, GUEST_IP, false), Some(true));
+        assert_eq!(
+            lease_flag(&mut net, Ipv4Addr::new(10, 0, 2, 99), false),
+            Some(false)
+        );
+    }
+
+    const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 87, 0, 1);
+    const LEASED: Ipv4Addr = Ipv4Addr::new(10, 87, 0, 2);
+
+    /// Returns a DHCP message of type `msg_type` for transaction `xid` from the
+    /// client `mac`, sent from `src` to the server.
+    fn client_dhcp(mac: [u8; 6], msg_type: u8, xid: [u8; 4], src: Ipv4Addr) -> Vec<u8> {
+        let mut bootp = bootp_discover(mac);
+        bootp[4..8].copy_from_slice(&xid);
+        bootp[242] = msg_type;
+        let udp = udp_datagram(68, 67, &bootp);
+        let dst = if src.is_unspecified() {
+            Ipv4Addr::BROADCAST
+        } else {
+            SERVER_IP
+        };
+        let ip = ipv4_packet(src, dst, IP_UDP, &udp);
+        eth_frame(OUR_MAC, mac, ETH_IPV4, &ip)
+    }
+
+    /// Returns a DHCP reply of type `msg_type` for transaction `xid` to the
+    /// client `mac`, leasing `yiaddr`.
+    fn server_dhcp(mac: [u8; 6], msg_type: u8, xid: [u8; 4], yiaddr: Ipv4Addr) -> Vec<u8> {
+        let mut bootp = bootp_discover(mac);
+        bootp[0] = 2; // op = reply
+        bootp[4..8].copy_from_slice(&xid);
+        bootp[16..20].copy_from_slice(&yiaddr.octets());
+        bootp[242] = msg_type;
+        let udp = udp_datagram(67, 68, &bootp);
+        let ip = ipv4_packet(SERVER_IP, Ipv4Addr::BROADCAST, IP_UDP, &udp);
+        eth_frame(mac, OUR_MAC, ETH_IPV4, &ip)
+    }
+
+    /// Returns a gateway-relay device with `buffers` RX buffers posted, each
+    /// large enough for a DHCP reply, and the RAM they live in.
+    fn relay_with_rx_buffers(buffers: u16) -> (GuestRam, VirtioNet) {
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let (_peer, dev) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut net = VirtioNet::with_gateway(dev);
+        if buffers == 0 {
+            return (mem, net);
+        }
+        let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
+        program_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
+        for i in 0..u64::from(buffers) {
+            mem.write_u64(desc + 16 * i, BASE + 0x3000 + 0x800 * i)
+                .unwrap();
+            mem.write_u32(desc + 16 * i + 8, 0x800).unwrap();
+            mem.write_u16(desc + 16 * i + 12, 2).unwrap(); // writable
+            mem.write_u16(desc + 16 * i + 14, 0).unwrap();
+            mem.write_u16(avail + 4 + 2 * i, i as u16).unwrap();
+        }
+        mem.write_u16(avail + 2, buffers).unwrap();
+        (mem, net)
+    }
+
+    /// Runs the guest's REQUEST for `xid` and the server's ACK through `net`.
+    fn lease_through(net: &mut VirtioNet, mem: &GuestRam, xid: [u8; 4]) {
+        net.observe_tx(&client_dhcp(
+            GUEST_MAC,
+            DHCP_REQUEST,
+            xid,
+            Ipv4Addr::UNSPECIFIED,
+        ));
+        let _ = net.take_events();
+        let _ = net.deliver(mem, &server_dhcp(GUEST_MAC, DHCP_ACK, xid, LEASED));
+    }
+
+    // Under a gateway the lease is the one the ACK the guest received carried.
+    // An ACK for another MAC or another transaction, and an OFFER, lease
+    // nothing.
+    #[test]
+    fn relayed_flow_is_checked_against_the_lease_delivered_to_the_guest() {
+        let (mem, mut net) = relay_with_rx_buffers(8);
+        let xid = [0xaa, 0xbb, 0xcc, 0xdd];
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "no lease seen");
+
+        // An ACK before the guest asked for a lease is not a lease.
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_ACK, xid, LEASED));
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "unsolicited ACK");
+
+        net.observe_tx(&client_dhcp(
+            GUEST_MAC,
+            DHCP_REQUEST,
+            xid,
+            Ipv4Addr::UNSPECIFIED,
+        ));
+        let _ = net.take_events();
+
+        let _ = net.deliver(
+            &mem,
+            &server_dhcp(GUEST_MAC, DHCP_ACK, [1, 2, 3, 4], LEASED),
+        );
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "wrong xid");
+        let other_mac = [0x02, 0, 0, 0, 0, 0x99];
+        let _ = net.deliver(&mem, &server_dhcp(other_mac, DHCP_ACK, xid, LEASED));
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_OFFER, xid, LEASED));
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "still no lease");
+
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_ACK, xid, LEASED));
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true));
+        assert_eq!(
+            lease_flag(&mut net, Ipv4Addr::new(10, 87, 0, 3), true),
+            Some(false)
+        );
+
+        // The transaction is answered: a second ACK for the same xid, from a
+        // host that saw it broadcast, does not move the lease.
+        let late = Ipv4Addr::new(10, 87, 0, 66);
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_ACK, xid, late));
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true), "late ACK");
+    }
+
+    // The guest has no RX buffer posted, so the ACK never reaches it. The
+    // transaction stays open for the ACK that answers the retransmission.
+    #[test]
+    fn dropped_ack_leases_nothing() {
+        let (mem, mut net) = relay_with_rx_buffers(0);
+        let xid = [1, 1, 1, 1];
+        lease_through(&mut net, &mem, xid);
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "dropped ACK");
+
+        let (mem, mut net_with_buffers) = relay_with_rx_buffers(1);
+        net_with_buffers.dhcp_xid = net.dhcp_xid;
+        assert_eq!(net_with_buffers.dhcp_xid, Some(xid), "the xid is kept");
+        let _ = net_with_buffers.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_ACK, xid, LEASED));
+        assert_eq!(lease_flag(&mut net_with_buffers, LEASED, true), Some(true));
+    }
+
+    #[test]
+    fn nak_that_answers_the_guests_request_clears_the_lease() {
+        let (mem, mut net) = relay_with_rx_buffers(8);
+        let xid = [2, 2, 2, 2];
+        lease_through(&mut net, &mem, xid);
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true));
+
+        // A NAK for the answered transaction, or for another, changes nothing.
+        let unspecified = Ipv4Addr::UNSPECIFIED;
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_NAK, xid, unspecified));
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true), "late NAK");
+
+        // The guest renews from its address and the server refuses.
+        let renew = [3, 3, 3, 3];
+        net.observe_tx(&client_dhcp(GUEST_MAC, DHCP_REQUEST, renew, LEASED));
+        let _ = net.take_events();
+        let _ = net.deliver(
+            &mem,
+            &server_dhcp(GUEST_MAC, DHCP_NAK, [9, 9, 9, 9], unspecified),
+        );
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true), "wrong xid");
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_NAK, renew, unspecified));
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "NAKed");
+    }
+
+    #[test]
+    fn release_the_guest_sends_clears_the_lease() {
+        let (mem, mut net) = relay_with_rx_buffers(8);
+        let xid = [4, 4, 4, 4];
+        lease_through(&mut net, &mem, xid);
+
+        // A RELEASE from another client behind the guest is not the guest's.
+        let other_mac = [0x02, 0, 0, 0, 0, 0x99];
+        net.observe_tx(&client_dhcp(other_mac, DHCP_RELEASE, xid, LEASED));
+        let _ = net.take_events();
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true));
+
+        // The RELEASE itself is sent from the leased address.
+        net.observe_tx(&client_dhcp(GUEST_MAC, DHCP_RELEASE, xid, LEASED));
+        match net.take_events().pop() {
+            Some(CapturedEvent::NetFlow { src_leased, .. }) => assert_eq!(src_leased, Some(true)),
+            _ => panic!("expected the RELEASE's record"),
+        }
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "released");
+    }
+
+    #[test]
+    fn device_reset_clears_the_lease() {
+        let (mem, mut net) = relay_with_rx_buffers(8);
+        lease_through(&mut net, &mem, [5, 5, 5, 5]);
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true));
+        net.mmio(&mem, mmio::STATUS, true, 0);
+        assert_eq!(lease_flag(&mut net, LEASED, true), None, "after a reset");
+    }
+
+    // A client behind the guest, in a nested VM or a container, shares the
+    // NIC. Its DISCOVER carries its own chaddr and must not take the slot of
+    // the guest's open transaction.
+    #[test]
+    fn request_from_another_client_leaves_the_guests_transaction_open() {
+        let (mem, mut net) = relay_with_rx_buffers(8);
+        let xid = [6, 6, 6, 6];
+        let unspecified = Ipv4Addr::UNSPECIFIED;
+        net.observe_tx(&client_dhcp(GUEST_MAC, DHCP_REQUEST, xid, unspecified));
+        let other_mac = [0x02, 0, 0, 0, 0, 0x99];
+        net.observe_tx(&client_dhcp(
+            other_mac,
+            DHCP_DISCOVER,
+            [7, 7, 7, 7],
+            unspecified,
+        ));
+        let _ = net.take_events();
+        let _ = net.deliver(&mem, &server_dhcp(GUEST_MAC, DHCP_ACK, xid, LEASED));
+        assert_eq!(lease_flag(&mut net, LEASED, true), Some(true));
     }
 
     // Unikraft posts the virtio-net header and the frame as two descriptors
@@ -2056,7 +2438,7 @@ mod tests {
         assert_eq!(parse_dns_name(&truncated, 12), None);
 
         let mut net = VirtioNet::new();
-        assert_eq!(net.handle_dns(1234, &truncated), None);
+        assert_eq!(net.handle_dns(GUEST_IP, 1234, &truncated), None);
     }
 
     #[test]
