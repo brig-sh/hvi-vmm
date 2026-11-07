@@ -203,7 +203,7 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => 0,
     };
 
-    let ram_size = mem_mib << 20;
+    let ram_size = mem_bytes(mem_mib)?;
     let gic = GicLayout::QEMU_VIRT;
     let kernel = loader::LoadedKernel::from_header(&kernel_bytes)?;
     let loader::Plan { layout, dtb } = kernel.plan(
@@ -237,6 +237,18 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote {} byte DTB to {path}", dtb.len());
     }
     Ok(())
+}
+
+/// Returns the RAM size `--mem-mib` asks for in bytes.
+///
+/// # Errors
+///
+/// Errors when the size does not fit in a `u64`. A shift would drop the high
+/// bits and boot a smaller guest than the one asked for.
+fn mem_bytes(mem_mib: u64) -> Result<u64, String> {
+    mem_mib
+        .checked_mul(1 << 20)
+        .ok_or_else(|| format!("--mem-mib {mem_mib} is past the end of the address space"))
 }
 
 /// Runs `boot`, which starts a Linux guest on the active backend (hvf/arm64 on
@@ -452,7 +464,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::BootConfig {
         kernel: std::fs::read(&kernel_path)?,
         initramfs: initramfs.map(std::fs::read).transpose()?,
-        mem_bytes: mem_mib << 20,
+        mem_bytes: mem_bytes(mem_mib)?,
         cmdline,
         disks,
         fs_shares,
@@ -532,8 +544,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::push_disk;
+    use super::{mem_bytes, push_disk};
     use hvi::config::DiskConfig;
+
+    // A shift drops the high bits of a size above 2^44 MiB, so 2^44 + 512
+    // booted a 512 MiB guest.
+    #[test]
+    fn a_ram_size_past_the_address_space_is_refused() {
+        assert_eq!(mem_bytes(512), Ok(512 << 20));
+        assert_eq!(mem_bytes((1 << 44) - 1), Ok(((1 << 44) - 1) << 20));
+        assert!(mem_bytes(1 << 44).is_err());
+        assert!(mem_bytes((1 << 44) + 512).is_err());
+    }
 
     fn parse(args: &[&str]) -> Result<Vec<DiskConfig>, String> {
         let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
