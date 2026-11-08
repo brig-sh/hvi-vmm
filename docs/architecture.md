@@ -425,10 +425,17 @@ a consumer that behaves like the driver. A pass is weak evidence, because the
 race may not land within the test's budget, so it is `#[ignore]`d and run
 weekly.
 
-Every device walks its descriptor chains through `DescriptorChain`, which ends after as
-many descriptors as the queue has entries, those of an indirect table included,
-so a cycle runs out of budget. A queue becomes ready only with its rings aligned
-and in guest RAM, and re-programming any queue register clears `ready`.
+Every in-process device walks its descriptor chains through `DescriptorChain`,
+which ends after as many descriptors as the queue has entries, indirect ones
+included, so a cycle runs out of budget. A chain that never reaches a descriptor
+without NEXT is incomplete. The device completes it with a used length of 0, and
+on a receive queue the frame or packet then goes to the next buffer. A receive
+buffer with less writable room than the device's header goes back the same way.
+The replies to a transmit notification go to the receive queue in one pass after
+the drain, and a receive pass returns at most a queue's worth of malformed
+buffers. A head outside the ring gets no used entry. A queue becomes ready only
+with its rings aligned and in guest RAM and its avail ring not at address 0.
+Re-programming any queue register makes it not ready again.
 
 ## 5. Concurrency and failure
 

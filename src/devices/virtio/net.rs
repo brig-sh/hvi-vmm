@@ -577,6 +577,8 @@ pub struct VirtioNet {
     /// The RX and TX queues, in that order, each `None` before activation,
     /// after reset, or when the driver did not make it ready.
     queues: [Option<Queue>; 2],
+    /// Whether a malformed receive buffer was reported, so only the first is.
+    malformed_rx_reported: bool,
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// Captured flows, drained by the hypervisor backend into the event ledger.
@@ -602,6 +604,7 @@ impl VirtioNet {
     pub fn new() -> Self {
         VirtioNet {
             queues: [None, None],
+            malformed_rx_reported: false,
             state: DeviceState::Inactive,
             events: Vec::new(),
             gw: None,
@@ -671,15 +674,15 @@ impl VirtioNet {
         });
     }
 
-    /// Drains the transmit queue: read each frame, capture it, and inject any
-    /// generated reply into the receive queue.
+    /// Drains the transmit queue, captures each frame, and injects the replies
+    /// the built-in stack generates into the receive queue after the drain.
     fn process_tx(&mut self, mem: &GuestRam) {
         // The drain takes the transmit queue out of `self.queues`, so handling
-        // a frame can borrow `self` mutably and inject replies into the receive
-        // queue.
+        // a frame can borrow `self` mutably.
         let Some(mut tx) = self.queues[TX_QUEUE as usize].take() else {
             return;
         };
+        let mut replies = Vec::new();
         let served = tx.serve(mem, |chain| {
             if let Some(frame) = Self::read_tx_frame(mem, chain) {
                 // Publish before the backend branch, so the ring carries egress
@@ -701,16 +704,19 @@ impl VirtioNet {
                     self.observe_tx(&frame);
                     self.relay_to_gateway(&frame);
                 } else {
-                    // The TX pass's used-buffer notification covers the
-                    // replies.
-                    for reply in self.handle_frame(&frame) {
-                        self.inject_rx(mem, &reply);
-                    }
+                    replies.extend(self.handle_frame(&frame));
                 }
             }
             0
         });
         self.queues[TX_QUEUE as usize] = Some(tx);
+        // The replies share one receive pass, so one transmit notification
+        // returns at most a queue's worth of malformed buffers. The used-buffer
+        // interrupt below covers the receive buffers too.
+        let mut malformed = 0;
+        for reply in &replies {
+            self.inject_rx(mem, reply, &mut malformed);
+        }
         if served {
             self.state.signal_used_buffer();
         }
@@ -727,8 +733,14 @@ impl VirtioNet {
     /// Writes one frame, behind a virtio-net header with `num_buffers` 1, into
     /// a receive-queue buffer and puts the buffer on the used ring.
     ///
+    /// A malformed buffer, one whose chain is incomplete, has a segment outside
+    /// guest RAM or has less writable room than the virtio-net header, goes
+    /// back to the guest empty, and the frame goes to the next buffer.
+    /// `malformed` counts the buffers that went back in this receive pass; once
+    /// it reaches the queue size, the frame is dropped instead.
+    ///
     /// Returns whether it put a buffer on the used ring.
-    fn inject_rx(&mut self, mem: &GuestRam, frame: &[u8]) -> bool {
+    fn inject_rx(&mut self, mem: &GuestRam, frame: &[u8], malformed: &mut u16) -> bool {
         // Ingress, published before the queue check: what the device was handed
         // for the guest is an observation whether or not the guest had a buffer
         // posted to take it.
@@ -736,51 +748,74 @@ impl VirtioNet {
         let Some(rx) = self.queues[RX_QUEUE as usize].as_mut() else {
             return false;
         };
-        // No RX buffer posted; drop silently (TCP/UDP recover). Logging here
-        // would flood under gateway-relay load.
-        let Some(mut chain) = rx.pop(mem) else {
-            return false;
-        };
-        let head = chain.head_index();
-        let mut out = vec![0u8; NET_HDR_LEN];
-        out[10] = 1; // num_buffers = 1
-        out.extend_from_slice(frame);
-        // Spread the header and frame over the *whole* writable chain. Linux
-        // posts one buffer big enough for both, so writing only the first
-        // descriptor was indistinguishable from correct; Unikraft posts the
-        // virtio-net header and the frame as two descriptors, and filling only
-        // the first delivered a 12-byte packet its driver rejected outright
-        // ("Received invalid packet size: 12") before the frame ever arrived.
-        let mut written = 0usize;
-        for descriptor in chain.by_ref() {
-            if descriptor.is_write_only() && written < out.len() {
-                let n = (descriptor.len() as usize).min(out.len() - written);
-                if mem
-                    .write(descriptor.addr().0, &out[written..written + n])
-                    .is_err()
-                {
-                    rx.undo_pop();
-                    return false;
+        let mut packet = None;
+        let mut returned = false;
+        while *malformed < rx.size() {
+            // No RX buffer posted; drop silently (TCP/UDP recover). Logging
+            // here would flood under gateway-relay load.
+            let Some(mut chain) = rx.pop(mem) else {
+                return returned;
+            };
+            let head = chain.head_index();
+            // The header and frame are copied only once a buffer is posted, so
+            // a frame dropped for want of one costs no copy.
+            let out = packet.get_or_insert_with(|| {
+                let mut out = vec![0u8; NET_HDR_LEN];
+                out[10] = 1; // num_buffers = 1
+                out.extend_from_slice(frame);
+                out
+            });
+            // Spread the header and frame over the whole writable chain.
+            // Unikraft posts the header and the frame as two descriptors.
+            let mut written = 0usize;
+            let mut room = 0usize;
+            let mut fault = false;
+            for descriptor in chain.by_ref() {
+                if !descriptor.is_write_only() {
+                    continue;
                 }
-                written += n;
+                room += descriptor.len() as usize;
+                if written < out.len() {
+                    let n = (descriptor.len() as usize).min(out.len() - written);
+                    if mem
+                        .write(descriptor.addr().0, &out[written..written + n])
+                        .is_err()
+                    {
+                        fault = true;
+                        break;
+                    }
+                    written += n;
+                }
             }
+            if fault || !chain.is_complete() || room < NET_HDR_LEN {
+                *malformed += 1;
+                if rx.add_used(mem, head, 0) {
+                    returned = true;
+                    if !self.malformed_rx_reported {
+                        self.malformed_rx_reported = true;
+                        stderrln!(
+                            "{LOG_PREFIX} virtio-net: a receive buffer is malformed or outside guest RAM; \
+                             it goes back to the guest empty, and later ones are not reported"
+                        );
+                    }
+                }
+                continue;
+            }
+            // num_buffers is 1, so a frame that does not fit the posted chain
+            // cannot be split across the next one. Drop it and leave the buffer
+            // posted rather than complete a truncated packet the guest would
+            // have to reject.
+            //
+            // The chain stays at the front of the avail ring, so a buffer too
+            // small for any frame blocks the ones behind it. Linux and Unikraft
+            // post uniform buffers, so neither does that.
+            if written < out.len() {
+                rx.undo_pop();
+                return returned;
+            }
+            return rx.add_used(mem, head, written as u32) || returned;
         }
-        // num_buffers is 1, so a frame that does not fit the posted chain
-        // cannot be split across the next one. Drop it and leave the buffer
-        // posted rather than complete a truncated packet the guest would have
-        // to reject. An incomplete chain is left posted the same way.
-        //
-        // The chain stays at the same avail slot, so a head that can never
-        // hold a frame blocks the ones behind it until the guest reposts.
-        // Linux and Unikraft post uniform buffers, so neither reaches that;
-        // completing it with a used length of 0 is the escape hatch if some
-        // driver ever does.
-        if !chain.is_complete() || written < out.len() {
-            rx.undo_pop();
-            return false;
-        }
-        rx.add_used(mem, head, written as u32);
-        true
+        returned
     }
 
     // --- gateway relay mode -------------------------------------------------
@@ -844,7 +879,7 @@ impl VirtioNet {
     /// so the device's next notification does not end its batch.
     #[must_use = "the caller ends the batch of the sink the frame fed"]
     pub fn deliver(&mut self, mem: &GuestRam, frame: &[u8]) -> Option<Arc<dyn IoSink>> {
-        if self.inject_rx(mem, frame) {
+        if self.inject_rx(mem, frame, &mut 0) {
             self.state.signal_used_buffer();
         }
         self.sink.take_fed()
@@ -1332,9 +1367,9 @@ mod tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Driver, LevelLine, Rings};
     use crate::devices::virtio::mmio::{INTERRUPT_ACK, INTERRUPT_STATUS};
-    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT};
+    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use std::io::Read;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
     /// A sink that counts the frames it is fed and the batches that end.
     #[derive(Default)]
@@ -1827,6 +1862,172 @@ mod tests {
             VirtioNet::read_tx_frame(&mem, chain),
             None,
             "a head outside the ring"
+        );
+    }
+
+    /// Asserts that a one-descriptor receive buffer goes back empty and a
+    /// 60-byte frame takes the good buffer behind it.
+    ///
+    /// `first` maps the data address to that descriptor's `(address, length,
+    /// flags)`.
+    fn assert_rx_buffer_goes_back_empty(first: impl FnOnce(u64) -> (u64, u32, u16)) {
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut net = VirtioNet::new();
+        let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+        activate_with_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
+        let (addr, len, flags) = first(data);
+        mem.write_u64(desc, addr).unwrap();
+        mem.write_u32(desc + 8, len).unwrap();
+        mem.write_u16(desc + 12, flags).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+        mem.write_u64(desc + 16, data + 0x1000).unwrap();
+        mem.write_u32(desc + 24, 2048).unwrap();
+        mem.write_u16(desc + 28, VIRTQ_DESC_F_WRITE).unwrap();
+        mem.write_u16(desc + 30, 0).unwrap();
+        mem.write_u16(avail + 4, 0).unwrap();
+        mem.write_u16(avail + 6, 1).unwrap();
+        mem.write_u16(avail + 2, 2).unwrap();
+        let frame = [0x5au8; 60];
+
+        let _ = net.deliver(&mem, &frame);
+
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 2);
+        assert_eq!(mem.read_u32(used + 4).unwrap(), 0, "the malformed head");
+        assert_eq!(mem.read_u32(used + 8).unwrap(), 0, "goes back empty");
+        assert_eq!(mem.read_u32(used + 12).unwrap(), 1, "the next head");
+        assert_eq!(
+            mem.read_u32(used + 16).unwrap(),
+            (NET_HDR_LEN + frame.len()) as u32
+        );
+        let mut got = [0u8; 60];
+        mem.read(data + 0x1000 + NET_HDR_LEN as u64, &mut got)
+            .unwrap();
+        assert_eq!(got, frame);
+    }
+
+    // A writable descriptor that points back at itself is malformed.
+    #[test]
+    fn rx_descriptor_cycle_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| {
+            (data, 2048, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+        });
+    }
+
+    // A buffer with no writable descriptor has no room for the virtio-net
+    // header, so it can never take a frame.
+    #[test]
+    fn rx_buffer_without_room_for_a_header_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| (data, 2048, 0));
+    }
+
+    #[test]
+    fn rx_buffer_smaller_than_a_header_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| (data, NET_HDR_LEN as u32 - 1, VIRTQ_DESC_F_WRITE));
+    }
+
+    #[test]
+    fn rx_buffer_outside_guest_ram_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| (data + 0x10_0000, 2048, VIRTQ_DESC_F_WRITE));
+    }
+
+    /// A sink that reposts every receive buffer each time it is fed, as a
+    /// second vCPU can while the device drains the transmit queue.
+    struct RepostingSink {
+        /// The host address of the receive queue's `avail.idx`.
+        avail: usize,
+        /// The host address of the receive queue's `used.idx`.
+        used: usize,
+    }
+
+    impl IoSink for RepostingSink {
+        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {}
+
+        fn on_net(&self, _frame: &[u8], _egress: bool) {
+            // SAFETY: both addresses are 2-byte aligned fields of guest RAM,
+            // which outlives the test's device.
+            let (avail, used) = unsafe {
+                (
+                    &*(self.avail as *const AtomicU16),
+                    &*(self.used as *const AtomicU16),
+                )
+            };
+            avail.store(
+                used.load(Ordering::SeqCst).wrapping_add(8),
+                Ordering::SeqCst,
+            );
+        }
+
+        fn on_batch_end(&self) {}
+    }
+
+    // Every receive buffer points back at itself, and the guest reposts each
+    // one as soon as it comes back. The replies to one transmit notification
+    // share one receive pass, so one queue's worth of buffers goes back, not a
+    // queue's worth per reply.
+    #[test]
+    fn malformed_rx_buffers_go_back_at_most_a_queue_per_notification() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x10000)]);
+        let (rx, tx) = (BASE, BASE + 0x8000);
+        let rings = |at: u64| Rings {
+            size: 8,
+            desc_table: at,
+            avail_ring: at + 0x1000,
+            used_ring: at + 0x2000,
+        };
+        let mut net = VirtioNet::new();
+        let queues = vec![
+            Some(testing::ready_queue(QUEUE_MAX_SIZE, rings(rx), &mem)),
+            Some(testing::ready_queue(QUEUE_MAX_SIZE, rings(tx), &mem)),
+        ];
+        let (interrupt, _line) = testing::enabled_interrupt();
+        net.activate(&mem, 0, queues, interrupt).unwrap();
+        net.set_io_sink(Arc::new(RepostingSink {
+            avail: mem.host_ptr(rx + 0x1000 + 2, 2).unwrap() as usize,
+            used: mem.host_ptr(rx + 0x2000 + 2, 2).unwrap() as usize,
+        }));
+        for i in 0..8 {
+            let desc = rx + i * 16;
+            mem.write_u64(desc, rx + 0x3000).unwrap();
+            mem.write_u32(desc + 8, 2048).unwrap();
+            mem.write_u16(desc + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+                .unwrap();
+            mem.write_u16(desc + 14, i as u16).unwrap();
+            mem.write_u16(rx + 0x1000 + 4 + i * 2, i as u16).unwrap();
+        }
+        let mut arp = vec![0u8; 28];
+        arp[0..2].copy_from_slice(&1u16.to_be_bytes());
+        arp[2..4].copy_from_slice(&ETH_IPV4.to_be_bytes());
+        arp[4] = 6;
+        arp[5] = 4;
+        arp[6..8].copy_from_slice(&1u16.to_be_bytes()); // request
+        arp[8..14].copy_from_slice(&GUEST_MAC);
+        arp[14..18].copy_from_slice(&GUEST_IP.octets());
+        arp[24..28].copy_from_slice(&GW_IP.octets());
+        let mut buf = vec![0u8; NET_HDR_LEN];
+        buf.extend_from_slice(&eth_frame([0xff; 6], GUEST_MAC, ETH_ARP, &arp));
+        mem.write(tx + 0x3000, &buf).unwrap();
+        for i in 0..8 {
+            let desc = tx + i * 16;
+            mem.write_u64(desc, tx + 0x3000).unwrap();
+            mem.write_u32(desc + 8, buf.len() as u32).unwrap();
+            mem.write_u16(tx + 0x1000 + 4 + i * 2, i as u16).unwrap();
+        }
+        mem.write_u16(tx + 0x1000 + 2, 8).unwrap();
+
+        net.notify(&mem, TX_QUEUE);
+
+        assert_eq!(mem.read_u16(tx + 0x2000 + 2).unwrap(), 8, "every request");
+        assert_eq!(
+            mem.read_u16(rx + 0x2000 + 2).unwrap(),
+            8,
+            "one queue's worth went back"
+        );
+        assert_eq!(
+            mem.read_u16(rx + 0x1000 + 2).unwrap(),
+            16,
+            "the guest had reposted them"
         );
     }
 
