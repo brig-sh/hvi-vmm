@@ -551,10 +551,8 @@ mod stop_tests {
 
     /// Returns the configuration of a two-vCPU boot of `kernel`.
     ///
-    /// The seccomp filters are on in a release build, so a vCPU thread exits
-    /// under the vCPU allowlist as it would in production. A debug build's std
-    /// checks every descriptor it closes with `fcntl`, which that allowlist
-    /// refuses, so there the filters stay off.
+    /// The seccomp filters are on, so a vCPU thread exits under the vCPU
+    /// allowlist as it would in production.
     fn config(kernel: Vec<u8>, plugin: Option<Arc<dyn Plugin>>) -> BootConfig {
         BootConfig {
             kernel,
@@ -574,7 +572,7 @@ mod stop_tests {
             irqchip: None,
             agent_sock: None,
             plugin,
-            sandbox: !cfg!(debug_assertions),
+            sandbox: true,
             stop: None,
         }
     }
@@ -780,12 +778,10 @@ mod stop_tests {
         };
         // The thread is named before its first instruction installs the filter,
         // so the mode is read until it changes or a deadline passes.
-        if !cfg!(debug_assertions) {
-            let filtered = Instant::now() + Duration::from_secs(2);
-            while seccomp_mode(thread).as_deref() != Some("2") {
-                assert!(Instant::now() < filtered, "the plugin thread is unfiltered");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+        let filtered = Instant::now() + Duration::from_secs(2);
+        while seccomp_mode(thread).as_deref() != Some("2") {
+            assert!(Instant::now() < filtered, "the plugin thread is unfiltered");
+            std::thread::sleep(Duration::from_millis(1));
         }
         stop.request_stop();
         let outcome = receiver

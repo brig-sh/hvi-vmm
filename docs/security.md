@@ -136,6 +136,14 @@ thread is allocating or freeing, and copes with each open failing. The open is
 refused rather than trapped, and the process still opens nothing. A musl build,
 whose malloc opens no file, installs the allowlist alone.
 
+A debug build adds one rule to `vcpu` and to `block`: `fcntl` with `F_GETFD` as
+its command, and no other command. std's debug build calls `fcntl(fd, F_GETFD)`
+before it closes an `OwnedFd`, to assert the descriptor is open. A vCPU thread
+closes descriptors when it stops, and a disk's worker closes its backing file
+and its wake as it exits. Without the rule a debug build died with `SIGSYS` at
+the end of every sandboxed run. `vmm` already allows `fcntl`. The filters a
+release build installs are unchanged, and the JSON files carry no such rule.
+
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
 `ppoll` alone, because aarch64 has no `poll` syscall.
@@ -200,9 +208,10 @@ sandbox is secure.
   unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
   as it begins, as the memory-dump plugin's `--dump-after` timer does.
 - **It constrains syscall arguments on one filter only.** The `block` filter
-  limits `ioctl` to the requests its thread makes. No `vmm` or `vcpu` rule
-  carries an argument condition, so `ioctl` and `sendmsg` are unconstrained
-  there over every descriptor the process already holds.
+  limits `ioctl` to the requests its thread makes. No `vmm` or `vcpu` rule in
+  either architecture file carries an argument condition, so `ioctl` and
+  `sendmsg` are unconstrained there over every descriptor the process already
+  holds. A debug build adds one condition, on `fcntl` in `vcpu` and `block`.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 

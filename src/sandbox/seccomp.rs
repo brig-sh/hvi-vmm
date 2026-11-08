@@ -127,6 +127,17 @@
 //! action changed to `log`, which lets the kernel record what would have been
 //! killed (`dmesg`, or `auditctl`) while the VMM keeps running. The open
 //! refusal stays in under it, unrecorded.
+//!
+//! # What a debug build adds
+//!
+//! std's debug build calls `fcntl(fd, F_GETFD)` before it closes an `OwnedFd`,
+//! to assert the descriptor is open. A vCPU thread closes descriptors when it
+//! stops (its own vCPU descriptor, a kick handle, a vsock connection's stream),
+//! and a disk's worker closes its backing file and its wake as it exits. So a
+//! debug build adds `fcntl` to `vcpu` and to `block` with one condition: the
+//! command in argument 1 must be `F_GETFD`. Any other command traps. `vmm`
+//! already allows `fcntl` unconditionally. The shipped release filter and the
+//! JSON files are unchanged.
 
 use std::io;
 
@@ -197,14 +208,26 @@ pub fn log_mode() -> bool {
 /// `default_action`, the mismatch action in seccompiler's schema, becomes
 /// `log`. A glibc build adds the open syscalls to each list, which is safe only
 /// behind the filter that refuses them, so the allowlist is compiled through
-/// [`programs`] alone.
+/// [`programs`] alone. A debug build adds `fcntl(F_GETFD)` to `vcpu` and
+/// `block`, which std's check before closing a descriptor needs.
 fn allowlist(thread: Thread, log: bool) -> io::Result<BpfProgram> {
+    allowlist_from(FILTERS, ARCH, thread, log)
+}
+
+/// Returns the allowlist [`allowlist`] builds, from the filter file `filters`
+/// compiled for `arch`.
+fn allowlist_from(
+    filters: &str,
+    arch: TargetArch,
+    thread: Thread,
+    log: bool,
+) -> io::Result<BpfProgram> {
     let mut doc: serde_json::Value =
-        serde_json::from_str(FILTERS).map_err(|e| io::Error::other(format!("filters: {e}")))?;
+        serde_json::from_str(filters).map_err(|e| io::Error::other(format!("filters: {e}")))?;
     let Some(map) = doc.as_object_mut() else {
         return Err(io::Error::other("filters: expected a JSON object"));
     };
-    for (_name, filter) in map.iter_mut() {
+    for (name, filter) in map.iter_mut() {
         let Some(obj) = filter.as_object_mut() else {
             continue;
         };
@@ -219,14 +242,33 @@ fn allowlist(thread: Thread, log: bool) -> io::Result<BpfProgram> {
             list.extend(
                 OPEN_SYSCALLS
                     .iter()
+                    // aarch64 has no `open`, whichever architecture this is.
+                    .filter(|(name, _)| *name != "open" || matches!(arch, TargetArch::x86_64))
                     .map(|(name, _)| serde_json::json!({ "syscall": name })),
             );
         }
+        #[cfg(debug_assertions)]
+        if name == Thread::Vcpu.key() || name == Thread::Block.key() {
+            if let Some(list) = obj.get_mut("filter").and_then(|f| f.as_array_mut()) {
+                list.push(serde_json::json!({
+                    "syscall": "fcntl",
+                    "args": [{
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": libc::F_GETFD,
+                    }],
+                    "comment": "std's check before a close, debug builds only",
+                }));
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = name;
     }
     let json =
         serde_json::to_string(&doc).map_err(|e| io::Error::other(format!("filters: {e}")))?;
 
-    let mut map = seccompiler::compile_from_json(json.as_bytes(), ARCH)
+    let mut map = seccompiler::compile_from_json(json.as_bytes(), arch)
         .map_err(|e| io::Error::other(format!("compiling the {} filter: {e}", thread.key())))?;
     map.remove(thread.key())
         .ok_or_else(|| io::Error::other(format!("no {} filter in the allowlists", thread.key())))
@@ -1135,11 +1177,22 @@ mod tests {
     /// It runs the program as the kernel's classic BPF interpreter would. It
     /// knows the instructions seccompiler emits and panics on any other.
     fn run_program(program: &[seccompiler::sock_filter], number: i64, args: [u64; 6]) -> u32 {
+        run_program_for(program, AUDIT_ARCH, number, args)
+    }
+
+    /// Returns the action `program` takes as [`run_program`] does, for a call
+    /// made under the audit architecture `arch`.
+    fn run_program_for(
+        program: &[seccompiler::sock_filter],
+        arch: u32,
+        number: i64,
+        args: [u64; 6],
+    ) -> u32 {
         // `seccomp_data`: the syscall number, the audit architecture, the
         // instruction pointer and six arguments.
         let mut data = [0u8; 64];
         data[0..4].copy_from_slice(&u32::try_from(number).unwrap().to_ne_bytes());
-        data[4..8].copy_from_slice(&AUDIT_ARCH.to_ne_bytes());
+        data[4..8].copy_from_slice(&arch.to_ne_bytes());
         for (index, arg) in args.iter().enumerate() {
             data[16 + index * 8..24 + index * 8].copy_from_slice(&arg.to_ne_bytes());
         }
@@ -1408,6 +1461,72 @@ mod tests {
                 assert!(
                     !forbidden.contains(&name),
                     "{key} allows {name}, which defeats installing the filter after setup"
+                );
+            }
+        }
+    }
+
+    // Both architecture files, compiled on whichever one the test runs on. A
+    // debug build lets a vCPU thread and a disk's worker check a descriptor
+    // before it closes it, and nothing else about `fcntl`. The vmm list allows
+    // every command.
+    #[test]
+    fn vcpu_and_block_allow_the_descriptor_check_of_a_debug_build() {
+        // Each file with its audit architecture and its fcntl syscall number.
+        let files = [
+            (
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/resources/seccomp/x86_64.json"
+                )),
+                TargetArch::x86_64,
+                62 | 0x8000_0000 | 0x4000_0000,
+                72,
+            ),
+            (
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/resources/seccomp/aarch64.json"
+                )),
+                TargetArch::aarch64,
+                183 | 0x8000_0000 | 0x4000_0000,
+                25,
+            ),
+        ];
+        let get_fd = if cfg!(debug_assertions) {
+            libc::SECCOMP_RET_ALLOW
+        } else {
+            libc::SECCOMP_RET_TRAP
+        };
+        for (json, target, audit_arch, fcntl) in files {
+            let action = |thread: Thread, command: libc::c_int| {
+                let program = allowlist_from(json, target, thread, false).unwrap();
+                run_program_for(&program, audit_arch, fcntl, [0, command as u64, 0, 0, 0, 0])
+            };
+            for thread in [Thread::Vcpu, Thread::Block] {
+                assert_eq!(
+                    action(thread, libc::F_GETFD),
+                    get_fd,
+                    "{target:?} {thread:?}, F_GETFD"
+                );
+                for command in [libc::F_SETFL, libc::F_SETFD, libc::F_DUPFD_CLOEXEC] {
+                    assert_eq!(
+                        action(thread, command),
+                        libc::SECCOMP_RET_TRAP,
+                        "{target:?} {thread:?}, fcntl command {command}"
+                    );
+                }
+            }
+            for command in [
+                libc::F_GETFD,
+                libc::F_SETFL,
+                libc::F_SETFD,
+                libc::F_DUPFD_CLOEXEC,
+            ] {
+                assert_eq!(
+                    action(Thread::Vmm, command),
+                    libc::SECCOMP_RET_ALLOW,
+                    "{target:?} vmm, fcntl command {command}"
                 );
             }
         }
