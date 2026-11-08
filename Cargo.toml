@@ -42,6 +42,9 @@ virtio-bindings = "0.2.7"
 # memory. `backend-mmap` maps each region from the shareable object that
 # `memory::SharedRam` allocates.
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+# The split virtqueue over that memory: the avail and used rings and the walk of
+# a descriptor chain, for every virtio device served in this process.
+virtio-queue = "0.18.0"
 # Kernel image loaders and boot configurators over that memory: the arm64
 # `Image` loader with the devicetree configurator, and the x86 `bzImage`
 # loader with the Linux boot-protocol configurator. The crate gates each

@@ -53,8 +53,8 @@ use crate::memory::GuestRam;
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, tap, DeviceState, Queue, SinkSlot, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
-    VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, tap, DeviceState, QueueConfig, SinkSlot, QUEUE_MAX_SIZE,
+    VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
 use crate::events::CapturedEvent;
 use crate::io_threads::HostWork;
@@ -576,7 +576,7 @@ impl TapRelay {
 /// A virtio-net device with a user-space capture backend.
 pub struct VirtioNet {
     /// The RX and TX queues, in that order.
-    queues: [Queue; 2],
+    queues: [QueueConfig; 2],
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// Captured flows, drained by the hypervisor backend into the event ledger.
@@ -601,7 +601,7 @@ impl VirtioNet {
     #[must_use]
     pub fn new() -> Self {
         VirtioNet {
-            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
+            queues: std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE)),
             state: DeviceState::Inactive,
             events: Vec::new(),
             gw: None,
@@ -1212,10 +1212,10 @@ impl virtio::Device for VirtioNet {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<Queue>,
+        queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()> {
-        if let Ok(queues) = <[Queue; 2]>::try_from(queues) {
+        if let Ok(queues) = <[QueueConfig; 2]>::try_from(queues) {
             self.queues = queues;
         }
         self.state = DeviceState::Active(interrupt);
@@ -1231,7 +1231,7 @@ impl virtio::Device for VirtioNet {
     }
 
     fn reset(&mut self) {
-        self.queues = std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE));
+        self.queues = std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE));
         self.state = DeviceState::Inactive;
     }
 
@@ -1771,7 +1771,7 @@ mod tests {
                 if queue == index {
                     testing::ready_queue(QUEUE_MAX_SIZE, rings, mem)
                 } else {
-                    Queue::new(QUEUE_MAX_SIZE)
+                    QueueConfig::new(QUEUE_MAX_SIZE)
                 }
             })
             .collect();

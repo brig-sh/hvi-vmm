@@ -39,8 +39,8 @@ use crate::LOG_PREFIX;
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DeviceState, Queue, SinkSlot, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
-    VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QueueConfig, SinkSlot,
+    QUEUE_MAX_SIZE,
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
@@ -78,8 +78,9 @@ pub struct VirtioBlk {
     file: File,
     /// The disk's size in 512-byte sectors.
     capacity_sectors: u64,
-    /// The request queue.
-    queue: Queue,
+    /// The request queue, or `None` before activation, after reset, or when the
+    /// driver did not make it ready.
+    queue: Option<Queue>,
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// Captured requests, drained by the hypervisor backend into the event
@@ -280,7 +281,7 @@ impl VirtioBlk {
         Ok(VirtioBlk {
             file,
             capacity_sectors,
-            queue: Queue::new(QUEUE_MAX_SIZE),
+            queue: None,
             state: DeviceState::Inactive,
             events: Vec::new(),
             sink: SinkSlot::default(),
@@ -305,64 +306,32 @@ impl VirtioBlk {
 
     /// Processes every buffer the driver has made available on queue 0.
     fn process_queue(&mut self, mem: &GuestRam) {
-        if !self.queue.is_ready() {
-            return;
-        }
-        let Some(pending) = self.queue.pending(mem) else {
+        // The drain takes the queue out of `self.queue`, so handling a request
+        // can borrow `self` mutably.
+        let Some(mut queue) = self.queue.take() else {
             return;
         };
-        let mut last = self.queue.last_avail();
-        let mut serviced = false;
-        for _ in 0..pending {
-            let Some(slot) = self.queue.avail_slot(last) else {
-                break;
-            };
-            let Ok(head) = mem.read_u16(slot) else {
-                break;
-            };
-            let used_len = self.handle_chain(mem, head);
-            self.queue.push_used(mem, head, used_len);
-            last = last.wrapping_add(1);
-            serviced = true;
-        }
-        self.queue.set_last_avail(last);
-        if serviced {
+        let served = queue.serve(mem, |chain| self.handle_chain(mem, chain));
+        self.queue = Some(queue);
+        if served {
             self.state.signal_used_buffer();
         }
     }
 
-    /// Walks the descriptor chain at `head`, runs the block request, and
-    /// returns the number of device-written bytes for the used ring.
-    fn handle_chain(&mut self, mem: &GuestRam, head: u16) -> u32 {
-        // Collect readable and writable segments.
+    /// Walks `chain`, runs the block request, and returns the number of
+    /// device-written bytes for the used ring.
+    fn handle_chain(&mut self, mem: &GuestRam, mut chain: DescriptorChain<'_>) -> u32 {
         let mut readable = Vec::new();
         let mut writable = Vec::new();
-        let mut d = head;
-        // A conforming chain visits each descriptor at most once, so the ring
-        // size bounds it; a cycle just runs out of budget instead of spinning.
-        for _ in 0..self.queue.size() {
-            let Some(da) = self.queue.desc_addr(d) else {
-                break;
-            };
-            let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
-                mem.read_u64(da),
-                mem.read_u32(da + 8),
-                mem.read_u16(da + 12),
-                mem.read_u16(da + 14),
-            ) else {
-                break;
-            };
-            if flags & VIRTQ_DESC_F_WRITE != 0 {
-                writable.push((addr, len));
+        for descriptor in chain.by_ref() {
+            let segment = (descriptor.addr().0, descriptor.len());
+            if descriptor.is_write_only() {
+                writable.push(segment);
             } else {
-                readable.push((addr, len));
+                readable.push(segment);
             }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            d = next;
         }
-        if readable.is_empty() || writable.is_empty() {
+        if !chain.is_complete() || readable.is_empty() || writable.is_empty() {
             return 0;
         }
         let (saddr, _) = *writable.last().unwrap();
@@ -539,11 +508,11 @@ impl virtio::Device for VirtioBlk {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<Queue>,
+        queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> std::io::Result<()> {
-        if let Ok([queue]) = <[Queue; 1]>::try_from(queues) {
-            self.queue = queue;
+        if let Ok([queue]) = <[QueueConfig; 1]>::try_from(queues) {
+            self.queue = queue.into_queue();
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -556,7 +525,7 @@ impl virtio::Device for VirtioBlk {
     }
 
     fn reset(&mut self) {
-        self.queue = Queue::new(QUEUE_MAX_SIZE);
+        self.queue = None;
         self.state = DeviceState::Inactive;
     }
 
@@ -706,7 +675,7 @@ mod backing_len_tests {
 mod queue_tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
-    use crate::devices::virtio::Device as _;
+    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     const BASE: u64 = 0x4000_0000;
 
@@ -753,55 +722,78 @@ mod queue_tests {
         testing::assert_common_registers(dev(), &mem, rings);
     }
 
-    /// A chain that points back at itself must run out of budget rather than
-    /// spin. The only bound on the walk is the ring size, so the shape to
-    /// test is a cycle of *writable* descriptors: nothing accumulates, so
-    /// no other limit can end it.
-    #[test]
-    fn a_descriptor_cycle_runs_out_of_budget() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut blk = activated(&mem);
-
-        // desc[0] -> desc[0]: a one-hop cycle, writable and F_NEXT set.
-        mem.write_u64(BASE, BASE + 0x3000).unwrap();
-        mem.write_u32(BASE + 8, 16).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+    /// Notifies the device of chain `head`, published as the next entry of the
+    /// avail ring of [`activated`]'s queue.
+    fn notify_head(blk: &mut VirtioBlk, mem: &GuestRam, head: u16) {
+        let avail = BASE + 0x1000;
+        let idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(idx % 4) * 2, head)
             .unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-
-        // Terminating at all is the property. Nothing readable came out of the
-        // walk, so there is no request to serve either.
-        assert_eq!(blk.handle_chain(&mem, 0), 0);
+        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        blk.notify(mem, 0);
     }
 
-    /// A `next` that leaves the ring ends the walk, rather than reading a
-    /// descriptor the driver never programmed.
-    ///
-    /// The descriptor one past the ring is deliberately a valid, writable one
-    /// here. Without the bound the walk would find it, `writable` would be
-    /// non-empty and the request would be serviced -- so this fails loudly
-    /// rather than passing on an empty walk.
+    /// Returns `used.idx` of [`activated`]'s queue, and the length of the used
+    /// entry before it.
+    fn last_used(mem: &GuestRam) -> (u16, u32) {
+        let used = BASE + 0x2000;
+        let idx = mem.read_u16(used + 2).unwrap();
+        let entry = used + 4 + u64::from(idx.wrapping_sub(1) % 4) * 8;
+        (idx, mem.read_u32(entry + 4).unwrap())
+    }
+
+    /// Writes descriptor `index` of [`activated`]'s queue.
+    fn write_descriptor(mem: &GuestRam, index: u64, addr: u64, flags: u16, next: u16) {
+        let at = BASE + index * 16;
+        mem.write_u64(at, addr).unwrap();
+        mem.write_u32(at + 8, 16).unwrap();
+        mem.write_u16(at + 12, flags).unwrap();
+        mem.write_u16(at + 14, next).unwrap();
+    }
+
+    // A header followed by a writable descriptor that points back at itself.
+    // The walk ends at the queue size, and the chain completes with a length of
+    // 0. Without the bound, the read past the empty disk's capacity would write
+    // an error status and complete with a length of 1.
     #[test]
-    fn a_next_index_outside_the_ring_ends_the_walk() {
+    fn descriptor_cycle_ends_at_the_queue_size_unserved() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = activated(&mem);
+        write_descriptor(&mem, 0, BASE + 0x3000, VIRTQ_DESC_F_NEXT, 1);
+        write_descriptor(
+            &mem,
+            1,
+            BASE + 0x3100,
+            VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+            1,
+        );
 
-        // desc[0]: readable, chaining to index 4 -- one past a 4-entry ring.
-        mem.write_u64(BASE, BASE + 0x3000).unwrap();
-        mem.write_u32(BASE + 8, 16).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 4).unwrap();
+        notify_head(&mut blk, &mem, 0);
 
-        // "desc[4]": in guest RAM, outside the ring, and writable, so it is
-        // exactly what an unbounded walk would pick up.
-        mem.write_u64(BASE + 64, BASE + 0x3100).unwrap();
-        mem.write_u32(BASE + 72, 16).unwrap();
-        mem.write_u16(BASE + 76, VIRTQ_DESC_F_WRITE).unwrap();
-        mem.write_u16(BASE + 78, 0).unwrap();
+        assert_eq!(last_used(&mem), (1, 0));
+    }
 
-        assert_eq!(blk.handle_chain(&mem, 0), 0, "the walk stopped at the ring");
-        assert_eq!(blk.handle_chain(&mem, 4), 0, "an out-of-ring head as well");
-        assert_eq!(blk.handle_chain(&mem, u16::MAX), 0);
+    // A `next` that leaves the ring ends the walk, rather than reading a
+    // descriptor the driver never programmed. The descriptor one past the ring
+    // is a valid, writable one, so a walk past the ring would find it and serve
+    // the request. A head outside the ring gets no used entry at all.
+    #[test]
+    fn next_index_outside_the_ring_ends_the_walk() {
+        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
+        let mut blk = activated(&mem);
+        write_descriptor(&mem, 0, BASE + 0x3000, VIRTQ_DESC_F_NEXT, 4);
+        write_descriptor(&mem, 4, BASE + 0x3100, VIRTQ_DESC_F_WRITE, 0);
+
+        notify_head(&mut blk, &mem, 0);
+        assert_eq!(last_used(&mem), (1, 0), "the walk stopped at the ring");
+
+        notify_head(&mut blk, &mem, 4);
+        notify_head(&mut blk, &mem, u16::MAX);
+        assert_eq!(
+            mem.read_u16(BASE + 0x2000 + 2).unwrap(),
+            1,
+            "a head outside the ring is not completed"
+        );
     }
 
     /// The happy path still works: a conforming driver's read request is
@@ -909,7 +901,7 @@ mod queue_tests {
 mod capacity_tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Rings};
-    use crate::devices::virtio::Device as _;
+    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     const BASE: u64 = 0x4000_0000;
 

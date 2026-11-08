@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DeviceState, Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    self, read_config_bytes, DeviceState, QueueConfig, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
     VIRTQ_DESC_F_WRITE,
 };
 use crate::memory::GuestRam;
@@ -414,7 +414,7 @@ impl Drop for Conn {
 /// A virtio-vsock device bridged to a host Unix socket.
 pub struct VirtioVsock {
     /// The RX, TX and event queues, in that order.
-    queues: [Queue; 3],
+    queues: [QueueConfig; 3],
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// Host-to-guest packets waiting for an RX buffer.
@@ -432,7 +432,7 @@ impl VirtioVsock {
     #[must_use]
     pub fn new() -> Self {
         VirtioVsock {
-            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
+            queues: std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE)),
             state: DeviceState::Inactive,
             pending: VecDeque::new(),
             conns: HashMap::new(),
@@ -1244,10 +1244,10 @@ impl virtio::Device for VirtioVsock {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<Queue>,
+        queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> std::io::Result<()> {
-        if let Ok(queues) = <[Queue; 3]>::try_from(queues) {
+        if let Ok(queues) = <[QueueConfig; 3]>::try_from(queues) {
             self.queues = queues;
         }
         self.state = DeviceState::Active(interrupt);
@@ -1268,7 +1268,7 @@ impl virtio::Device for VirtioVsock {
     // Every session is dropped with the queues, since the guest agent that
     // initializes the device again has never seen their `OP_REQUEST`.
     fn reset(&mut self) {
-        self.queues = std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE));
+        self.queues = std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE));
         self.state = DeviceState::Inactive;
         self.pending.clear();
         self.conns.clear();

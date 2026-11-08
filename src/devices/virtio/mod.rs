@@ -33,7 +33,9 @@ use std::sync::Arc;
 use std::task::Waker;
 
 use mmio::Interrupt;
-use queue::{Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use queue::{
+    DescriptorChain, Queue, QueueConfig, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+};
 
 use crate::events::CapturedEvent;
 use crate::memory::GuestRam;
@@ -90,7 +92,7 @@ pub(crate) trait Device: Send {
         &mut self,
         ram: &GuestRam,
         driver_features: u64,
-        queues: Vec<Queue>,
+        queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()>;
 
