@@ -42,7 +42,7 @@ use crate::config::CachePolicy;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DeviceState, Queue, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
+    self, read_config_bytes, DeviceState, QueueConfig, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
     VIRTQ_DESC_F_WRITE,
 };
 use crate::memory::GuestRam;
@@ -1219,7 +1219,7 @@ pub struct VirtioFs {
     /// The mount tag, zero-padded, which the configuration space holds.
     tag: [u8; TAG_LEN],
     /// The hiprio and request queues, in that order.
-    queues: [Queue; NUM_QUEUES],
+    queues: [QueueConfig; NUM_QUEUES],
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// The waker of the device's worker thread, or `None` until one is set.
@@ -1436,7 +1436,7 @@ impl VirtioFs {
             writable,
             cache_policy,
             tag: tag_buf,
-            queues: std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE)),
+            queues: std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE)),
             state: DeviceState::Inactive,
             waker: None,
             pending_wake: None,
@@ -1599,7 +1599,7 @@ impl VirtioFs {
     /// touches the host filesystem on the vCPU thread, once per reset and
     /// bounded by the handle limit.
     fn end_session(&mut self) {
-        self.queues = std::array::from_fn(|_| Queue::new(QUEUE_MAX_SIZE));
+        self.queues = std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE));
         self.state = DeviceState::Inactive;
         self.pending_wake = None;
         self.notified.store(0, Ordering::Release);
@@ -5819,10 +5819,10 @@ impl virtio::Device for VirtioFs {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<Queue>,
+        queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()> {
-        if let Ok(queues) = <[Queue; NUM_QUEUES]>::try_from(queues) {
+        if let Ok(queues) = <[QueueConfig; NUM_QUEUES]>::try_from(queues) {
             self.queues = queues;
         }
         self.state = DeviceState::Active(interrupt);

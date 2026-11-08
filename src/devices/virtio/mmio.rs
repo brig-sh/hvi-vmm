@@ -40,7 +40,7 @@ use virtio_bindings::virtio_mmio::*;
 use crate::config::Stop;
 use crate::devices::bus;
 use crate::devices::irq::{Irq, IrqLine};
-use crate::devices::virtio::{self, Queue};
+use crate::devices::virtio::{self, QueueConfig};
 use crate::events::Ledger;
 use crate::memory::GuestRam;
 use crate::LOG_PREFIX;
@@ -292,8 +292,8 @@ struct TransportState {
     driver_features: u64,
     /// The queue the queue registers address.
     queue_select: u32,
-    /// The queues, until the device is activated with them.
-    queues: Vec<Queue>,
+    /// Each queue's programming, until the device is activated.
+    queues: Vec<QueueConfig>,
     /// Whether each queue was ready when the device was activated with it.
     ready_at_activation: Vec<bool>,
 }
@@ -302,10 +302,8 @@ impl TransportState {
     /// Returns the state of a new or reset device, with a fresh queue of each
     /// size.
     ///
-    /// A driver initializing the device again programs rings whose `avail.idx`
-    /// starts at 0. A consumed index kept from the previous programming would
-    /// make the device refuse every notification, and a ready flag kept from it
-    /// would make the driver's probe refuse the queue.
+    /// A queue kept from before the reset would stay ready, and the driver's
+    /// probe refuses a ready queue.
     fn new(queue_max_sizes: &[u16]) -> Self {
         Self {
             status: DeviceStatus::default(),
@@ -313,7 +311,10 @@ impl TransportState {
             driver_features_select: 0,
             driver_features: 0,
             queue_select: 0,
-            queues: queue_max_sizes.iter().map(|&max| Queue::new(max)).collect(),
+            queues: queue_max_sizes
+                .iter()
+                .map(|&max| QueueConfig::new(max))
+                .collect(),
             ready_at_activation: Vec::new(),
         }
     }
@@ -531,7 +532,7 @@ impl<D: virtio::Device> Transport<D> {
     /// activated, so a notification is passed only to an activated device.
     fn activate(&self, state: &mut TransportState) -> Vec<u32> {
         let queues = std::mem::take(&mut state.queues);
-        state.ready_at_activation = queues.iter().map(Queue::is_ready).collect();
+        state.ready_at_activation = queues.iter().map(QueueConfig::is_ready).collect();
         let ready = (0u32..)
             .zip(&state.ready_at_activation)
             .filter(|&(_, &ready)| ready)
@@ -669,8 +670,8 @@ pub(crate) mod testing {
 
     /// Returns a queue of up to `max_size` descriptors, programmed at `rings`
     /// and ready, as a transport hands it over at activation.
-    pub(crate) fn ready_queue(max_size: u16, rings: Rings, ram: &GuestRam) -> Queue {
-        let mut queue = Queue::new(max_size);
+    pub(crate) fn ready_queue(max_size: u16, rings: Rings, ram: &GuestRam) -> QueueConfig {
+        let mut queue = QueueConfig::new(max_size);
         queue.set_num(rings.size);
         queue.set_desc_lo(rings.desc_table as u32);
         queue.set_desc_hi((rings.desc_table >> 32) as u32);
@@ -877,7 +878,7 @@ mod tests {
     /// the transport hands it.
     struct Stub {
         /// The queues the stub was last activated with.
-        queues: Vec<Queue>,
+        queues: Vec<QueueConfig>,
         /// The features the stub was last activated with.
         driver_features: u64,
         /// The activation state, with the interrupt once active.
@@ -938,7 +939,7 @@ mod tests {
             &mut self,
             _ram: &GuestRam,
             driver_features: u64,
-            queues: Vec<Queue>,
+            queues: Vec<QueueConfig>,
             interrupt: Arc<Interrupt>,
         ) -> io::Result<()> {
             if self.refuse_activation {
@@ -1223,7 +1224,7 @@ mod tests {
         assert_eq!(driver.read(STATUS), STATUS_STEPS[3]);
         let device = driver.device.lock().unwrap();
         assert!(device.state.is_active());
-        let ready: Vec<bool> = device.queues.iter().map(Queue::is_ready).collect();
+        let ready: Vec<bool> = device.queues.iter().map(QueueConfig::is_ready).collect();
         assert_eq!(ready, [true, false]);
     }
 

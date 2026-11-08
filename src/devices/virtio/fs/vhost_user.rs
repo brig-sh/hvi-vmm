@@ -88,7 +88,7 @@ mod device {
 
     use crate::config::FsConfig;
     use crate::devices::virtio::mmio::Interrupt;
-    use crate::devices::virtio::{self, read_config_bytes, Queue};
+    use crate::devices::virtio::{self, read_config_bytes, QueueConfig};
     use crate::io_threads::HostWork;
     use crate::memory::GuestRam;
     use crate::teardown::StopToken;
@@ -474,13 +474,13 @@ mod device {
         /// and the ready `queues` to the daemon.
         ///
         /// Each ready queue has a size and rings in guest RAM, which
-        /// [`Queue::set_ready`] checks. A queue that is not ready is left
+        /// [`QueueConfig::set_ready`] checks. A queue that is not ready is left
         /// disabled, which the guest sees as a queue that does not answer.
         fn hand_over(
             &mut self,
             mem: &GuestRam,
             driver_features: u64,
-            queues: &[Queue],
+            queues: &[QueueConfig],
         ) -> io::Result<()> {
             let mut features = driver_features;
             if self.protocol_features_offered {
@@ -588,7 +588,7 @@ mod device {
             &mut self,
             ram: &GuestRam,
             driver_features: u64,
-            queues: Vec<Queue>,
+            queues: Vec<QueueConfig>,
             _interrupt: Arc<Interrupt>,
         ) -> io::Result<()> {
             if let Err(e) = self.hand_over(ram, driver_features, &queues) {
