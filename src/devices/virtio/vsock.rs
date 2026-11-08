@@ -426,6 +426,8 @@ pub struct VirtioVsock {
     /// The port whose backlog `frame_backlog` serves first, so connections
     /// take turns.
     next_turn: u32,
+    /// Whether a malformed receive buffer was reported, so only the first is.
+    malformed_rx_reported: bool,
 }
 
 impl VirtioVsock {
@@ -438,6 +440,7 @@ impl VirtioVsock {
             conns: HashMap::new(),
             next_port: 40000,
             next_turn: 0,
+            malformed_rx_reported: false,
         }
     }
 
@@ -682,6 +685,13 @@ impl VirtioVsock {
     /// EPIPE, and its reads go on. The guest gets `OP_RST` after the last host
     /// byte.
     pub fn host_gone(&mut self, mem: &GuestRam, host_port: u32) {
+        self.record_host_gone(host_port);
+        self.fill_rx(mem);
+    }
+
+    /// Records that the host end of `host_port` has gone, as
+    /// [`host_gone`](Self::host_gone) does, without filling the receive queue.
+    fn record_host_gone(&mut self, host_port: u32) {
         let Some(conn) = self.conns.get_mut(&host_port) else {
             return;
         };
@@ -705,7 +715,6 @@ impl VirtioVsock {
             self.pending.push_back(pkt);
         }
         self.settle(host_port);
-        self.fill_rx(mem);
     }
 
     /// Returns a header-only packet from host port `host_port` to the agent
@@ -749,6 +758,15 @@ impl VirtioVsock {
     /// as credit. A send that fails for any reason but a full socket means the
     /// host has gone, see [`VirtioVsock::host_gone`].
     pub fn flush_to_host(&mut self, mem: &GuestRam, host_port: u32) -> bool {
+        let needs_writer = self.send_to_host(host_port);
+        self.fill_rx(mem);
+        needs_writer
+    }
+
+    /// Sends what the host socket takes of the guest bytes waiting for it,
+    /// without filling the receive queue, and returns whether the connection
+    /// still needs its bridge writer.
+    fn send_to_host(&mut self, host_port: u32) -> bool {
         let Some(conn) = self.conns.get_mut(&host_port) else {
             return false;
         };
@@ -770,7 +788,7 @@ impl VirtioVsock {
             }
         }
         if gone {
-            self.host_gone(mem, host_port);
+            self.record_host_gone(host_port);
             return false;
         }
         if conn.to_host.is_empty() {
@@ -786,7 +804,6 @@ impl VirtioVsock {
             self.enqueue_credit(host_port, rx);
         }
         self.settle(host_port);
-        self.fill_rx(mem);
         self.conns.contains_key(&host_port)
     }
 
@@ -851,12 +868,16 @@ impl VirtioVsock {
         };
         let served = tx.serve(mem, |chain| {
             if let Some(pkt) = Self::read_tx(mem, chain) {
-                self.handle_pkt(mem, &pkt);
+                self.handle_pkt(&pkt);
             }
             0
         });
         self.queues[TX_QUEUE as usize] = Some(tx);
-        if served {
+        // The replies, and the backlog an accept or new credit lets out, go to
+        // the receive queue in one fill, so one transmit notification returns
+        // at most a queue's worth of malformed buffers.
+        let filled = self.fill_rx_buffers(mem);
+        if served || filled {
             self.state.signal_used_buffer();
         }
     }
@@ -877,7 +898,7 @@ impl VirtioVsock {
     }
 
     /// Acts on one guest -> host packet.
-    fn handle_pkt(&mut self, mem: &GuestRam, pkt: &[u8]) {
+    fn handle_pkt(&mut self, pkt: &[u8]) {
         let Some(h) = Hdr::parse(pkt) else {
             return;
         };
@@ -943,7 +964,7 @@ impl VirtioVsock {
                 };
                 match relay {
                     Relay::Send => {
-                        self.flush_to_host(mem, port);
+                        self.send_to_host(port);
                     }
                     Relay::Drop(rx) => self.enqueue_credit(port, rx),
                     Relay::Overrun => {
@@ -1023,10 +1044,6 @@ impl VirtioVsock {
             // The credit itself was taken above.
             _ => {}
         }
-        // A reply may be waiting, and an accept or new credit may let backlog
-        // out. The TX pass's used-buffer notification covers the buffers filled
-        // here.
-        self.fill_rx_buffers(mem);
     }
 
     /// Queues an `OP_CREDIT_UPDATE` for `host_port` that advertises `fwd_cnt`.
@@ -1036,13 +1053,13 @@ impl VirtioVsock {
     }
 
     /// Returns the writable segments of RX `chain`, in order, or `None` when
-    /// the chain is incomplete.
+    /// the chain is incomplete or has less room than a packet header.
     ///
     /// Linux posts one buffer per packet today, but the chained form is just as
     /// legal: older guests split the header off into its own descriptor, and a
     /// device that reads only the head silently drops the body.
     fn rx_chain(mut chain: DescriptorChain<'_>) -> Option<Vec<(u64, u32)>> {
-        let segs = chain
+        let segs: Vec<(u64, u32)> = chain
             .by_ref()
             .filter(|descriptor| descriptor.is_write_only())
             .map(|descriptor| (descriptor.addr().0, descriptor.len()))
@@ -1050,7 +1067,11 @@ impl VirtioVsock {
         // An incomplete chain may be a cycle that yields one descriptor many
         // times, and the caller would then size a packet from capacity that
         // does not exist.
-        chain.is_complete().then_some(segs)
+        if !chain.is_complete() {
+            return None;
+        }
+        let room: usize = segs.iter().map(|&(_, len)| len as usize).sum();
+        (room >= HDR_LEN).then_some(segs)
     }
 
     /// Trims `pkt` to the `cap` bytes the guest's buffer holds and re-queues
@@ -1115,6 +1136,7 @@ impl VirtioVsock {
     /// Returns whether it put a buffer on the used ring.
     fn fill_rx_queue(&mut self, mem: &GuestRam, rx: &mut Queue) -> bool {
         let mut filled = false;
+        let mut malformed = 0u16;
         loop {
             if self.pending.is_empty() && !self.frame_backlog() {
                 return filled;
@@ -1124,26 +1146,35 @@ impl VirtioVsock {
                 return filled;
             };
             let head = chain.head_index();
-            // A chain this walk refuses is malformed, so the guest cannot
-            // repost its way out of it: this head stays at the front of the
-            // ring and the RX queue stops for that guest. Completing it with a
-            // used length of zero would keep the queue moving; only a guest
-            // that posted a cycle reaches it.
+            // A malformed buffer goes back to the guest empty, and the packet
+            // waits for the next buffer. At most a queue's worth go back per
+            // fill.
             let Some(segs) = Self::rx_chain(chain) else {
-                rx.undo_pop();
-                return filled;
+                if rx.add_used(mem, head, 0) {
+                    filled = true;
+                    if !self.malformed_rx_reported {
+                        self.malformed_rx_reported = true;
+                        stderrln!(
+                            "{LOG_PREFIX} virtio-vsock: a receive buffer is malformed; it goes back \
+                             to the guest empty, and later ones are not reported"
+                        );
+                    }
+                }
+                malformed += 1;
+                if malformed >= rx.size() {
+                    return filled;
+                }
+                continue;
             };
             let cap: usize = segs.iter().map(|&(_, l)| l as usize).sum();
             let waiting = self.pending.front().map_or(0, Vec::len);
-            // A buffer too small for a header cannot carry any packet, and one
-            // that holds exactly a header cannot carry a payload: splitting
-            // there would hand the guest a zero-payload RW packet and push the
-            // whole of the original back, consuming every buffer it posts
-            // without moving a byte. As in `net::inject_rx`, a head that can
-            // never hold what is waiting blocks the packets behind it until the
-            // guest reposts one that can; leave the queue alone rather than
+            // A buffer that holds exactly a header cannot carry a payload:
+            // splitting there would hand the guest a zero-payload RW packet and
+            // push the whole of the original back, consuming every buffer it
+            // posts without moving a byte. As in `net::inject_rx`, such a head
+            // blocks the packets behind it; leave the queue alone rather than
             // complete it with a partial packet.
-            if cap < HDR_LEN || (waiting > cap && cap == HDR_LEN) {
+            if waiting > cap && cap == HDR_LEN {
                 rx.undo_pop();
                 return filled;
             }
@@ -1592,6 +1623,13 @@ mod session_tests {
         GuestRam::from_ranges(&[(0x4000_0000, len)])
     }
 
+    /// Hands `pkt` to `dev` as the only packet of a transmit drain: handles it,
+    /// then fills the receive queue as the end of the drain does.
+    fn transmit(dev: &mut VirtioVsock, mem: &GuestRam, pkt: &[u8]) {
+        dev.handle_pkt(pkt);
+        dev.fill_rx_buffers(mem);
+    }
+
     /// The receive buffer a Linux guest advertises by default.
     const GUEST_BUF_ALLOC: u32 = 256 * 1024;
 
@@ -1887,8 +1925,8 @@ mod session_tests {
         dev.connect(&mem, port_b);
 
         // The guest accepts only A, then tries to write into B.
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port_a, &[]));
-        dev.handle_pkt(&mem, &pkt(OP_RW, port_b, b"STOLEN"));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port_a, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port_b, b"STOLEN"));
         assert!(recv(&mut b_peer, 6).is_none(), "nothing reached session B");
     }
 
@@ -1902,8 +1940,8 @@ mod session_tests {
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap(); // registered but never
                                                     // offered
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"STOLEN"));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"STOLEN"));
         assert!(
             recv(&mut peer, 6).is_none(),
             "the forged accept was refused"
@@ -1919,7 +1957,7 @@ mod session_tests {
         let (dev_side, mut peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port);
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
 
         let mut forged = |mutate: fn(&mut Hdr)| {
             let mut h = Hdr {
@@ -1935,7 +1973,7 @@ mod session_tests {
             mutate(&mut h);
             let mut p = h.to_bytes().to_vec();
             p.extend_from_slice(b"STOLEN");
-            dev.handle_pkt(&mem, &p);
+            transmit(&mut dev, &mem, &p);
         };
         forged(|h| h.dst_cid = 0xbeef);
         forged(|h| h.src_cid = 0xdead);
@@ -1948,7 +1986,7 @@ mod session_tests {
 
         // The same packet, unmutated, still works -- the checks are not
         // blanket.
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"STOLEN"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"STOLEN"));
         assert_eq!(recv(&mut peer, 6).as_deref(), Some(&b"STOLEN"[..]));
     }
 
@@ -1973,7 +2011,7 @@ mod session_tests {
         let (live_dev, _live_peer) = UnixStream::pair().unwrap();
         let live_port = dev.add_conn(live_dev).unwrap();
         dev.connect(&mem, live_port);
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, live_port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, live_port, &[]));
 
         // The two offers are pending packets in their own right. Drop them, so
         // whatever is pending after this point came from a credit request.
@@ -1982,7 +2020,7 @@ mod session_tests {
         let absent_port = live_port + 1000;
         assert!(!dev.conns.contains_key(&absent_port));
         for port in [new_port, offered_port, absent_port] {
-            dev.handle_pkt(&mem, &pkt(OP_CREDIT_REQUEST, port, &[]));
+            transmit(&mut dev, &mem, &pkt(OP_CREDIT_REQUEST, port, &[]));
         }
         assert!(
             dev.pending.is_empty(),
@@ -1991,7 +2029,7 @@ mod session_tests {
 
         // The live session still gets its answer, so the gate is not a blanket
         // refusal.
-        dev.handle_pkt(&mem, &pkt(OP_CREDIT_REQUEST, live_port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_CREDIT_REQUEST, live_port, &[]));
         let reply = dev
             .pending
             .pop_front()
@@ -2012,11 +2050,11 @@ mod session_tests {
         let (dev_side, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
 
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(dev.conns.contains_key(&port), "the session survived");
 
         dev.connect(&mem, port);
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(!dev.conns.contains_key(&port), "its own session closes");
     }
 
@@ -2035,9 +2073,9 @@ mod session_tests {
         }
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port);
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
 
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(!dev.conns.contains_key(&port));
         for socket in [&mut reader, &mut peer] {
             assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0, "the socket saw EOF");
@@ -2054,10 +2092,10 @@ mod session_tests {
 
         dev.connect(&mem, port);
         assert_eq!(dev.conns[&port].state, ConnState::Offered);
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
         assert_eq!(dev.conns[&port].state, ConnState::Connected);
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"hello"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"hello"));
         assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"hello"[..]));
         assert_eq!(dev.conns[&port].rx_cnt, 5, "credit accounted");
     }
@@ -2121,7 +2159,7 @@ mod session_tests {
         let (dev_side, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port); // REQUEST takes used slot 0
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
 
         dev.host_data(&mem, port, &vec![b'x'; PAYLOAD]);
 
@@ -2185,6 +2223,55 @@ mod session_tests {
         );
     }
 
+    /// Asserts that a one-descriptor receive buffer goes back empty and the
+    /// REQUEST a new session sends takes the good buffer behind it.
+    ///
+    /// `first` maps the data address to that descriptor's `(address, length,
+    /// flags)`.
+    fn assert_rx_buffer_goes_back_empty(first: impl FnOnce(u64) -> (u64, u32, u16)) {
+        const BASE: u64 = 0x4000_0000;
+        let mem = mem_of(0x8000);
+        let mut dev = VirtioVsock::new();
+        let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
+        set_ready_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
+        let (addr, len, flags) = first(BASE + 0x3000);
+        mem.write_u64(desc, addr).unwrap();
+        mem.write_u32(desc + 8, len).unwrap();
+        mem.write_u16(desc + 12, flags).unwrap();
+        mem.write_u16(desc + 14, 0).unwrap();
+        mem.write_u16(avail + 4, 0).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap();
+        post_rx_buffer(&mem, desc, avail, 1, BASE + 0x3100);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(stream).unwrap();
+
+        dev.connect(&mem, port);
+
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 2);
+        assert_eq!(mem.read_u32(used + 4).unwrap(), 0, "the malformed head");
+        assert_eq!(mem.read_u32(used + 8).unwrap(), 0, "goes back empty");
+        assert_eq!(mem.read_u32(used + 12).unwrap(), 1, "the next head");
+        assert_eq!(mem.read_u32(used + 16).unwrap(), HDR_LEN as u32);
+    }
+
+    // A writable descriptor that points back at itself is malformed.
+    #[test]
+    fn rx_descriptor_cycle_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| (data, 64, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT));
+    }
+
+    // A buffer with no writable descriptor has no room for a packet header, so
+    // it can never take a packet.
+    #[test]
+    fn rx_buffer_without_room_for_a_header_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| (data, 64, 0));
+    }
+
+    #[test]
+    fn rx_buffer_smaller_than_a_header_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|data| (data, HDR_LEN as u32 - 1, VIRTQ_DESC_F_WRITE));
+    }
+
     // A buffer with room for a header and nothing else is left for the guest to
     // repost, rather than split into a packet that carries no payload.
     // `split_pending` would take `keep = 0`, deliver an RW header describing an
@@ -2202,7 +2289,7 @@ mod session_tests {
         let (dev_side, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port); // REQUEST is header-only and fits exactly
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "the REQUEST landed");
 
         dev.host_data(&mem, port, b"payload");
@@ -2252,7 +2339,7 @@ mod session_tests {
         let (dev_side, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port); // REQUEST takes the first chain
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
         dev.host_data(&mem, port, &vec![b'y'; BODY]);
 
         let entry = used + 4 + 8;
@@ -2285,7 +2372,7 @@ mod session_tests {
         let (dev_side, peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(mem, port);
-        dev.handle_pkt(mem, &credit_pkt(OP_RESPONSE, port, buf_alloc, 0));
+        transmit(&mut dev, mem, &credit_pkt(OP_RESPONSE, port, buf_alloc, 0));
         (dev, port, peer)
     }
 
@@ -2327,6 +2414,68 @@ mod session_tests {
             .collect()
     }
 
+    // Every receive buffer points back at itself, and the guest reposts them
+    // between the packets of one transmit drain. Each RW packet queues a credit
+    // update, and the drain's replies share one fill, so one queue's worth of
+    // buffers goes back, not a queue's worth per packet.
+    #[test]
+    fn malformed_rx_buffers_go_back_at_most_a_queue_per_drain() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
+        let (desc, avail, used, _) = RINGS;
+        for i in 0..8 {
+            let descriptor = desc + i * 16;
+            mem.write_u16(descriptor + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+                .unwrap();
+            mem.write_u16(descriptor + 14, i as u16).unwrap();
+        }
+        let before = mem.read_u16(used + 2).unwrap();
+        let repost = || {
+            let completed = mem.read_u16(used + 2).unwrap();
+            mem.write_u16(avail + 2, completed.wrapping_add(8)).unwrap();
+        };
+
+        // The drain handles each packet with the ring reposted before it, and
+        // fills the receive queue once at the end.
+        for _ in 0..4 {
+            repost();
+            dev.handle_pkt(&pkt(OP_RW, port, b"x"));
+        }
+        repost();
+        dev.fill_rx_buffers(&mem);
+
+        assert_eq!(recv(&mut peer, 4).as_deref(), Some(&b"xxxx"[..]));
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap().wrapping_sub(before),
+            8,
+            "one queue's worth went back"
+        );
+    }
+
+    // The fill at the end of a transmit drain delivers the reply in the same
+    // notification.
+    #[test]
+    fn credit_request_is_answered_in_its_transmit_notification() {
+        let mem = mem_of(0x10000);
+        let (mut dev, port, _peer) = accepted(&mem, GUEST_BUF_ALLOC);
+        let (desc, avail, used, packet) =
+            (BASE + 0xa000, BASE + 0xa200, BASE + 0xa400, BASE + 0xb000);
+        set_ready_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
+        let request = pkt(OP_CREDIT_REQUEST, port, &[]);
+        mem.write(packet, &request).unwrap();
+        mem.write_u64(desc, packet).unwrap();
+        mem.write_u32(desc + 8, request.len() as u32).unwrap();
+        mem.write_u16(avail + 4, 0).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap();
+
+        dev.notify(&mem, TX_QUEUE);
+
+        assert_eq!(
+            delivered_hdrs(&mem).last().map(|hdr| hdr.op),
+            Some(OP_CREDIT_UPDATE)
+        );
+    }
+
     // A Linux guest resets a connection whose RW packets overrun its
     // buf_alloc. The guest then sees ENOBUFS and the host EPIPE.
     #[test]
@@ -2342,7 +2491,11 @@ mod session_tests {
         );
 
         // The guest consumed those 8 KiB.
-        dev.handle_pkt(&mem, &credit_pkt(OP_CREDIT_UPDATE, port, 8192, 8192));
+        transmit(
+            &mut dev,
+            &mem,
+            &credit_pkt(OP_CREDIT_UPDATE, port, 8192, 8192),
+        );
         assert_eq!(
             delivered_since_request(&mem),
             [(OP_RW, 4096), (OP_RW, 4096), (OP_RW, 12000 - 8192)]
@@ -2367,7 +2520,8 @@ mod session_tests {
             "the gate opened without credit"
         );
 
-        dev.handle_pkt(
+        transmit(
+            &mut dev,
             &mem,
             &credit_pkt(OP_CREDIT_UPDATE, port, GUEST_BUF_ALLOC, 0),
         );
@@ -2398,7 +2552,7 @@ mod session_tests {
         let (mut dev, port, _peer) = accepted(&mem, 0);
         let gate = fill_until_gated(&mut dev, &mem, port);
 
-        dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RST, port, &[]));
         assert!(!dev.conns.contains_key(&port));
         assert!(gate.wait(|| false), "the reader would wait forever");
     }
@@ -2416,7 +2570,11 @@ mod session_tests {
         assert!(dev.conns.contains_key(&port));
         assert_eq!(delivered_since_request(&mem), [(OP_RW, 4096)]);
 
-        dev.handle_pkt(&mem, &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096));
+        transmit(
+            &mut dev,
+            &mem,
+            &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096),
+        );
         assert_eq!(
             delivered_since_request(&mem),
             [(OP_RW, 4096), (OP_RW, 6000 - 4096), (OP_SHUTDOWN, 0)]
@@ -2454,7 +2612,7 @@ mod session_tests {
         let mut filler = dev_side.try_clone().unwrap();
         let port = dev.add_conn(dev_side).unwrap();
         dev.connect(&mem, port);
-        dev.handle_pkt(&mem, &pkt(OP_RESPONSE, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RESPONSE, port, &[]));
         dev.pending.clear();
 
         // A blocking socket would hang the fill below, and a vCPU in a send.
@@ -2485,7 +2643,7 @@ mod session_tests {
         let gate = dev.writer_gate(port).unwrap();
         assert!(!gate.wait(|| false), "the writer gate starts closed");
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"held"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"held"));
         assert_eq!(dev.conns[&port].rx_cnt, 0, "credit for bytes not sent");
         assert!(dev.pending.is_empty(), "a credit update went out");
         assert!(gate.wait(|| false), "the writer was not woken");
@@ -2504,14 +2662,14 @@ mod session_tests {
         let mem = mem_of(0x1000);
         let (mut dev, port, _peer, _) = host_socket_full();
         let full = vec![0u8; OUR_BUF_ALLOC as usize];
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, &full));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, &full));
         assert!(
             dev.conns.contains_key(&port),
             "the credit itself was refused"
         );
         assert!(dev.pending.is_empty());
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"x"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"x"));
         assert!(!dev.conns.contains_key(&port));
         let rst = Hdr::parse(&dev.pending.pop_front().unwrap()).unwrap();
         assert_eq!((rst.op, rst.src_port), (OP_RST, port));
@@ -2521,11 +2679,11 @@ mod session_tests {
     fn overrun_reset_carries_the_bytes_the_host_took() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"abc"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"abc"));
         assert_eq!(recv(&mut peer, 3).as_deref(), Some(&b"abc"[..]));
 
         let over = vec![0u8; OUR_BUF_ALLOC as usize + 1];
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, &over));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, &over));
         let rst = last_delivered(&mem);
         assert_eq!((rst.op, rst.fwd_cnt), (OP_RST, 3));
     }
@@ -2540,7 +2698,7 @@ mod session_tests {
         let (mut dev, port, peer) = accepted(&mem, GUEST_BUF_ALLOC);
         drop(peer);
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"late"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"late"));
         let hdrs = delivered_hdrs(&mem);
         assert_eq!(
             hdrs.iter()
@@ -2551,7 +2709,7 @@ mod session_tests {
         );
 
         // A second failed send changes nothing.
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"more"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"more"));
         dev.host_eof(&mem, port);
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(
@@ -2571,12 +2729,16 @@ mod session_tests {
         drop(peer);
 
         // The guest still advertises its 4 KiB, so the write grants nothing.
-        dev.handle_pkt(&mem, &guest_pkt(OP_RW, port, (4096, 0), b"echo"));
+        transmit(&mut dev, &mem, &guest_pkt(OP_RW, port, (4096, 0), b"echo"));
         dev.host_eof(&mem, port);
         assert!(dev.conns.contains_key(&port), "the backlog was dropped");
 
         // The guest consumed the first 4 KiB.
-        dev.handle_pkt(&mem, &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096));
+        transmit(
+            &mut dev,
+            &mem,
+            &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096),
+        );
         let got = delivered_since_request(&mem);
         let host_bytes: usize = got
             .iter()
@@ -2594,8 +2756,8 @@ mod session_tests {
     fn guest_close_waits_for_the_host_to_take_its_bytes() {
         let mem = mem_of(0x1000);
         let (mut dev, port, mut peer, filled) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"tail"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(
             dev.conns.contains_key(&port),
             "the guest's tail was dropped"
@@ -2615,14 +2777,14 @@ mod session_tests {
     fn host_close_leaves_guest_bytes_to_the_writer() {
         let mem = mem_of(0x1000);
         let (mut dev, port, peer, _) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"reply"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"reply"));
         drop(peer);
         assert!(!dev.host_eof(&mem, port), "a full close read as half");
         let shutdown = Hdr::parse(&dev.pending.pop_front().unwrap()).unwrap();
         assert_eq!((shutdown.op, shutdown.flags), (OP_SHUTDOWN, SHUTDOWN_BOTH));
         // A Linux guest with nothing left to read answers a full shutdown
         // with OP_RST at once.
-        dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RST, port, &[]));
         assert!(
             dev.conns.contains_key(&port),
             "the connection went before the writer"
@@ -2642,8 +2804,8 @@ mod session_tests {
     fn guest_reset_keeps_bytes_the_host_has_not_taken() {
         let mem = mem_of(0x1000);
         let (mut dev, port, mut peer, filled) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
-        dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"tail"));
+        transmit(&mut dev, &mem, &pkt(OP_RST, port, &[]));
         assert!(
             dev.conns.contains_key(&port),
             "the guest's tail was dropped"
@@ -2664,8 +2826,9 @@ mod session_tests {
     fn guest_close_gets_a_reset_once_its_bytes_are_out() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"bye"));
-        dev.handle_pkt(
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"bye"));
+        transmit(
+            &mut dev,
             &mem,
             &shutdown_from_guest(port, SHUTDOWN_RCV | SHUTDOWN_SEND),
         );
@@ -2680,8 +2843,8 @@ mod session_tests {
     fn guest_half_close_gets_no_reset() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"req"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"req"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert_eq!(recv(&mut peer, 3).as_deref(), Some(&b"req"[..]));
         assert!(
             delivered_since_request(&mem)
@@ -2695,7 +2858,7 @@ mod session_tests {
     fn host_half_close_keeps_guest_bytes_the_host_has_not_taken() {
         let mem = mem_of(0x1000);
         let (mut dev, port, mut peer, filled) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"reply"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"reply"));
         peer.shutdown(Shutdown::Write).unwrap();
         dev.host_eof(&mem, port);
         let shutdown = Hdr::parse(&dev.pending.pop_front().unwrap()).unwrap();
@@ -2708,7 +2871,7 @@ mod session_tests {
         assert!(recv(&mut peer, filled).is_some());
         assert!(dev.flush_to_host(&mem, port), "the host still reads");
         assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"reply"[..]));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
     }
@@ -2732,8 +2895,8 @@ mod session_tests {
     fn guest_shut_wr_keeps_host_bytes_flowing_to_the_guest() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"req"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"req"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert!(dev.conns.contains_key(&port), "both directions ended");
         assert_eq!(recv(&mut peer, 3).as_deref(), Some(&b"req"[..]));
         assert_eq!(
@@ -2766,8 +2929,8 @@ mod session_tests {
     fn guest_shut_wr_waits_for_the_host_to_take_the_tail() {
         let mem = mem_of(0x1000);
         let (mut dev, port, mut peer, filled) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"tail"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert!(recv(&mut peer, filled).is_some());
         assert!(dev.flush_to_host(&mem, port));
         assert_eq!(recv(&mut peer, 4).as_deref(), Some(&b"tail"[..]));
@@ -2785,7 +2948,7 @@ mod session_tests {
     fn host_shut_wr_lets_the_guest_reply() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"hi"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"hi"));
         assert_eq!(recv(&mut peer, 2).as_deref(), Some(&b"hi"[..]));
         assert!(dev.host_data(&mem, port, b"REQ\n").is_none());
         peer.shutdown(Shutdown::Write).unwrap();
@@ -2800,10 +2963,10 @@ mod session_tests {
         assert_eq!((shutdown.flags, shutdown.fwd_cnt), (SHUTDOWN_SEND, 2));
         assert!(dev.conns.contains_key(&port), "the host end was dropped");
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"REPLY 4\n"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"REPLY 4\n"));
         assert_eq!(recv(&mut peer, 8).as_deref(), Some(&b"REPLY 4\n"[..]));
 
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
         assert_eq!(last_delivered(&mem).op, OP_RST, "the guest close waits 8 s");
@@ -2821,8 +2984,8 @@ mod session_tests {
         dev.host_eof(&mem, port);
         assert_eq!(last_delivered(&mem).flags, SHUTDOWN_SEND);
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"last"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"last"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(recv(&mut peer, 4).as_deref(), Some(&b"last"[..]));
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
@@ -2843,7 +3006,7 @@ mod session_tests {
         assert_eq!(last_delivered(&mem).flags, SHUTDOWN_SEND);
 
         drop(peer);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"late"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"late"));
         assert_eq!(last_delivered(&mem).op, OP_RST);
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(resets_delivered(&mem), 1);
@@ -2857,7 +3020,7 @@ mod session_tests {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, 0);
         assert!(dev.host_data(&mem, port, b"unread").is_none());
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
         assert!(dev.conns[&port].backlog.is_empty());
         let gate = dev.host_data(&mem, port, b"more");
         assert!(
@@ -2866,7 +3029,7 @@ mod session_tests {
         );
         assert!(dev.conns[&port].backlog.is_empty());
 
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"still"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"still"));
         assert_eq!(recv(&mut peer, 5).as_deref(), Some(&b"still"[..]));
     }
 
@@ -2874,9 +3037,9 @@ mod session_tests {
     fn guest_rst_after_a_half_close_ends_the_session() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert!(dev.conns.contains_key(&port));
-        dev.handle_pkt(&mem, &pkt(OP_RST, port, &[]));
+        transmit(&mut dev, &mem, &pkt(OP_RST, port, &[]));
         assert!(!dev.conns.contains_key(&port));
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the host saw EOF");
         assert_eq!(resets_delivered(&mem), 0);
@@ -2889,12 +3052,12 @@ mod session_tests {
         let mem = mem_of(0x10000);
         let (mut dev, port, _peer) = accepted(&mem, 0);
         let gate = fill_until_gated(&mut dev, &mem, port);
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
         assert!(dev.conns[&port].backlog.is_empty());
         assert!(!gate.wait(|| false), "the reader goes on reading");
 
         // Dropping the connection still lets the reader go.
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert!(!dev.conns.contains_key(&port));
         assert!(gate.wait(|| false), "the reader waits forever");
     }
@@ -2906,8 +3069,8 @@ mod session_tests {
     fn guest_close_with_a_tail_keeps_reading_host_bytes() {
         let mem = mem_of(0x1000);
         let (mut dev, port, mut peer, filled) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"tail"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_BOTH));
         assert!(dev.conns.contains_key(&port), "the tail was dropped");
         assert!(
             dev.host_data(&mem, port, b"more").is_none(),
@@ -2927,12 +3090,12 @@ mod session_tests {
     fn guest_close_after_shut_rd_opens_the_reader_gate() {
         let mem = mem_of(0x1000);
         let (mut dev, port, _peer, _filled) = host_socket_full();
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"tail"));
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"tail"));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
         let gate = dev.host_data(&mem, port, b"more").unwrap();
         assert!(!gate.wait(|| false), "the reader goes on reading");
 
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_SEND));
         assert!(dev.conns.contains_key(&port), "the tail was dropped");
         assert!(gate.wait(|| false), "the reader still waits");
     }
@@ -2966,7 +3129,7 @@ mod session_tests {
     fn guest_shut_rd_hears_only_of_a_full_host_close() {
         let mem = mem_of(0x10000);
         let (mut dev, port, peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
+        transmit(&mut dev, &mem, &shutdown_from_guest(port, SHUTDOWN_RCV));
         peer.shutdown(Shutdown::Write).unwrap();
         assert!(dev.host_eof(&mem, port), "the host is half open");
         assert!(
@@ -2989,7 +3152,7 @@ mod session_tests {
     fn host_close_after_a_half_close_reaches_an_idle_guest() {
         let mem = mem_of(0x10000);
         let (mut dev, port, mut peer) = accepted(&mem, GUEST_BUF_ALLOC);
-        dev.handle_pkt(&mem, &pkt(OP_RW, port, b"hi"));
+        transmit(&mut dev, &mem, &pkt(OP_RW, port, b"hi"));
         assert_eq!(recv(&mut peer, 2).as_deref(), Some(&b"hi"[..]));
         peer.shutdown(Shutdown::Write).unwrap();
         assert!(dev.host_eof(&mem, port), "the host is half open");
@@ -3040,7 +3203,11 @@ mod session_tests {
         assert!(dev.host_eof(&mem, port), "the host is half open");
         drop(peer);
 
-        dev.handle_pkt(&mem, &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096));
+        transmit(
+            &mut dev,
+            &mem,
+            &credit_pkt(OP_CREDIT_UPDATE, port, 4096, 4096),
+        );
         let last = last_delivered(&mem);
         assert_eq!((last.op, last.flags), (OP_SHUTDOWN, SHUTDOWN_BOTH));
         assert!(!dev.conns.contains_key(&port));
