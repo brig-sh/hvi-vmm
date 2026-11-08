@@ -53,8 +53,7 @@ use crate::memory::GuestRam;
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, tap, DescriptorChain, DeviceState, Queue, QueueConfig, SinkSlot,
-    QUEUE_MAX_SIZE,
+    self, read_config_bytes, tap, DescriptorChain, DeviceState, Queue, SinkSlot, QUEUE_MAX_SIZE,
 };
 use crate::events::CapturedEvent;
 use crate::io_threads::HostWork;
@@ -1151,11 +1150,11 @@ impl virtio::Device for VirtioNet {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<QueueConfig>,
+        queues: Vec<Option<Queue>>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()> {
-        if let Ok([rx, tx]) = <[QueueConfig; 2]>::try_from(queues) {
-            self.queues = [rx.into_queue(), tx.into_queue()];
+        if let Ok(queues) = <[Option<Queue>; 2]>::try_from(queues) {
+            self.queues = queues;
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -1706,13 +1705,7 @@ mod tests {
             used_ring: used,
         };
         let queues = (0..2)
-            .map(|queue| {
-                if queue == index {
-                    testing::ready_queue(QUEUE_MAX_SIZE, rings, mem)
-                } else {
-                    QueueConfig::new(QUEUE_MAX_SIZE)
-                }
-            })
+            .map(|queue| (queue == index).then(|| testing::ready_queue(QUEUE_MAX_SIZE, rings, mem)))
             .collect();
         let (interrupt, line) = testing::enabled_interrupt();
         net.activate(mem, 0, queues, interrupt).unwrap();

@@ -39,8 +39,7 @@ use crate::LOG_PREFIX;
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QueueConfig, SinkSlot,
-    QUEUE_MAX_SIZE,
+    self, read_config_bytes, DescriptorChain, DeviceState, Queue, SinkSlot, QUEUE_MAX_SIZE,
 };
 use crate::events::CapturedEvent;
 use crate::plugin::IoSink;
@@ -508,11 +507,11 @@ impl virtio::Device for VirtioBlk {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<QueueConfig>,
+        queues: Vec<Option<Queue>>,
         interrupt: Arc<Interrupt>,
     ) -> std::io::Result<()> {
-        if let Ok([queue]) = <[QueueConfig; 1]>::try_from(queues) {
-            self.queue = queue.into_queue();
+        if let Ok([queue]) = <[Option<Queue>; 1]>::try_from(queues) {
+            self.queue = queue;
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -706,7 +705,7 @@ mod queue_tests {
         };
         let queue = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
         let (interrupt, _) = testing::enabled_interrupt();
-        blk.activate(mem, 0, vec![queue], interrupt).unwrap();
+        blk.activate(mem, 0, vec![Some(queue)], interrupt).unwrap();
         blk
     }
 
@@ -980,7 +979,7 @@ mod capacity_tests {
             };
             let queue = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
             let (interrupt, _) = testing::enabled_interrupt();
-            blk.activate(mem, 0, vec![queue], interrupt).unwrap();
+            blk.activate(mem, 0, vec![Some(queue)], interrupt).unwrap();
         }
         let (hdr, data, status) = (BASE + 0x4000, BASE + 0x5000, BASE + 0x6000);
         mem.write_u32(hdr, typ).unwrap();

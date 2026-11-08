@@ -42,7 +42,7 @@ use crate::config::CachePolicy;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QueueConfig, QUEUE_MAX_SIZE,
+    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QUEUE_MAX_SIZE,
 };
 use crate::memory::GuestRam;
 
@@ -5819,11 +5819,11 @@ impl virtio::Device for VirtioFs {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<QueueConfig>,
+        queues: Vec<Option<Queue>>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()> {
-        if let Ok([hiprio, request]) = <[QueueConfig; NUM_QUEUES]>::try_from(queues) {
-            self.queues = [hiprio.into_queue(), request.into_queue()];
+        if let Ok(queues) = <[Option<Queue>; NUM_QUEUES]>::try_from(queues) {
+            self.queues = queues;
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -12487,8 +12487,7 @@ mod tests {
             avail_ring: avail,
             used_ring: used,
         };
-        dev.queues[usize::from(REQ_QUEUE)] =
-            testing::ready_queue(QUEUE_MAX_SIZE, rings, mem).into_queue();
+        dev.queues[usize::from(REQ_QUEUE)] = Some(testing::ready_queue(QUEUE_MAX_SIZE, rings, mem));
         if !dev.state.is_active() {
             dev.state = DeviceState::Active(testing::enabled_interrupt().0);
         }

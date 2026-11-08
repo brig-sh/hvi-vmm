@@ -524,21 +524,22 @@ impl<D: virtio::Device> Transport<D> {
                 .accepts_features(driver_features)
     }
 
-    /// Activates the device with the queues.
+    /// Activates the device with the queues the driver made ready.
     ///
     /// Returns the indexes of the queues that were ready. When the device
     /// refuses, STATUS gets NEEDS_RESET, a configuration change is raised and
     /// no index is returned. STATUS gets DRIVER_OK only once the device is
     /// activated, so a notification is passed only to an activated device.
     fn activate(&self, state: &mut TransportState) -> Vec<u32> {
-        let queues = std::mem::take(&mut state.queues);
-        state.ready_at_activation = queues.iter().map(QueueConfig::is_ready).collect();
+        let configs = std::mem::take(&mut state.queues);
+        state.ready_at_activation = configs.iter().map(QueueConfig::is_ready).collect();
         let ready = (0u32..)
             .zip(&state.ready_at_activation)
             .filter(|&(_, &ready)| ready)
             .map(|(index, _)| index)
             .collect();
         self.interrupt.enable();
+        let queues = configs.into_iter().map(QueueConfig::into_queue).collect();
         let activated = self.device.lock().unwrap().activate(
             &self.ram,
             state.driver_features,
@@ -636,6 +637,7 @@ pub(crate) mod testing {
 
     use super::*;
     use crate::devices::bus::Device as _;
+    use crate::devices::virtio::Queue;
 
     /// A line that holds the level it was last set to.
     #[derive(Default)]
@@ -670,7 +672,7 @@ pub(crate) mod testing {
 
     /// Returns a queue of up to `max_size` descriptors, programmed at `rings`
     /// and ready, as a transport hands it over at activation.
-    pub(crate) fn ready_queue(max_size: u16, rings: Rings, ram: &GuestRam) -> QueueConfig {
+    pub(crate) fn ready_queue(max_size: u16, rings: Rings, ram: &GuestRam) -> Queue {
         let mut queue = QueueConfig::new(max_size);
         queue.set_num(rings.size);
         queue.set_desc_lo(rings.desc_table as u32);
@@ -680,8 +682,9 @@ pub(crate) mod testing {
         queue.set_used_lo(rings.used_ring as u32);
         queue.set_used_hi((rings.used_ring >> 32) as u32);
         queue.set_ready(1, ram);
-        assert!(queue.is_ready(), "the rings should fit in guest RAM");
         queue
+            .into_queue()
+            .expect("the rings should fit in guest RAM")
     }
 
     /// Returns an enabled interrupt and its line.
@@ -832,7 +835,7 @@ mod tests {
     use super::testing::{self, Driver, Rings};
     use super::*;
     use crate::devices::bus::Device as _;
-    use crate::devices::virtio::{read_config_bytes, DeviceState};
+    use crate::devices::virtio::{read_config_bytes, DeviceState, Queue};
     use crate::events::CapturedEvent;
     use crate::plugin::IoSink;
 
@@ -878,7 +881,7 @@ mod tests {
     /// the transport hands it.
     struct Stub {
         /// The queues the stub was last activated with.
-        queues: Vec<QueueConfig>,
+        queues: Vec<Option<Queue>>,
         /// The features the stub was last activated with.
         driver_features: u64,
         /// The activation state, with the interrupt once active.
@@ -939,7 +942,7 @@ mod tests {
             &mut self,
             _ram: &GuestRam,
             driver_features: u64,
-            queues: Vec<QueueConfig>,
+            queues: Vec<Option<Queue>>,
             interrupt: Arc<Interrupt>,
         ) -> io::Result<()> {
             if self.refuse_activation {
@@ -1224,7 +1227,7 @@ mod tests {
         assert_eq!(driver.read(STATUS), STATUS_STEPS[3]);
         let device = driver.device.lock().unwrap();
         assert!(device.state.is_active());
-        let ready: Vec<bool> = device.queues.iter().map(QueueConfig::is_ready).collect();
+        let ready: Vec<bool> = device.queues.iter().map(Option::is_some).collect();
         assert_eq!(ready, [true, false]);
     }
 
