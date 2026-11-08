@@ -88,7 +88,7 @@ mod device {
 
     use crate::config::FsConfig;
     use crate::devices::virtio::mmio::Interrupt;
-    use crate::devices::virtio::{self, read_config_bytes, QueueConfig};
+    use crate::devices::virtio::{self, read_config_bytes, Queue};
     use crate::io_threads::HostWork;
     use crate::memory::GuestRam;
     use crate::teardown::StopToken;
@@ -473,14 +473,15 @@ mod device {
         /// Hands the features the driver accepted, `driver_features`, guest RAM
         /// and the ready `queues` to the daemon.
         ///
-        /// Each ready queue has a size and rings in guest RAM, which
-        /// [`QueueConfig::set_ready`] checks. A queue that is not ready is left
-        /// disabled, which the guest sees as a queue that does not answer.
+        /// Each ready queue has a size and aligned rings in guest RAM, which
+        /// [`QueueConfig::set_ready`](crate::devices::virtio::QueueConfig::set_ready)
+        /// checks. A queue that is not ready is left disabled, which the guest
+        /// sees as a queue that does not answer.
         fn hand_over(
             &mut self,
             mem: &GuestRam,
             driver_features: u64,
-            queues: &[QueueConfig],
+            queues: &[Option<Queue>],
         ) -> io::Result<()> {
             let mut features = driver_features;
             if self.protocol_features_offered {
@@ -494,13 +495,13 @@ mod device {
                 .send("SET_MEM_TABLE", |f| f.set_mem_table(&regions))?;
 
             for (index, queue) in queues.iter().enumerate() {
-                if !queue.is_ready() {
+                let Some(queue) = queue else {
                     stderrln!(
                         "{LOG_PREFIX} virtio-fs {}: queue {index} is not ready; leaving it disabled",
                         self.tag
                     );
                     continue;
-                }
+                };
                 // The daemon is sent each ring's address in this process, which
                 // its memory table maps.
                 let [desc, avail, used] = queue
@@ -588,7 +589,7 @@ mod device {
             &mut self,
             ram: &GuestRam,
             driver_features: u64,
-            queues: Vec<QueueConfig>,
+            queues: Vec<Option<Queue>>,
             _interrupt: Arc<Interrupt>,
         ) -> io::Result<()> {
             if let Err(e) = self.hand_over(ram, driver_features, &queues) {

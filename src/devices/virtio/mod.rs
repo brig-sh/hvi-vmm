@@ -82,8 +82,8 @@ pub(crate) trait Device: Send {
     /// [`queue_max_sizes`](Self::queue_max_sizes).
     ///
     /// `driver_features` holds the features the driver accepted. The device
-    /// signals its notifications through `interrupt`. `queues` includes any
-    /// queue the driver did not make ready.
+    /// signals its notifications through `interrupt`. `queues` has `None` for
+    /// each queue the driver did not make ready.
     ///
     /// # Errors
     ///
@@ -93,7 +93,7 @@ pub(crate) trait Device: Send {
         &mut self,
         ram: &GuestRam,
         driver_features: u64,
-        queues: Vec<QueueConfig>,
+        queues: Vec<Option<Queue>>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()>;
 

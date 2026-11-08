@@ -132,18 +132,8 @@ impl QueueConfig {
 
     /// Returns the address and the length in bytes of the descriptor table, the
     /// avail ring and the used ring, in that order.
-    ///
-    /// The lengths are those of a split virtqueue of `n` entries, the
-    /// programmed size: `16*n` for the descriptor table, `6+2*n` for the avail
-    /// ring and `6+8*n` for the used ring, each ring with its 2-byte event
-    /// suffix.
-    pub(crate) fn ring_extents(&self) -> [(u64, u64); 3] {
-        let n = u64::from(self.num);
-        [
-            (self.desc, 16 * n),
-            (self.avail, 6 + 2 * n),
-            (self.used, 6 + 8 * n),
-        ]
+    fn ring_extents(&self) -> [(u64, u64); 3] {
+        ring_extents(self.size(), [self.desc, self.avail, self.used])
     }
 
     /// Returns whether the queue has a size and its three rings are in guest
@@ -251,6 +241,20 @@ impl Queue {
             })
     }
 
+    /// Returns the address and the length in bytes of the descriptor table, the
+    /// avail ring and the used ring, in that order.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ring_extents(&self) -> [(u64, u64); 3] {
+        ring_extents(
+            self.size(),
+            [
+                self.inner.desc_table(),
+                self.inner.avail_ring(),
+                self.inner.used_ring(),
+            ],
+        )
+    }
+
     /// Puts the chain [`pop`](Self::pop) returned last back at the front of the
     /// queue, so the next `pop` returns it again.
     pub(crate) fn undo_pop(&mut self) {
@@ -342,6 +346,17 @@ impl Iterator for DescriptorChain<'_> {
         self.complete = !descriptor.has_next();
         Some(descriptor)
     }
+}
+
+/// Returns the address and the length in bytes of the descriptor table, the
+/// avail ring and the used ring of a split virtqueue of `size` entries whose
+/// rings start at `desc`, `avail` and `used`.
+///
+/// The lengths are `16*n` for the descriptor table, `6+2*n` for the avail ring
+/// and `6+8*n` for the used ring, each ring with its 2-byte event suffix.
+fn ring_extents(size: u16, [desc, avail, used]: [u64; 3]) -> [(u64, u64); 3] {
+    let n = u64::from(size);
+    [(desc, 16 * n), (avail, 6 + 2 * n), (used, 6 + 8 * n)]
 }
 
 fn set_lo(v: u64, lo: u32) -> u64 {

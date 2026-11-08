@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QueueConfig, QUEUE_MAX_SIZE,
+    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QUEUE_MAX_SIZE,
 };
 use crate::memory::GuestRam;
 use crate::teardown::{poll, pollfd, StopToken, HANGUP};
@@ -1199,11 +1199,11 @@ impl virtio::Device for VirtioVsock {
         &mut self,
         _ram: &GuestRam,
         _driver_features: u64,
-        queues: Vec<QueueConfig>,
+        queues: Vec<Option<Queue>>,
         interrupt: Arc<Interrupt>,
     ) -> std::io::Result<()> {
-        if let Ok([rx, tx, event]) = <[QueueConfig; 3]>::try_from(queues) {
-            self.queues = [rx.into_queue(), tx.into_queue(), event.into_queue()];
+        if let Ok(queues) = <[Option<Queue>; 3]>::try_from(queues) {
+            self.queues = queues;
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -1644,8 +1644,7 @@ mod session_tests {
             avail_ring: avail,
             used_ring: used,
         };
-        dev.queues[usize::from(index)] =
-            testing::ready_queue(QUEUE_MAX_SIZE, rings, mem).into_queue();
+        dev.queues[usize::from(index)] = Some(testing::ready_queue(QUEUE_MAX_SIZE, rings, mem));
         if !dev.state.is_active() {
             dev.state = DeviceState::Active(testing::enabled_interrupt().0);
         }
