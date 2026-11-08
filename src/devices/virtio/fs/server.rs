@@ -42,8 +42,7 @@ use crate::config::CachePolicy;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DeviceState, QueueConfig, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
-    VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QueueConfig, QUEUE_MAX_SIZE,
 };
 use crate::memory::GuestRam;
 
@@ -1218,8 +1217,9 @@ pub struct VirtioFs {
     ids: GuestIds,
     /// The mount tag, zero-padded, which the configuration space holds.
     tag: [u8; TAG_LEN],
-    /// The hiprio and request queues, in that order.
-    queues: [QueueConfig; NUM_QUEUES],
+    /// The hiprio and request queues, in that order, each `None` before
+    /// activation, after reset, or when the driver did not make it ready.
+    queues: [Option<Queue>; NUM_QUEUES],
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// The waker of the device's worker thread, or `None` until one is set.
@@ -1436,7 +1436,7 @@ impl VirtioFs {
             writable,
             cache_policy,
             tag: tag_buf,
-            queues: std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE)),
+            queues: [None, None],
             state: DeviceState::Inactive,
             waker: None,
             pending_wake: None,
@@ -1599,7 +1599,7 @@ impl VirtioFs {
     /// touches the host filesystem on the vCPU thread, once per reset and
     /// bounded by the handle limit.
     fn end_session(&mut self) {
-        self.queues = std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE));
+        self.queues = [None, None];
         self.state = DeviceState::Inactive;
         self.pending_wake = None;
         self.notified.store(0, Ordering::Release);
@@ -1715,7 +1715,7 @@ impl VirtioFs {
         let mut answered = false;
         let waiters = std::mem::take(&mut self.lock_waiters);
         for waiter in waiters {
-            if !self.queues[waiter.queue_idx].is_ready() {
+            if self.queues[waiter.queue_idx].is_none() {
                 continue;
             }
             let answer = match self.handles.get(&waiter.fh) {
@@ -1737,7 +1737,7 @@ impl VirtioFs {
                 Err(errno) => error_response(waiter.unique, errno),
             };
             let used = Self::write_reply(mem, &waiter.output, &response);
-            self.queues[waiter.queue_idx].push_used(mem, waiter.head, used);
+            self.add_used(mem, waiter.queue_idx, waiter.head, used);
             answered = true;
         }
         (answered, !self.lock_waiters.is_empty())
@@ -1745,46 +1745,58 @@ impl VirtioFs {
 
     /// Services at most `budget` chains from `queue_idx`.
     ///
-    /// Returns whether it pushed a used buffer, and whether the queue still had
-    /// chains past the budget.
+    /// Returns whether it put a chain on the used ring, and whether the queue
+    /// still has chains available.
     pub(crate) fn process_queue_bounded(
         &mut self,
         mem: &GuestRam,
         queue_idx: usize,
         budget: u16,
     ) -> (bool, bool) {
-        if !self.queues[queue_idx].is_ready() {
-            return (false, false);
-        }
-        let Some(pending) = self.queues[queue_idx].pending(mem) else {
-            return (false, false);
-        };
-        let take = pending.min(budget);
-        let mut last = self.queues[queue_idx].last_avail();
+        // At most a queue's worth per pass.
         let mut served = false;
-        for _ in 0..take {
-            let Some(slot) = self.queues[queue_idx].avail_slot(last) else {
+        for _ in 0..budget.min(self.queue_size(queue_idx)) {
+            let Some(chain) = self.queues[queue_idx]
+                .as_mut()
+                .and_then(|queue| queue.pop(mem))
+            else {
                 break;
             };
-            let Ok(head) = mem.read_u16(slot) else {
-                break;
-            };
+            let head = chain.head_index();
             // A chain without a reply yet is a SETLKW parked on a held lock,
             // which `retry_lock_waiters` completes.
-            if let Some(used) = self.handle_chain(mem, queue_idx, head) {
-                self.queues[queue_idx].push_used(mem, head, used);
-                served = true;
+            if let Some(used) = self.handle_chain(mem, queue_idx, chain) {
+                served |= self.add_used(mem, queue_idx, head, used);
             }
-            last = last.wrapping_add(1);
         }
-        self.queues[queue_idx].set_last_avail(last);
-        (served, take < pending)
+        let remaining = self.queues[queue_idx]
+            .as_ref()
+            .is_some_and(|queue| !queue.is_empty(mem));
+        (served, remaining)
+    }
+
+    /// Puts chain `head` of queue `queue_idx` on its used ring with `len`
+    /// device-written bytes, and returns whether it did.
+    fn add_used(&mut self, mem: &GuestRam, queue_idx: usize, head: u16, len: u32) -> bool {
+        self.queues[queue_idx]
+            .as_mut()
+            .is_some_and(|queue| queue.add_used(mem, head, len))
+    }
+
+    /// Returns the size of queue `queue_idx`, or 0 when it is not ready.
+    fn queue_size(&self, queue_idx: usize) -> u16 {
+        self.queues[queue_idx].as_ref().map_or(0, Queue::size)
     }
 
     /// Serves one chain and returns the length of its reply, or `None` for a
     /// SETLKW that is now parked and will be completed later.
-    fn handle_chain(&mut self, mem: &GuestRam, queue_idx: usize, head: u16) -> Option<u32> {
-        let q = &self.queues[queue_idx];
+    fn handle_chain(
+        &mut self,
+        mem: &GuestRam,
+        queue_idx: usize,
+        mut chain: DescriptorChain<'_>,
+    ) -> Option<u32> {
+        let head = chain.head_index();
         // Descriptor-lists, not a concatenated buffer: Linux always lays a
         // request out as header(+small fixed args) in the input descriptors
         // and any bulk payload in its own descriptor(s), which is what lets
@@ -1793,35 +1805,23 @@ impl VirtioFs {
         let mut input: Vec<(u64, u32)> = Vec::new();
         let mut output: Vec<(u64, u32)> = Vec::new();
         let mut total_in = 0usize;
-        let mut desc = head;
-        for _ in 0..q.size() {
-            let Some(da) = q.desc_addr(desc) else {
-                return Some(0);
-            };
-            let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
-                mem.read_u64(da),
-                mem.read_u32(da + 8),
-                mem.read_u16(da + 12),
-                mem.read_u16(da + 14),
-            ) else {
-                return Some(0);
-            };
-            if flags & VIRTQ_DESC_F_WRITE != 0 {
-                output.push((addr, len));
+        for descriptor in chain.by_ref() {
+            let segment = (descriptor.addr().0, descriptor.len());
+            if descriptor.is_write_only() {
+                output.push(segment);
             } else {
-                let Some(total) = total_in.checked_add(len as usize) else {
+                let Some(total) = total_in.checked_add(descriptor.len() as usize) else {
                     return Some(0);
                 };
                 if total > MAX_REQUEST {
                     return Some(0);
                 }
                 total_in = total;
-                input.push((addr, len));
+                input.push(segment);
             }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            desc = next;
+        }
+        if !chain.is_complete() {
+            return Some(0);
         }
         if total_in < IN_HEADER_LEN {
             return Some(0);
@@ -1850,7 +1850,7 @@ impl VirtioFs {
             Reply::Direct(n) => Some(n as u32),
             Reply::Buffered(response) => {
                 if let Some(pending) = self.lock_to_park.take() {
-                    let cap = LockWaiter::cap(self.queues[queue_idx].size());
+                    let cap = LockWaiter::cap(self.queue_size(queue_idx));
                     let held: usize = self
                         .lock_waiters
                         .iter()
@@ -2133,18 +2133,18 @@ impl VirtioFs {
         }
         // The largest request, in pages. Linux sizes it to its ring less four
         // entries of headers, so a request may take the whole ring, and then
-        // one parked lock waiter leaves it nowhere to go: a holder writing
-        // a megabyte under its lock would wait for the waiter, which waits
-        // for it. What is offered fits beside the waiters' quarter instead.
-        // The queues are programmed before the mount sends INIT, both to the
-        // size this device advertises; the smaller is the safe one should
-        // they differ. No queue programmed yet gets the full size, as before.
+        // one parked lock waiter leaves it nowhere to go: a holder writing a
+        // megabyte under its lock would wait for the waiter, which waits for
+        // it. What is offered fits beside the waiters' quarter instead. The
+        // queues are ready before the mount sends INIT, both at the size this
+        // device advertises; the smaller is the safe one should they differ.
+        // With no queue ready, INIT offers the full size.
         const FUSE_HEADER_OVERHEAD: u32 = 4;
         let ring = self
             .queues
             .iter()
-            .map(|queue| queue.size())
-            .filter(|&size| size != 0)
+            .flatten()
+            .map(Queue::size)
             .min()
             .unwrap_or(0);
         let max_pages = if ring == 0 {
@@ -5822,8 +5822,8 @@ impl virtio::Device for VirtioFs {
         queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()> {
-        if let Ok(queues) = <[QueueConfig; NUM_QUEUES]>::try_from(queues) {
-            self.queues = queues;
+        if let Ok([hiprio, request]) = <[QueueConfig; NUM_QUEUES]>::try_from(queues) {
+            self.queues = [hiprio.into_queue(), request.into_queue()];
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -7482,7 +7482,7 @@ mod tests {
     use std::task::Wake;
 
     use crate::devices::virtio::mmio::testing::{self, Rings};
-    use crate::devices::virtio::Device as _;
+    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -12487,7 +12487,8 @@ mod tests {
             avail_ring: avail,
             used_ring: used,
         };
-        dev.queues[usize::from(REQ_QUEUE)] = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
+        dev.queues[usize::from(REQ_QUEUE)] =
+            testing::ready_queue(QUEUE_MAX_SIZE, rings, mem).into_queue();
         if !dev.state.is_active() {
             dev.state = DeviceState::Active(testing::enabled_interrupt().0);
         }
