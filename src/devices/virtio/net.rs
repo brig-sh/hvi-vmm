@@ -53,8 +53,8 @@ use crate::memory::GuestRam;
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, tap, DeviceState, QueueConfig, SinkSlot, QUEUE_MAX_SIZE,
-    VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, tap, DescriptorChain, DeviceState, Queue, QueueConfig, SinkSlot,
+    QUEUE_MAX_SIZE,
 };
 use crate::events::CapturedEvent;
 use crate::io_threads::HostWork;
@@ -575,8 +575,9 @@ impl TapRelay {
 
 /// A virtio-net device with a user-space capture backend.
 pub struct VirtioNet {
-    /// The RX and TX queues, in that order.
-    queues: [QueueConfig; 2],
+    /// The RX and TX queues, in that order, each `None` before activation,
+    /// after reset, or when the driver did not make it ready.
+    queues: [Option<Queue>; 2],
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// Captured flows, drained by the hypervisor backend into the event ledger.
@@ -601,7 +602,7 @@ impl VirtioNet {
     #[must_use]
     pub fn new() -> Self {
         VirtioNet {
-            queues: std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE)),
+            queues: [None, None],
             state: DeviceState::Inactive,
             events: Vec::new(),
             gw: None,
@@ -674,23 +675,14 @@ impl VirtioNet {
     /// Drains the transmit queue: read each frame, capture it, and inject any
     /// generated reply into the receive queue.
     fn process_tx(&mut self, mem: &GuestRam) {
-        let tx = &self.queues[TX_QUEUE as usize];
-        if !tx.is_ready() {
-            return;
-        }
-        let Some(pending) = tx.pending(mem) else {
+        // The drain takes the transmit queue out of `self.queues`, so handling
+        // a frame can borrow `self` mutably and inject replies into the receive
+        // queue.
+        let Some(mut tx) = self.queues[TX_QUEUE as usize].take() else {
             return;
         };
-        let mut last = tx.last_avail();
-        let mut serviced = false;
-        for _ in 0..pending {
-            let Some(slot) = self.queues[TX_QUEUE as usize].avail_slot(last) else {
-                break;
-            };
-            let Ok(head) = mem.read_u16(slot) else {
-                break;
-            };
-            if let Some(frame) = self.read_tx_frame(mem, head) {
+        let served = tx.serve(mem, |chain| {
+            if let Some(frame) = Self::read_tx_frame(mem, chain) {
                 // Publish before the backend branch, so the ring carries egress
                 // whichever one carries the frame -- including the built-in
                 // stack, which observe_tx below never sees. Raw and unparsed:
@@ -717,53 +709,20 @@ impl VirtioNet {
                     }
                 }
             }
-            self.queues[TX_QUEUE as usize].push_used(mem, head, 0);
-            last = last.wrapping_add(1);
-            serviced = true;
-        }
-        self.queues[TX_QUEUE as usize].set_last_avail(last);
-        if serviced {
+            0
+        });
+        self.queues[TX_QUEUE as usize] = Some(tx);
+        if served {
             self.state.signal_used_buffer();
         }
     }
 
-    /// Gathers a transmit chain's readable bytes and strips the virtio-net
-    /// header, returning the Ethernet frame.
-    fn read_tx_frame(&self, mem: &GuestRam, head: u16) -> Option<Vec<u8>> {
-        let q = &self.queues[TX_QUEUE as usize];
-        let mut buf = Vec::new();
-        let mut d = head;
-        for _ in 0..q.size() {
-            let da = q.desc_addr(d)?;
-            let (addr, len, flags, next) = (
-                mem.read_u64(da).ok()?,
-                mem.read_u32(da + 8).ok()?,
-                mem.read_u16(da + 12).ok()?,
-                mem.read_u16(da + 14).ok()?,
-            );
-            if flags & VIRTQ_DESC_F_WRITE == 0 {
-                // Readable segment (device-readable). The length comes from
-                // the guest, so it is checked against the ceiling before it
-                // is allowed to size an allocation, and the bytes are read
-                // straight into the frame rather than through a segment
-                // buffer the guest also sized.
-                let len = len as usize;
-                let start = buf.len();
-                if start.checked_add(len)? > MAX_TX_FRAME {
-                    return None;
-                }
-                buf.resize(start + len, 0);
-                mem.read(addr, &mut buf[start..]).ok()?;
-            }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            d = next;
-        }
-        if buf.len() <= NET_HDR_LEN {
-            return None;
-        }
-        Some(buf[NET_HDR_LEN..].to_vec())
+    /// Returns the Ethernet frame after the virtio-net header in a transmit
+    /// chain's readable bytes, or `None` when the chain is incomplete, longer
+    /// than `MAX_TX_FRAME` or holds no frame.
+    fn read_tx_frame(mem: &GuestRam, chain: DescriptorChain<'_>) -> Option<Vec<u8>> {
+        let buf = chain.read_to_vec(mem, MAX_TX_FRAME)?;
+        (buf.len() > NET_HDR_LEN).then(|| buf[NET_HDR_LEN..].to_vec())
     }
 
     /// Writes one frame, behind a virtio-net header with `num_buffers` 1, into
@@ -775,23 +734,15 @@ impl VirtioNet {
         // for the guest is an observation whether or not the guest had a buffer
         // posted to take it.
         self.sink.feed(|sink| sink.on_net(frame, false));
-        let rx = &self.queues[RX_QUEUE as usize];
-        if !rx.is_ready() {
-            return false;
-        }
-        let last = rx.last_avail();
-        match rx.pending(mem) {
-            // No RX buffer posted; drop silently (TCP/UDP recover). Logging here
-            // would flood under gateway-relay load.
-            Some(0) | None => return false,
-            Some(_) => {}
-        }
-        let Some(slot) = rx.avail_slot(last) else {
+        let Some(rx) = self.queues[RX_QUEUE as usize].as_mut() else {
             return false;
         };
-        let Ok(head) = mem.read_u16(slot) else {
+        // No RX buffer posted; drop silently (TCP/UDP recover). Logging here
+        // would flood under gateway-relay load.
+        let Some(mut chain) = rx.pop(mem) else {
             return false;
         };
+        let head = chain.head_index();
         let mut out = vec![0u8; NET_HDR_LEN];
         out[10] = 1; // num_buffers = 1
         out.extend_from_slice(frame);
@@ -802,46 +753,34 @@ impl VirtioNet {
         // the first delivered a 12-byte packet its driver rejected outright
         // ("Received invalid packet size: 12") before the frame ever arrived.
         let mut written = 0usize;
-        let mut d = head;
-        for _ in 0..rx.size() {
-            let Some(da) = rx.desc_addr(d) else {
-                return false;
-            };
-            let (Ok(addr), Ok(len), Ok(flags), Ok(next)) = (
-                mem.read_u64(da),
-                mem.read_u32(da + 8),
-                mem.read_u16(da + 12),
-                mem.read_u16(da + 14),
-            ) else {
-                return false;
-            };
-            if flags & VIRTQ_DESC_F_WRITE != 0 && written < out.len() {
-                let n = (len as usize).min(out.len() - written);
-                if mem.write(addr, &out[written..written + n]).is_err() {
+        for descriptor in chain.by_ref() {
+            if descriptor.is_write_only() && written < out.len() {
+                let n = (descriptor.len() as usize).min(out.len() - written);
+                if mem
+                    .write(descriptor.addr().0, &out[written..written + n])
+                    .is_err()
+                {
+                    rx.undo_pop();
                     return false;
                 }
                 written += n;
             }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            d = next;
         }
         // num_buffers is 1, so a frame that does not fit the posted chain
         // cannot be split across the next one. Drop it and leave the buffer
         // posted rather than complete a truncated packet the guest would have
-        // to reject.
+        // to reject. An incomplete chain is left posted the same way.
         //
         // The chain stays at the same avail slot, so a head that can never
         // hold a frame blocks the ones behind it until the guest reposts.
         // Linux and Unikraft post uniform buffers, so neither reaches that;
         // completing it with a used length of 0 is the escape hatch if some
         // driver ever does.
-        if written < out.len() {
+        if !chain.is_complete() || written < out.len() {
+            rx.undo_pop();
             return false;
         }
-        self.queues[RX_QUEUE as usize].push_used(mem, head, written as u32);
-        self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
+        rx.add_used(mem, head, written as u32);
         true
     }
 
@@ -1215,8 +1154,8 @@ impl virtio::Device for VirtioNet {
         queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> io::Result<()> {
-        if let Ok(queues) = <[QueueConfig; 2]>::try_from(queues) {
-            self.queues = queues;
+        if let Ok([rx, tx]) = <[QueueConfig; 2]>::try_from(queues) {
+            self.queues = [rx.into_queue(), tx.into_queue()];
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -1231,7 +1170,7 @@ impl virtio::Device for VirtioNet {
     }
 
     fn reset(&mut self) {
-        self.queues = std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE));
+        self.queues = [None, None];
         self.state = DeviceState::Inactive;
     }
 
@@ -1394,7 +1333,7 @@ mod tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Driver, LevelLine, Rings};
     use crate::devices::virtio::mmio::{INTERRUPT_ACK, INTERRUPT_STATUS};
-    use crate::devices::virtio::Device as _;
+    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT};
     use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1830,36 +1769,72 @@ mod tests {
         assert!(net.take_fed_sink().is_none());
     }
 
-    /// A TX chain that points back at itself must run out of budget rather
-    /// than spin. The ring size is the only bound on the walk, so the shape
-    /// to test is a cycle of *writable* descriptors: they contribute nothing
-    /// to the frame, so the `MAX_TX_FRAME` ceiling can never end it.
+    /// Returns chain `head` as the device pops it, after making it the next
+    /// entry of the avail ring at `avail` of the transmit queue
+    /// [`activate_with_queue`] set up.
+    fn tx_chain<'r>(
+        net: &mut VirtioNet,
+        mem: &'r GuestRam,
+        avail: u64,
+        head: u16,
+    ) -> DescriptorChain<'r> {
+        let idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
+            .unwrap();
+        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        net.queues[TX_QUEUE as usize]
+            .as_mut()
+            .expect("the transmit queue should be ready")
+            .pop(mem)
+            .expect("the chain should be available")
+    }
+
+    // A readable descriptor that points back at itself ends at the queue size
+    // and gives no frame. Without the bound, its eight copies would make one.
     #[test]
-    fn a_tx_descriptor_cycle_runs_out_of_budget() {
+    fn tx_descriptor_cycle_gives_no_frame() {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut net = VirtioNet::new();
-        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
-
-        // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
+        let avail = BASE + 0x1000;
+        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 64).unwrap();
-        mem.write_u16(BASE + 12, 2 | 1).unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-        assert_eq!(net.read_tx_frame(&mem, 0), None);
-
-        // A `next` outside the ring ends the walk too. The descriptor one
-        // past the ring is a valid readable one carrying real bytes, so an
-        // unbounded walk would return a frame instead of None.
         mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
-        mem.write_u16(BASE + 12, 1).unwrap();
-        mem.write_u16(BASE + 14, 8).unwrap(); // == the ring size
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
+        mem.write_u16(BASE + 14, 0).unwrap();
+
+        let chain = tx_chain(&mut net, &mem, avail, 0);
+
+        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
+    }
+
+    // A `next` outside the ring ends the walk. The descriptor one past the ring
+    // is a valid readable one carrying real bytes, so a walk past the ring
+    // would return a frame.
+    #[test]
+    fn tx_next_index_outside_the_ring_gives_no_frame() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut net = VirtioNet::new();
+        let avail = BASE + 0x1000;
+        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
+        mem.write_u64(BASE, BASE + 0x4000).unwrap();
+        mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
+        mem.write_u16(BASE + 14, 8).unwrap();
         mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
         mem.write_u32(BASE + 136, 8).unwrap();
         mem.write_u16(BASE + 140, 0).unwrap();
         mem.write_u16(BASE + 142, 0).unwrap();
-        assert_eq!(net.read_tx_frame(&mem, 0), None);
-        assert_eq!(net.read_tx_frame(&mem, 8), None, "an out-of-ring head");
+
+        let chain = tx_chain(&mut net, &mem, avail, 0);
+        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
+        let chain = tx_chain(&mut net, &mem, avail, 8);
+        assert_eq!(
+            VirtioNet::read_tx_frame(&mem, chain),
+            None,
+            "a head outside the ring"
+        );
     }
 
     // Unikraft posts the virtio-net header and the frame as two descriptors
@@ -2172,7 +2147,8 @@ mod tests {
         mem.write_u16(desc + 12, 0).unwrap();
         mem.write_u16(desc + 14, 0).unwrap();
 
-        assert_eq!(net.read_tx_frame(&mem, 0), None);
+        let chain = tx_chain(&mut net, &mem, avail, 0);
+        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
     }
 
     /// A question that ends before its type and class fields must be refused.
