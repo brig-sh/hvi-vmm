@@ -20,7 +20,7 @@
 //! [`DescriptorChain`]s and publishes completed ones to the used ring.
 
 use virtio_queue::desc::split::Descriptor;
-use virtio_queue::QueueT;
+use virtio_queue::{QueueOwnedT, QueueT};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use crate::memory::GuestRam;
@@ -297,6 +297,12 @@ impl Queue {
         })
     }
 
+    /// Puts the chain [`pop`](Self::pop) returned last back at the front of the
+    /// queue, so the next `pop` returns it again.
+    pub(crate) fn undo_pop(&mut self) {
+        self.inner.go_to_previous_position();
+    }
+
     /// Puts chain `head` on the used ring with `len` device-written bytes, and
     /// returns whether it did.
     ///
@@ -344,6 +350,29 @@ impl DescriptorChain<'_> {
     /// crate refuses.
     pub(crate) fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Returns the bytes of the chain's device-readable descriptors, in order,
+    /// or `None` when the chain is incomplete, a read fails or the bytes would
+    /// pass `max`.
+    ///
+    /// Each length comes from the guest, so it is checked against `max` before
+    /// it sizes the buffer, and the bytes are read straight into the buffer.
+    pub(crate) fn read_to_vec(mut self, ram: &GuestRam, max: usize) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        for descriptor in self.by_ref() {
+            if descriptor.is_write_only() {
+                continue;
+            }
+            let start = buf.len();
+            let end = start.checked_add(descriptor.len() as usize)?;
+            if end > max {
+                return None;
+            }
+            buf.resize(end, 0);
+            ram.read(descriptor.addr().0, &mut buf[start..]).ok()?;
+        }
+        self.is_complete().then_some(buf)
     }
 }
 
@@ -635,6 +664,54 @@ mod tests {
         make_available(&mem, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (0, false));
+    }
+
+    #[test]
+    fn read_to_vec_joins_the_readable_descriptors_in_order() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        mem.write(BASE + 0x3000, b"abc").unwrap();
+        mem.write(BASE + 0x3100, b"de").unwrap();
+        write_descriptor(&mem, DESC, 0, BASE + 0x3000, 3, VIRTQ_DESC_F_NEXT, 1);
+        write_descriptor(
+            &mem,
+            DESC,
+            1,
+            BASE + 0x3200,
+            8,
+            VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+            2,
+        );
+        write_descriptor(&mem, DESC, 2, BASE + 0x3100, 2, 0, 0);
+        make_available(&mem, 8, 0);
+
+        let chain = queue.pop(&mem).unwrap();
+
+        assert_eq!(chain.read_to_vec(&mem, 5), Some(b"abcde".to_vec()));
+    }
+
+    #[test]
+    fn read_to_vec_past_the_limit_is_refused() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        write_descriptor(&mem, DESC, 0, BASE + 0x3000, 6, 0, 0);
+        make_available(&mem, 8, 0);
+
+        let chain = queue.pop(&mem).unwrap();
+
+        assert_eq!(chain.read_to_vec(&mem, 5), None);
+    }
+
+    #[test]
+    fn read_to_vec_of_an_incomplete_chain_is_refused() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        write_descriptor(&mem, DESC, 0, BASE + 0x3000, 1, VIRTQ_DESC_F_NEXT, 0);
+        make_available(&mem, 8, 0);
+
+        let chain = queue.pop(&mem).unwrap();
+
+        assert_eq!(chain.read_to_vec(&mem, 64), None);
     }
 
     #[test]
