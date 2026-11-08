@@ -28,8 +28,10 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use crate::memory::GuestRam;
 
-/// Descriptor flags.
+/// Descriptor flags, which the tests write into the rings they build.
+#[cfg(test)]
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_NEXT as u16;
+#[cfg(test)]
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16;
 #[cfg(test)]
 pub(super) const VIRTQ_DESC_F_INDIRECT: u16 =
@@ -60,8 +62,6 @@ pub(crate) struct QueueConfig {
     avail: u64,
     /// The guest address of the used ring.
     used: u64,
-    /// The avail ring index of the next chain the device serves.
-    last_avail: u16,
 }
 
 impl QueueConfig {
@@ -74,7 +74,6 @@ impl QueueConfig {
             desc: 0,
             avail: 0,
             used: 0,
-            last_avail: 0,
         }
     }
 
@@ -157,43 +156,6 @@ impl QueueConfig {
                 .all(|&(address, len)| mem.contains(address, len))
     }
 
-    /// Address of descriptor `d`, or `None` if the driver referenced an index
-    /// outside the ring it programmed.
-    pub(crate) fn desc_addr(&self, d: u16) -> Option<u64> {
-        (u32::from(d) < self.num).then(|| self.desc + u64::from(d) * 16)
-    }
-
-    /// Address of the avail ring's `idx`-th slot, wrapped into the ring.
-    pub(crate) fn avail_slot(&self, idx: u16) -> Option<u64> {
-        let n = self.size();
-        (n != 0).then(|| self.avail + 4 + u64::from(idx % n) * 2)
-    }
-
-    /// How many buffers the driver has published since `last_avail`.
-    ///
-    /// `None` if `avail.idx` is unreadable, or if it claims more than a ring's
-    /// worth -- which no conforming driver can do, and which would otherwise
-    /// let a single notify drive up to 65535 descriptor-chain walks.
-    pub(crate) fn pending(&self, mem: &GuestRam) -> Option<u16> {
-        let idx = mem.read_u16(self.avail + 2).ok()?;
-        // Acquire against the guest's `virtio_wmb()`: the driver fills the
-        // avail ring slot and the descriptor table before it bumps
-        // `avail.idx`, and the ring slot is an unrelated address, so without
-        // this the host may read the slot before it reads the index and get
-        // the previous wrap's head. Free on x86, a `dmb ishld` on arm64, and
-        // only once per drain pass rather than per chain.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        let n = idx.wrapping_sub(self.last_avail);
-        (n <= self.size()).then_some(n)
-    }
-
-    pub(crate) fn last_avail(&self) -> u16 {
-        self.last_avail
-    }
-    pub(crate) fn set_last_avail(&mut self, v: u16) {
-        self.last_avail = v;
-    }
-
     pub(crate) fn set_desc_lo(&mut self, v: u32) {
         self.desc = set_lo(self.desc, v);
         self.queue = None;
@@ -217,30 +179,6 @@ impl QueueConfig {
     pub(crate) fn set_used_hi(&mut self, v: u32) {
         self.used = set_hi(self.used, v);
         self.queue = None;
-    }
-
-    /// Appends a completed buffer to the used ring and advances its index.
-    pub(crate) fn push_used(&self, mem: &GuestRam, head: u16, len: u32) {
-        let Some(n) = Some(self.size()).filter(|&n| n != 0) else {
-            return;
-        };
-        let Ok(used_idx) = mem.read_u16(self.used + 2) else {
-            return;
-        };
-        let entry = self.used + 4 + u64::from(used_idx % n) * 8;
-        let _ = mem.write_u32(entry, u32::from(head));
-        let _ = mem.write_u32(entry + 4, len);
-        // Release against the guest's `virtio_rmb()` in
-        // `virtqueue_get_buf_ctx_split`. The element and `used.idx` are
-        // separate addresses with no dependency between them, so on arm64
-        // the guest -- running on another core the whole time a host worker
-        // thread is completing requests -- may observe the bumped index
-        // while the element still holds the previous wrap's contents. It
-        // then takes a descriptor id it has already freed, prints
-        // "id %u is not a head!", sets `vq->broken` and fails every later
-        // enqueue with -EIO.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        let _ = mem.write_u16(self.used + 2, used_idx.wrapping_add(1));
     }
 
     /// Returns the queue a device serves from this programming, or `None` when
@@ -326,7 +264,10 @@ impl Queue {
     /// index outside the ring produces one.
     ///
     /// The used entry is written before the used index, which is stored with
-    /// release ordering, so a guest that sees the index also sees the entry.
+    /// release ordering, so a guest that sees the index also sees the entry. On
+    /// arm64 a guest on another core could otherwise see the new index with the
+    /// previous wrap's entry, take a descriptor id it already freed, and mark
+    /// the queue broken.
     pub(crate) fn add_used(&mut self, ram: &GuestRam, head: u16, len: u32) -> bool {
         self.inner.add_used(ram.memory(), head, len).is_ok()
     }
@@ -442,35 +383,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn descriptor_index_outside_the_ring_is_refused() {
-        let mut q = QueueConfig::new(QUEUE_MAX_SIZE);
-        q.set_num(8);
-        q.set_desc_lo(0x1000);
-        assert_eq!(q.desc_addr(0), Some(0x1000));
-        assert_eq!(q.desc_addr(7), Some(0x1000 + 7 * 16));
-        assert_eq!(q.desc_addr(8), None, "index == size is out of the ring");
-        assert_eq!(q.desc_addr(u16::MAX), None);
-    }
-
-    /// `avail.idx` claiming more than a ring's worth is a bogus ring, not
-    /// 65535 chain walks.
-    #[test]
-    fn avail_idx_beyond_the_ring_is_refused() {
-        let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
-        let mut q = QueueConfig::new(QUEUE_MAX_SIZE);
-        q.set_num(8);
-        q.set_avail_lo((BASE + 0x1000) as u32);
-        q.set_avail_hi(((BASE + 0x1000) >> 32) as u32);
-
-        mem.write_u16(BASE + 0x1000 + 2, 8).unwrap();
-        assert_eq!(q.pending(&mem), Some(8), "a full ring is fine");
-        mem.write_u16(BASE + 0x1000 + 2, 9).unwrap();
-        assert_eq!(q.pending(&mem), None, "one past the ring is refused");
-        mem.write_u16(BASE + 0x1000 + 2, 0xffff).unwrap();
-        assert_eq!(q.pending(&mem), None);
-    }
-
     const DESC: u64 = BASE;
     const AVAIL: u64 = BASE + 0x1000;
     const USED: u64 = BASE + 0x2000;
@@ -534,6 +446,18 @@ mod tests {
         let mut chain = queue.pop(mem).expect("a chain should be available");
         let count = chain.by_ref().count();
         (count, chain.is_complete())
+    }
+
+    // An avail index more than a queue's worth ahead is refused, so one
+    // notification cannot start 65535 chain walks.
+    #[test]
+    fn avail_idx_beyond_the_ring_is_refused() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        mem.write_u16(AVAIL + 2, 9).unwrap();
+        assert!(queue.pop(&mem).is_none(), "one past the ring is refused");
+        mem.write_u16(AVAIL + 2, 8).unwrap();
+        assert!(queue.pop(&mem).is_some(), "a full ring is fine");
     }
 
     #[test]
@@ -777,13 +701,13 @@ mod tests {
     }
 }
 
-// A litmus test for the used-ring publish in `QueueConfig::push_used`. It
-// models what `run_fs_worker` does on macOS: a host thread that is not the vCPU
-// thread appends completions to the used ring while the guest is running and
-// consuming that same ring.
+// A litmus test for the used-ring publish in `Queue::add_used`. It models what
+// `run_fs_worker` does on macOS: a host thread that is not the vCPU thread
+// appends completions to the used ring while the guest is running and consuming
+// that same ring.
 #[cfg(test)]
 mod ordering_tests {
-    use super::QueueConfig;
+    use super::{Queue, QueueConfig};
     use crate::memory::GuestRam;
     use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering as AOrd};
 
@@ -822,22 +746,20 @@ mod ordering_tests {
         (i % N + i / N) % N
     }
 
-    /// The real thing. This is what the test guards: if the release in
-    /// `QueueConfig::push_used` is ever removed, this arm starts tearing on any
-    /// weakly ordered host.
-    fn publish_real(q: &QueueConfig, mem: &GuestRam, _used: u64, head: u16, len: u32) {
-        q.push_used(mem, head, len);
+    /// Publishes through `Queue::add_used`, whose `used.idx` store has release
+    /// ordering. This arm tears on a weakly ordered host if that store loses
+    /// its release.
+    fn publish_real(q: &mut Queue, mem: &GuestRam, _used: u64, head: u16, len: u32) {
+        q.add_used(mem, head, len);
     }
 
-    /// The publish as it was before the fence: element stores, then the index
-    /// store, with nothing in between.
+    /// Publishes with a relaxed `used.idx` store: the element stores, then the
+    /// index store, with nothing ordering them.
     ///
-    /// This is the harness's positive control, and it is deliberately a local
-    /// copy rather than a call into `QueueConfig`. Pointing it at `push_used`
-    /// would make it track whatever `push_used` does, so the moment the
-    /// fence landed the control would stop tearing and the test would be
-    /// asserting against itself.
-    fn publish_unfenced(_q: &QueueConfig, mem: &GuestRam, used: u64, head: u16, len: u32) {
+    /// This is the harness's positive control. It is a local copy rather than a
+    /// call into `Queue`, so it keeps tearing whatever `add_used` does, and the
+    /// test cannot pass by asserting against itself.
+    fn publish_relaxed(_q: &mut Queue, mem: &GuestRam, used: u64, head: u16, len: u32) {
         let n = N as u16;
         let Ok(used_idx) = mem.read_u16(used + 2) else {
             return;
@@ -856,15 +778,23 @@ mod ordering_tests {
     /// of those were a bogus descriptor id, and how many completions it got
     /// through. That last count is below `ITERS` when the time budget ended the
     /// run first.
-    fn run(publish: fn(&QueueConfig, &GuestRam, u64, u16, u32)) -> (u32, u32, u32) {
+    fn run(publish: fn(&mut Queue, &GuestRam, u64, u16, u32)) -> (u32, u32, u32) {
         let start = std::time::Instant::now();
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let used = BASE + 0x1000;
 
-        let mut q = QueueConfig::new(N as u16);
-        q.set_num(N);
-        q.set_used_lo(used as u32);
-        q.set_used_hi((used >> 32) as u32);
+        let desc = BASE + 0x2000;
+        let avail = BASE + 0x3000;
+        let mut config = QueueConfig::new(N as u16);
+        config.set_num(N);
+        config.set_desc_lo(desc as u32);
+        config.set_desc_hi((desc >> 32) as u32);
+        config.set_avail_lo(avail as u32);
+        config.set_avail_hi((avail >> 32) as u32);
+        config.set_used_lo(used as u32);
+        config.set_used_hi((used >> 32) as u32);
+        config.set_ready(1, &mem);
+        let mut q = config.into_queue().expect("the queue should be ready");
 
         // Pre-stamp every slot with a generation the guest recognises as stale.
         for s in 0..N {
@@ -887,7 +817,6 @@ mod ordering_tests {
 
         std::thread::scope(|s| {
             let start = &start;
-            let q = &q;
             let mem = &mem;
             let done = &done;
             let stale = &stale;
@@ -977,7 +906,7 @@ mod ordering_tests {
                         }
                         wait(&mut idle);
                     }
-                    publish(q, mem, used, expected_head(i) as u16, i);
+                    publish(&mut q, mem, used, expected_head(i) as u16, i);
                 }
                 done.store(true, AOrd::Release);
             });
@@ -990,41 +919,25 @@ mod ordering_tests {
         )
     }
 
-    /// Not part of the default suite. Run it with:
-    ///
-    /// ```text
-    /// cargo test --release ordering_tests -- --ignored --nocapture
-    /// ```
-    ///
-    /// It is a stress test, and it is kept out of CI on purpose. Two reasons,
-    /// both learned the hard way:
-    ///
-    /// It is low-signal. On an M-series Mac the unfenced control is observed
-    /// torn 0 to 3 times in 4,000,000 completions, so a green run mostly means
-    /// the race did not happen to land, not that the ordering is right. An
-    /// earlier version of this test appeared to be far more sensitive, with
-    /// hundreds of tearings per run, but that was the harness miscounting: it
-    /// chased `used.idx` by equality, so one stale index sent it walking 65535
-    /// phantom slots and it flagged every one.
-    ///
-    /// And a stress test that spins two coupled threads is a bad CI citizen.
-    /// That same phantom walk deadlocked against the device's flow control and
-    /// left a hosted macOS job running for 47 minutes on a step that takes 36
-    /// seconds.
-    ///
-    /// What it is good for is what it was written for: showing the defect
-    /// exists, and showing a fix removes it. Remove the `fence(Release)` from
-    /// `QueueConfig::push_used` and this fails.
+    // A timing-dependent stress test, ignored by default. Run it with:
+    //
+    //     cargo test --release ordering_tests -- --ignored --nocapture
+    //
+    // A pass is weak evidence, because the race may not land within the budget.
+    // The relaxed control reports whether this host tears at all. The store the
+    // test guards is the `used.idx` store in the `virtio-queue` crate's
+    // `Queue::add_used`: with `Ordering::Relaxed` there in place of
+    // `Ordering::Release`, the test fails.
     #[ignore = "timing-dependent stress test; run explicitly with --ignored"]
     #[test]
-    fn push_used_is_never_observed_torn() {
+    fn add_used_is_never_observed_torn() {
         let (torn, bad, n) = run(publish_real);
         eprintln!(
-            "push_used        : {torn} torn elements, {bad} bogus descriptor ids, in {n} completions"
+            "add_used         : {torn} torn elements, {bad} bogus descriptor ids, in {n} completions"
         );
-        let (ctl_torn, ctl_bad, ctl_n) = run(publish_unfenced);
+        let (ctl_torn, ctl_bad, ctl_n) = run(publish_relaxed);
         eprintln!(
-            "unfenced control : {ctl_torn} torn elements, {ctl_bad} bogus descriptor ids, in {ctl_n} completions"
+            "relaxed control  : {ctl_torn} torn elements, {ctl_bad} bogus descriptor ids, in {ctl_n} completions"
         );
 
         // The guard. A bogus id is the fatal one: the guest takes a descriptor
@@ -1032,17 +945,17 @@ mod ordering_tests {
         // and every later enqueue returns -EIO for the life of the guest.
         assert_eq!(
             bad, 0,
-            "push_used handed the guest a descriptor id it had already freed"
+            "add_used handed the guest a descriptor id it had already freed"
         );
-        assert_eq!(torn, 0, "push_used was observed torn");
+        assert_eq!(torn, 0, "add_used was observed torn");
 
         // The control says whether this host can detect the race at all. A
-        // strongly ordered one (x86) will not tear even unfenced, and then the
-        // assertions above have not been exercised -- say so rather than let a
-        // green result imply more than it does.
+        // strongly ordered host (x86) does not tear even with a relaxed store,
+        // and then the assertions above have not been exercised, so the test
+        // says so.
         if ctl_torn == 0 {
             eprintln!(
-                "note: the unfenced control did not tear on this host, so the check \
+                "note: the relaxed control did not tear on this host, so the check \
                  above did not exercise the ordering it is guarding. Run it on arm64."
             );
         }

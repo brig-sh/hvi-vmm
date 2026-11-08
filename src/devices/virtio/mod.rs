@@ -14,11 +14,12 @@
 
 //! The virtio devices over MMIO, and the split virtqueue they share.
 //!
-//! `block`, `fs`, `net` and `vsock` are the devices, and they serve their
-//! queues through `Queue`, which `queue` holds. `mmio` holds the virtio-mmio
-//! transport that serves a `Device` to the guest. `tap` attaches virtio-net to
-//! a host tap device and holds the `virtio_net_hdr_v1` framing every tap read
-//! and write carries.
+//! `block`, `fs`, `net` and `vsock` are the devices. They serve their queues
+//! through `Queue` and walk each chain as a `DescriptorChain`, both from
+//! `queue`. `mmio` holds the virtio-mmio transport that serves a `Device` to
+//! the guest, and records each queue's programming as a `QueueConfig`. `tap`
+//! attaches virtio-net to a host tap device and holds the `virtio_net_hdr_v1`
+//! framing every tap read and write carries.
 
 pub mod block;
 pub mod fs;
@@ -33,9 +34,9 @@ use std::sync::Arc;
 use std::task::Waker;
 
 use mmio::Interrupt;
-use queue::{
-    DescriptorChain, Queue, QueueConfig, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
-};
+use queue::{DescriptorChain, Queue, QueueConfig, QUEUE_MAX_SIZE};
+#[cfg(test)]
+use queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 use crate::events::CapturedEvent;
 use crate::memory::GuestRam;
