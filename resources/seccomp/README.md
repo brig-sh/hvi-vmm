@@ -65,6 +65,20 @@ takes the strictest answer of a thread's filters, so an open is refused rather
 than trapped, and the process still opens nothing. musl's malloc opens no file,
 so a musl build installs the allowlist alone.
 
+## What a debug build adds
+
+std's debug build calls `fcntl(fd, F_GETFD)` before it closes an `OwnedFd`, to
+assert the descriptor is open. A vCPU thread closes descriptors when it stops,
+so `allowlist()` adds one rule to `vcpu` under `cfg(debug_assertions)`:
+
+```json
+{"syscall": "fcntl", "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1}]}
+```
+
+`val` is `F_GETFD`. Any other command traps, and `vmm` already allows `fcntl`
+unconditionally. The rule is not in these files, so a release build installs
+exactly what they list. Do not add it here.
+
 ## Changing a list
 
 Adding a syscall is granting a right to a process that parses guest-controlled
