@@ -414,20 +414,21 @@ sequences that change host state or make the terminal answer (see
 
 ### Used-ring ordering
 
-`Queue::push_used` writes the used element and then the index. Completions
-happen on worker threads while the guest runs on another core, so the publish
-carries a release fence per drain pass: free on x86, `dmb` on arm64. Without
-it an arm64 guest observed the bumped index before the element and broke its
-virtqueue with `id 65 is not a head!`.
+`Queue::add_used` writes the used element and then stores the index with release
+ordering, through the `virtio-queue` crate: a plain store on x86, `stlr` on
+arm64. Completions happen on worker threads while the guest runs on another
+core. Without the release an arm64 guest observed the bumped index before the
+element and broke its virtqueue with `id 65 is not a head!`.
 
-`ordering_tests` in `devices/virtio/queue.rs` drives the real `push_used`
-against a consumer that behaves like the driver. It demonstrates the defect and
-the fix, and it does not reliably catch a regression, so it is `#[ignore]`d and
-run weekly.
+`ordering_tests` in `devices/virtio/queue.rs` drives the real `add_used` against
+a consumer that behaves like the driver. A pass is weak evidence, because the
+race may not land within the test's budget, so it is `#[ignore]`d and run
+weekly.
 
-Every descriptor-chain walker refuses an index outside the ring and caps the
-walk at the ring size, so a cycle runs out of budget. Re-programming any queue
-register clears `ready`.
+Every device walks its descriptor chains through `DescriptorChain`, which ends after as
+many descriptors as the queue has entries, those of an indirect table included,
+so a cycle runs out of budget. A queue becomes ready only with its rings aligned
+and in guest RAM, and re-programming any queue register clears `ready`.
 
 ## 5. Concurrency and failure
 

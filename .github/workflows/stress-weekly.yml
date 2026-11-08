@@ -1,7 +1,7 @@
 name: Stress tests (weekly)
 
 # Runs the used-ring litmus test, which is the only test that can catch a
-# lost fence in `Queue::push_used`.
+# lost release on the used-index store behind `Queue::add_used`.
 #
 # The test carries `#[ignore]` because it depends on timing and can deadlock,
 # so it must never gate a pull request. This lane runs it on a schedule
@@ -55,9 +55,9 @@ jobs:
       || github.repository == 'brig-sh/hvi-vmm'
     #
     # The runner must be arm64. A strongly ordered host, such as x86, does
-    # not tear even when the fence is absent. The test then passes whether
-    # or not `Queue::push_used` still has its `fence(Release)`, and its
-    # control arm says so and prints "Run it on arm64."
+    # not tear even when the release is absent. The test then passes whether
+    # or not the used-index store behind `Queue::add_used` is a release, and
+    # its control arm says so and prints "Run it on arm64."
     #
     # There is no machine label. This is a userspace threading test, and it
     # has no interest in KVM or in the interrupt controller of the host, so
@@ -92,7 +92,7 @@ jobs:
           # matches it but `--ignored` then excludes it, and the step
           # reports "running 0 tests" and exits zero.
           timeout --foreground -k 30 600 "$BIN" \
-            devices::virtio::queue::ordering_tests::push_used_is_never_observed_torn \
+            devices::virtio::queue::ordering_tests::add_used_is_never_observed_torn \
             --exact --include-ignored --nocapture 2>&1 | tee litmus.log
           # A filter that matches nothing also exits zero. Assert that one
           # test ran, or the lane cannot tell a pass from a test that never
@@ -109,7 +109,7 @@ jobs:
           if-no-files-found: ignore
       - name: File or update the tracking issue
         # File an issue for a test failure only. A checkout or toolchain
-        # error must not report a memory-fence regression that nothing
+        # error must not report a used-index ordering regression that nothing
         # looked for.
         if: failure() && steps.litmus.outcome == 'failure'
         env:
@@ -133,9 +133,9 @@ jobs:
           - Run: $run_url
           - Test: \`ordering_tests\` in \`src/devices/virtio/queue.rs\`, on an arm64 runner
 
-          A torn read points at a missing or reordered fence on the used-ring
-          publish path. A timeout points at the flow-control deadlock the
-          test's doc comment records. Either way this is a real finding, not
+          A torn read points at a used-index store that lost its release
+          ordering. A timeout points at the flow-control deadlock the test's
+          comments describe. Either way this is a real finding, not
           flake to retry: the test exists to show the defect exists and to
           show a fix removes it. The run's \`litmus-log\` artifact has the
           full output, including the control arm that says whether this host

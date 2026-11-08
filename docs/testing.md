@@ -217,9 +217,9 @@ green run closes it.
 - `schedule-e2e-nightly.yml`: the e2e suite's `full` profile on every backend,
   every night. It also runs the ignored tests and names any that now pass, and
   reports the tests ready to leave probation.
-- `stress-weekly.yml`: the `#[ignore]`d used-ring litmus on a self-hosted
-  arm64 runner every Monday. It demonstrates the ordering defect and the fence
-  that removes it. It is not reliable enough to gate a pull request.
+- `stress-weekly.yml`: the `#[ignore]`d used-ring litmus on a self-hosted arm64
+  runner every Monday. It checks that the used-index store keeps its release
+  ordering. It is not reliable enough to gate a pull request.
 - `schedule-reflow-drift.yml`: monthly, runs the reflow on the latest nightly
   and compares it with the pin, so the pin advances deliberately.
 

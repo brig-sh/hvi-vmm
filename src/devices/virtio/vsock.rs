@@ -60,8 +60,7 @@ use std::time::{Duration, Instant};
 
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
-    self, read_config_bytes, DeviceState, QueueConfig, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT,
-    VIRTQ_DESC_F_WRITE,
+    self, read_config_bytes, DescriptorChain, DeviceState, Queue, QueueConfig, QUEUE_MAX_SIZE,
 };
 use crate::memory::GuestRam;
 use crate::teardown::{poll, pollfd, StopToken, HANGUP};
@@ -413,8 +412,9 @@ impl Drop for Conn {
 
 /// A virtio-vsock device bridged to a host Unix socket.
 pub struct VirtioVsock {
-    /// The RX, TX and event queues, in that order.
-    queues: [QueueConfig; 3],
+    /// The RX, TX and event queues, in that order, each `None` before
+    /// activation, after reset, or when the driver did not make it ready.
+    queues: [Option<Queue>; 3],
     /// The activation state, with the interrupt once active.
     state: DeviceState,
     /// Host-to-guest packets waiting for an RX buffer.
@@ -432,7 +432,7 @@ impl VirtioVsock {
     #[must_use]
     pub fn new() -> Self {
         VirtioVsock {
-            queues: std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE)),
+            queues: [None, None, None],
             state: DeviceState::Inactive,
             pending: VecDeque::new(),
             conns: HashMap::new(),
@@ -843,67 +843,30 @@ impl VirtioVsock {
     /// Drains the guest's transmit queue: connection responses, RW data
     /// (written to the host socket), credit, and shutdowns.
     fn process_tx(&mut self, mem: &GuestRam) {
-        let tx = &self.queues[TX_QUEUE as usize];
-        if !tx.is_ready() {
-            return;
-        }
-        let Some(pending) = tx.pending(mem) else {
+        // The drain takes the transmit queue out of `self.queues`, so handling
+        // a packet can borrow `self` mutably and queue replies for the receive
+        // queue.
+        let Some(mut tx) = self.queues[TX_QUEUE as usize].take() else {
             return;
         };
-        let mut last = tx.last_avail();
-        let mut serviced = false;
-        for _ in 0..pending {
-            let Some(slot) = self.queues[TX_QUEUE as usize].avail_slot(last) else {
-                break;
-            };
-            let Ok(head) = mem.read_u16(slot) else {
-                break;
-            };
-            if let Some(pkt) = self.read_tx(mem, head) {
+        let served = tx.serve(mem, |chain| {
+            if let Some(pkt) = Self::read_tx(mem, chain) {
                 self.handle_pkt(mem, &pkt);
             }
-            self.queues[TX_QUEUE as usize].push_used(mem, head, 0);
-            last = last.wrapping_add(1);
-            serviced = true;
-        }
-        self.queues[TX_QUEUE as usize].set_last_avail(last);
-        if serviced {
+            0
+        });
+        self.queues[TX_QUEUE as usize] = Some(tx);
+        if served {
             self.state.signal_used_buffer();
         }
     }
 
-    /// Reads one packet (header + payload) from a TX descriptor chain.
-    fn read_tx(&self, mem: &GuestRam, head: u16) -> Option<Vec<u8>> {
-        let q = &self.queues[TX_QUEUE as usize];
-        let mut buf = Vec::new();
-        let mut d = head;
-        for _ in 0..q.size() {
-            let da = q.desc_addr(d)?;
-            let (addr, len, flags, next) = (
-                mem.read_u64(da).ok()?,
-                mem.read_u32(da + 8).ok()?,
-                mem.read_u16(da + 12).ok()?,
-                mem.read_u16(da + 14).ok()?,
-            );
-            if flags & VIRTQ_DESC_F_WRITE == 0 {
-                // The length comes from the guest, so it is checked against
-                // the ceiling before it is allowed to size an allocation, and
-                // the bytes are read straight into the packet rather than
-                // through a segment buffer the guest also sized.
-                let len = len as usize;
-                let start = buf.len();
-                if start.checked_add(len)? > MAX_TX_PACKET {
-                    return None;
-                }
-                buf.resize(start + len, 0);
-                mem.read(addr, &mut buf[start..]).ok()?;
-            }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            d = next;
-        }
-        (buf.len() >= HDR_LEN).then_some(buf)
+    /// Returns one packet (header and payload) from a TX descriptor chain, or
+    /// `None` when the chain is incomplete or shorter than a header.
+    fn read_tx(mem: &GuestRam, chain: DescriptorChain<'_>) -> Option<Vec<u8>> {
+        chain
+            .read_to_vec(mem, MAX_TX_PACKET)
+            .filter(|buf| buf.len() >= HDR_LEN)
     }
 
     /// Every packet we act on must be a stream packet the guest agent sent to
@@ -1072,37 +1035,22 @@ impl VirtioVsock {
         self.pending.push_back(pkt);
     }
 
-    /// Returns the writable segments of RX descriptor chain `head`, in order,
-    /// or `None` when the chain does not end within the queue's size.
+    /// Returns the writable segments of RX `chain`, in order, or `None` when
+    /// the chain is incomplete.
     ///
     /// Linux posts one buffer per packet today, but the chained form is just as
     /// legal: older guests split the header off into its own descriptor, and a
     /// device that reads only the head silently drops the body.
-    fn rx_chain(&self, mem: &GuestRam, head: u16) -> Option<Vec<(u64, u32)>> {
-        let q = &self.queues[RX_QUEUE as usize];
-        let mut segs = Vec::new();
-        let mut d = head;
-        for _ in 0..q.size() {
-            let da = q.desc_addr(d)?;
-            let (addr, len, flags, next) = (
-                mem.read_u64(da).ok()?,
-                mem.read_u32(da + 8).ok()?,
-                mem.read_u16(da + 12).ok()?,
-                mem.read_u16(da + 14).ok()?,
-            );
-            if flags & VIRTQ_DESC_F_WRITE != 0 {
-                segs.push((addr, len));
-            }
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                return Some(segs);
-            }
-            d = next;
-        }
-        // A chain that never clears NEXT within the queue's own size is a
-        // cycle. Walking it to the budget would return the same descriptor
-        // many times over, and the caller would size a packet from capacity
-        // that does not exist and then write every copy onto one buffer.
-        None
+    fn rx_chain(mut chain: DescriptorChain<'_>) -> Option<Vec<(u64, u32)>> {
+        let segs = chain
+            .by_ref()
+            .filter(|descriptor| descriptor.is_write_only())
+            .map(|descriptor| (descriptor.addr().0, descriptor.len()))
+            .collect();
+        // An incomplete chain may be a cycle that yields one descriptor many
+        // times, and the caller would then size a packet from capacity that
+        // does not exist.
+        chain.is_complete().then_some(segs)
     }
 
     /// Trims `pkt` to the `cap` bytes the guest's buffer holds and re-queues
@@ -1142,41 +1090,47 @@ impl VirtioVsock {
         }
     }
 
-    /// Moves pending packets into the guest's RX buffers while packets wait and
-    /// the guest has buffers posted.
+    /// Moves pending packets into the receive queue's buffers.
+    ///
+    /// Returns whether it put a buffer on the used ring, which is `false` when
+    /// the receive queue is not ready.
+    fn fill_rx_buffers(&mut self, mem: &GuestRam) -> bool {
+        // The fill takes the receive queue out of `self.queues`, so it can
+        // borrow `self` mutably.
+        let Some(mut rx) = self.queues[RX_QUEUE as usize].take() else {
+            return false;
+        };
+        let filled = self.fill_rx_queue(mem, &mut rx);
+        self.queues[RX_QUEUE as usize] = Some(rx);
+        filled
+    }
+
+    /// Moves pending packets into the buffers the guest posted on `rx` while
+    /// packets wait and the guest has buffers posted.
     ///
     /// Packets in `pending` go out in order. Backlog is framed one packet at a
     /// time, only when `pending` is empty, so at most one RW packet waits for
     /// an RX buffer.
     ///
-    /// Returns whether it filled a buffer.
-    fn fill_rx_buffers(&mut self, mem: &GuestRam) -> bool {
-        if !self.queues[RX_QUEUE as usize].is_ready() {
-            return false;
-        }
+    /// Returns whether it put a buffer on the used ring.
+    fn fill_rx_queue(&mut self, mem: &GuestRam, rx: &mut Queue) -> bool {
         let mut filled = false;
         loop {
             if self.pending.is_empty() && !self.frame_backlog() {
                 return filled;
             }
-            let rx = &self.queues[RX_QUEUE as usize];
-            let last = rx.last_avail();
-            match rx.pending(mem) {
-                Some(0) | None => return filled, // no guest RX buffer; keep it pending
-                Some(_) => {}
-            }
-            let Some(slot) = rx.avail_slot(last) else {
+            // No guest RX buffer: keep the packet pending.
+            let Some(chain) = rx.pop(mem) else {
                 return filled;
             };
-            let Ok(head) = mem.read_u16(slot) else {
-                return filled;
-            };
+            let head = chain.head_index();
             // A chain this walk refuses is malformed, so the guest cannot
             // repost its way out of it: this head stays at the front of the
             // ring and the RX queue stops for that guest. Completing it with a
             // used length of zero would keep the queue moving; only a guest
             // that posted a cycle reaches it.
-            let Some(segs) = self.rx_chain(mem, head) else {
+            let Some(segs) = Self::rx_chain(chain) else {
+                rx.undo_pop();
                 return filled;
             };
             let cap: usize = segs.iter().map(|&(_, l)| l as usize).sum();
@@ -1190,6 +1144,7 @@ impl VirtioVsock {
             // guest reposts one that can; leave the queue alone rather than
             // complete it with a partial packet.
             if cap < HDR_LEN || (waiting > cap && cap == HDR_LEN) {
+                rx.undo_pop();
                 return filled;
             }
             let pkt = self.pending.pop_front().unwrap();
@@ -1205,12 +1160,12 @@ impl VirtioVsock {
                 }
                 let n = (pkt.len() - off).min(len as usize);
                 if mem.write(addr, &pkt[off..off + n]).is_err() {
+                    rx.undo_pop();
                     return filled;
                 }
                 off += n;
             }
-            self.queues[RX_QUEUE as usize].push_used(mem, head, off as u32);
-            self.queues[RX_QUEUE as usize].set_last_avail(last.wrapping_add(1));
+            rx.add_used(mem, head, off as u32);
             filled = true;
         }
     }
@@ -1247,8 +1202,8 @@ impl virtio::Device for VirtioVsock {
         queues: Vec<QueueConfig>,
         interrupt: Arc<Interrupt>,
     ) -> std::io::Result<()> {
-        if let Ok(queues) = <[QueueConfig; 3]>::try_from(queues) {
-            self.queues = queues;
+        if let Ok([rx, tx, event]) = <[QueueConfig; 3]>::try_from(queues) {
+            self.queues = [rx.into_queue(), tx.into_queue(), event.into_queue()];
         }
         self.state = DeviceState::Active(interrupt);
         Ok(())
@@ -1268,7 +1223,7 @@ impl virtio::Device for VirtioVsock {
     // Every session is dropped with the queues, since the guest agent that
     // initializes the device again has never seen their `OP_REQUEST`.
     fn reset(&mut self) {
-        self.queues = std::array::from_fn(|_| QueueConfig::new(QUEUE_MAX_SIZE));
+        self.queues = [None, None, None];
         self.state = DeviceState::Inactive;
         self.pending.clear();
         self.conns.clear();
@@ -1689,10 +1644,32 @@ mod session_tests {
             avail_ring: avail,
             used_ring: used,
         };
-        dev.queues[usize::from(index)] = testing::ready_queue(QUEUE_MAX_SIZE, rings, mem);
+        dev.queues[usize::from(index)] =
+            testing::ready_queue(QUEUE_MAX_SIZE, rings, mem).into_queue();
         if !dev.state.is_active() {
             dev.state = DeviceState::Active(testing::enabled_interrupt().0);
         }
+    }
+
+    /// Returns chain `head` as the device pops it, after making it the next
+    /// entry of the avail ring at `avail` of queue `index`, which
+    /// [`set_ready_queue`] set up.
+    fn pop<'r>(
+        dev: &mut VirtioVsock,
+        mem: &'r GuestRam,
+        index: u16,
+        avail: u64,
+        head: u16,
+    ) -> DescriptorChain<'r> {
+        let idx = mem.read_u16(avail + 2).unwrap();
+        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
+            .unwrap();
+        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        dev.queues[usize::from(index)]
+            .as_mut()
+            .expect("the queue should be ready")
+            .pop(mem)
+            .expect("the chain should be available")
     }
 
     /// Posts descriptor `idx`, a 64-byte writable buffer at `buffer`, as the
@@ -1813,7 +1790,8 @@ mod session_tests {
         mem.write_u16(desc + 12, 0).unwrap();
         mem.write_u16(desc + 14, 0).unwrap();
 
-        assert_eq!(dev.read_tx(&mem, 0), None);
+        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
+        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
     }
 
     /// A Linux guest splits a vsock send at `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`,
@@ -1840,41 +1818,59 @@ mod session_tests {
         mem.write_u16(desc + 12, 0).unwrap();
         mem.write_u16(desc + 14, 0).unwrap();
 
+        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
         assert_eq!(
-            dev.read_tx(&mem, 0).map(|p| p.len()),
+            VirtioVsock::read_tx(&mem, chain).map(|p| p.len()),
             Some(HDR_LEN + PAYLOAD)
         );
     }
 
-    /// The same bound on the vsock transmit walker. A cycle of writable
-    /// descriptors accumulates nothing, so `MAX_TX_PACKET` cannot end it and
-    /// the ring size is all that stands between a hostile ring and a spin.
+    // A readable descriptor that points back at itself ends at the queue size
+    // and gives no packet. Without the bound, its eight copies would make one.
     #[test]
-    fn tx_descriptor_cycle_runs_out_of_budget() {
+    fn tx_descriptor_cycle_gives_no_packet() {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let mut dev = VirtioVsock::new();
-        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
-
-        // desc[0] -> desc[0], writable (bit 1) and F_NEXT (bit 0) set.
+        let avail = BASE + 0x1000;
+        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 64).unwrap();
-        mem.write_u16(BASE + 12, 2 | 1).unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-        assert_eq!(dev.read_tx(&mem, 0), None);
-
-        // A `next` outside the ring ends the walk. The descriptor one past
-        // the ring is a valid readable one carrying a whole header, so an
-        // unbounded walk would return a packet instead of None.
         mem.write_u32(BASE + 8, 8).unwrap();
-        mem.write_u16(BASE + 12, 1).unwrap();
-        mem.write_u16(BASE + 14, 8).unwrap(); // == the ring size
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
+        mem.write_u16(BASE + 14, 0).unwrap();
+
+        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
+
+        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
+    }
+
+    // A `next` outside the ring ends the walk. The descriptor one past the ring
+    // is a valid readable one carrying a whole header, so a walk past the ring
+    // would return a packet.
+    #[test]
+    fn tx_next_index_outside_the_ring_gives_no_packet() {
+        const BASE: u64 = 0x4000_0000;
+        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
+        let mut dev = VirtioVsock::new();
+        let avail = BASE + 0x1000;
+        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
+        mem.write_u64(BASE, BASE + 0x4000).unwrap();
+        mem.write_u32(BASE + 8, 8).unwrap();
+        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
+        mem.write_u16(BASE + 14, 8).unwrap();
         mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
         mem.write_u32(BASE + 136, HDR_LEN as u32).unwrap();
         mem.write_u16(BASE + 140, 0).unwrap();
         mem.write_u16(BASE + 142, 0).unwrap();
-        assert_eq!(dev.read_tx(&mem, 0), None);
-        assert_eq!(dev.read_tx(&mem, 8), None, "an out-of-ring head");
+
+        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
+        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
+        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 8);
+        assert_eq!(
+            VirtioVsock::read_tx(&mem, chain),
+            None,
+            "a head outside the ring"
+        );
     }
 
     /// Regression for the cross-session injection: session B is registered and
@@ -2158,18 +2154,15 @@ mod session_tests {
         assert!(carried.iter().all(|&b| b == b'x'));
     }
 
-    // An RX chain that never clears NEXT is refused rather than walked to the
-    // queue's size. The walk used to end on the budget and hand back the
-    // segments it had collected, so one self-referencing descriptor became
-    // `q.size()` copies of the same buffer: a capacity far larger than the
-    // guest posted, no split for a packet that needed one, and every copy
-    // written over the same bytes with a used length the buffer could not hold.
+    // An RX chain that never clears NEXT is refused. Its segments would repeat
+    // one descriptor `q.size()` times.
     #[test]
     fn rx_descriptor_cycle_is_refused() {
         const BASE: u64 = 0x4000_0000;
         let mem = mem_of(0x8000);
         let mut dev = VirtioVsock::new();
-        set_ready_queue(&mut dev, &mem, RX_QUEUE, BASE, BASE + 0x1000, BASE + 0x2000);
+        let avail = BASE + 0x1000;
+        set_ready_queue(&mut dev, &mem, RX_QUEUE, BASE, avail, BASE + 0x2000);
 
         // desc[0] -> desc[0], writable and carrying NEXT.
         mem.write_u64(BASE, BASE + 0x4000).unwrap();
@@ -2177,11 +2170,20 @@ mod session_tests {
         mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
             .unwrap();
         mem.write_u16(BASE + 14, 0).unwrap();
-        assert_eq!(dev.rx_chain(&mem, 0), None, "a cycle yields no segments");
+        let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
+        assert_eq!(
+            VirtioVsock::rx_chain(chain),
+            None,
+            "a cycle yields no segments"
+        );
 
         // The same descriptor with NEXT clear is an ordinary one-buffer chain.
         mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE).unwrap();
-        assert_eq!(dev.rx_chain(&mem, 0), Some(vec![(BASE + 0x4000, 4140)]));
+        let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
+        assert_eq!(
+            VirtioVsock::rx_chain(chain),
+            Some(vec![(BASE + 0x4000, 4140)])
+        );
     }
 
     // A buffer with room for a header and nothing else is left for the guest to
