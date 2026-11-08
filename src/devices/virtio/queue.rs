@@ -19,6 +19,9 @@
 //! made the queue ready: it hands out the available chains as
 //! [`DescriptorChain`]s and publishes completed ones to the used ring.
 
+#[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
+
 use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{QueueOwnedT, QueueT};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -292,9 +295,22 @@ impl Queue {
         let inner = self.inner.pop_descriptor_chain(ram.memory())?;
         Some(DescriptorChain {
             inner,
-            left: self.inner.size(),
+            left: self.size(),
             complete: false,
         })
+    }
+
+    /// Returns whether [`pop`](Self::pop) has no chain to return: the driver
+    /// made none available past those popped, or the avail ring claims more
+    /// than the queue holds.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_empty(&self, ram: &GuestRam) -> bool {
+        self.inner
+            .avail_idx(ram.memory(), Ordering::Acquire)
+            .map_or(true, |idx| {
+                let available = idx.0.wrapping_sub(self.inner.next_avail());
+                available == 0 || available > self.inner.size()
+            })
     }
 
     /// Puts the chain [`pop`](Self::pop) returned last back at the front of the
