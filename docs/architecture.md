@@ -38,8 +38,8 @@ usual mistake:
   x86-64 UART already wraps.
 
 Porting to a new host backend means a new `arch/<arch>/<hypervisor>/` directory
-with a `Kick` and an `IrqLine` implementation, a `Guest` built from them, and an
-exit loop that hands each decoded MMIO access to `Guest::read_mmio` or
+with a `Kick` and an `irq::Line` implementation, a `Guest` built from them, and
+an exit loop that hands each decoded MMIO access to `Guest::read_mmio` or
 `Guest::write_mmio`. It also needs its `mod` line in `arch/<arch>/mod.rs`, its
 `use ... as backend` line and its target in the build guard, both in `lib.rs`,
 and its dependencies in `Cargo.toml`. Porting to a new guest architecture is a

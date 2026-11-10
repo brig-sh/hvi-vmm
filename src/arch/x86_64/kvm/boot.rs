@@ -31,12 +31,12 @@ use crate::arch::x86_64::layout::{
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
-use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
+use crate::hypervisor::kvm::{self, kick_handle, run_guest, start_io_threads, Kicker};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, RamRegion};
@@ -103,7 +103,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
     let mut devices = DeviceManager::new(&ram, &ledger, slots, {
         let vm = Arc::clone(&vm);
-        move |gsi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), gsi)) as Arc<dyn IrqLine>
+        move |gsi| Arc::new(kvm::IrqLine::new(Arc::clone(&vm), gsi)) as Arc<dyn irq::Line>
     });
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
 
@@ -191,7 +191,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     uart.lock()
         .unwrap()
-        .connect_irq(Arc::new(KvmIrqLine::new(Arc::clone(&vm), COM1_GSI)));
+        .connect_irq(Arc::new(kvm::IrqLine::new(Arc::clone(&vm), COM1_GSI)));
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,

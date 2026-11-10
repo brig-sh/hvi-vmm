@@ -19,14 +19,14 @@ use std::sync::Arc;
 
 use applevisor::prelude::{VirtualMachine, VirtualMachineConfig};
 
-use super::gic::{gic_config, gic_layout, gic_num_irqs, HvfIrqLine};
+use super::gic::{self, gic_config, gic_layout, gic_num_irqs};
 use super::kick::Kicker;
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{virtio_slots, RAM_BASE, UART_BASE, UART_SPI};
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
@@ -117,7 +117,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let mut devices = DeviceManager::new(&ram, &ledger, slots, {
         let (vm, vcpus) = (vm.clone(), Arc::clone(&vcpus));
         move |spi| {
-            Arc::new(HvfIrqLine::new(vm.clone(), spi, Some(Arc::clone(&vcpus)))) as Arc<dyn IrqLine>
+            Arc::new(gic::Line::new(vm.clone(), spi, Some(Arc::clone(&vcpus))))
+                as Arc<dyn irq::Line>
         }
     });
     let pl011 = devices.attach_uart_and_rtc()?;
@@ -163,7 +164,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     pl011
         .lock()
         .unwrap()
-        .connect_irq(Arc::new(HvfIrqLine::new(vm.clone(), UART_SPI, None)));
+        .connect_irq(Arc::new(gic::Line::new(vm.clone(), UART_SPI, None)));
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.

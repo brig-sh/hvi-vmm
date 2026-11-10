@@ -32,7 +32,7 @@ use kvm_bindings::{KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 use crate::hypervisor::guest::{Guest, LedgerCloseGuard, SafepointVcpu};
 use crate::hypervisor::vcpus::{report_on_panic, Kick, Outcome};
 use crate::io_threads::{HostWork, IoThreads};
@@ -135,21 +135,21 @@ impl Kick for Kicker {
 }
 
 /// A guest interrupt line on KVM's in-kernel interrupt controller.
-pub(crate) struct KvmIrqLine {
+pub(crate) struct IrqLine {
     /// The VM whose interrupt controller has the line.
     vm: Arc<VmFd>,
     /// The line's number, as `KVM_IRQ_LINE` takes it.
     gsi: u32,
 }
 
-impl KvmIrqLine {
+impl IrqLine {
     /// Returns the line `gsi` of `vm`.
     pub(crate) fn new(vm: Arc<VmFd>, gsi: u32) -> Self {
         Self { vm, gsi }
     }
 }
 
-impl IrqLine for KvmIrqLine {
+impl irq::Line for IrqLine {
     fn set_level(&self, level: bool) -> std::io::Result<()> {
         Ok(self.vm.set_irq_line(self.gsi, level)?)
     }
