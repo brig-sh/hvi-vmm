@@ -38,7 +38,9 @@ use crate::devices::irq::Chip as _;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
-use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker};
+use crate::hypervisor::kvm::{
+    kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
+};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::GuestArch;
@@ -99,7 +101,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // The ledger exists first, since each device's transport writes to it.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
     let uart_line = vgic.line(UART_SPI);
-    let mut devices = DeviceManager::new(&ram, &ledger, slots, &vgic);
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, &vgic, {
+        let vm = Arc::clone(&vm);
+        move |fd, address, value| register_ioeventfd(&vm, fd, address, value)
+    });
     let pl011 = devices.attach_uart_and_rtc()?;
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
     let fdt_devices = fdt::virtio_devices(devices.records());
