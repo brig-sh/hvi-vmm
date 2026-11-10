@@ -154,7 +154,10 @@ pub(crate) fn start_stop_signal_thread() -> io::Result<()> {
         let handle = signals.handle();
         std::thread::Builder::new()
             .name("stop signals".to_string())
-            .spawn(move || receive_stop_signals(state, signals))?;
+            .spawn(move || receive_stop_signals(state, signals))
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("spawning the stop signals thread: {e}"))
+            })?;
         stop_signals.signals = Some(handle);
     }
     stop_signals.register()
