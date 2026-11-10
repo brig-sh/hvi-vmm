@@ -12,18 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The interrupt line a device drives.
+//! The interrupt line a device drives, and the controller it is on.
 //!
 //! The line is set under the lock that decided the level, and only when the
 //! level changes. Two threads that change one device's level then cannot leave
 //! the line at a level the device no longer has. A virtio device's level is
 //! held by its [`Interrupt`](crate::devices::virtio::mmio::Interrupt). Each
-//! backend supplies the line, since how it reaches the guest's interrupt
-//! controller is the hypervisor's.
+//! backend supplies the lines through its [`Chip`], since how a line reaches
+//! the guest's interrupt controller is the hypervisor's.
 
 use std::sync::Arc;
 
-/// A device's interrupt line, as the backend wires it to the guest.
+/// A guest's interrupt controller, which gives each device its line.
+pub(crate) trait Chip {
+    /// Returns the line of interrupt `irq`, numbered as in
+    /// [`Slot::irq`](crate::devices::manager::Slot::irq).
+    fn line(&self, irq: u32) -> Arc<dyn Line>;
+}
+
+impl<C: Chip + ?Sized> Chip for &C {
+    fn line(&self, irq: u32) -> Arc<dyn Line> {
+        (**self).line(irq)
+    }
+}
+
+/// A device's interrupt line on the guest's interrupt controller.
 pub(crate) trait Line: Send + Sync {
     /// Sets the line to `level`.
     ///

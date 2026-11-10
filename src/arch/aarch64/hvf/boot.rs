@@ -26,7 +26,6 @@ use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{virtio_slots, RAM_BASE, UART_BASE, UART_SPI};
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
@@ -114,13 +113,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         Kicker::new(vm.clone(), num_cpus),
         cfg.take_stop_handle()?,
     ));
-    let mut devices = DeviceManager::new(&ram, &ledger, slots, {
-        let (vm, vcpus) = (vm.clone(), Arc::clone(&vcpus));
-        move |spi| {
-            Arc::new(gic::Line::new(vm.clone(), spi, Some(Arc::clone(&vcpus))))
-                as Arc<dyn irq::Line>
-        }
-    });
+    let irq_chip = gic::Gic {
+        vm: vm.clone(),
+        vcpus: Arc::clone(&vcpus),
+    };
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip);
     let pl011 = devices.attach_uart_and_rtc()?;
     devices.attach_virtio_devices(&cfg)?;
     // Seatbelt allows using a socket but not creating one, so the agent socket

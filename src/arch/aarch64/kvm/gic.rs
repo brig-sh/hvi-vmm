@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The in-kernel vGIC of an arm64 guest on KVM, and the GSI that names one of
-//! its SPIs.
+//! The in-kernel vGIC of an arm64 guest on KVM, and the interrupt lines on its
+//! SPIs.
+
+use std::sync::Arc;
 
 use kvm_bindings::{
     kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2,
@@ -25,18 +27,23 @@ use kvm_bindings::{
 use kvm_ioctls::{DeviceFd, VmFd};
 
 use crate::arch::aarch64::layout::{GicLayout, GicVersion, SPI_BASE};
+use crate::devices::irq;
+use crate::hypervisor::kvm;
 use crate::LOG_PREFIX;
 
 /// Returns the KVM GSI of SPI `spi`, whose INTID is [`SPI_BASE`] + `spi`.
-pub(super) fn spi_gsi(spi: u32) -> u32 {
+fn spi_gsi(spi: u32) -> u32 {
     (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | (SPI_BASE + spi)
 }
 
 /// A VM's in-kernel vGIC, and the version KVM created.
 ///
-/// KVM takes the setup in three steps, [`Vgic::create`], [`Vgic::set_regions`]
-/// and [`Vgic::finalize`], in that order.
+/// The devices' lines are its SPIs. KVM takes the setup in three steps,
+/// [`Vgic::create`], [`Vgic::set_regions`] and [`Vgic::finalize`], in that
+/// order.
 pub(super) struct Vgic {
+    /// The VM the vGIC is in.
+    vm: Arc<VmFd>,
     /// The vGIC device.
     fd: DeviceFd,
     /// The version KVM created.
@@ -55,7 +62,7 @@ impl Vgic {
     /// It does not use `KVM_CREATE_DEVICE_TEST`. With that flag the kernel
     /// leaves `fd` at 0, and kvm-ioctls would wrap descriptor 0 in a `DeviceFd`
     /// that closes stdin when dropped.
-    pub(super) fn create(vm: &VmFd) -> Result<Self, kvm_ioctls::Error> {
+    pub(super) fn create(vm: Arc<VmFd>) -> Result<Self, kvm_ioctls::Error> {
         let (fd, version) = match vm.create_device(&mut kvm_create_device {
             type_: kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
             fd: 0,
@@ -72,7 +79,7 @@ impl Vgic {
                 (fd, GicVersion::V2)
             }
         };
-        Ok(Self { fd, version })
+        Ok(Self { vm, fd, version })
     }
 
     /// Returns the version KVM created.
@@ -128,5 +135,11 @@ impl Vgic {
             attr,
             addr,
         })
+    }
+}
+
+impl irq::Chip for Vgic {
+    fn line(&self, spi: u32) -> Arc<dyn irq::Line> {
+        Arc::new(kvm::IrqLine::new(Arc::clone(&self.vm), spi_gsi(spi)))
     }
 }
