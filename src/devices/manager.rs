@@ -25,10 +25,15 @@
 //! Linux probes them in that order, so the guest probes the disks in argv
 //! order. It still has to tell them apart by serial.
 
+#[cfg(target_os = "linux")]
+use std::io;
 use std::ops::Range;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "linux")]
+use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_os = "linux")]
 use crate::config::FsConfig;
@@ -172,6 +177,11 @@ pub(crate) struct Devices {
     pub(crate) exports: Vec<worker::Export>,
 }
 
+/// A function that registers an eventfd for a guest's 4-byte write of a value
+/// to an address, so the write signals the eventfd with no exit to hvi.
+#[cfg(target_os = "linux")]
+type IoeventfdRegistrar = Box<dyn Fn(&EventFd, u64, u32) -> io::Result<()>>;
+
 /// The devices of a VM as a backend attaches them.
 pub(crate) struct DeviceManager<C> {
     /// Guest RAM, which the devices' queues are in.
@@ -182,6 +192,9 @@ pub(crate) struct DeviceManager<C> {
     slots: SlotAllocator,
     /// The interrupt controller the devices' lines are on.
     irq_chip: C,
+    /// The backend's function that registers an ioeventfd.
+    #[cfg(target_os = "linux")]
+    register_ioeventfd: IoeventfdRegistrar,
     /// A record per virtio device, in the order they were attached.
     records: Vec<DeviceRecord>,
     /// What has been attached.
@@ -191,17 +204,24 @@ pub(crate) struct DeviceManager<C> {
 impl<C: irq::Chip> DeviceManager<C> {
     /// Returns a manager with no devices, which places them in `slots` and
     /// connects them to lines of `irq_chip`.
+    ///
+    /// On Linux, `register_ioeventfd` registers the eventfds of each device's
+    /// `notify_fds`.
     pub(crate) fn new(
         ram: &Arc<GuestRam>,
         ledger: &Arc<Ledger>,
         slots: SlotAllocator,
         irq_chip: C,
+        #[cfg(target_os = "linux")] register_ioeventfd: impl Fn(&EventFd, u64, u32) -> io::Result<()>
+            + 'static,
     ) -> Self {
         Self {
             ram: Arc::clone(ram),
             ledger: Arc::clone(ledger),
             slots,
             irq_chip,
+            #[cfg(target_os = "linux")]
+            register_ioeventfd: Box::new(register_ioeventfd),
             records: Vec::new(),
             devices: Devices {
                 mmio_bus: Bus::new(),
@@ -396,7 +416,8 @@ impl<C: irq::Chip> DeviceManager<C> {
     ///
     /// # Errors
     ///
-    /// Errors when the range of `slot` overlaps one already on the bus.
+    /// Errors when the range of `slot` overlaps one already on the bus, or the
+    /// hypervisor refuses a notification eventfd.
     fn attach_virtio<D: virtio::Device + 'static>(
         &mut self,
         kind: DeviceKind,
@@ -414,6 +435,11 @@ impl<C: irq::Chip> DeviceManager<C> {
                 &self.ledger,
             )),
         )?;
+        #[cfg(target_os = "linux")]
+        for (fd, address, value) in mmio::notify_ioeventfds(&*device.lock().unwrap(), slot.base) {
+            (self.register_ioeventfd)(fd, address, value)
+                .map_err(|e| format!("registering a queue notification at {address:#x}: {e}"))?;
+        }
         Ok(interrupt)
     }
 
@@ -442,7 +468,12 @@ impl<C: irq::Chip> DeviceManager<C> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::devices::virtio::mmio::testing::EventfdDevice;
 
     /// A line that sets nothing.
     struct NoLine;
@@ -468,11 +499,54 @@ mod tests {
         }
     }
 
+    /// Returns the guest RAM and the ledger of a manager under test.
+    fn ram_and_ledger() -> (Arc<GuestRam>, Arc<Ledger>) {
+        (
+            Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x10000)])),
+            Arc::new(Ledger::new(None, "manager-test").unwrap()),
+        )
+    }
+
     /// Returns a manager on `slots`.
+    #[cfg(target_os = "macos")]
     fn manager(slots: SlotAllocator) -> DeviceManager<RecordingIrqChip> {
-        let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x10000)]));
-        let ledger = Arc::new(Ledger::new(None, "manager-test").unwrap());
+        let (ram, ledger) = ram_and_ledger();
         DeviceManager::new(&ram, &ledger, slots, RecordingIrqChip::default())
+    }
+
+    /// Returns a manager on `slots`.
+    #[cfg(target_os = "linux")]
+    fn manager(slots: SlotAllocator) -> DeviceManager<RecordingIrqChip> {
+        manager_with_ioeventfds(slots).0
+    }
+
+    /// The eventfd, address and value of each ioeventfd a manager registered,
+    /// in order.
+    #[cfg(target_os = "linux")]
+    type Ioeventfds = Arc<Mutex<Vec<(RawFd, u64, u32)>>>;
+
+    /// Returns a manager on `slots`, with the ioeventfds it registers.
+    #[cfg(target_os = "linux")]
+    fn manager_with_ioeventfds(
+        slots: SlotAllocator,
+    ) -> (DeviceManager<RecordingIrqChip>, Ioeventfds) {
+        let (ram, ledger) = ram_and_ledger();
+        let ioeventfds = Ioeventfds::default();
+        let registered = Arc::clone(&ioeventfds);
+        let manager = DeviceManager::new(
+            &ram,
+            &ledger,
+            slots,
+            RecordingIrqChip::default(),
+            move |fd: &EventFd, address, value| {
+                registered
+                    .lock()
+                    .unwrap()
+                    .push((fd.as_raw_fd(), address, value));
+                Ok(())
+            },
+        );
+        (manager, ioeventfds)
     }
 
     /// Returns a path under the temporary directory for the file `name`, unique
@@ -541,6 +615,32 @@ mod tests {
         for path in disks.iter().map(|disk| &disk.path).chain([&agent]) {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    // The device takes the second slot, so the address is the slot's own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn notify_fds_are_registered_at_the_slot_with_their_queue() {
+        let (mut devices, ioeventfds) =
+            manager_with_ioeventfds(SlotAllocator::new(0x10_0000..0x10_1000, [5, 6]));
+        let device = Arc::new(Mutex::new(EventfdDevice {
+            fds: [EventFd::new(0).unwrap(), EventFd::new(0).unwrap()],
+        }));
+        devices.slots.allocate().unwrap();
+        let slot = devices.slots.allocate().unwrap();
+        devices
+            .attach_virtio(DeviceKind::Fs, slot, &device)
+            .unwrap();
+        let [first, second] = device
+            .lock()
+            .unwrap()
+            .fds
+            .each_ref()
+            .map(AsRawFd::as_raw_fd);
+        assert_eq!(
+            *ioeventfds.lock().unwrap(),
+            [(first, 0x10_0250, 0), (second, 0x10_0250, 1)]
+        );
     }
 
     #[test]

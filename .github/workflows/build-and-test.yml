@@ -382,6 +382,16 @@ jobs:
             </dev/null 2>&1 | tee stop.log || true
           grep -q "test result: ok. 8 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
+      # The queue notification test runs a few guest instructions in a bare VM.
+      - name: run the queue notification test
+        if: steps.kvm.outputs.ok == 'yes'
+        env:
+          BIN: ${{ steps.blk.outputs.bin }}
+        run: |
+          sudo "$BIN" kvm::notify_tests:: --ignored 2>&1 \
+            | tee notify.log || true
+          grep -q "test result: ok. 1 passed" notify.log \
+            || { echo "::error::the notification test did not pass"; exit 1; }
       # The vhost-user handover runs on the vCPU thread that services the
       # guest's DRIVER_OK write, so it is the seccomp filter for that thread
       # that has to allow it. A missing entry there does not fail a unit test:
@@ -824,6 +834,13 @@ jobs:
             -- --ignored --nocapture --test-threads=1 </dev/null 2>&1 | tee stop.log || true
           grep -q "test result: ok. 8 passed" stop.log \
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
+      # The queue notification test, as on the x86 job.
+      - name: run the queue notification test
+        run: |
+          cargo test --release --lib kvm::notify_tests:: -- --ignored 2>&1 \
+            | tee notify.log || true
+          grep -q "test result: ok. 1 passed" notify.log \
+            || { echo "::error::the notification test did not pass"; exit 1; }
       # The aarch64 allowlist is a different file from the x86 one. The hosted
       # arm64 musl job runs it on the static musl binary. This is the only place
       # it runs on the glibc build, and where another page size appears.

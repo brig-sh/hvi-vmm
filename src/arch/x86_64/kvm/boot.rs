@@ -36,7 +36,9 @@ use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
-use crate::hypervisor::kvm::{self, kick_handle, run_guest, start_io_threads, Kicker};
+use crate::hypervisor::kvm::{
+    self, kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
+};
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, RamRegion};
@@ -105,7 +107,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         vm: Arc::clone(&vm),
     };
     let com1_line = irq_chip.line(COM1_GSI);
-    let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip);
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip, {
+        let vm = Arc::clone(&vm);
+        move |fd, address, value| register_ioeventfd(&vm, fd, address, value)
+    });
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
 
     // Kernel command line: the caller's args and the ttyS0 console. The devices
