@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::Stop;
 use crate::devices::bus::{self, fill_le_bytes, u64_from_le_bytes};
-use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::irq::{self, Irq};
 use crate::terminal::ConsoleFilter;
 
 /// Data register: reads pop the RX FIFO, writes are console bytes.
@@ -86,7 +86,7 @@ impl Pl011 {
     /// Connects the UART to the interrupt line it raises.
     // Only the arm64 backends attach a PL011.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
+    pub(crate) fn connect_irq(&mut self, line: Arc<dyn irq::Line>) {
         self.irq.connect(line);
     }
 

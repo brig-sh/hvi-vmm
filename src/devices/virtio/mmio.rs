@@ -39,7 +39,7 @@ use virtio_bindings::virtio_mmio::*;
 
 use crate::config::Stop;
 use crate::devices::bus;
-use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::irq::{self, Irq};
 use crate::devices::virtio::{self, QueueConfig};
 use crate::events::Ledger;
 use crate::memory::GuestRam;
@@ -163,7 +163,7 @@ struct InterruptState {
 
 impl Interrupt {
     /// Returns an interrupt that drives `line`.
-    pub(crate) fn new(line: Arc<dyn IrqLine>) -> Self {
+    pub(crate) fn new(line: Arc<dyn irq::Line>) -> Self {
         let mut irq = Irq::default();
         irq.connect(line);
         Self {
@@ -650,7 +650,7 @@ pub(crate) mod testing {
         }
     }
 
-    impl IrqLine for LevelLine {
+    impl irq::Line for LevelLine {
         fn set_level(&self, level: bool) -> std::io::Result<()> {
             self.0.store(level, Ordering::SeqCst);
             Ok(())
@@ -690,7 +690,7 @@ pub(crate) mod testing {
     /// Returns an enabled interrupt and its line.
     pub(crate) fn enabled_interrupt() -> (Arc<Interrupt>, Arc<LevelLine>) {
         let line = Arc::new(LevelLine::default());
-        let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn IrqLine>));
+        let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn irq::Line>));
         interrupt.enable();
         (interrupt, line)
     }
@@ -748,7 +748,7 @@ pub(crate) mod testing {
         pub(crate) fn new(device: D, ram: &Arc<GuestRam>) -> Self {
             let device = Arc::new(Mutex::new(device));
             let line = Arc::new(LevelLine::default());
-            let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn IrqLine>));
+            let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn irq::Line>));
             let ledger = Arc::new(Ledger::new(None, "transport-test").unwrap());
             Self {
                 transport: Transport::new(&device, &interrupt, ram, &ledger),

@@ -21,7 +21,7 @@ use applevisor::prelude::{GicConfig, GicEnabled, HypervisorError, VirtualMachine
 
 use super::kick::{on_vcpu_thread, Kicker};
 use crate::arch::aarch64::layout::{GicLayout, GicVersion, SPI_BASE};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
@@ -32,7 +32,7 @@ pub(super) type VmGic = VirtualMachineInstance<GicEnabled>;
 /// A line that rises on an I/O thread also kicks the vCPUs, so a guest in WFI
 /// takes the interrupt promptly. A vCPU thread raises a line between its own
 /// guest entries and kicks no one, and neither does the console UART's line.
-pub(super) struct HvfIrqLine {
+pub(super) struct Line {
     /// The VM whose GIC has the line.
     vm: VmGic,
     /// The line's interrupt ID.
@@ -42,7 +42,7 @@ pub(super) struct HvfIrqLine {
     kick: Option<Arc<Vcpus<Kicker>>>,
 }
 
-impl HvfIrqLine {
+impl Line {
     /// Returns the line of SPI `spi` of `vm`, which kicks `kick` on a rise.
     pub(super) fn new(vm: VmGic, spi: u32, kick: Option<Arc<Vcpus<Kicker>>>) -> Self {
         Self {
@@ -53,7 +53,7 @@ impl HvfIrqLine {
     }
 }
 
-impl IrqLine for HvfIrqLine {
+impl irq::Line for Line {
     fn set_level(&self, level: bool) -> std::io::Result<()> {
         self.vm
             .gic_set_spi(self.intid, level)

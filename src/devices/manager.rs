@@ -37,7 +37,7 @@ use crate::config::FsConfig;
 use crate::config::FsShare;
 use crate::config::{BootConfig, DiskConfig};
 use crate::devices::bus::{self, Bus};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::{pl011::Pl011, rtc_pl031::Pl031};
 use crate::devices::virtio;
@@ -182,7 +182,7 @@ pub(crate) struct DeviceManager {
     /// The slots the virtio devices take.
     slots: SlotAllocator,
     /// Makes the line for an interrupt, numbered as in [`Slot::irq`].
-    line: Box<dyn Fn(u32) -> Arc<dyn IrqLine>>,
+    line: Box<dyn Fn(u32) -> Arc<dyn irq::Line>>,
     /// A record per virtio device, in the order they were attached.
     records: Vec<DeviceRecord>,
     /// What has been attached.
@@ -196,7 +196,7 @@ impl DeviceManager {
         ram: &Arc<GuestRam>,
         ledger: &Arc<Ledger>,
         slots: SlotAllocator,
-        line: impl Fn(u32) -> Arc<dyn IrqLine> + 'static,
+        line: impl Fn(u32) -> Arc<dyn irq::Line> + 'static,
     ) -> Self {
         Self {
             ram: Arc::clone(ram),
@@ -448,7 +448,7 @@ mod tests {
     /// A line that sets nothing.
     struct NoLine;
 
-    impl IrqLine for NoLine {
+    impl irq::Line for NoLine {
         fn set_level(&self, _level: bool) -> std::io::Result<()> {
             Ok(())
         }
@@ -462,7 +462,7 @@ mod tests {
         let made = Arc::clone(&lines);
         let manager = DeviceManager::new(&ram, &ledger, slots, move |irq| {
             made.lock().unwrap().push(irq);
-            Arc::new(NoLine) as Arc<dyn IrqLine>
+            Arc::new(NoLine) as Arc<dyn irq::Line>
         });
         (manager, lines)
     }

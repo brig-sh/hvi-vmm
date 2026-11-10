@@ -34,11 +34,11 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
-use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
+use crate::hypervisor::kvm::{self, kick_handle, run_guest, start_io_threads, Kicker};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::GuestArch;
@@ -100,7 +100,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
     let mut devices = DeviceManager::new(&ram, &ledger, slots, {
         let vm = Arc::clone(&vm);
-        move |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi))) as Arc<dyn IrqLine>
+        move |spi| Arc::new(kvm::IrqLine::new(Arc::clone(&vm), spi_gsi(spi))) as Arc<dyn irq::Line>
     });
     let pl011 = devices.attach_uart_and_rtc()?;
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
@@ -179,10 +179,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    pl011.lock().unwrap().connect_irq(Arc::new(KvmIrqLine::new(
-        Arc::clone(&vm),
-        spi_gsi(UART_SPI),
-    )));
+    pl011
+        .lock()
+        .unwrap()
+        .connect_irq(Arc::new(kvm::IrqLine::new(
+            Arc::clone(&vm),
+            spi_gsi(UART_SPI),
+        )));
     let (filters, io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
