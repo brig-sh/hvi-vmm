@@ -46,6 +46,11 @@ The stack parses the question, records the name, and asks the host to resolve
 it. It refuses a question that uses a compression pointer, and one whose name
 runs past the end of the message without room for the type and class.
 
+Each query is also logged on stderr as `[virtio-net] dns query <name>`. That
+line escapes every character outside printable ASCII (`\u{1b}` for ESC, `\n` for
+a newline), since a label may carry any byte. The ledger records the name as the
+guest sent it.
+
 **Name resolution does not work while confined.** Resolving needs a socket,
 and neither the macOS Seatbelt profile nor the Linux seccomp allowlists grant
 one. The query is still parsed and recorded, so the reply reaches the guest
@@ -129,6 +134,11 @@ An interface name must be 1 to 15 bytes. A tap that cannot be opened fails the
 boot and names the interface, which is the opposite of the gateway's silent
 fallback.
 
+hvi writes the guest's frames to the tap as the guest built them. It filters no
+source MAC or IP address, and no ARP, DHCP server or router advertisement
+traffic. Put each sandbox's tap on a segment of its own, or filter on the host
+side of the tap.
+
 On macOS the flag is refused after the backend starts:
 
 ```text
@@ -169,11 +179,26 @@ properties decide what those records can be used for:
   aggregation. One DNS lookup that retransmits produces two identical records.
 - **They are egress only.** The `direction` and `guest_initiated` fields are
   constants in the code, not observations. Inbound frames produce no record.
+- **Every header field is the guest's.** The five-tuple is read from the frame
+  the guest sent, so `src_ip` is whatever address the guest wrote there.
+  `src_ip_leased` says whether it is the address DHCP leased to the guest. On
+  the built-in stack that is `10.0.2.15`. Under a gateway or a tap it is the
+  `yiaddr` of the first DHCP ACK for the guest's MAC that echoes the
+  transaction id of the guest's open DISCOVER or REQUEST and that reached an
+  RX buffer the guest had posted. A later ACK for the same transaction leases
+  nothing. A NAK that answers the request the same way, a RELEASE the guest
+  sends and a device reset clear the lease. The lease time (option 51) is not
+  tracked. The device does not know the DHCP server's address, so a guest that
+  cooperates with a host it can reach can still forge an ACK: treat the field
+  as a hint, not as proof. It is absent while the device has seen no lease,
+  which includes a guest configured with a static address, and on the DHCP
+  traffic a guest sends from `0.0.0.0` before it has one. Attribute a record
+  to a sandbox by `sandbox_id`, not by `src_ip`.
 
 A record looks like this:
 
 ```json
-{"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
+{"sandbox_id":"hvi","ts":1788992154919811000,"provenance":"boundary","source":"net","payload":{"five_tuple":{"proto":17,"src_ip":"10.0.2.15","src_port":43098,"dst_ip":"10.0.2.3","dst_port":53},"src_ip_leased":true,"direction":"egress","guest_initiated":true,"bytes":37,"dns":"example.com"}}
 ```
 
 `bytes` is the length of the layer-4 slice, not the IP total length.
