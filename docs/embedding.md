@@ -40,7 +40,9 @@ tell one failure from another, and `BootError::into_inner` hands it over.
 powered off or reset. `Requested` means the host asked the run to stop (see
 [Stopping a run from the host](#stopping-a-run-from-the-host)). It is
 `#[non_exhaustive]`, so a `match` on it needs a wildcard arm. When a vCPU fails,
-`boot` returns an error that names the vCPU and says how it failed.
+`boot` returns an error that names the vCPU and says how it failed. When the OS
+refuses a thread of the run, `boot` stops the threads it has started and returns
+an error that names the thread.
 
 CAUTION: `boot` returns `Stop::SystemReset` and stops. It does not reboot the
 guest, and nothing in hvi restarts one. If your integration wants a reboot,
