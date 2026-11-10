@@ -15,13 +15,14 @@
 //! The host-side I/O threads a backend runs beside its vCPUs.
 //!
 //! [`IoThreads`] starts the console reader, the threads a plugin asked for in
-//! `on_attach`, and the threads that serve the devices from the host, such as
-//! the agent bridge and the network relay, which each device queues in a
-//! [`HostWork`]. Each thread polls a stop token beside its own descriptor. A
-//! backend starts the threads only it has with [`IoThreads::spawn`]. Once the
-//! vCPUs have exited or been left running, [`IoThreads::stop`] requests the
+//! `on_attach`, and the threads that serve the guest from the host, such as the
+//! agent bridge and the network relay, which each device queues in a
+//! [`HostWork`]. Each thread polls a stop token beside its own descriptor. Once
+//! the vCPUs have exited or been left running, [`IoThreads::stop`] requests the
 //! stop and joins every thread, as `teardown` describes.
 
+use std::error::Error;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -30,17 +31,19 @@ use std::time::{Duration, Instant};
 use crate::hypervisor::guest::{Guest, PluginThread};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
+use crate::run::LeftRunning;
 use crate::sandbox::confine_io_thread;
 use crate::signal::kick_signal;
 use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
 use crate::LOG_PREFIX;
 
-/// The threads and stop actions of the devices on the host, held until the I/O
-/// threads start.
+/// The threads and stop actions that serve the guest from the host, held until
+/// the I/O threads start.
 ///
 /// A thread spawned before the seccomp filters are armed would run unfiltered,
-/// so a device queues its threads here and [`IoThreads::start`] spawns them.
+/// so a device or the backend queues its threads here and [`IoThreads::start`]
+/// spawns them.
 #[derive(Default)]
 pub(crate) struct HostWork {
     /// The threads, each with its name and what it runs.
@@ -55,6 +58,11 @@ pub(crate) struct HostWork {
 
 impl HostWork {
     /// Queues a thread named `name` that runs `run` with a stop token.
+    ///
+    /// The I/O threads' stop only joins the thread, so `run` has to return on
+    /// its own: it watches the token, or an action queued with
+    /// [`on_io_stop`](Self::on_io_stop) ends it. A panic in the thread fails
+    /// the run and asks it to stop.
     pub(crate) fn spawn(
         &mut self,
         name: &'static str,
@@ -104,8 +112,8 @@ impl<K: Kick> Drop for StopOnPanic<K> {
 
 /// The I/O threads of one VM and the stop that ends them.
 ///
-/// They serve the guest's devices from the host. A backend can start a thread
-/// of its own under the same stop, such as the x86 trace watchdog.
+/// They serve the guest's devices from the host, beside any thread the backend
+/// queued in its [`HostWork`], such as the x86 trace watchdog.
 pub(crate) struct IoThreads<K: Kick> {
     /// The vCPUs of the run, which a thread that panics stops.
     vcpus: Arc<Vcpus<K>>,
@@ -154,6 +162,12 @@ impl<K: Kick> IoThreads<K> {
     /// `deliver` hands a console byte to the guest's UART. The console's
     /// request key asks `plugin` for an observation and kicks the boot vCPU,
     /// which runs it.
+    ///
+    /// # Errors
+    ///
+    /// Errors when a thread cannot be started. The threads already started are
+    /// then stopped and joined, and one that does not stop makes the error a
+    /// [`LeftRunning`].
     pub(crate) fn start(
         source: StopSource,
         guest: &Arc<Guest<K>>,
@@ -161,7 +175,7 @@ impl<K: Kick> IoThreads<K> {
         deliver: impl FnMut(u8) + Send + 'static,
         plugin_threads: Vec<PluginThread>,
         host: HostWork,
-    ) -> Self
+    ) -> Result<Self, Box<dyn Error + Send + Sync>>
     where
         K: 'static,
     {
@@ -175,7 +189,7 @@ impl<K: Kick> IoThreads<K> {
             move |stop| {
                 terminal::input::run(plugin, &stop, move || vcpus.kicker().kick(0), deliver);
             },
-        );
+        )?;
         let mut io_threads = Self {
             vcpus: Arc::clone(&guest.vcpus),
             stop: StopPlan {
@@ -192,47 +206,45 @@ impl<K: Kick> IoThreads<K> {
             vcpu_stops,
         } = host;
         // The stop actions and hooks are added before the plugin's and the
-        // devices' threads start, so when a spawn panics the stop still ends
+        // devices' threads start, so the stop after a failed start still ends
         // the threads already started.
         io_threads.stop.actions.extend(io_stops);
         for hook in vcpu_stops {
             guest.vcpus.on_stop(hook);
         }
-        for PluginThread { name, run } in plugin_threads.into_iter().chain(threads) {
-            io_threads.spawn(name, run);
-        }
-        io_threads
+        io_threads.spawn_all(plugin_threads.into_iter().chain(threads))
     }
 
-    /// Starts a thread named `name` that runs `body` with a stop token, to be
-    /// joined with the others.
-    ///
-    /// [`stop`](Self::stop) only joins the thread, so `body` has to return on
-    /// its own: it watches the token, or an action queued with
-    /// [`HostWork::on_io_stop`] ends it. A panic in `body` fails the run and
-    /// asks it to stop.
+    /// Starts each of `threads` in order, to be joined with the others.
     ///
     /// It has to be called from a thread with no seccomp filter, since naming
-    /// the new thread calls `prctl`, which neither allowlist has.
+    /// a new thread calls `prctl`, which neither allowlist has.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the thread cannot be created.
-    pub(crate) fn spawn(
-        &mut self,
-        name: &'static str,
-        body: impl FnOnce(StopToken) + Send + 'static,
-    ) where
+    /// Errors when a thread cannot be started, after stopping the others as
+    /// [`start`](Self::start) describes.
+    fn spawn_all(
+        mut self,
+        threads: impl IntoIterator<Item = PluginThread>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>>
+    where
         K: 'static,
     {
-        let thread = IoThread::spawn(
-            name,
-            self.stop.source.token(),
-            &self.finish_count,
-            Arc::clone(&self.vcpus),
-            body,
-        );
-        self.threads.push(thread);
+        for PluginThread { name, run } in threads {
+            let spawned = IoThread::spawn(
+                name,
+                self.stop.source.token(),
+                &self.finish_count,
+                Arc::clone(&self.vcpus),
+                run,
+            );
+            match spawned {
+                Ok(thread) => self.threads.push(thread),
+                Err(e) => return Err(LeftRunning::wrap(e.into(), self.stop().err())),
+            }
+        }
+        Ok(self)
     }
 
     /// Requests the stop and joins every thread.
@@ -278,7 +290,8 @@ impl<K: Kick + 'static> IoThreads<K> {
             &finish_count,
             Arc::clone(&vcpus),
             |_| {},
-        );
+        )
+        .expect("the console reader should start");
         Self {
             vcpus,
             stop: StopPlan {
@@ -300,6 +313,20 @@ struct IoThread {
     finished: Arc<AtomicBool>,
 }
 
+/// Returns the builder of the I/O thread `name`.
+///
+/// In a test, the thread named in `tests::REFUSED` asks for a 256 TiB stack.
+/// That is at least the address range a mapping gets by default on x86-64,
+/// arm64 Linux and macOS, so the OS refuses it whatever the overcommit setting.
+fn thread_builder(name: &'static str) -> std::thread::Builder {
+    let builder = std::thread::Builder::new().name(name.to_string());
+    #[cfg(test)]
+    if tests::REFUSED.get() == Some(name) {
+        return builder.stack_size(1 << 48);
+    }
+    builder
+}
+
 impl IoThread {
     /// Starts a thread named `name` that confines itself and then runs `body`
     /// with `stop`.
@@ -307,22 +334,21 @@ impl IoThread {
     /// The thread holds a [`FinishGuard`] that notes on `count`, and a
     /// [`StopOnPanic`] that fails and stops the run of `vcpus` if it panics.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the thread cannot be created.
+    /// Errors with the thread's name when the thread cannot be created.
     fn spawn<K: Kick + 'static>(
         name: &'static str,
         stop: StopToken,
         count: &Arc<FinishCount>,
         vcpus: Arc<Vcpus<K>>,
         body: impl FnOnce(StopToken) + Send + 'static,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let finished = Arc::new(AtomicBool::new(false));
         // The guard is built on the thread, so a thread that is never created
         // notes nothing.
         let (flag, count) = (Arc::clone(&finished), Arc::clone(count));
-        let handle = std::thread::Builder::new()
-            .name(name.to_string())
+        let handle = thread_builder(name)
             .spawn(move || {
                 let _finished = FinishGuard {
                     finished: flag,
@@ -332,8 +358,8 @@ impl IoThread {
                 confine_io_thread();
                 body(stop);
             })
-            .unwrap_or_else(|e| panic!("spawning the {name} thread: {e}"));
-        Self { handle, finished }
+            .map_err(|e| io::Error::new(e.kind(), format!("spawning the {name} thread: {e}")))?;
+        Ok(Self { handle, finished })
     }
 
     /// Sends the kick signal to the thread until its flag is set, or until
@@ -389,8 +415,17 @@ impl IoThread {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
     use super::*;
     use crate::run::StopHandle;
+
+    thread_local! {
+        /// The name of the I/O thread whose start fails, for a test that runs on
+        /// this thread.
+        pub(super) static REFUSED: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
 
     /// A kicker that reaches no thread.
     struct NoopKicker;
@@ -425,6 +460,44 @@ mod tests {
             Arc::clone(vcpus),
             move |_| body(),
         )
+        .unwrap()
+    }
+
+    // The OS refuses the third thread. The two started before it are stopped
+    // and joined before the error returns, and the fourth never starts.
+    #[test]
+    fn refused_thread_stops_the_threads_started_before_it() {
+        // The stop kicks the console reader, so the kick signal needs its
+        // handler.
+        crate::signal::install_kick_handler();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let thread = |name: &'static str| {
+            let ran = Arc::clone(&ran);
+            PluginThread {
+                name,
+                run: Box::new(move |stop: StopToken| {
+                    let _ = stop.sleep(Duration::from_secs(5));
+                    ran.lock().unwrap().push(name);
+                }),
+            }
+        };
+        let threads = [
+            thread("first"),
+            thread("second"),
+            thread("third"),
+            thread("fourth"),
+        ];
+        REFUSED.set(Some("third"));
+        let started = IoThreads::idle(vcpus()).spawn_all(threads);
+        REFUSED.set(None);
+        let error = started.err().expect("the third thread should be refused");
+        assert!(
+            error.to_string().starts_with("spawning the third thread: "),
+            "{error}"
+        );
+        let mut ran = ran.lock().unwrap().clone();
+        ran.sort_unstable();
+        assert_eq!(ran, ["first", "second"]);
     }
 
     // An unwind drops the threads without `stop`. They are still asked to stop,

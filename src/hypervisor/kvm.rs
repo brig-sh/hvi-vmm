@@ -238,8 +238,8 @@ impl Drop for Registration<'_> {
 /// # Errors
 ///
 /// Errors if the plugin refuses the guest, a filter does not compile, the
-/// stop-signal thread cannot be started or its handlers installed, or the stop
-/// source cannot be created.
+/// stop-signal thread cannot be started or its handlers installed, the stop
+/// source cannot be created, or an I/O thread cannot be started.
 pub(crate) fn start_io_threads(
     cfg: &BootConfig,
     guest: &Arc<Guest<Kicker>>,
@@ -265,7 +265,7 @@ pub(crate) fn start_io_threads(
         deliver,
         plugin_threads,
         host,
-    );
+    )?;
     Ok((filters, io_threads, ledger_guard))
 }
 
