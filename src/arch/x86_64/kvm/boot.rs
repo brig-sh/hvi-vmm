@@ -19,7 +19,7 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::kvm_pit_config;
-use kvm_ioctls::{Cap, Kvm};
+use kvm_ioctls::{Cap, Kvm, VmFd};
 
 use super::cpuid::guest_cpuid;
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
@@ -31,7 +31,7 @@ use crate::arch::x86_64::layout::{
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq;
+use crate::devices::irq::{self, Chip as _};
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
@@ -101,10 +101,11 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The ledger exists first, since each device's transport writes to it.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let mut devices = DeviceManager::new(&ram, &ledger, slots, {
-        let vm = Arc::clone(&vm);
-        move |gsi| Arc::new(kvm::IrqLine::new(Arc::clone(&vm), gsi)) as Arc<dyn irq::Line>
-    });
+    let irq_chip = KernelIoApic {
+        vm: Arc::clone(&vm),
+    };
+    let com1_line = irq_chip.line(COM1_GSI);
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip);
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
 
     // Kernel command line: the caller's args and the ttyS0 console. The devices
@@ -189,9 +190,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    uart.lock()
-        .unwrap()
-        .connect_irq(Arc::new(kvm::IrqLine::new(Arc::clone(&vm), COM1_GSI)));
+    uart.lock().unwrap().connect_irq(com1_line);
     let (filters, mut io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,
@@ -227,4 +226,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         filters,
         io_threads,
     )
+}
+
+/// The in-kernel IOAPIC of an x86-64 guest on KVM, whose lines are its pins.
+struct KernelIoApic {
+    /// The VM whose IOAPIC has the lines.
+    vm: Arc<VmFd>,
+}
+
+impl irq::Chip for KernelIoApic {
+    fn line(&self, gsi: u32) -> Arc<dyn irq::Line> {
+        Arc::new(kvm::IrqLine::new(Arc::clone(&self.vm), gsi))
+    }
 }

@@ -69,6 +69,25 @@ impl irq::Line for Line {
     }
 }
 
+/// The in-kernel GIC of an arm64 guest on Hypervisor.framework, whose lines are
+/// its SPIs.
+pub(super) struct Gic {
+    /// The VM whose GIC has the lines.
+    pub(super) vm: VmGic,
+    /// The vCPUs each line kicks on a rise.
+    pub(super) vcpus: Arc<Vcpus<Kicker>>,
+}
+
+impl irq::Chip for Gic {
+    fn line(&self, spi: u32) -> Arc<dyn irq::Line> {
+        Arc::new(Line::new(
+            self.vm.clone(),
+            spi,
+            Some(Arc::clone(&self.vcpus)),
+        ))
+    }
+}
+
 /// Returns where the in-kernel GICv3 sits and how large it is.
 ///
 /// The sizes come from the framework, so the devicetree matches `hv_gic`, and
