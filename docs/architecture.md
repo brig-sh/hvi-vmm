@@ -360,7 +360,9 @@ specifies them: the feature words, the device status in the order a driver sets
 it, the queue registers, and the interrupt status and its acknowledgment. It
 offers `VIRTIO_F_VERSION_1` for every device. At DRIVER_OK it hands the device
 its queues and its interrupt, and from then on passes it each queue
-notification. The device holds its configuration space and serves its queues.
+notification. On KVM a vhost-user export's notifications do not exit to hvi:
+KVM signals the queue's eventfd, which the daemon reads. The device holds its
+configuration space and serves its queues.
 
 A virtio device's interrupt holds the status bits and the line under a lock of
 its own, so a vCPU reads and acknowledges the interrupt without the device's

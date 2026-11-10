@@ -174,11 +174,12 @@ artifacts when they fail, and the two arm64 boots also upload the event
 ledger.
 
 One known gap: the arm64/KVM backend is unit-tested on its stop path only. Its
-only tests are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a run
-stops: a vCPU thread that ends, a stop request, plugin threads, the lifecycle
-records, and a kick before the run. The suite runs on arm64 Linux, on the
-self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the boot
-runners also run the stop tests.
+only tests are the KVM tests in `src/hypervisor/kvm.rs`: the stop tests, of how
+a run stops (a vCPU thread that ends, a stop request, plugin threads, the
+lifecycle records, and a kick before the run), and the queue notification test,
+which runs a few guest instructions in a bare VM. The suite runs on arm64 Linux,
+on the self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the
+boot runners also run the KVM tests.
 
 Four scheduled workflows run outside the two entry points, each reporting
 through a tracking issue so `main` stays green: the nightly e2e suite on every
