@@ -19,9 +19,10 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::kvm_pit_config;
-use kvm_ioctls::{Cap, Kvm, VmFd};
+use kvm_ioctls::{Cap, Kvm};
 
 use super::cpuid::guest_cpuid;
+use super::ioapic::KernelIoApic;
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
 use super::vcpu::{port_bus, run_cpu, VcpuContext};
 use crate::arch::x86_64::acpi;
@@ -31,13 +32,13 @@ use crate::arch::x86_64::layout::{
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::mptable;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::{self, Chip as _};
+use crate::devices::irq::Chip as _;
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
 use crate::hypervisor::kvm::{
-    self, kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
+    kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
 };
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
@@ -231,16 +232,4 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         filters,
         io_threads,
     )
-}
-
-/// The in-kernel IOAPIC of an x86-64 guest on KVM, whose lines are its pins.
-struct KernelIoApic {
-    /// The VM whose IOAPIC has the lines.
-    vm: Arc<VmFd>,
-}
-
-impl irq::Chip for KernelIoApic {
-    fn line(&self, gsi: u32) -> Arc<dyn irq::Line> {
-        Arc::new(kvm::IrqLine::new(Arc::clone(&self.vm), gsi))
-    }
 }

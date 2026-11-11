@@ -36,12 +36,13 @@
 //! `HVI_X86_TRACE=1` for exit and register tracing.
 //!
 //! `boot` builds the VM, its RAM, devices and vCPUs, and runs it. `vcpu` runs
-//! each vCPU thread and routes its exits to the devices. `regs` holds the
-//! long-mode state the boot vCPU enters with, and `cpuid` the CPUID every vCPU
-//! gets.
+//! each vCPU thread and routes its exits to the devices. `ioapic` holds the
+//! interrupt controller the devices' lines are on. `regs` holds the long-mode
+//! state the boot vCPU enters with, and `cpuid` the CPUID every vCPU gets.
 
 mod boot;
 mod cpuid;
+mod ioapic;
 mod regs;
 mod vcpu;
 
