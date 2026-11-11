@@ -19,7 +19,8 @@
 //! `queue`. `mmio` holds the virtio-mmio transport that serves a `Device` to
 //! the guest, and records each queue's programming as a `QueueConfig`. `tap`
 //! attaches virtio-net to a host tap device and holds the `virtio_net_hdr_v1`
-//! framing every tap read and write carries.
+//! framing every tap read and write carries. `wake` holds what wakes a device's
+//! worker thread.
 
 pub mod block;
 pub mod fs;
@@ -28,6 +29,7 @@ pub mod net;
 mod queue;
 pub mod tap;
 pub mod vsock;
+mod wake;
 
 use std::io;
 use std::sync::Arc;
@@ -53,8 +55,9 @@ use crate::plugin::IoSink;
 /// [`queue_max_sizes`](Self::queue_max_sizes) return the same value on every
 /// call.
 ///
-/// A device captures I/O only in [`notify`](Self::notify). A device thread that
-/// feeds the sink outside `notify` ends the batch itself.
+/// A device captures I/O in [`notify`](Self::notify), or on a thread of its
+/// own. Such a thread writes what it captures to the ledger and ends the sink's
+/// batch itself.
 pub(crate) trait Device: Send {
     /// Returns the device type, a `VIRTIO_ID_*` value.
     fn device_type(&self) -> u32;
@@ -121,6 +124,13 @@ pub(crate) trait Device: Send {
 
     /// Resets the device to the state it was built in.
     fn reset(&mut self);
+
+    /// Stops serving the queues of a device the driver has given up on.
+    ///
+    /// The transport calls it when the driver sets FAILED, after which it calls
+    /// [`notify`](Self::notify) no more until a reset. The default does
+    /// nothing, which suits a device that serves a queue only from `notify`.
+    fn driver_failed(&mut self) {}
 
     /// Returns the I/O the device captured since the last call.
     fn take_events(&mut self) -> Vec<CapturedEvent> {

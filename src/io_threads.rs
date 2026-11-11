@@ -52,7 +52,7 @@ pub(crate) struct HostWork {
     /// something a stop token cannot reach.
     io_stops: Vec<Box<dyn FnOnce() + Send>>,
     /// The hooks the vCPUs' stop runs, for a vCPU that waits outside the
-    /// hypervisor.
+    /// hypervisor or a thread that may be left running.
     vcpu_stops: Vec<Box<dyn Fn() + Send + Sync>>,
 }
 
@@ -109,7 +109,6 @@ impl HostWork {
     }
 
     /// Queues `hook` for the vCPUs' stop, as [`Vcpus::on_stop`] describes.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn on_vcpu_stop(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.vcpu_stops.push(Box::new(hook));
     }
@@ -118,6 +117,28 @@ impl HostWork {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn thread_names(&self) -> Vec<&'static str> {
         self.threads.iter().map(|thread| thread.name).collect()
+    }
+
+    /// Takes the queued threads, for a test that runs them itself.
+    #[cfg(test)]
+    pub(crate) fn take_threads(&mut self) -> Vec<QueuedThread> {
+        std::mem::take(&mut self.threads)
+    }
+
+    /// Runs the hooks queued for the vCPUs' stop, as a stop of the vCPUs does.
+    #[cfg(test)]
+    pub(crate) fn run_vcpu_stops(&self) {
+        for hook in &self.vcpu_stops {
+            hook();
+        }
+    }
+
+    /// Runs the actions queued for the I/O threads' stop, as that stop does.
+    #[cfg(test)]
+    pub(crate) fn run_io_stops(&mut self) {
+        for action in std::mem::take(&mut self.io_stops) {
+            action();
+        }
     }
 }
 
@@ -254,7 +275,7 @@ impl<K: Kick> IoThreads<K> {
     /// Starts each of `threads` in order, to be joined with the others.
     ///
     /// It has to be called from a thread with no seccomp filter, since naming
-    /// a new thread calls `prctl`, which neither allowlist has.
+    /// a new thread calls `prctl`, which no allowlist has.
     ///
     /// # Errors
     ///

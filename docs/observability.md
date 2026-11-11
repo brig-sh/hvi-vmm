@@ -50,16 +50,21 @@ the run left out because the ledger's buffer was full, and appears only when
 there were any. A boot that fails before it writes `vmm.start` writes no
 `vmm.stop` either. A record's `ts` is when the VMM added it to the ledger's
 buffer, so a `vmm.vcpu_started` record can follow records the vCPU caused after
-it entered its run loop.
+it entered its run loop. A disk's worker adds the `block` records of a pass
+together once the pass ends, after the guest has seen those requests complete,
+so a `block` record can follow the record of what the guest did with the data. A
+pass is at most a queue's worth of requests.
 
 Under hvi's own binary, a panic stops the vCPUs and writes `vmm.stop` before the
-process aborts, with reason `failed` and the panic's report as `error`. Every
-`block` and `net` record comes from a vCPU thread, and the VMM waits up to half
-a second for the vCPUs to exit before it writes the record. So the record
-follows every record the vCPUs caused, unless a vCPU has not exited by then,
-such as one a plugin's pause holds. The VMM writes a `vmm.vcpu_started` record a
-moment after the vCPU starts, so a vCPU that starts just before a panic can have
-none.
+process aborts, with reason `failed` and the panic's report as `error`. The VMM
+waits up to half a second for the vCPUs to exit before it writes the record. So
+the record follows every record the vCPUs caused, unless a vCPU has not exited
+by then, such as one a plugin's pause holds. A `block` record comes from the
+disk's worker thread, which the panic does not stop. The worker starts no
+request once the ledger is closed, so at most the requests of the pass each disk
+had in progress at `vmm.stop` reach the disk with no record. The VMM writes a
+`vmm.vcpu_started` record a moment after the vCPU starts, so a vCPU that starts
+just before a panic can have none.
 
 On KVM every vCPU enters its run loop at the start, and one the guest has not
 brought up yet waits inside the hypervisor. On macOS a secondary vCPU enters its
@@ -110,13 +115,15 @@ until it ends.
 
 A run loses nothing when the guest stops it, a vCPU fails, or a stop is
 requested, by `SIGTERM` for example. The exceptions are a write at the stop that
-stalls for one second or more, and a vCPU left running at the stop, whose later
-records are discarded. A VMM ended by `SIGKILL`, a crash or a syscall the
-seccomp filter refuses loses the records not written yet. Under hvi's own
-binary, a panic loses the records not written within one second of it. A panic
-before `vmm.start` loses every record not written yet. A repeated stop signal
-that arrives one second or more after the first ends the process at once and
-loses the records not written yet. One that arrives sooner has no effect.
+stalls for one second or more, and a vCPU or a disk's worker left running at the
+stop, whose later records are discarded. A worker left running loses the record
+of the request it has in progress. The stop writes the records of the requests
+completed before it. A VMM ended by `SIGKILL`, a crash or a syscall the seccomp
+filter refuses loses the records not written yet. Under hvi's own binary, a
+panic loses the records not written within one second of it. A panic before
+`vmm.start` loses every record not written yet. A repeated stop signal that
+arrives one second or more after the first ends the process at once and loses
+the records not written yet. One that arrives sooner has no effect.
 
 Once a stalled write lets the buffer fill to 4 MiB, the ledger drops later
 `block` and `net` records. A `vmm.dropped` record after each run of drops says

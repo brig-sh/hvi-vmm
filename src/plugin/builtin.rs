@@ -310,9 +310,10 @@ struct TraceSink {
 
 impl IoSink for TraceSink {
     fn on_block(&self, sector: u64, length: u64, disk_id: u64, write: bool) {
-        // Called on the vCPU thread with the device lock held: buffered, never
-        // flushed here, and a failed write is dropped rather than propagated. A
-        // trace that stalls the guest it is tracing is not a trace.
+        // Called on the disk's worker thread with its queue locked: buffered,
+        // never flushed here, and a failed write is dropped rather than
+        // propagated. A trace that stalls the guest it is tracing is not a
+        // trace.
         let rw = if write { 'w' } else { 'r' };
         let _ = writeln!(
             self.out.lock().unwrap(),

@@ -35,6 +35,9 @@ pub enum Thread {
     Vmm,
     /// A vCPU thread: KVM plus the device models it services inline.
     Vcpu,
+    /// A disk's worker thread, which runs the disk's requests against its
+    /// backing file.
+    Block,
 }
 
 /// Confines the calling host-side I/O thread with `filter`.
