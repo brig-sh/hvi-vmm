@@ -17,9 +17,9 @@
 //! A backend makes a [`DeviceManager`] with the machine's [`SlotAllocator`] and
 //! its [`irq::Chip`], and attaches the virtio devices the configuration asks
 //! for in one call. An attach opens the device, places it, puts it on the MMIO
-//! bus behind a transport, gives it an interrupt on its slot's line and records
-//! it. The records describe the virtio devices to the guest's firmware, and
-//! [`DeviceManager::finish`] hands the bus and the devices to the guest.
+//! bus behind a transport, gives it an interrupt on its slot's trigger and
+//! records it. The records describe the virtio devices to the guest's firmware,
+//! and [`DeviceManager::finish`] hands the bus and the devices to the guest.
 //!
 //! The firmware lists the virtio devices in the order they were attached, and
 //! Linux probes them in that order, so the guest probes the disks in argv
@@ -190,7 +190,7 @@ pub(crate) struct DeviceManager<C> {
     ledger: Arc<Ledger>,
     /// The slots the virtio devices take.
     slots: SlotAllocator,
-    /// The interrupt controller the devices' lines are on.
+    /// The interrupt controller the devices' interrupts are on.
     irq_chip: C,
     /// The backend's function that registers an ioeventfd.
     #[cfg(target_os = "linux")]
@@ -203,7 +203,7 @@ pub(crate) struct DeviceManager<C> {
 
 impl<C: irq::Chip> DeviceManager<C> {
     /// Returns a manager with no devices, which places them in `slots` and
-    /// connects them to lines of `irq_chip`.
+    /// connects them to triggers of `irq_chip`.
     ///
     /// On Linux, `register_ioeventfd` registers the eventfds of each device's
     /// `notify_fds`.
@@ -412,7 +412,8 @@ impl<C: irq::Chip> DeviceManager<C> {
     /// Puts the virtio `device` of `kind` on the bus at `slot` behind a
     /// transport and records it.
     ///
-    /// Returns the device's interrupt, which drives the line of `slot`.
+    /// Returns the device's interrupt, which calls the trigger of `slot`'s
+    /// interrupt.
     ///
     /// # Errors
     ///
@@ -424,7 +425,7 @@ impl<C: irq::Chip> DeviceManager<C> {
         slot: Slot,
         device: &Arc<Mutex<D>>,
     ) -> Result<Arc<Interrupt>, String> {
-        let interrupt = Arc::new(Interrupt::new(self.irq_chip.line(slot.irq)));
+        let interrupt = Arc::new(Interrupt::new(self.irq_chip.trigger(slot.irq)));
         self.insert(
             kind,
             slot,
@@ -475,27 +476,37 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::devices::virtio::mmio::testing::EventfdDevice;
 
-    /// A line that sets nothing.
-    struct NoLine;
+    /// A line and a trigger that reach no guest.
+    struct Unwired;
 
-    impl irq::Line for NoLine {
+    impl irq::Line for Unwired {
         fn set_level(&self, _level: bool) -> std::io::Result<()> {
             Ok(())
         }
     }
 
-    /// An interrupt controller whose lines set nothing, which records the lines
-    /// it made.
+    impl irq::Trigger for Unwired {
+        fn trigger(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An interrupt controller whose lines and triggers reach no guest, which
+    /// records the triggers it made.
     #[derive(Default)]
     struct RecordingIrqChip {
-        /// The interrupts it made lines for, in order.
-        lines: Mutex<Vec<u32>>,
+        /// The interrupts it made triggers for, in order.
+        triggers: Mutex<Vec<u32>>,
     }
 
     impl irq::Chip for RecordingIrqChip {
-        fn line(&self, irq: u32) -> Arc<dyn irq::Line> {
-            self.lines.lock().unwrap().push(irq);
-            Arc::new(NoLine)
+        fn line(&self, _irq: u32) -> Arc<dyn irq::Line> {
+            Arc::new(Unwired)
+        }
+
+        fn trigger(&self, irq: u32) -> Arc<dyn irq::Trigger> {
+            self.triggers.lock().unwrap().push(irq);
+            Arc::new(Unwired)
         }
     }
 
@@ -573,7 +584,7 @@ mod tests {
 
     // The interrupt list skips 8, as the x86-64 one skips the CMOS RTC's line.
     #[test]
-    fn devices_take_their_slots_and_lines_in_attach_order() {
+    fn devices_take_their_slots_and_triggers_in_attach_order() {
         let mut devices = manager(SlotAllocator::new(0x10_0000..0x10_1000, [5, 6, 7, 9, 10]));
         let disks = vec![disk("disk0"), disk("disk1")];
         let agent = scratch("agent");
@@ -601,7 +612,7 @@ mod tests {
                 slot(0x10_0600, 9, DeviceKind::Vsock),
             ]
         );
-        assert_eq!(*devices.irq_chip.lines.lock().unwrap(), [5, 6, 7, 9]);
+        assert_eq!(*devices.irq_chip.triggers.lock().unwrap(), [5, 6, 7, 9]);
 
         let attached = devices.finish();
         assert_eq!(attached.disks.len(), 2);

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The in-kernel GIC of an arm64 guest on Hypervisor.framework, with the VM
-//! handle it comes with, the interrupt lines and the GIC's placement.
+//! handle it comes with, its interrupt lines and triggers, and its placement.
 
 use std::sync::Arc;
 
@@ -27,11 +27,13 @@ use crate::hypervisor::vcpus::{Kick, Vcpus};
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
 pub(super) type VmGic = VirtualMachineInstance<GicEnabled>;
 
-/// A guest interrupt line on the in-kernel GIC.
+/// A guest interrupt line on the in-kernel GIC, which is also the trigger of an
+/// edge-triggered SPI.
 ///
-/// A line that rises on an I/O thread also kicks the vCPUs, so a guest in WFI
-/// takes the interrupt promptly. A vCPU thread raises a line between its own
-/// guest entries and kicks no one, and neither does the console UART's line.
+/// A virtio device's trigger that fires on an I/O thread also kicks the vCPUs,
+/// so a guest in WFI takes the interrupt promptly. A vCPU thread triggers
+/// between its own guest entries and kicks no one. The console UART's line
+/// never kicks.
 pub(super) struct Line {
     /// The VM whose GIC has the line.
     vm: VmGic,
@@ -69,17 +71,30 @@ impl irq::Line for Line {
     }
 }
 
-/// The in-kernel GIC of an arm64 guest on Hypervisor.framework, whose lines are
-/// its SPIs.
+// The framework takes each rise of an edge-triggered SPI as one interrupt, and
+// ignores a fall.
+impl irq::Trigger for Line {
+    fn trigger(&self) -> std::io::Result<()> {
+        irq::Line::set_level(self, true)
+    }
+}
+
+/// The in-kernel GIC of an arm64 guest on Hypervisor.framework, whose lines and
+/// triggers are its SPIs.
 pub(super) struct Gic {
     /// The VM whose GIC has the lines.
     pub(super) vm: VmGic,
-    /// The vCPUs each line kicks on a rise.
+    /// The vCPUs each trigger kicks.
     pub(super) vcpus: Arc<Vcpus<Kicker>>,
 }
 
 impl irq::Chip for Gic {
+    // The lines serve the console UART, whose line kicks no vCPU.
     fn line(&self, spi: u32) -> Arc<dyn irq::Line> {
+        Arc::new(Line::new(self.vm.clone(), spi, None))
+    }
+
+    fn trigger(&self, spi: u32) -> Arc<dyn irq::Trigger> {
         Arc::new(Line::new(
             self.vm.clone(),
             spi,

@@ -823,7 +823,7 @@ mod queue_tests {
         mem.read(buffers + 0x100, &mut got).unwrap();
         assert_eq!(&got, b"HELLO", "the sector reached guest memory");
         assert_eq!(mem.read_u16(used + 2).unwrap(), 1, "used.idx advanced");
-        assert!(driver.line.is_high(), "used-buffer interrupt asserted");
+        assert_eq!(driver.trigger.count(), 1, "the used buffer was signaled");
     }
 
     /// Publishes one read of sector 0 on `avail`, as the next entry of an

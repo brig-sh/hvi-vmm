@@ -41,6 +41,7 @@ const PHANDLE_CLK: u32 = 2;
 const IRQ_SPI: u32 = 0;
 const IRQ_PPI: u32 = 1;
 /// GIC interrupt flag cell.
+const IRQ_EDGE_RISING: u32 = 1;
 const IRQ_LEVEL_HIGH: u32 = 4;
 
 /// Length of `/chosen/rng-seed`, in bytes. 64 bytes is 512 bits, twice what
@@ -241,12 +242,13 @@ pub fn build(
     fdt.end_node(rtc)?;
 
     // /virtio_mmio: one node per device, in the order of `devices`, which is
-    // the order Linux probes them in.
+    // the order Linux probes them in. A device's SPI is edge-triggered, since
+    // the device triggers it once per interrupt and never lowers it.
     for device in devices {
         let node = fdt.begin_node(&format!("virtio_mmio@{:x}", device.base))?;
         fdt.property_string("compatible", "virtio,mmio")?;
         fdt.property_array_u64("reg", &[device.base, device.size])?;
-        fdt.property_array_u32("interrupts", &[IRQ_SPI, device.spi, IRQ_LEVEL_HIGH])?;
+        fdt.property_array_u32("interrupts", &[IRQ_SPI, device.spi, IRQ_EDGE_RISING])?;
         fdt.end_node(node)?;
     }
 
@@ -357,20 +359,27 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("no node for disk {index}"))
         };
         assert!(at(0) < at(1) && at(1) < at(2), "disks in argv order");
-        // Each node carries its own SPI as <SPI type, number, level-high>,
-        // written out as the spec's cell values.
+        // Each node carries its own SPI as <SPI type, number, edge-rising>, and
+        // the PL011 carries its SPI as <SPI type, number, level-high>, written
+        // out as the spec's cell values.
+        let cells = |spi: u32, flags: u32| -> Vec<u8> {
+            [0, spi, flags]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect()
+        };
         for index in 0..3 {
             let node = format!("virtio_mmio@{:x}", disk(index).base);
-            let cells: Vec<u8> = [0u32, disk(index).spi, 4]
-                .iter()
-                .flat_map(|c| c.to_be_bytes())
-                .collect();
             assert_eq!(
                 prop(&blob, &node, "interrupts"),
-                Some(cells),
+                Some(cells(disk(index).spi, 1)),
                 "disk {index} interrupts"
             );
         }
+        assert_eq!(
+            prop(&blob, "pl011@", "interrupts"),
+            Some(cells(UART_SPI, 4))
+        );
         let fifth = format!("virtio_mmio@{:x}", device(4).base);
         assert!(!contains(&blob, &fifth), "only the devices given");
         let net = format!("virtio_mmio@{:x}", net.base);

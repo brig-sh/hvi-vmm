@@ -136,6 +136,8 @@ impl Kick for Kicker {
 }
 
 /// A guest interrupt line on KVM's in-kernel interrupt controller.
+///
+/// On arm64 it is also the trigger of an edge-triggered SPI.
 pub(crate) struct IrqLine {
     /// The VM whose interrupt controller has the line.
     vm: Arc<VmFd>,
@@ -153,6 +155,16 @@ impl IrqLine {
 impl irq::Line for IrqLine {
     fn set_level(&self, level: bool) -> std::io::Result<()> {
         Ok(self.vm.set_irq_line(self.gsi, level)?)
+    }
+}
+
+// The vGIC latches an edge-triggered SPI as pending on each call with level 1,
+// and ignores level 0. An x86 IOAPIC pin takes an edge only on a 0 to 1
+// transition, so this one call is a trigger on arm64 alone.
+#[cfg(target_arch = "aarch64")]
+impl irq::Trigger for IrqLine {
+    fn trigger(&self) -> std::io::Result<()> {
+        Ok(self.vm.set_irq_line(self.gsi, true)?)
     }
 }
 
