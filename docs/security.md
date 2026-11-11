@@ -93,9 +93,9 @@ thread for itself:
 
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
-| `vcpu` | the vCPU threads, where guest descriptors are parsed | 39 syscalls | 40 syscalls |
+| `vcpu` | the vCPU threads, where guest descriptors are parsed | 34 syscalls | 35 syscalls |
 | `block` | each disk's worker thread, which parses the disk's descriptors and runs its requests | 34 syscalls | 35 syscalls |
-| `vmm` | the thread that calls `boot`, the other host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
+| `vmm` | the thread that calls `boot`, the other host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 45 syscalls | 46 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -110,11 +110,15 @@ installs the `vmm` filter once they are, so only a write under way as they are
 armed runs unfiltered. The `vmm.start` record wakes it before any vCPU thread
 starts.
 
-`vcpu` is a strict subset of `vmm`. `block` is too, apart from `preadv` and
-`pwritev`, with which a worker reads and writes a request's data straight
-between the backing file and guest RAM. No other thread makes them, so `vmm`
-does not allow them. Tests check both. All three use a default action of `trap`,
-so an off-list syscall raises `SIGSYS` and kills the process.
+`vcpu` is a strict subset of `vmm`. The vCPU thread parses MMIO, and a disk's
+requests run on the disk's worker, so `vcpu` allows no read or write at an
+offset, no seek and no file sync. `block` is a subset of `vmm` too, apart from
+`preadv` and `pwritev`, with which a worker reads and writes a request's data
+straight between the backing file and guest RAM. No other thread makes them, so
+`vmm` does not allow them. `vmm` keeps `fdatasync` and `fsync`, which only a
+worker calls, so that `block` stays within it. Tests check these rules. All
+three filters use a default action of `trap`, so an off-list syscall raises
+`SIGSYS` and kills the process.
 
 `block` allows `ioctl` only for the requests a worker makes: `KVM_IRQ_LINE` on
 x86-64, which raises the disk's interrupt, and `TCGETS`, `TCSETS` and `TCFLSH`,
@@ -163,12 +167,12 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 30 probes, 13 expect denial, 17 expect success
+hvi seccomp-selftest    # Linux: 34 probes, 17 expect denial, 17 expect success
 ```
 
-On aarch64 the Linux selftest has 29 probes, since the `KVM_IRQ_LINE` probe is
-x86-64 only. A glibc build expects 3 of the 13 denials, the three opens, to fail
-with `EPERM`, and a musl build expects all 13 to raise `SIGSYS`.
+On aarch64 the Linux selftest has 33 probes, since the `KVM_IRQ_LINE` probe is
+x86-64 only. A glibc build expects 3 of the 17 denials, the three opens, to fail
+with `EPERM`, and a musl build expects all 17 to raise `SIGSYS`.
 
 Both install the profile or the filters that actually ship and check both
 directions: what a confined thread must keep, and what it must lose. Neither

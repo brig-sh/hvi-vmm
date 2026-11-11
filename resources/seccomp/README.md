@@ -20,15 +20,17 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-Three filters. `vcpu` is the tight one for the vCPU threads, because MMIO exits
-are serviced inline there -- the virtio device models, the code that parses
-guest descriptors, run there. `block` covers each disk's worker thread, which
-parses the disk's descriptors and runs its requests against the backing file. It
-alone allows `preadv` and `pwritev`, which move a request's data between the
-backing file and guest RAM.
-`vmm` covers the thread that calls `boot`, the other host-side I/O threads, the
-threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the
-ledger's writer.
+Three filters. `vcpu` is the tight one for the vCPU threads. A vCPU thread
+serves its MMIO and port exits, so the virtio-mmio transport, the net and vsock
+device models, the vhost-user handover and the legacy devices run there, and the
+device models parse guest descriptors. A disk's requests run on the disk's
+worker, so `vcpu` allows no read or write at an offset, no seek and no file
+sync. `block` covers each disk's worker thread, which parses the disk's
+descriptors and runs its requests against the backing file. It alone allows
+`preadv` and `pwritev`, which move a request's data between the backing file and
+guest RAM. `vmm` covers the thread that calls `boot`, the other host-side I/O
+threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal
+thread and the ledger's writer.
 
 A rule can also match an argument, as `block`'s `ioctl` rules match the request
 number:
@@ -100,7 +102,8 @@ data, so the bar is a demonstrated need, not a suspicion:
    apart from `preadv` and `pwritev`, which only a disk's worker makes. They
    also check that no list ever gains `open*`, `socket`, `connect`, `execve`,
    `seccomp` or `prctl`, each of which would undo the reason the filters go in
-   after setup, and which `ioctl` requests `block` allows. The opens a glibc
+   after setup. They check that `vcpu` gains no positioned read or write, seek
+   or file sync, and which `ioctl` requests `block` allows. The opens a glibc
    build adds are compiled in by the code, behind the filter that refuses them.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
