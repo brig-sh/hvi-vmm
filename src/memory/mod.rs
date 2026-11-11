@@ -21,12 +21,17 @@
 //! memory. A tool that received the object's descriptor maps it read-only as a
 //! [`GuestRamView`]. A `GuestRam` dereferences to the view, so code written
 //! against the view runs on either. [`RamRegion`] describes one region: where
-//! it sits in the guest and in the object.
+//! it sits in the guest and in the object. Inside the crate, `io` moves data
+//! between a host file and guest RAM with no host buffer.
 
 mod guest;
+mod io;
 mod region;
 mod shared;
 
 pub use guest::{GuestRam, GuestRamView};
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) use io::IOV_MAX;
+pub(crate) use io::{read_vectored_at_volatile, write_vectored_at_volatile};
 pub use region::RamRegion;
 pub use shared::SharedRam;

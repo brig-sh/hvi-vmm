@@ -112,9 +112,13 @@ does not own. A range that would cross from one region into the next is refused.
 `scan()` takes no guest address: it walks each region's host mapping and maps
 its hits back to guest addresses.
 
-`host_ptr` is a bounds-checked raw pointer into one region for the iovec
-paths. It is a raw pointer rather than a `&mut [u8]` because a guest can point
-two descriptors at one address, which would alias the borrow.
+`slice` returns a bounds-checked `VolatileSlice` of one region, and
+`memory/io.rs` reads and writes a host file straight into and out of such slices
+with `preadv` and `pwritev`. virtio-blk and the macOS virtio-fs server use them.
+`host_ptr` is a bounds-checked raw pointer into one region, for the vhost-user
+memory table. Neither is a `&mut [u8]`: the guest changes the bytes during a
+call, and it can point two descriptors at one address, which would alias the
+borrow.
 
 The backing object comes from `memory/shared.rs`: a memfd on Linux or a POSIX
 shared-memory object on macOS, unlinked from the namespace as soon as it is
@@ -371,13 +375,16 @@ A disk's queue is served by a worker thread of its own, which runs under the
 notification of the disk does not exit to hvi either: KVM signals the worker's
 eventfd. On macOS the notification exits, and the device wakes the worker. The
 worker takes a request off the ring and completes it under a lock it shares with
-the device, and calls the backing file with no lock held. It raises the
-interrupt once per request, so a slow flush does not hold back the requests
+the device, and calls the backing file with no lock held. A read or a write
+moves its data between the backing file and the request's buffers in guest RAM
+with `preadv` and `pwritev`, so no host buffer is sized by the guest. It raises
+the interrupt once per request, so a slow flush does not hold back the requests
 before it, and it asks the driver for no notification while it serves the ring.
 After each pass of at most a queue's worth of requests it writes their records
-to the ledger and ends the sink's batch. A reset waits for the call in flight,
-so no request of the reset device reaches guest RAM after the STATUS write
-returns, and the vCPUs' stop ends that wait.
+to the ledger and ends the sink's batch. The kernel writes a read's data into
+guest RAM during the call, so a reset waits for the call in flight, and no
+request of the reset device reaches guest RAM after the STATUS write returns.
+The vCPUs' stop ends that wait.
 
 A virtio device's interrupt is edge-triggered. It holds the status bits under a
 lock of its own, so a vCPU reads and acknowledges the interrupt without the
