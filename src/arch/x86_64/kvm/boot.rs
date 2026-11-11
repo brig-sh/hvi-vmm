@@ -43,6 +43,7 @@ use crate::hypervisor::kvm::{
 use crate::hypervisor::vcpus::{Kick, Vcpus};
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::{GuestArch, RamRegion};
+use crate::sandbox::Thread;
 use crate::signal::install_kick_handler;
 use crate::LOG_PREFIX;
 
@@ -200,7 +201,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
         let guest = Arc::clone(&context.guest);
-        host.spawn("trace watchdog", move |watch| {
+        host.spawn("trace watchdog", Thread::Vmm, move |watch| {
             for _ in 0..4 {
                 match watch.sleep(std::time::Duration::from_secs(2)) {
                     Ok(true) => guest.vcpus.kicker().kick(0),

@@ -850,7 +850,7 @@ impl Shared {
             // The file is emptied before the thread confines itself, since its
             // filter does not allow `ftruncate`.
             let written = empty_once(&file, &mut to_empty).and_then(|()| {
-                crate::sandbox::confine_io_thread();
+                crate::sandbox::confine_io_thread(crate::sandbox::Thread::Vmm);
                 self.write_all_at(&file, &taken, offset)
             });
             // The line is printed before the lock is taken, so a stderr that

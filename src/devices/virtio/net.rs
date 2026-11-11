@@ -58,6 +58,7 @@ use crate::devices::virtio::{
 use crate::events::CapturedEvent;
 use crate::io_threads::HostWork;
 use crate::plugin::IoSink;
+use crate::sandbox::Thread;
 use crate::LOG_PREFIX;
 
 /// `VIRTIO_NET_F_MAC`: the configuration space carries the guest's MAC.
@@ -179,13 +180,13 @@ impl NetSource {
         let (device, ram) = (Arc::clone(device), Arc::clone(ram));
         let deliver = move |frame: &[u8]| device.lock().unwrap().deliver(&ram, frame);
         match self {
-            Self::Gateway(stream) => host.spawn("gateway relay", move |stop| {
+            Self::Gateway(stream) => host.spawn("gateway relay", Thread::Vmm, move |stop| {
                 if let Err(e) = GatewayRelay::new(stream).run(&stop, deliver) {
                     stderrln!("{LOG_PREFIX} virtio-net: {e}; gateway relay stopped");
                 }
             }),
             #[cfg(target_os = "linux")]
-            Self::Tap(file) => host.spawn("tap relay", move |stop| {
+            Self::Tap(file) => host.spawn("tap relay", Thread::Vmm, move |stop| {
                 if let Err(e) = TapRelay::new(file).run(&stop, deliver) {
                     stderrln!("{LOG_PREFIX} virtio-net: {e}; tap relay stopped");
                 }

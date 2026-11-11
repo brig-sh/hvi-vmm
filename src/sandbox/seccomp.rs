@@ -119,17 +119,9 @@
 
 use std::io;
 
+pub use super::Thread;
 use crate::LOG_PREFIX;
 use seccompiler::{BpfProgram, TargetArch};
-
-/// Which filter a thread installs on itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Thread {
-    /// The thread that calls `boot` and the host-side I/O threads.
-    Vmm,
-    /// A vCPU thread: KVM plus the device models it services inline.
-    Vcpu,
-}
 
 impl Thread {
     /// The key this filter has in the JSON.

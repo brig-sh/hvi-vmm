@@ -56,6 +56,7 @@ use crate::devices::virtio::vsock;
 use crate::events::Ledger;
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
+use crate::sandbox::Thread;
 
 /// The error an attach returns.
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -327,7 +328,7 @@ impl<C: irq::Chip> DeviceManager<C> {
         let bridge = agent.bridge;
         self.devices
             .host
-            .spawn("agent bridge", move |stop| bridge.run(&stop));
+            .spawn("agent bridge", Thread::Vmm, move |stop| bridge.run(&stop));
         Ok(())
     }
 
