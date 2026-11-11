@@ -64,6 +64,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -226,6 +227,7 @@ impl Ledger {
                     state: Mutex::default(),
                     to_writer: Condvar::new(),
                     from_writer: Condvar::new(),
+                    closed: AtomicBool::new(false),
                 });
                 let writer = Arc::clone(&shared);
                 std::thread::Builder::new()
@@ -342,17 +344,36 @@ impl Ledger {
         self.submit(|| deadline, true, f)
     }
 
+    /// Returns whether the ledger is closed, after which it takes no record.
+    ///
+    /// A disabled ledger is never closed. The answer can be stale by the time
+    /// the caller acts on it, since the ledger can close at any moment.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| shared.closed.load(Ordering::Acquire))
+    }
+
     /// Adds the `block` and `net` records of `events`, with `boundary`
     /// provenance, observed by the host at the device model.
     ///
     /// It does not wait for the writer. A record that does not fit in the
     /// buffer is dropped.
     pub(crate) fn captured(&self, events: &[CapturedEvent]) {
+        self.captured_unreported(events).print();
+    }
+
+    /// Adds `events` as [`captured`](Self::captured) does, and returns the
+    /// report of the overflows they started or ended in place of printing it.
+    ///
+    /// It never blocks on stderr, so a caller can hold a lock of its own across
+    /// it and print the report once that lock is released.
+    pub(crate) fn captured_unreported(&self, events: &[CapturedEvent]) -> OverflowReport {
         let Some(shared) = &self.shared else {
-            return;
+            return OverflowReport::default();
         };
         if events.is_empty() {
-            return;
+            return OverflowReport::default();
         }
         let mut batch = Batch::new(true);
         for event in events {
@@ -360,14 +381,14 @@ impl Ledger {
         }
         let mut state = shared.state.lock().unwrap();
         if state.closed {
-            return;
+            return OverflowReport::default();
         }
         let (wake, report) = self.add(&mut state, &batch, true);
         drop(state);
         if wake {
             shared.to_writer.notify_one();
         }
-        report.print();
+        report
     }
 
     /// Returns the number of `block` and `net` records dropped because the
@@ -505,6 +526,7 @@ impl Ledger {
         // close has one to report.
         self.add(&mut state, &batch, false);
         let report = if last {
+            shared.closed.store(true, Ordering::Release);
             state.close()
         } else {
             state.urgent = true;
@@ -605,6 +627,7 @@ impl Drop for Ledger {
         // The close counts as a batch, as a close with records does, so the
         // wait lasts until the writer has closed the file and released its
         // lock.
+        shared.closed.store(true, Ordering::Release);
         let report = state.close();
         state.added += 1;
         shared.to_writer.notify_one();
@@ -633,6 +656,8 @@ struct Shared {
     to_writer: Condvar,
     /// The condition variable that wakes the threads waiting for the writer.
     from_writer: Condvar,
+    /// Whether the ledger is closed, for a reader that takes no lock.
+    closed: AtomicBool,
 }
 
 /// The buffer of a [`Ledger`] and the progress of its writer.
@@ -698,7 +723,7 @@ struct Overflow {
 /// The overflows that adding one batch started or ended, as the lines on stderr
 /// report them.
 #[derive(Default)]
-struct OverflowReport {
+pub(crate) struct OverflowReport {
     /// Whether the batch started an overflow.
     started: bool,
     /// The number of records dropped in the overflow the batch ended, or 0.
@@ -716,7 +741,7 @@ impl OverflowReport {
     ///
     /// It must run with the ledger's lock released, so a stderr that blocks
     /// holds up no other thread that adds a record.
-    fn print(&self) {
+    pub(crate) fn print(&self) {
         if self.ended > 0 {
             stderrln!(
                 "{LOG_PREFIX} the ledger dropped {} block and net records while its buffer was full",

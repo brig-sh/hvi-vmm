@@ -19,7 +19,6 @@
 //! made the queue ready: it hands out the available chains as
 //! [`DescriptorChain`]s and publishes completed ones to the used ring.
 
-#[cfg(target_os = "macos")]
 use std::sync::atomic::Ordering;
 
 use virtio_queue::desc::split::Descriptor;
@@ -231,7 +230,6 @@ impl Queue {
     /// Returns whether [`pop`](Self::pop) has no chain to return: the driver
     /// made none available past those popped, or the avail ring claims more
     /// than the queue holds.
-    #[cfg(target_os = "macos")]
     pub(crate) fn is_empty(&self, ram: &GuestRam) -> bool {
         self.inner
             .avail_idx(ram.memory(), Ordering::Acquire)
@@ -253,6 +251,29 @@ impl Queue {
                 self.inner.used_ring(),
             ],
         )
+    }
+
+    /// Asks the driver not to notify the queue, until
+    /// [`enable_notification`](Self::enable_notification).
+    ///
+    /// The request is the used ring's `VRING_USED_F_NO_NOTIFY` flag, since no
+    /// queue enables `VIRTIO_RING_F_EVENT_IDX`. A driver may notify anyway.
+    pub(crate) fn disable_notification(&mut self, ram: &GuestRam) {
+        // The used ring was checked against guest RAM when the queue was made
+        // ready, so the write does not fail.
+        let _ = self.inner.disable_notification(ram.memory());
+    }
+
+    /// Returns whether a chain is available, after asking the driver to notify
+    /// the queue again.
+    ///
+    /// The ring is read after the request, so a chain the driver made available
+    /// while notifications were off is found here.
+    pub(crate) fn enable_notification(&mut self, ram: &GuestRam) -> bool {
+        // The crate's answer is `true` too when the avail ring claims more than
+        // the queue holds, which `pop` refuses, so the ring is read again.
+        let _ = self.inner.enable_notification(ram.memory());
+        !self.is_empty(ram)
     }
 
     /// Puts the chain [`pop`](Self::pop) returned last back at the front of the
@@ -532,6 +553,34 @@ mod tests {
 
         assert!(served);
         assert_eq!(mem.read_u16(USED + 2).unwrap(), 8);
+    }
+
+    // The flags field of the used ring is its first 16 bits.
+    #[test]
+    fn notifications_are_off_until_enabled_again() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        write_descriptor(&mem, DESC, 0, BASE + 0x3000, 16, 0, 0);
+
+        queue.disable_notification(&mem);
+        assert_eq!(mem.read_u16(USED).unwrap(), 1, "VRING_USED_F_NO_NOTIFY");
+        assert!(!queue.enable_notification(&mem), "the ring is empty");
+        assert_eq!(mem.read_u16(USED).unwrap(), 0);
+
+        queue.disable_notification(&mem);
+        make_available(&mem, 8, 0);
+        assert!(
+            queue.enable_notification(&mem),
+            "a chain made available while notifications were off"
+        );
+        queue.pop(&mem).unwrap();
+        assert!(!queue.enable_notification(&mem), "the chain was taken");
+
+        mem.write_u16(AVAIL + 2, 10).unwrap();
+        assert!(
+            !queue.enable_notification(&mem),
+            "an avail index past the ring has no chain to serve"
+        );
     }
 
     #[test]

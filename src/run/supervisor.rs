@@ -197,8 +197,10 @@ impl CurrentRun {
             return false;
         };
         drop(current);
-        // Every `block` and `net` record comes from a vCPU thread, so once the
-        // vCPUs have exited, the closed ledger drops none of them.
+        // Every `net` record comes from a vCPU thread, so once the vCPUs have
+        // exited, the closed ledger drops none of them. A disk's worker writes
+        // its `block` records itself, and the closed ledger drops one it adds
+        // after the stop record.
         vcpus.stop_without_blocking(error);
         vcpus.wait_for_exits_until(start + STOP_TIMEOUT / 2);
         let stop = StopRecord {
@@ -803,7 +805,7 @@ mod tests {
     }
 
     // The vCPUs exit before the ledger closes, so the closed ledger drops no
-    // `block` record a vCPU adds. The host-path ban in clippy.toml is aimed at
+    // `net` record a vCPU adds. The host-path ban in clippy.toml is aimed at
     // the virtio-fs device, where every component of a path comes from the
     // guest. This test reads the ledger file it made.
     #[test]
@@ -819,11 +821,15 @@ mod tests {
                 let ledger = Arc::clone(&guest.ledger);
                 Box::new(move || {
                     while vcpus.is_running() {
-                        ledger.captured(&[CapturedEvent::Block {
-                            disk: "disk0".into(),
-                            lba: 8,
-                            len: 4096,
-                            write: true,
+                        ledger.captured(&[CapturedEvent::NetFlow {
+                            proto: 6,
+                            src: std::net::Ipv4Addr::new(10, 0, 2, 15),
+                            src_port: 40000,
+                            dst: std::net::Ipv4Addr::new(10, 0, 2, 2),
+                            dst_port: 80,
+                            bytes: 64,
+                            dns: None,
+                            sni: None,
                         }]);
                         std::thread::sleep(Duration::from_millis(1));
                     }
