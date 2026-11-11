@@ -237,6 +237,12 @@ impl VmBuilder {
             .arg(dir.join("ledger.ndjson"))
             .arg("--agent-sock")
             .arg(sockets.path().join(AGENT_SOCKET))
+            .args(
+                suite
+                    .irqchip
+                    .iter()
+                    .flat_map(|irqchip| ["--irqchip", irqchip]),
+            )
             .args(&self.args)
             .envs(self.envs.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
