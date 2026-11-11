@@ -861,6 +861,14 @@ jobs:
             | tee notify.log || true
           grep -q "test result: ok. 1 passed" notify.log \
             || { echo "::error::the notification test did not pass"; exit 1; }
+      # The vGIC irqfd tests register irqfds before and after the vGIC is
+      # initialized. They need an arm64 vGIC, so only this job runs them.
+      - name: run vGIC irqfd tests
+        run: |
+          cargo test --release --lib gic::irqfd_tests:: -- --ignored 2>&1 \
+            | tee irqfd.log || true
+          grep -q "test result: ok. 2 passed" irqfd.log \
+            || { echo "::error::the vGIC irqfd tests did not pass"; exit 1; }
       # The aarch64 allowlist is a different file from the x86 one. The hosted
       # arm64 musl job runs it on the static musl binary. This is the only place
       # it runs on the glibc build, and where another page size appears.

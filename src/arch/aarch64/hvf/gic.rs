@@ -94,12 +94,12 @@ impl irq::Chip for Gic {
         Arc::new(Line::new(self.vm.clone(), spi, None))
     }
 
-    fn trigger(&self, spi: u32) -> Arc<dyn irq::Trigger> {
-        Arc::new(Line::new(
+    fn trigger(&self, spi: u32) -> std::io::Result<Arc<dyn irq::Trigger>> {
+        Ok(Arc::new(Line::new(
             self.vm.clone(),
             spi,
             Some(Arc::clone(&self.vcpus)),
-        ))
+        )))
     }
 }
 

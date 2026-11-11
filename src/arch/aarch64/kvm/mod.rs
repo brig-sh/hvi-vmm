@@ -16,10 +16,10 @@
 //!
 //! The Linux counterpart of `hvf`. KVM runs the GIC and PSCI in the kernel.
 //! Secondaries are created powered off, and the guest brings them up with PSCI
-//! `CPU_ON`, which the kernel serves. A device sets its interrupt line with
-//! `KVM_IRQ_LINE`, which also wakes a vCPU in WFI. A kick sets the vCPU's
-//! `immediate_exit` byte and signals its thread, as `hypervisor::kvm`
-//! describes.
+//! `CPU_ON`, which the kernel serves. The PL011 sets its interrupt line with
+//! `KVM_IRQ_LINE`, and a virtio device triggers its interrupt through an irqfd.
+//! Either wakes a vCPU in WFI. A kick sets the vCPU's `immediate_exit` byte and
+//! signals its thread, as `hypervisor::kvm` describes.
 //!
 //! The image and layout, the DTB, the virtio devices, the PL011 and the PL031,
 //! the `RawEvent` ledger and the plugin interface are the same code the macOS
@@ -27,8 +27,8 @@
 //!
 //! `boot` builds the VM, its RAM, devices and vCPUs, and runs it. `vcpu` runs
 //! each vCPU thread and routes its MMIO exits to the devices. `gic` sets up the
-//! vGIC and encodes its interrupt lines. `regs` names the vCPU registers the
-//! backend reads and writes, and sets the boot vCPU's.
+//! vGIC and makes its interrupt lines and triggers. `regs` names the vCPU
+//! registers the backend reads and writes, and sets the boot vCPU's.
 
 mod boot;
 mod gic;

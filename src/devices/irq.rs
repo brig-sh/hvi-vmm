@@ -22,11 +22,16 @@
 //!
 //! A [`Trigger`] delivers one interrupt per call, on an interrupt the guest is
 //! told is edge-triggered. A virtio device's
-//! [`Interrupt`](crate::devices::virtio::mmio::Interrupt) calls it. Each
-//! backend supplies the lines and the triggers through its [`Chip`], since how
-//! an interrupt reaches the guest's interrupt controller is the hypervisor's.
+//! [`Interrupt`](crate::devices::virtio::mmio::Interrupt) calls it. On Linux a
+//! trigger may also take an eventfd that delivers the interrupt in the kernel,
+//! for a writer outside hvi. Each backend supplies the lines and the triggers
+//! through its [`Chip`], since how an interrupt reaches the guest's interrupt
+//! controller is the hypervisor's.
 
 use std::sync::Arc;
+
+#[cfg(target_os = "linux")]
+use vmm_sys_util::eventfd::EventFd;
 
 /// A guest's interrupt controller, which gives each device its line or its
 /// trigger.
@@ -39,7 +44,11 @@ pub(crate) trait Chip {
     /// [`Slot::irq`](crate::devices::manager::Slot::irq).
     ///
     /// The guest's firmware tables declare the interrupt edge-triggered.
-    fn trigger(&self, irq: u32) -> Arc<dyn Trigger>;
+    ///
+    /// # Errors
+    ///
+    /// Errors if the backend cannot make the trigger.
+    fn trigger(&self, irq: u32) -> std::io::Result<Arc<dyn Trigger>>;
 }
 
 impl<C: Chip + ?Sized> Chip for &C {
@@ -47,7 +56,7 @@ impl<C: Chip + ?Sized> Chip for &C {
         (**self).line(irq)
     }
 
-    fn trigger(&self, irq: u32) -> Arc<dyn Trigger> {
+    fn trigger(&self, irq: u32) -> std::io::Result<Arc<dyn Trigger>> {
         (**self).trigger(irq)
     }
 }
@@ -70,6 +79,21 @@ pub(crate) trait Trigger: Send + Sync {
     ///
     /// Errors if the hypervisor does not deliver it.
     fn trigger(&self) -> std::io::Result<()>;
+
+    /// Makes every write to `fd` deliver the interrupt in the kernel, with no
+    /// call to [`trigger`](Self::trigger).
+    ///
+    /// A trigger that cannot take an eventfd keeps this default.
+    ///
+    /// # Errors
+    ///
+    /// Errors with [`ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported)
+    /// if the trigger cannot take an eventfd, and otherwise if the hypervisor
+    /// refuses it.
+    #[cfg(target_os = "linux")]
+    fn register_irqfd(&self, _fd: &EventFd) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// A device's interrupt line, with the level it was last set to.

@@ -89,6 +89,12 @@ impl HostWork {
     pub(crate) fn on_vcpu_stop(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.vcpu_stops.push(Box::new(hook));
     }
+
+    /// Returns the names of the queued threads, in order.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn thread_names(&self) -> Vec<&'static str> {
+        self.threads.iter().map(|thread| thread.name).collect()
+    }
 }
 
 /// A guard that, when its I/O thread panics, reports the run failed and asks it
