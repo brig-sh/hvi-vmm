@@ -36,6 +36,7 @@ fn config() -> BootConfig {
         events: None,
         sandbox_id: "sandbox-log-test".to_string(),
         vcpus: 1,
+        irqchip: None,
         agent_sock: None,
         plugin: None,
         sandbox: true,

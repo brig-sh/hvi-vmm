@@ -213,6 +213,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         events: None,
         sandbox_id: String::from("watch-guest"),
         vcpus: 1,
+        irqchip: None,
         agent_sock: None,
         plugin: Some(Arc::new(WatchGuest::new())),
         sandbox: true,

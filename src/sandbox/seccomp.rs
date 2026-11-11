@@ -745,12 +745,25 @@ fn probes() -> Vec<Probe> {
             what: "raise an interrupt line (block)",
             thread: Thread::Block,
             expected: Outcome::Allowed,
-            // A worker pulses its disk's IOAPIC pin with KVM_IRQ_LINE.
+            // With the in-kernel irqchip, a worker pulses its disk's IOAPIC pin
+            // with KVM_IRQ_LINE.
             run: || {
                 let level = kvm_bindings::kvm_irq_level::default();
                 // SAFETY: KVM_IRQ_LINE on a descriptor that is not open, which
                 // the kernel refuses with EBADF once the filter has passed it.
                 unsafe { libc::ioctl(-1, kvm_irq_line(), &level) };
+            },
+        },
+        Probe {
+            what: "write to an inherited descriptor (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            // A worker raises its disk's interrupt with a write to an irqfd on
+            // arm64, and on x86-64 with the split irqchip.
+            run: || {
+                let msg = b"";
+                // SAFETY: writing zero bytes to fd 1, which we inherited.
+                unsafe { libc::write(1, msg.as_ptr().cast(), 0) };
             },
         },
         Probe {

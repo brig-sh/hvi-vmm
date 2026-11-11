@@ -26,22 +26,21 @@
 //! An [`IoApic`] serves edge-triggered inputs, which every hvi device on x86
 //! drives. It holds an edge that arrives while the guest has the input masked
 //! and sends it when the guest unmasks the input. A level-triggered entry gets
-//! its route too, but the IOAPIC keeps no remote IRR. A split irqchip has no
-//! PIC and no PIT. [`NoPic`] answers the 8259's ports.
+//! its route too, but the IOAPIC keeps no remote IRR, and the vCPU loop ignores
+//! the EOI exit KVM reports for it. A split irqchip has no PIC and no PIT.
+//! [`NoPic`] answers the 8259's ports.
 //!
 //! The registers follow the 82093AA's layout and answer as KVM's in-kernel
 //! IOAPIC does, so a guest reads the same values in either mode.
-
-// The boot path that builds an `IoApic` is not wired in yet.
-#![cfg_attr(not(test), expect(dead_code))]
 
 use std::io;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    kvm_irq_routing_entry, kvm_irq_routing_msi, KvmIrqRouting, KVM_IRQ_ROUTING_MSI,
+    kvm_enable_cap, kvm_irq_routing_entry, kvm_irq_routing_msi, KvmIrqRouting,
+    KVM_CAP_SPLIT_IRQCHIP, KVM_IRQ_ROUTING_MSI,
 };
-use kvm_ioctls::VmFd;
+use kvm_ioctls::{Cap, VmFd};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::arch::x86_64::layout::{IOAPIC_ADDR, IOAPIC_INPUTS, PIC_PORTS};
@@ -368,6 +367,31 @@ pub(super) struct IoApic {
 }
 
 impl IoApic {
+    /// Returns the IOAPIC hvi serves over KVM's split irqchip, after enabling
+    /// the split irqchip on `vm`, which has no vCPU yet.
+    ///
+    /// # Errors
+    ///
+    /// Errors if KVM does not offer the split irqchip, refuses to enable it, or
+    /// refuses an input's irqfd.
+    pub(super) fn create(vm: &Arc<VmFd>) -> Result<Self, String> {
+        if !vm.check_extension(Cap::SplitIrqchip) {
+            return Err("enabling the split irqchip: this host's KVM lacks \
+                 KVM_CAP_SPLIT_IRQCHIP; --irqchip kernel boots without it"
+                .into());
+        }
+        // The argument reserves the GSIs of the IOAPIC's inputs, which are the
+        // ones KVM reports an EOI for.
+        let mut split = kvm_enable_cap {
+            cap: KVM_CAP_SPLIT_IRQCHIP,
+            ..Default::default()
+        };
+        split.args[0] = INPUTS as u64;
+        vm.enable_cap(&split)
+            .map_err(|e| format!("enabling the split irqchip: {e}"))?;
+        Self::new(Routing::from(Arc::clone(vm))).map_err(|e| e.to_string())
+    }
+
     /// Returns an IOAPIC with every input masked, which registers an irqfd for
     /// each input and sets routes through `routing`.
     ///
@@ -1132,5 +1156,136 @@ mod tests {
         mmio_bus.read(base + WINDOW, &mut version).unwrap();
         assert_eq!(u32::from_le_bytes(version), 0x0017_0011);
         assert!(mmio_bus.read(base + REGISTERS_LEN, &mut version).is_err());
+    }
+}
+
+// These tests need a usable `/dev/kvm` on an x86-64 host, so they are ignored
+// by default.
+#[cfg(test)]
+mod kvm_tests {
+    use bus::Device as _;
+    use irq::Chip as _;
+    use kvm_ioctls::{Kvm, VcpuExit};
+
+    use super::*;
+    use crate::memory::GuestRam;
+
+    /// Returns a VM with no vCPU, and the IOAPIC hvi serves on its split
+    /// irqchip.
+    fn vm_with_split_irqchip() -> (Arc<VmFd>, IoApic) {
+        let kvm = Kvm::new().expect("/dev/kvm should be usable");
+        let vm = Arc::new(kvm.create_vm().unwrap());
+        let ioapic = IoApic::create(&vm).unwrap();
+        (vm, ioapic)
+    }
+
+    // KVM refuses an eventfd that is already an irqfd with `EBUSY`, so the
+    // refusal shows that the eventfd was registered.
+    #[test]
+    #[ignore]
+    fn split_irqchip_takes_an_irqfd_on_every_input() {
+        let (vm, ioapic) = vm_with_split_irqchip();
+        let call = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        ioapic.trigger(23).unwrap().register_irqfd(&call).unwrap();
+        let refused = vm.register_irqfd(&call, 23).unwrap_err();
+        assert_eq!(refused.errno(), libc::EBUSY);
+    }
+
+    #[test]
+    #[ignore]
+    fn route_of_every_input_is_accepted() {
+        let (_vm, ioapic) = vm_with_split_irqchip();
+        let mut registers = ioapic.registers.lock().unwrap();
+        for (vector, route) in (0x30u64..).zip(&mut registers.routes) {
+            *route = Entry(vector | (vector % 2) << 8 | (vector % 3 / 2) << 15).msi();
+        }
+        let routes = registers.route_table();
+        assert_eq!(routes.len(), INPUTS);
+        (ioapic.routing.set_routes)(&routes).unwrap();
+    }
+
+    /// The vector the guest programs.
+    const VECTOR: u8 = 0x30;
+    /// The input the guest programs.
+    const GSI: u32 = 5;
+    /// The guest RAM, which holds the real-mode interrupt vector table at 0.
+    const RAM: (u64, usize) = (0, 0x2000);
+    /// Where the guest code starts.
+    const MAIN: u16 = 0x1000;
+    /// The handler of [`VECTOR`].
+    const HANDLER: u16 = 0x1100;
+    /// The handler of every other vector.
+    const OTHER: u16 = 0x1200;
+    /// The port each piece of code writes to when it runs.
+    const PORTS: (u16, u16, u16) = (0x98, 0x99, 0x9a);
+
+    // The guest enables interrupts and spins a while, so an interrupt pending
+    // in its local APIC is taken before the loop ends. Each piece of code
+    // writes a port of its own, so the vCPU's first exit names the code that
+    // ran.
+    #[test]
+    #[ignore]
+    fn irqfd_write_delivers_the_programmed_vector() {
+        let (vm, ioapic) = vm_with_split_irqchip();
+        let ram = GuestRam::from_ranges(&[RAM]);
+        ram.register_kvm_slots(&vm).unwrap();
+        let mut table = Vec::with_capacity(4 * 256);
+        for vector in 0..=255u8 {
+            let offset = if vector == VECTOR { HANDLER } else { OTHER };
+            table.extend_from_slice(&offset.to_le_bytes());
+            table.extend_from_slice(&0u16.to_le_bytes());
+        }
+        ram.write(0, &table).unwrap();
+        let main = [
+            0xfb, // sti
+            0xb9,
+            0xff,
+            0xff, // mov cx, 0xffff
+            0xe2,
+            0xfe, // loop $
+            0xe6,
+            PORTS.0 as u8, // out 0x98, al
+            0xf4,          // hlt
+        ];
+        ram.write(u64::from(MAIN), &main).unwrap();
+        ram.write(u64::from(HANDLER), &[0xe6, PORTS.1 as u8, 0xf4])
+            .unwrap();
+        ram.write(u64::from(OTHER), &[0xe6, PORTS.2 as u8, 0xf4])
+            .unwrap();
+
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.get_regs().unwrap();
+        regs.rip = u64::from(MAIN);
+        regs.rsp = RAM.1 as u64;
+        regs.rflags = 2;
+        vcpu.set_regs(&regs).unwrap();
+        // The local APIC leaves reset enabled but software-disabled, and then
+        // takes no fixed interrupt. Bit 8 of the spurious vector register at
+        // 0xf0 enables it.
+        let mut lapic = vcpu.get_lapic().unwrap();
+        lapic.regs[0xf1] |= 1;
+        vcpu.set_lapic(&lapic).unwrap();
+
+        // Physical destination 0, the vCPU's APIC id, then the vector,
+        // unmasked, fixed and edge-triggered.
+        let low = REDIRECTION_TABLE + 2 * GSI as u8;
+        ioapic.write(SELECT, &[low + 1]);
+        ioapic.write(WINDOW, &0u32.to_le_bytes());
+        ioapic.write(SELECT, &[low]);
+        ioapic.write(WINDOW, &u32::from(VECTOR).to_le_bytes());
+        ioapic.trigger(GSI).unwrap().trigger().unwrap();
+
+        match vcpu.run().unwrap() {
+            VcpuExit::IoOut(port, _) => assert_eq!(
+                port, PORTS.1,
+                "port {:#x} is the main code's, {:#x} another vector's",
+                PORTS.0, PORTS.2
+            ),
+            other => panic!("unexpected exit {other:?}"),
+        }
     }
 }

@@ -45,6 +45,10 @@ The rules of one syscall are joined, so the syscall is allowed when any of them
 matches. A rule without `args` beside one with `args` does not allow every call:
 only the conditions count.
 
+One list serves both x86-64 irqchip modes. `block`'s `KVM_IRQ_LINE` rule serves
+the in-kernel irqchip only: with the split irqchip, a worker raises its disk's
+interrupt with a `write` to an irqfd, as it does on arm64.
+
 ## Why these are not Firecracker's lists
 
 Vendoring Firecracker's filters wholesale, with their copyright header, was the

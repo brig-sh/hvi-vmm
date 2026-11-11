@@ -190,6 +190,7 @@ logs a redistributor region that does not match the table:
 | i8042 status and reset command | PIO `0x64` |
 | ACPI PM1 event, PM1 control and reset registers | PIO `0x600` / `0x604` / `0x606`, SCI on GSI 23 |
 | IOAPIC / LAPIC | `0xfec0_0000` / `0xfee0_0000` |
+| 8259 PIC pair, with the split irqchip | PIO `0x20` / `0xa0`, read 0 |
 | RAM, high half | `0x1_0000_0000` upward |
 
 Guest RAM cannot be one contiguous span from zero. Two fixed things live under
@@ -292,7 +293,7 @@ flowchart TB
     B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image or synthesized; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
     C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs<br/>acpi::build @0xe0000<br/>RSDP, DSDT (_S5), FACS,<br/>FADT (PM1 @0x600), MADT, XSDT"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
-    E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>irqchip + PIT2, CPUID<br/>+hypervisor +TSC-deadline"] --> F
+    E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>split irqchip, or irqchip + PIT2<br/>CPUID +hypervisor +TSC-deadline"] --> F
     F["BSP: rip=entry, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
 ```
 
@@ -317,7 +318,10 @@ as kvm-clock, steal time and paravirtual EOI, IPIs and TLB flushes. It starts on
 kvm-clock, and moves to the TSC when the host's TSC is invariant. A Linux guest
 also runs its local APIC in x2APIC mode, which it allows without interrupt
 remapping only under a hypervisor. With the TSC-deadline bit the guest runs its
-APIC timer in that mode and skips calibrating it at boot.
+APIC timer in that mode and skips calibrating it at boot. With the split irqchip
+the guest has no PIT, so it depends on that mode. Linux leaves the PIT unused
+when kvm-clock gives it the TSC frequency, KVM's CPUID offers ARAT and the
+TSC-deadline bit is set (`apic_needs_pit` in Linux 6.18).
 
 With kvm-clock set up, a vCPU can tell the guest it was paused (section 5). A
 vCPU that parked for a second or more, and the boot vCPU after a safe point
@@ -392,12 +396,26 @@ is the one device-facing thing that differs by backend:
   keeps the eventfds until boot initializes it, after the devices are attached
   and before any vCPU runs. A vhost-user export's call eventfds are irqfds on
   its SPI too, so a daemon's completion reaches the guest with no hvi thread.
-- **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7
-  and 9 to 22. A virtio trigger raises the pin and lowers it again, under a
-  lock, since the IOAPIC takes an edge only on a 0 to 1 transition. KVM delivers
-  an irqfd on an IOAPIC pin from a kernel worker thread, so a vhost-user export
-  instead has an hvi thread per queue that reads its call eventfd and triggers
-  the interrupt.
+- **x86, split irqchip** (the default): hvi serves the IOAPIC, and KVM runs the
+  local APICs. Each IOAPIC input, GSIs 0 to 23, has an irqfd, and its KVM route
+  is the MSI its redirection entry describes. A virtio trigger and a rise of the
+  console UART's line write the input's irqfd, and a fall does nothing. KVM
+  delivers an irqfd on an MSI route in the thread that writes it. While the
+  guest has the input masked, the input holds one edge and sends it on unmask.
+  hvi sets the routes again only when an entry's MSI differs from its route. A
+  write to the high half of a masked entry sets none, so no route pairs the new
+  destination with the old vector while the guest writes the two halves. An
+  input with no route holds its edge as a masked one does. A vhost-user export's
+  call eventfds are further irqfds on its input. A daemon's completion then
+  reaches the guest with no hvi thread, also while the guest has the input
+  masked. The guest has no PIC and no PIT. The 8259's ports read 0, so Linux's
+  probe finds no PIC, and its timer is the local APIC's TSC-deadline mode.
+- **x86, in-kernel irqchip** (`--irqchip kernel`): KVM runs the IOAPIC, a PIC
+  and a PIT. A line is `vm.set_irq_line(GSI, level)`, GSIs 4 to 7 and 9 to 22. A
+  virtio trigger raises the pin and lowers it again, under a lock, since the
+  IOAPIC takes an edge only on a 0 to 1 transition. KVM delivers an irqfd on an
+  IOAPIC pin from a kernel worker thread, so a vhost-user export instead has an
+  hvi thread per queue that reads its call eventfd and triggers the interrupt.
 
 A daemon's write to a call eventfd sets no status bit. So once a device has an
 irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` from DRIVER_OK until
