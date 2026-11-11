@@ -101,15 +101,17 @@ allocation you can avoid. A write that cannot block, such as one to an eventfd
 or a non-blocking pipe that wakes a reader, goes in `on_batch_end`, which runs
 once per batch with the lock released. A write that can block, such as one to a
 file, waits for `on_safepoint`: count in the sink, set a dirty flag, and write
-there. `IoTrace` is the worked example. `on_block` and the `on_batch_end` after
-it run on a disk's worker thread under the `block` filter, which does not allow
-every call the vCPU filter does: no `getrandom`, so no first use of a `HashMap`
-there, and no `sendmsg`, `recvmsg` or `shutdown`. Each disk has a worker of its
-own, so one sink gets `on_block` from several threads at once when the guest has
-several disks. A sink must not keep the `VmHandle` either: the device holds the
-sink and the handle holds the device, so the three would keep one another alive
-after `boot` returns. A sink that needs the handle keeps a `Weak` from
-`Arc::downgrade`.
+there. `IoTrace` is the worked example. On Linux the vCPU seccomp filter refuses
+a read or write at an offset, a seek and a file sync, so a write to a file there
+goes at the file's position, as `IoTrace`'s does. `on_block` and the
+`on_batch_end` after it run on a disk's worker thread under the `block` filter,
+which does not allow every call the vCPU filter does: no `getrandom`, so no
+first use of a `HashMap` there, and no `sendmsg`, `recvmsg` or `shutdown`. Each
+disk has a worker of its own, so one sink gets `on_block` from several threads
+at once when the guest has several disks. A sink must not keep the `VmHandle`
+either: the device holds the sink and the handle holds the device, so the three
+would keep one another alive after `boot` returns. A sink that needs the handle
+keeps a `Weak` from `Arc::downgrade`.
 
 **5. `on_request` must return promptly.** It runs on the VMM's console thread,
 and the stop waits for that thread. An `on_request` still running a second after
@@ -119,16 +121,17 @@ returns.
 
 **6. Start your threads with `VmHandle::spawn`.** Call it from `on_attach`, with
 a name and a boxed closure that takes a `hvi::teardown::StopToken`. The VMM
-starts the thread once the attach has succeeded, under the same seccomp filter
-as its own I/O threads on Linux, and joins it with them when the run stops. The
-token reports the stop once the vCPUs have exited or been left running: wait on
-it with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own
-`poll` set, and return when it fires. A thread still running a second after the
-token reports the stop is left running and fails the run, and a thread that
-panics fails the run and stops it, as [Panics](#panics) says. Open files and
-bind sockets in `on_attach`, since the filter refuses them. A thread you start
-any other way is neither joined nor filtered, and it keeps the `VmHandle` and
-the VM it holds alive for as long as it runs.
+starts the thread once the attach has succeeded, under the `vmm` seccomp filter
+on Linux, and joins it with its own I/O threads when the run stops. The token
+reports the stop once the vCPUs have exited or been left running: wait on it
+with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own `poll`
+set, and return when it fires. A thread still running a second after the token
+reports the stop is left running and fails the run, and a thread that panics
+fails the run and stops it, as [Panics](#panics) says. Open files and bind
+sockets in `on_attach`, since the filter refuses them. It also refuses a read at
+an offset and a seek. A thread you start any other way is neither joined nor
+filtered, and it keeps the `VmHandle` and the VM it holds alive for as long as
+it runs.
 
 ## Reading guest memory
 

@@ -56,20 +56,22 @@
 //! # Where the filters go in
 //!
 //! Three filters, because the threads are not alike. `vcpu` is the tight one
-//! for the vCPU threads: MMIO exits are serviced inline there, so the virtio
-//! device models -- the code that parses guest descriptors -- run there.
-//! `block` covers each disk's worker thread, which parses the disk's
-//! descriptors and runs its requests against the backing file. It alone allows
-//! `preadv` and `pwritev`, which move a request's data between the backing file
-//! and guest RAM. `vmm` covers the
-//! thread that calls `boot`, the boot thread below, the other host-side I/O
-//! threads (the console reader, the agent bridge and its per-connection
-//! readers, the tap and gateway readers, and the debug watchdog when it is
-//! enabled), the threads a plugin starts with `VmHandle::spawn`, the thread
-//! that receives the stop signals and the ledger writer. The ledger writer
-//! starts with the ledger, before the filters are armed, and installs `vmm`
-//! before its first write after the filters are armed. Each queued I/O thread
-//! names its filter when it is queued.
+//! for the vCPU threads. A vCPU thread serves its MMIO and port exits, so the
+//! virtio-mmio transport, the net and vsock device models, the vhost-user
+//! handover and the legacy devices run there, and the device models parse guest
+//! descriptors. A disk's requests run on the disk's worker, so `vcpu` allows no
+//! read or write at an offset, no seek and no file sync. `block` covers each
+//! disk's worker thread, which parses the disk's descriptors and runs its
+//! requests against the backing file. It alone allows `preadv` and `pwritev`,
+//! which move a request's data between the backing file and guest RAM. `vmm`
+//! covers the thread that calls `boot`, the boot thread below, the other
+//! host-side I/O threads (the console reader, the agent bridge and its
+//! per-connection readers, the tap and gateway readers, and the debug watchdog
+//! when it is enabled), the threads a plugin starts with `VmHandle::spawn`, the
+//! thread that receives the stop signals and the ledger writer. The ledger
+//! writer starts with the ledger, before the filters are armed, and installs
+//! `vmm` before its first write after the filters are armed. Each queued I/O
+//! thread names its filter when it is queued.
 //!
 //! A rule may match an argument as well as the syscall. `block` allows `ioctl`
 //! only for the requests its thread makes, so a worker cannot reach the rest of
@@ -95,7 +97,7 @@
 //!
 //! Everything acquired during setup is finished by the time any filter is in,
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
-//! absent from both lists. A compromised virtio backend cannot open a file.
+//! absent from every list. A compromised virtio backend cannot open a file.
 //!
 //! # The files glibc opens by itself
 //!
@@ -610,45 +612,68 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::kill(1, 0) };
             },
         },
-        // The other half: what a filtered thread must still be able to do.
-        //
-        // The flush pair earns its place: the lists first shipped allowing
-        // `fsync` for "virtio-blk flush requests", but the device model calls
-        // `File::sync_data`, which is `fdatasync`. Nothing caught it, because a
-        // guest that only ever reads its disk never issues a flush -- it took a
-        // container with a writable rootfs, and the VMM died of SIGSYS mid-run.
-        // A probe per filter means the allowlist is checked against the syscall
-        // the code actually makes.
+        // A disk's requests run on its worker, so a vCPU thread reads and writes
+        // no file at an offset and flushes none. The read and the write each
+        // take one empty buffer, so a call the filter passes moves nothing.
+        Probe {
+            what: "read at an offset (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || {
+                let _ = std::os::unix::fs::FileExt::read_at(&*inherited(0), &mut [], 0);
+            },
+        },
+        Probe {
+            what: "write at an offset (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || {
+                let _ = std::os::unix::fs::FileExt::write_at(&*inherited(1), &[], 0);
+            },
+        },
         Probe {
             what: "flush an inherited descriptor (vcpu)",
             thread: Thread::Vcpu,
-            expected: Outcome::Allowed,
+            expected: Outcome::Trapped,
             run: || {
-                // SAFETY: fdatasync on fd 1, which we inherited. It is the
-                // syscall `File::sync_data` makes on the virtio-blk flush path.
+                // SAFETY: fdatasync on fd 1, which we inherited.
                 unsafe { libc::fdatasync(1) };
             },
         },
         Probe {
-            what: "flush an inherited descriptor (vmm)",
+            what: "read at an offset (vmm)",
             thread: Thread::Vmm,
-            expected: Outcome::Allowed,
+            expected: Outcome::Trapped,
             run: || {
-                // SAFETY: as above.
-                unsafe { libc::fdatasync(1) };
+                let _ = std::os::unix::fs::FileExt::read_at(&*inherited(0), &mut [], 0);
             },
         },
+        // The other half: what a filtered thread must still be able to do.
+        //
+        // A disk's flush calls `File::sync_data`, which is `fdatasync`, not
+        // `fsync`, so the probe makes the call the worker makes.
         Probe {
             what: "flush an inherited descriptor (block)",
             thread: Thread::Block,
             expected: Outcome::Allowed,
             run: || {
-                // SAFETY: as above.
+                // SAFETY: fdatasync on fd 1, which we inherited.
                 unsafe { libc::fdatasync(1) };
             },
         },
-        // A virtio-blk read or write goes through the functions the worker
-        // calls, so the probe makes whichever syscall the libc lowers them to.
+        Probe {
+            what: "write at an offset (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Allowed,
+            // The ledger writer writes the file at an offset. The probe writes
+            // one empty buffer to fd 1, which we inherited, so the call is made
+            // and writes nothing.
+            run: || {
+                let _ = std::os::unix::fs::FileExt::write_at(&*inherited(1), &[], 0);
+            },
+        },
+        // The probe calls the functions the worker calls for a virtio-blk read
+        // or write, so it makes whichever syscall the libc lowers them to.
         Probe {
             what: "read at an offset into buffers (block)",
             thread: Thread::Block,
@@ -1240,6 +1265,27 @@ mod tests {
         let extra: Vec<_> = vcpu.difference(&vmm).collect();
         assert!(extra.is_empty(), "vcpu allows what vmm does not: {extra:?}");
         assert!(vcpu.len() < vmm.len(), "vcpu should be the tighter filter");
+    }
+
+    // A disk's requests run on its worker, so a vCPU thread reads and writes no
+    // file at an offset, seeks none and syncs none.
+    #[test]
+    fn vcpu_filter_has_no_positioned_io_seek_or_sync() {
+        let vcpu = names("vcpu");
+        for name in [
+            "pread64",
+            "pwrite64",
+            "preadv",
+            "pwritev",
+            "preadv2",
+            "pwritev2",
+            "lseek",
+            "fsync",
+            "fdatasync",
+            "sync_file_range",
+        ] {
+            assert!(!vcpu.contains(name), "vcpu allows {name}");
+        }
     }
 
     // A disk's worker parses guest descriptors too, so its list follows the
