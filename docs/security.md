@@ -27,7 +27,7 @@ Everything a hostile guest can touch, it touches through hvi:
 | Surface | Exposure |
 | --- | --- |
 | virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. |
-| Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. |
+| Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. A disk's chains are parsed on its worker thread. |
 | virtio-blk backing file | Whatever `--disk` names. |
 | virtio-fs shares | The exported tree, read-only or read-write. |
 | Network frames | Parsed by the built-in stack, or relayed without the guest's virtio-net header. |
@@ -88,13 +88,14 @@ touches guest data unconfined.
 
 ### Linux: seccomp-bpf
 
-Two allowlists per architecture, in `resources/seccomp/`, installed by each
+Three allowlists per architecture, in `resources/seccomp/`, installed by each
 thread for itself:
 
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
-| `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
+| `vcpu` | the vCPU threads, where guest descriptors are parsed | 39 syscalls | 40 syscalls |
+| `block` | each disk's worker thread, which parses the disk's descriptors and runs its requests | 34 syscalls | 35 syscalls |
+| `vmm` | the thread that calls `boot`, the other host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -109,11 +110,17 @@ installs the `vmm` filter once they are, so only a write under way as they are
 armed runs unfiltered. The `vmm.start` record wakes it before any vCPU thread
 starts.
 
-`vcpu` is a strict subset of `vmm`, checked by a test. Both use a default
-action of `trap`, so an off-list syscall raises `SIGSYS` and kills the
-process.
+`vcpu` and `block` are each a strict subset of `vmm`, checked by tests. All
+three use a default action of `trap`, so an off-list syscall raises `SIGSYS` and
+kills the process.
 
-Neither list carries an open syscall (`openat`, `openat2`, and on x86-64
+`block` allows `ioctl` only for the requests a worker makes: `KVM_IRQ_LINE` on
+x86-64, which raises the disk's interrupt, and `TCGETS`, `TCSETS` and `TCFLSH`,
+which the fatal-signal handler and the panic hook make from whichever thread
+they run on to restore the terminal. The rule matches the request number, not
+the descriptor. A syscall with a rule per request counts once in the table.
+
+No list carries an open syscall (`openat`, `openat2`, and on x86-64
 `open`). A glibc build also installs, on every filtered thread and before the
 allowlist, a filter that fails those with `EPERM`, and adds them to the
 allowlist it compiles. glibc's malloc opens `/proc/sys/vm/overcommit_memory`,
@@ -154,11 +161,12 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 21 probes, 9 expect denial, 12 expect success
+hvi seccomp-selftest    # Linux: 30 probes, 13 expect denial, 17 expect success
 ```
 
-On Linux a glibc build expects 2 of the 9 denials, the two opens, to fail with
-`EPERM`, and a musl build expects all 9 to raise `SIGSYS`.
+On aarch64 the Linux selftest has 29 probes, since the `KVM_IRQ_LINE` probe is
+x86-64 only. A glibc build expects 3 of the 13 denials, the three opens, to fail
+with `EPERM`, and a musl build expects all 13 to raise `SIGSYS`.
 
 Both install the profile or the filters that actually ship and check both
 directions: what a confined thread must keep, and what it must lose. Neither
@@ -184,9 +192,10 @@ sandbox is secure.
   a thread starts in `on_attach`, before the Linux filters are armed, and stays
   unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
   as it begins, as the memory-dump plugin's `--dump-after` timer does.
-- **It does not constrain syscall arguments.** No rule in either architecture
-  file carries an argument condition, so `ioctl` and `sendmsg` are
-  unconstrained over every descriptor the process already holds.
+- **It constrains syscall arguments on one filter only.** The `block` filter
+  limits `ioctl` to the requests its thread makes. No `vmm` or `vcpu` rule
+  carries an argument condition, so `ioctl` and `sendmsg` are unconstrained
+  there over every descriptor the process already holds.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 

@@ -20,11 +20,11 @@
 //! stop through its [`StopSource`] once the vCPU threads have exited or been
 //! left running, every poll returns, and it joins the threads before `boot`
 //! returns. Some helpers need more than the poll. A macOS virtio-fs device's
-//! worker and readahead workers wait on no descriptor; each parks on a
-//! condition variable, and a stop action that `IoThreads::stop` runs wakes it.
-//! The console reader reads stdin, which the whole process shares, so a byte
-//! another reader took between the poll and the read would leave it blocked;
-//! `IoThreads::stop` sends it the kick signal until it has finished, with
+//! readahead workers wait on no descriptor; each parks on a condition variable,
+//! and a stop action that `IoThreads::stop` runs wakes it. The console reader
+//! reads stdin, which the whole process shares, so a byte another reader took
+//! between the poll and the read would leave it blocked; `IoThreads::stop`
+//! sends it the kick signal until it has finished, with
 //! `IoThread::kick_until_finished`.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
@@ -275,7 +275,7 @@ pub(crate) fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::R
 
 /// Sleeps for 1 ms, or until `deadline` when that comes sooner.
 ///
-/// It sleeps in `poll`, which both seccomp allowlists allow, so a vCPU thread
+/// It sleeps in `poll`, which every seccomp allowlist allows, so a vCPU thread
 /// can call it. `clock_nanosleep` is in the `vmm` allowlist only.
 pub(crate) fn sleep_step(deadline: Instant) {
     let next = (Instant::now() + Duration::from_millis(1)).min(deadline);

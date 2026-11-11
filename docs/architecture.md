@@ -343,7 +343,7 @@ sequenceDiagram
     participant B as Backend run loop
     participant R as Bus
     participant T as virtio-mmio transport
-    participant D as Device (blk/net/vsock/fs)
+    participant D as Device (net/vsock/fs)
     participant M as GuestRam
     participant L as Event ledger
     G->>B: MMIO/PIO exit @ device range
@@ -365,6 +365,19 @@ its queues and its interrupt, and from then on passes it each queue
 notification. On KVM a vhost-user export's notifications do not exit to hvi:
 KVM signals the queue's eventfd, which the daemon reads. The device holds its
 configuration space and serves its queues.
+
+A disk's queue is served by a worker thread of its own, which runs under the
+`block` seccomp filter and never takes the transport's device lock. On KVM a
+notification of the disk does not exit to hvi either: KVM signals the worker's
+eventfd. On macOS the notification exits, and the device wakes the worker. The
+worker takes a request off the ring and completes it under a lock it shares with
+the device, and calls the backing file with no lock held. It raises the
+interrupt once per request, so a slow flush does not hold back the requests
+before it, and it asks the driver for no notification while it serves the ring.
+After each pass of at most a queue's worth of requests it writes their records
+to the ledger and ends the sink's batch. A reset waits for the call in flight,
+so no request of the reset device reaches guest RAM after the STATUS write
+returns, and the vCPUs' stop ends that wait.
 
 A virtio device's interrupt is edge-triggered. It holds the status bits under a
 lock of its own, so a vCPU reads and acknowledges the interrupt without the
@@ -405,9 +418,10 @@ reads `VIRTIO_MMIO_INT_VRING`.
 - **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`, one device
   per disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real
   sync, adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with
-  the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image
-  is locked while open, shared for a read-only disk and exclusive for a
-  writable one.
+  the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image is
+  locked while open, shared for a read-only disk and exclusive for a writable
+  one. Each disk has a worker thread that serves its queue, one request at a
+  time.
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_NET_F_MAC` and no offloads.
   Queue 0 is RX, queue 1 is TX.
@@ -547,7 +561,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `psci.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
+| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `wake.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

@@ -16,9 +16,9 @@
 //!
 //! Two ship with the VMM, and between them they use every part of the seam:
 //!
-//! - [`MemoryDump`] writes guest RAM to a file, with the VM parked so the image
-//!   is consistent. Post-mortem debugging, and the thing you want when a guest
-//!   wedges and the console has stopped answering.
+//! - [`MemoryDump`] writes guest RAM to a file, with the vCPUs parked so no
+//!   guest code runs during the write. Post-mortem debugging, and the thing you
+//!   want when a guest wedges and the console has stopped answering.
 //! - [`IoTrace`] logs every virtio-blk request and virtio-net frame as it
 //!   crosses the device. The ledger already aggregates flows; this is the
 //!   unaggregated version, for when the aggregate is what you distrust.
@@ -94,7 +94,7 @@ impl Plugin for Chain {
     }
 }
 
-/// Writes guest RAM to a file, with the VM parked.
+/// Writes guest RAM to a file, with the vCPUs parked.
 ///
 /// Triggered by the console's interrupt key, or on a timer with
 /// [`MemoryDump::after`]. The dump is raw guest-physical memory, one region
@@ -212,12 +212,16 @@ impl Plugin for MemoryDump {
         Ok(())
     }
 
-    /// Parks the VM and writes the dump.
+    /// Parks the vCPUs and writes the dump.
     ///
-    /// The guest is stopped for the whole write, which for a large guest on a
+    /// The vCPUs are stopped for the whole write, which for a large guest on a
     /// slow disk is a visible stall. That is the deliberate choice: a dump
-    /// taken while the guest runs is torn, and a torn memory image is worse
-    /// than a slow one, because nothing about it says so.
+    /// taken while the vCPUs run is torn, and a torn memory image is worse
+    /// than a slow one, because nothing about it says so. The pause parks the
+    /// vCPUs only. A disk's worker and a shared folder's server still complete
+    /// the requests the guest made before it, and a network reader delivers
+    /// the frames that arrive, so the image can hold part of a read that was
+    /// in flight.
     fn on_safepoint(&self, cpu: &dyn CpuHandle) {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return;
@@ -310,9 +314,10 @@ struct TraceSink {
 
 impl IoSink for TraceSink {
     fn on_block(&self, sector: u64, length: u64, disk_id: u64, write: bool) {
-        // Called on the vCPU thread with the device lock held: buffered, never
-        // flushed here, and a failed write is dropped rather than propagated. A
-        // trace that stalls the guest it is tracing is not a trace.
+        // Called on the disk's worker thread with its queue locked: buffered,
+        // never flushed here, and a failed write is dropped rather than
+        // propagated. A trace that stalls the guest it is tracing is not a
+        // trace.
         let rw = if write { 'w' } else { 'r' };
         let _ = writeln!(
             self.out.lock().unwrap(),

@@ -25,6 +25,9 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | virtio-blk disks attach at boot only. | No hotplug, no PCI at all. | Design |
+| A disk's requests run one at a time. | Each disk has one worker thread, so the host sees one request at a time whatever the guest queues, and a read waits behind a flush queued before it. | Design |
+| Several busy disks need more host cores than the guest has vCPUs. | A request runs on the disk's worker while the vCPU that sent it waits. When a guest sends small requests one after another to several disks at once, each request takes longer the more disks are busy. The cost is largest once the vCPUs and the busy workers outnumber the host's cores. On a Mac only the performance cores count, and the cost starts with the second busy disk. | Design |
+| A disk whose backing file stops answering holds the vCPU that resets the disk. | A reset waits for the request in flight, so its data and status byte do not reach the guest after the reset. The VMM's stop ends the wait. | Design |
 | An MMIO access to an address no device claims reads 0, and a write there is dropped. | The run goes on. With `HVI_MMIO_TRACE` set, hvi writes a line to stderr with the address, the width and the program counter, at most 10 at once and then one every 500 ms. It is off by default, because the line is written on the vCPU, and a full stderr would stop it. On x86-64, the program counter of a write is the next instruction's, because KVM has finished the instruction by then. | Design |
 | On arm64, an MMIO access with no instruction syndrome, such as a load pair, ends the run. | hvi cannot tell which registers the access names. A cache maintenance instruction on such an address is skipped. | Design |
 | An x86-64 port no device claims reads `0xff`, and a write there is dropped. | hvi reports nothing, because Linux probes absent ports at every boot. | Design |
@@ -96,7 +99,7 @@ three things a reader should not have to guess between:
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
 | A thread a plugin starts outside `VmHandle::spawn` is unfiltered on Linux. | It starts in `on_attach`, before the filters are armed, and stays unfiltered. | Design |
-| No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
+| Only the `block` filter's `ioctl` rules carry an argument condition, on the request number. | Under the `vmm` and `vcpu` filters `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. Under `block` an allowed `ioctl` request reaches any of them. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. A glibc build still refuses an open, without a record. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |
 | No external security audit. | Testing, not assurance. | Design |
