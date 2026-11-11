@@ -174,6 +174,10 @@ pub(crate) fn register_ioeventfd(
     Ok(vm.register_ioevent(fd, &IoEventAddress::Mmio(address), value)?)
 }
 
+/// A function that registers an eventfd as the irqfd of an interrupt, by the
+/// interrupt's number on the guest's interrupt controller.
+pub(crate) type IrqfdRegistrar = Box<dyn Fn(&EventFd, u32) -> std::io::Result<()> + Send + Sync>;
+
 /// A vCPU thread as the other threads reach it.
 struct VcpuThread {
     /// The pthread handle the signal goes to, as an integer.
