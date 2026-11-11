@@ -167,6 +167,11 @@ impl DeviceStatus {
 /// and send no trigger. The lock is separate from the transport state lock and
 /// the device lock, so an interrupt status read or an acknowledgment never
 /// waits for a device that is serving its queues.
+///
+/// On Linux an eventfd can deliver the interrupt in the kernel, for a writer
+/// outside hvi such as a vhost-user daemon. Such a write sets no status bit, so
+/// once one is registered the status the guest reads always has
+/// `VIRTIO_MMIO_INT_VRING` while the interrupt is enabled.
 pub(crate) struct Interrupt {
     /// The state behind the lock.
     state: Mutex<InterruptState>,
@@ -182,6 +187,8 @@ struct InterruptState {
     /// Whether notifications are taken, from the DRIVER_OK write until the next
     /// reset.
     enabled: bool,
+    /// Whether an irqfd is registered.
+    irqfd_registered: bool,
     /// The trigger a raise calls.
     trigger: Arc<dyn irq::Trigger>,
 }
@@ -194,9 +201,28 @@ impl Interrupt {
                 status: 0,
                 config_generation: 0,
                 enabled: false,
+                irqfd_registered: false,
                 trigger,
             }),
         }
+    }
+
+    /// Makes every write to `fd` deliver the interrupt in the kernel, as
+    /// [`irq::Trigger::register_irqfd`] describes.
+    ///
+    /// The irqfd stays registered across a reset.
+    ///
+    /// # Errors
+    ///
+    /// Errors as the trigger's `register_irqfd` does, with
+    /// [`ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) if it cannot
+    /// take an eventfd.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_irqfd(&self, fd: &EventFd) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.trigger.register_irqfd(fd)?;
+        state.irqfd_registered = true;
+        Ok(())
     }
 
     /// Raises a used-buffer notification.
@@ -219,9 +245,20 @@ impl Interrupt {
         self.state.lock().unwrap().raise(bit);
     }
 
-    /// Returns the pending notification bits.
+    /// Returns the notification bits the guest reads.
+    ///
+    /// With an irqfd registered, the status has `VIRTIO_MMIO_INT_VRING` while
+    /// the interrupt is enabled, even when `VIRTIO_MMIO_INT_CONFIG` is set. A
+    /// configuration change and an irqfd write can reach the guest as one
+    /// interrupt, and the guest scans its queues only when it reads
+    /// `VIRTIO_MMIO_INT_VRING`.
     fn status(&self) -> u32 {
-        self.state.lock().unwrap().status
+        let state = self.state.lock().unwrap();
+        if state.irqfd_registered && state.enabled {
+            state.status | VIRTIO_MMIO_INT_VRING
+        } else {
+            state.status
+        }
     }
 
     /// Returns whether a notification is pending.
@@ -682,6 +719,42 @@ pub(crate) mod testing {
         }
     }
 
+    /// A trigger that takes irqfds, and counts the interrupts it delivered and
+    /// the irqfds registered on it.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    pub(crate) struct IrqfdTrigger {
+        /// The interrupts delivered through the trigger.
+        triggers: CountingTrigger,
+        /// The number of irqfds registered.
+        irqfds: AtomicU32,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl IrqfdTrigger {
+        /// Returns the number of interrupts delivered through the trigger.
+        pub(crate) fn count(&self) -> u32 {
+            self.triggers.count()
+        }
+
+        /// Returns the number of irqfds registered.
+        pub(crate) fn irqfds(&self) -> u32 {
+            self.irqfds.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl irq::Trigger for IrqfdTrigger {
+        fn trigger(&self) -> std::io::Result<()> {
+            self.triggers.trigger()
+        }
+
+        fn register_irqfd(&self, _fd: &EventFd) -> std::io::Result<()> {
+            self.irqfds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     /// A device of two queues whose notifications signal an eventfd per queue.
     #[cfg(target_os = "linux")]
     pub(crate) struct EventfdDevice {
@@ -803,20 +876,27 @@ pub(crate) mod testing {
 
     /// A guest driver of one device, which programs its transport in the order
     /// Linux's `virtio_mmio` driver does.
-    pub(crate) struct Driver<D> {
+    pub(crate) struct Driver<D, T = CountingTrigger> {
         /// The transport the driver accesses.
         pub(crate) transport: Transport<D>,
         /// The device behind the transport.
         pub(crate) device: Arc<Mutex<D>>,
         /// The device's trigger.
-        pub(crate) trigger: Arc<CountingTrigger>,
+        pub(crate) trigger: Arc<T>,
     }
 
     impl<D: virtio::Device> Driver<D> {
         /// Returns a driver of `device`, whose queues are in `ram`.
         pub(crate) fn new(device: D, ram: &Arc<GuestRam>) -> Self {
+            Self::with_trigger(device, ram, Arc::default())
+        }
+    }
+
+    impl<D: virtio::Device, T: irq::Trigger + 'static> Driver<D, T> {
+        /// Returns a driver of `device`, whose queues are in `ram` and whose
+        /// interrupt calls `trigger`.
+        pub(crate) fn with_trigger(device: D, ram: &Arc<GuestRam>, trigger: Arc<T>) -> Self {
             let device = Arc::new(Mutex::new(device));
-            let trigger = Arc::new(CountingTrigger::default());
             let interrupt = Arc::new(Interrupt::new(Arc::clone(&trigger) as Arc<dyn irq::Trigger>));
             let ledger = Arc::new(Ledger::new(None, "transport-test").unwrap());
             Self {
@@ -1478,6 +1558,76 @@ mod tests {
             failure
         });
         assert_eq!(failure, None);
+    }
+
+    /// Returns a driver of a fresh stub, in 16 KiB of guest RAM, whose
+    /// interrupt has an irqfd.
+    #[cfg(target_os = "linux")]
+    fn driver_with_irqfd() -> Driver<Stub, testing::IrqfdTrigger> {
+        let ram = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let driver = Driver::with_trigger(Stub::new(), &ram, Arc::default());
+        driver
+            .transport
+            .interrupt
+            .register_irqfd(&EventFd::new(0).unwrap())
+            .unwrap();
+        driver
+    }
+
+    // No queue is ready at DRIVER_OK, so no replayed notification sets a bit,
+    // as none does on a vhost-user device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn irqfd_status_reads_vring_only_while_enabled() {
+        let driver = driver_with_irqfd();
+        assert_eq!(driver.trigger.irqfds(), 1);
+        assert_eq!(driver.read(INTERRUPT_STATUS), 0, "before DRIVER_OK");
+        driver.start(&[]);
+        assert_eq!(driver.read(INTERRUPT_STATUS), VIRTIO_MMIO_INT_VRING);
+        driver.write(INTERRUPT_ACK, VIRTIO_MMIO_INT_VRING);
+        assert_eq!(
+            driver.read(INTERRUPT_STATUS),
+            VIRTIO_MMIO_INT_VRING,
+            "after the acknowledgment"
+        );
+        driver.reset();
+        assert_eq!(driver.read(INTERRUPT_STATUS), 0, "after the reset");
+        driver.start(&[]);
+        assert_eq!(
+            driver.read(INTERRUPT_STATUS),
+            VIRTIO_MMIO_INT_VRING,
+            "after the next DRIVER_OK"
+        );
+        assert_eq!(driver.trigger.count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_change_with_an_irqfd_triggers_and_reads_beside_vring() {
+        let driver = driver_with_irqfd();
+        driver.start(&[]);
+        driver.transport.interrupt.signal_config_change();
+        assert_eq!(driver.trigger.count(), 1);
+        let read = driver.read(INTERRUPT_STATUS);
+        assert_eq!(read, VIRTIO_MMIO_INT_CONFIG | VIRTIO_MMIO_INT_VRING);
+        driver.write(INTERRUPT_ACK, read);
+        assert_eq!(driver.read(INTERRUPT_STATUS), VIRTIO_MMIO_INT_VRING);
+        driver.transport.interrupt.signal_config_change();
+        assert_eq!(driver.trigger.count(), 2, "CONFIG was acknowledged");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_irqfd_adds_no_vring_to_the_status() {
+        let driver = driver();
+        let refused = driver
+            .transport
+            .interrupt
+            .register_irqfd(&EventFd::new(0).unwrap())
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+        driver.start(&[]);
+        assert_eq!(driver.read(INTERRUPT_STATUS), 0);
     }
 
     #[test]

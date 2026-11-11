@@ -339,15 +339,18 @@ impl<C: irq::Chip> DeviceManager<C> {
     ///
     /// # Errors
     ///
-    /// Errors when no slot is left for an export, `vhost_user::attach` fails,
-    /// or a range overlaps one already on the bus.
+    /// Errors when no slot is left for an export, `vhost_user::attach` fails, a
+    /// range overlaps one already on the bus, or an export's interrupt cannot
+    /// be delivered.
     #[cfg(target_os = "linux")]
     fn attach_exports(&mut self, exports: &[FsConfig], ram_fd: RawFd) -> Result<(), Error> {
         let slots = self.export_slots(exports.len())?;
         let exports = vhost_user::attach(exports, ram_fd)?;
-        for (export, slot) in exports.iter().zip(slots) {
+        for (index, (export, slot)) in exports.iter().zip(slots).enumerate() {
             let interrupt = self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
-            export.queue_interrupts(&interrupt, &mut self.devices.host);
+            export
+                .queue_interrupts(&interrupt, &mut self.devices.host)
+                .map_err(|e| format!("virtio-fs export {index}: {e}"))?;
         }
         // A vCPU in an export's activation or reset waits on its daemon, where
         // no kick reaches it. Ending the connections at the stop frees it.
@@ -417,15 +420,20 @@ impl<C: irq::Chip> DeviceManager<C> {
     ///
     /// # Errors
     ///
-    /// Errors when the range of `slot` overlaps one already on the bus, or the
-    /// hypervisor refuses a notification eventfd.
+    /// Errors when the backend cannot make the trigger of `slot`'s interrupt,
+    /// the range of `slot` overlaps one already on the bus, or the hypervisor
+    /// refuses a notification eventfd.
     fn attach_virtio<D: virtio::Device + 'static>(
         &mut self,
         kind: DeviceKind,
         slot: Slot,
         device: &Arc<Mutex<D>>,
     ) -> Result<Arc<Interrupt>, String> {
-        let interrupt = Arc::new(Interrupt::new(self.irq_chip.trigger(slot.irq)));
+        let trigger = self
+            .irq_chip
+            .trigger(slot.irq)
+            .map_err(|e| format!("setting up interrupt {}: {e}", slot.irq))?;
+        let interrupt = Arc::new(Interrupt::new(trigger));
         self.insert(
             kind,
             slot,
@@ -504,9 +512,9 @@ mod tests {
             Arc::new(Unwired)
         }
 
-        fn trigger(&self, irq: u32) -> Arc<dyn irq::Trigger> {
+        fn trigger(&self, irq: u32) -> std::io::Result<Arc<dyn irq::Trigger>> {
             self.triggers.lock().unwrap().push(irq);
-            Arc::new(Unwired)
+            Ok(Arc::new(Unwired))
         }
     }
 
