@@ -13,8 +13,9 @@ env:
   CARGO_TERM_COLOR: always
 
 # Every job sets a `timeout-minutes` far below the six-hour default. This
-# matters most for the self-hosted jobs: each runs on the only runner of its
-# kind, so one stuck job blocks that runner for everything else.
+# matters most for the self-hosted jobs: the GICv3 and macOS lanes each run on
+# the only runner of their kind, so one stuck job blocks that runner for
+# everything else.
 
 # Name bash for every run block. The default shell runs `bash -e` without
 # pipefail, so a command that fails in front of a `tee` or a search can pass
@@ -176,32 +177,34 @@ jobs:
   # with --cpus 2 also exercises SMP: the BSP enters long mode and the guest
   # brings the AP online with INIT-SIPI-SIPI serviced by the in-kernel LAPIC, so
   # we additionally assert both processors activate. Needs a runner with
-  # /dev/kvm; skips cleanly otherwise.
+  # /dev/kvm; the job fails without it.
   #
   # Self-hosted rather than GitHub-hosted, which is a change of runner and not
-  # of what is tested. The `guest kernel` step below installs a package, and on
-  # the hosted image that fetch wedged five times in one afternoon -- once for
-  # 55 minutes -- against a normal two, on unrelated pull requests, while
-  # GitHub reported no incident. Every time, cancelling and re-running cleared
-  # it, so it is a stuck fetch rather than a slow one (#49).
+  # of what is tested. The `guest kernel` step below fetches the signed
+  # hull-assets kernel (cosign verify, then oras pull), and on the hosted image
+  # a package fetch wedged five times in one afternoon -- once for 55 minutes --
+  # against a normal two, on unrelated pull requests, while GitHub reported no
+  # incident. Every time, cancelling and re-running cleared it, so it is a stuck
+  # fetch rather than a slow one (#49).
   #
-  # A persistent runner also installs that kernel once instead of on every run,
-  # so the flaky dependency is off the path for all but the first job, and the
-  # boot itself is on bare metal rather than in a hosted VM. The arm64 KVM jobs
-  # below are already self-hosted for a harder reason -- no hosted arm64 runner
+  # The runner is a pod of the kvm-dind-2604-amd64 scale set. It runs on bare
+  # metal with /dev/kvm, so the boot is not nested in a hosted VM. The arm64 KVM
+  # jobs below are self-hosted for a harder reason -- no hosted arm64 runner
   # exposes /dev/kvm at all -- so this is the same shape, not a new one.
   boot-x86:
     name: Boot x86
-    # A fork's pull request is untrusted code. These runners are persistent
-    # machines we own, not ephemeral VMs, so a malicious pull request would not
-    # merely run once -- it could leave something behind for the next job. The
-    # hosted lanes above already cover a fork's build and unit tests; the live
-    # boots are what we withhold. Pushes, dispatches and same-repo pull
-    # requests are trusted and still run.
+    # A fork's pull request is untrusted code. The GICv3 and macOS lanes run on
+    # persistent machines we own, so a malicious pull request would not merely
+    # run once -- it could leave something behind for the next job. This lane
+    # runs in a pod, but a privileged one that shares the node's kernel: it
+    # runs as root with sudo and attaches loop devices and creates taps. So it
+    # is withheld too. The hosted lanes above already cover a fork's build and
+    # unit tests; the live boots are what we withhold. Pushes, dispatches
+    # and same-repo pull requests are trusted and still run.
     if: >-
       github.event_name != 'pull_request'
       || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, kvm]
+    runs-on: kvm-dind-2604-amd64
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -212,8 +215,12 @@ jobs:
           cache-key: x86-live
       - id: kvm
         run: |
-          if [ -e /dev/kvm ]; then echo "ok=yes" >> "$GITHUB_OUTPUT"; ls -l /dev/kvm; \
-          else echo "ok=no" >> "$GITHUB_OUTPUT"; echo "::warning::/dev/kvm absent — skipping live boot"; fi
+          # The scale set maps /dev/kvm into every pod, so a pod without it is
+          # a broken runner, and a skip would report that as a pass.
+          test -e /dev/kvm \
+            || { echo "::error::no /dev/kvm in this pod -- the runner is not mapping the device"; exit 1; }
+          ls -l /dev/kvm
+          echo "ok=yes" >> "$GITHUB_OUTPUT"
       - name: build
         if: steps.kvm.outputs.ok == 'yes'
         run: cargo build --release
@@ -311,7 +318,9 @@ jobs:
           for range in "0x0000000000000000-0x000000000009fbff" \
                        "0x0000000000100000-0x00000000cfffffff" \
                        "0x0000000100000000-0x000000012fffffff"; do
-            grep -q "BIOS-e820: \[mem $range\] usable" boot-4g.log \
+            # Kernels print the type as either `usable` or `System RAM`, so the
+            # pattern accepts both spellings.
+            grep -qE "BIOS-e820: \[mem $range\] +(usable|System RAM)" boot-4g.log \
               || { echo "::error::e820 lacks the usable range $range"; exit 1; }
           done
           echo "e820 split around the MMIO hole ✓"
@@ -364,13 +373,14 @@ jobs:
           truncate -s 64M blk.img
           LOOP=$(sudo losetup --find --show blk.img)
           echo "loop device: $LOOP"
+          echo "loop=$LOOP" >> "$GITHUB_OUTPUT"
           # Build the test binary as the runner user, so the cargo caches stay
           # unowned by root; only the test itself needs sudo to open the device.
           # The test is in the library, so pick the lib test artifact: the bin
           # artifact lists no test by this name, and the harness exits 0 on a
           # filter that matches nothing, so the step is also held to one pass.
-          # The loop device is detached before that check, so a failing test
-          # does not leave it behind on the runner.
+          # The loop device is detached by the step after this one, however
+          # the job ends: in a pod the device belongs to the node.
           BIN=$(cargo test --release --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true
                             and .target.name=="hvi" and (.target.kind|contains(["lib"])))
@@ -380,9 +390,11 @@ jobs:
           sudo HVI_BLOCK_DEV="$LOOP" "$BIN" \
             devices::virtio::block::backing_len_tests::a_block_device_reports_the_device_size --exact --nocapture \
             | tee blk.log || true
-          sudo losetup -d "$LOOP"
           grep -q "test result: ok. 1 passed" blk.log \
             || { echo "::error::the block-device size test did not pass"; exit 1; }
+      - name: detach the loop device
+        if: always() && steps.blk.outputs.loop != ''
+        run: sudo losetup -d "${{ steps.blk.outputs.loop }}" 2>/dev/null || true
       # The tests of how a run stops: a vCPU thread that ends, a stop request,
       # plugin threads, the lifecycle records, and a kick before the run. They
       # are ignored in the plain suite, since they need KVM (root's here) and
@@ -442,8 +454,8 @@ jobs:
           rm -f fs.sock
           sudo "$VFSD" --socket-path="$PWD/fs.sock" --shared-dir "$PWD/share" \
             --sandbox namespace --cache auto 2>daemon-fs.log &
-          # An hvi that exits before it connects leaves the daemon waiting, on
-          # a runner the next job reuses.
+          # An hvi that exits before it connects leaves the daemon waiting for
+          # the rest of the job.
           VFSD_PID=$!
           trap 'sudo kill "$VFSD_PID" 2>/dev/null || true' EXIT
           # The guest does its work in a couple of seconds and powers off.
@@ -794,17 +806,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: nbfc
+          - runs-on: kvm-dind-2604-arm64
             vgic: vGICv2
             expect_gicv3: "no"
-          - runner: gicv3
+          - runs-on: [self-hosted, Linux, ARM64, gicv3]
             vgic: vGICv3
             expect_gicv3: "yes"
     # Withheld from fork pull requests; see the note on boot-x86.
     if: >-
       github.event_name != 'pull_request'
       || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, ARM64, "${{ matrix.runner }}"]
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -812,13 +824,17 @@ jobs:
           persist-credentials: false
       - name: kvm availability
         run: |
-          # Fail fast and legibly if the runner lost /dev/kvm access, rather
-          # than leaving a boot timeout to explain it. The runner user must be
-          # in the kvm group; a group added after the runner started does not
-          # reach it until the runner is restarted.
+          # Fail fast and legibly if the runner cannot open /dev/kvm, rather
+          # than leaving a boot timeout to explain it. In a pod the scale set
+          # maps the device and the pod spec supplies the kvm group. On the
+          # GICv3 host the runner user must be in the kvm group, and a group
+          # added after the runner started does not reach it until the runner
+          # is restarted.
           test -w /dev/kvm \
-            || { echo "::error::runner cannot write /dev/kvm (kvm group? runner restarted?)"; exit 1; }
+            || { echo "::error::runner cannot write /dev/kvm (pod: device not mapped? host: kvm group, runner restarted?)"; exit 1; }
           grep -m1 GICv /proc/interrupts || true
+          # Guest-memory mapping follows the host page size, so the log records it.
+          echo "page size: $(getconf PAGESIZE)"
       # Install the toolchain rather than trusting one to be pre-provisioned
       # in the runner user's home. That assumption held while a single machine
       # served this job and broke as soon as it did not: the runner user is
@@ -827,12 +843,12 @@ jobs:
       # "cargo: command not found" at the build step.
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: linux-arm64-${{ matrix.runner }}
+          cache-key: linux-arm64-${{ matrix.vgic }}
       - name: build
         run: cargo build --release
-      # The hosted test jobs have 4 KiB pages. Guest-memory mapping constraints
-      # follow the host page size, and these runners are where another size
-      # appears in CI, so the suite runs here too. `--release` reuses the
+      # Guest-memory mapping constraints follow the host page size. These
+      # hosts run 4 KiB pages, as the hosted jobs do, and the availability
+      # step logs the size so a change shows up. `--release` reuses the
       # build above.
       - name: unit suite
         run: cargo test --release
@@ -846,7 +862,7 @@ jobs:
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
       # The aarch64 allowlist is a different file from the x86 one. The hosted
       # arm64 musl job runs it on the static musl binary. This is the only place
-      # it runs on the glibc build, and where another page size appears.
+      # it runs on the glibc build.
       - name: seccomp filters (aarch64)
         run: ./target/release/hvi seccomp-selftest
       - name: guest kernel
@@ -959,8 +975,8 @@ jobs:
             echo "::warning::cannot create a tap (needs CAP_NET_ADMIN or passwordless sudo) -- skipping the tap network boot"
             exit 0
           fi
-          # The e2e suite's tap, which stays on these runners, takes the next
-          # /24, 172.30.1.0/24; see e2e/tools/provision.sh.
+          # The e2e suite's tap, which stays on the GICv3 host between jobs,
+          # takes the next /24, 172.30.1.0/24; see e2e/tools/provision.sh.
           $NET ip addr add 172.30.0.1/24 dev hvi-ci-tap
           $NET ip link set hvi-ci-tap up
           ip -d link show hvi-ci-tap
@@ -1015,8 +1031,9 @@ jobs:
       - name: tap teardown
         if: always()
         run: |
-          # The tap is host state that would outlive the job on this
-          # persistent runner; remove it however it was created. (The probe's
-          # pre-clean also covers a crashed run, so best-effort is enough.)
+          # The tap is host state. It would outlive the job on the GICv3 host,
+          # and in a pod it lives in the pod's namespace until the pod goes.
+          # Remove it however it was created. (The probe's pre-clean also
+          # covers a crashed run, so best-effort is enough.)
           pkill -f "target/release/hvi boot" 2>/dev/null || true
           ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true

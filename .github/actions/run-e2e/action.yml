@@ -49,16 +49,34 @@ runs:
     # Every Linux runner builds the same virtiofsd, since distributions ship
     # different ones or none. Each version goes in a directory of its own, and
     # the step builds it only when the binary there does not report that
-    # version, so a persistent runner builds each version once, even while it
-    # alternates between two pins, and a job with the binary in place does not
-    # reach crates.io. As for cargo-nextest above, `.github/renovate.json` holds
-    # a custom manager for the pin below. Keep the `# renovate:` marker with it.
-    - name: Install virtiofsd
+    # version. A persistent runner keeps the directory between jobs, and a pod
+    # gets it back from the Actions cache, so a job with the binary in place
+    # does not reach crates.io. The cache key holds the version and `$HOME`
+    # alone: a new pin is a new key, and the host and the pod, whose home
+    # directories differ, do not share an entry that stores the path. As for
+    # cargo-nextest above, `.github/renovate.json` holds a custom manager for
+    # the pin below. Keep the `# renovate:` marker with it.
+    - name: Pin virtiofsd
+      id: virtiofsd
       if: runner.os == 'Linux'
       shell: bash
       env:
         # renovate: datasource=crate depName=virtiofsd
         VIRTIOFSD_VERSION: 1.14.0
+      run: |
+        echo "version=$VIRTIOFSD_VERSION" >> "$GITHUB_OUTPUT"
+        echo "home=$(echo "$HOME" | tr / _)" >> "$GITHUB_OUTPUT"
+    - name: Restore virtiofsd
+      if: runner.os == 'Linux'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/hvi-e2e/virtiofsd
+        key: virtiofsd-${{ runner.os }}-${{ runner.arch }}-${{ steps.virtiofsd.outputs.version }}-${{ steps.virtiofsd.outputs.home }}
+    - name: Install virtiofsd
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        VIRTIOFSD_VERSION: ${{ steps.virtiofsd.outputs.version }}
       run: |
         root="$HOME/.cache/hvi-e2e/virtiofsd/$VIRTIOFSD_VERSION"
         virtiofsd="$root/bin/virtiofsd"
