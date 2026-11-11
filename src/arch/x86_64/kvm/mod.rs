@@ -14,10 +14,12 @@
 
 //! The x86-64 guest on KVM, SMP-capable.
 //!
-//! The x86 counterpart of `aarch64::kvm`. KVM runs the LAPIC, the IOAPIC and
-//! the PIT in the kernel (`create_irq_chip`, `create_pit2`), and the guest
-//! brings up its APs with INIT-SIPI-SIPI, which the kernel handles. The VMM
-//! enters the BSP in long mode and runs every vCPU thread. It builds the
+//! The x86 counterpart of `aarch64::kvm`. KVM runs the local APICs in the
+//! kernel. The IOAPIC is the one hvi serves over KVM's split irqchip, with no
+//! PIC and no PIT, or KVM's in-kernel one with a PIC and a PIT beside it
+//! (`create_irq_chip`, `create_pit2`), as `BootConfig::irqchip` chooses. The
+//! guest brings up its APs with INIT-SIPI-SIPI, which the kernel handles. The
+//! VMM enters the BSP in long mode and runs every vCPU thread. It builds the
 //! initial long-mode state (identity page tables, flat 64-bit segments,
 //! CR0/CR3/CR4/EFER), loads the bzImage or vmlinux, writes `boot_params` (see
 //! `super::loader`), and enters at the 64-bit entry with RSI pointing at the
@@ -36,9 +38,10 @@
 //! `HVI_X86_TRACE=1` for exit and register tracing.
 //!
 //! `boot` builds the VM, its RAM, devices and vCPUs, and runs it. `vcpu` runs
-//! each vCPU thread and routes its exits to the devices. `ioapic` holds the
-//! interrupt controller the devices' lines are on. `regs` holds the long-mode
-//! state the boot vCPU enters with, and `cpuid` the CPUID every vCPU gets.
+//! each vCPU thread and routes its exits to the devices. `ioapic` holds the two
+//! IOAPICs the devices' lines and triggers can be on. `regs` holds the
+//! long-mode state the boot vCPU enters with, and `cpuid` the CPUID every vCPU
+//! gets.
 
 mod boot;
 mod cpuid;

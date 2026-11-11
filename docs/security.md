@@ -28,6 +28,7 @@ Everything a hostile guest can touch, it touches through hvi:
 | --- | --- |
 | virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. |
 | Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. A disk's chains are parsed on its worker thread. |
+| IOAPIC registers (x86-64, split irqchip) | Parsed on the vCPU thread. A redirection entry whose MSI changes becomes a `KVM_SET_GSI_ROUTING` call. |
 | virtio-blk backing file | Whatever `--disk` names. |
 | virtio-fs shares | The exported tree, read-only or read-write. |
 | Network frames | Parsed by the built-in stack, or relayed without the guest's virtio-net header. |
@@ -124,12 +125,15 @@ three filters use a default action of `trap`, so an off-list syscall raises
 x86-64, which raises the disk's interrupt, and `TCGETS`, `TCSETS` and `TCFLSH`,
 which the fatal-signal handler and the panic hook make from whichever thread
 they run on to restore the terminal. The rule matches the request number, not
-the descriptor. A syscall with a rule per request counts once in the table.
+the descriptor. A syscall with a rule per request counts once in the table. The
+`KVM_IRQ_LINE` rule serves the in-kernel irqchip only. With the split irqchip, a
+worker raises the disk's interrupt with a `write` to an irqfd, as it does on
+arm64, and the one `block` list covers both modes.
 
-No list carries an open syscall (`openat`, `openat2`, and on x86-64
-`open`). A glibc build also installs, on every filtered thread and before the
-allowlist, a filter that fails those with `EPERM`, and adds them to the
-allowlist it compiles. glibc's malloc opens `/proc/sys/vm/overcommit_memory`,
+No list carries an open syscall (`openat`, `openat2`, and on x86-64 `open`). A
+glibc build also installs, on every filtered thread and before the allowlist, a
+filter that fails those with `EPERM`, and adds them to the allowlist it
+compiles. glibc's malloc opens `/proc/sys/vm/overcommit_memory`,
 `/sys/devices/system/cpu/online` and `/proc/stat` on its own, from whichever
 thread is allocating or freeing, and copes with each open failing. The open is
 refused rather than trapped, and the process still opens nothing. A musl build,
@@ -167,10 +171,10 @@ vulnerability report.
 
 ```sh
 hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 34 probes, 17 expect denial, 17 expect success
+hvi seccomp-selftest    # Linux: 35 probes, 17 expect denial, 18 expect success
 ```
 
-On aarch64 the Linux selftest has 33 probes, since the `KVM_IRQ_LINE` probe is
+On aarch64 the Linux selftest has 34 probes, since the `KVM_IRQ_LINE` probe is
 x86-64 only. A glibc build expects 3 of the 17 denials, the three opens, to fail
 with `EPERM`, and a musl build expects all 17 to raise `SIGSYS`.
 

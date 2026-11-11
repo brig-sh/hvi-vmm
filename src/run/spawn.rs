@@ -136,6 +136,7 @@ mod tests {
             events: None,
             sandbox_id: "spawn-test".to_string(),
             vcpus: 1,
+            irqchip: None,
             agent_sock: None,
             plugin: None,
             sandbox: false,

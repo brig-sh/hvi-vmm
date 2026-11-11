@@ -571,6 +571,7 @@ mod stop_tests {
             events: None,
             sandbox_id: "stop-test".to_string(),
             vcpus: 2,
+            irqchip: None,
             agent_sock: None,
             plugin,
             sandbox: !cfg!(debug_assertions),
