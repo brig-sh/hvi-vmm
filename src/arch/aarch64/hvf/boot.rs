@@ -26,6 +26,7 @@ use crate::arch::aarch64::fdt;
 use crate::arch::aarch64::layout::{virtio_slots, RAM_BASE, UART_BASE, UART_SPI};
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
+use crate::devices::irq::Chip as _;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
@@ -117,6 +118,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         vm: vm.clone(),
         vcpus: Arc::clone(&vcpus),
     };
+    let uart_line = irq_chip.line(UART_SPI);
     let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip);
     let pl011 = devices.attach_uart_and_rtc()?;
     devices.attach_virtio_devices(&cfg)?;
@@ -158,10 +160,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         dtb_addr: layout.dtb_addr,
         plugin: cfg.plugin.clone(),
     };
-    pl011
-        .lock()
-        .unwrap()
-        .connect_irq(Arc::new(gic::Line::new(vm.clone(), UART_SPI, None)));
+    pl011.lock().unwrap().connect_irq(uart_line);
 
     // Hand the plugin the guest before any vCPU runs, so nothing happens
     // between the first instruction and the attach.

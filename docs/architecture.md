@@ -38,12 +38,12 @@ usual mistake:
   x86-64 UART already wraps.
 
 Porting to a new host backend means a new `arch/<arch>/<hypervisor>/` directory
-with `Kick`, `irq::Chip` and `irq::Line` implementations, a `Guest` built from
-them, and an exit loop that hands each decoded MMIO access to `Guest::read_mmio`
-or `Guest::write_mmio`. It also needs its `mod` line in `arch/<arch>/mod.rs`,
-its `use ... as backend` line and its target in the build guard, both in
-`lib.rs`, and its dependencies in `Cargo.toml`. Porting to a new guest
-architecture is a much larger job.
+with `Kick`, `irq::Chip`, `irq::Line` and `irq::Trigger` implementations, a
+`Guest` built from them, and an exit loop that hands each decoded MMIO access to
+`Guest::read_mmio` or `Guest::write_mmio`. It also needs its `mod` line in
+`arch/<arch>/mod.rs`, its `use ... as backend` line and its target in the build
+guard, both in `lib.rs`, and its dependencies in `Cargo.toml`. Porting to a new
+guest architecture is a much larger job.
 
 On any other target the build stops with a compile error.
 
@@ -224,10 +224,12 @@ PSCI with `method = "hvc"`, the interrupt controller the backend chose
 (`arm,gic-v3`, or `arm,cortex-a15-gic` for the compatible QEMU virt advertises
 for its vGICv2), the architected timer PPIs, an `/apb-pclk` fixed 24 MHz clock,
 the PL011 console as `stdout-path`, the PL031 RTC as `pl031@c001000`, and one
-`virtio_mmio@…` node per backed device. The PL031 node has no `interrupts`,
-because the `vm-superio` RTC has no alarm. Without an IRQ, Linux's rtc-pl031
-offers no alarm either. The timer node is marked `always-on`, because the
-hypervisor keeps each vCPU's timer while the vCPU is out of the guest.
+`virtio_mmio@…` node per backed device. A virtio node's SPI is edge-rising and
+the PL011's is level-high. The guest has to configure each SPI as its node says,
+since nothing lowers a virtio SPI. The PL031 node has no `interrupts`, because
+the `vm-superio` RTC has no alarm. Without an IRQ, Linux's rtc-pl031 offers no
+alarm either. The timer node is marked `always-on`, because the hypervisor keeps
+each vCPU's timer while the vCPU is out of the guest.
 
 `/chosen` also carries a 64-byte `rng-seed`, fresh from the host's CSPRNG for
 every boot. Under HVF it is the guest's only entropy source at boot, since the
@@ -364,20 +366,24 @@ notification. On KVM a vhost-user export's notifications do not exit to hvi:
 KVM signals the queue's eventfd, which the daemon reads. The device holds its
 configuration space and serves its queues.
 
-A virtio device's interrupt holds the status bits and the line under a lock of
-its own, so a vCPU reads and acknowledges the interrupt without the device's
-lock. A legacy device sets its line under its own lock. Either way the line is
-set only when the level changes. The level is recorded only when the set
-succeeds, so a failed set is tried again. How the line reaches the guest is the
-one device-facing thing that differs by backend:
+A virtio device's interrupt is edge-triggered. It holds the status bits under a
+lock of its own, so a vCPU reads and acknowledges the interrupt without the
+device's lock. A raise triggers the interrupt only when its bit was clear, and
+an acknowledgment only clears bits. A raise whose trigger fails leaves its bit
+clear, so the next raise tries again. A legacy device sets its line under its
+own lock, and only when the level changes. The level is recorded only when the
+set succeeds, so a failed set is tried again. How an interrupt reaches the guest
+is the one device-facing thing that differs by backend:
 
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
-  line that rises on an I/O thread also kicks the vCPUs. The console UART's line
-  never kicks.
+  trigger sets the level to 1, which the GIC takes as one edge. A virtio trigger
+  on an I/O thread also kicks the vCPUs. The console UART's line never kicks.
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
-  vGICv2 and vGICv3.
+  vGICv2 and vGICv3. A virtio trigger is one call with level 1, which the vGIC
+  latches as pending.
 - **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7
-  and 9 to 22.
+  and 9 to 22. A virtio trigger raises the pin and lowers it again, under a
+  lock, since the IOAPIC takes an edge only on a 0 to 1 transition.
 
 ### Devices
 
@@ -401,7 +407,7 @@ one device-facing thing that differs by backend:
   [storage-and-sharing.md](storage-and-sharing.md).
 
 A write of 0 to a device's STATUS register resets it: every queue returns to
-its unprogrammed state, the interrupt is withdrawn, and state the driver
+its unprogrammed state, the interrupt status is cleared, and state the driver
 created goes with them (vsock sessions, the virtio-fs FUSE session). A driver
 that binds again after that starts from a device in its boot state.
 

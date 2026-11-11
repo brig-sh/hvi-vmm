@@ -25,8 +25,8 @@
 //! vCPU threads. `vcpu` runs one of them: it creates and starts its vCPU, runs
 //! the exit loop, and serves the MMIO, PSCI and system-register exits. `kick`
 //! holds the vCPU handles a kick goes through and the secondaries' `CPU_ON`
-//! mailboxes. `gic` holds the in-kernel GIC's interrupt lines and works out its
-//! placement.
+//! mailboxes. `gic` holds the in-kernel GIC's interrupt lines and triggers, and
+//! works out its placement.
 
 mod boot;
 mod gic;

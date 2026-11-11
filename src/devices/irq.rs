@@ -12,27 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The interrupt line a device drives, and the controller it is on.
+//! The interrupt lines and triggers devices use, and the controller they are
+//! on.
 //!
-//! The line is set under the lock that decided the level, and only when the
-//! level changes. Two threads that change one device's level then cannot leave
-//! the line at a level the device no longer has. A virtio device's level is
-//! held by its [`Interrupt`](crate::devices::virtio::mmio::Interrupt). Each
-//! backend supplies the lines through its [`Chip`], since how a line reaches
-//! the guest's interrupt controller is the hypervisor's.
+//! A [`Line`] holds a level, which a UART sets through an [`Irq`]. The line is
+//! set under the lock that decided the level, and only when the level changes.
+//! Two threads that change one device's level then cannot leave the line at a
+//! level the device no longer has.
+//!
+//! A [`Trigger`] delivers one interrupt per call, on an interrupt the guest is
+//! told is edge-triggered. A virtio device's
+//! [`Interrupt`](crate::devices::virtio::mmio::Interrupt) calls it. Each
+//! backend supplies the lines and the triggers through its [`Chip`], since how
+//! an interrupt reaches the guest's interrupt controller is the hypervisor's.
 
 use std::sync::Arc;
 
-/// A guest's interrupt controller, which gives each device its line.
+/// A guest's interrupt controller, which gives each device its line or its
+/// trigger.
 pub(crate) trait Chip {
     /// Returns the line of interrupt `irq`, numbered as in
     /// [`Slot::irq`](crate::devices::manager::Slot::irq).
     fn line(&self, irq: u32) -> Arc<dyn Line>;
+
+    /// Returns the trigger of interrupt `irq`, numbered as in
+    /// [`Slot::irq`](crate::devices::manager::Slot::irq).
+    ///
+    /// The guest's firmware tables declare the interrupt edge-triggered.
+    fn trigger(&self, irq: u32) -> Arc<dyn Trigger>;
 }
 
 impl<C: Chip + ?Sized> Chip for &C {
     fn line(&self, irq: u32) -> Arc<dyn Line> {
         (**self).line(irq)
+    }
+
+    fn trigger(&self, irq: u32) -> Arc<dyn Trigger> {
+        (**self).trigger(irq)
     }
 }
 
@@ -44,6 +60,16 @@ pub(crate) trait Line: Send + Sync {
     ///
     /// Errors if the hypervisor does not set the line.
     fn set_level(&self, level: bool) -> std::io::Result<()>;
+}
+
+/// A device's edge-triggered interrupt on the guest's interrupt controller.
+pub(crate) trait Trigger: Send + Sync {
+    /// Delivers one interrupt.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the hypervisor does not deliver it.
+    fn trigger(&self) -> std::io::Result<()>;
 }
 
 /// A device's interrupt line, with the level it was last set to.

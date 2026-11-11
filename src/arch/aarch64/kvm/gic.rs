@@ -142,4 +142,8 @@ impl irq::Chip for Vgic {
     fn line(&self, spi: u32) -> Arc<dyn irq::Line> {
         Arc::new(kvm::IrqLine::new(Arc::clone(&self.vm), spi_gsi(spi)))
     }
+
+    fn trigger(&self, spi: u32) -> Arc<dyn irq::Trigger> {
+        Arc::new(kvm::IrqLine::new(Arc::clone(&self.vm), spi_gsi(spi)))
+    }
 }
