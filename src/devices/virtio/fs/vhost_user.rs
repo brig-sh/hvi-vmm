@@ -24,6 +24,9 @@
 //! walks the virtqueues in its own process. What stays here is the device the
 //! virtio-mmio transport serves: the features the daemon offers, the
 //! configuration space, and the handshake that hands the rings to the daemon.
+//! The daemon signals a used buffer on a queue's call eventfd. Where the
+//! device's interrupt takes an irqfd, KVM delivers that signal to the guest.
+//! Elsewhere a thread per queue reads it and raises the interrupt.
 //!
 //! The split costs one thing. A request the daemon serves never crosses this
 //! process, so the file-level events the macOS device captures have no
@@ -376,7 +379,7 @@ mod device {
             for _ in 0..queues {
                 // The kick side is only written, by KVM or by the vCPU thread
                 // that passes the device a queue notification. The call side is
-                // read by a thread per queue, which blocks on it.
+                // an irqfd, or is read by a thread per queue that blocks on it.
                 kick.push(EventFd::new(libc::EFD_NONBLOCK)?);
                 call.push(EventFd::new(0)?);
             }
@@ -404,8 +407,8 @@ mod device {
             &self.tag
         }
 
-        /// Returns the number of virtqueues, which is how many call
-        /// descriptors a caller has to wait on.
+        /// Returns the number of virtqueues, which is how many call descriptors
+        /// the device has.
         #[must_use]
         pub fn queues(&self) -> usize {
             self.queue_max_sizes.len()
@@ -423,8 +426,8 @@ mod device {
 
         /// Returns the call descriptors of every queue, duplicated.
         ///
-        /// A caller waits on these to learn that the daemon has used buffers;
-        /// see `serve_interrupts`.
+        /// The daemon signals one when it has used buffers of its queue, and
+        /// the export's interrupt is raised for it.
         ///
         /// # Errors
         ///
@@ -715,25 +718,48 @@ mod device {
     }
 
     impl Export {
-        /// Queues in `host` a [`serve_interrupts`] thread on `interrupt` for
-        /// each queue of the export.
+        /// Makes the daemon's signal on each queue's call descriptor raise
+        /// `interrupt`.
         ///
-        /// A thread ends when the I/O threads stop. An export whose call
-        /// descriptors cannot be duplicated gets no thread, so its guest never
-        /// sees a used buffer, and the boot says so on stderr.
-        pub(crate) fn queue_interrupts(&self, interrupt: &Arc<Interrupt>, host: &mut HostWork) {
-            let calls = match self.dev.lock().unwrap().call_fds() {
-                Ok(calls) => calls,
-                Err(e) => {
-                    stderrln!("{LOG_PREFIX} virtio-fs: queue interrupts unavailable: {e}");
-                    return;
+        /// Each call descriptor is registered as an irqfd on `interrupt`, so
+        /// KVM delivers the interrupt with no thread in hvi. When the interrupt
+        /// cannot take an eventfd, a [`serve_interrupts`] thread per queue is
+        /// queued in `host` instead, which ends when the I/O threads stop.
+        ///
+        /// # Errors
+        ///
+        /// Errors if the call descriptors cannot be duplicated, or if a
+        /// registration fails. The first queue's answer of
+        /// [`ErrorKind::Unsupported`](io::ErrorKind::Unsupported) is not a
+        /// failure, since no queue has an irqfd then. A later queue's is one,
+        /// so an export never has an irqfd on one queue and a thread on
+        /// another.
+        pub(crate) fn queue_interrupts(
+            &self,
+            interrupt: &Arc<Interrupt>,
+            host: &mut HostWork,
+        ) -> io::Result<()> {
+            let calls = self.dev.lock().unwrap().call_fds().map_err(|e| {
+                io::Error::new(e.kind(), format!("duplicating a call descriptor: {e}"))
+            })?;
+            let registered = calls.iter().enumerate().try_for_each(|(index, call)| {
+                interrupt.register_irqfd(call).map_err(|e| (index, e))
+            });
+            match registered {
+                Ok(()) => Ok(()),
+                Err((0, e)) if e.kind() == io::ErrorKind::Unsupported => {
+                    for call in calls {
+                        let interrupt = Arc::clone(interrupt);
+                        host.spawn("virtio-fs interrupts", move |stop| {
+                            serve_interrupts(&interrupt, &call, &stop);
+                        });
+                    }
+                    Ok(())
                 }
-            };
-            for call in calls {
-                let interrupt = Arc::clone(interrupt);
-                host.spawn("virtio-fs interrupts", move |stop| {
-                    serve_interrupts(&interrupt, &call, &stop);
-                });
+                Err((index, e)) => Err(io::Error::new(
+                    e.kind(),
+                    format!("registering the call descriptor of queue {index}: {e}"),
+                )),
             }
         }
     }
@@ -760,7 +786,7 @@ mod device {
     #[cfg(test)]
     #[allow(clippy::disallowed_methods)]
     mod tests {
-        use std::io::{Read, Write};
+        use std::io::{self, Read, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::sync::{mpsc, Arc, Mutex};
@@ -775,10 +801,18 @@ mod device {
             VIRTIO_F_VERSION_1,
         };
 
-        use super::{connect_waiting, serve_interrupts, VhostUserFs};
-        use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
-        use crate::devices::virtio::mmio::{QUEUE_NUM_MAX, QUEUE_READY, QUEUE_SEL, STATUS};
+        use vmm_sys_util::eventfd::EventFd;
+
+        use super::{connect_waiting, serve_interrupts, Export, VhostUserFs};
+        use crate::devices::irq;
+        use crate::devices::virtio::mmio::testing::{
+            self, CountingTrigger, Driver, IrqfdTrigger, Rings,
+        };
+        use crate::devices::virtio::mmio::{
+            Interrupt, QUEUE_NUM_MAX, QUEUE_READY, QUEUE_SEL, STATUS,
+        };
         use crate::devices::virtio::Device as _;
+        use crate::io_threads::HostWork;
         use crate::memory::{GuestRam, RamRegion, SharedRam};
         use crate::teardown::StopSource;
 
@@ -1145,6 +1179,75 @@ mod device {
             serving.join().expect("the stop ended the thread");
             drop(dev);
             daemon.join();
+        }
+
+        /// A trigger that takes the first irqfd and refuses every later one, as
+        /// an arm64 trigger does once the process is out of descriptors.
+        #[derive(Default)]
+        struct TakesOneIrqfd(std::sync::atomic::AtomicBool);
+
+        impl irq::Trigger for TakesOneIrqfd {
+            fn trigger(&self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn register_irqfd(&self, _fd: &EventFd) -> io::Result<()> {
+                if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                Ok(())
+            }
+        }
+
+        /// Returns what [`Export::queue_interrupts`] answers for an export of
+        /// two queues whose interrupt calls `trigger`, with the names of the
+        /// threads it queued.
+        fn queue_interrupts_with(
+            trigger: Arc<dyn irq::Trigger>,
+        ) -> (io::Result<()>, Vec<&'static str>) {
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
+            let (ram, _mem) = guest_ram();
+            let dev =
+                VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
+            let export = Export {
+                stop: dev.shutdown_fds(),
+                dev: Arc::new(Mutex::new(dev)),
+            };
+            let mut host = HostWork::default();
+            let queued = export.queue_interrupts(&Arc::new(Interrupt::new(trigger)), &mut host);
+            let names = host.thread_names();
+            drop((export, host));
+            daemon.join();
+            (queued, names)
+        }
+
+        #[test]
+        fn call_descriptors_taken_as_irqfds_queue_no_thread() {
+            let trigger = Arc::new(IrqfdTrigger::default());
+            let (queued, names) = queue_interrupts_with(Arc::clone(&trigger) as _);
+            queued.expect("the registrations should succeed");
+            assert_eq!(trigger.irqfds(), 2);
+            assert!(names.is_empty(), "{names:?}");
+        }
+
+        #[test]
+        fn interrupt_without_irqfds_gets_a_thread_per_queue() {
+            let (queued, names) = queue_interrupts_with(Arc::new(CountingTrigger::default()));
+            queued.expect("the fallback should succeed");
+            assert_eq!(names, ["virtio-fs interrupts"; 2]);
+        }
+
+        #[test]
+        fn refused_irqfd_fails_and_queues_no_thread() {
+            let (queued, names) = queue_interrupts_with(Arc::new(TakesOneIrqfd::default()));
+            let error = queued.expect_err("the second registration was refused");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("registering the call descriptor of queue 1: "),
+                "{error}"
+            );
+            assert!(names.is_empty(), "{names:?}");
         }
 
         /// Returns a path for a socket in a fresh directory of its own.
