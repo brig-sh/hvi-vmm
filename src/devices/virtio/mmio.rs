@@ -19,8 +19,8 @@
 //! words, the device status and the order the driver sets it in, the queue
 //! registers and the interrupt registers. It passes configuration space
 //! accesses, activation, queue notifications and reset to the device.
-//! [`Interrupt`] holds the interrupt status and the line, which the transport
-//! and the device share.
+//! [`Interrupt`] holds the interrupt status and the trigger, which the
+//! transport and the device share.
 //!
 //! The offsets come from `virtio-bindings`, which bindgen generates from the
 //! kernel headers. They are `u64`, the offset type an MMIO dispatch matches on.
@@ -41,7 +41,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::Stop;
 use crate::devices::bus;
-use crate::devices::irq::{self, Irq};
+use crate::devices::irq;
 use crate::devices::virtio::{self, QueueConfig};
 use crate::events::Ledger;
 use crate::memory::GuestRam;
@@ -154,11 +154,18 @@ impl DeviceStatus {
 /// The interrupt of one virtio device, with the interrupt status the guest
 /// reads.
 ///
-/// The status bits and the level of the line change under one lock. The line is
-/// level-triggered, so a raise from a device thread and an acknowledgment from
-/// a vCPU must set it in the order they changed the bits, or the line could
-/// stay low with a bit set. The lock is separate from the transport state lock
-/// and the device lock, so an interrupt status read or an acknowledgment never
+/// The interrupt is edge-triggered. A raise triggers it only when the raised
+/// bit was clear. A raise of a bit already set needs no trigger, since the
+/// guest has not read the status yet, or it acknowledges the bit before it
+/// drains the queues. An acknowledgment clears bits and makes no call to the
+/// trigger.
+///
+/// The status, the generation and `enabled` change under one lock, and a raise
+/// triggers inside it. A raise that has passed the `enabled` check then cannot
+/// set its bit after a reset has cleared the status. Such a bit would outlive
+/// the reset, and the first raise after the next DRIVER_OK would find it set
+/// and send no trigger. The lock is separate from the transport state lock and
+/// the device lock, so an interrupt status read or an acknowledgment never
 /// waits for a device that is serving its queues.
 pub(crate) struct Interrupt {
     /// The state behind the lock.
@@ -175,21 +182,19 @@ struct InterruptState {
     /// Whether notifications are taken, from the DRIVER_OK write until the next
     /// reset.
     enabled: bool,
-    /// The line the status drives.
-    irq: Irq,
+    /// The trigger a raise calls.
+    trigger: Arc<dyn irq::Trigger>,
 }
 
 impl Interrupt {
-    /// Returns an interrupt that drives `line`.
-    pub(crate) fn new(line: Arc<dyn irq::Line>) -> Self {
-        let mut irq = Irq::default();
-        irq.connect(line);
+    /// Returns an interrupt that calls `trigger`.
+    pub(crate) fn new(trigger: Arc<dyn irq::Trigger>) -> Self {
         Self {
             state: Mutex::new(InterruptState {
                 status: 0,
                 config_generation: 0,
                 enabled: false,
-                irq,
+                trigger,
             }),
         }
     }
@@ -225,14 +230,11 @@ impl Interrupt {
         self.status() != 0
     }
 
-    /// Clears the notification `bits` and lowers the line once none is left,
-    /// when the interrupt is enabled.
+    /// Clears the notification `bits`, when the interrupt is enabled.
     fn acknowledge(&self, bits: u32) {
         let mut state = self.state.lock().unwrap();
         if state.enabled {
             state.status &= !bits;
-            let level = state.status != 0;
-            state.irq.set(level);
         }
     }
 
@@ -246,26 +248,31 @@ impl Interrupt {
         self.state.lock().unwrap().enabled = true;
     }
 
-    /// Drops the pending notifications, lowers the line and disables the
-    /// interrupt.
+    /// Disables the interrupt.
     ///
-    /// The configuration generation is kept.
+    /// The pending notifications are dropped, and the configuration generation
+    /// is kept.
     fn reset(&self) {
         let mut state = self.state.lock().unwrap();
         state.enabled = false;
         state.status = 0;
-        state.irq.set(false);
     }
 }
 
 impl InterruptState {
-    /// Sets the notification `bit` and raises the line, when the interrupt is
-    /// enabled.
+    /// Sets the notification `bit`, when the interrupt is enabled.
+    ///
+    /// It triggers the interrupt if the bit was clear. A clear bit is set only
+    /// once the trigger succeeds, so the next raise of it tries again after a
+    /// failure.
     fn raise(&mut self, bit: u32) {
-        if self.enabled {
-            self.status |= bit;
-            self.irq.set(true);
+        if !self.enabled {
+            return;
         }
+        if self.status & bit == 0 && self.trigger.trigger().is_err() {
+            return;
+        }
+        self.status |= bit;
     }
 }
 
@@ -651,26 +658,26 @@ impl<D: virtio::Device> bus::Device for Transport<D> {
 /// Helpers for the device tests, among them a guest driver of one device.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
     use crate::devices::bus::Device as _;
     use crate::devices::virtio::Queue;
 
-    /// A line that holds the level it was last set to.
+    /// A trigger that counts the interrupts it delivered.
     #[derive(Default)]
-    pub(crate) struct LevelLine(AtomicBool);
+    pub(crate) struct CountingTrigger(AtomicU32);
 
-    impl LevelLine {
-        /// Returns whether the line is high.
-        pub(crate) fn is_high(&self) -> bool {
+    impl CountingTrigger {
+        /// Returns the number of interrupts delivered.
+        pub(crate) fn count(&self) -> u32 {
             self.0.load(Ordering::SeqCst)
         }
     }
 
-    impl irq::Line for LevelLine {
-        fn set_level(&self, level: bool) -> std::io::Result<()> {
-            self.0.store(level, Ordering::SeqCst);
+    impl irq::Trigger for CountingTrigger {
+        fn trigger(&self) -> std::io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -749,12 +756,12 @@ pub(crate) mod testing {
             .expect("the rings should fit in guest RAM")
     }
 
-    /// Returns an enabled interrupt and its line.
-    pub(crate) fn enabled_interrupt() -> (Arc<Interrupt>, Arc<LevelLine>) {
-        let line = Arc::new(LevelLine::default());
-        let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn irq::Line>));
+    /// Returns an enabled interrupt and its trigger.
+    pub(crate) fn enabled_interrupt() -> (Arc<Interrupt>, Arc<CountingTrigger>) {
+        let trigger = Arc::new(CountingTrigger::default());
+        let interrupt = Arc::new(Interrupt::new(Arc::clone(&trigger) as Arc<dyn irq::Trigger>));
         interrupt.enable();
-        (interrupt, line)
+        (interrupt, trigger)
     }
 
     /// Checks the common registers a driver probes on the transport of
@@ -801,21 +808,21 @@ pub(crate) mod testing {
         pub(crate) transport: Transport<D>,
         /// The device behind the transport.
         pub(crate) device: Arc<Mutex<D>>,
-        /// The device's line.
-        pub(crate) line: Arc<LevelLine>,
+        /// The device's trigger.
+        pub(crate) trigger: Arc<CountingTrigger>,
     }
 
     impl<D: virtio::Device> Driver<D> {
         /// Returns a driver of `device`, whose queues are in `ram`.
         pub(crate) fn new(device: D, ram: &Arc<GuestRam>) -> Self {
             let device = Arc::new(Mutex::new(device));
-            let line = Arc::new(LevelLine::default());
-            let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn irq::Line>));
+            let trigger = Arc::new(CountingTrigger::default());
+            let interrupt = Arc::new(Interrupt::new(Arc::clone(&trigger) as Arc<dyn irq::Trigger>));
             let ledger = Arc::new(Ledger::new(None, "transport-test").unwrap());
             Self {
                 transport: Transport::new(&device, &interrupt, ram, &ledger),
                 device,
-                line,
+                trigger,
             }
         }
 
@@ -890,7 +897,7 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Weak;
     use std::time::Duration;
 
@@ -936,6 +943,26 @@ mod tests {
                     self.locked_at_end.fetch_add(1, Ordering::SeqCst);
                 }
             }
+        }
+    }
+
+    /// A trigger that refuses the first time it is called, and counts the
+    /// interrupts it delivered after that.
+    #[derive(Default)]
+    struct RefusesFirst {
+        /// Whether the trigger has already refused once.
+        refused: AtomicBool,
+        /// The number of interrupts delivered.
+        count: AtomicUsize,
+    }
+
+    impl irq::Trigger for RefusesFirst {
+        fn trigger(&self) -> io::Result<()> {
+            if !self.refused.swap(true, Ordering::SeqCst) {
+                return Err(io::Error::other("refused"));
+            }
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1323,7 +1350,7 @@ mod tests {
         assert_eq!(driver.read(STATUS), STATUS_STEPS[2] | NEEDS_RESET);
         assert_eq!(driver.read(INTERRUPT_STATUS), VIRTIO_MMIO_INT_CONFIG);
         assert_eq!(driver.read(CONFIG_GENERATION), 1);
-        assert!(driver.line.is_high());
+        assert_eq!(driver.trigger.count(), 1);
 
         driver.device.lock().unwrap().refuse_activation = false;
         driver.driver_ok();
@@ -1346,12 +1373,10 @@ mod tests {
         driver.write(DEVICE_FEATURES_SEL, 1);
         driver.start(&[RINGS]);
         driver.transport.interrupt.signal_config_change();
-        assert!(driver.line.is_high());
 
         driver.reset();
         assert_eq!(driver.read(STATUS), 0);
         assert_eq!(driver.read(INTERRUPT_STATUS), 0);
-        assert!(!driver.line.is_high());
         assert_eq!(driver.read(CONFIG_GENERATION), 1);
         assert_eq!(driver.read(DEVICE_FEATURES), 1 << 5, "word 0 is selected");
         driver.write(QUEUE_SEL, 0);
@@ -1361,20 +1386,38 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgment_lowers_the_line_once_no_bit_is_left() {
+    fn raise_triggers_only_when_its_bit_is_clear() {
         let driver = driver();
         driver.start(&[RINGS]);
-        driver.transport.interrupt.signal_config_change();
-        assert_eq!(
-            driver.read(INTERRUPT_STATUS),
-            VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG,
-            "the replayed notify and the configuration change"
-        );
+        assert_eq!(driver.trigger.count(), 1, "the replayed notify");
+        driver.transport.interrupt.signal_used_buffer();
+        assert_eq!(driver.trigger.count(), 1, "VRING was still set");
         driver.write(INTERRUPT_ACK, VIRTIO_MMIO_INT_VRING);
-        assert!(driver.line.is_high());
-        driver.write(INTERRUPT_ACK, VIRTIO_MMIO_INT_CONFIG);
-        assert!(!driver.line.is_high());
         assert_eq!(driver.read(INTERRUPT_STATUS), 0);
+        assert_eq!(
+            driver.trigger.count(),
+            1,
+            "an acknowledgment triggers nothing"
+        );
+        driver.transport.interrupt.signal_used_buffer();
+        assert_eq!(driver.trigger.count(), 2, "VRING was acknowledged");
+    }
+
+    // The guest acknowledges only the bits it read, as Linux's `vm_interrupt`
+    // does. A configuration change raised between its read and its
+    // acknowledgment sets a clear bit, so it triggers the interrupt again.
+    #[test]
+    fn config_change_between_status_read_and_acknowledgment_triggers() {
+        let driver = driver();
+        driver.start(&[RINGS]);
+        let read = driver.read(INTERRUPT_STATUS);
+        assert_eq!(read, VIRTIO_MMIO_INT_VRING, "the replayed notify");
+        driver.transport.interrupt.signal_config_change();
+        driver.write(INTERRUPT_ACK, read);
+        assert_eq!(driver.trigger.count(), 2);
+        assert_eq!(driver.read(INTERRUPT_STATUS), VIRTIO_MMIO_INT_CONFIG);
+        driver.transport.interrupt.signal_used_buffer();
+        assert_eq!(driver.trigger.count(), 3, "VRING was acknowledged");
     }
 
     #[test]
@@ -1383,8 +1426,70 @@ mod tests {
         driver.transport.interrupt.signal_used_buffer();
         driver.transport.interrupt.signal_config_change();
         assert_eq!(driver.read(INTERRUPT_STATUS), 0);
-        assert!(!driver.line.is_high());
+        assert_eq!(driver.trigger.count(), 0);
         assert_eq!(driver.read(CONFIG_GENERATION), 1, "the change is counted");
+    }
+
+    #[test]
+    fn interrupt_after_reset_is_dropped() {
+        let driver = driver();
+        driver.start(&[RINGS]);
+        driver.reset();
+        driver.transport.interrupt.signal_used_buffer();
+        driver.transport.interrupt.signal_config_change();
+        assert_eq!(driver.read(INTERRUPT_STATUS), 0);
+        assert_eq!(driver.trigger.count(), 1, "the replayed notify alone");
+    }
+
+    // A device thread can raise the interrupt while the guest resets the
+    // device, as a vhost-user relay does. No queue is ready, so the activation
+    // replays no notification and the thread is the only one raising.
+    #[test]
+    fn raise_during_a_reset_does_not_suppress_the_next_trigger() {
+        let driver = driver();
+        let interrupt = Arc::clone(&driver.transport.interrupt);
+        let done = AtomicBool::new(false);
+        let failure = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    interrupt.signal_used_buffer();
+                }
+            });
+            let failure = (0..1000).find_map(|round| {
+                driver.reset();
+                driver.negotiate();
+                let status = driver.read(INTERRUPT_STATUS);
+                if status != 0 {
+                    return Some(format!("round {round}: status {status} before DRIVER_OK"));
+                }
+                let before = driver.trigger.count();
+                driver.driver_ok();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while driver.read(INTERRUPT_STATUS) == 0 {
+                    if std::time::Instant::now() > deadline {
+                        return Some(format!("round {round}: no raise set a bit"));
+                    }
+                    std::thread::yield_now();
+                }
+                (driver.trigger.count() == before)
+                    .then(|| format!("round {round}: the first raise sent no trigger"))
+            });
+            done.store(true, Ordering::SeqCst);
+            failure
+        });
+        assert_eq!(failure, None);
+    }
+
+    #[test]
+    fn refused_trigger_is_tried_again() {
+        let trigger = Arc::new(RefusesFirst::default());
+        let interrupt = Interrupt::new(Arc::clone(&trigger) as Arc<dyn irq::Trigger>);
+        interrupt.enable();
+        interrupt.signal_used_buffer();
+        assert_eq!(interrupt.status(), 0, "the refused raise set no bit");
+        interrupt.signal_used_buffer();
+        assert_eq!(interrupt.status(), VIRTIO_MMIO_INT_VRING);
+        assert_eq!(trigger.count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1403,7 +1508,7 @@ mod tests {
             drop(held);
             assert_eq!(status, Ok(VIRTIO_MMIO_INT_VRING));
         });
-        assert!(!driver.line.is_high());
+        assert_eq!(driver.read(INTERRUPT_STATUS), 0);
     }
 
     #[test]
