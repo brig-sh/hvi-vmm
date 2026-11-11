@@ -153,6 +153,15 @@ its `guest stopped:` line and the event ledger. It runs under cargo-nextest.
 [e2e/README.md](../e2e/README.md) covers the setup it needs, running it, its
 layout, and adding a test.
 
+On x86-64 the suite runs in either irqchip mode. `HVI_E2E_IRQCHIP=kernel` makes
+every run pass `--irqchip kernel`, and `split` passes `--irqchip split`. Unset,
+the runs take hvi's default, the split irqchip. CI runs the suite once in each
+mode.
+
+```sh
+HVI_E2E_IRQCHIP=kernel cargo nextest run --manifest-path e2e/Cargo.toml
+```
+
 ### Tiers
 
 | Profile | What it runs | Where |
@@ -173,7 +182,7 @@ failure rather than as a pass. A test that pins a bug not fixed yet carries
 
 | Where | What runs |
 | --- | --- |
-| Self-hosted x86, arm64/KVM (vGICv2 and vGICv3) and Apple silicon | `test-e2e.yml`: the `default` profile for same-repository pull requests and `main`. `schedule-e2e-nightly.yml` runs the `full` profile there every night. |
+| Self-hosted x86, arm64/KVM (vGICv2 and vGICv3) and Apple silicon | `test-e2e.yml`: the `default` profile for same-repository pull requests and `main`. `schedule-e2e-nightly.yml` runs the `full` profile there every night. On x86 the suite runs twice, once with each irqchip. |
 | The same runners, on a pull request | `e2e/tools/check-probation.sh`: every new test is on the probation or nightly list, and a test that leaves the nightly list goes on probation. |
 | `ubuntu-latest`, once every backend has passed | The filter-name check: each exact name in the nextest filters names a test on some backend. |
 | x86-64 Linux (`ubuntu-latest`) | The e2e workspace's unit tests, which need no hypervisor, so a fork's pull request runs them too. |
