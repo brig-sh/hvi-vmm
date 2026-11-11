@@ -1053,12 +1053,17 @@ impl VirtioVsock {
     }
 
     /// Returns the writable segments of RX `chain`, in order, or `None` when
-    /// the chain is incomplete or has less room than a packet header.
+    /// the chain is incomplete, a segment lies outside guest RAM, or the chain
+    /// has less room than a packet header.
+    ///
+    /// The check covers every segment, including the ones the next packet
+    /// would not reach, so a buffer that cannot be written is found before
+    /// `fill_rx_queue` takes a packet off `pending`.
     ///
     /// Linux posts one buffer per packet today, but the chained form is just as
     /// legal: older guests split the header off into its own descriptor, and a
     /// device that reads only the head silently drops the body.
-    fn rx_chain(mut chain: DescriptorChain<'_>) -> Option<Vec<(u64, u32)>> {
+    fn rx_chain(mem: &GuestRam, mut chain: DescriptorChain<'_>) -> Option<Vec<(u64, u32)>> {
         let segs: Vec<(u64, u32)> = chain
             .by_ref()
             .filter(|descriptor| descriptor.is_write_only())
@@ -1068,6 +1073,12 @@ impl VirtioVsock {
         // times, and the caller would then size a packet from capacity that
         // does not exist.
         if !chain.is_complete() {
+            return None;
+        }
+        if segs
+            .iter()
+            .any(|&(addr, len)| !mem.contains(addr, u64::from(len)))
+        {
             return None;
         }
         let room: usize = segs.iter().map(|&(_, len)| len as usize).sum();
@@ -1133,6 +1144,10 @@ impl VirtioVsock {
     /// time, only when `pending` is empty, so at most one RW packet waits for
     /// an RX buffer.
     ///
+    /// A buffer is malformed when `rx_chain` rejects it: an incomplete chain,
+    /// a segment outside guest RAM, or less room than a header. It goes back
+    /// to the guest empty, and the packet waits for the next buffer.
+    ///
     /// Returns whether it put a buffer on the used ring.
     fn fill_rx_queue(&mut self, mem: &GuestRam, rx: &mut Queue) -> bool {
         let mut filled = false;
@@ -1149,14 +1164,15 @@ impl VirtioVsock {
             // A malformed buffer goes back to the guest empty, and the packet
             // waits for the next buffer. At most a queue's worth go back per
             // fill.
-            let Some(segs) = Self::rx_chain(chain) else {
+            let Some(segs) = Self::rx_chain(mem, chain) else {
                 if rx.add_used(mem, head, 0) {
                     filled = true;
                     if !self.malformed_rx_reported {
                         self.malformed_rx_reported = true;
                         stderrln!(
-                            "{LOG_PREFIX} virtio-vsock: a receive buffer is malformed; it goes back \
-                             to the guest empty, and later ones are not reported"
+                            "{LOG_PREFIX} virtio-vsock: a receive buffer is malformed or lies \
+                             outside guest RAM; it goes back to the guest empty, and later ones \
+                             are not reported"
                         );
                     }
                 }
@@ -1190,10 +1206,10 @@ impl VirtioVsock {
                     break;
                 }
                 let n = (pkt.len() - off).min(len as usize);
-                if mem.write(addr, &pkt[off..off + n]).is_err() {
-                    rx.undo_pop();
-                    return filled;
-                }
+                // `rx_chain` checked every segment with the same lookup, so a
+                // failure here is a bug in that check, not a guest's buffer.
+                mem.write(addr, &pkt[off..off + n])
+                    .expect("a segment rx_chain checked should be in guest RAM");
                 off += n;
             }
             rx.add_used(mem, head, off as u32);
@@ -2209,7 +2225,7 @@ mod session_tests {
         mem.write_u16(BASE + 14, 0).unwrap();
         let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
         assert_eq!(
-            VirtioVsock::rx_chain(chain),
+            VirtioVsock::rx_chain(&mem, chain),
             None,
             "a cycle yields no segments"
         );
@@ -2218,7 +2234,7 @@ mod session_tests {
         mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE).unwrap();
         let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
         assert_eq!(
-            VirtioVsock::rx_chain(chain),
+            VirtioVsock::rx_chain(&mem, chain),
             Some(vec![(BASE + 0x4000, 4140)])
         );
     }
@@ -2252,6 +2268,13 @@ mod session_tests {
         assert_eq!(mem.read_u32(used + 8).unwrap(), 0, "goes back empty");
         assert_eq!(mem.read_u32(used + 12).unwrap(), 1, "the next head");
         assert_eq!(mem.read_u32(used + 16).unwrap(), HDR_LEN as u32);
+    }
+
+    // A buffer outside guest RAM cannot take the REQUEST, so it goes back
+    // empty and the REQUEST waits for the buffer behind it.
+    #[test]
+    fn rx_buffer_outside_guest_ram_goes_back_empty() {
+        assert_rx_buffer_goes_back_empty(|_| (0x9000_0000, 64, VIRTQ_DESC_F_WRITE));
     }
 
     // A writable descriptor that points back at itself is malformed.
@@ -3269,5 +3292,163 @@ mod session_tests {
         }
         assert!(waiter.is_finished(), "a dropped list left its gate closed");
         waiter.join().unwrap();
+    }
+
+    /// Returns the `(id, len)` of used slot `u`.
+    fn used_entry(mem: &GuestRam, used: u64, u: u64) -> (u32, u32) {
+        let entry = used + 4 + u * 8;
+        (
+            mem.read_u32(entry).unwrap(),
+            mem.read_u32(entry + 4).unwrap(),
+        )
+    }
+
+    /// Returns a device with three RX buffers and a connected session on the
+    /// returned port.
+    ///
+    /// The session's `OP_REQUEST` takes buffer 0.
+    fn connected_with_three_buffers(mem: &GuestRam) -> (VirtioVsock, u32, UnixStream) {
+        let mut dev = VirtioVsock::new();
+        program_rx_buffers(&mut dev, mem, RINGS, 3, RXBUF);
+        let (dev_side, peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side).unwrap();
+        dev.connect(mem, port);
+        dev.handle_pkt(&pkt(OP_RESPONSE, port, &[]));
+        (dev, port, peer)
+    }
+
+    #[test]
+    fn rx_buffer_outside_guest_ram_is_returned_and_the_packet_kept() {
+        let (desc, _, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
+        // Buffer 1 now points past the end of guest RAM.
+        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
+
+        dev.host_data(&mem, port, b"intact");
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0), "returned empty");
+        let (hdr, body) = delivered(&mem, used, 2, data, RXBUF);
+        assert_eq!((hdr.op, hdr.len), (OP_RW, 6));
+        assert_eq!(body, b"intact");
+        assert!(dev.pending.is_empty());
+    }
+
+    #[test]
+    fn packet_waits_while_every_rx_buffer_is_outside_guest_ram() {
+        let (desc, avail, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
+        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
+        mem.write_u64(desc + 32, BASE + 0x20_0000).unwrap();
+
+        dev.host_data(&mem, port, b"intact");
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0));
+        assert_eq!(used_entry(&mem, used, 2), (2, 0));
+        assert_eq!(dev.pending.len(), 1, "the packet is still queued");
+
+        // The guest reposts buffer 1 inside guest RAM.
+        post_rx_buffer(&mem, desc, avail, 1, data + 0x4000);
+        dev.notify(&mem, RX_QUEUE);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 4);
+        let (id, len) = used_entry(&mem, used, 3);
+        assert_eq!((id, len as usize), (1, HDR_LEN + 6));
+        let mut buf = vec![0u8; HDR_LEN + 6];
+        mem.read(data + 0x4000, &mut buf).unwrap();
+        assert_eq!(Hdr::parse(&buf).unwrap().op, OP_RW);
+        assert_eq!(&buf[HDR_LEN..], b"intact");
+        assert!(dev.pending.is_empty());
+    }
+
+    // A packet longer than the bad buffer is not cut to its size: the buffer
+    // is rejected before anything is popped, so the packet reaches the next
+    // good buffer whole.
+    #[test]
+    fn long_packet_reaches_the_next_buffer_whole() {
+        const SMALL: u32 = HDR_LEN as u32 + 16;
+        let (desc, _, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let mut dev = VirtioVsock::new();
+        program_rx_buffers(&mut dev, &mem, RINGS, 3, SMALL);
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side).unwrap();
+        dev.connect(&mem, port);
+        dev.handle_pkt(&pkt(OP_RESPONSE, port, &[]));
+        // Buffer 1 has room for 16 bytes but lies outside guest RAM, and
+        // buffer 2 holds a whole packet.
+        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
+        mem.write_u64(desc + 32, data + 0x4000).unwrap();
+        mem.write_u32(desc + 40, RXBUF).unwrap();
+
+        let sent: Vec<u8> = (0..40u8).collect();
+        dev.host_data(&mem, port, &sent);
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0));
+        assert_eq!(used_entry(&mem, used, 2), (2, (HDR_LEN + 40) as u32));
+        let mut buf = vec![0u8; HDR_LEN + 40];
+        mem.read(data + 0x4000, &mut buf).unwrap();
+        let hdr = Hdr::parse(&buf).unwrap();
+        assert_eq!((hdr.op, hdr.len), (OP_RW, 40), "whole, not head and tail");
+        assert_eq!(&buf[HDR_LEN..], &sent[..]);
+        assert!(dev.pending.is_empty());
+    }
+
+    // A header-only buffer outside guest RAM goes back empty like any other
+    // buffer that cannot be written, and the packets behind it flow. It used
+    // to stall the queue through the header-only guard, with nothing logged.
+    #[test]
+    fn header_only_rx_buffer_outside_guest_ram_goes_back_empty() {
+        let (desc, _, used, _) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let mut dev = VirtioVsock::new();
+        program_rx_buffers(&mut dev, &mem, RINGS, 6, RXBUF);
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side).unwrap();
+        dev.connect(&mem, port);
+        dev.handle_pkt(&pkt(OP_RESPONSE, port, &[]));
+        // Buffer 4 is the fifth in line: 44 bytes, outside guest RAM.
+        mem.write_u64(desc + 4 * 16, BASE + 0x10_0000).unwrap();
+        mem.write_u32(desc + 4 * 16 + 8, HDR_LEN as u32).unwrap();
+
+        for _ in 0..4 {
+            dev.host_data(&mem, port, b"x");
+        }
+        assert_eq!(
+            mem.read_u16(used + 2).unwrap(),
+            6,
+            "the queue did not stall"
+        );
+        assert_eq!(used_entry(&mem, used, 4), (4, 0), "returned empty");
+        assert_eq!(used_entry(&mem, used, 5), (5, (HDR_LEN + 1) as u32));
+        assert!(dev.pending.is_empty());
+    }
+
+    // The check covers the whole buffer, not just the part a packet reaches.
+    // A 2-byte packet fits the 64 bytes in RAM, and the buffer still goes back
+    // empty because the segment behind them lies outside guest RAM.
+    #[test]
+    fn rx_buffer_with_a_bad_segment_the_packet_does_not_reach_goes_back_empty() {
+        let (desc, _, used, data) = RINGS;
+        let mem = mem_of(0x8_0000);
+        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
+        // Buffer 1 chains 64 bytes in RAM to 4 KiB outside it.
+        mem.write_u64(desc + 16, data + 0x4000).unwrap();
+        mem.write_u32(desc + 24, 64).unwrap();
+        mem.write_u16(desc + 28, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+            .unwrap();
+        mem.write_u16(desc + 30, 3).unwrap();
+        mem.write_u64(desc + 48, BASE + 0x10_0000).unwrap();
+        mem.write_u32(desc + 56, 4096).unwrap();
+        mem.write_u16(desc + 60, VIRTQ_DESC_F_WRITE).unwrap();
+        mem.write_u16(desc + 62, 0).unwrap();
+
+        dev.host_data(&mem, port, b"ab");
+        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
+        assert_eq!(used_entry(&mem, used, 1), (1, 0), "returned empty");
+        let (hdr, body) = delivered(&mem, used, 2, data, RXBUF);
+        assert_eq!((hdr.op, hdr.len), (OP_RW, 2));
+        assert_eq!(body, b"ab");
+        assert!(dev.pending.is_empty());
     }
 }
