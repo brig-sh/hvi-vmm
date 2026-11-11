@@ -94,6 +94,7 @@ mod device {
     use crate::devices::virtio::{self, read_config_bytes, Queue};
     use crate::io_threads::HostWork;
     use crate::memory::GuestRam;
+    use crate::sandbox::Thread;
     use crate::teardown::StopToken;
     use crate::LOG_PREFIX;
 
@@ -750,7 +751,7 @@ mod device {
                 Err((0, e)) if e.kind() == io::ErrorKind::Unsupported => {
                     for call in calls {
                         let interrupt = Arc::clone(interrupt);
-                        host.spawn("virtio-fs interrupts", move |stop| {
+                        host.spawn("virtio-fs interrupts", Thread::Vmm, move |stop| {
                             serve_interrupts(&interrupt, &call, &stop);
                         });
                     }

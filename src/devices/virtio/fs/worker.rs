@@ -28,6 +28,7 @@ use super::server::{self, VirtioFs};
 use crate::config::FsShare;
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
+use crate::sandbox::Thread;
 use crate::LOG_PREFIX;
 
 /// One virtio-fs export as the macOS backend wires it.
@@ -104,14 +105,14 @@ impl Export {
             Arc::clone(ram),
             Arc::clone(&self.wake),
         );
-        host.spawn("virtio-fs worker", move |_| {
+        host.spawn("virtio-fs worker", Thread::Vmm, move |_| {
             run_fs_worker(&dev, &ram, &wake)
         });
         let wake = Arc::clone(&self.wake);
         host.on_io_stop(move || wake.stop());
         let (workers, stop) = self.dev.lock().unwrap().readahead_workers();
         for worker in workers {
-            host.spawn("virtio-fs readahead", move |_| worker());
+            host.spawn("virtio-fs readahead", Thread::Vmm, move |_| worker());
         }
         host.on_io_stop(move || stop.stop());
     }

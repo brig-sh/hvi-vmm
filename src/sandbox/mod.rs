@@ -25,13 +25,43 @@ pub mod seatbelt;
 #[cfg(target_os = "linux")]
 pub mod seccomp;
 
-/// Confines the calling host-side I/O thread.
+/// Which seccomp filter a thread installs on itself on Linux.
 ///
-/// On Linux the thread installs the `vmm` seccomp filter on itself. On macOS
-/// the Seatbelt profile already covers the whole process.
-pub(crate) fn confine_io_thread() {
+/// macOS has no filter per thread, since the Seatbelt profile covers the whole
+/// process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thread {
+    /// The thread that calls `boot` and the host-side I/O threads.
+    Vmm,
+    /// A vCPU thread: KVM plus the device models it services inline.
+    Vcpu,
+}
+
+/// Confines the calling host-side I/O thread with `filter`.
+///
+/// On Linux the thread installs the seccomp filter `filter` names on itself.
+/// On macOS the Seatbelt profile already covers the whole process.
+pub(crate) fn confine_io_thread(filter: Thread) {
+    #[cfg(test)]
+    CONFINED.set(Some(filter));
     #[cfg(target_os = "linux")]
-    seccomp::install_thread(seccomp::Thread::Vmm);
+    seccomp::install_thread(filter);
+    #[cfg(not(target_os = "linux"))]
+    let _ = filter;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The filter the calling thread last confined itself with, for a test
+    /// that cannot install a filter in the test process.
+    static CONFINED: std::cell::Cell<Option<Thread>> = const { std::cell::Cell::new(None) };
+}
+
+/// Returns the filter the calling thread last confined itself with, or `None`
+/// when it did not.
+#[cfg(test)]
+pub(crate) fn confined() -> Option<Thread> {
+    CONFINED.get()
 }
 
 /// Checks that a run can start in this process with the sandbox as `sandbox`
