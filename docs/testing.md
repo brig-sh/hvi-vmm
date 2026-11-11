@@ -121,12 +121,13 @@ console log:
 | `boot-unikraft-hvf` | self-hosted Apple silicon | Two public Unikraft images, over four boots. A DHCP boot asserts the banner, `Set IPv4 address 10.0.2.15` and `Listening on port 8123`, with a share attached so the VMM has to place a virtio-fs device -- no other job does. A second boot passes `netdev.ip=` and asserts the guest took `10.0.2.99` and did *not* fall through to `10.0.2.15`, which is what fails if an image loses `CONFIG_LIBUKNETDEV_EINFO_LIBPARAM`. A third boots a padded cpio -- the pinned one is two whole pages, so the job adds 512 bytes to make the length ragged -- and asserts the banner, no memory-region assertion failure, and no `nginx:` error line. |
 | `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the vCPU stop tests, the aarch64 seccomp selftest, a boot that checks the guest gets pointer authentication when the host CPU and the guest kernel have it, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
 
-`boot-x86` skips itself with a warning when the runner has no `/dev/kvm`. A
-skip is not a pass.
+`boot-x86` fails when its pod has no `/dev/kvm`, so a runner that stops
+mapping the device cannot pass by skipping.
 
-The self-hosted lanes are withheld from pull requests opened from a fork,
-because these are persistent machines rather than ephemeral VMs. A fork still
-gets every hosted job.
+The self-hosted lanes are withheld from pull requests opened from a fork. The
+GICv3 and macOS lanes are persistent machines, and the x86 and GIC-400 lanes
+are privileged pods that share their node's kernel. A fork still gets every
+hosted job.
 
 They are self-hosted for two reasons. No GitHub-hosted arm64 runner exposes
 `/dev/kvm`, and the hosted macOS images do not give a guest

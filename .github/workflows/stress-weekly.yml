@@ -59,11 +59,12 @@ jobs:
     # or not the used-index store behind `Queue::add_used` is a release, and
     # its control arm says so and prints "Run it on arm64."
     #
-    # There is no machine label. This is a userspace threading test, and it
-    # has no interest in KVM or in the interrupt controller of the host, so
-    # either arm64 Linux runner serves. It runs weekly and takes seconds.
-    # The timeouts below bound a deadlock.
-    runs-on: [self-hosted, Linux, ARM64]
+    # This is a userspace threading test with no interest in KVM or in the
+    # interrupt controller of the host, so any arm64 Linux runner serves. It
+    # runs on the arm64 scale set, which is always free; the GICv3 host is
+    # not. It runs weekly and takes seconds. The timeouts below bound a
+    # deadlock.
+    runs-on: kvm-dind-2604-arm64
     # The recorded failure mode is a deadlock, not a slow pass. Cap the job
     # well under the runaway, far over the normal run.
     timeout-minutes: 20

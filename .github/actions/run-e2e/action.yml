@@ -49,10 +49,17 @@ runs:
     # Every Linux runner builds the same virtiofsd, since distributions ship
     # different ones or none. Each version goes in a directory of its own, and
     # the step builds it only when the binary there does not report that
-    # version, so a persistent runner builds each version once, even while it
-    # alternates between two pins, and a job with the binary in place does not
-    # reach crates.io. As for cargo-nextest above, `.github/renovate.json` holds
-    # a custom manager for the pin below. Keep the `# renovate:` marker with it.
+    # version. A persistent runner keeps the directory between jobs, and a pod
+    # gets it back from the Actions cache, keyed by this file so a new pin is a
+    # new key, so a job with the binary in place does not reach crates.io. As
+    # for cargo-nextest above, `.github/renovate.json` holds a custom manager
+    # for the pin below. Keep the `# renovate:` marker with it.
+    - name: Restore virtiofsd
+      if: runner.os == 'Linux'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/hvi-e2e/virtiofsd
+        key: virtiofsd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/run-e2e/action.yml') }}
     - name: Install virtiofsd
       if: runner.os == 'Linux'
       shell: bash
