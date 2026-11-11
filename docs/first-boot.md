@@ -184,6 +184,11 @@ which is the arm64 console and does nothing here. The devices are in the ACPI
 tables, so the guest kernel needs `CONFIG_ACPI`, which every distribution kernel
 has.
 
+By default hvi serves the guest's IOAPIC over KVM's split irqchip, and the guest
+has no PIT and no PIC. A distribution kernel keeps time with kvm-clock and the
+local APIC's TSC-deadline timer. `--irqchip kernel` gives the guest KVM's
+IOAPIC, PIC and PIT instead; see [cli.md](cli.md).
+
 `tools/mk-initramfs.py` builds an **arm64** initramfs only. For an x86-64
 guest, supply your own, or boot without one and let the kernel stop at the
 root-filesystem gate.

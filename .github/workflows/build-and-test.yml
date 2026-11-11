@@ -411,6 +411,19 @@ jobs:
             | tee notify.log || true
           grep -q "test result: ok. 1 passed" notify.log \
             || { echo "::error::the notification test did not pass"; exit 1; }
+      # The split irqchip tests register an irqfd on every IOAPIC input, set a
+      # route for each, and check that a write to an irqfd delivers the vector
+      # its input is programmed with. They need KVM on an x86-64 host, so only
+      # this job runs them.
+      - name: run split irqchip tests
+        if: steps.kvm.outputs.ok == 'yes'
+        env:
+          BIN: ${{ steps.blk.outputs.bin }}
+        run: |
+          sudo "$BIN" ioapic::kvm_tests:: --ignored 2>&1 \
+            | tee ioapic.log || true
+          grep -q "test result: ok. 3 passed" ioapic.log \
+            || { echo "::error::the split irqchip tests did not pass"; exit 1; }
       # The vhost-user handover runs on the vCPU thread that services the
       # guest's DRIVER_OK write, so it is the seccomp filter for that thread
       # that has to allow it. A missing entry there does not fail a unit test:

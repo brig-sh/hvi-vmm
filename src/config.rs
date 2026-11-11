@@ -61,6 +61,50 @@ pub enum CachePolicy {
     None,
 }
 
+/// Where an x86-64 guest's IOAPIC runs, and with it whether the guest has a PIC
+/// and a PIT.
+///
+/// KVM runs the local APICs in either mode. The guest's firmware tables
+/// describe the same IOAPIC in both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub enum IrqChip {
+    /// hvi serves the IOAPIC over KVM's split irqchip.
+    ///
+    /// The guest has no PIC and no PIT. KVM delivers each device's interrupt in
+    /// the thread that raises it, including a vhost-user daemon's.
+    ///
+    /// The guest needs a timer that is not the PIT. A Linux guest uses the
+    /// local APIC timer in TSC-deadline mode, which hvi offers.
+    #[default]
+    Split,
+    /// KVM runs the IOAPIC, a PIC and a PIT in the kernel.
+    Kernel,
+}
+
+impl std::str::FromStr for IrqChip {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        match name {
+            "split" => Ok(Self::Split),
+            "kernel" => Ok(Self::Kernel),
+            other => Err(format!(
+                "unknown irqchip {other:?}; expected split or kernel"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for IrqChip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Split => "split",
+            Self::Kernel => "kernel",
+        })
+    }
+}
+
 /// One host directory exported to the guest through virtio-fs, which hvi
 /// serves itself. Only the macOS backend serves these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,6 +690,11 @@ pub struct BootConfig {
     pub sandbox_id: String,
     /// Number of vCPUs (>= 1).
     pub vcpus: u32,
+    /// Where an x86-64 guest's IOAPIC runs, or `None` for [`IrqChip::Split`].
+    ///
+    /// Only the x86-64 backend takes a choice. [`boot`](crate::boot) refuses
+    /// `Some` on the arm64 backends.
+    pub irqchip: Option<IrqChip>,
     /// Host Unix-socket path bridged to the guest agent's vsock port (exec).
     pub agent_sock: Option<String>,
     /// A plugin attached to this guest, or `None` to run it with none.
@@ -683,8 +732,14 @@ impl BootConfig {
     ///
     /// Errors for an option the host has no device for, for two exports with
     /// one tag, for exports [`check_fs`] or [`check_export_overlap`] refuses,
-    /// and on x86-64 for more vCPUs than `arch::x86_64::MAX_VCPUS`.
+    /// on arm64 for an irqchip choice, and on x86-64 for more vCPUs than
+    /// `arch::x86_64::MAX_VCPUS`.
     pub(crate) fn check(&self) -> Result<(), String> {
+        // The arm64 backends have a GIC, whose kind follows the host.
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Some(irqchip) = self.irqchip {
+            return Err(format!("--irqchip {irqchip}: x86-64 only"));
+        }
         #[cfg(target_os = "linux")]
         {
             // The Linux backends serve only exports a caller's vhost-user
@@ -780,6 +835,7 @@ impl BootConfig {
             events: None,
             sandbox_id: "test".to_string(),
             vcpus,
+            irqchip: None,
             agent_sock: None,
             plugin: None,
             sandbox: false,
@@ -868,7 +924,7 @@ impl std::error::Error for BootError {
 mod tests {
     use super::{
         check_disks, check_export_overlap, check_fs, disk_serial, BootConfig, BootError,
-        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, ShareMode,
+        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, IrqChip, ShareMode,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -1426,6 +1482,39 @@ mod tests {
             cfg.check().unwrap_err(),
             "--net-tap tap0: no /dev/net/tun on macOS; use --net-gateway"
         );
+    }
+
+    #[test]
+    fn irqchip_names_parse_and_print_back() {
+        for name in ["split", "kernel"] {
+            assert_eq!(name.parse::<IrqChip>().unwrap().to_string(), name);
+        }
+        assert_eq!(
+            "on".parse::<IrqChip>().unwrap_err(),
+            "unknown irqchip \"on\"; expected split or kernel"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn irqchip_choice_is_taken_on_x86_64() {
+        for irqchip in [IrqChip::Split, IrqChip::Kernel] {
+            let cfg = BootConfig {
+                irqchip: Some(irqchip),
+                ..BootConfig::with_no_devices(1)
+            };
+            cfg.check().unwrap();
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[test]
+    fn irqchip_choice_is_refused_off_x86_64() {
+        let cfg = BootConfig {
+            irqchip: Some(IrqChip::Kernel),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(cfg.check().unwrap_err(), "--irqchip kernel: x86-64 only");
     }
 
     #[cfg(target_arch = "x86_64")]

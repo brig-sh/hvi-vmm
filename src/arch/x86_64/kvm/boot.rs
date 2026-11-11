@@ -14,6 +14,11 @@
 
 //! The boot of an x86-64 guest on KVM, from the VM, its RAM and devices to the
 //! vCPUs and the run.
+//!
+//! The IOAPIC that `BootConfig::irqchip` chooses is built before the devices,
+//! which take their lines and triggers from it, and before the vCPUs, since KVM
+//! enables the split irqchip only on a VM with no vCPU. A boot with the split
+//! irqchip fails on a host whose KVM lacks `KVM_CAP_SPLIT_IRQCHIP`.
 
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -22,7 +27,7 @@ use kvm_bindings::kvm_pit_config;
 use kvm_ioctls::{Cap, Kvm};
 
 use super::cpuid::guest_cpuid;
-use super::ioapic::KernelIoApic;
+use super::ioapic::{IoApic, KernelIoApic};
 use super::regs::{setup_long_mode, write_boot_gdt, write_boot_page_tables};
 use super::vcpu::{port_bus, run_cpu, VcpuContext};
 use crate::arch::x86_64::acpi;
@@ -31,8 +36,8 @@ use crate::arch::x86_64::layout::{
 };
 use crate::arch::x86_64::loader::{splice_kernel_args, LoadedKernel};
 use crate::arch::x86_64::mptable;
-use crate::config::{BootConfig, Stop};
-use crate::devices::irq::Chip as _;
+use crate::config::{BootConfig, IrqChip, Stop};
+use crate::devices::irq;
 use crate::devices::legacy::uart16550::Uart16550;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
@@ -100,14 +105,28 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     let ram = Arc::new(GuestRam::new(&shared_ram, &regions)?);
     ram.register_kvm_slots(&vm)?;
 
-    vm.create_irq_chip()?;
-    vm.create_pit2(kvm_pit_config::default())?;
+    let mode = cfg.irqchip.unwrap_or_default();
+    let ioapic = match mode {
+        IrqChip::Split => Some(Arc::new(IoApic::create(&vm)?)),
+        IrqChip::Kernel => {
+            vm.create_irq_chip()?;
+            vm.create_pit2(kvm_pit_config::default())?;
+            None
+        }
+    };
+    let kernel_ioapic;
+    let irq_chip: &dyn irq::Chip = match &ioapic {
+        Some(ioapic) => ioapic.as_ref(),
+        None => {
+            kernel_ioapic = KernelIoApic {
+                vm: Arc::clone(&vm),
+            };
+            &kernel_ioapic
+        }
+    };
 
     // The ledger exists first, since each device's transport writes to it.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let irq_chip = KernelIoApic {
-        vm: Arc::clone(&vm),
-    };
     let com1_line = irq_chip.line(COM1_GSI);
     let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip, {
         let vm = Arc::clone(&vm);
@@ -135,7 +154,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
     eprintln!(
-        "{LOG_PREFIX} {num_cpus} vCPU(s)  {} entry@{:#x}",
+        "{LOG_PREFIX} {num_cpus} vCPU(s)  irqchip {mode}  {} entry@{:#x}",
         kernel.format, kernel.entry
     );
 
@@ -169,12 +188,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     }
 
     let Devices {
-        mmio_bus,
+        mut mmio_bus,
         disks,
         net,
         mut host,
     } = devices.finish();
     let uart = Arc::new(Mutex::new(Uart16550::new()));
+    let mut port_bus = port_bus(&uart)?;
+    if let Some(ioapic) = &ioapic {
+        ioapic.attach(&mut mmio_bus, &mut port_bus)?;
+    }
     let context = VcpuContext {
         guest: Arc::new(Guest {
             arch: GuestArch::X86_64,
@@ -193,7 +216,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             )),
             plugin_threads: PluginThreads::new(),
         }),
-        port_bus: Arc::new(port_bus(&uart)?),
+        port_bus: Arc::new(port_bus),
         plugin: cfg.plugin.clone(),
     };
 

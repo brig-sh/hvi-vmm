@@ -130,6 +130,9 @@ pub(super) fn run_cpu(cpu_id: u32, vcpu: VcpuFd, kick_handle: VcpuFd, context: V
                     }
                     return ControlFlow::Break(Outcome::Stopped(Stop::SystemReset));
                 }
+                // The EOI of a level-triggered input of the split irqchip's
+                // IOAPIC, which keeps no remote IRR (see `ioapic`).
+                VcpuExit::IoapicEoi(_) => {}
                 VcpuExit::Intr => {
                     if dbg && cpu_id == 0 {
                         dump("kick");
