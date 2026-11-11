@@ -59,7 +59,9 @@
 //! for the vCPU threads: MMIO exits are serviced inline there, so the virtio
 //! device models -- the code that parses guest descriptors -- run there.
 //! `block` covers each disk's worker thread, which parses the disk's
-//! descriptors and runs its requests against the backing file. `vmm` covers the
+//! descriptors and runs its requests against the backing file. It alone allows
+//! `preadv` and `pwritev`, which move a request's data between the backing file
+//! and guest RAM. `vmm` covers the
 //! thread that calls `boot`, the boot thread below, the other host-side I/O
 //! threads (the console reader, the agent bridge and its per-connection
 //! readers, the tap and gateway readers, and the debug watchdog when it is
@@ -645,15 +647,30 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::fdatasync(1) };
             },
         },
+        // A virtio-blk read or write goes through the functions the worker
+        // calls, so the probe makes whichever syscall the libc lowers them to.
         Probe {
-            what: "read at an offset of an inherited descriptor (block)",
+            what: "read at an offset into buffers (block)",
             thread: Thread::Block,
             expected: Outcome::Allowed,
             run: || {
-                let mut b = [0u8; 1];
-                // SAFETY: reading zero bytes from fd 0, which we inherited. It
-                // is the syscall a virtio-blk read makes.
-                unsafe { libc::pread(0, b.as_mut_ptr().cast(), 0, 0) };
+                let mut empty = [0u8; 0];
+                let buffers = [vm_memory::VolatileSlice::from(&mut empty[..])];
+                // It reads one empty buffer from fd 0, which we inherited, so
+                // the call is made and reads nothing.
+                let _ = crate::memory::read_vectored_at_volatile(&inherited(0), &buffers, 0);
+            },
+        },
+        Probe {
+            what: "write at an offset from buffers (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            run: || {
+                let mut empty = [0u8; 0];
+                let buffers = [vm_memory::VolatileSlice::from(&mut empty[..])];
+                // It writes one empty buffer to fd 1, which we inherited, so
+                // the call is made and writes nothing.
+                let _ = crate::memory::write_vectored_at_volatile(&inherited(1), &buffers, 0);
             },
         },
         Probe {
@@ -847,6 +864,14 @@ fn probes() -> Vec<Probe> {
 #[cfg(target_arch = "x86_64")]
 const fn kvm_irq_line() -> libc::Ioctl {
     libc::_IOW::<kvm_bindings::kvm_irq_level>(kvm_bindings::KVMIO, 0x61)
+}
+
+/// Returns the inherited descriptor `fd` as a `File` that never closes it.
+fn inherited(fd: std::os::fd::RawFd) -> std::mem::ManuallyDrop<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the `File` is never dropped, so it never closes `fd`, which the
+    // probe child inherited and owns no other handle to.
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Exit status of a probe child whose syscall failed with `EPERM`.
@@ -1218,15 +1243,18 @@ mod tests {
     }
 
     // A disk's worker parses guest descriptors too, so its list follows the
-    // same rule.
+    // same rule, apart from the two calls that move a request's data between
+    // the backing file and guest RAM. No other thread makes them, so `vmm` does
+    // not allow them.
     #[test]
-    fn block_is_a_subset_of_vmm() {
+    fn block_adds_only_the_vectored_file_calls_to_vmm() {
         let vmm = names("vmm");
         let block = names("block");
-        let extra: Vec<_> = block.difference(&vmm).collect();
-        assert!(
-            extra.is_empty(),
-            "block allows what vmm does not: {extra:?}"
+        let extra: Vec<_> = block.difference(&vmm).map(String::as_str).collect();
+        assert_eq!(
+            extra,
+            ["preadv", "pwritev"],
+            "block allows what vmm does not"
         );
         assert!(
             block.len() < vmm.len(),

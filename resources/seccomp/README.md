@@ -23,7 +23,9 @@ Firecracker and reads the same files:
 Three filters. `vcpu` is the tight one for the vCPU threads, because MMIO exits
 are serviced inline there -- the virtio device models, the code that parses
 guest descriptors, run there. `block` covers each disk's worker thread, which
-parses the disk's descriptors and runs its requests against the backing file.
+parses the disk's descriptors and runs its requests against the backing file. It
+alone allows `preadv` and `pwritev`, which move a request's data between the
+backing file and guest RAM.
 `vmm` covers the thread that calls `boot`, the other host-side I/O threads, the
 threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the
 ledger's writer.
@@ -94,11 +96,12 @@ data, so the bar is a demonstrated need, not a suspicion:
 2. Add it to the narrowest filter that needs it, with a `comment` saying which
    code path calls it.
 3. `cargo test` -- the unit tests check that every list compiles for the target
-   arch, that `vcpu` and `block` stay strict subsets of `vmm`, that no list ever
-   gains `open*`, `socket`, `connect`, `execve`, `seccomp` or `prctl`, each of
-   which would undo the reason the filters go in after setup, and which `ioctl`
-   requests `block` allows. The opens a glibc build adds are compiled in by the
-   code, behind the filter that refuses them.
+   arch, that `vcpu` stays a strict subset of `vmm`, and that `block` does too
+   apart from `preadv` and `pwritev`, which only a disk's worker makes. They
+   also check that no list ever gains `open*`, `socket`, `connect`, `execve`,
+   `seccomp` or `prctl`, each of which would undo the reason the filters go in
+   after setup, and which `ioctl` requests `block` allows. The opens a glibc
+   build adds are compiled in by the code, behind the filter that refuses them.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
 

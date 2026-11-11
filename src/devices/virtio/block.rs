@@ -25,9 +25,16 @@
 //! and the sink behind one lock, which is never held across a call to the
 //! backing file. The worker takes a request off the ring under the lock, makes
 //! its call with no lock held, and completes it under the lock, unless a reset
-//! took the queue in between. A reset waits for the call in flight, so nothing
-//! reaches guest RAM for a request of the reset device after the STATUS write
-//! returns. One worker serves the requests in the order the ring holds them.
+//! took the queue in between. One worker serves the requests in the order the
+//! ring holds them.
+//!
+//! A read or a write moves its data between the backing file and the request's
+//! buffers in guest RAM with `preadv` and `pwritev`, so no host buffer is sized
+//! by the guest. The kernel writes a read's data into guest RAM during the
+//! call. A reset therefore waits for the call in flight, and nothing reaches
+//! guest RAM for a request of the reset device after the STATUS write returns.
+//! The vCPUs' stop ends that wait, and a read still in flight then writes guest
+//! RAM after the reset returns, while the VM is ending.
 // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
 // every component of a path comes from the guest. The paths here are this
 // VMM's own.
@@ -35,18 +42,18 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use vm_memory::VolatileSlice;
 #[cfg(target_os = "linux")]
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::config;
-use crate::memory::GuestRam;
+use crate::memory::{self, GuestRam};
 use crate::LOG_PREFIX;
 
 use crate::devices::virtio::mmio::Interrupt;
@@ -190,12 +197,13 @@ impl Shared {
         }
     }
 
-    /// Stops serving the queue, and returns once no request is in flight or the
-    /// vCPUs have stopped.
+    /// Stops serving the queue.
     ///
-    /// The worker completes a request in flight only while the queue is served,
-    /// so after the wait no request of the reset device reaches guest RAM or
-    /// the used ring.
+    /// It returns once no request is in flight or the vCPUs have stopped. The
+    /// worker completes a request in flight only while the queue is served, so
+    /// once no request is in flight, no request of the reset device reaches
+    /// guest RAM or the used ring. When the vCPUs' stop ends the wait instead,
+    /// [`stop`](Self::stop) says what still reaches guest RAM.
     fn reset(&self) {
         let mut state = self.lock();
         state.active = None;
@@ -207,11 +215,12 @@ impl Shared {
         }
     }
 
-    /// Stops serving the queue for good, and frees a vCPU that waits in
-    /// [`reset`](Self::reset).
+    /// Stops serving the queue for good.
     ///
-    /// The vCPUs' stop calls it, since a vCPU waiting for a slow backing file
-    /// would otherwise hold up the stop.
+    /// It also frees a vCPU that waits in [`reset`](Self::reset). The vCPUs'
+    /// stop calls it, since a vCPU waiting for a slow backing file would
+    /// otherwise hold up the stop. A read in flight still writes its buffers in
+    /// guest RAM after the reset returns, while the VM is ending.
     fn stop(&self) {
         let mut state = self.lock();
         state.stopping = true;
@@ -239,29 +248,144 @@ impl Shared {
 
 /// The backing store a [`Worker`] runs requests against.
 ///
-/// It is the backing file, or in a test a store whose calls can be held.
+/// It is the backing file, or in a test a store whose calls can be held or cut
+/// short. Its reads and writes take the request's buffers in guest RAM.
 pub(crate) trait BackingStore: Send + 'static {
-    /// Reads exactly `buf.len()` bytes at `offset`.
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+    /// Reads from `offset` into `bufs` in order with one call, and returns the
+    /// number of bytes read.
+    fn read_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice<'_>],
+        offset: u64,
+    ) -> io::Result<usize>;
 
-    /// Writes all of `buf` at `offset`.
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    /// Writes `bufs` in order at `offset` with one call, and returns the number
+    /// of bytes written.
+    fn write_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice<'_>],
+        offset: u64,
+    ) -> io::Result<usize>;
 
     /// Makes the data written so far durable.
     fn sync_data(&self) -> io::Result<()>;
+
+    /// Reads from `offset` until `bufs` are full.
+    ///
+    /// A short read is followed by another from where it stopped, inside a
+    /// buffer too.
+    ///
+    /// # Errors
+    ///
+    /// Errors with `UnexpectedEof` when a read returns no bytes before `bufs`
+    /// are full, or with the read's own error.
+    fn read_exact_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice<'_>],
+        offset: u64,
+    ) -> io::Result<()> {
+        transfer_all(bufs, offset, io::ErrorKind::UnexpectedEof, |left, at| {
+            self.read_vectored_at_volatile(left, at)
+        })
+    }
+
+    /// Writes all of `bufs` at `offset`.
+    ///
+    /// A short write is followed by another from where it stopped, inside a
+    /// buffer too.
+    ///
+    /// # Errors
+    ///
+    /// Errors with `WriteZero` when a write returns no bytes before `bufs` are
+    /// written, or with the write's own error.
+    fn write_all_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice<'_>],
+        offset: u64,
+    ) -> io::Result<()> {
+        transfer_all(bufs, offset, io::ErrorKind::WriteZero, |left, at| {
+            self.write_vectored_at_volatile(left, at)
+        })
+    }
 }
 
 impl BackingStore for File {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        FileExt::read_exact_at(self, buf, offset)
+    fn read_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice<'_>],
+        offset: u64,
+    ) -> io::Result<usize> {
+        memory::read_vectored_at_volatile(self, bufs, offset)
     }
 
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        FileExt::write_all_at(self, buf, offset)
+    fn write_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice<'_>],
+        offset: u64,
+    ) -> io::Result<usize> {
+        memory::write_vectored_at_volatile(self, bufs, offset)
     }
 
     fn sync_data(&self) -> io::Result<()> {
         File::sync_data(self)
+    }
+}
+
+/// Makes `call` on what is left of `bufs` and its offset, from `offset`, until
+/// every byte of `bufs` is moved.
+///
+/// An empty buffer is skipped, so a call is never given buffers that are all
+/// empty, and a count of 0 means that the store moved nothing.
+///
+/// # Errors
+///
+/// Errors with `stalled` when a call moves no bytes before every byte is moved,
+/// or with the call's own error.
+fn transfer_all<'a>(
+    bufs: &[VolatileSlice<'a>],
+    mut offset: u64,
+    stalled: io::ErrorKind,
+    mut call: impl FnMut(&[VolatileSlice<'a>], u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut left: Vec<_> = bufs.iter().filter(|buf| !buf.is_empty()).copied().collect();
+    let mut left = left.as_mut_slice();
+    while !left.is_empty() {
+        match call(left, offset) {
+            Ok(0) => return Err(stalled.into()),
+            Ok(moved) => {
+                offset += moved as u64;
+                advance_slices(&mut left, moved);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Drops the first `count` bytes of `bufs`, as `IoSliceMut::advance_slices`
+/// does.
+///
+/// # Panics
+///
+/// Panics if `bufs` hold fewer than `count` bytes.
+fn advance_slices(bufs: &mut &mut [VolatileSlice<'_>], mut count: usize) {
+    let mut whole = 0;
+    for buf in bufs.iter() {
+        if count < buf.len() {
+            break;
+        }
+        count -= buf.len();
+        whole += 1;
+    }
+    *bufs = &mut std::mem::take(bufs)[whole..];
+    match bufs.first_mut() {
+        Some(first) => {
+            *first = first
+                .offset(count)
+                .expect("a count inside the buffer should advance it");
+        }
+        None => assert_eq!(count, 0, "a count should not pass the end of the buffers"),
     }
 }
 
@@ -293,8 +417,9 @@ pub(crate) struct Worker<F = File> {
     shared: Arc<Shared>,
 }
 
-/// A request taken off the ring, as the worker parsed it under the lock.
-struct Request {
+/// A request taken off the ring, as the worker parsed it under the lock, with
+/// its buffers in the guest RAM that `'a` borrows.
+struct Request<'a> {
     /// The head of the request's chain, which its used entry names.
     head: u16,
     /// The guest address of the status byte, or `None` when the chain is too
@@ -305,24 +430,24 @@ struct Request {
     /// The sector the request starts at.
     sector: u64,
     /// What the request asks of the backing store.
-    work: Work,
+    work: Work<'a>,
 }
 
 /// What a request asks of the backing store.
-enum Work {
-    /// A read from `offset` into the guest segments.
+enum Work<'a> {
+    /// A read from `offset` into the request's buffers in guest RAM.
     Read {
         /// The byte offset in the backing store.
         offset: u64,
-        /// The guest segments, as address and length.
-        segments: Vec<(u64, u32)>,
+        /// The buffers, in chain order.
+        buffers: Vec<VolatileSlice<'a>>,
     },
-    /// A write of `data`, gathered from guest RAM, at `offset`.
+    /// A write of the request's buffers in guest RAM at `offset`.
     Write {
         /// The byte offset in the backing store.
         offset: u64,
-        /// The bytes to write.
-        data: Vec<u8>,
+        /// The buffers, in chain order.
+        buffers: Vec<VolatileSlice<'a>>,
     },
     /// A flush of the writes so far.
     Flush,
@@ -348,7 +473,7 @@ struct Pass {
     more: bool,
 }
 
-impl Request {
+impl Request<'_> {
     /// Returns a request whose chain carries none.
     fn malformed(head: u16) -> Self {
         Self {
@@ -364,8 +489,9 @@ impl Request {
     /// the backing store.
     fn data_len(&self) -> u64 {
         match &self.work {
-            Work::Read { segments, .. } => segments.iter().map(|&(_, len)| u64::from(len)).sum(),
-            Work::Write { data, .. } => data.len() as u64,
+            Work::Read { buffers, .. } | Work::Write { buffers, .. } => {
+                buffers.iter().map(|buffer| buffer.len() as u64).sum()
+            }
             _ => 0,
         }
     }
@@ -606,9 +732,9 @@ impl<F: BackingStore> Worker<F> {
     ///
     /// The first readable segment is the 16-byte header (type, reserved,
     /// sector), the last writable segment is the status byte, and the segments
-    /// between carry data. The walk is bounded by the queue size, and a write's
-    /// data is gathered here, so a request in flight reads no guest RAM.
-    fn parse(&self, mut chain: DescriptorChain<'_>) -> Request {
+    /// between carry data. The walk is bounded by the queue size, so the
+    /// request holds at most that many buffers.
+    fn parse(&self, mut chain: DescriptorChain<'_>) -> Request<'_> {
         let head = chain.head_index();
         let mut readable = Vec::new();
         let mut writable = Vec::new();
@@ -662,22 +788,19 @@ impl<F: BackingStore> Worker<F> {
     ///
     /// # Errors
     ///
-    /// Errors when the request falls outside the disk, or its data cannot be
-    /// read from guest RAM.
+    /// Errors when a read or write falls outside the disk, or one of its
+    /// segments outside guest RAM.
     fn work(
         &self,
         kind: u32,
         sector: u64,
         data_out: &[(u64, u32)],
         data_in: &[(u64, u32)],
-    ) -> io::Result<Work> {
+    ) -> io::Result<Work<'_>> {
         Ok(match kind {
             VIRTIO_BLK_T_IN => {
-                let total = data_in.iter().map(|&(_, len)| u64::from(len)).sum();
-                Work::Read {
-                    offset: self.byte_range(sector, total)?,
-                    segments: data_in.to_vec(),
-                }
+                let (offset, buffers) = self.buffers(sector, data_in)?;
+                Work::Read { offset, buffers }
             }
             // The guest was offered VIRTIO_BLK_F_RO. A write that arrives
             // anyway fails.
@@ -685,18 +808,8 @@ impl<F: BackingStore> Worker<F> {
             // Nothing was written, so there is nothing to make durable.
             VIRTIO_BLK_T_FLUSH if self.read_only => Work::Answer(VIRTIO_BLK_S_OK),
             VIRTIO_BLK_T_OUT => {
-                // The range is checked before the guest-sized buffer exists.
-                let total: usize = data_out.iter().map(|&(_, len)| len as usize).sum();
-                let offset = self.byte_range(sector, total as u64)?;
-                let mut data = vec![0u8; total];
-                let mut at = 0;
-                for &(addr, len) in data_out {
-                    self.ram
-                        .read(addr, &mut data[at..at + len as usize])
-                        .map_err(other)?;
-                    at += len as usize;
-                }
-                Work::Write { offset, data }
+                let (offset, buffers) = self.buffers(sector, data_out)?;
+                Work::Write { offset, buffers }
             }
             VIRTIO_BLK_T_FLUSH => Work::Flush,
             VIRTIO_BLK_T_GET_ID => Work::GetId {
@@ -707,6 +820,31 @@ impl<F: BackingStore> Worker<F> {
             // driver that sends one anyway must learn that nothing happened.
             _ => Work::Answer(VIRTIO_BLK_S_UNSUPP),
         })
+    }
+
+    /// Returns the byte offset of a read or write of `segments` at `sector`,
+    /// and the segments as buffers in guest RAM.
+    ///
+    /// Every segment is checked before the request reaches the backing store,
+    /// so a request with one segment outside guest RAM moves no byte. A
+    /// zero-length segment is checked too.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the request falls outside the disk, or a segment outside
+    /// guest RAM.
+    fn buffers(
+        &self,
+        sector: u64,
+        segments: &[(u64, u32)],
+    ) -> io::Result<(u64, Vec<VolatileSlice<'_>>)> {
+        let total = segments.iter().map(|&(_, len)| u64::from(len)).sum();
+        let offset = self.byte_range(sector, total)?;
+        let buffers = segments
+            .iter()
+            .map(|&(addr, len)| self.ram.slice(addr, len as usize))
+            .collect::<io::Result<_>>()?;
+        Ok((offset, buffers))
     }
 
     /// Byte offset of `sector`, once we know the whole `len`-byte access falls
@@ -731,42 +869,46 @@ impl<F: BackingStore> Worker<F> {
         Ok(base)
     }
 
-    /// Runs `work` against the backing store, and returns the bytes a read
-    /// brought back.
+    /// Runs `work` against the backing store.
     ///
-    /// It is the one step of a request that runs with no lock held. A read
-    /// lands in a host buffer, and only the completion copies it to the guest.
-    fn run_request(&self, work: &Work) -> io::Result<Vec<u8>> {
+    /// It returns the number of bytes it wrote to guest RAM. It is the one step
+    /// of a request that runs with no lock held. A read writes the request's
+    /// buffers in guest RAM during the call.
+    fn run_request(&self, work: &Work<'_>) -> io::Result<u32> {
         match work {
-            Work::Read { offset, segments } => {
-                let total = segments.iter().map(|&(_, len)| len as usize).sum();
-                let mut data = vec![0u8; total];
-                self.file.read_exact_at(&mut data, *offset)?;
-                Ok(data)
+            Work::Read { offset, buffers } => {
+                self.file
+                    .read_exact_vectored_at_volatile(buffers, *offset)?;
+                let total: usize = buffers.iter().map(VolatileSlice::len).sum();
+                // The buffers may overlap, so their total can pass what the
+                // used length holds.
+                Ok(u32::try_from(total).unwrap_or(u32::MAX))
             }
-            Work::Write { offset, data } => {
-                self.file.write_all_at(data, *offset).map(|()| Vec::new())
-            }
+            Work::Write { offset, buffers } => self
+                .file
+                .write_all_vectored_at_volatile(buffers, *offset)
+                .map(|()| 0),
             // Honor the guest's cache flush (durability for fsync).
-            Work::Flush => self.file.sync_data().map(|()| Vec::new()),
-            Work::GetId { .. } | Work::Answer(_) => Ok(Vec::new()),
+            Work::Flush => self.file.sync_data().map(|()| 0),
+            Work::GetId { .. } | Work::Answer(_) => Ok(0),
             Work::Refused(reason) => Err(io::Error::other(reason.clone())),
         }
     }
 
     /// Completes `request`, whose call to the backing store returned `done`.
     ///
-    /// While the queue is served, the read data and the status byte reach guest
-    /// RAM, the chain goes on the used ring and the interrupt is raised, once
-    /// per request, so a slow request does not hold back the ones before it.
-    /// After a reset none of that happens. A read or write that went through is
-    /// recorded in `events` and fed to the sink either way, since it reached
-    /// the backing store. With tracing on, its console line goes in `trace`.
+    /// While the queue is served, the status byte and a `GET_ID` serial reach
+    /// guest RAM, the chain goes on the used ring and the interrupt is raised,
+    /// once per request, so a slow request does not hold back the ones before
+    /// it. After a reset none of that happens. A read or write that went
+    /// through is recorded in the state and fed to the sink either way, since
+    /// it reached the backing store. With tracing on, its console line goes
+    /// in `trace_lines`.
     fn complete(
         &self,
         state: &mut State,
-        request: &Request,
-        done: io::Result<Vec<u8>>,
+        request: &Request<'_>,
+        done: io::Result<u32>,
         trace_lines: &mut Vec<String>,
     ) {
         let State {
@@ -812,7 +954,10 @@ impl<F: BackingStore> Worker<F> {
             // back as whatever the driver put there, so a refused or failed
             // request could look like a success with stale data in the buffer.
             let _ = self.ram.write_u8(status_at, status);
-            if active.queue.add_used(&self.ram, request.head, written + 1) {
+            if active
+                .queue
+                .add_used(&self.ram, request.head, written.saturating_add(1))
+            {
                 active.interrupt.signal_used_buffer();
             }
         }
@@ -845,28 +990,25 @@ impl<F: BackingStore> Worker<F> {
     /// Returns the status of `request`, whose call to the backing store
     /// returned `done`, and the number of data bytes written to the guest.
     ///
-    /// The read data or the serial reach the guest only when `deliver` is set.
+    /// The serial reaches the guest only when `deliver` is set.
     ///
     /// # Errors
     ///
-    /// Errors when the call failed, the request was refused, or the data cannot
-    /// be written to guest RAM.
+    /// Errors when the call failed, the request was refused, or the serial
+    /// cannot be written to guest RAM.
     fn answer(
         &self,
-        request: &Request,
-        done: io::Result<Vec<u8>>,
+        request: &Request<'_>,
+        done: io::Result<u32>,
         deliver: bool,
     ) -> io::Result<(u8, u32)> {
-        let data = done?;
+        let written = done?;
         Ok(match &request.work {
-            Work::Read { segments, .. } if deliver => {
-                (VIRTIO_BLK_S_OK, scatter(&self.ram, segments, &data)?)
-            }
             Work::GetId { segments } if deliver => {
                 (VIRTIO_BLK_S_OK, scatter(&self.ram, segments, &self.serial)?)
             }
             Work::Answer(status) => (*status, 0),
-            _ => (VIRTIO_BLK_S_OK, 0),
+            _ => (VIRTIO_BLK_S_OK, written),
         })
     }
 }
@@ -2098,14 +2240,22 @@ mod worker_tests {
     }
 
     impl BackingStore for Gated {
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        fn read_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
             self.hold();
-            FileExt::read_exact_at(&self.file, buf, offset)
+            memory::read_vectored_at_volatile(&self.file, bufs, offset)
         }
 
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        fn write_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
             self.hold();
-            FileExt::write_all_at(&self.file, buf, offset)
+            memory::write_vectored_at_volatile(&self.file, bufs, offset)
         }
 
         // The gate decides how long a flush takes, so the store syncs nothing.
@@ -2385,8 +2535,11 @@ mod worker_tests {
     }
 
     // The guest resets the device while the worker's read is held at the gate.
-    // The STATUS write returns only once the read has returned, and the read's
-    // data, its status byte and a used entry never reach the guest.
+    // The STATUS write returns only once the read has returned. The read writes
+    // its buffer during the call, which is before the reset returns. After the
+    // reset returns, nothing reaches guest RAM for the request: the buffer,
+    // poisoned again, stays as it is until the worker has exited, the status
+    // byte is untouched and no used entry is added.
     #[test]
     fn reset_waits_for_the_call_in_flight_and_completes_nothing() {
         let rig = Rig::new("disk0", &no_ledger(), true);
@@ -2404,15 +2557,29 @@ mod worker_tests {
         });
 
         assert_eq!(rig.in_flight(), 0, "the read has returned");
-        assert_eq!(rig.data(0), [0xee; 4], "the data buffer is untouched");
-        assert_eq!(rig.status(0), 0xff, "the status byte is untouched");
-        assert_eq!(rig.used_idx(), 0, "no used entry was added");
-        assert_eq!(rig.driver.trigger.count(), 0, "no interrupt was raised");
+        assert_eq!(rig.data(0), [2; 4], "the read wrote its buffer");
+        rig.ram.write(BUFFERS + DATA, &[0xdd; 512]).unwrap();
+        let ram = Arc::clone(&rig.ram);
+        let trigger = Arc::clone(&rig.driver.trigger);
+        drop(rig);
+        let mut data = [0; 4];
+        ram.read(BUFFERS + DATA, &mut data).unwrap();
+        assert_eq!(data, [0xdd; 4], "the buffer is untouched after the reset");
+        let mut status = [0];
+        ram.read(BUFFERS + STATUS, &mut status).unwrap();
+        assert_eq!(status, [0xff], "the status byte is untouched");
+        assert_eq!(
+            ram.read_u16(RINGS.used_ring + 2).unwrap(),
+            0,
+            "no used entry was added"
+        );
+        assert_eq!(trigger.count(), 0, "no interrupt was raised");
     }
 
     // A backing file that never answers would hold the vCPU in the reset
-    // forever. The vCPUs' stop frees it while the read is still held, and the
-    // read completes nothing once it returns.
+    // forever. The vCPUs' stop frees it while the read is still held. Once the
+    // read returns it has written its buffer, after the reset returned, and it
+    // completes nothing.
     #[test]
     fn vcpu_stop_frees_a_vcpu_waiting_in_reset() {
         let rig = Rig::new("disk0", &no_ledger(), true);
@@ -2438,7 +2605,7 @@ mod worker_tests {
         });
 
         wait_until("the read did not return", || rig.in_flight() == 0);
-        assert_eq!(rig.data(0), [0xee; 4], "the data buffer is untouched");
+        assert_eq!(rig.data(0), [2; 4], "the read wrote its buffer");
         assert_eq!(rig.status(0), 0xff, "the status byte is untouched");
         assert_eq!(rig.used_idx(), 0, "no used entry was added");
     }
@@ -2778,5 +2945,446 @@ mod worker_tests {
         }
         wait_until("the request was not served", || rig.used_idx() == 1);
         assert_eq!(rig.data(0), [2; 4]);
+    }
+}
+
+#[cfg(test)]
+mod data_path_tests {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::devices::virtio::mmio::testing::{self, Rings};
+    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+
+    const BASE: u64 = 0x4000_0000;
+    /// The queue of every disk, a 256-entry ring at the start of guest RAM.
+    const RINGS: Rings = Rings {
+        size: 256,
+        desc_table: BASE,
+        avail_ring: BASE + 0x1000,
+        used_ring: BASE + 0x2000,
+    };
+    /// Where a request has its header, and its status byte.
+    const HEADER: u64 = BASE + 0x8000;
+    const STATUS: u64 = BASE + 0x8100;
+    /// Where the data buffers start, running to the end of guest RAM.
+    const BUFFERS: u64 = BASE + 0x1_0000;
+    /// The size of guest RAM.
+    const RAM: usize = 0x10_0000;
+
+    /// A backing file whose reads and writes each move at most `most` bytes,
+    /// and which counts its calls.
+    struct Short {
+        /// The backing file.
+        file: File,
+        /// The most bytes one call moves.
+        most: usize,
+        /// The number of reads and writes made.
+        calls: AtomicUsize,
+    }
+
+    impl Short {
+        /// Returns the first `most` bytes of `bufs`, with the last buffer cut
+        /// where they end.
+        ///
+        /// It counts a call. It panics at the hundredth call, so a loop that
+        /// does not advance fails the test instead of hanging it.
+        fn cut<'a>(&self, bufs: &[VolatileSlice<'a>]) -> Vec<VolatileSlice<'a>> {
+            let calls = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(calls < 100, "the store was called {calls} times");
+            let mut left = self.most;
+            let mut cut = Vec::new();
+            for buf in bufs {
+                if left == 0 {
+                    break;
+                }
+                let len = buf.len().min(left);
+                cut.push(buf.subslice(0, len).unwrap());
+                left -= len;
+            }
+            cut
+        }
+    }
+
+    impl BackingStore for Short {
+        fn read_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
+            memory::read_vectored_at_volatile(&self.file, &self.cut(bufs), offset)
+        }
+
+        fn write_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
+            memory::write_vectored_at_volatile(&self.file, &self.cut(bufs), offset)
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            self.file.sync_data()
+        }
+    }
+
+    /// A backing file that records each buffer it is handed.
+    struct Recording {
+        /// The backing file.
+        file: File,
+        /// The host address and the length of each buffer handed so far.
+        handed: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl Recording {
+        /// Records `bufs`.
+        fn record(&self, bufs: &[VolatileSlice<'_>]) {
+            let handed = bufs
+                .iter()
+                .map(|buf| (buf.ptr_guard().as_ptr() as usize, buf.len()));
+            self.handed.lock().unwrap().extend(handed);
+        }
+    }
+
+    impl BackingStore for Recording {
+        fn read_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
+            self.record(bufs);
+            memory::read_vectored_at_volatile(&self.file, bufs, offset)
+        }
+
+        fn write_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
+            self.record(bufs);
+            memory::write_vectored_at_volatile(&self.file, bufs, offset)
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            self.file.sync_data()
+        }
+    }
+
+    /// Returns the path of a new `len`-byte image, whose byte `n` is `n % 251`,
+    /// or which is sparse when `sparse` is set.
+    fn image(len: usize, sparse: bool) -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("hvi-blk-data-{}-{n}.img", std::process::id()));
+        if sparse {
+            File::create(&path).unwrap().set_len(len as u64).unwrap();
+        } else {
+            let bytes: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        path
+    }
+
+    /// A disk whose worker the test runs a pass at a time, on the test's
+    /// thread.
+    struct Disk<F: BackingStore = File> {
+        /// The device, activated with [`RINGS`].
+        _blk: VirtioBlk,
+        /// The device's worker.
+        worker: Worker<F>,
+        /// The guest RAM the queue and the buffers are in.
+        ram: Arc<GuestRam>,
+    }
+
+    impl Disk {
+        /// Returns a writable disk over an image of `len` bytes made by
+        /// [`image`], with its queue activated.
+        ///
+        /// The image is unlinked at once, and the worker's descriptor keeps it.
+        fn new(len: usize, sparse: bool) -> Self {
+            let path = image(len, sparse);
+            let mut blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let ram = Arc::new(GuestRam::from_ranges(&[(BASE, RAM)]));
+            let ledger = Arc::new(Ledger::new(None, "blk-data-test").unwrap());
+            let worker = blk.take_worker(&ram, &ledger).unwrap();
+            let queue = testing::ready_queue(QUEUE_MAX_SIZE, RINGS, &ram);
+            let (interrupt, _) = testing::enabled_interrupt();
+            blk.activate(&ram, 0, vec![Some(queue)], interrupt).unwrap();
+            Self {
+                _blk: blk,
+                worker,
+                ram,
+            }
+        }
+
+        /// Returns the disk with its backing file replaced by what `wrap` makes
+        /// of it.
+        fn with_store<G: BackingStore>(self, wrap: impl FnOnce(File) -> G) -> Disk<G> {
+            Disk {
+                _blk: self._blk,
+                worker: self.worker.with_store(wrap),
+                ram: self.ram,
+            }
+        }
+
+        /// Returns the bytes of the image.
+        fn image(&self) -> Vec<u8> {
+            let file = &self.worker.file;
+            let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+            file.read_exact_at(&mut bytes, 0).unwrap();
+            bytes
+        }
+    }
+
+    impl<F: BackingStore> Disk<F> {
+        /// Submits a request of type `kind` at `sector` with its data in the
+        /// guest `segments`.
+        ///
+        /// The worker serves it, and the call returns the status byte the
+        /// device wrote and what the pass captured. The chain starts at
+        /// descriptor 0, and each request takes the next entry of the avail
+        /// ring. The status byte is poisoned to `0xff`, so an untouched byte is
+        /// visible.
+        fn submit(&self, kind: u32, sector: u64, segments: &[(u64, u32)]) -> (u8, Pass) {
+            let ram = &self.ram;
+            ram.write_u32(HEADER, kind).unwrap();
+            ram.write_u64(HEADER + 8, sector).unwrap();
+            ram.write_u8(STATUS, 0xff).unwrap();
+            let data = if kind == VIRTIO_BLK_T_IN {
+                VIRTQ_DESC_F_WRITE
+            } else {
+                0
+            };
+            let chain: Vec<_> = std::iter::once((HEADER, 16, 0))
+                .chain(segments.iter().map(|&(addr, len)| (addr, len, data)))
+                .chain(std::iter::once((STATUS, 1, VIRTQ_DESC_F_WRITE)))
+                .collect();
+            for (index, &(addr, len, flags)) in (0u64..).zip(&chain) {
+                let at = RINGS.desc_table + index * 16;
+                let next = if index + 1 < chain.len() as u64 {
+                    VIRTQ_DESC_F_NEXT
+                } else {
+                    0
+                };
+                ram.write_u64(at, addr).unwrap();
+                ram.write_u32(at + 8, len).unwrap();
+                ram.write_u16(at + 12, flags | next).unwrap();
+                ram.write_u16(at + 14, (index + 1) as u16).unwrap();
+            }
+            let avail = RINGS.avail_ring;
+            let idx = ram.read_u16(avail + 2).unwrap();
+            ram.write_u16(avail + 4 + u64::from(idx % 256) * 2, 0)
+                .unwrap();
+            ram.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+            let pass = self.worker.pass();
+            let mut status = [0];
+            ram.read(STATUS, &mut status).unwrap();
+            (status[0], pass)
+        }
+
+        /// Returns the length of the newest used entry.
+        fn used_len(&self) -> u32 {
+            let used = RINGS.used_ring;
+            let idx = self.ram.read_u16(used + 2).unwrap();
+            let entry = used + 4 + u64::from(idx.wrapping_sub(1) % 256) * 8;
+            self.ram.read_u32(entry + 4).unwrap()
+        }
+
+        /// Returns the bytes of the guest `segments`, joined.
+        fn joined(&self, segments: &[(u64, u32)]) -> Vec<u8> {
+            let mut joined = Vec::new();
+            for &(addr, len) in segments {
+                let mut bytes = vec![0; len as usize];
+                self.ram.read(addr, &mut bytes).unwrap();
+                joined.extend(bytes);
+            }
+            joined
+        }
+
+        /// Fills the guest `segments` with consecutive bytes after `first`.
+        ///
+        /// It returns the bytes, joined.
+        fn fill(&self, segments: &[(u64, u32)], first: u8) -> Vec<u8> {
+            let mut next = first;
+            for &(addr, len) in segments {
+                let bytes: Vec<u8> = (0..len)
+                    .map(|_| {
+                        next = next.wrapping_add(1);
+                        next
+                    })
+                    .collect();
+                self.ram.write(addr, &bytes).unwrap();
+            }
+            self.joined(segments)
+        }
+    }
+
+    /// Segments of 100, 0, 300, 112 and 0 bytes, one sector in all, at
+    /// addresses out of order.
+    ///
+    /// The zero-length ones sit between data segments and before the status
+    /// byte.
+    const WRITE_SEGMENTS: [(u64, u32); 5] = [
+        (BUFFERS + 0x3000, 100),
+        (BUFFERS + 0x100, 0),
+        (BUFFERS + 0x1000, 300),
+        (BUFFERS + 0x2000, 112),
+        (BUFFERS + 0x5000, 0),
+    ];
+    /// Segments of 7, 0, 205 and 300 bytes, one sector in all.
+    const READ_SEGMENTS: [(u64, u32); 4] = [
+        (BUFFERS + 0x6000, 7),
+        (BUFFERS + 0x6100, 0),
+        (BUFFERS + 0x7000, 205),
+        (BUFFERS + 0x4000, 300),
+    ];
+
+    #[test]
+    fn read_and_write_round_trip_across_segments_of_different_sizes() {
+        let disk = Disk::new(8 * 512, false);
+        let written = disk.fill(&WRITE_SEGMENTS, 0x40);
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_OUT, 2, &WRITE_SEGMENTS);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.used_len(), 1, "a write returns only the status byte");
+        let image = disk.image();
+        assert_eq!(&image[1024..1536], &written[..]);
+        assert_eq!(image[1023], (1023 % 251) as u8, "the sector before");
+        assert_eq!(image[1536], (1536 % 251) as u8, "the sector after");
+        assert_eq!(disk.worker.take_pending().len(), 1);
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_IN, 2, &READ_SEGMENTS);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.used_len(), 513, "the sector and the status byte");
+        assert_eq!(disk.joined(&READ_SEGMENTS), written);
+    }
+
+    // A call given only empty buffers returns 0, which reads as the end of the
+    // file. The request moves nothing and makes no call.
+    #[test]
+    fn request_with_only_empty_segments_succeeds() {
+        let disk = Disk::new(8 * 512, false);
+        for kind in [VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT] {
+            let (status, _) = disk.submit(kind, 1, &[(BUFFERS, 0)]);
+            assert_eq!(status, VIRTIO_BLK_S_OK, "type {kind}");
+        }
+    }
+
+    // Each call moves at most 150 bytes, so calls end inside the 300-byte and
+    // the 205-byte segments, and the next call starts there.
+    #[test]
+    fn short_transfers_resume_inside_a_segment() {
+        let disk = Disk::new(8 * 512, false).with_store(|file| Short {
+            file,
+            most: 150,
+            calls: AtomicUsize::new(0),
+        });
+        let written = disk.fill(&WRITE_SEGMENTS, 0x80);
+        let calls = || disk.worker.file.calls.load(Ordering::SeqCst);
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_OUT, 3, &WRITE_SEGMENTS);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(calls(), 4, "512 bytes take four calls of 150");
+        let (status, _) = disk.submit(VIRTIO_BLK_T_IN, 3, &READ_SEGMENTS);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(calls(), 8);
+
+        assert_eq!(disk.joined(&READ_SEGMENTS), written);
+        let mut image = vec![0; 512];
+        let file = &disk.worker.file.file;
+        file.read_exact_at(&mut image, 1536).unwrap();
+        assert_eq!(image, written);
+    }
+
+    // The second segment starts at the end of guest RAM. The request is refused
+    // before it reaches the backing file, so the first segment, which is in
+    // guest RAM, is not written either.
+    #[test]
+    fn segment_outside_guest_ram_is_refused_and_moves_nothing() {
+        let disk = Disk::new(8 * 512, false);
+        let segments = [(BUFFERS, 256), (BASE + RAM as u64, 256)];
+        disk.ram.write(BUFFERS, &[0xcc; 256]).unwrap();
+        let before = disk.image();
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_IN, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(
+            disk.joined(&segments[..1]),
+            [0xcc; 256],
+            "guest RAM is untouched"
+        );
+        assert!(disk.worker.take_pending().is_empty());
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_OUT, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(disk.image(), before, "the backing file is untouched");
+        assert!(disk.worker.take_pending().is_empty());
+    }
+
+    // A chain holds at most a queue's worth of descriptors, fewer than IOV_MAX,
+    // so this calls the store's loop with more buffers than one call takes.
+    #[test]
+    fn more_buffers_than_iov_max_are_moved_in_several_calls() {
+        let ram = GuestRam::from_ranges(&[(BASE, RAM)]);
+        let disk = Disk::new(0, true);
+        let file = &disk.worker.file;
+        let count = memory::IOV_MAX as u64 + 100;
+        let buffers: Vec<_> = (0..count)
+            .map(|n| ram.slice(BUFFERS + n * 4, 2).unwrap())
+            .collect();
+        let bytes: Vec<u8> = (0..count * 2).map(|n| n as u8).collect();
+        for (n, pair) in (0..count).zip(bytes.chunks(2)) {
+            ram.write(BUFFERS + n * 4, pair).unwrap();
+        }
+
+        file.write_all_vectored_at_volatile(&buffers, 8).unwrap();
+        let mut image = vec![0; bytes.len()];
+        file.read_exact_at(&mut image, 8).unwrap();
+        assert_eq!(image, bytes);
+
+        for n in 0..count {
+            ram.write(BUFFERS + n * 4, &[0, 0]).unwrap();
+        }
+        file.read_exact_vectored_at_volatile(&buffers, 8).unwrap();
+        for (n, pair) in (0..count).zip(bytes.chunks(2)) {
+            let mut got = [0; 2];
+            ram.read(BUFFERS + n * 4, &mut got).unwrap();
+            assert_eq!(got, pair, "buffer {n}");
+        }
+    }
+
+    // 128 data descriptors of 128 KiB each claim 16 MiB against a 16 MiB disk,
+    // all at one guest buffer. The request is inside the disk and its segments
+    // inside guest RAM, so it is served. Every buffer the store is handed lies
+    // inside that guest buffer, so no host buffer holds the request's data.
+    #[test]
+    fn store_is_handed_only_the_requests_guest_buffers() {
+        const SEGMENT: u32 = 128 << 10;
+        let disk = Disk::new(16 << 20, true).with_store(|file| Recording {
+            file,
+            handed: Mutex::default(),
+        });
+        let segments = [(BUFFERS, SEGMENT); 128];
+        disk.ram.write(BUFFERS, &[0x5a; SEGMENT as usize]).unwrap();
+        let guest = disk.ram.slice(BUFFERS, SEGMENT as usize).unwrap();
+        let start = guest.ptr_guard().as_ptr() as usize;
+        let end = start + guest.len();
+
+        for kind in [VIRTIO_BLK_T_OUT, VIRTIO_BLK_T_IN] {
+            let (status, _) = disk.submit(kind, 0, &segments);
+            assert_eq!(status, VIRTIO_BLK_S_OK, "type {kind}");
+            let handed = std::mem::take(&mut *disk.worker.file.handed.lock().unwrap());
+            assert!(!handed.is_empty(), "type {kind}: the store was not called");
+            for (at, len) in handed {
+                assert!(
+                    start <= at && at + len <= end,
+                    "type {kind}: a buffer of {len} bytes outside the guest's"
+                );
+            }
+        }
+        assert_eq!(disk.joined(&segments[..1]), [0x5a; SEGMENT as usize]);
     }
 }

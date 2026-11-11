@@ -110,9 +110,11 @@ installs the `vmm` filter once they are, so only a write under way as they are
 armed runs unfiltered. The `vmm.start` record wakes it before any vCPU thread
 starts.
 
-`vcpu` and `block` are each a strict subset of `vmm`, checked by tests. All
-three use a default action of `trap`, so an off-list syscall raises `SIGSYS` and
-kills the process.
+`vcpu` is a strict subset of `vmm`. `block` is too, apart from `preadv` and
+`pwritev`, with which a worker reads and writes a request's data straight
+between the backing file and guest RAM. No other thread makes them, so `vmm`
+does not allow them. Tests check both. All three use a default action of `trap`,
+so an off-list syscall raises `SIGSYS` and kills the process.
 
 `block` allows `ioctl` only for the requests a worker makes: `KVM_IRQ_LINE` on
 x86-64, which raises the disk's interrupt, and `TCGETS`, `TCSETS` and `TCFLSH`,
