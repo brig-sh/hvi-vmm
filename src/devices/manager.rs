@@ -330,8 +330,8 @@ impl DeviceManager {
             let interrupt = self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
             export.queue_interrupts(&interrupt, &mut self.devices.host);
         }
-        // A vCPU in an export's reset waits on its daemon, where no kick
-        // reaches it. Ending the connections at the stop frees it.
+        // A vCPU in an export's activation or reset waits on its daemon, where
+        // no kick reaches it. Ending the connections at the stop frees it.
         self.devices
             .host
             .on_vcpu_stop(move || vhost_user::shut_down(&exports));
