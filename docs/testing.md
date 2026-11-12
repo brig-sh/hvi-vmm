@@ -111,8 +111,10 @@ quietly turn the step into a no-op.
 
 ## The live boots
 
-Three jobs boot a real guest on hardware the project owns. They assert on the
-console log:
+Three jobs boot a real guest on hardware the project owns. The Linux and HVF
+lanes boot the kernel hull ships: the hull-assets bundle for the platform,
+verified with cosign against the hull-assets release workflow and pulled at
+that digest, as hull does at run time. They assert on the console log:
 
 | Job | Runner | Asserts |
 | --- | --- | --- |
