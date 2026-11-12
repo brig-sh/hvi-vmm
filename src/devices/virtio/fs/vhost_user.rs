@@ -477,6 +477,8 @@ mod device {
         /// [`QueueConfig::set_ready`](crate::devices::virtio::QueueConfig::set_ready)
         /// checks. A queue that is not ready is left disabled, which the guest
         /// sees as a queue that does not answer.
+        ///
+        /// It returns `Ok` once the daemon has read every message it was sent.
         fn hand_over(
             &mut self,
             mem: &GuestRam,
@@ -543,6 +545,15 @@ mod device {
                         .send("SET_VRING_ENABLE", |f| f.set_vring_enable(index, true))?;
                 }
             }
+            // None of the messages above has a reply, so without a wait the
+            // driver can notify a ring before the daemon has read them. A
+            // daemon drops a notification it reads on a ring it has not
+            // enabled. Without protocol features a ring is enabled before
+            // SET_VRING_KICK starts it, and a daemon that watches notifications
+            // before it marks the ring ready can lose one that is already
+            // pending. The daemon answers its requests in order, so the reply
+            // to GET_FEATURES says it has read them all.
+            self.peer.send("GET_FEATURES", |f| f.get_features())?;
             Ok(())
         }
 
@@ -768,58 +779,112 @@ mod device {
         const OFFERED: u64 =
             (1 << VIRTIO_F_VERSION_1) | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
 
-        /// How the stand-in daemon answers `GET_VRING_BASE`.
+        /// The `handover_delay` of a stand-in that lags, far longer than a
+        /// DRIVER_OK that does not wait for the daemon takes to return.
+        const HANDOVER_DELAY: Duration = Duration::from_millis(50);
+
+        /// The requests a stand-in daemon answers.
         #[derive(Clone, Copy)]
-        enum VringBase {
-            /// With the ring's index and a base of 0.
-            Answer,
-            /// First with a reply to `GET_FEATURES`, which the frontend
-            /// rejects, and after that as `Answer` does.
+        enum ReplyPolicy {
+            /// Every request that has a reply. `GET_VRING_BASE` gets the ring's
+            /// index and a base of 0.
+            All,
+            /// As `All`, except that the first `GET_VRING_BASE` gets a reply to
+            /// `GET_FEATURES`, which the frontend rejects.
             WrongReplyFirst,
-            /// Never.
-            Silent,
+            /// As `All`, except `GET_VRING_BASE`.
+            NoVringBase,
+            /// The requests of the attach, and none from the first
+            /// `SET_FEATURES` on, which starts a handover.
+            AttachOnly,
+        }
+
+        /// What a stand-in daemon offers and how it answers.
+        #[derive(Clone, Copy)]
+        struct DaemonConfig {
+            /// The features it offers.
+            features: u64,
+            /// The protocol features it offers.
+            protocol_features: VhostUserProtocolFeatures,
+            /// The requests it answers.
+            replies: ReplyPolicy,
+            /// How long it waits after it reads `SET_FEATURES`, before it reads
+            /// the rest of the handover.
+            handover_delay: Duration,
+        }
+
+        impl Default for DaemonConfig {
+            fn default() -> Self {
+                Self {
+                    features: OFFERED,
+                    protocol_features: VhostUserProtocolFeatures::MQ,
+                    replies: ReplyPolicy::All,
+                    handover_delay: Duration::ZERO,
+                }
+            }
+        }
+
+        impl DaemonConfig {
+            /// Returns a running stand-in with this configuration, and the
+            /// frontend's end of its socket.
+            fn spawn(self) -> (Daemon, UnixStream) {
+                let (ours, theirs) = UnixStream::pair().expect("socket pair");
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let thread = std::thread::spawn({
+                    let seen = Arc::clone(&seen);
+                    move || serve(theirs, self, &seen)
+                });
+                (Daemon { thread, seen }, ours)
+            }
         }
 
         /// A vhost-user daemon stand-in on one end of a socket pair.
-        struct Daemon(JoinHandle<Vec<FrontendReq>>);
+        struct Daemon {
+            /// The thread that answers the requests.
+            thread: JoinHandle<()>,
+            /// The requests it has read.
+            seen: Arc<Mutex<Vec<FrontendReq>>>,
+        }
 
         impl Daemon {
-            /// Starts the stand-in and returns it with the frontend's end.
-            fn spawn(vring_base: VringBase) -> (Self, UnixStream) {
-                Self::spawn_offering(vring_base, OFFERED, VhostUserProtocolFeatures::MQ)
+            /// Returns a running stand-in that answers as `replies` says, and
+            /// the frontend's end of its socket.
+            fn spawn(replies: ReplyPolicy) -> (Self, UnixStream) {
+                DaemonConfig {
+                    replies,
+                    ..DaemonConfig::default()
+                }
+                .spawn()
             }
 
-            /// Starts a stand-in that offers `features`, with `protocol` as its
-            /// protocol features, and returns it with the frontend's end.
-            fn spawn_offering(
-                vring_base: VringBase,
-                features: u64,
-                protocol: VhostUserProtocolFeatures,
-            ) -> (Self, UnixStream) {
-                let (ours, theirs) = UnixStream::pair().expect("socket pair");
-                let thread =
-                    std::thread::spawn(move || serve(theirs, vring_base, features, protocol));
-                (Self(thread), ours)
+            /// Returns the requests the stand-in has read so far.
+            fn requests(&self) -> Vec<FrontendReq> {
+                self.seen.lock().unwrap().clone()
             }
 
             /// Returns the requests the stand-in read, once the frontend's end
             /// has closed.
-            fn requests(self) -> Vec<FrontendReq> {
-                self.0.join().expect("the stand-in daemon")
+            fn join(self) -> Vec<FrontendReq> {
+                let Self { thread, seen } = self;
+                thread.join().expect("the stand-in daemon");
+                let seen = seen.lock().unwrap();
+                seen.clone()
             }
         }
 
         /// Answers the requests on `socket` until it closes, as a daemon of two
-        /// queues that offers `features` and the `protocol` features, and
-        /// returns them.
-        fn serve(
-            mut socket: UnixStream,
-            vring_base: VringBase,
-            features: u64,
-            protocol: VhostUserProtocolFeatures,
-        ) -> Vec<FrontendReq> {
-            let mut seen = Vec::new();
+        /// queues with `config`.
+        ///
+        /// It records each request in `seen` before it answers.
+        fn serve(mut socket: UnixStream, config: DaemonConfig, seen: &Mutex<Vec<FrontendReq>>) {
+            let DaemonConfig {
+                features,
+                protocol_features,
+                replies,
+                handover_delay,
+            } = config;
             let mut wrong_reply_sent = false;
+            let mut handing_over = false;
             let mut header = [0u8; 12];
             while socket.read_exact(&mut header).is_ok() {
                 let word =
@@ -829,22 +894,29 @@ mod device {
                 if socket.read_exact(&mut body).is_err() {
                     break;
                 }
-                seen.push(request);
+                seen.lock().unwrap().push(request);
+                if request == FrontendReq::SET_FEATURES {
+                    handing_over = true;
+                    std::thread::sleep(handover_delay);
+                }
                 let reply = match request {
+                    _ if handing_over && matches!(replies, ReplyPolicy::AttachOnly) => None,
                     FrontendReq::GET_FEATURES => Some((request, features.to_le_bytes().to_vec())),
                     FrontendReq::GET_PROTOCOL_FEATURES => {
-                        Some((request, protocol.bits().to_le_bytes().to_vec()))
+                        Some((request, protocol_features.bits().to_le_bytes().to_vec()))
                     }
                     // virtiofsd's count: the hiprio queue and one request
                     // queue.
                     FrontendReq::GET_QUEUE_NUM => Some((request, 2u64.to_le_bytes().to_vec())),
-                    FrontendReq::GET_VRING_BASE => match vring_base {
-                        VringBase::Silent => None,
-                        VringBase::WrongReplyFirst if !wrong_reply_sent => {
+                    FrontendReq::GET_VRING_BASE => match replies {
+                        ReplyPolicy::NoVringBase => None,
+                        ReplyPolicy::WrongReplyFirst if !wrong_reply_sent => {
                             wrong_reply_sent = true;
                             Some((FrontendReq::GET_FEATURES, vec![0; 8]))
                         }
-                        VringBase::Answer | VringBase::WrongReplyFirst => {
+                        ReplyPolicy::All
+                        | ReplyPolicy::WrongReplyFirst
+                        | ReplyPolicy::AttachOnly => {
                             Some((request, [&body[..4], &[0u8; 4][..]].concat()))
                         }
                     },
@@ -862,7 +934,6 @@ mod device {
                     }
                 }
             }
-            seen
         }
 
         /// Returns 1 MiB of shareable guest RAM, mapped at [`BASE`].
@@ -893,7 +964,7 @@ mod device {
         // message the daemon is answering.
         #[test]
         fn connection_that_failed_is_sent_nothing_more() {
-            let (daemon, stream) = Daemon::spawn(VringBase::WrongReplyFirst);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::WrongReplyFirst);
             let (ram, mem) = guest_ram();
             let driver = driver(stream, &mem, ram.as_raw_fd());
             driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
@@ -902,7 +973,7 @@ mod device {
             driver.start(&[rings(BASE)]);
             drop(driver);
 
-            let seen = daemon.requests();
+            let seen = daemon.join();
             let failed = seen
                 .iter()
                 .position(|&r| r == FrontendReq::GET_VRING_BASE)
@@ -925,7 +996,7 @@ mod device {
         // back. No ring was sent, so the reset takes none back.
         #[test]
         fn failed_handover_is_not_run_again_before_a_reset() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (_ram, mem) = guest_ram();
             let driver = driver(stream, &mem, -1);
             driver.start(&[rings(BASE)]);
@@ -936,7 +1007,7 @@ mod device {
             drop(driver);
 
             assert_eq!(
-                daemon.requests(),
+                daemon.join(),
                 [
                     FrontendReq::SET_OWNER,
                     FrontendReq::GET_FEATURES,
@@ -950,33 +1021,35 @@ mod device {
 
         #[test]
         fn daemon_without_version_1_is_refused_at_attach() {
-            let offered = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-            let (daemon, stream) =
-                Daemon::spawn_offering(VringBase::Answer, offered, VhostUserProtocolFeatures::MQ);
+            let (daemon, stream) = DaemonConfig {
+                features: VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
+                ..DaemonConfig::default()
+            }
+            .spawn();
             let (ram, _mem) = guest_ram();
             let error = VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd())
                 .err()
                 .expect("the attach should fail");
             assert!(error.to_string().contains("VIRTIO_F_VERSION_1"), "{error}");
             assert_eq!(
-                daemon.requests(),
+                daemon.join(),
                 [FrontendReq::SET_OWNER, FrontendReq::GET_FEATURES]
             );
         }
 
         #[test]
         fn common_registers_follow_virtio_1_2() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (ram, mem) = guest_ram();
             let dev =
                 VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake");
             testing::assert_common_registers(dev, &mem, rings(BASE));
-            daemon.requests();
+            daemon.join();
         }
 
         #[test]
         fn more_request_queues_than_the_daemon_serves_are_refused() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (ram, _mem) = guest_ram();
             let err = VhostUserFs::from_stream(stream, "t", 2, 1024, ram.as_raw_fd())
                 .err()
@@ -986,24 +1059,24 @@ mod device {
                     .contains("num_queues=2 needs 3 queues, and the daemon serves 2"),
                 "{err}"
             );
-            daemon.requests();
+            daemon.join();
         }
 
         #[test]
         fn queue_num_max_is_the_exports_queue_size() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (ram, mem) = guest_ram();
             let dev =
                 VhostUserFs::from_stream(stream, "t", 1, 256, ram.as_raw_fd()).expect("handshake");
             let driver = Driver::new(dev, &mem);
             assert_eq!(driver.read(QUEUE_NUM_MAX), 256);
             drop(driver);
-            daemon.requests();
+            daemon.join();
         }
 
         #[test]
         fn shutdown_frees_a_reset_waiting_on_a_silent_daemon() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Silent);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::NoVringBase);
             let (ram, mem) = guest_ram();
             let driver = driver(stream, &mem, ram.as_raw_fd());
             driver.start(&[rings(BASE)]);
@@ -1023,14 +1096,14 @@ mod device {
             rx.recv_timeout(Duration::from_secs(5))
                 .expect("the shutdown freed the reset");
             drop(resetting.join().expect("the resetting thread"));
-            daemon.requests();
+            daemon.join();
         }
 
         // A reset that waits on the daemon holds the device, and the guest
         // still learns of the buffers the daemon used.
         #[test]
         fn used_buffer_raises_the_interrupt_while_the_device_is_held() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (ram, _mem) = guest_ram();
             let dev = Arc::new(Mutex::new(
                 VhostUserFs::from_stream(stream, "t", 1, 1024, ram.as_raw_fd()).expect("handshake"),
@@ -1060,7 +1133,7 @@ mod device {
             stop.request_stop();
             serving.join().expect("the stop ended the thread");
             drop(dev);
-            daemon.requests();
+            daemon.join();
         }
 
         /// Returns a path for a socket in a fresh directory of its own.
@@ -1132,7 +1205,7 @@ mod device {
 
         #[test]
         fn reset_takes_back_a_ring_the_guest_cleared_after_driver_ok() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (ram, mem) = guest_ram();
             let driver = driver(stream, &mem, ram.as_raw_fd());
             driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
@@ -1141,7 +1214,7 @@ mod device {
             driver.reset();
             drop(driver);
 
-            let seen = daemon.requests();
+            let seen = daemon.join();
             let taken_back = seen
                 .iter()
                 .filter(|&&r| r == FrontendReq::GET_VRING_BASE)
@@ -1152,12 +1225,82 @@ mod device {
             );
         }
 
+        // The stand-in lags once the handover starts, so a DRIVER_OK that does
+        // not wait for it returns before the stand-in has read the enables.
+        #[test]
+        fn driver_ok_waits_for_the_daemon_to_enable_the_rings() {
+            let (daemon, stream) = DaemonConfig {
+                handover_delay: HANDOVER_DELAY,
+                ..DaemonConfig::default()
+            }
+            .spawn();
+            let (ram, mem) = guest_ram();
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
+            let seen = daemon.requests();
+            let enabled = seen
+                .iter()
+                .filter(|&&r| r == FrontendReq::SET_VRING_ENABLE)
+                .count();
+            assert_eq!(enabled, 2, "DRIVER_OK returned first: {seen:?}");
+            drop(driver);
+            daemon.join();
+        }
+
+        // Without protocol features a ring starts, already enabled, on
+        // SET_VRING_KICK, so the wait has to cover the last SET_VRING_KICK.
+        #[test]
+        fn driver_ok_waits_for_a_daemon_without_protocol_features_to_start_the_rings() {
+            let (daemon, stream) = DaemonConfig {
+                features: 1 << VIRTIO_F_VERSION_1,
+                protocol_features: VhostUserProtocolFeatures::empty(),
+                handover_delay: HANDOVER_DELAY,
+                ..DaemonConfig::default()
+            }
+            .spawn();
+            let (ram, mem) = guest_ram();
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
+            let seen = daemon.requests();
+            let started = seen
+                .iter()
+                .filter(|&&r| r == FrontendReq::SET_VRING_KICK)
+                .count();
+            assert_eq!(started, 2, "DRIVER_OK returned first: {seen:?}");
+            drop(driver);
+            daemon.join();
+        }
+
+        #[test]
+        fn shutdown_frees_a_driver_ok_waiting_on_a_silent_daemon() {
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::AttachOnly);
+            let (ram, mem) = guest_ram();
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            let stop = driver.device.lock().unwrap().shutdown_fds();
+
+            let (tx, rx) = mpsc::channel();
+            let starting = std::thread::spawn(move || {
+                driver.start(&[rings(BASE)]);
+                tx.send(()).expect("the test is waiting");
+                driver
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "DRIVER_OK returned with no answer from the daemon"
+            );
+            stop.shutdown();
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the shutdown freed DRIVER_OK");
+            drop(starting.join().expect("the starting thread"));
+            daemon.join();
+        }
+
         // The transport refuses a ring outside guest RAM at QUEUE_READY, so the
         // handover sends none of it, and the daemon has nothing to enable and
         // nothing to give back.
         #[test]
         fn refused_ring_is_neither_enabled_nor_taken_back() {
-            let (daemon, stream) = Daemon::spawn(VringBase::Answer);
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
             let (ram, mem) = guest_ram();
             let driver = driver(stream, &mem, ram.as_raw_fd());
             driver.start(&[rings(BASE), rings(BASE + 0x20_0000)]);
@@ -1165,7 +1308,7 @@ mod device {
             drop(driver);
 
             assert_eq!(
-                daemon.requests(),
+                daemon.join(),
                 [
                     FrontendReq::SET_OWNER,
                     FrontendReq::GET_FEATURES,
@@ -1180,6 +1323,7 @@ mod device {
                     FrontendReq::SET_VRING_CALL,
                     FrontendReq::SET_VRING_KICK,
                     FrontendReq::SET_VRING_ENABLE,
+                    FrontendReq::GET_FEATURES,
                     FrontendReq::SET_VRING_ENABLE,
                     FrontendReq::GET_VRING_BASE,
                 ]
@@ -1192,11 +1336,11 @@ mod device {
         // guest's first request hung.
         #[test]
         fn rings_are_enabled_on_a_daemon_without_mq() {
-            let (daemon, stream) = Daemon::spawn_offering(
-                VringBase::Answer,
-                OFFERED,
-                VhostUserProtocolFeatures::empty(),
-            );
+            let (daemon, stream) = DaemonConfig {
+                protocol_features: VhostUserProtocolFeatures::empty(),
+                ..DaemonConfig::default()
+            }
+            .spawn();
             let (ram, mem) = guest_ram();
             let driver = driver(stream, &mem, ram.as_raw_fd());
             driver.start(&[rings(BASE)]);
@@ -1204,7 +1348,7 @@ mod device {
             drop(driver);
 
             assert_eq!(
-                daemon.requests(),
+                daemon.join(),
                 [
                     FrontendReq::SET_OWNER,
                     FrontendReq::GET_FEATURES,
@@ -1218,6 +1362,7 @@ mod device {
                     FrontendReq::SET_VRING_CALL,
                     FrontendReq::SET_VRING_KICK,
                     FrontendReq::SET_VRING_ENABLE,
+                    FrontendReq::GET_FEATURES,
                     FrontendReq::SET_VRING_ENABLE,
                     FrontendReq::GET_VRING_BASE,
                 ]
