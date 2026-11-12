@@ -213,44 +213,26 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: x86-live
-      - id: kvm
+      - name: kvm availability
         run: |
           # The scale set maps /dev/kvm into every pod, so a pod without it is
           # a broken runner, and a skip would report that as a pass.
           test -e /dev/kvm \
             || { echo "::error::no /dev/kvm in this pod -- the runner is not mapping the device"; exit 1; }
           ls -l /dev/kvm
-          echo "ok=yes" >> "$GITHUB_OUTPUT"
       - name: build
-        if: steps.kvm.outputs.ok == 'yes'
         run: cargo build --release
-      # The step installs the guest kernel and its headers, and outputs the
-      # release and image of the kernel `linux-image-virtual` depends on. The
-      # boots use that kernel rather than the newest one under /boot, which can
-      # be any kernel the runner has.
+      # The kernel hull ships, fetched as hull fetches it.
       - name: guest kernel
         id: kernel
-        if: steps.kvm.outputs.ok == 'yes'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            linux-image-virtual linux-headers-virtual zstd binutils
-          KREL=$(dpkg-query -W -f='${Depends}' linux-image-virtual \
-            | grep -o 'linux-image-[0-9][^ ,]*' | head -1) || true
-          test -n "$KREL" \
-            || { echo "::error::linux-image-virtual names no image"; exit 1; }
-          KREL=${KREL#linux-image-}
-          KIMG=/boot/vmlinuz-$KREL
-          test -f "$KIMG" \
-            || { echo "::error::no kernel image for '$KREL'"; exit 1; }
-          echo "kernel: $KIMG"
-          echo "release=$KREL" >> "$GITHUB_OUTPUT"
-          echo "image=$KIMG" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/fetch-hull-kernel
+        with:
+          platform: linux-amd64
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
-        if: steps.kvm.outputs.ok == 'yes'
         env:
-          KIMG: ${{ steps.kernel.outputs.image }}
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
+          echo "kernel: $KIMG"
           # 2>&1: the VMM's own lines (including what it says about seccomp)
           # go to stderr, and asserting on them means capturing them.
           sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
@@ -275,22 +257,19 @@ jobs:
           grep -q "TSC deadline timer available" boot.log \
             || { echo "::error::the guest found no TSC-deadline timer"; exit 1; }
           echo "kvm-clock and the TSC-deadline timer ✓"
-      # The distribution vmlinuz is a bzImage. `scripts/extract-vmlinux` unpacks
-      # the ELF inside it, which is the other x86 format hvi boots. It comes
-      # from the headers package the guest kernel step installs, so it is the
-      # copy that ships with the kernel being unpacked, it arrives over the same
-      # signed archive as everything else here, and the job reaches no host of
-      # its own to get it.
+      # The bundle's kernel is a bzImage. `scripts/extract-vmlinux` unpacks the
+      # ELF inside it, which is the other x86 format hvi boots. The script
+      # comes from the kernel headers in the runner image and reads any
+      # bzImage.
       - name: boot the uncompressed vmlinux
-        if: steps.kvm.outputs.ok == 'yes'
         env:
-          KIMG: ${{ steps.kernel.outputs.image }}
-          KREL: ${{ steps.kernel.outputs.release }}
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
-          EXTRACT=/lib/modules/$KREL/build/scripts/extract-vmlinux
-          # A missing script would otherwise surface as an empty vmlinux below.
-          test -f "$EXTRACT" \
-            || { echo "::error::no extract-vmlinux at $EXTRACT"; exit 1; }
+          EXTRACT=$(find /usr/src -maxdepth 3 -type f -path '*/scripts/extract-vmlinux' \
+            | sort -V | tail -1)
+          # Named rather than assumed: the path carries a kernel version, and a
+          # missing file would otherwise surface as an empty vmlinux below.
+          test -n "$EXTRACT" || { echo "::error::no extract-vmlinux in the installed kernel headers"; exit 1; }
           echo "extractor: $EXTRACT"
           sudo install -m 644 "$KIMG" vmlinuz
           bash "$EXTRACT" vmlinuz > vmlinux
@@ -308,9 +287,8 @@ jobs:
       # RAM past the MMIO hole is a second region at 4 GiB. The guest's own
       # e820 must show the split, not the hole described as RAM.
       - name: boot with 4096 MiB, RAM split around the MMIO hole
-        if: steps.kvm.outputs.ok == 'yes'
         env:
-          KIMG: ${{ steps.kernel.outputs.image }}
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 4096 --cpus 1 \
             --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-4g.log || true
@@ -330,11 +308,10 @@ jobs:
       # the i8042 alone. KVM handles a halt itself, so a power-off that fell back
       # to one would end only at the timeout.
       - name: check that power-off and reset end the run
-        if: steps.kvm.outputs.ok == 'yes'
         env:
-          KIMG: ${{ steps.kernel.outputs.image }}
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
-          sudo apt-get install -y --no-install-recommends busybox-static cpio
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends busybox-static cpio
           for cmd in poweroff reboot; do
             W=$(mktemp -d); mkdir -p "$W/bin"
             cp /bin/busybox "$W/bin/busybox"
@@ -364,11 +341,9 @@ jobs:
       # openable, which is every unprivileged run — so nothing exercised it
       # live. A loop device over a sparse file is exactly the shape that broke
       # (metadata().len() == 0), and HVI_BLOCK_DEV points the test at it so a
-      # skip cannot pass for coverage. Loop devices need root, not KVM, but the
-      # build above is gated on KVM, so gate the same way.
+      # skip cannot pass for coverage. Loop devices need root, not KVM.
       - name: virtio-blk sizing against a real block device
         id: blk
-        if: steps.kvm.outputs.ok == 'yes'
         run: |
           truncate -s 64M blk.img
           LOOP=$(sudo losetup --find --show blk.img)
@@ -404,7 +379,6 @@ jobs:
       # allowlist refuses. One at a time, since some of them find a thread by
       # name. 2>&1: the panic report is on stderr.
       - name: run the vCPU stop tests
-        if: steps.kvm.outputs.ok == 'yes'
         env:
           BIN: ${{ steps.blk.outputs.bin }}
         run: |
@@ -418,26 +392,22 @@ jobs:
       # that has to allow it. A missing entry there does not fail a unit test:
       # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
       - name: serve a virtio-fs export through virtiofsd
-        if: steps.kvm.outputs.ok == 'yes'
         env:
-          KIMG: ${{ steps.kernel.outputs.image }}
-          KREL: ${{ steps.kernel.outputs.release }}
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
-          sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
           VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
           echo "daemon: $VFSD"; "$VFSD" --version
-          # The distribution kernel builds virtiofs as a module, so the guest
-          # loads it before it can mount anything.
+          # The bundle's kernel builds virtiofs in, so the guest mounts it
+          # straight away.
           W=$(mktemp -d); mkdir -p "$W/bin"
           cp /bin/busybox "$W/bin/busybox"
-          for a in sh mount ls cat echo sleep insmod poweroff sync; do ln -sf busybox "$W/bin/$a"; done
-          unzstd -f -o "$W/virtiofs.ko" "/lib/modules/$KREL/kernel/fs/fuse/virtiofs.ko.zst"
+          for a in sh mount ls cat echo sleep poweroff sync; do ln -sf busybox "$W/bin/$a"; done
           {
             echo '#!/bin/sh'
             echo 'export PATH=/bin'
             echo '/bin/busybox mount -t proc proc /proc'
             echo '/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null'
-            echo 'insmod /virtiofs.ko'
             echo 'mkdir -p /mnt/s'
             echo 'mount -t virtiofs hvishare /mnt/s && echo FS-MOUNT-OK'
             echo 'cat /mnt/s/hello.txt && echo FS-READ-OK'
@@ -531,21 +501,10 @@ jobs:
           ./target/release/hvi smoke
           ./target/release/hvi smoke --shm
       - name: guest kernel
-        env:
-          # This image is public, so the pull needs no credentials -- but
-          # oras still consults the credential helper for any registry
-          # named in ~/.docker/config.json, and on the macOS runners that
-          # helper reads the login keychain. A runner is a background
-          # service with no interactive session, so the keychain is locked
-          # and cannot be prompted: the pull fails on authentication it
-          # never needed. Point oras at an empty config instead.
-          DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
-        run: |
-          mkdir -p "$DOCKER_CONFIG"
-          # An uncompressed arm64 Image, published as an OCI artifact by
-          # urunc-images. `oras` is on the runner for the image work already.
-          oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
-          ls -l guest/Image && file guest/Image | grep -qi "MS-DOS\|data\|ARM64\|Linux"
+        id: kernel
+        uses: ./.github/actions/fetch-hull-kernel
+        with:
+          platform: darwin-arm64
       - name: keep-alive initramfs
         run: |
           # Unattended: hold userspace long enough for a few snapshots, then
@@ -553,13 +512,15 @@ jobs:
           python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
           ls -l target/initramfs.cpio
       - name: boot to userspace
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # The alarm bounds a stuck boot, as `timeout 180` does on the KVM
           # jobs. macOS supplies no coreutils `timeout`. The alarm stays
           # through the exec and stops the VMM when it occurs.
           perl -e 'alarm shift; exec @ARGV' 180 \
             ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs.cpio \
             --mem-mib 1024 --events ev.ndjson \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > run.log 2>&1 || true
@@ -571,7 +532,7 @@ jobs:
           # A kernel with rtc-pl031 and HCTOSYS prints the time it took from
           # the RTC. The unit tests stop at the register file and the
           # devicetree, so this is where the MMIO dispatch is checked.
-          if grep -qa "rtc-pl031" guest/Image; then
+          if grep -qa "rtc-pl031" "$KIMG"; then
             grep -q "setting system clock to 20" run.log \
               || { echo "::error::the guest has rtc-pl031 but did not set its clock from the RTC"; exit 1; }
             echo "the guest set its clock from the PL031 ✓"
@@ -866,29 +827,22 @@ jobs:
       - name: seccomp filters (aarch64)
         run: ./target/release/hvi seccomp-selftest
       - name: guest kernel
-        env:
-          # This image is public, so the pull needs no credentials -- but
-          # oras still consults the credential helper for any registry
-          # named in ~/.docker/config.json, and on the macOS runners that
-          # helper reads the login keychain. A runner is a background
-          # service with no interactive session, so the keychain is locked
-          # and cannot be prompted: the pull fails on authentication it
-          # never needed. Point oras at an empty config instead.
-          DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
-        run: |
-          mkdir -p "$DOCKER_CONFIG"
-          oras pull ghcr.io/nofireai/urunc-kernel:minimal -o guest
-          ls -l guest/Image
+        id: kernel
+        uses: ./.github/actions/fetch-hull-kernel
+        with:
+          platform: linux-arm64
       - name: keep-alive initramfs
         run: |
           python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
           ls -l target/initramfs.cpio
       - name: boot to userspace
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # --cpus 2 also asserts SMP secondary bring-up through the guest's
           # own in-kernel PSCI CPU_ON.
           timeout 180 ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs.cpio \
             --mem-mib 1024 --cpus 2 --events ev.ndjson \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > run.log 2>&1 || true
@@ -915,7 +869,7 @@ jobs:
           # The guest can get pointer authentication only from a host CPU that
           # has it and a guest kernel built with it, so check it on those.
           if grep -qw paca /proc/cpuinfo && grep -qw pacg /proc/cpuinfo \
-            && grep -qa "Address authentication" guest/Image; then
+            && grep -qa "Address authentication" "$KIMG"; then
             grep -q "Address authentication" run.log \
               || { echo "::error::the host has pointer authentication, the guest did not get it"; exit 1; }
             echo "pointer authentication reached the guest ✓"
@@ -925,7 +879,7 @@ jobs:
           # A kernel with rtc-pl031 and HCTOSYS prints the time it took from
           # the RTC. The unit tests stop at the register file and the
           # devicetree, so this is where the MMIO dispatch is checked.
-          if grep -qa "rtc-pl031" guest/Image; then
+          if grep -qa "rtc-pl031" "$KIMG"; then
             grep -q "setting system clock to 20" run.log \
               || { echo "::error::the guest has rtc-pl031 but did not set its clock from the RTC"; exit 1; }
             echo "the guest set its clock from the PL031 ✓"
@@ -944,10 +898,12 @@ jobs:
       # exist needs no privileges, so unlike the positive boot below this runs
       # on every runner, probe or no probe.
       - name: an unusable tap refuses to boot
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           set +e
           timeout 30 ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs.cpio \
             --mem-mib 1024 --net-tap hvi-ci-nope \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > tap-refuse.log 2>&1
@@ -983,6 +939,8 @@ jobs:
           echo "ok=yes" >> "$GITHUB_OUTPUT"
       - name: boot with the container network on a real tap
         if: steps.tap.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # The whole tap path in one assertion: attach to a pre-existing tap,
           # present the override MAC, and have the guest ping the host side of
@@ -994,7 +952,7 @@ jobs:
           python3 tools/mk-initramfs.py --out target/initramfs-tap.cpio \
             --keep-alive 45 --net-static 172.30.0.2/24,172.30.0.1
           ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs-tap.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs-tap.cpio \
             --mem-mib 1024 --net-tap hvi-ci-tap --net-mac 52:54:00:c1:5c:01 \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > tap.log 2>&1 &
