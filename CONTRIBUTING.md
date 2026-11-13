@@ -165,9 +165,10 @@ boots, the e2e filter-name check, which needs every backend's test list, and the
 commit-message lint, which needs a pull request's commit range.
 
 The self-hosted lanes, which are the live boots, the e2e suite and the
-performance gate, are withheld from pull requests opened from a fork, because
-they run on persistent machines the project owns rather than ephemeral VMs. A
-fork still gets every hosted job.
+performance gate, are withheld from pull requests opened from a fork. The GICv3
+and macOS lanes run on persistent machines the project owns, and the x86 and
+GIC-400 lanes run in privileged pods that share their node's kernel. A fork
+still gets every hosted job.
 
 Every job carries a `timeout-minutes` cap. The boot jobs upload their logs as
 artifacts when they fail, and the two arm64 boots also upload the event

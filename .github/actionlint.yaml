@@ -1,10 +1,11 @@
 # Labels of the self-hosted runners, so actionlint does not flag them as
-# unknown. The GIC labels pin the two arm64/KVM hosts by their interrupt
+# unknown. The kvm-dind labels are the runner scale sets with /dev/kvm, one per
+# architecture. The gicv3 label pins the one arm64 host with that interrupt
 # controller; see the boot-arm64-kvm matrix in build-and-test.yml.
 self-hosted-runner:
   labels:
-    - kvm
-    - nbfc
+    - kvm-dind-2604-amd64
+    - kvm-dind-2604-arm64
     - gicv3
     # The Macs that hold the Developer ID and reach Apple's notary service;
     # see the sign-macos job in build-binaries.yml.

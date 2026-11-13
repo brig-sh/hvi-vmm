@@ -1,0 +1,51 @@
+name: Fetch the kernel hull ships
+description: >-
+  Pull the hull-assets bundle for a platform the way hull and brig do at run
+  time: verify its keyless cosign signature against the hull-assets release
+  workflow, then pull the bundle at the verified digest with oras. The kernel
+  lands in guest/, as bzImage on x86-64 and as Image on arm64.
+
+inputs:
+  platform:
+    description: The bundle platform, linux-amd64, linux-arm64 or darwin-arm64.
+    required: true
+
+outputs:
+  kernel:
+    description: Path of the kernel, guest/bzImage or guest/Image.
+    value: ${{ steps.pull.outputs.kernel }}
+
+runs:
+  using: composite
+  steps:
+    - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    - id: pull
+      shell: bash
+      env:
+        PLATFORM: ${{ inputs.platform }}
+        # oras consults the credential helper for any registry named in
+        # ~/.docker/config.json. On a macOS runner that helper reads a locked
+        # keychain and fails a pull that needed no credentials, so point oras
+        # at an empty config. The bundle is public.
+        DOCKER_CONFIG: ${{ runner.temp }}/empty-docker-config
+      run: |
+        mkdir -p "$DOCKER_CONFIG"
+        repo=ghcr.io/nofireai/hull-assets
+        # The policy hull applies before it boots: the bundle is signed by the
+        # hull-assets release workflow on its main branch, and by nothing else.
+        digest=$(cosign verify "$repo:$PLATFORM" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp '^https://github\.com/NOFireAI/hull-assets/\.github/workflows/build-assets\.yml@refs/heads/main$' \
+            -o json 2>cosign.log \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["critical"]["image"]["docker-manifest-digest"])') \
+          || { cat cosign.log; echo "::error::$repo:$PLATFORM did not verify"; exit 1; }
+        echo "verified $repo:$PLATFORM at $digest"
+        oras pull "$repo@$digest" -o guest
+        python3 -c 'import json;b=json.load(open("guest/bundle.json"));print("hull-assets", b["version"], "kernel", b["kernel"]["version"])'
+        case "$PLATFORM" in
+          linux-amd64) kernel=guest/bzImage ;;
+          *) kernel=guest/Image ;;
+        esac
+        ls -l "$kernel"
+        echo "kernel=$kernel" >> "$GITHUB_OUTPUT"
