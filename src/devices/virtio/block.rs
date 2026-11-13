@@ -1229,9 +1229,21 @@ mod capacity_tests {
 
     #[test]
     fn disk_at_the_ledger_path_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
         let (r, blk) = rig("ledger");
         drop(blk);
         let path = r.path.to_str().unwrap();
+        let set_mode = |mode| {
+            std::fs::set_permissions(&r.path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        // An image others can read is refused by the ledger itself.
+        set_mode(0o644);
+        let refused = crate::events::Ledger::new(Some(path), "vm1").err().unwrap();
+        assert!(refused.to_string().ends_with("move it aside"), "{refused}");
+        assert_eq!(std::fs::read(&r.path).unwrap(), [0xabu8; 512]);
+        // A private one is kept by the ledger, and its lock refuses the disk.
+        set_mode(0o600);
         let ledger = crate::events::Ledger::new(Some(path), "vm1").unwrap();
         let err = open_disks(&[config::DiskConfig::rw(path)]).err().unwrap();
         assert!(err.ends_with("the image is open elsewhere"), "{err}");

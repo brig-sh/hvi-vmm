@@ -596,8 +596,10 @@ pub struct BootConfig {
     pub net_mac: Option<[u8; 6]>,
     /// The path of the `RawEvent` ledger, or `None` for no ledger.
     ///
-    /// A file already at the path must be a regular file that no other ledger
-    /// is writing. The last component of the path cannot be a symbolic link.
+    /// A file already at the path must be a regular file the effective uid
+    /// owns that no other ledger is writing, and that only its owner can read
+    /// unless it is empty. The last component of the path cannot be a
+    /// symbolic link. [`crate::private_file::open`] states the rest.
     pub events: Option<String>,
     pub sandbox_id: String,
     /// Number of vCPUs (>= 1).
