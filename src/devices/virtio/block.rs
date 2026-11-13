@@ -84,8 +84,11 @@ const VIRTIO_BLK_T_GET_ID: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_GET_I
 /// Length of the serial `GET_ID` returns, zero-padded.
 pub const SERIAL_LEN: usize = virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES as usize;
 
-/// The longest a disk's worker polls an empty ring before it sleeps.
-const POLL_CAP: Duration = Duration::from_micros(32);
+/// The longest a disk's worker polls an empty ring before it sleeps, unless the
+/// disk sets another.
+pub const DEFAULT_POLL_MAX: Duration = Duration::from_micros(32);
+/// The longest poll a disk can set.
+pub const POLL_MAX_LIMIT: Duration = Duration::from_millis(1);
 /// The poll a worker's window grows from.
 const POLL_START: Duration = Duration::from_micros(4);
 
@@ -118,6 +121,8 @@ pub struct VirtioBlk {
     disk_id: u64,
     /// The state the device shares with its worker.
     shared: Arc<Shared>,
+    /// The longest the worker polls an empty ring before it sleeps.
+    poll_max: Duration,
 }
 
 /// The state a disk's device and its worker share.
@@ -650,6 +655,7 @@ impl VirtioBlk {
             serial_text: Arc::from(serial),
             disk_id,
             shared: Arc::new(Shared::new()?),
+            poll_max: DEFAULT_POLL_MAX,
         })
     }
 
@@ -657,6 +663,15 @@ impl VirtioBlk {
     #[cfg(test)]
     pub(crate) fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Sets the longest the disk's worker polls an empty ring before it sleeps,
+    /// in place of [`DEFAULT_POLL_MAX`].
+    ///
+    /// Zero means the worker never polls. It takes effect for a worker taken
+    /// after the call.
+    pub fn set_poll_max(&mut self, longest: Duration) {
+        self.poll_max = longest;
     }
 
     /// Feeds each request to `sink` as well as the ledger.
@@ -682,7 +697,7 @@ impl VirtioBlk {
             ram: Arc::clone(ram),
             ledger: Arc::clone(ledger),
             shared: Arc::clone(&self.shared),
-            poll: PollWindow::new(POLL_CAP),
+            poll: PollWindow::new(self.poll_max),
         })
     }
 }
@@ -1364,7 +1379,9 @@ pub fn open_disks(disks: &[config::DiskConfig]) -> Result<Vec<Arc<Mutex<VirtioBl
                 )));
             }
         }
-        let blk = VirtioBlk::open_as(&disk.path, disk.read_only, &serial).map_err(|e| fail(&e))?;
+        let mut blk =
+            VirtioBlk::open_as(&disk.path, disk.read_only, &serial).map_err(|e| fail(&e))?;
+        blk.set_poll_max(disk.poll_max.unwrap_or(DEFAULT_POLL_MAX));
         let mode = if disk.read_only { "ro" } else { "rw" };
         eprintln!(
             "{LOG_PREFIX} virtio-blk[{index}]: {} ({mode}, serial {serial})",
@@ -2233,6 +2250,33 @@ mod capacity_tests {
     }
 
     #[test]
+    fn open_disks_gives_each_worker_its_disks_poll() {
+        use std::os::unix::fs::PermissionsExt;
+        let (r, blk) = ro_rig("poll", "");
+        drop(blk);
+        std::fs::set_permissions(&r.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut off = config::DiskConfig::ro(r.path.to_str().unwrap());
+        off.serial = Some("off".into());
+        off.poll_max = Some(Duration::ZERO);
+        let default = config::DiskConfig::ro(r.path.to_str().unwrap());
+        let disks = open_disks(&[off, default]).unwrap();
+
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x8000)]));
+        let ledger = Arc::new(Ledger::new(None, "blk-test").unwrap());
+        let caps: Vec<Duration> = disks
+            .iter()
+            .map(|disk| {
+                let worker = disk.lock().unwrap().take_worker(&mem, &ledger).unwrap();
+                worker.poll.cap
+            })
+            .collect();
+        assert_eq!(caps, [Duration::ZERO, DEFAULT_POLL_MAX]);
+    }
+
+    // One image may back two read-only disks of a guest. With a writer among
+    // them the message names the other disk, where the lock alone would say
+    // "elsewhere".
+    #[test]
     fn open_disks_names_the_other_disk_on_one_image() {
         use std::os::unix::fs::PermissionsExt;
         let (r, blk) = ro_rig("twice", "");
@@ -2244,6 +2288,7 @@ mod capacity_tests {
             path: path.to_string(),
             read_only: true,
             serial: Some(serial.to_string()),
+            poll_max: None,
         };
         assert_eq!(open_disks(&[ro("a"), ro("b")]).unwrap().len(), 2);
         let refused = |disks: &[config::DiskConfig]| match open_disks(disks) {
