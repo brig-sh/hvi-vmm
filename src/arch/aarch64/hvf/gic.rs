@@ -19,10 +19,8 @@ use std::sync::Arc;
 
 use applevisor::prelude::{GicConfig, GicEnabled, HypervisorError, VirtualMachineInstance};
 
-use super::kick::{on_vcpu_thread, Kicker};
 use crate::arch::aarch64::layout::{GicLayout, GicVersion, SPI_BASE};
 use crate::devices::irq;
-use crate::hypervisor::vcpus::{Kick, Vcpus};
 
 /// The VM handle once the GICv3 is configured (Send/Sync; cloned per thread).
 pub(super) type VmGic = VirtualMachineInstance<GicEnabled>;
@@ -30,27 +28,21 @@ pub(super) type VmGic = VirtualMachineInstance<GicEnabled>;
 /// A guest interrupt line on the in-kernel GIC, which is also the trigger of an
 /// edge-triggered SPI.
 ///
-/// A virtio device's trigger that fires on an I/O thread also kicks the vCPUs,
-/// so a guest in WFI takes the interrupt promptly. A vCPU thread triggers
-/// between its own guest entries and kicks no one. The console UART's line
-/// never kicks.
+/// The framework delivers the interrupt to its vCPU from whichever thread sets
+/// the line, and wakes a vCPU that waits in WFI for it.
 pub(super) struct Line {
     /// The VM whose GIC has the line.
     vm: VmGic,
     /// The line's interrupt ID.
     intid: u32,
-    /// The vCPUs a rise on an I/O thread kicks, or `None` for a line that kicks
-    /// none.
-    kick: Option<Arc<Vcpus<Kicker>>>,
 }
 
 impl Line {
-    /// Returns the line of SPI `spi` of `vm`, which kicks `kick` on a rise.
-    pub(super) fn new(vm: VmGic, spi: u32, kick: Option<Arc<Vcpus<Kicker>>>) -> Self {
+    /// Returns the line of SPI `spi` of `vm`.
+    pub(super) fn new(vm: VmGic, spi: u32) -> Self {
         Self {
             vm,
             intid: SPI_BASE + spi,
-            kick,
         }
     }
 }
@@ -59,15 +51,7 @@ impl irq::Line for Line {
     fn set_level(&self, level: bool) -> std::io::Result<()> {
         self.vm
             .gic_set_spi(self.intid, level)
-            .map_err(std::io::Error::other)?;
-        let Some(vcpus) = self.kick.as_ref().filter(|_| level) else {
-            return Ok(());
-        };
-        // After the stop no vCPU is left to wake.
-        if vcpus.is_running() && !on_vcpu_thread() {
-            vcpus.kicker().kick_all();
-        }
-        Ok(())
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -84,22 +68,15 @@ impl irq::Trigger for Line {
 pub(super) struct Gic {
     /// The VM whose GIC has the lines.
     pub(super) vm: VmGic,
-    /// The vCPUs each trigger kicks.
-    pub(super) vcpus: Arc<Vcpus<Kicker>>,
 }
 
 impl irq::Chip for Gic {
-    // The lines serve the console UART, whose line kicks no vCPU.
     fn line(&self, spi: u32) -> Arc<dyn irq::Line> {
-        Arc::new(Line::new(self.vm.clone(), spi, None))
+        Arc::new(Line::new(self.vm.clone(), spi))
     }
 
     fn trigger(&self, spi: u32) -> std::io::Result<Arc<dyn irq::Trigger>> {
-        Ok(Arc::new(Line::new(
-            self.vm.clone(),
-            spi,
-            Some(Arc::clone(&self.vcpus)),
-        )))
+        Ok(Arc::new(Line::new(self.vm.clone(), spi)))
     }
 }
 
