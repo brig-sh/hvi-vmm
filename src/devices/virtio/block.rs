@@ -46,7 +46,7 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vm_memory::VolatileSlice;
 #[cfg(target_os = "linux")]
@@ -83,6 +83,11 @@ const VIRTIO_BLK_T_GET_ID: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_GET_I
 
 /// Length of the serial `GET_ID` returns, zero-padded.
 pub const SERIAL_LEN: usize = virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES as usize;
+
+/// The longest a disk's worker polls an empty ring before it sleeps.
+const POLL_CAP: Duration = Duration::from_micros(32);
+/// The poll a worker's window grows from.
+const POLL_START: Duration = Duration::from_micros(4);
 
 /// virtio-blk status byte.
 const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
@@ -415,6 +420,8 @@ pub(crate) struct Worker<F = File> {
     ledger: Arc<Ledger>,
     /// The state the worker shares with the device.
     shared: Arc<Shared>,
+    /// The poll window the worker starts with.
+    poll: PollWindow,
 }
 
 /// A request taken off the ring, as the worker parsed it under the lock, with
@@ -469,8 +476,68 @@ struct Pass {
     trace_lines: Vec<String>,
     /// The sink the pass fed, or `None` when it fed none.
     fed: Option<Arc<dyn IoSink>>,
+    /// Whether the pass took a chain off the ring.
+    served: bool,
     /// Whether the ring had a chain left when the pass ended.
     more: bool,
+}
+
+/// How long a disk's worker polls an empty ring before it sleeps, which follows
+/// how soon the driver's next chain tends to come.
+///
+/// The worker measures each gap from the ring going empty to the next chain. A
+/// gap within the window keeps it. A gap longer than the cap sets it to zero,
+/// since a poll that long would not have been worth its CPU time. Any other gap
+/// doubles it, from [`POLL_START`] up to the cap. A disk that sits idle
+/// therefore polls for no time, and one that takes a request right after the
+/// last polls just long enough to catch it.
+#[derive(Clone, Copy, Debug)]
+struct PollWindow {
+    /// The longest the window gets.
+    cap: Duration,
+    /// The window.
+    len: Duration,
+    /// When the ring went empty, until the next chain is found.
+    empty_since: Option<Instant>,
+}
+
+impl PollWindow {
+    /// Returns a window of zero that grows up to `cap`.
+    fn new(cap: Duration) -> Self {
+        Self {
+            cap,
+            len: Duration::ZERO,
+            empty_since: None,
+        }
+    }
+
+    /// Returns the window, after noting that the ring went empty at `now`.
+    fn begin(&mut self, now: Instant) -> Duration {
+        self.empty_since = Some(now);
+        self.len
+    }
+
+    /// Notes that a chain was found at `at`.
+    ///
+    /// It adapts the window to the gap since the ring went empty.
+    fn chain_found(&mut self, at: Instant) {
+        if let Some(since) = self.empty_since.take() {
+            self.adapt(at.saturating_duration_since(since));
+        }
+    }
+
+    /// Adapts the window to a `gap` between the ring going empty and the next
+    /// chain.
+    fn adapt(&mut self, gap: Duration) {
+        if gap <= self.len {
+            return;
+        }
+        self.len = if gap > self.cap {
+            Duration::ZERO
+        } else {
+            (self.len * 2).max(POLL_START).min(self.cap)
+        };
+    }
 }
 
 impl Request<'_> {
@@ -615,6 +682,7 @@ impl VirtioBlk {
             ram: Arc::clone(ram),
             ledger: Arc::clone(ledger),
             shared: Arc::clone(&self.shared),
+            poll: PollWindow::new(POLL_CAP),
         })
     }
 }
@@ -641,29 +709,39 @@ impl<F: BackingStore> Worker<F> {
     /// Serves the queue each time the worker is woken, until the I/O threads'
     /// stop.
     fn run(&self, stop: &StopToken) {
+        let mut window = self.poll;
         while self.shared.wake.wait(stop) {
-            self.serve();
+            self.serve(&mut window);
         }
     }
 
-    /// Serves the requests on the ring a pass at a time, until a pass finds the
-    /// ring empty or the queue no longer served.
+    /// Serves the requests on the ring a pass at a time, until a poll ends with
+    /// no chain or the queue is no longer served.
     ///
-    /// After each pass it ends the sink's batch and then writes the records to
-    /// the ledger, with no lock held, so a reader that waits on the sink does
-    /// not also wait for the ledger. The pass's console lines are written with
-    /// no lock held too, so a console nobody reads does not hold up a reset or
-    /// the vCPUs' stop.
+    /// It polls the ring each time a pass leaves it empty. After each pass it
+    /// ends the sink's batch and then writes the pending records to the ledger,
+    /// so a reader that waits on the sink does not also wait for the ledger.
+    /// Both come before the poll, so the poll holds no record back. The pass's
+    /// console lines come last, with no lock held, so a console nobody reads
+    /// holds up neither the records nor a reset or the vCPUs' stop.
     ///
     /// It serves nothing once the ledger is closed, which a failed run does
     /// with the worker still running, so no request starts that the ledger
     /// would hold no record of.
-    fn serve(&self) {
+    fn serve(&self, window: &mut PollWindow) {
+        // When the chain the next pass serves became known: at this wake, and
+        // after it at the end of each poll.
+        let mut found = Some(Instant::now());
         loop {
             if self.ledger.is_closed() {
                 break;
             }
             let pass = self.pass();
+            if pass.served {
+                if let Some(at) = found.take() {
+                    window.chain_found(at);
+                }
+            }
             if let Some(sink) = pass.fed {
                 sink.on_batch_end();
             }
@@ -671,27 +749,40 @@ impl<F: BackingStore> Worker<F> {
             for line in &pass.trace_lines {
                 stderr!("{line}");
             }
-            if !pass.more {
+            if pass.more {
+                continue;
+            }
+            // A pass that served nothing, after a wake with no chain behind it,
+            // is no sign that the next chain is near, so the ring is looked at
+            // once and the window is left as it was.
+            found = if pass.served {
+                self.poll(window)
+            } else {
+                self.poll_for(Instant::now(), Duration::ZERO)
+            };
+            if found.is_none() {
                 break;
             }
         }
     }
 
     /// Serves up to a queue's worth of requests with the driver's notifications
-    /// off, and returns what it captured.
+    /// off.
     ///
-    /// Each request is parsed under the lock and counted in flight, its call to
-    /// the backing store runs with no lock held, and it completes under the
-    /// lock. A pass ends early when a reset takes the queue. Notifications are
-    /// back on at the end of the pass, and a chain made available while they
-    /// were off is reported in [`Pass::more`].
+    /// It returns what it captured. Each request is parsed under the lock and
+    /// counted in flight, its call to the backing store runs with no lock held,
+    /// and it completes under the lock. A pass ends early when a reset takes
+    /// the queue. Notifications stay off when the pass ends, and
+    /// [`poll`](Self::poll) turns them on.
     fn pass(&self) -> Pass {
         let mut trace_lines = Vec::new();
+        let mut served = false;
         let mut state = self.shared.lock();
         let Some(active) = state.active.as_mut() else {
             return Pass {
                 trace_lines,
                 fed: None,
+                served,
                 more: false,
             };
         };
@@ -708,6 +799,7 @@ impl<F: BackingStore> Worker<F> {
             else {
                 break;
             };
+            served = true;
             let request = self.parse(chain);
             state.in_flight += 1;
             drop(state);
@@ -719,12 +811,54 @@ impl<F: BackingStore> Worker<F> {
         }
         let more = state
             .active
-            .as_mut()
-            .is_some_and(|active| active.queue.enable_notification(&self.ram));
+            .as_ref()
+            .is_some_and(|active| !active.queue.is_empty(&self.ram));
         Pass {
             trace_lines,
             fed: state.sink.take_fed(),
+            served,
             more,
+        }
+    }
+
+    /// Polls the empty ring for the length of `window`.
+    ///
+    /// It returns what [`poll_for`](Self::poll_for) returns. A chain the driver
+    /// makes available during the poll needs no notification and no wake of the
+    /// worker.
+    fn poll(&self, window: &mut PollWindow) -> Option<Instant> {
+        let start = Instant::now();
+        let len = window.begin(start);
+        self.poll_for(start, len)
+    }
+
+    /// Returns when a chain became available, or `None` when the ring is still
+    /// empty.
+    ///
+    /// It looks at the ring until `len` after `start` with the driver's
+    /// notifications still off, and then turns them on. The ring is read once
+    /// more after the notifications are on, so a chain made available just
+    /// before is found too. The lock is taken for each look and released
+    /// between two, so a reset or the vCPUs' stop ends the wait at the next
+    /// look.
+    fn poll_for(&self, start: Instant, len: Duration) -> Option<Instant> {
+        loop {
+            let mut state = self.shared.lock();
+            if state.stopping {
+                return None;
+            }
+            let active = state.active.as_mut()?;
+            if !active.queue.is_empty(&self.ram) {
+                return Some(Instant::now());
+            }
+            if start.elapsed() >= len {
+                return active
+                    .queue
+                    .enable_notification(&self.ram)
+                    .then(Instant::now);
+            }
+            drop(state);
+            std::hint::spin_loop();
         }
     }
 
@@ -1034,6 +1168,7 @@ impl<F: BackingStore> Worker<F> {
             ram: self.ram,
             ledger: self.ledger,
             shared: self.shared,
+            poll: self.poll,
         }
     }
 }
@@ -1372,6 +1507,62 @@ mod queue_tests {
         worker
     }
 
+    // The window is longer than the test allows, so the worker returns in time
+    // only because it did not poll.
+    #[test]
+    fn wake_with_no_chain_does_not_poll_or_restart_the_gap() {
+        let window = Duration::from_secs(120);
+        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let worker = activated(&mem);
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut poll = PollWindow {
+                cap: window,
+                len: window,
+                empty_since: None,
+            };
+            worker.serve(&mut poll);
+            done.send(poll.empty_since).unwrap();
+        });
+        let empty_since = waited
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the worker should not poll after a pass that served nothing");
+        assert_eq!(empty_since, None, "the gap's start");
+    }
+
+    // The window is longer than the test allows the poll, so the poll returns
+    // in time only because it saw the queue taken.
+    #[test]
+    fn poll_ends_once_the_queue_is_taken_or_the_vcpus_stop() {
+        let window = Duration::from_secs(120);
+        type Take = fn(&Shared);
+        let takes: [(&str, Take); 2] = [
+            ("a reset", Shared::reset),
+            ("the vCPUs' stop", Shared::stop),
+        ];
+        for (what, take) in takes {
+            let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+            let worker = activated(&mem);
+            let shared = Arc::clone(&worker.shared);
+            let taker = std::thread::spawn(move || take(&shared));
+            let mut poll = PollWindow {
+                cap: window,
+                len: window,
+                empty_since: None,
+            };
+            let started = Instant::now();
+            assert!(
+                worker.poll(&mut poll).is_none(),
+                "{what}: a chain was found"
+            );
+            assert!(
+                started.elapsed() < window / 2,
+                "{what} did not end the poll"
+            );
+            taker.join().unwrap();
+        }
+    }
+
     #[test]
     fn common_registers_follow_virtio_1_2() {
         let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
@@ -1394,7 +1585,7 @@ mod queue_tests {
         mem.write_u16(avail + 4 + u64::from(idx % 4) * 2, head)
             .unwrap();
         mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
     }
 
     /// Returns `used.idx` of [`activated`]'s queue, and the length of the used
@@ -1500,7 +1691,7 @@ mod queue_tests {
         }]);
         publish_read(&mem, desc, avail, buffers);
         driver.notify(0);
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
         let _ = std::fs::remove_file(&path);
 
         let mut got = [0u8; 5];
@@ -1553,7 +1744,7 @@ mod queue_tests {
         driver.write(crate::devices::virtio::mmio::STATUS, 0x80);
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
 
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
 
         assert_eq!(mem.read_u16(BASE + 0x2000 + 2).unwrap(), 0, "used.idx");
     }
@@ -1574,12 +1765,12 @@ mod queue_tests {
             used_ring: BASE + 0x2000,
         }]);
         ledger
-            .close_with(std::time::Instant::now() + Duration::from_secs(5), |_| {})
+            .close_with(Instant::now() + Duration::from_secs(5), |_| {})
             .unwrap();
         std::fs::remove_file(&path).unwrap();
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
 
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
 
         assert_eq!(mem.read_u16(BASE + 0x2000 + 2).unwrap(), 0, "used.idx");
     }
@@ -1621,7 +1812,7 @@ mod queue_tests {
         }]);
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
 
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
 
         assert_eq!(*sink.seen.lock().unwrap(), [0]);
         assert_eq!(mem.read_u16(BASE + 0x2000 + 2).unwrap(), 1);
@@ -1644,7 +1835,7 @@ mod queue_tests {
         }]);
         publish_read(&mem, BASE, BASE + 0x1000, BASE + 0x6000);
         driver.notify(0);
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
         assert_eq!(
             mem.read_u16(BASE + 0x2000 + 2).unwrap(),
             1,
@@ -1660,7 +1851,7 @@ mod queue_tests {
         }]);
         publish_read(&mem, BASE + 0x3000, BASE + 0x4000, BASE + 0x7000);
         driver.notify(0);
-        worker.serve();
+        worker.serve(&mut PollWindow::new(Duration::ZERO));
         assert_eq!(
             mem.read_u16(BASE + 0x5000 + 2).unwrap(),
             1,
@@ -2192,6 +2383,9 @@ mod worker_tests {
     /// How long a test waits for the worker before it fails, since a loaded
     /// host can hold the worker for seconds.
     const WAIT: Duration = Duration::from_secs(30);
+    /// A poll that outlasts any test, so a worker in one serves a chain only if
+    /// the poll finds it.
+    const FOREVER: Duration = Duration::from_secs(3600);
 
     /// A backing file whose calls each wait at a gate until the test lets one
     /// through.
@@ -2327,6 +2521,17 @@ mod worker_tests {
         /// its requests in `ledger`, with a gate on its backing file when
         /// `gated` is set.
         fn new(serial: &str, ledger: &Arc<Ledger>, gated: bool) -> Self {
+            Self::with_poll(serial, ledger, gated, None)
+        }
+
+        /// Returns a rig as [`new`](Self::new) does, whose worker polls an
+        /// empty ring for `poll` from its first pass on when `poll` is set.
+        fn with_poll(
+            serial: &str,
+            ledger: &Arc<Ledger>,
+            gated: bool,
+            poll: Option<Duration>,
+        ) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let path =
@@ -2336,7 +2541,14 @@ mod worker_tests {
             let mut blk = VirtioBlk::open_as(path.to_str().unwrap(), false, serial).unwrap();
             let ram = Arc::new(GuestRam::from_ranges(&[(BASE, 0x10000)]));
             let mut host = HostWork::default();
-            let worker = blk.take_worker(&ram, ledger).unwrap();
+            let mut worker = blk.take_worker(&ram, ledger).unwrap();
+            if let Some(len) = poll {
+                worker.poll = PollWindow {
+                    cap: len,
+                    len,
+                    empty_since: None,
+                };
+            }
             let mut gate = None;
             if gated {
                 worker
@@ -2469,6 +2681,9 @@ mod worker_tests {
             // The gate goes first, so a worker held at it after a failed
             // assertion returns and the join does not wait for it.
             self.gate = None;
+            // The vCPUs stop before the I/O threads do, which is what ends a
+            // worker's poll.
+            self.host.run_vcpu_stops();
             self.stop.request_stop();
             self.host.run_io_stops();
             if let Some(worker) = self.worker.take() {
@@ -2901,6 +3116,86 @@ mod worker_tests {
             .close(Instant::now() + Duration::from_secs(5))
             .unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn poll_window_follows_the_gap_to_the_next_chain() {
+        let us = Duration::from_micros;
+        let mut window = PollWindow::new(us(32));
+        // Each row is a gap and the window it leaves.
+        for (gap, len) in [
+            (us(0), us(0)),
+            (us(10), us(4)),
+            (us(3), us(4)),
+            (us(10), us(8)),
+            (us(30), us(16)),
+            (us(30), us(32)),
+            (us(32), us(32)),
+            (us(33), us(0)),
+            (us(1), us(4)),
+            (Duration::from_secs(1), us(0)),
+        ] {
+            window.adapt(gap);
+            assert_eq!(window.len, len, "after a gap of {gap:?}");
+        }
+
+        let mut off = PollWindow::new(Duration::ZERO);
+        off.adapt(us(1));
+        assert_eq!(off.len, Duration::ZERO, "a cap of zero never polls");
+    }
+
+    #[test]
+    fn poll_window_counts_a_gap_only_from_an_empty_ring() {
+        let mut window = PollWindow::new(Duration::from_micros(32));
+        let start = Instant::now();
+        window.chain_found(start + Duration::from_micros(10));
+        assert_eq!(window.len, Duration::ZERO, "no ring went empty");
+
+        assert_eq!(window.begin(start), Duration::ZERO);
+        window.chain_found(start + Duration::from_micros(10));
+        assert_eq!(window.len, POLL_START);
+        window.chain_found(start + Duration::from_micros(20));
+        assert_eq!(window.len, POLL_START, "the gap was counted once");
+    }
+
+    // The worker polls for far longer than the test waits, so it serves the
+    // second read only if the poll finds it: nothing notifies the queue.
+    #[test]
+    fn chain_made_available_during_a_poll_needs_no_notification() {
+        let rig = Rig::with_poll("disk0", &no_ledger(), false, Some(FOREVER));
+        rig.driver.start(&[RINGS]);
+        rig.publish(0, VIRTIO_BLK_T_IN, 1);
+        rig.kick();
+        wait_until("the first read was not served", || rig.used_idx() == 1);
+        assert_eq!(rig.used_flags(), 1, "notifications stay off during a poll");
+
+        rig.publish(1, VIRTIO_BLK_T_IN, 2);
+        wait_until("the poll did not find the second read", || {
+            rig.used_idx() == 2
+        });
+        assert_eq!(rig.data(1), [3; 4], "sector 2 reached the guest");
+    }
+
+    // A reset while the worker polls returns, and the worker serves the queue
+    // of the next activation.
+    #[test]
+    fn disk_serves_again_after_a_reset_during_a_poll() {
+        let rig = Rig::with_poll("disk0", &no_ledger(), false, Some(FOREVER));
+        rig.driver.start(&[RINGS]);
+        rig.publish(0, VIRTIO_BLK_T_IN, 1);
+        rig.kick();
+        wait_until("the first read was not served", || rig.used_idx() == 1);
+
+        rig.driver.reset();
+        rig.ram.write_u16(RINGS.avail_ring + 2, 0).unwrap();
+        rig.ram.write_u16(RINGS.used_ring + 2, 0).unwrap();
+        rig.driver.start(&[RINGS]);
+        rig.publish(0, VIRTIO_BLK_T_IN, 2);
+        rig.kick();
+        wait_until("the read after the reset was not served", || {
+            rig.used_idx() == 1
+        });
+        assert_eq!(rig.data(0), [3; 4], "sector 2 reached the guest");
     }
 
     // While the first read is held, the used ring asks the driver not to
