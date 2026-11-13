@@ -382,8 +382,9 @@ set succeeds, so a failed set is tried again. How an interrupt reaches the guest
 is the one device-facing thing that differs by backend:
 
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
-  trigger sets the level to 1, which the GIC takes as one edge. A virtio trigger
-  on an I/O thread also kicks the vCPUs. The console UART's line never kicks.
+  trigger sets the level to 1, which the GIC takes as one edge. The framework
+  delivers it from whichever thread set the level, and wakes a vCPU that waits
+  in WFI for it.
 - **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)` for the console UART,
   the same call for vGICv2 and vGICv3. A virtio trigger is a write to an eventfd
   that KVM delivers as an irqfd on the SPI, and the vGIC latches the SPI as
