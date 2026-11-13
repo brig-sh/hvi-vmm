@@ -17,6 +17,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Access granted to a host directory exported through virtio-fs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,13 +427,25 @@ pub struct DiskConfig {
     /// The guest reads it from `/sys/block/vdX/serial`, so an initrd finds a
     /// disk by a name the caller chose.
     pub serial: Option<String>,
+    /// The longest the disk's worker polls an empty queue before it sleeps, or
+    /// `None` for [`DEFAULT_POLL_MAX`](Self::DEFAULT_POLL_MAX).
+    ///
+    /// Zero turns the poll off. The worker then sleeps as soon as the queue is
+    /// empty, so a request that closely follows another costs a notification
+    /// and a wake.
+    pub poll_max: Option<Duration>,
 }
 
 impl DiskConfig {
     /// The syntax [`parse`](Self::parse) takes, for an error to quote.
-    pub const SYNTAX: &'static str = "<path> or path=<path>[,readonly=on|off][,serial=<id>]";
+    pub const SYNTAX: &'static str =
+        "<path> or path=<path>[,readonly=on|off][,serial=<id>][,poll-max-us=<n>]";
     /// The longest serial, which is the length of the `GET_ID` field.
     pub const MAX_SERIAL_LEN: usize = crate::devices::virtio::block::SERIAL_LEN;
+    /// The longest a worker polls when [`poll_max`](Self::poll_max) is `None`.
+    pub const DEFAULT_POLL_MAX: Duration = crate::devices::virtio::block::DEFAULT_POLL_MAX;
+    /// The longest [`poll_max`](Self::poll_max) a disk can set.
+    pub const POLL_MAX_LIMIT: Duration = crate::devices::virtio::block::POLL_MAX_LIMIT;
 
     /// Returns a writable disk backed by `path`, with the default serial.
     #[must_use]
@@ -441,6 +454,7 @@ impl DiskConfig {
             path: path.into(),
             read_only: false,
             serial: None,
+            poll_max: None,
         }
     }
 
@@ -451,6 +465,7 @@ impl DiskConfig {
             path: path.into(),
             read_only: true,
             serial: None,
+            poll_max: None,
         }
     }
 
@@ -463,9 +478,11 @@ impl DiskConfig {
     ///
     /// # Errors
     ///
-    /// Errors on an empty path, on a key that is unknown or repeated, on a
-    /// `readonly` that is not `on` or `off`, and on a serial that is empty,
-    /// longer than 20 bytes, or holds a byte outside printable ASCII.
+    /// Errors on an empty path, on a key that is unknown or repeated, and on a
+    /// `readonly` that is not `on` or `off`. Errors on a serial that is empty,
+    /// longer than 20 bytes, or holds a byte outside printable ASCII. Errors on
+    /// a `poll-max-us` that is not a number of microseconds up to
+    /// [`POLL_MAX_LIMIT`](Self::POLL_MAX_LIMIT).
     pub fn parse(spec: &str) -> Result<Self, String> {
         let bad = |why: String| format!("--disk {spec:?}: {why}; expected {}", Self::SYNTAX);
         if !spec.starts_with("path=") {
@@ -474,7 +491,7 @@ impl DiskConfig {
             }
             return Ok(Self::rw(spec));
         }
-        let fields = key_values(spec, &["path", "readonly", "serial"], bad)?;
+        let fields = key_values(spec, &["path", "readonly", "serial", "poll-max-us"], bad)?;
         let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
         let path = get("path").filter(|v| !v.is_empty());
         let path = path.ok_or_else(|| bad("no path".into()))?;
@@ -490,10 +507,21 @@ impl DiskConfig {
                 Some(serial.to_string())
             }
         };
+        let poll_max = match get("poll-max-us") {
+            None => None,
+            Some(micros) => {
+                let poll_max = micros.parse().ok().map(Duration::from_micros);
+                let poll_max = poll_max
+                    .ok_or_else(|| bad(format!("poll-max-us {micros:?} is not a number")))?;
+                check_poll_max(poll_max).map_err(bad)?;
+                Some(poll_max)
+            }
+        };
         Ok(DiskConfig {
             path: path.to_string(),
             read_only,
             serial,
+            poll_max,
         })
     }
 
@@ -530,21 +558,37 @@ fn check_serial(serial: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuses a disk list whose serials the guest could not read or tell apart.
+/// Refuses a poll longer than a disk can set.
+fn check_poll_max(poll_max: Duration) -> Result<(), String> {
+    if poll_max > DiskConfig::POLL_MAX_LIMIT {
+        return Err(format!(
+            "the poll must be at most {} microseconds",
+            DiskConfig::POLL_MAX_LIMIT.as_micros()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a disk list whose serials the guest could not read or tell apart, or
+/// that sets a poll longer than a disk can set.
 ///
 /// Every caller's list passes here, the CLI's after it parsed the arguments and
-/// a library caller's in `open_disks`, so a serial set without
+/// a library caller's in `open_disks`, so a serial or poll set without
 /// [`DiskConfig::parse`] is checked too.
 ///
 /// # Errors
 ///
-/// Returns the disk whose serial the `GET_ID` field cannot carry, and the
-/// serial when two disks would answer `GET_ID` the same way, which is what the
-/// serial is for.
+/// Returns the disk whose serial the `GET_ID` field cannot carry or whose poll
+/// is longer than [`DiskConfig::POLL_MAX_LIMIT`], and the serial when two disks
+/// would answer `GET_ID` the same way, which is what the serial is for.
 pub fn check_disks(disks: &[DiskConfig]) -> Result<(), String> {
     for (index, disk) in disks.iter().enumerate() {
+        let named = |why| format!("disk {index} ({}): {why}", disk.path);
         if let Some(serial) = &disk.serial {
-            check_serial(serial).map_err(|why| format!("disk {index} ({}): {why}", disk.path))?;
+            check_serial(serial).map_err(named)?;
+        }
+        if let Some(poll_max) = disk.poll_max {
+            check_poll_max(poll_max).map_err(named)?;
         }
     }
     let serials: Vec<String> = disks
@@ -828,6 +872,7 @@ mod tests {
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     fn shares(pairs: &[(&str, ShareMode)]) -> Vec<FsShare> {
         pairs
@@ -982,6 +1027,7 @@ mod tests {
                 path: "lo.img".into(),
                 read_only: true,
                 serial: Some("lower".into()),
+                poll_max: None,
             }
         );
         assert_eq!(
@@ -997,11 +1043,37 @@ mod tests {
             ("path=a.img,serial=", "1 to 20 bytes"),
             ("path=a.img,serial=abcdefghijklmnopqrstu", "1 to 20 bytes"),
             ("path=a.img,serial=\u{2603}", "printable ASCII"),
+            ("path=a.img,poll-max-us=soon", "not a number"),
+            ("path=a.img,poll-max-us=-1", "not a number"),
+            ("path=a.img,poll-max-us=1001", "at most 1000 microseconds"),
         ] {
             let err = DiskConfig::parse(spec).unwrap_err();
             assert!(err.contains(why), "{spec:?}: {err}");
             assert!(err.contains(DiskConfig::SYNTAX), "{spec:?}: {err}");
         }
+    }
+
+    #[test]
+    fn disk_spec_sets_the_poll_or_turns_it_off() {
+        let poll_max = |spec| DiskConfig::parse(spec).unwrap().poll_max;
+        assert_eq!(poll_max("path=a.img"), None);
+        assert_eq!(poll_max("path=a.img,poll-max-us=0"), Some(Duration::ZERO));
+        assert_eq!(
+            poll_max("path=a.img,poll-max-us=1000"),
+            Some(DiskConfig::POLL_MAX_LIMIT)
+        );
+    }
+
+    // A library caller builds the struct without `parse`, so the list check is
+    // where a poll it set is checked.
+    #[test]
+    fn check_disks_checks_a_poll_set_without_parse() {
+        let mut disk = DiskConfig::rw("a.img");
+        disk.poll_max = Some(DiskConfig::POLL_MAX_LIMIT);
+        check_disks(std::slice::from_ref(&disk)).unwrap();
+        disk.poll_max = Some(DiskConfig::POLL_MAX_LIMIT + Duration::from_micros(1));
+        let err = check_disks(&[disk]).unwrap_err();
+        assert!(err.starts_with("disk 0 (a.img): the poll"), "{err}");
     }
 
     // The serial is how the guest tells the disks apart, so two alike are
@@ -1036,6 +1108,7 @@ mod tests {
                 path: "a.img".into(),
                 read_only: false,
                 serial: Some(serial.into()),
+                poll_max: None,
             }];
             let err = check_disks(&disks).unwrap_err();
             assert!(
