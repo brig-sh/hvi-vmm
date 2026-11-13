@@ -60,7 +60,7 @@ including a typo, silently runs the plain test.
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
-| `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
+| `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. Mode 0600, and only the VMM's own uid may connect. See [security.md](security.md#the-agent-socket). |
 | `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. An existing file is emptied when the run writes its first record, so a refused boot leaves it as it was. hvi refuses anything that is not a regular file, such as `/dev/null` or a FIFO. It also refuses a locked file, such as another run's ledger or disk, and a symbolic link as the last component of the path, such as `/dev/fd/N` on Linux. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |

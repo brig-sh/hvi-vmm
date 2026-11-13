@@ -46,6 +46,38 @@ escape sequences for the display, and drops the rest. When it restores the
 terminal at exit, it discards the input the guest did not read. The allowlist
 is in [cli.md](cli.md#console-output).
 
+## The agent socket
+
+`--agent-sock` names the host end of the vsock bridge to the guest agent. A
+process that connects to it gets a session with the agent, so hvi limits who
+can connect:
+
+- **The node is mode 0600.** hvi sets it right after the bind, whatever the
+  umask.
+- **Every peer is checked.** hvi reads the uid of each connection it accepts,
+  with `getpeereid` on macOS and `SO_PEERCRED` on Linux. A peer running as
+  any other uid is closed before it reaches the guest, and that includes
+  root. The first refusal is reported on stderr.
+- **The bind replaces only a stale socket.** A socket at the path that
+  refuses a connection is removed, and hvi binds in its place. A socket that
+  accepts a connection fails the boot. So does anything that is not a socket,
+  a symbolic link included. hvi tells the two apart with a connect. On macOS
+  a listener whose backlog is full refuses that connect like a stale socket
+  does, so a second hvi started at the path of a stalled one replaces its
+  socket. Only the same uid and root can fill the backlog of a 0600 node. A
+  connect that a live hvi accepts opens a session to its guest agent, which
+  closes at once.
+
+These are the only access controls on the socket. A user who can write the
+directory it is in can remove the node and bind their own at the path, so
+put the socket in a directory only you can write.
+
+When the run stops, hvi removes the node only under `--no-sandbox`. The removal
+needs a stat and an unlink, and a confined process may make neither: Seatbelt
+denies both outside a writable share, and the seccomp filters on Linux trap
+both. The node left behind is stale, and the next boot at the same path
+replaces it.
+
 ## Confinement
 
 On by default. `--no-sandbox` turns it off, for debugging a run the profile or
@@ -94,7 +126,7 @@ thread for itself:
 | Filter | Covers | aarch64 | x86-64 |
 | --- | --- | --- | --- |
 | `vcpu` | the vCPU threads, where guest descriptors are parsed | 37 syscalls | 38 syscalls |
-| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 47 syscalls | 48 syscalls |
+| `vmm` | the thread that calls `boot`, the host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 48 syscalls | 49 syscalls |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -160,12 +192,12 @@ vulnerability report.
 ## The selftests
 
 ```sh
-hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 29 probes, 15 expect denial, 14 expect success
+hvi sandbox-selftest    # macOS: 26 probes, 15 expect denial, 11 expect success
+hvi seccomp-selftest    # Linux: 31 probes, 16 expect denial, 15 expect success
 ```
 
-On Linux a glibc build expects 2 of the 15 denials, the two opens, to fail
-with `EPERM`, and a musl build expects all 15 to raise `SIGSYS`.
+On Linux a glibc build expects 2 of the 16 denials, the two opens, to fail
+with `EPERM`, and a musl build expects all 16 to raise `SIGSYS`.
 
 Both install the profile or the filters that actually ship and check both
 directions: what a confined thread must keep, and what it must lose. Neither
@@ -191,8 +223,9 @@ sandbox is secure.
   a thread starts in `on_attach`, before the Linux filters are armed, and stays
   unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
   as it begins, as the memory-dump plugin's `--dump-after` timer does.
-- **It does not constrain most syscall arguments.** Only the `ioctl` rule
-  carries conditions, and they refuse `TIOCSTI` and `TIOCLINUX`. Every other
+- **It constrains the arguments of two syscalls.** The `ioctl` rule refuses
+  `TIOCSTI` and `TIOCLINUX`, and `getsockopt` in the `vmm` list is pinned to
+  `SOL_SOCKET` and `SO_PEERCRED` for the agent socket's peer check. Every other
   `ioctl` request, and `sendmsg`, is unconstrained over every descriptor the
   process already holds.
 - **It does not remove the risk of an escape.** It reduces what an escape

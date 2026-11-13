@@ -52,12 +52,12 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::agent_socket::{self, Node, PeerGate};
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
     self, read_config_bytes, DescriptorChain, DeviceState, Queue, QUEUE_MAX_SIZE,
@@ -1287,6 +1287,8 @@ impl virtio::Device for VirtioVsock {
 pub(crate) struct VsockBridge {
     /// The agent socket, non-blocking.
     listener: UnixListener,
+    /// The check every accepted connection passes before it reaches `dev`.
+    gate: PeerGate,
     /// The device the connections are relayed to.
     dev: Arc<Mutex<VirtioVsock>>,
     /// Guest RAM, which the device's queues are in.
@@ -1299,6 +1301,9 @@ pub(crate) struct Agent {
     pub(crate) device: Arc<Mutex<VirtioVsock>>,
     /// The bridge, bound to the host socket.
     pub(crate) bridge: VsockBridge,
+    /// The host socket's node, which [`Node::remove`] unlinks when the run
+    /// stops.
+    pub(crate) node: Node,
 }
 
 /// Opens the agent device and binds its host socket at `path`, or returns
@@ -1312,19 +1317,23 @@ pub(crate) fn open(path: Option<&str>, ram: &Arc<GuestRam>) -> std::io::Result<O
         return Ok(None);
     };
     let device = Arc::new(Mutex::new(VirtioVsock::new()));
-    let bridge = VsockBridge::bind(path, Arc::clone(&device), Arc::clone(ram))?;
+    let (bridge, node) = VsockBridge::bind(path, Arc::clone(&device), Arc::clone(ram))?;
     eprintln!(
         "{LOG_PREFIX} virtio-vsock: agent bridge on {path} (guest cid {GUEST_CID}, port {AGENT_PORT})"
     );
-    Ok(Some(Agent { device, bridge }))
+    Ok(Some(Agent {
+        device,
+        bridge,
+        node,
+    }))
 }
 
 impl VsockBridge {
-    /// Binds the agent socket at `path` for `dev`, first removing a stale
-    /// socket a previous run left, which would make `bind` fail with
-    /// `EADDRINUSE`.
+    /// Binds the agent socket at `path` for `dev` through
+    /// [`agent_socket::bind`], and returns the bridge with the socket's node.
     ///
-    /// Any other file at `path` stays, and the bind fails on it.
+    /// [`agent_socket::bind`] replaces only a stale socket, refuses anything
+    /// else at `path` and sets the node to mode 0600.
     ///
     /// The listener is non-blocking, so the accept loop can poll it beside the
     /// stop token and then accept without blocking. It must be bound before the
@@ -1333,33 +1342,36 @@ impl VsockBridge {
     ///
     /// # Errors
     ///
-    /// Errors if the socket cannot be bound.
-    // The host-path ban in clippy.toml is aimed at the virtio-fs device, where
-    // every component of a path comes from the guest. This path is the
-    // operator's.
-    #[allow(clippy::disallowed_methods)]
+    /// Errors if [`agent_socket::bind`] refuses what is at `path`, or the bind
+    /// fails.
     pub(crate) fn bind(
         path: &str,
         dev: Arc<Mutex<VirtioVsock>>,
         mem: Arc<GuestRam>,
-    ) -> std::io::Result<Self> {
-        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
-            let _ = std::fs::remove_file(path);
-        }
-        let listener = UnixListener::bind(path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
-        })?;
-        listener.set_nonblocking(true)?;
-        Ok(Self { listener, dev, mem })
+    ) -> std::io::Result<(Self, Node)> {
+        let bound = agent_socket::bind(path)?;
+        let bridge = Self {
+            listener: bound.listener,
+            gate: bound.gate,
+            dev,
+            mem,
+        };
+        Ok((bridge, bound.node))
     }
 
     /// Accepts and relays agent connections until `stop` is requested.
     ///
+    /// A connection the gate refuses is closed before it reaches the device.
     /// The per-connection threads poll the same token, and this thread joins
     /// the ones still running before it returns. On Linux they inherit the
     /// seccomp filter of the thread that runs this.
     pub(crate) fn run(self, stop: &StopToken) {
-        let Self { listener, dev, mem } = self;
+        let Self {
+            listener,
+            mut gate,
+            dev,
+            mem,
+        } = self;
         let mut relays: Vec<JoinHandle<()>> = Vec::new();
         let mut gates = WriterGates(Vec::new());
         loop {
@@ -1374,6 +1386,9 @@ impl VsockBridge {
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
+            if !gate.admits(&stream) {
+                continue;
+            }
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
@@ -1593,35 +1608,23 @@ mod tests {
         assert_eq!(EVENT_QUEUE, 2);
     }
 
-    /// Returns the result of binding the agent socket at `path`.
-    fn bind_at(path: &std::path::Path) -> std::io::Result<VsockBridge> {
+    // The test binds and removes a socket of its own; see clippy.toml.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn open_refuses_a_live_listener_and_leaves_it() {
         let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]));
-        let dev = Arc::new(Mutex::new(VirtioVsock::new()));
-        VsockBridge::bind(path.to_str().expect("a UTF-8 temporary path"), dev, ram)
-    }
-
-    // The tests make and remove files of their own; see clippy.toml.
-    #[allow(clippy::disallowed_methods)]
-    #[test]
-    fn bind_keeps_a_file_that_is_not_a_socket() {
-        let path = std::env::temp_dir().join(format!("hvi-agent-file-{}", std::process::id()));
-        std::fs::write(&path, b"keep").unwrap();
-        let bound = bind_at(&path);
-        let kept = std::fs::read(&path).unwrap();
+        let path = std::env::temp_dir().join(format!("hvi-agent-live-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        assert!(bound.is_err());
-        assert_eq!(kept, b"keep");
-    }
-
-    #[allow(clippy::disallowed_methods)]
-    #[test]
-    fn bind_replaces_a_stale_socket() {
-        let path = std::env::temp_dir().join(format!("hvi-agent-stale-{}", std::process::id()));
+        let other = UnixListener::bind(&path).unwrap();
+        let opened = open(path.to_str(), &ram).map(|agent| agent.is_some());
+        let still_there = UnixStream::connect(&path).is_ok();
+        drop(other);
         let _ = std::fs::remove_file(&path);
-        drop(UnixListener::bind(&path).unwrap());
-        let bound = bind_at(&path);
-        let _ = std::fs::remove_file(&path);
-        bound.expect("the stale socket replaced");
+        assert_eq!(
+            opened.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::AddrInUse)
+        );
+        assert!(still_there, "the other process lost its socket");
     }
 }
 

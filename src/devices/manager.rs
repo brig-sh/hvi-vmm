@@ -241,7 +241,7 @@ impl DeviceManager {
     ) -> Result<(), Error> {
         self.attach_disks(&cfg.disks)?;
         self.attach_net(cfg)?;
-        self.attach_vsock(cfg.agent_sock.as_deref())?;
+        self.attach_vsock(cfg.agent_sock.as_deref(), cfg.sandbox)?;
         #[cfg(target_os = "linux")]
         self.attach_exports(&cfg.fs, ram_fd)?;
         #[cfg(target_os = "macos")]
@@ -292,11 +292,15 @@ impl DeviceManager {
     /// Attaches the agent device and binds its host socket at `path`, when
     /// there is one.
     ///
+    /// With `sandbox` off, the I/O threads' stop removes the socket's node. A
+    /// confined process may not remove it, as
+    /// [`Node::remove`](crate::agent_socket::Node::remove) says.
+    ///
     /// # Errors
     ///
     /// Errors when the socket cannot be bound, no slot is left, or the range
     /// overlaps one already on the bus.
-    fn attach_vsock(&mut self, path: Option<&str>) -> Result<(), Error> {
+    fn attach_vsock(&mut self, path: Option<&str>, sandbox: bool) -> Result<(), Error> {
         let Some(agent) = vsock::open(path, &self.ram)? else {
             return Ok(());
         };
@@ -305,10 +309,13 @@ impl DeviceManager {
             .allocate()
             .map_err(|e| format!("virtio-vsock: {e}"))?;
         self.attach_virtio(DeviceKind::Vsock, slot, &agent.device)?;
-        let bridge = agent.bridge;
+        let vsock::Agent { bridge, node, .. } = agent;
         self.devices
             .host
             .spawn("agent bridge", move |stop| bridge.run(&stop));
+        if !sandbox {
+            self.devices.host.on_io_stop(move || node.remove());
+        }
         Ok(())
     }
 
@@ -546,7 +553,10 @@ mod tests {
                 ..BootConfig::with_no_devices(1)
             })
             .unwrap();
-        let err = devices.attach_vsock(Some(&agent)).unwrap_err().to_string();
+        let err = devices
+            .attach_vsock(Some(&agent), false)
+            .unwrap_err()
+            .to_string();
         let _ = std::fs::remove_file(&agent);
         assert_eq!(
             err,
