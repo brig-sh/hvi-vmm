@@ -595,6 +595,7 @@ mod tests {
             path,
             read_only: false,
             serial: None,
+            poll_max: None,
         }
     }
 

@@ -559,6 +559,7 @@ mod tests {
                     path: "lower.img".into(),
                     read_only: true,
                     serial: Some("lower".into()),
+                    poll_max: None,
                 },
                 DiskConfig::rw("upper.img"),
                 DiskConfig::rw("c.img"),
