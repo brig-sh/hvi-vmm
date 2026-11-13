@@ -170,7 +170,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         mmio_bus,
         disks,
         net,
-        host,
+        mut host,
     } = devices.finish();
     let uart = Arc::new(Mutex::new(Uart16550::new()));
     let context = VcpuContext {
@@ -196,16 +196,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     };
 
     uart.lock().unwrap().connect_irq(com1_line);
-    let (filters, mut io_threads, ledger_guard) = start_io_threads(
-        &cfg,
-        &context.guest,
-        move |byte| uart.lock().unwrap().push_rx(byte),
-        host,
-    )?;
     // Debug watchdog: force a register dump on a stuck guest (HVI_X86_TRACE).
     if trace {
         let guest = Arc::clone(&context.guest);
-        io_threads.spawn("trace watchdog", move |watch| {
+        host.spawn("trace watchdog", move |watch| {
             for _ in 0..4 {
                 match watch.sleep(std::time::Duration::from_secs(2)) {
                     Ok(true) => guest.vcpus.kicker().kick(0),
@@ -218,6 +212,12 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             }
         });
     }
+    let (filters, io_threads, ledger_guard) = start_io_threads(
+        &cfg,
+        &context.guest,
+        move |byte| uart.lock().unwrap().push_rx(byte),
+        host,
+    )?;
 
     // The run closes the ledger from here on.
     ledger_guard.disarm();

@@ -206,7 +206,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         move |byte| pl011.lock().unwrap().push_rx(byte),
         plugin_threads,
         host,
-    );
+    )?;
     // The run closes the ledger from here on.
     ledger_guard.disarm();
     let _current = record_start(&context.guest, cfg.sandbox);

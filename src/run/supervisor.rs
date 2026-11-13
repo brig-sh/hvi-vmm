@@ -247,6 +247,23 @@ pub(crate) struct LeftRunning {
     pub(crate) left: Option<io::Error>,
 }
 
+impl LeftRunning {
+    /// Returns `error`, in a `LeftRunning` beside `left` when a thread was left
+    /// running.
+    pub(crate) fn wrap(
+        error: Box<dyn std::error::Error + Send + Sync>,
+        left: Option<io::Error>,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        match left {
+            Some(left) => Box::new(Self {
+                error,
+                left: Some(left),
+            }),
+            None => error,
+        }
+    }
+}
+
 impl fmt::Display for LeftRunning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.left {
@@ -391,13 +408,7 @@ pub(crate) fn run_to_stop<K: Kick>(
                 if let Outcome::Failed(text) = outcome {
                     stderrln!("{LOG_PREFIX} {text}");
                 }
-                match left_running {
-                    Some(left) => Err(Box::new(LeftRunning {
-                        error: e,
-                        left: Some(left),
-                    })),
-                    None => Err(e),
-                }
+                Err(LeftRunning::wrap(e, left_running))
             }
             (None, outcome, None) => outcome.into_result(),
             (None, Outcome::Failed(text), Some(e)) => Err(Box::new(LeftRunning {
