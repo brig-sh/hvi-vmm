@@ -188,6 +188,8 @@ mod device {
         /// Sends one message through `send` and returns its reply, or returns
         /// an error without sending when the connection is broken.
         ///
+        /// A failure that breaks the connection also shuts the socket down.
+        ///
         /// `request` names the message in the error.
         fn send<T>(
             &mut self,
@@ -202,6 +204,13 @@ mod device {
             send(&mut self.frontend).map_err(|e| {
                 if breaks_connection(&e) {
                     self.broken = true;
+                    // A reset cannot take the rings back over a broken
+                    // connection, and the daemon would keep serving them. With
+                    // the socket shut down, the daemon exits.
+                    ShutdownFds {
+                        connection: self.frontend.as_raw_fd(),
+                    }
+                    .shutdown();
                 }
                 io::Error::other(format!("{request}: {e}"))
             })
@@ -365,9 +374,9 @@ mod device {
             let mut kick = Vec::with_capacity(queues);
             let mut call = Vec::with_capacity(queues);
             for _ in 0..queues {
-                // The kick side is only written, from the vCPU thread that
-                // passes the device a queue notification. The call side is read
-                // by a thread per queue, which blocks on it.
+                // The kick side is only written, by KVM or by the vCPU thread
+                // that passes the device a queue notification. The call side is
+                // read by a thread per queue, which blocks on it.
                 kick.push(EventFd::new(libc::EFD_NONBLOCK)?);
                 call.push(EventFd::new(0)?);
             }
@@ -613,12 +622,13 @@ mod device {
         }
 
         fn notify(&mut self, _ram: &GuestRam, queue: u16) {
-            let queue = usize::from(queue);
-            if self.handed_over.get(queue) == Some(&true) {
-                if let Some(fd) = self.kick.get(queue) {
-                    let _ = fd.write(1);
-                }
+            if let Some(fd) = self.kick.get(usize::from(queue)) {
+                let _ = fd.write(1);
             }
+        }
+
+        fn notify_fds(&self) -> &[EventFd] {
+            &self.kick
         }
 
         // The daemon walks the rings in its own process. Left enabled on rings
@@ -768,6 +778,7 @@ mod device {
         use super::{connect_waiting, serve_interrupts, VhostUserFs};
         use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
         use crate::devices::virtio::mmio::{QUEUE_NUM_MAX, QUEUE_READY, QUEUE_SEL, STATUS};
+        use crate::devices::virtio::Device as _;
         use crate::memory::{GuestRam, RamRegion, SharedRam};
         use crate::teardown::StopSource;
 
@@ -1328,6 +1339,51 @@ mod device {
                     FrontendReq::GET_VRING_BASE,
                 ]
             );
+        }
+
+        // KVM signals the eventfds `notify_fds` returns. A notification that
+        // reaches `notify` instead, such as the replay at DRIVER_OK, has to
+        // signal the same ones.
+        #[test]
+        fn trapped_notification_signals_the_queues_notify_fd() {
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::All);
+            let (ram, mem) = guest_ram();
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
+            assert_eq!(kick_counts(&driver), [1, 1], "the replay at DRIVER_OK");
+            driver.notify(1);
+            assert_eq!(kick_counts(&driver), [0, 1]);
+            driver.reset();
+            drop(driver);
+            daemon.join();
+        }
+
+        // The daemon still serves the rings it was given when a reset cannot
+        // take them back. Shutting the socket down ends it while the device
+        // lives on.
+        #[test]
+        fn broken_connection_is_shut_down() {
+            let (daemon, stream) = Daemon::spawn(ReplyPolicy::WrongReplyFirst);
+            let (ram, mem) = guest_ram();
+            let driver = driver(stream, &mem, ram.as_raw_fd());
+            driver.start(&[rings(BASE), rings(BASE + 0x1000)]);
+            // The reset reads the wrong reply to queue 0's GET_VRING_BASE.
+            driver.reset();
+            let (ended, has_ended) = mpsc::channel();
+            std::thread::spawn(move || ended.send(daemon.join()).unwrap());
+            assert!(
+                has_ended.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "the daemon's end of the socket is still open"
+            );
+            drop(driver);
+        }
+
+        /// Returns and clears the count of each kick eventfd of the device
+        /// `driver` drives.
+        fn kick_counts(driver: &Driver<VhostUserFs>) -> Vec<u64> {
+            let device = driver.device.lock().unwrap();
+            let fds = device.notify_fds();
+            fds.iter().map(|fd| fd.read().unwrap_or(0)).collect()
         }
 
         // Negotiating VHOST_USER_F_PROTOCOL_FEATURES leaves every ring

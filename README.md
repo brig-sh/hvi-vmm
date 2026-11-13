@@ -197,10 +197,11 @@ hvi is young. Read these before you build on it.
 - **The event ledger is per packet and egress only.** It is not aggregated per
   flow, and it is not a tamper-proof record.
 - **The arm64/KVM backend is unit-tested on its stop path only.** Its only tests
-  are the KVM stop tests in `src/hypervisor/kvm.rs`, of how a run stops: a vCPU
-  thread that ends, a stop request, plugin threads, the lifecycle records, and a
-  kick. They need `/dev/kvm`. The rest of that backend is cross-linted and
-  booted.
+  are the KVM tests in `src/hypervisor/kvm.rs`: the stop tests, of how a run
+  stops (a vCPU thread that ends, a stop request, plugin threads, the lifecycle
+  records, and a kick), and the queue notification test, which runs a few guest
+  instructions in a bare VM. They need `/dev/kvm`. The rest of that backend is
+  cross-linted and booted.
 
 [docs/limitations.md](docs/limitations.md) has the full list with the
 consequences.

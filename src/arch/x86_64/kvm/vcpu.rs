@@ -216,7 +216,7 @@ mod pio_tests {
 
     use super::*;
     use crate::devices::bus::UnclaimedError;
-    use crate::devices::irq::IrqLine;
+    use crate::devices::irq;
     use crate::devices::legacy::acpi_pm::{PM1_CONTROL, SLP_EN, SLP_TYP_S5, SLP_TYP_SHIFT};
 
     /// Returns the byte a read of `port` gets.
@@ -254,7 +254,7 @@ mod pio_tests {
     fn com1_rises_again_for_the_writes_after_an_iir_read() {
         let line = Arc::new(EdgeCounter::default());
         let mut com1 = Uart16550::new();
-        com1.connect_irq(Arc::clone(&line) as Arc<dyn IrqLine>);
+        com1.connect_irq(Arc::clone(&line) as Arc<dyn irq::Line>);
         let ports = port_bus(&Arc::new(Mutex::new(com1))).unwrap();
         const IER: u16 = COM1_PORT + 1;
         const IIR: u16 = COM1_PORT + 2;
@@ -327,7 +327,7 @@ mod pio_tests {
         edges: AtomicU32,
     }
 
-    impl IrqLine for EdgeCounter {
+    impl irq::Line for EdgeCounter {
         fn set_level(&self, level: bool) -> std::io::Result<()> {
             if level && !self.high.swap(level, Ordering::SeqCst) {
                 self.edges.fetch_add(1, Ordering::SeqCst);

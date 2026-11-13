@@ -33,6 +33,9 @@ use std::io;
 use std::sync::Arc;
 use std::task::Waker;
 
+#[cfg(target_os = "linux")]
+use vmm_sys_util::eventfd::EventFd;
+
 use mmio::Interrupt;
 use queue::{DescriptorChain, Queue, QueueConfig, QUEUE_MAX_SIZE};
 #[cfg(test)]
@@ -103,6 +106,18 @@ pub(crate) trait Device: Send {
     /// A [`reset`](Self::reset) on another vCPU can run just before this call,
     /// so the device serves the queue only while it is active.
     fn notify(&mut self, ram: &GuestRam, queue: u16);
+
+    /// Returns an eventfd per queue, in queue order, that a notification of the
+    /// queue can signal in place of a call to [`notify`](Self::notify).
+    ///
+    /// A notification may signal the eventfd with no call to `notify`, so the
+    /// `notify` of a device that returns eventfds must write the queue's
+    /// eventfd and do nothing else. The default returns none, and every
+    /// notification calls `notify`.
+    #[cfg(target_os = "linux")]
+    fn notify_fds(&self) -> &[EventFd] {
+        &[]
+    }
 
     /// Resets the device to the state it was built in.
     fn reset(&mut self);

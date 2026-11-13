@@ -24,7 +24,7 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{Cap, Kvm};
 
-use super::gic::{spi_gsi, Vgic};
+use super::gic::Vgic;
 use super::regs::{setup_boot_regs, try_get_u64, REG_MPIDR_EL1};
 use super::vcpu::{run_cpu, VcpuContext};
 use crate::arch::aarch64::fdt;
@@ -34,11 +34,13 @@ use crate::arch::aarch64::layout::{
 };
 use crate::arch::aarch64::loader;
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq::Chip as _;
 use crate::devices::manager::{DeviceManager, Devices};
 use crate::events::Ledger;
 use crate::hypervisor::guest::{mmio_report_limiter, Guest, PluginThreads};
-use crate::hypervisor::kvm::{kick_handle, run_guest, start_io_threads, Kicker, KvmIrqLine};
+use crate::hypervisor::kvm::{
+    kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
+};
 use crate::hypervisor::vcpus::Vcpus;
 use crate::memory::{GuestRam, SharedRam};
 use crate::plugin::GuestArch;
@@ -68,7 +70,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The guest GIC has to exist before the DTB is built, because the version
     // KVM creates decides what the DTB describes.
-    let vgic = Vgic::create(&vm)?;
+    let vgic = Vgic::create(Arc::clone(&vm))?;
     let version = vgic.version();
 
     // The DTB and KVM must agree on this placement.
@@ -98,9 +100,10 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
 
     // The ledger exists first, since each device's transport writes to it.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
-    let mut devices = DeviceManager::new(&ram, &ledger, slots, {
+    let uart_line = vgic.line(UART_SPI);
+    let mut devices = DeviceManager::new(&ram, &ledger, slots, &vgic, {
         let vm = Arc::clone(&vm);
-        move |spi| Arc::new(KvmIrqLine::new(Arc::clone(&vm), spi_gsi(spi))) as Arc<dyn IrqLine>
+        move |fd, address, value| register_ioeventfd(&vm, fd, address, value)
     });
     let pl011 = devices.attach_uart_and_rtc()?;
     devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
@@ -179,10 +182,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         plugin: cfg.plugin.clone(),
     };
 
-    pl011.lock().unwrap().connect_irq(Arc::new(KvmIrqLine::new(
-        Arc::clone(&vm),
-        spi_gsi(UART_SPI),
-    )));
+    pl011.lock().unwrap().connect_irq(uart_line);
     let (filters, io_threads, ledger_guard) = start_io_threads(
         &cfg,
         &context.guest,

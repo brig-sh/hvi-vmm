@@ -36,10 +36,12 @@ use virtio_bindings::virtio_config::{
     VIRTIO_F_VERSION_1,
 };
 use virtio_bindings::virtio_mmio::*;
+#[cfg(target_os = "linux")]
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::Stop;
 use crate::devices::bus;
-use crate::devices::irq::{Irq, IrqLine};
+use crate::devices::irq::{self, Irq};
 use crate::devices::virtio::{self, QueueConfig};
 use crate::events::Ledger;
 use crate::memory::GuestRam;
@@ -98,6 +100,22 @@ const STATUS_STEPS: [u32; 4] = [
     ACKNOWLEDGE | DRIVER | FEATURES_OK,
     ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK,
 ];
+
+/// Returns each eventfd of `device`'s
+/// [`notify_fds`](virtio::Device::notify_fds) with the address and the value of
+/// the guest write that notifies its queue, for a transport at `base`.
+///
+/// A driver notifies queue N with a 4-byte write of N to `QueueNotify`, so the
+/// value is a `u32`.
+#[cfg(target_os = "linux")]
+pub(crate) fn notify_ioeventfds(
+    device: &impl virtio::Device,
+    base: u64,
+) -> impl Iterator<Item = (&EventFd, u64, u32)> {
+    (0..)
+        .zip(device.notify_fds())
+        .map(move |(queue, fd)| (fd, base + QUEUE_NOTIFY, queue))
+}
 
 /// The device status field, which a driver sets one step at a time as it
 /// initializes a device.
@@ -163,7 +181,7 @@ struct InterruptState {
 
 impl Interrupt {
     /// Returns an interrupt that drives `line`.
-    pub(crate) fn new(line: Arc<dyn IrqLine>) -> Self {
+    pub(crate) fn new(line: Arc<dyn irq::Line>) -> Self {
         let mut irq = Irq::default();
         irq.connect(line);
         Self {
@@ -650,11 +668,55 @@ pub(crate) mod testing {
         }
     }
 
-    impl IrqLine for LevelLine {
+    impl irq::Line for LevelLine {
         fn set_level(&self, level: bool) -> std::io::Result<()> {
             self.0.store(level, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// A device of two queues whose notifications signal an eventfd per queue.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct EventfdDevice {
+        /// The eventfd of each queue.
+        pub(crate) fds: [EventFd; 2],
+    }
+
+    #[cfg(target_os = "linux")]
+    impl virtio::Device for EventfdDevice {
+        fn device_type(&self) -> u32 {
+            virtio_bindings::virtio_ids::VIRTIO_ID_FS
+        }
+
+        fn features(&self) -> u64 {
+            0
+        }
+
+        fn queue_max_sizes(&self) -> &[u16] {
+            &[8, 8]
+        }
+
+        fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
+
+        fn activate(
+            &mut self,
+            _ram: &GuestRam,
+            _driver_features: u64,
+            _queues: Vec<Option<Queue>>,
+            _interrupt: Arc<Interrupt>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn notify(&mut self, _ram: &GuestRam, queue: u16) {
+            let _ = self.fds[usize::from(queue)].write(1);
+        }
+
+        fn notify_fds(&self) -> &[EventFd] {
+            &self.fds
+        }
+
+        fn reset(&mut self) {}
     }
 
     /// The size and the ring addresses of one queue.
@@ -690,7 +752,7 @@ pub(crate) mod testing {
     /// Returns an enabled interrupt and its line.
     pub(crate) fn enabled_interrupt() -> (Arc<Interrupt>, Arc<LevelLine>) {
         let line = Arc::new(LevelLine::default());
-        let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn IrqLine>));
+        let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn irq::Line>));
         interrupt.enable();
         (interrupt, line)
     }
@@ -748,7 +810,7 @@ pub(crate) mod testing {
         pub(crate) fn new(device: D, ram: &Arc<GuestRam>) -> Self {
             let device = Arc::new(Mutex::new(device));
             let line = Arc::new(LevelLine::default());
-            let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn IrqLine>));
+            let interrupt = Arc::new(Interrupt::new(Arc::clone(&line) as Arc<dyn irq::Line>));
             let ledger = Arc::new(Ledger::new(None, "transport-test").unwrap());
             Self {
                 transport: Transport::new(&device, &interrupt, ram, &ledger),
