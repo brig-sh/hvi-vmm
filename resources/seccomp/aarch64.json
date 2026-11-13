@@ -115,7 +115,7 @@
             {"syscall": "mremap", "comment": "safety net: realloc of a buffer"},
             {"syscall": "madvise", "comment": "allocator returning pages; glibc releasing the thread's stack as it exits"},
             {"syscall": "brk", "comment": "glibc malloc"},
-            {"syscall": "clock_gettime", "comment": "safety net: event timestamps if vDSO is bypassed"},
+            {"syscall": "clock_gettime", "comment": "safety net: event timestamps and the clock of the queue poll, if vDSO is bypassed"},
             {"syscall": "getpid", "comment": "the panic hook's tgkill kick of the vCPUs; the fatal-signal handler raising its signal again"},
             {"syscall": "gettid", "comment": "thread startup"},
             {"syscall": "tgkill", "comment": "the panic hook kicking the vCPUs to stop; the fatal-signal handler raising its signal again"},

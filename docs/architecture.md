@@ -381,9 +381,15 @@ with `preadv` and `pwritev`, so no host buffer is sized by the guest. It raises
 the interrupt once per request, so a slow flush does not hold back the requests
 before it, and it asks the driver for no notification while it serves the ring.
 After each pass of at most a queue's worth of requests it writes their records
-to the ledger and ends the sink's batch. The kernel writes a read's data into
-guest RAM during the call, so a reset waits for the call in flight, and no
-request of the reset device reaches guest RAM after the STATUS write returns.
+to the ledger and ends the sink's batch. When a pass leaves the ring empty, the
+worker polls it for a short time before it sleeps, still with no notification
+asked for, so a request that follows closely costs the guest no notification
+and the worker no wake. The poll adapts to the disk: it grows, to 32
+microseconds at most, while the next request keeps coming within that time,
+and it is zero once requests come further apart. The kernel writes a read's
+data into guest RAM during the call, so a reset waits for the call in flight,
+and no request of the reset device reaches guest RAM after the STATUS write
+returns.
 The vCPUs' stop ends that wait.
 
 A virtio device's interrupt is edge-triggered. It holds the status bits under a

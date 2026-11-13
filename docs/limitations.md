@@ -25,6 +25,7 @@ three things a reader should not have to guess between:
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | virtio-blk disks attach at boot only. | No hotplug, no PCI at all. | Design |
+| A disk's worker uses host CPU while it polls. | After a request the worker polls its queue for up to 32 microseconds before it sleeps, when the guest's requests have been coming that closely. A guest that reads or writes one small request after another keeps one host thread per such disk busy. A disk whose requests come further apart is not polled. | Design |
 | A disk's requests run one at a time. | Each disk has one worker thread, so the host sees one request at a time whatever the guest queues, and a read waits behind a flush queued before it. | Design |
 | Several busy disks need more host cores than the guest has vCPUs. | A request runs on the disk's worker while the vCPU that sent it waits. When a guest sends small requests one after another to several disks at once, each request takes longer the more disks are busy. The cost is largest once the vCPUs and the busy workers outnumber the host's cores. On a Mac only the performance cores count, and the cost starts with the second busy disk. | Design |
 | A disk whose backing file stops answering holds the vCPU that resets the disk. | A read writes guest RAM during its call, so a reset waits for the request in flight, and nothing of it reaches the guest after the reset. The VMM's stop ends the wait. | Design |
