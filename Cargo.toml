@@ -99,7 +99,7 @@ acpi_tables = "0.2.1"
 # one cloud-hypervisor and QEMU speak, so the device in
 # `devices::virtio::fs::vhost_user` drives the daemon through it.
 [target.'cfg(target_os = "linux")'.dependencies]
-vhost = { version = "0.17.0", features = ["vhost-user-frontend"] }
+vhost = { version = "0.18.0", features = ["vhost-user-frontend"] }
 # EventFd, the type `vhost` takes for the kick and call descriptors.
 vmm-sys-util = "0.15"
 
