@@ -1,4 +1,4 @@
-name: Fetch the kernel hull ships
+name: Fetch hull kernel
 description: >-
   Pull the hull-assets bundle for a platform the way hull and brig do at run
   time: verify its keyless cosign signature against the hull-assets release
