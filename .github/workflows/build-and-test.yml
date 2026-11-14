@@ -234,10 +234,12 @@ jobs:
           platform: linux-amd64
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # Use find, not ls. SC2012 refuses a script that parses the
           # output of ls, and it is correct to do so.
-          KIMG=guest/bzImage; echo "kernel: $KIMG"
+          echo "kernel: $KIMG"
           # 2>&1: the VMM's own lines (including what it says about seccomp)
           # go to stderr, and asserting on them means capturing them.
           sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
@@ -268,8 +270,9 @@ jobs:
       # bzImage.
       - name: boot the uncompressed vmlinux
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
-          KIMG=guest/bzImage
           EXTRACT=$(find /usr/src -maxdepth 3 -type f -path '*/scripts/extract-vmlinux' \
             | sort -V | tail -1)
           # Named rather than assumed: the path carries a kernel version, and a
@@ -293,8 +296,9 @@ jobs:
       # e820 must show the split, not the hole described as RAM.
       - name: boot with 4096 MiB, RAM split around the MMIO hole
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
-          KIMG=guest/bzImage
           sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 4096 --cpus 1 \
             --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-4g.log || true
           grep -q "Linux version" boot-4g.log || { echo "::error::the 4 GiB guest did not boot"; exit 1; }
@@ -314,9 +318,10 @@ jobs:
       # to one would end only at the timeout.
       - name: check that power-off and reset end the run
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends busybox-static cpio
-          KIMG=guest/bzImage
           for cmd in poweroff reboot; do
             W=$(mktemp -d); mkdir -p "$W/bin"
             cp /bin/busybox "$W/bin/busybox"
@@ -403,6 +408,8 @@ jobs:
       # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
       - name: serve a virtio-fs export through virtiofsd
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
           VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
@@ -428,7 +435,6 @@ jobs:
           chmod +x "$W/init"
           ( cd "$W" && find . | cpio -o -H newc --quiet | gzip -1 ) > fs-initramfs.cpio.gz
           rm -rf share && mkdir share && echo "hello from the host" > share/hello.txt
-          KIMG=guest/bzImage
           # hvi starts no daemon. The step runs virtiofsd as a runtime would,
           # and the daemon exits once hvi closes the connection.
           rm -f fs.sock
@@ -522,13 +528,15 @@ jobs:
           python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
           ls -l target/initramfs.cpio
       - name: boot to userspace
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # The alarm bounds a stuck boot, as `timeout 180` does on the KVM
           # jobs. macOS supplies no coreutils `timeout`. The alarm stays
           # through the exec and stops the VMM when it occurs.
           perl -e 'alarm shift; exec @ARGV' 180 \
             ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs.cpio \
             --mem-mib 1024 --events ev.ndjson \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > run.log 2>&1 || true
@@ -540,7 +548,7 @@ jobs:
           # A kernel with rtc-pl031 and HCTOSYS prints the time it took from
           # the RTC. The unit tests stop at the register file and the
           # devicetree, so this is where the MMIO dispatch is checked.
-          if grep -qa "rtc-pl031" guest/Image; then
+          if grep -qa "rtc-pl031" "$KIMG"; then
             grep -q "setting system clock to 20" run.log \
               || { echo "::error::the guest has rtc-pl031 but did not set its clock from the RTC"; exit 1; }
             echo "the guest set its clock from the PL031 ✓"
@@ -842,11 +850,13 @@ jobs:
           python3 tools/mk-initramfs.py --out target/initramfs.cpio --keep-alive 45
           ls -l target/initramfs.cpio
       - name: boot to userspace
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # --cpus 2 also asserts SMP secondary bring-up through the guest's
           # own in-kernel PSCI CPU_ON.
           timeout 180 ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs.cpio \
             --mem-mib 1024 --cpus 2 --events ev.ndjson \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > run.log 2>&1 || true
@@ -873,7 +883,7 @@ jobs:
           # The guest can get pointer authentication only from a host CPU that
           # has it and a guest kernel built with it, so check it on those.
           if grep -qw paca /proc/cpuinfo && grep -qw pacg /proc/cpuinfo \
-            && grep -qa "Address authentication" guest/Image; then
+            && grep -qa "Address authentication" "$KIMG"; then
             grep -q "Address authentication" run.log \
               || { echo "::error::the host has pointer authentication, the guest did not get it"; exit 1; }
             echo "pointer authentication reached the guest ✓"
@@ -883,7 +893,7 @@ jobs:
           # A kernel with rtc-pl031 and HCTOSYS prints the time it took from
           # the RTC. The unit tests stop at the register file and the
           # devicetree, so this is where the MMIO dispatch is checked.
-          if grep -qa "rtc-pl031" guest/Image; then
+          if grep -qa "rtc-pl031" "$KIMG"; then
             grep -q "setting system clock to 20" run.log \
               || { echo "::error::the guest has rtc-pl031 but did not set its clock from the RTC"; exit 1; }
             echo "the guest set its clock from the PL031 ✓"
@@ -902,10 +912,12 @@ jobs:
       # exist needs no privileges, so unlike the positive boot below this runs
       # on every runner, probe or no probe.
       - name: an unusable tap refuses to boot
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           set +e
           timeout 30 ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs.cpio \
             --mem-mib 1024 --net-tap hvi-ci-nope \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > tap-refuse.log 2>&1
@@ -941,6 +953,8 @@ jobs:
           echo "ok=yes" >> "$GITHUB_OUTPUT"
       - name: boot with the container network on a real tap
         if: steps.tap.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.kernel }}
         run: |
           # The whole tap path in one assertion: attach to a pre-existing tap,
           # present the override MAC, and have the guest ping the host side of
@@ -952,7 +966,7 @@ jobs:
           python3 tools/mk-initramfs.py --out target/initramfs-tap.cpio \
             --keep-alive 45 --net-static 172.30.0.2/24,172.30.0.1
           ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs-tap.cpio \
+            --kernel "$KIMG" --initramfs target/initramfs-tap.cpio \
             --mem-mib 1024 --net-tap hvi-ci-tap --net-mac 52:54:00:c1:5c:01 \
             --cmdline "earlycon console=ttyAMA0 panic=-1" \
             </dev/null > tap.log 2>&1 &
