@@ -5,6 +5,6 @@
 # in tools/tidy.sh needs a nightly rustfmt, installed separately (rustfmt's
 # wrap_comments is nightly-only).
 [toolchain]
-channel = "1.95.0"
+channel = "1.100.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
