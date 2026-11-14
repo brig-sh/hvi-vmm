@@ -418,19 +418,18 @@ is the one device-facing thing that differs by backend:
   the interrupt.
 
 A daemon's write to a call eventfd sets no status bit. So once a device has an
-irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` beside any bit that is
-set from DRIVER_OK until the next reset, and 0 outside that time. A
-configuration change still sets its bit and triggers the interrupt. The status
-keeps `VIRTIO_MMIO_INT_VRING` beside `VIRTIO_MMIO_INT_CONFIG`, since the two can
-reach the guest as one interrupt, and the guest scans its queues only when it
-reads `VIRTIO_MMIO_INT_VRING`.
+irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` from DRIVER_OK until
+the next reset, beside any bit that is set, and reads 0 outside that time. A
+configuration change still sets its bit and triggers the interrupt. The guest
+scans its queues only when it reads `VIRTIO_MMIO_INT_VRING`, and the two bits
+can reach it as one interrupt.
 
 ### Devices
 
-- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`, one device
-  per disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real
-  sync, adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with
-  the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image is
+- **virtio-blk** (`devices/virtio/block/`, id 2) backs `--disk`, one device per
+  disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync,
+  adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with the
+  disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image is
   locked while open, shared for a read-only disk and exclusive for a writable
   one. Each disk has a worker thread that serves its queue, one request at a
   time.
@@ -573,7 +572,7 @@ how it works.
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `psci.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
 | Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `wake.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
+| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block/device.rs`, `block/worker.rs`, `block/request.rs`, `block/store.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `wake.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |
