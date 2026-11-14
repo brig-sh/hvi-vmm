@@ -2,8 +2,9 @@ name: Fetch hull kernel
 description: >-
   Pull the hull-assets bundle for a platform the way hull and brig do at run
   time: verify its keyless cosign signature against the hull-assets release
-  workflow, then pull the bundle at the verified digest with oras. The kernel
-  lands in guest/, as bzImage on x86-64 and as Image on arm64.
+  workflow, then pull the bundle with oras at the version and digest pinned
+  for the platform, after the cosign check. The kernel lands in guest/, as
+  bzImage on x86-64 and as Image on arm64. The kernel output names the path.
 
 inputs:
   platform:
@@ -32,15 +33,24 @@ runs:
       run: |
         mkdir -p "$DOCKER_CONFIG"
         repo=ghcr.io/nofireai/hull-assets
+        # Each platform's bundle is pinned by version and digest, so a
+        # hull-assets release reaches these lanes as a Renovate pull request.
+        # .github/renovate.json holds a custom manager for the lines below.
+        case "$PLATFORM" in
+          linux-amd64) ref=ghcr.io/nofireai/hull-assets:0.1.11-linux-amd64@sha256:032eec5cb56caf4b9021644f3a29fa83964dc226ca610ab714cab518b4bcf6d9 ;;
+          linux-arm64) ref=ghcr.io/nofireai/hull-assets:0.1.11-linux-arm64@sha256:0324d89e0b46f7977c7f120ce3d84899c531dfccef824a9f9af2be093ca669bd ;;
+          darwin-arm64) ref=ghcr.io/nofireai/hull-assets:0.1.11-darwin-arm64@sha256:e8451c0d150386f4ef62249ba908bbbb784de300791eb86364a77dfc0c2e9ccd ;;
+          *) echo "::error::no hull-assets pin for $PLATFORM"; exit 1 ;;
+        esac
         # The policy hull applies before it boots: the bundle is signed by the
         # hull-assets release workflow on its main branch, and by nothing else.
-        digest=$(cosign verify "$repo:$PLATFORM" \
+        digest=$(cosign verify "$repo@${ref#*@}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp '^https://github\.com/NOFireAI/hull-assets/\.github/workflows/build-assets\.yml@refs/heads/main$' \
             -o json 2>cosign.log \
           | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["critical"]["image"]["docker-manifest-digest"])') \
-          || { cat cosign.log; echo "::error::$repo:$PLATFORM did not verify"; exit 1; }
-        echo "verified $repo:$PLATFORM at $digest"
+          || { cat cosign.log; echo "::error::$ref did not verify"; exit 1; }
+        echo "verified $ref at $digest"
         oras pull "$repo@$digest" -o guest
         python3 -c 'import json;b=json.load(open("guest/bundle.json"));print("hull-assets", b["version"], "kernel", b["kernel"]["version"])'
         case "$PLATFORM" in

@@ -54,6 +54,13 @@
       "datasourceTemplate": "docker"
     },
     {
+      "description": "Bump the hull-assets bundles the live boots fetch, pinned by version and digest in the fetch-hull-kernel action.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/actions/fetch-hull-kernel/action\\.yml$/"],
+      "matchStrings": ["(?<depName>ghcr\\.io/nofireai/hull-assets):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[0-9a-f]{64})"],
+      "datasourceTemplate": "docker"
+    },
+    {
       "description": "Bump the gvproxy release the e2e suite downloads, with the sha256 of each binary, which the datasource reads from the release's sha256sums.",
       "customType": "regex",
       "managerFilePatterns": ["/^e2e/assets\\.toml$/"],
@@ -74,6 +81,12 @@
       "matchDatasources": ["docker"],
       "matchDepNames": ["ghcr.io/brig-sh/kernel"],
       "versioning": "regex:^(?<compatibility>amd64|arm64)-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "description": "Parse the hull-assets tag as the bundle version followed by its platform, so a newer bundle for the same platform shows as an update and the moving platform tags are ignored.",
+      "matchDatasources": ["docker"],
+      "matchDepNames": ["ghcr.io/nofireai/hull-assets"],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<compatibility>linux-amd64|linux-arm64|darwin-arm64)$"
     },
     {
       "description": "Keep the SHA-pinned actions bumped.",
@@ -97,6 +110,13 @@
       "matchFileNames": ["e2e/assets.toml"],
       "groupName": "e2e assets",
       "semanticCommitType": "test"
+    },
+    {
+      "description": "Keep the hull-assets bundles of every platform bumped in one pull request.",
+      "matchFileNames": [".github/actions/fetch-hull-kernel/action.yml"],
+      "matchDepNames": ["ghcr.io/nofireai/hull-assets"],
+      "groupName": "hull-assets",
+      "semanticCommitType": "ci"
     },
     {
       "description": "Keep the commitlint tooling under .github/linters bumped.",
