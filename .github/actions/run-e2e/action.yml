@@ -50,22 +50,34 @@ runs:
     # different ones or none. Each version goes in a directory of its own, and
     # the step builds it only when the binary there does not report that
     # version. A persistent runner keeps the directory between jobs, and a pod
-    # gets it back from the Actions cache, keyed by this file so a new pin is a
-    # new key, so a job with the binary in place does not reach crates.io. As
-    # for cargo-nextest above, `.github/renovate.json` holds a custom manager
-    # for the pin below. Keep the `# renovate:` marker with it.
-    - name: Restore virtiofsd
-      if: runner.os == 'Linux'
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ~/.cache/hvi-e2e/virtiofsd
-        key: virtiofsd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/run-e2e/action.yml') }}
-    - name: Install virtiofsd
+    # gets it back from the Actions cache, so a job with the binary in place
+    # does not reach crates.io. The cache key holds the pin, so only a
+    # virtiofsd bump is a new key. It holds $HOME too, because the cache entry
+    # records the path it was saved from, and $HOME is /home/ghrunner on the
+    # GICv3 host and /home/runner in a pod. As for cargo-nextest above,
+    # `.github/renovate.json` holds a custom manager for the pin below. Keep
+    # the `# renovate:` marker with it.
+    - name: Pin virtiofsd
+      id: virtiofsd
       if: runner.os == 'Linux'
       shell: bash
       env:
         # renovate: datasource=crate depName=virtiofsd
         VIRTIOFSD_VERSION: 1.14.0
+      run: |
+        echo "version=$VIRTIOFSD_VERSION" >> "$GITHUB_OUTPUT"
+        echo "home=$HOME" >> "$GITHUB_OUTPUT"
+    - name: Restore virtiofsd
+      if: runner.os == 'Linux'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/hvi-e2e/virtiofsd
+        key: virtiofsd-${{ runner.os }}-${{ runner.arch }}-${{ steps.virtiofsd.outputs.home }}-${{ steps.virtiofsd.outputs.version }}
+    - name: Install virtiofsd
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        VIRTIOFSD_VERSION: ${{ steps.virtiofsd.outputs.version }}
       run: |
         root="$HOME/.cache/hvi-e2e/virtiofsd/$VIRTIOFSD_VERSION"
         virtiofsd="$root/bin/virtiofsd"
