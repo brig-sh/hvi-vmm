@@ -12,77 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A virtio-blk device over virtio-mmio, and the worker thread that serves it.
-//!
-//! Because this VMM implements the device backend, every block request the
-//! guest issues passes through our code by construction: servicing the
-//! virtqueue and capturing the guest's disk I/O are the same act (see the
-//! `[virtio-blk]` log lines).
-//!
-//! Each disk has one queue, which a worker thread of its own serves. The
-//! [`VirtioBlk`] behind the transport holds what the registers read, and a
-//! notification only wakes the worker. The two share the queue, its interrupt
-//! and the sink behind one lock, which is never held across a call to the
-//! backing file. The worker takes a request off the ring under the lock, makes
-//! its call with no lock held, and completes it under the lock, unless a reset
-//! took the queue in between. One worker serves the requests in the order the
-//! ring holds them.
-//!
-//! A read or a write moves its data between the backing file and the request's
-//! buffers in guest RAM with `preadv` and `pwritev`, so no host buffer is sized
-//! by the guest. The kernel writes a read's data into guest RAM during the
-//! call. A reset therefore waits for the call in flight, and nothing reaches
-//! guest RAM for a request of the reset device after the STATUS write returns.
-//! The vCPUs' stop ends that wait, and a read still in flight then writes guest
-//! RAM after the reset returns, while the VM is ending.
-// The host-path ban in clippy.toml is aimed at the virtio-fs device, where
-// every component of a path comes from the guest. The paths here are this
-// VMM's own.
-#![allow(clippy::disallowed_methods)]
+//! A disk's worker thread, and the state it shares with the device.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use vm_memory::VolatileSlice;
-#[cfg(target_os = "linux")]
-use vmm_sys_util::eventfd::EventFd;
 
-use crate::config;
-use crate::memory::{self, GuestRam};
-use crate::LOG_PREFIX;
-
+use super::device::{VirtioBlk, SERIAL_LEN};
+use super::request::{
+    other, Request, Work, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_FLUSH,
+    VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
+};
+use super::store::BackingStore;
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::wake::WorkerWake;
-use crate::devices::virtio::{
-    self, read_config_bytes, DescriptorChain, Queue, SinkSlot, QUEUE_MAX_SIZE,
-};
+use crate::devices::virtio::{Queue, SinkSlot};
 use crate::events::{CapturedEvent, Ledger};
 use crate::io_threads::HostWork;
+use crate::memory::GuestRam;
 use crate::plugin::IoSink;
 use crate::sandbox::Thread;
 use crate::teardown::StopToken;
-
-/// `VIRTIO_BLK_F_FLUSH`: the guest may issue explicit cache-flush requests.
-///
-/// With it, an `fsync` in the guest reaches stable storage on the host.
-const F_FLUSH: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
-/// `VIRTIO_BLK_F_RO`: the disk is read-only, and Linux marks the guest's block
-/// device read-only to match.
-const F_RO: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
-
-/// virtio-blk request types.
-const VIRTIO_BLK_T_IN: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN; // read disk -> guest
-const VIRTIO_BLK_T_OUT: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT; // guest -> write disk
-const VIRTIO_BLK_T_FLUSH: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_FLUSH; // flush the cache
-const VIRTIO_BLK_T_GET_ID: u32 = virtio_bindings::virtio_blk::VIRTIO_BLK_T_GET_ID; // read the serial
-
-/// Length of the serial `GET_ID` returns, zero-padded.
-pub const SERIAL_LEN: usize = virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES as usize;
 
 /// The longest a disk's worker polls an empty ring before it sleeps, unless the
 /// disk sets another.
@@ -92,52 +45,19 @@ pub const POLL_MAX_LIMIT: Duration = Duration::from_millis(1);
 /// The poll a worker's window grows from.
 const POLL_START: Duration = Duration::from_micros(4);
 
-/// virtio-blk status byte.
-const VIRTIO_BLK_S_OK: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_OK as u8;
-const VIRTIO_BLK_S_IOERR: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8;
-/// The device does not implement this request type (virtio 1.2, 5.2.6).
-/// Answering `S_OK` instead tells the driver a request it depends on, such as a
-/// discard, did its work when it did nothing at all.
-const VIRTIO_BLK_S_UNSUPP: u8 = virtio_bindings::virtio_blk::VIRTIO_BLK_S_UNSUPP as u8;
-
-const SECTOR: u64 = 512;
-
-/// A virtio-blk device behind a virtio-mmio transport.
-///
-/// It holds what the registers read, and the state it shares with its worker,
-/// which `take_worker` returns.
-pub struct VirtioBlk {
-    /// The backing file, until the worker takes it.
-    file: Option<File>,
-    /// The disk's size in 512-byte sectors.
-    capacity_sectors: u64,
-    /// The backing file is open read-only, and every write is refused.
-    read_only: bool,
-    /// What `GET_ID` returns, zero-padded.
-    serial: [u8; SERIAL_LEN],
-    /// The serial as given, for the ledger.
-    serial_text: Arc<str>,
-    /// Stable id for this backing file, so a reader can tell two disks apart.
-    disk_id: u64,
-    /// The state the device shares with its worker.
-    shared: Arc<Shared>,
-    /// The longest the worker polls an empty ring before it sleeps.
-    poll_max: Duration,
-}
-
 /// The state a disk's device and its worker share.
 ///
 /// The state's lock is never held across a call to the backing file. It is
 /// taken before the lock of the device's [`Interrupt`], never after it, and
 /// after the lock that orders the records, never before it.
-struct Shared {
+pub(super) struct Shared {
     /// The queue, the sink and the requests in flight.
     state: Mutex<State>,
     /// The condition notified when a request leaves flight and when the vCPUs
     /// stop.
     idle: Condvar,
     /// What wakes the worker.
-    wake: WorkerWake,
+    pub(super) wake: WorkerWake,
     /// The lock a thread holds while it moves the pending records to the
     /// ledger, so the worker and the vCPUs' stop add them in the order the
     /// requests completed.
@@ -145,12 +65,12 @@ struct Shared {
 }
 
 /// The state behind the lock of [`Shared`].
-struct State {
+pub(super) struct State {
     /// The queue and the interrupt, from activation until a reset or the vCPUs'
     /// stop.
     active: Option<Active>,
     /// The sink each request also feeds, when a plugin installed one.
-    sink: SinkSlot,
+    pub(super) sink: SinkSlot,
     /// The number of requests taken off the ring whose call to the backing file
     /// has not completed.
     in_flight: u32,
@@ -175,7 +95,7 @@ impl Shared {
     /// # Errors
     ///
     /// Errors if the worker's wake cannot be made.
-    fn new() -> io::Result<Self> {
+    pub(super) fn new() -> io::Result<Self> {
         Ok(Self {
             state: Mutex::new(State {
                 active: None,
@@ -194,13 +114,13 @@ impl Shared {
     ///
     /// A plugin's sink runs under the lock, so a panic there poisons it, and
     /// the vCPUs' stop still has to free a vCPU waiting in a reset.
-    fn lock(&self) -> MutexGuard<'_, State> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Starts serving `queue`, which raises `interrupt`, unless the vCPUs have
     /// stopped.
-    fn activate(&self, queue: Option<Queue>, interrupt: Arc<Interrupt>) {
+    pub(super) fn activate(&self, queue: Option<Queue>, interrupt: Arc<Interrupt>) {
         let mut state = self.lock();
         if !state.stopping {
             state.active = queue.map(|queue| Active { queue, interrupt });
@@ -214,7 +134,7 @@ impl Shared {
     /// once no request is in flight, no request of the reset device reaches
     /// guest RAM or the used ring. When the vCPUs' stop ends the wait instead,
     /// [`stop`](Self::stop) says what still reaches guest RAM.
-    fn reset(&self) {
+    pub(super) fn reset(&self) {
         let mut state = self.lock();
         state.active = None;
         while state.in_flight > 0 && !state.stopping {
@@ -256,149 +176,6 @@ impl Shared {
     }
 }
 
-/// The backing store a [`Worker`] runs requests against.
-///
-/// It is the backing file, or in a test a store whose calls can be held or cut
-/// short. Its reads and writes take the request's buffers in guest RAM.
-pub(crate) trait BackingStore: Send + 'static {
-    /// Reads from `offset` into `bufs` in order with one call, and returns the
-    /// number of bytes read.
-    fn read_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice<'_>],
-        offset: u64,
-    ) -> io::Result<usize>;
-
-    /// Writes `bufs` in order at `offset` with one call, and returns the number
-    /// of bytes written.
-    fn write_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice<'_>],
-        offset: u64,
-    ) -> io::Result<usize>;
-
-    /// Makes the data written so far durable.
-    fn sync_data(&self) -> io::Result<()>;
-
-    /// Reads from `offset` until `bufs` are full.
-    ///
-    /// A short read is followed by another from where it stopped, inside a
-    /// buffer too.
-    ///
-    /// # Errors
-    ///
-    /// Errors with `UnexpectedEof` when a read returns no bytes before `bufs`
-    /// are full, or with the read's own error.
-    fn read_exact_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice<'_>],
-        offset: u64,
-    ) -> io::Result<()> {
-        transfer_all(bufs, offset, io::ErrorKind::UnexpectedEof, |left, at| {
-            self.read_vectored_at_volatile(left, at)
-        })
-    }
-
-    /// Writes all of `bufs` at `offset`.
-    ///
-    /// A short write is followed by another from where it stopped, inside a
-    /// buffer too.
-    ///
-    /// # Errors
-    ///
-    /// Errors with `WriteZero` when a write returns no bytes before `bufs` are
-    /// written, or with the write's own error.
-    fn write_all_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice<'_>],
-        offset: u64,
-    ) -> io::Result<()> {
-        transfer_all(bufs, offset, io::ErrorKind::WriteZero, |left, at| {
-            self.write_vectored_at_volatile(left, at)
-        })
-    }
-}
-
-impl BackingStore for File {
-    fn read_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice<'_>],
-        offset: u64,
-    ) -> io::Result<usize> {
-        memory::read_vectored_at_volatile(self, bufs, offset)
-    }
-
-    fn write_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice<'_>],
-        offset: u64,
-    ) -> io::Result<usize> {
-        memory::write_vectored_at_volatile(self, bufs, offset)
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        File::sync_data(self)
-    }
-}
-
-/// Makes `call` on what is left of `bufs` and its offset, from `offset`, until
-/// every byte of `bufs` is moved.
-///
-/// An empty buffer is skipped, so a call is never given buffers that are all
-/// empty, and a count of 0 means that the store moved nothing.
-///
-/// # Errors
-///
-/// Errors with `stalled` when a call moves no bytes before every byte is moved,
-/// or with the call's own error.
-fn transfer_all<'a>(
-    bufs: &[VolatileSlice<'a>],
-    mut offset: u64,
-    stalled: io::ErrorKind,
-    mut call: impl FnMut(&[VolatileSlice<'a>], u64) -> io::Result<usize>,
-) -> io::Result<()> {
-    let mut left: Vec<_> = bufs.iter().filter(|buf| !buf.is_empty()).copied().collect();
-    let mut left = left.as_mut_slice();
-    while !left.is_empty() {
-        match call(left, offset) {
-            Ok(0) => return Err(stalled.into()),
-            Ok(moved) => {
-                offset += moved as u64;
-                advance_slices(&mut left, moved);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// Drops the first `count` bytes of `bufs`, as `IoSliceMut::advance_slices`
-/// does.
-///
-/// # Panics
-///
-/// Panics if `bufs` hold fewer than `count` bytes.
-fn advance_slices(bufs: &mut &mut [VolatileSlice<'_>], mut count: usize) {
-    let mut whole = 0;
-    for buf in bufs.iter() {
-        if count < buf.len() {
-            break;
-        }
-        count -= buf.len();
-        whole += 1;
-    }
-    *bufs = &mut std::mem::take(bufs)[whole..];
-    match bufs.first_mut() {
-        Some(first) => {
-            *first = first
-                .offset(count)
-                .expect("a count inside the buffer should advance it");
-        }
-        None => assert_eq!(count, 0, "a count should not pass the end of the buffers"),
-    }
-}
-
 /// The thread that serves one disk's requests from its backing store.
 ///
 /// It never takes the transport's device lock. It ends the sink's batch and
@@ -408,9 +185,9 @@ pub(crate) struct Worker<F = File> {
     /// The backing store.
     file: F,
     /// The disk's size in 512-byte sectors.
-    capacity_sectors: u64,
+    pub(super) capacity_sectors: u64,
     /// Whether every write is refused.
-    read_only: bool,
+    pub(super) read_only: bool,
     /// What `GET_ID` returns, zero-padded.
     serial: [u8; SERIAL_LEN],
     /// The serial as given, for the ledger.
@@ -420,59 +197,13 @@ pub(crate) struct Worker<F = File> {
     /// Whether each request writes a `[virtio-blk]` console line.
     trace: bool,
     /// The guest RAM the queue and the buffers are in.
-    ram: Arc<GuestRam>,
+    pub(super) ram: Arc<GuestRam>,
     /// The ledger the requests are recorded in.
     ledger: Arc<Ledger>,
     /// The state the worker shares with the device.
     shared: Arc<Shared>,
     /// The poll window the worker starts with.
     poll: PollWindow,
-}
-
-/// A request taken off the ring, as the worker parsed it under the lock, with
-/// its buffers in the guest RAM that `'a` borrows.
-struct Request<'a> {
-    /// The head of the request's chain, which its used entry names.
-    head: u16,
-    /// The guest address of the status byte, or `None` when the chain is too
-    /// short to carry a request or its walk did not end.
-    status: Option<u64>,
-    /// The request type, a `VIRTIO_BLK_T_*` value.
-    kind: u32,
-    /// The sector the request starts at.
-    sector: u64,
-    /// What the request asks of the backing store.
-    work: Work<'a>,
-}
-
-/// What a request asks of the backing store.
-enum Work<'a> {
-    /// A read from `offset` into the request's buffers in guest RAM.
-    Read {
-        /// The byte offset in the backing store.
-        offset: u64,
-        /// The buffers, in chain order.
-        buffers: Vec<VolatileSlice<'a>>,
-    },
-    /// A write of the request's buffers in guest RAM at `offset`.
-    Write {
-        /// The byte offset in the backing store.
-        offset: u64,
-        /// The buffers, in chain order.
-        buffers: Vec<VolatileSlice<'a>>,
-    },
-    /// A flush of the writes so far.
-    Flush,
-    /// The serial, written into the guest segments.
-    GetId {
-        /// The guest segments, as address and length.
-        segments: Vec<(u64, u32)>,
-    },
-    /// A request answered with a status and no call to the backing store.
-    Answer(u8),
-    /// A request refused for the reason given, which fails with
-    /// `VIRTIO_BLK_S_IOERR`.
-    Refused(String),
 }
 
 /// What one pass of the worker captured, and whether the ring has more.
@@ -545,140 +276,7 @@ impl PollWindow {
     }
 }
 
-impl Request<'_> {
-    /// Returns a request whose chain carries none.
-    fn malformed(head: u16) -> Self {
-        Self {
-            head,
-            status: None,
-            kind: 0,
-            sector: 0,
-            work: Work::Answer(VIRTIO_BLK_S_IOERR),
-        }
-    }
-
-    /// Returns the number of data bytes the request moves between the guest and
-    /// the backing store.
-    fn data_len(&self) -> u64 {
-        match &self.work {
-            Work::Read { buffers, .. } | Work::Write { buffers, .. } => {
-                buffers.iter().map(|buffer| buffer.len() as u64).sum()
-            }
-            _ => 0,
-        }
-    }
-}
-
 impl VirtioBlk {
-    /// Opens `path` read-write as the backing disk, with an empty serial.
-    ///
-    /// # Errors
-    ///
-    /// Errors if the file cannot be opened or its length read.
-    #[cfg(test)]
-    pub(crate) fn open(path: &str) -> std::io::Result<Self> {
-        Self::open_as(path, false, "")
-    }
-
-    /// Opens `path` as the backing disk, read-only when `read_only` is set, and
-    /// answers `GET_ID` with `serial`.
-    ///
-    /// A read-only disk is opened `O_RDONLY`, so an image the VMM cannot write
-    /// still attaches, and the guest is told it is read-only.
-    ///
-    /// The file is locked for as long as it is open, shared for a read-only
-    /// disk and exclusive for a writable one, so two hvi processes never write
-    /// one image at once and no hvi writes an image another one reads. One
-    /// read-only image can back any number of guests. A writable block device
-    /// is opened `O_EXCL` on Linux as well, which claims the device itself and
-    /// so holds against another device node for it and against a mount. A
-    /// read-only open claims nothing, so a reader through another node is not
-    /// held against a writer.
-    ///
-    /// # Errors
-    ///
-    /// Errors if `serial` is longer than [`SERIAL_LEN`] bytes, the file cannot
-    /// be opened or its length read, a lock on it that this one excludes is
-    /// held, or the worker's wake cannot be made.
-    pub fn open_as(path: &str, read_only: bool, serial: &str) -> std::io::Result<Self> {
-        if serial.len() > SERIAL_LEN {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("virtio-blk serial {serial:?} is longer than {SERIAL_LEN} bytes"),
-            ));
-        }
-        let mut id = [0u8; SERIAL_LEN];
-        id[..serial.len()].copy_from_slice(serial.as_bytes());
-        let block_device = std::fs::metadata(path)?.file_type().is_block_device();
-        let mut options = OpenOptions::new();
-        options.read(true).write(!read_only);
-        #[cfg(target_os = "linux")]
-        if block_device && !read_only {
-            options.custom_flags(libc::O_EXCL);
-        }
-        let file = options.open(path).map_err(|e| {
-            // O_EXCL is what fails with EBUSY, so the message says what it
-            // means rather than what errno it was.
-            if block_device && e.raw_os_error() == Some(libc::EBUSY) {
-                std::io::Error::new(
-                    e.kind(),
-                    "the device is claimed elsewhere: open for writing, or mounted",
-                )
-            } else {
-                e
-            }
-        })?;
-        let mut tries = if block_device {
-            BLOCK_DEVICE_LOCK_TRIES
-        } else {
-            1
-        };
-        loop {
-            tries -= 1;
-            match lock(&file, read_only) {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries > 0 => {
-                    std::thread::sleep(BLOCK_DEVICE_LOCK_PAUSE);
-                }
-                taken => break taken?,
-            }
-        }
-        let capacity_sectors = backing_len(&file)? / SECTOR;
-        // The backing store is identified across the two processes that care
-        // about it without agreeing on a path: hvi may have been given a
-        // relative one, and the reader is given its own.
-        let disk_id = disk_id(&file.metadata()?);
-        Ok(VirtioBlk {
-            file: Some(file),
-            capacity_sectors,
-            read_only,
-            serial: id,
-            serial_text: Arc::from(serial),
-            disk_id,
-            shared: Arc::new(Shared::new()?),
-            poll_max: DEFAULT_POLL_MAX,
-        })
-    }
-
-    /// Returns whether the disk is read-only.
-    #[cfg(test)]
-    pub(crate) fn read_only(&self) -> bool {
-        self.read_only
-    }
-
-    /// Sets the longest the disk's worker polls an empty ring before it sleeps,
-    /// in place of [`DEFAULT_POLL_MAX`].
-    ///
-    /// Zero means the worker never polls. It takes effect for a worker taken
-    /// after the call.
-    pub fn set_poll_max(&mut self, longest: Duration) {
-        self.poll_max = longest;
-    }
-
-    /// Feeds each request to `sink` as well as the ledger.
-    pub fn set_io_sink(&self, sink: Arc<dyn IoSink>) {
-        self.shared.lock().sink.set(sink);
-    }
-
     /// Returns the worker that serves the disk's queue in `ram` and records
     /// each request in `ledger`, or `None` when it was already taken.
     pub(crate) fn take_worker(
@@ -877,147 +475,6 @@ impl<F: BackingStore> Worker<F> {
         }
     }
 
-    /// Walks `chain` and parses the request it carries from guest RAM.
-    ///
-    /// The first readable segment is the 16-byte header (type, reserved,
-    /// sector), the last writable segment is the status byte, and the segments
-    /// between carry data. The walk is bounded by the queue size, so the
-    /// request holds at most that many buffers.
-    fn parse(&self, mut chain: DescriptorChain<'_>) -> Request<'_> {
-        let head = chain.head_index();
-        let mut readable = Vec::new();
-        let mut writable = Vec::new();
-        for descriptor in chain.by_ref() {
-            let segment = (descriptor.addr().0, descriptor.len());
-            if descriptor.is_write_only() {
-                writable.push(segment);
-            } else {
-                readable.push(segment);
-            }
-        }
-        let (Some(&(header, _)), Some((&(status, _), data_in))) =
-            (readable.first(), writable.split_last())
-        else {
-            return Request::malformed(head);
-        };
-        if !chain.is_complete() {
-            return Request::malformed(head);
-        }
-        let fields = header
-            .checked_add(8)
-            .ok_or_else(|| other("the header's address overflows"))
-            .and_then(|sector| Ok((self.ram.read_u32(header)?, self.ram.read_u64(sector)?)));
-        let (kind, sector) = match fields {
-            Ok(fields) => fields,
-            Err(e) => {
-                return Request {
-                    head,
-                    status: Some(status),
-                    kind: 0,
-                    sector: 0,
-                    work: Work::Refused(e.to_string()),
-                };
-            }
-        };
-        let work = self
-            .work(kind, sector, &readable[1..], data_in)
-            .unwrap_or_else(|e| Work::Refused(e.to_string()));
-        Request {
-            head,
-            status: Some(status),
-            kind,
-            sector,
-            work,
-        }
-    }
-
-    /// Returns what a request of type `kind` at `sector` asks of the backing
-    /// store, with its data in the guest segments `data_out` and room for what
-    /// it returns in `data_in`.
-    ///
-    /// # Errors
-    ///
-    /// Errors when a read or write falls outside the disk, or one of its
-    /// segments outside guest RAM.
-    fn work(
-        &self,
-        kind: u32,
-        sector: u64,
-        data_out: &[(u64, u32)],
-        data_in: &[(u64, u32)],
-    ) -> io::Result<Work<'_>> {
-        Ok(match kind {
-            VIRTIO_BLK_T_IN => {
-                let (offset, buffers) = self.buffers(sector, data_in)?;
-                Work::Read { offset, buffers }
-            }
-            // The guest was offered VIRTIO_BLK_F_RO. A write that arrives
-            // anyway fails.
-            VIRTIO_BLK_T_OUT if self.read_only => Work::Answer(VIRTIO_BLK_S_IOERR),
-            // Nothing was written, so there is nothing to make durable.
-            VIRTIO_BLK_T_FLUSH if self.read_only => Work::Answer(VIRTIO_BLK_S_OK),
-            VIRTIO_BLK_T_OUT => {
-                let (offset, buffers) = self.buffers(sector, data_out)?;
-                Work::Write { offset, buffers }
-            }
-            VIRTIO_BLK_T_FLUSH => Work::Flush,
-            VIRTIO_BLK_T_GET_ID => Work::GetId {
-                segments: data_in.to_vec(),
-            },
-            // Every request type this device does not implement, discard and
-            // write-zeroes among them. None of them were negotiated, but a
-            // driver that sends one anyway must learn that nothing happened.
-            _ => Work::Answer(VIRTIO_BLK_S_UNSUPP),
-        })
-    }
-
-    /// Returns the byte offset of a read or write of `segments` at `sector`,
-    /// and the segments as buffers in guest RAM.
-    ///
-    /// Every segment is checked before the request reaches the backing store,
-    /// so a request with one segment outside guest RAM moves no byte. A
-    /// zero-length segment is checked too.
-    ///
-    /// # Errors
-    ///
-    /// Errors when the request falls outside the disk, or a segment outside
-    /// guest RAM.
-    fn buffers(
-        &self,
-        sector: u64,
-        segments: &[(u64, u32)],
-    ) -> io::Result<(u64, Vec<VolatileSlice<'_>>)> {
-        let total = segments.iter().map(|&(_, len)| u64::from(len)).sum();
-        let offset = self.byte_range(sector, total)?;
-        let buffers = segments
-            .iter()
-            .map(|&(addr, len)| self.ram.slice(addr, len as usize))
-            .collect::<io::Result<_>>()?;
-        Ok((offset, buffers))
-    }
-
-    /// Byte offset of `sector`, once we know the whole `len`-byte access falls
-    /// inside the capacity we advertised in config space.
-    ///
-    /// The guest picks `sector`, so this is what keeps a request inside the
-    /// disk it was given: without it a write past the end simply extended the
-    /// backing file, and the multiplication wrapped in release builds.
-    fn byte_range(&self, sector: u64, len: u64) -> std::io::Result<u64> {
-        let base = sector
-            .checked_mul(SECTOR)
-            .ok_or_else(|| other("sector offset overflows"))?;
-        let end = base
-            .checked_add(len)
-            .ok_or_else(|| other("request length overflows"))?;
-        if end > self.capacity_sectors * SECTOR {
-            return Err(other(format!(
-                "request at sector {sector} (+{len} bytes) is past the {} sector capacity",
-                self.capacity_sectors
-            )));
-        }
-        Ok(base)
-    }
-
     /// Runs `work` against the backing store.
     ///
     /// It returns the number of bytes it wrote to guest RAM. It is the one step
@@ -1188,215 +645,11 @@ impl<F: BackingStore> Worker<F> {
     }
 }
 
-impl virtio::Device for VirtioBlk {
-    fn device_type(&self) -> u32 {
-        virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK
-    }
-
-    fn features(&self) -> u64 {
-        if self.read_only {
-            F_FLUSH | F_RO
-        } else {
-            F_FLUSH
-        }
-    }
-
-    fn queue_max_sizes(&self) -> &[u16] {
-        &[QUEUE_MAX_SIZE]
-    }
-
-    // The configuration space starts with the capacity, in 512-byte sectors.
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
-        read_config_bytes(&self.capacity_sectors.to_le_bytes(), offset, data);
-    }
-
-    fn activate(
-        &mut self,
-        _ram: &GuestRam,
-        _driver_features: u64,
-        queues: Vec<Option<Queue>>,
-        interrupt: Arc<Interrupt>,
-    ) -> std::io::Result<()> {
-        let queue = <[Option<Queue>; 1]>::try_from(queues)
-            .ok()
-            .and_then(|[queue]| queue);
-        self.shared.activate(queue, interrupt);
-        Ok(())
-    }
-
-    fn notify(&mut self, _ram: &GuestRam, _queue: u16) {
-        self.shared.wake.signal();
-    }
-
-    #[cfg(target_os = "linux")]
-    fn notify_fds(&self) -> &[EventFd] {
-        std::slice::from_ref(self.shared.wake.eventfd())
-    }
-
-    // The reset waits for a request in flight, as `Shared::reset` describes.
-    // The transport holds its state lock until it returns, so a later
-    // activation cannot hand the worker a new queue while an old request is
-    // still in flight.
-    fn reset(&mut self) {
-        self.shared.reset();
-    }
-
-    // The worker serves the queue from its own wake and from its poll, which
-    // the transport's refusal of a notification does not reach.
-    fn driver_failed(&mut self) {
-        self.shared.reset();
-    }
-}
-
-/// Size in bytes of whatever is behind `file`.
+/// Writes `src` across the guest segments `segs`, each up to its length.
 ///
-/// `metadata().len()` is the *file* size, and for a block special file that is
-/// 0 -- so a disk-image path works and a block device silently advertises a
-/// zero-sector virtio-blk. That failure is unpleasant to read: the guest
-/// registers `/dev/vda` normally and then fails every read, so the console says
-/// "unable to read superblock" rather than anything about a missing disk.
-///
-/// Container runtimes hand us exactly that. urunc passes the devmapper snapshot
-/// of the container's rootfs (`/dev/mapper/...`), not a file. So ask the kernel
-/// for the device size when the path is a block device.
-fn backing_len(file: &File) -> std::io::Result<u64> {
-    let meta = file.metadata()?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        use std::os::unix::io::AsRawFd;
-
-        if meta.file_type().is_block_device() {
-            // The device size in bytes; BLKGETSIZE counts 512-byte sectors.
-            // libc declares no BLKGETSIZE64, so the request is built here.
-            const BLKGETSIZE64: libc::Ioctl = libc::_IOR::<usize>(0x12, 114);
-            let mut size: u64 = 0;
-            // SAFETY: `file` is an open block device and `size` is a live u64
-            // that the ioctl writes exactly one u64 into.
-            let rc = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size) };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            return Ok(size);
-        }
-    }
-    Ok(meta.len())
-}
-
-/// Takes the lock on `file` that its mode needs, without waiting.
-///
-/// # Errors
-///
-/// Errors with `WouldBlock` when a lock this one excludes is held, and with
-/// what the filesystem answered otherwise, as on NFS without a lock service.
-fn lock(file: &File, read_only: bool) -> std::io::Result<()> {
-    let taken = if read_only {
-        file.try_lock_shared()
-    } else {
-        file.try_lock()
-    };
-    match taken {
-        Ok(()) => Ok(()),
-        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            if read_only {
-                "the image is open for writing elsewhere"
-            } else {
-                "the image is open elsewhere"
-            },
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
-    }
-}
-
-/// How often, and how long apart, a lock on a block device is retried.
-///
-/// systemd-udevd holds a shared lock on a whole-disk device while it handles an
-/// event for it, as after `losetup`, so a first attempt can land in that
-/// window.
-const BLOCK_DEVICE_LOCK_TRIES: u32 = 20;
-const BLOCK_DEVICE_LOCK_PAUSE: Duration = Duration::from_millis(50);
-
-/// Returns the id `IoSink::on_block` reports for the backing store `meta`
-/// describes, which a reader derives from its own path to the same store.
-///
-/// For a block device it is the device number, `st_rdev`, so every node for
-/// one device gives one id. For a regular file it is `st_dev` rotated left by
-/// 32 bits, xor `st_ino`, so two images on different filesystems with one
-/// inode number differ.
-#[must_use]
-pub fn disk_id(meta: &std::fs::Metadata) -> u64 {
-    store_id(
-        meta.file_type().is_block_device(),
-        meta.dev(),
-        meta.ino(),
-        meta.rdev(),
-    )
-}
-
-/// Returns [`disk_id`] for a node `ino` on filesystem `dev`, which is the
-/// device number `rdev` when `block_device` is set.
-fn store_id(block_device: bool, dev: u64, ino: u64, rdev: u64) -> u64 {
-    if block_device {
-        rdev
-    } else {
-        dev.rotate_left(32) ^ ino
-    }
-}
-
-/// Opens every disk in `disks` in order, each with the [`serial_at`] its
-/// position, and logs each one.
-///
-/// [`serial_at`]: config::DiskConfig::serial_at
-///
-/// # Errors
-///
-/// Errors when [`config::check_disks`] refuses the list, when one image backs
-/// two disks of which one is writable, or when a disk does not open. The
-/// message names the disk and its path.
-pub fn open_disks(disks: &[config::DiskConfig]) -> Result<Vec<Arc<Mutex<VirtioBlk>>>, String> {
-    config::check_disks(disks)?;
-    let mut opened: Vec<(Arc<Mutex<VirtioBlk>>, u64)> = Vec::new();
-    for (index, disk) in disks.iter().enumerate() {
-        let serial = disk.serial_at(index);
-        let fail =
-            |e: &dyn std::fmt::Display| format!("virtio-blk disk {index} ({}): {e}", disk.path);
-        // The lock would refuse this too, with a message about another process.
-        // Here the other holder is known, so the message names it.
-        let id = std::fs::metadata(&disk.path)
-            .map(|meta| disk_id(&meta))
-            .map_err(|e| fail(&e))?;
-        if let Some(earlier) = opened.iter().position(|(_, other)| *other == id) {
-            let earlier_writes = !disks[earlier].read_only;
-            if earlier_writes || !disk.read_only {
-                return Err(fail(&format!(
-                    "the same image is disk {earlier}, {}",
-                    if earlier_writes {
-                        "which this guest writes"
-                    } else {
-                        "and only one of the two may be writable"
-                    }
-                )));
-            }
-        }
-        let mut blk =
-            VirtioBlk::open_as(&disk.path, disk.read_only, &serial).map_err(|e| fail(&e))?;
-        blk.set_poll_max(disk.poll_max.unwrap_or(DEFAULT_POLL_MAX));
-        let mode = if disk.read_only { "ro" } else { "rw" };
-        eprintln!(
-            "{LOG_PREFIX} virtio-blk[{index}]: {} ({mode}, serial {serial})",
-            disk.path
-        );
-        opened.push((Arc::new(Mutex::new(blk)), id));
-    }
-    Ok(opened.into_iter().map(|(blk, _)| blk).collect())
-}
-
-/// Writes `src` across the guest segments `segs`, each up to its length, and
-/// returns how many bytes were written.
-///
-/// A source shorter than the segments fills them in order and leaves the rest,
-/// which is what `GET_ID` does with a serial shorter than the buffer.
+/// It returns how many bytes were written. A source shorter than the segments
+/// fills them in order and leaves the rest, which is what `GET_ID` does with a
+/// serial shorter than the buffer.
 fn scatter(mem: &GuestRam, segs: &[(u64, u32)], mut src: &[u8]) -> std::io::Result<u32> {
     let mut written = 0u32;
     for &(addr, len) in segs {
@@ -1408,86 +661,18 @@ fn scatter(mem: &GuestRam, segs: &[(u64, u32)], mut src: &[u8]) -> std::io::Resu
     Ok(written)
 }
 
-fn other<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
-
-#[cfg(test)]
-mod backing_len_tests {
-    use super::backing_len;
-
-    /// A plain disk image still sizes from the file length.
-    #[test]
-    fn a_regular_file_reports_its_length() {
-        let path = std::env::temp_dir().join("hvi-backing-len-test.img");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("create temp image");
-        file.set_len(4 << 20).expect("size temp image");
-        assert_eq!(backing_len(&file).expect("len"), 4 << 20);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The regression: a block special file has a file length of 0, so sizing a
-    /// virtio-blk from `metadata().len()` gives the guest a 0-sector disk. This
-    /// needs a real block device. CI creates a loop device and names it in
-    /// `HVI_BLOCK_DEV`; when the variable is set the device must be usable,
-    /// because a skip there would silently drop the coverage the CI step exists
-    /// to provide. Without it the test scans for one, and reports rather than
-    /// fails when none is openable.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_block_device_reports_the_device_size() {
-        use std::os::unix::fs::FileTypeExt;
-
-        let picked = match std::env::var("HVI_BLOCK_DEV") {
-            Ok(dev) => {
-                let file = std::fs::File::open(&dev)
-                    .unwrap_or_else(|e| panic!("HVI_BLOCK_DEV={dev}: {e}"));
-                Some((std::path::PathBuf::from(dev), file))
-            }
-            Err(_) => std::fs::read_dir("/sys/block")
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| {
-                    let path = std::path::Path::new("/dev").join(e.file_name());
-                    let file = std::fs::File::open(&path).ok()?;
-                    let is_block = file.metadata().ok()?.file_type().is_block_device();
-                    is_block.then_some((path, file))
-                })
-                .next(),
-        };
-        let Some((path, file)) = picked else {
-            eprintln!("skipping: no openable block device (needs root on most hosts)");
-            return;
-        };
-
-        let meta_len = file.metadata().expect("metadata").len();
-        let got = backing_len(&file).expect("backing_len");
-        assert_eq!(meta_len, 0, "{path:?} unexpectedly has a file length");
-        assert!(got > 0, "{path:?} sized as {got} bytes");
-        assert_eq!(
-            got % super::SECTOR,
-            0,
-            "{path:?} size is not sector-aligned"
-        );
-    }
-}
-
 #[cfg(test)]
 mod queue_tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
-    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::devices::virtio::{
+        Device as _, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    };
 
     const BASE: u64 = 0x4000_0000;
 
-    /// A device over an empty image, so every sector is past the capacity.
+    /// Returns a device over an empty image, so every sector is past the
+    /// capacity.
     ///
     /// Each call gets a file of its own, since a writable disk locks its image
     /// and the tests run in parallel. The file is unlinked at once; the open
@@ -1685,8 +870,6 @@ mod queue_tests {
         );
     }
 
-    /// The happy path still works: a conforming driver's read request is
-    /// serviced, the data lands in guest RAM and the status byte is written.
     #[test]
     fn conforming_queue_still_services_a_request() {
         let path = std::env::temp_dir().join(format!("hvi-q-{}.img", std::process::id()));
@@ -1835,8 +1018,8 @@ mod queue_tests {
         assert_eq!(mem.read_u16(BASE + 0x2000 + 2).unwrap(), 1);
     }
 
-    // The re-programmed queue sits at fresh ring pages with `avail.idx` back
-    // at 0.
+    // The re-programmed queue sits at fresh ring pages with `avail.idx` back at
+    // 0.
     #[test]
     fn status_reset_lets_the_re_programmed_queue_service_a_request() {
         let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x8000)]));
@@ -1885,9 +1068,13 @@ mod queue_tests {
 
 #[cfg(test)]
 mod capacity_tests {
+    use super::super::device::{disk_id, open_disks, store_id};
     use super::*;
+    use crate::config;
     use crate::devices::virtio::mmio::testing::{self, Rings};
-    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::devices::virtio::{
+        Device as _, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    };
 
     const BASE: u64 = 0x4000_0000;
 
@@ -1901,8 +1088,8 @@ mod capacity_tests {
         }
     }
 
-    // A reader in a container reaches the device through its own node: the
-    // node differs in filesystem and inode, the device number is the same.
+    // A reader in a container reaches the device through its own node: the node
+    // differs in filesystem and inode, the device number is the same.
     #[test]
     fn two_nodes_for_one_block_device_give_one_disk_id() {
         let host = store_id(true, 6, 1200, 0x0800);
@@ -2059,7 +1246,6 @@ mod capacity_tests {
         assert!(pass.fed.is_none());
     }
 
-    /// Regression for the guest writing outside the disk it was advertised.
     #[test]
     fn write_past_the_advertised_capacity_is_refused() {
         let (r, mut disk) = rig("out");
@@ -2084,8 +1270,9 @@ mod capacity_tests {
         assert_eq!(st, VIRTIO_BLK_S_IOERR);
     }
 
-    /// A sector that would wrap the byte offset is refused rather than aliased
-    /// back into the file (release builds used to wrap silently).
+    // A sector that would wrap the byte offset is refused rather than aliased
+    // back into the file. An unchecked multiplication wraps silently in release
+    // builds.
     #[test]
     fn sector_offset_overflow_is_refused() {
         let (r, mut disk) = rig("ovf");
@@ -2094,8 +1281,8 @@ mod capacity_tests {
         assert_eq!(std::fs::metadata(&r.path).unwrap().len(), 512);
     }
 
-    /// The last sector inside the capacity still works, so the bound is not
-    /// off by one.
+    // The last sector inside the capacity still works, so the bound is not off
+    // by one.
     #[test]
     fn request_inside_the_capacity_still_succeeds() {
         let (_r, mut disk) = rig("ok");
@@ -2106,9 +1293,9 @@ mod capacity_tests {
         assert_eq!(&got, &[0xab; 4], "the sector reached guest memory");
     }
 
-    /// A request type the device does not implement is answered `S_UNSUPP`, not
-    /// `S_OK`: a driver told its discard succeeded would trust a range that
-    /// still holds the old data.
+    // A request type the device does not implement is answered `S_UNSUPP`, not
+    // `S_OK`: a driver told its discard succeeded would trust a range that
+    // still holds the old data.
     #[test]
     fn unknown_request_type_is_unsupported() {
         let (r, mut disk) = rig("unsupp");
@@ -2134,7 +1321,8 @@ mod capacity_tests {
         );
     }
 
-    /// A 1-sector read-only disk on a `0444` image, opened with `serial`.
+    /// Returns a 1-sector read-only disk on a `0444` image, opened with
+    /// `serial`.
     fn ro_rig(tag: &str, serial: &str) -> (Rig, VirtioBlk) {
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!("hvi-ro-{tag}-{}.img", std::process::id()));
@@ -2146,7 +1334,7 @@ mod capacity_tests {
     }
 
     // The ro lower image of an overlay root is 0444 in the store; opening it
-    // for writing failed the boot.
+    // for writing would fail the boot.
     #[test]
     fn read_only_disk_opens_an_image_nobody_may_write() {
         let (r, blk) = ro_rig("open", "disk0");
@@ -2373,8 +1561,8 @@ mod capacity_tests {
         VirtioBlk::open_as(r.path.to_str().unwrap(), false, &exact).expect("20 bytes fit");
     }
 
-    /// The bound is on the bytes actually transferred, so it is exact at the
-    /// end of the disk in both directions.
+    // The bound is on the bytes actually transferred, so it is exact at the end
+    // of the disk in both directions.
     #[test]
     fn byte_range_bounds_are_exact() {
         let (_r, disk) = rig("rng");
@@ -2410,6 +1598,7 @@ mod worker_tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{Driver, Rings};
     use crate::devices::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::memory;
     use crate::teardown::StopSource;
 
     const BASE: u64 = 0x4000_0000;
@@ -3295,7 +2484,10 @@ mod data_path_tests {
 
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Rings};
-    use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::devices::virtio::{
+        Device as _, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    };
+    use crate::memory;
 
     const BASE: u64 = 0x4000_0000;
     /// The queue of every disk, a 256-entry ring at the start of guest RAM.
