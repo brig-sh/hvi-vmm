@@ -229,6 +229,6 @@ architecture, embedding, benchmarking, and contributor testing.
 
 Apache-2.0, copyright NOFire AI. [NOTICE](NOTICE) names the modules that
 follow Firecracker and records that the Linux seccomp filters are hvi's own.
-Maintainers are in [`.github/CODEOWNERS`](.github/CODEOWNERS). The
-[code of conduct](CODE_OF_CONDUCT.md), the [AI policy](AI_POLICY.md) and
+The maintainers are @ananos, @asapranidis, @pmoust, @papazof and @cmainas.
+The [code of conduct](CODE_OF_CONDUCT.md), the [AI policy](AI_POLICY.md) and
 [CONTRIBUTING.md](CONTRIBUTING.md) apply to every contribution.
