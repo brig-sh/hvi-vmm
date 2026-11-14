@@ -227,8 +227,9 @@ jobs:
         run: cargo build --release
       # The kernel hull ships, fetched as hull fetches it.
       - name: guest kernel
+        id: kernel
         if: steps.kvm.outputs.ok == 'yes'
-        uses: ./.github/actions/hull-assets-kernel
+        uses: ./.github/actions/fetch-hull-kernel
         with:
           platform: linux-amd64
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
@@ -510,7 +511,8 @@ jobs:
           ./target/release/hvi smoke
           ./target/release/hvi smoke --shm
       - name: guest kernel
-        uses: ./.github/actions/hull-assets-kernel
+        id: kernel
+        uses: ./.github/actions/fetch-hull-kernel
         with:
           platform: darwin-arm64
       - name: keep-alive initramfs
@@ -831,7 +833,8 @@ jobs:
       - name: seccomp filters (aarch64)
         run: ./target/release/hvi seccomp-selftest
       - name: guest kernel
-        uses: ./.github/actions/hull-assets-kernel
+        id: kernel
+        uses: ./.github/actions/fetch-hull-kernel
         with:
           platform: linux-arm64
       - name: keep-alive initramfs
