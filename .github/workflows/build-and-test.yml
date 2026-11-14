@@ -800,6 +800,8 @@ jobs:
           test -w /dev/kvm \
             || { echo "::error::runner cannot write /dev/kvm (pod: device not mapped? host: kvm group, runner restarted?)"; exit 1; }
           grep -m1 GICv /proc/interrupts || true
+          # Guest-memory mapping follows the host page size, so the log records it.
+          echo "page size: $(getconf PAGESIZE)"
       # Install the toolchain rather than trusting one to be pre-provisioned
       # in the runner user's home. That assumption held while a single machine
       # served this job and broke as soon as it did not: the runner user is
@@ -811,9 +813,9 @@ jobs:
           cache-key: linux-arm64-${{ matrix.vgic }}
       - name: build
         run: cargo build --release
-      # The hosted test jobs have 4 KiB pages. Guest-memory mapping constraints
-      # follow the host page size, and these runners are where another size
-      # appears in CI, so the suite runs here too. `--release` reuses the
+      # Guest-memory mapping constraints follow the host page size, so the
+      # suite runs on these hosts as well as on the hosted jobs. The
+      # availability step logs each host's page size. `--release` reuses the
       # build above.
       - name: unit suite
         run: cargo test --release
@@ -827,7 +829,7 @@ jobs:
             || { echo "::error::the vCPU stop tests did not pass"; exit 1; }
       # The aarch64 allowlist is a different file from the x86 one. The hosted
       # arm64 musl job runs it on the static musl binary. This is the only place
-      # it runs on the glibc build, and where another page size appears.
+      # it runs on the glibc build.
       - name: seccomp filters (aarch64)
         run: ./target/release/hvi seccomp-selftest
       - name: guest kernel
