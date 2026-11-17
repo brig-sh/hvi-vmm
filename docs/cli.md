@@ -344,6 +344,14 @@ On a clean stop, macOS reports each share's peak handle count:
 guest stopped: SystemOff
 ```
 
+On Linux x86-64 the line after `booting` names the irqchip, `split` or `kernel`,
+the kernel's format and its entry point:
+
+```text
+booting bzImage with 1024 MiB ...
+[hvi] 2 vCPU(s)  irqchip split  bzImage entry@0x100200
+```
+
 ## vCPU limits
 
 hvi has three caps. On Linux/arm64 a vGICv2 host takes at most 8 vCPUs:

@@ -119,12 +119,14 @@ timer is the local APIC timer in TSC-deadline mode, which hvi offers in CPUID.
 Linux leaves the PIT unused when it knows the TSC frequency, which kvm-clock
 gives it, and when the TSC-deadline mode and ARAT are offered. So a Linux guest
 needs `CONFIG_KVM_GUEST`. Without kvm-clock, as with `no-kvmclock`, Linux
-calibrates the TSC against the PIT unless CPUID reports the frequency. The
-8259's ports read 0, so Linux's probe finds no PIC and every interrupt goes
-through the IOAPIC. A guest that needs a PIT or a PIC runs with the in-kernel
-irqchip, `--irqchip kernel`, where KVM provides both. Such a guest stops early
-in its boot with the split irqchip and prints no reason. hvi's boot line names
-the irqchip in use, as in `[hvi] 2 vCPU(s)  irqchip split  bzImage entry@...`.
+calibrates the TSC against the PIT unless CPUID reports the frequency.
+[architecture.md](architecture.md#32-x86-64-the-linux-64-bit-boot-protocol)
+describes how the guest finds no PIC.
+
+A guest that needs a PIT or a PIC stops early in its boot with the split irqchip
+and prints no reason. It runs with the in-kernel irqchip, `--irqchip kernel`,
+where KVM provides both. hvi's boot line names the irqchip in use (see
+[cli.md](cli.md#startup-output)).
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.
