@@ -8,7 +8,7 @@ artefacts come out of that position, and they answer different questions.
 | --- | --- | --- |
 | Event ledger | `--events <path>` | Structured NDJSON records of device activity and the run's lifecycle. |
 | I/O trace | `--trace-io <path>` | One raw line per block request and per network frame. |
-| Memory dump | `--dump-memory <path>` | Guest RAM, written with the VM parked. |
+| Memory dump | `--dump-memory <path>` | Guest RAM, written with the vCPUs parked. |
 
 CAUTION: All three contain the guest's workload data. A memory dump contains
 whatever was in guest RAM, which includes keys, tokens and plaintext. Treat
@@ -50,21 +50,15 @@ the run left out because the ledger's buffer was full, and appears only when
 there were any. A boot that fails before it writes `vmm.start` writes no
 `vmm.stop` either. A record's `ts` is when the VMM added it to the ledger's
 buffer, so a `vmm.vcpu_started` record can follow records the vCPU caused after
-it entered its run loop. A disk's worker adds the `block` records of a pass
-together once the pass ends, after the guest has seen those requests complete,
-so a `block` record can follow the record of what the guest did with the data. A
-pass is at most a queue's worth of requests.
+it entered its run loop.
 
 Under hvi's own binary, a panic stops the vCPUs and writes `vmm.stop` before the
 process aborts, with reason `failed` and the panic's report as `error`. The VMM
 waits up to half a second for the vCPUs to exit before it writes the record. So
 the record follows every record the vCPUs caused, unless a vCPU has not exited
-by then, such as one a plugin's pause holds. A `block` record comes from the
-disk's worker thread, which the panic does not stop. The worker starts no
-request once the ledger is closed, so at most the requests of the pass each disk
-had in progress at `vmm.stop` reach the disk with no record. The VMM writes a
-`vmm.vcpu_started` record a moment after the vCPU starts, so a vCPU that starts
-just before a panic can have none.
+by then, such as one a plugin's pause holds. The VMM writes a `vmm.vcpu_started`
+record a moment after the vCPU starts, so a vCPU that starts just before a panic
+can have none.
 
 On KVM every vCPU enters its run loop at the start, and one the guest has not
 brought up yet waits inside the hypervisor. On macOS a secondary vCPU enters its
@@ -112,6 +106,13 @@ records do not wait. The writer takes them at once when it is idle. After each
 write it waits 1 ms for more records before it goes idle, so the records of a
 burst are written together, within about 1 ms. A write in progress delays them
 until it ends.
+
+A disk's worker adds the `block` records of up to a queue's worth of requests
+together, after the guest has seen those requests complete. So a `block` record
+can follow the record of what the guest did with the data. A panic does not stop
+a disk's worker, but the worker starts no request once the ledger is closed. So
+at most a queue's worth of requests per disk, the ones in progress at
+`vmm.stop`, reach the disk with no record.
 
 A run loses nothing when the guest stops it, a vCPU fails, or a stop is
 requested, by `SIGTERM` for example. The exceptions are a write at the stop that
@@ -176,9 +177,12 @@ nothing happens. hvi parks every vCPU, writes the image, and resumes:
 [hvi] dumped 536870912 bytes of guest RAM to guest.ram
 ```
 
-The guest is stopped for the whole write. That is deliberate. A dump taken
-while the guest runs is torn, and a torn image is worse than a slow one
-because nothing about it says so.
+The vCPUs are stopped for the whole write. That is deliberate. A dump taken
+while the vCPUs run is torn, and a torn image is worse than a slow one because
+nothing about it says so. The pause parks the vCPUs only: a disk's worker and a
+shared folder's server still complete the requests the guest made before it, and
+a network reader delivers the frames that arrive. So the image can hold part of
+a read that was in flight, and a used ring the guest has not seen yet.
 
 ### The dump needs somewhere it is allowed to write
 
