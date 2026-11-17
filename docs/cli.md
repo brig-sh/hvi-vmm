@@ -51,7 +51,7 @@ including a typo, silently runs the plain test.
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | A writable virtio-blk disk. Repeatable. Each disk takes one of the interrupt lines every virtio device shares. A failure to open, or a lock another hvi holds on the image, fails the boot. |
-| `--disk path=<path>[,readonly=on\|off][,serial=<id>][,poll-max-us=<n>]` | none | The same disk with options. `readonly=on` opens the image `O_RDONLY` and advertises `VIRTIO_BLK_F_RO`. `serial` is what the guest reads from `/sys/block/vdX/serial`, 1 to 20 printable ASCII bytes, `disk<N>` by default with `N` the disk's position. Two disks may not share one. `poll-max-us` is the longest, in microseconds, the disk's worker polls its queue after a request before it sleeps: 32 by default, at most 1000, and 0 for no poll. A poll makes small requests that follow one another faster and uses host CPU while it lasts. |
+| `--disk path=<path>[,readonly=on\|off][,serial=<id>][,poll-max-us=<n>]` | none | The same disk with options. `readonly=on` opens the image `O_RDONLY` and advertises `VIRTIO_BLK_F_RO`. `serial` is what the guest reads from `/sys/block/vdX/serial`, 1 to 20 printable ASCII bytes, `disk<N>` by default with `N` the disk's position. Two disks may not share one. `poll-max-us` is the longest, in microseconds, the disk's worker polls after a request: 32 by default, at most 1000, 0 for no poll. See [storage-and-sharing.md](storage-and-sharing.md#virtio-blk---disk-file-and---disk-pathfile). |
 | `--fs tag=<tag>,path=<dir>[,readonly=on\|off][,cache=auto\|always\|none][,uid=<n>][,gid=<n>]` | none | virtio-fs export of `<dir>`, which hvi serves itself. Writable unless `readonly=on`; `cache` defaults to `auto`; `uid` and `gid` are the guest owner of the host user's files, 0 by default. Repeatable. macOS only. |
 | `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. The defaults are one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable. Each export takes one of the interrupt lines every virtio device shares: 17 on x86-64, 222 on arm64. Linux only. |
 | `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
@@ -73,10 +73,10 @@ including a typo, silently runs the plain test.
 Three things about the parser are worth knowing, because none of them warns.
 
 **Repeating a flag is last-wins.** Only `--fs`, `--share-ro`, `--share-rw` and
-`--disk` accumulate. Each `--disk` adds a disk, in command-line order, and a
-fifth fails the boot. Before hvi had more than one disk slot, a second `--disk`
-replaced the first without a word; a caller that relied on that now gets two
-disks.
+`--disk` accumulate. Each `--disk` adds a disk, in command-line order, until the
+guest's virtio device slots run out (see [limitations.md](limitations.md)).
+Before hvi had more than one disk slot, a second `--disk` replaced the first
+without a word; a caller that relied on that now gets two disks.
 
 **A value-taking flag at the end of the line silently takes none.** These
 flags accept a missing value as "not set" rather than erroring: `--kernel`,

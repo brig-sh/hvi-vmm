@@ -50,21 +50,15 @@ the run left out because the ledger's buffer was full, and appears only when
 there were any. A boot that fails before it writes `vmm.start` writes no
 `vmm.stop` either. A record's `ts` is when the VMM added it to the ledger's
 buffer, so a `vmm.vcpu_started` record can follow records the vCPU caused after
-it entered its run loop. A disk's worker adds the `block` records of a pass
-together once the pass ends, after the guest has seen those requests complete,
-so a `block` record can follow the record of what the guest did with the data. A
-pass is at most a queue's worth of requests.
+it entered its run loop.
 
 Under hvi's own binary, a panic stops the vCPUs and writes `vmm.stop` before the
 process aborts, with reason `failed` and the panic's report as `error`. The VMM
 waits up to half a second for the vCPUs to exit before it writes the record. So
 the record follows every record the vCPUs caused, unless a vCPU has not exited
-by then, such as one a plugin's pause holds. A `block` record comes from the
-disk's worker thread, which the panic does not stop. The worker starts no
-request once the ledger is closed, so at most the requests of the pass each disk
-had in progress at `vmm.stop` reach the disk with no record. The VMM writes a
-`vmm.vcpu_started` record a moment after the vCPU starts, so a vCPU that starts
-just before a panic can have none.
+by then, such as one a plugin's pause holds. The VMM writes a `vmm.vcpu_started`
+record a moment after the vCPU starts, so a vCPU that starts just before a panic
+can have none.
 
 On KVM every vCPU enters its run loop at the start, and one the guest has not
 brought up yet waits inside the hypervisor. On macOS a secondary vCPU enters its
@@ -112,6 +106,13 @@ records do not wait. The writer takes them at once when it is idle. After each
 write it waits 1 ms for more records before it goes idle, so the records of a
 burst are written together, within about 1 ms. A write in progress delays them
 until it ends.
+
+A disk's worker adds the `block` records of up to a queue's worth of requests
+together, after the guest has seen those requests complete. So a `block` record
+can follow the record of what the guest did with the data. A panic does not stop
+a disk's worker, but the worker starts no request once the ledger is closed. So
+at most a queue's worth of requests per disk, the ones in progress at
+`vmm.stop`, reach the disk with no record.
 
 A run loses nothing when the guest stops it, a vCPU fails, or a stop is
 requested, by `SIGTERM` for example. The exceptions are a write at the stop that
