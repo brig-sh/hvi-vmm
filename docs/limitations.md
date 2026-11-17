@@ -18,7 +18,7 @@ three things a reader should not have to guess between:
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | The KVM backends need kernel 4.11 or newer. | hvi stops a vCPU through `kvm_run.immediate_exit` and refuses to boot without `KVM_CAP_IMMEDIATE_EXIT`, which 4.11 added. | Platform |
 | No published crate. | Build from source, or take a release binary; pin a commit or a release tag when you depend on it. | Design |
-| The arm64/KVM backend is unit-tested on its stop path only. | Its only tests are the KVM tests in `src/hypervisor/kvm.rs`: the stop tests, of how a run stops (a vCPU thread that ends, a stop request, plugin threads, the lifecycle records, and a kick), and the queue notification test, which runs a few guest instructions in a bare VM. They need `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
+| The arm64/KVM backend is unit-tested on its stop path and its vGIC irqfd list only. | Its tests are the KVM tests in `src/hypervisor/kvm.rs`: the stop tests, of how a run stops (a vCPU thread that ends, a stop request, plugin threads, the lifecycle records, and a kick), and the queue notification test, which runs a few guest instructions in a bare VM. They need `/dev/kvm`. `src/arch/aarch64/kvm/gic.rs` also tests the vGIC's irqfd list, with and without `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
 
 ## Devices
 
