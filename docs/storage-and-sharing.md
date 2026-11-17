@@ -27,7 +27,9 @@ written.
 
 `poll-max-us=<n>` sets the longest, in microseconds, the disk's worker polls its
 queue after a request before it sleeps: 32 by default, at most 1000, and 0 for
-no poll.
+no poll. A poll makes small requests that follow one another faster and uses
+host CPU while it lasts. [limitations.md](limitations.md#devices) lists what a
+disk's worker costs the host.
 
 The image is locked for as long as the guest has it open: shared for a read-only
 disk, exclusive for a writable one, with `flock`. A second hvi on a writable
