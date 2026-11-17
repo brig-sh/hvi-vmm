@@ -69,18 +69,20 @@ Where it actually runs in CI:
 | x86-64 Linux, musl (`ubuntu-latest`) | The full suite for `x86_64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 | arm64 Linux, musl (`ubuntu-24.04-arm`) | The full suite for `aarch64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 
-`src/arch/x86_64/kvm/` has unit tests and they run on `ubuntu-latest`, so the
-x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm/gic.rs` has unit tests
-of the vGIC's irqfd list, which run on the arm64 runners. The KVM stop tests and
-the queue notification test in `src/hypervisor/kvm.rs` run on whichever KVM
-backend the host has, and they need `/dev/kvm`. The vGIC irqfd tests in
-`src/arch/aarch64/kvm/gic.rs` need `/dev/kvm` on an arm64 host, and the split
-irqchip tests in `src/arch/x86_64/kvm/ioapic.rs` need it on an x86-64 host.
+The KVM backends' own tests are these:
 
-The used-ring litmus, the virtio-fs benchmarks, the KVM stop tests, the queue
-notification test, the vGIC irqfd tests and the split irqchip tests are
-`#[ignore]`d and do not run in a normal `cargo test`. The `kvm` profile below
-runs the last four.
+| Tests | File | Needs `/dev/kvm` | In a normal `cargo test` |
+| --- | --- | --- | --- |
+| x86-64/KVM unit tests | `src/arch/x86_64/kvm/` | no | yes, on `ubuntu-latest` |
+| split irqchip tests | `src/arch/x86_64/kvm/ioapic.rs` | yes, on an x86-64 host | no, `#[ignore]`d |
+| vGIC irqfd list unit tests | `src/arch/aarch64/kvm/gic.rs` | no | yes, on the arm64 runners |
+| vGIC irqfd tests | `src/arch/aarch64/kvm/gic.rs` | yes, on an arm64 host | no, `#[ignore]`d |
+| KVM stop tests, queue notification test | `src/hypervisor/kvm.rs` | yes, on either KVM backend | no, `#[ignore]`d |
+
+So the x86-64/KVM backend is unit-tested. The arm64/KVM backend's gap is in
+[limitations.md](limitations.md#platforms-and-features). The used-ring litmus
+and the virtio-fs benchmarks are `#[ignore]`d too. The `kvm` profile below runs
+the `#[ignore]`d tests of the table.
 
 The stop tests boot a guest on the terminal, and two of them find a thread by
 name. Run them with the `kvm` profile in `.config/nextest.toml`, which runs each
@@ -155,8 +157,7 @@ layout, and adding a test.
 
 On x86-64 the suite runs in either irqchip mode. `HVI_E2E_IRQCHIP=kernel` makes
 every run pass `--irqchip kernel`, and `split` passes `--irqchip split`. Unset,
-the runs take hvi's default, the split irqchip. CI runs the suite once in each
-mode.
+the runs take hvi's default, the split irqchip.
 
 ```sh
 HVI_E2E_IRQCHIP=kernel cargo nextest run --manifest-path e2e/Cargo.toml

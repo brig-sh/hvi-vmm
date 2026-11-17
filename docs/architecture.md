@@ -319,10 +319,15 @@ as kvm-clock, steal time and paravirtual EOI, IPIs and TLB flushes. It starts on
 kvm-clock, and moves to the TSC when the host's TSC is invariant. A Linux guest
 also runs its local APIC in x2APIC mode, which it allows without interrupt
 remapping only under a hypervisor. With the TSC-deadline bit the guest runs its
-APIC timer in that mode and skips calibrating it at boot. With the split irqchip
-the guest has no PIT, so it depends on that mode. Linux leaves the PIT unused
-when kvm-clock gives it the TSC frequency, KVM's CPUID offers ARAT and the
-TSC-deadline bit is set (`apic_needs_pit` in Linux 6.18).
+APIC timer in that mode and skips calibrating it at boot.
+
+With the split irqchip, the default, the guest has no PIT and no PIC, so it
+depends on the TSC-deadline mode. Linux leaves the PIT unused when kvm-clock
+gives it the TSC frequency, KVM's CPUID offers ARAT and the TSC-deadline bit is
+set (`apic_needs_pit` in Linux 6.18). The 8259's ports read 0, so Linux's probe
+finds no PIC and every interrupt goes through the IOAPIC.
+[guest-images.md](guest-images.md#building-your-own) lists the kernel options
+this needs.
 
 With kvm-clock set up, a vCPU can tell the guest it was paused (section 5). A
 vCPU that parked for a second or more, and the boot vCPU after a safe point
@@ -383,40 +388,47 @@ device's lock. A raise triggers the interrupt only when its bit was clear, and
 an acknowledgment only clears bits. A raise whose trigger fails leaves its bit
 clear, so the next raise tries again. A legacy device sets its line under its
 own lock, and only when the level changes. The level is recorded only when the
-set succeeds, so a failed set is tried again. How an interrupt reaches the guest
-is the one device-facing thing that differs by backend:
+set succeeds, so a failed set is tried again.
 
-- **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
-  trigger sets the level to 1, which the GIC takes as one edge. The framework
-  delivers it from whichever thread set the level, and wakes a vCPU that waits
-  in WFI for it.
-- **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)` for the console UART,
-  the same call for vGICv2 and vGICv3. A virtio trigger is a write to an eventfd
-  that KVM delivers as an irqfd on the SPI, and the vGIC latches the SPI as
-  pending. KVM takes an irqfd only once the vGIC is initialized, so the vGIC
-  keeps the eventfds until boot initializes it, after the devices are attached
-  and before any vCPU runs. A vhost-user export's call eventfds are irqfds on
-  its SPI too, so a daemon's completion reaches the guest with no hvi thread.
-- **x86, split irqchip** (the default): hvi serves the IOAPIC, and KVM runs the
-  local APICs. Each IOAPIC input, GSIs 0 to 23, has an irqfd, and its KVM route
-  is the MSI its redirection entry describes. A virtio trigger and a rise of the
-  console UART's line write the input's irqfd, and a fall does nothing. KVM
-  delivers an irqfd on an MSI route in the thread that writes it. While the
-  guest has the input masked, the input holds one edge and sends it on unmask.
-  hvi sets the routes again only when an entry's MSI differs from its route. A
-  write to the high half of a masked entry sets none, so no route pairs the new
-  destination with the old vector while the guest writes the two halves. An
-  input with no route holds its edge as a masked one does. A vhost-user export's
-  call eventfds are further irqfds on its input. A daemon's completion then
-  reaches the guest with no hvi thread, also while the guest has the input
-  masked. The guest has no PIC and no PIT. The 8259's ports read 0, so Linux's
-  probe finds no PIC, and its timer is the local APIC's TSC-deadline mode.
-- **x86, in-kernel irqchip** (`--irqchip kernel`): KVM runs the IOAPIC, a PIC
-  and a PIT. A line is `vm.set_irq_line(GSI, level)`, GSIs 4 to 7 and 9 to 22. A
-  virtio trigger raises the pin and lowers it again, under a lock, since the
-  IOAPIC takes an edge only on a 0 to 1 transition. KVM delivers an irqfd on an
-  IOAPIC pin from a kernel worker thread, so a vhost-user export instead has an
-  hvi thread per queue that reads its call eventfd and triggers the interrupt.
+An irqfd is an eventfd that KVM ties to a guest interrupt. A write to the
+eventfd makes KVM deliver that interrupt, and hvi makes no further call. How an
+interrupt reaches the guest is the one device-facing thing that differs by
+backend.
+
+**macOS/arm64.** `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
+trigger sets the level to 1, which the GIC takes as one edge. The framework
+delivers it from whichever thread set the level, and wakes a vCPU that waits in
+WFI for it.
+
+**Linux/arm64.** `vm.set_irq_line(spi_gsi(SPI), level)` for the console UART,
+the same call for vGICv2 and vGICv3. A virtio trigger is a write to an eventfd
+that KVM delivers as an irqfd on the SPI, and the vGIC latches the SPI as
+pending. KVM takes an irqfd only once the vGIC is initialized, so the vGIC keeps
+the eventfds until boot initializes it, after the devices are attached and
+before any vCPU runs. A vhost-user export's call eventfds are irqfds on its SPI
+too, so a daemon's completion reaches the guest with no hvi thread.
+
+**x86, split irqchip** (the default). hvi serves the IOAPIC, and KVM runs the
+local APICs. Each IOAPIC input, GSIs 0 to 23, has an irqfd, and its KVM route is
+the MSI its redirection entry describes. A virtio trigger and a rise of the
+console UART's line write the input's irqfd, and a fall does nothing. KVM
+delivers an irqfd on an MSI route in the thread that writes it. The guest has no
+PIC and no PIT (section 3.2).
+
+While the guest has an input masked, the input holds one edge and sends it on
+unmask. An input with no route holds its edge as a masked one does. hvi sets the
+routes again only when an entry's MSI differs from its route. A write to the
+high half of a masked entry sets none, so no route pairs the new destination
+with the old vector while the guest writes the two halves. A vhost-user export's
+call eventfds are further irqfds on its input. A daemon's completion then
+reaches the guest with no hvi thread, also while the guest has the input masked.
+
+**x86, in-kernel irqchip** (`--irqchip kernel`). KVM runs the IOAPIC, a PIC and
+a PIT. A line is `vm.set_irq_line(GSI, level)`, GSIs 4 to 7 and 9 to 22. A
+virtio trigger raises the pin and lowers it again, under a lock, since the
+IOAPIC takes an edge only on a 0 to 1 transition. KVM delivers an irqfd on an
+IOAPIC pin from a kernel worker thread, so a vhost-user export instead has an
+hvi thread per queue that reads its call eventfd and triggers the interrupt.
 
 A daemon's write to a call eventfd sets no status bit. So once a device has an
 irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` from DRIVER_OK until
