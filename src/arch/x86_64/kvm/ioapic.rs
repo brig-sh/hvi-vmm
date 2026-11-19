@@ -34,8 +34,11 @@ impl irq::Chip for KernelIoApic {
         Arc::new(kvm::IrqLine::new(Arc::clone(&self.vm), gsi))
     }
 
-    fn trigger(&self, gsi: u32) -> Arc<dyn irq::Trigger> {
-        Arc::new(Pulsed::new(kvm::IrqLine::new(Arc::clone(&self.vm), gsi)))
+    fn trigger(&self, gsi: u32) -> std::io::Result<Arc<dyn irq::Trigger>> {
+        Ok(Arc::new(Pulsed::new(kvm::IrqLine::new(
+            Arc::clone(&self.vm),
+            gsi,
+        ))))
     }
 }
 
@@ -61,6 +64,9 @@ impl<L> Pulsed<L> {
     }
 }
 
+// `Pulsed` keeps the default `register_irqfd`, which answers `Unsupported`. KVM
+// delivers an irqfd on a pin of the in-kernel IOAPIC from a kernel worker
+// thread, which is slower than a pulse from the thread that reads the eventfd.
 impl<L: irq::Line> irq::Trigger for Pulsed<L> {
     fn trigger(&self) -> std::io::Result<()> {
         let line = self.line.lock().unwrap();

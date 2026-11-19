@@ -378,12 +378,27 @@ is the one device-facing thing that differs by backend:
 - **macOS/arm64**: `gic_set_spi(INTID, level)` on the in-kernel GICv3. A virtio
   trigger sets the level to 1, which the GIC takes as one edge. A virtio trigger
   on an I/O thread also kicks the vCPUs. The console UART's line never kicks.
-- **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)`, the same call for
-  vGICv2 and vGICv3. A virtio trigger is one call with level 1, which the vGIC
-  latches as pending.
+- **Linux/arm64**: `vm.set_irq_line(spi_gsi(SPI), level)` for the console UART,
+  the same call for vGICv2 and vGICv3. A virtio trigger is a write to an eventfd
+  that KVM delivers as an irqfd on the SPI, and the vGIC latches the SPI as
+  pending. KVM takes an irqfd only once the vGIC is initialized, so the vGIC
+  keeps the eventfds until boot initializes it, after the devices are attached
+  and before any vCPU runs. A vhost-user export's call eventfds are irqfds on
+  its SPI too, so a daemon's completion reaches the guest with no hvi thread.
 - **x86**: `vm.set_irq_line(GSI, level)` on the in-kernel IOAPIC, GSIs 4 to 7
   and 9 to 22. A virtio trigger raises the pin and lowers it again, under a
-  lock, since the IOAPIC takes an edge only on a 0 to 1 transition.
+  lock, since the IOAPIC takes an edge only on a 0 to 1 transition. KVM delivers
+  an irqfd on an IOAPIC pin from a kernel worker thread, so a vhost-user export
+  instead has an hvi thread per queue that reads its call eventfd and triggers
+  the interrupt.
+
+A daemon's write to a call eventfd sets no status bit. So once a device has an
+irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` beside any bit that is
+set from DRIVER_OK until the next reset, and 0 outside that time. A
+configuration change still sets its bit and triggers the interrupt. The status
+keeps `VIRTIO_MMIO_INT_VRING` beside `VIRTIO_MMIO_INT_CONFIG`, since the two can
+reach the guest as one interrupt, and the guest scans its queues only when it
+reads `VIRTIO_MMIO_INT_VRING`.
 
 ### Devices
 
