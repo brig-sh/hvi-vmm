@@ -1,9 +1,9 @@
 name: Test e2e
 
-# Runs the e2e suite in e2e/ on each backend. It builds the release hvi binary,
-# boots guests under it with its default confinement, and checks each run from
-# outside the process: exit status, stop line and event ledger. See
-# docs/testing.md.
+# Runs the e2e suite in e2e/ on each backend, and on x86-64 once with each
+# irqchip. It builds the release hvi binary, boots guests under it with its
+# default confinement, and checks each run from outside the process: exit
+# status, stop line and event ledger. See docs/testing.md.
 
 on:
   workflow_call:
@@ -34,12 +34,19 @@ jobs:
       # pairs by platform, so it holds only characters an artifact name allows.
       # The arm64 boards boot and run guests slower than the other runners, so
       # every timeout in the suite is doubled on them. The arm64/KVM rows name
-      # their host's vGIC, whose vCPU limit the 32-vCPU test expects.
+      # their host's vGIC, whose vCPU limit the 32-vCPU test expects. The x86
+      # rows differ in the irqchip. The first takes hvi's default, the split
+      # irqchip, and the second passes `--irqchip kernel` to every run.
       matrix:
         include:
           - platform: x86
             runs-on: [self-hosted, Linux, X64, kvm]
             guest-target: x86_64-unknown-linux-musl
+            timeout-scale: "1"
+          - platform: x86-irqchip-kernel
+            runs-on: [self-hosted, Linux, X64, kvm]
+            guest-target: x86_64-unknown-linux-musl
+            irqchip: kernel
             timeout-scale: "1"
           - platform: arm64-kvm-vGICv2
             runs-on: [self-hosted, Linux, ARM64, nbfc]
@@ -65,6 +72,7 @@ jobs:
     env:
       HVI_E2E_TIMEOUT_SCALE: ${{ matrix.timeout-scale }}
       HVI_E2E_VGIC: ${{ matrix.vgic }}
+      HVI_E2E_IRQCHIP: ${{ matrix.irqchip }}
     steps:
       # A pull request checks out its merge commit, whose first parent is the
       # base it is tested against.

@@ -259,6 +259,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut events = None;
     let mut sandbox_id = String::from("hvi");
     let mut vcpus: u32 = 1;
+    let mut irqchip = None;
     let mut agent_sock = None;
     let mut dump_memory = None;
     let mut dump_after = None;
@@ -404,6 +405,9 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 sandbox_id = it.next().ok_or("--sandbox-id needs a value")?.clone();
             }
             "--cpus" => vcpus = it.next().ok_or("--cpus needs a value")?.parse()?,
+            "--irqchip" => {
+                irqchip = Some(it.next().ok_or("--irqchip needs a value")?.parse()?);
+            }
             "--agent-sock" => agent_sock = it.next().cloned(),
             "--dump-memory" => dump_memory = it.next().cloned(),
             "--dump-after" => {
@@ -458,6 +462,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         events,
         sandbox_id,
         vcpus,
+        irqchip,
         agent_sock,
         sandbox,
         // `None` rather than an empty chain, so without tools the hooks stay a

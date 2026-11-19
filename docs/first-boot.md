@@ -184,6 +184,11 @@ which is the arm64 console and does nothing here. The devices are in the ACPI
 tables, so the guest kernel needs `CONFIG_ACPI`, which every distribution kernel
 has.
 
+By default the guest has no PIT and no PIC, and a distribution kernel boots
+without them. A guest that stops early in its boot and prints no reason needs
+them: boot it with `--irqchip kernel`, which gives it KVM's IOAPIC, PIC and PIT.
+[guest-images.md](guest-images.md#building-your-own) has the kernel options.
+
 `tools/mk-initramfs.py` builds an **arm64** initramfs only. For an x86-64
 guest, supply your own, or boot without one and let the kernel stop at the
 root-filesystem gate.
@@ -218,6 +223,8 @@ This is a check of the pre-boot pipeline. It is not a boot, and a successful
 | `Permission denied` opening `/dev/kvm` | Linux: you are not in the `kvm` group, or the shell predates the change. |
 | The console stops after `Run /init as init process` | The initramfs has no working `/init`, or it is built for the wrong architecture. |
 | The kernel panics at `Unable to mount root fs` | No initramfs and no `--disk`. Expected without a root filesystem. |
+| An x86-64 guest stops early in its boot and prints no reason | The guest needs a PIT or a PIC, which the default split irqchip does not have. Boot it with `--irqchip kernel`. |
+| `hvi: enabling the split irqchip: this host's KVM lacks KVM_CAP_SPLIT_IRQCHIP; --irqchip kernel boots without it` | Linux x86-64: the host's KVM cannot run the default irqchip. Boot with `--irqchip kernel`. |
 | `--net-stub` gives the guest an address but no name resolution | Expected while confined. See [networking.md](networking.md#dns). |
 
 ## Next

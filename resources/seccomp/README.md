@@ -20,18 +20,6 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-Three filters. `vcpu` is the tight one for the vCPU threads. A vCPU thread
-serves its MMIO and port exits, so the virtio-mmio transport, the net and vsock
-device models, the vhost-user handover and the legacy devices run there, and the
-device models parse guest descriptors. A disk's requests run on the disk's
-worker, so `vcpu` allows no read or write at an offset, no seek and no file
-sync. `block` covers each disk's worker thread, which parses the disk's
-descriptors and runs its requests against the backing file. It alone allows
-`preadv` and `pwritev`, which move a request's data between the backing file and
-guest RAM. `vmm` covers the thread that calls `boot`, the other host-side I/O
-threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal
-thread and the ledger's writer.
-
 A rule can also match an argument, as `block`'s `ioctl` rules match the request
 number:
 
@@ -44,6 +32,26 @@ number:
 The rules of one syscall are joined, so the syscall is allowed when any of them
 matches. A rule without `args` beside one with `args` does not allow every call:
 only the conditions count.
+
+A filter per kind of thread:
+
+- `vcpu` is the tight one, for the vCPU threads. A vCPU thread serves its MMIO
+  and port exits, so the virtio-mmio transport, the net and vsock device models,
+  the vhost-user handover and the legacy devices run there, and the device
+  models parse guest descriptors. A disk's requests run on the disk's worker, so
+  `vcpu` allows no read or write at an offset, no seek and no file sync.
+- `block` covers each disk's worker thread, which parses the disk's descriptors
+  and runs its requests against the backing file. It alone allows `preadv` and
+  `pwritev`, which move a request's data between the backing file and guest RAM.
+- `vmm` covers the thread that calls `boot`, the other host-side I/O threads,
+  the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and
+  the ledger's writer. No other thread makes `preadv` or `pwritev`, so `vmm`
+  does not allow them. It keeps `fdatasync` and `fsync`, which only a worker
+  calls, so that `block` stays within it apart from those two.
+
+One list serves both x86-64 irqchip modes. `block`'s `KVM_IRQ_LINE` rule serves
+the in-kernel irqchip only: with the split irqchip, a worker raises its disk's
+interrupt with a `write` to an irqfd, as it does on arm64.
 
 ## Why these are not Firecracker's lists
 

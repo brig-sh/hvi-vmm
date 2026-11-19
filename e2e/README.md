@@ -80,6 +80,7 @@ cargo nextest run --manifest-path e2e/Cargo.toml \
 | `HVI_E2E_CACHE` | the runner | The download cache. |
 | `HVI_E2E_ARTIFACTS` | the runner | Where runs write their files. |
 | `HVI_E2E_VIRTIOFSD` | the runner | The virtiofsd to use, instead of the one found. |
+| `HVI_E2E_IRQCHIP` | the runner | The `--irqchip` every run passes on an x86-64 host, `split` or `kernel`. Unset, the runs take hvi's default, `split`. The arm64 backends refuse the option. |
 | `HVI_E2E_VGIC` | the runner | The vGIC an arm64 KVM host offers, `v2` or `v3`. The 32-vCPU test then expects that vGIC's limit rather than reading it from hvi's stderr. |
 | `HVI_E2E_HVI`, `HVI_E2E_KERNEL`, `HVI_E2E_INITRAMFS`, `HVI_E2E_GVPROXY`, `HVI_E2E_TAP`, `HVI_E2E_TAP_ADDRESS` | the setup binary | What it prepared, for the tests. |
 

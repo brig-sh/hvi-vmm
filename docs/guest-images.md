@@ -80,6 +80,7 @@ CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_RTC_DRV_CMOS=y               # not optional, see below
 CONFIG_X86_MPPARSE=y                # the CPUs from the MP table, without ACPI
+CONFIG_KVM_GUEST=y                  # kvm-clock, which the split irqchip needs
 CONFIG_ACPI=y                       # power off, see below
 ```
 
@@ -112,6 +113,20 @@ table instead: it finds its CPUs, but no virtio device, and it has no way to
 power off: `poweroff` halts it, and hvi does not see the halt. The command
 `reboot -f` ends the run either way, through the ACPI reset register or the
 i8042's reset command.
+
+With the split irqchip, the default, an x86-64 guest has no PIT and no PIC. Its
+timer is the local APIC timer in TSC-deadline mode, which hvi offers in CPUID.
+Linux leaves the PIT unused when it knows the TSC frequency, which kvm-clock
+gives it, and when the TSC-deadline mode and ARAT are offered. So a Linux guest
+needs `CONFIG_KVM_GUEST`. Without kvm-clock, as with `no-kvmclock`, Linux
+calibrates the TSC against the PIT unless CPUID reports the frequency.
+[architecture.md](architecture.md#32-x86-64-the-linux-64-bit-boot-protocol)
+describes how the guest finds no PIC.
+
+A guest that needs a PIT or a PIC stops early in its boot with the split irqchip
+and prints no reason. It runs with the in-kernel irqchip, `--irqchip kernel`,
+where KVM provides both. hvi's boot line names the irqchip in use (see
+[cli.md](cli.md#startup-output)).
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.

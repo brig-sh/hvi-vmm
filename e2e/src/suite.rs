@@ -44,6 +44,8 @@ pub mod vars {
     pub const TIMEOUT_SCALE: &str = "HVI_E2E_TIMEOUT_SCALE";
     /// The vGIC an arm64 KVM host offers, `v2` or `v3`.
     pub const VGIC: &str = "HVI_E2E_VGIC";
+    /// The `--irqchip` every run passes on an x86-64 host, `split` or `kernel`.
+    pub const IRQCHIP: &str = "HVI_E2E_IRQCHIP";
 }
 
 /// The binaries, guest images and host capabilities the setup binary prepared
@@ -69,6 +71,8 @@ pub struct Suite {
     /// The vGIC this arm64 KVM host offers, `v2` or `v3`, when the runner
     /// states it.
     pub vgic: Option<String>,
+    /// The `--irqchip` every run passes, or `None` for hvi's default.
+    pub irqchip: Option<String>,
 }
 
 impl Suite {
@@ -114,6 +118,9 @@ impl Suite {
             vgic: std::env::var(vars::VGIC)
                 .ok()
                 .filter(|vgic| !vgic.is_empty()),
+            irqchip: std::env::var(vars::IRQCHIP)
+                .ok()
+                .filter(|irqchip| !irqchip.is_empty()),
         }
     }
 
