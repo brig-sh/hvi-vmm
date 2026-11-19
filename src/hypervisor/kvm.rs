@@ -29,10 +29,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{KVM_EXIT_INTR, KVM_SYSTEM_EVENT_RESET};
-use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{IoEventAddress, VcpuExit, VcpuFd, VmFd};
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::{BootConfig, Stop};
-use crate::devices::irq::IrqLine;
+use crate::devices::irq;
 use crate::hypervisor::guest::{Guest, LedgerCloseGuard, SafepointVcpu};
 use crate::hypervisor::vcpus::{report_on_panic, Kick, Outcome};
 use crate::io_threads::{HostWork, IoThreads};
@@ -135,24 +136,42 @@ impl Kick for Kicker {
 }
 
 /// A guest interrupt line on KVM's in-kernel interrupt controller.
-pub(crate) struct KvmIrqLine {
+pub(crate) struct IrqLine {
     /// The VM whose interrupt controller has the line.
     vm: Arc<VmFd>,
     /// The line's number, as `KVM_IRQ_LINE` takes it.
     gsi: u32,
 }
 
-impl KvmIrqLine {
+impl IrqLine {
     /// Returns the line `gsi` of `vm`.
     pub(crate) fn new(vm: Arc<VmFd>, gsi: u32) -> Self {
         Self { vm, gsi }
     }
 }
 
-impl IrqLine for KvmIrqLine {
+impl irq::Line for IrqLine {
     fn set_level(&self, level: bool) -> std::io::Result<()> {
         Ok(self.vm.set_irq_line(self.gsi, level)?)
     }
+}
+
+/// Makes `vm` signal `fd` for a 4-byte guest write of `value` to `address`,
+/// instead of exiting to hvi.
+///
+/// KVM takes the width it matches from the size of `value`. A write of another
+/// value or width still exits.
+///
+/// # Errors
+///
+/// Errors if KVM refuses the registration.
+pub(crate) fn register_ioeventfd(
+    vm: &VmFd,
+    fd: &EventFd,
+    address: u64,
+    value: u32,
+) -> std::io::Result<()> {
+    Ok(vm.register_ioevent(fd, &IoEventAddress::Mmio(address), value)?)
 }
 
 /// A vCPU thread as the other threads reach it.
@@ -888,5 +907,90 @@ mod stop_tests {
             immediate_exit(&mut registered.vcpu).load(Ordering::SeqCst),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+    use crate::memory::GuestRam;
+    use kvm_ioctls::Kvm;
+
+    /// The guest RAM, as its address and length. On arm64 the code runs from
+    /// address 0, where `KVM_ARM_VCPU_INIT` leaves the PC. The 64 KiB region is
+    /// whole pages on any host page size.
+    #[cfg(target_arch = "x86_64")]
+    const RAM: (u64, usize) = (0x1000, 0x1000);
+    #[cfg(target_arch = "aarch64")]
+    const RAM: (u64, usize) = (0, 0x1_0000);
+
+    /// The notification register, outside the guest RAM.
+    #[cfg(target_arch = "x86_64")]
+    const NOTIFY: u64 = 0x8000;
+    #[cfg(target_arch = "aarch64")]
+    const NOTIFY: u64 = 0x4_0000;
+
+    /// Guest code that writes the 4-byte values 1 and then 2 to [`NOTIFY`], for
+    /// real mode with the code segment at 0.
+    #[cfg(target_arch = "x86_64")]
+    const CODE: &[u8] = &[
+        0x66, 0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0x66, 0xa3, 0x00, 0x80, // mov [0x8000], eax
+        0x66, 0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2
+        0x66, 0xa3, 0x00, 0x80, // mov [0x8000], eax
+        0xf4, // hlt
+    ];
+
+    /// Guest code that writes the 4-byte values 1 and then 2 to [`NOTIFY`].
+    #[cfg(target_arch = "aarch64")]
+    const CODE: &[u32] = &[
+        0xd2a0_0081, // movz x1, #0x4, lsl #16
+        0x5280_0020, // movz w0, #1
+        0xb900_0020, // str w0, [x1]
+        0x5280_0040, // movz w0, #2
+        0xb900_0020, // str w0, [x1]
+        0x1400_0000, // b .
+    ];
+
+    // The guest writes queue 1's index and then queue 2's. KVM consumes the
+    // first, so the vCPU's first exit is the second write. Ignored by default,
+    // as it needs a usable `/dev/kvm`.
+    #[test]
+    #[ignore]
+    fn registered_notification_reaches_the_eventfd_without_an_exit() {
+        let kvm = Kvm::new().expect("/dev/kvm is not usable");
+        let vm = kvm.create_vm().unwrap();
+        let ram = GuestRam::from_ranges(&[RAM]);
+        ram.register_kvm_slots(&vm).unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        {
+            ram.write(RAM.0, CODE).unwrap();
+            let mut sregs = vcpu.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            vcpu.set_sregs(&sregs).unwrap();
+            let mut regs = vcpu.get_regs().unwrap();
+            regs.rip = RAM.0;
+            regs.rflags = 2;
+            vcpu.set_regs(&regs).unwrap();
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let code: Vec<u8> = CODE.iter().flat_map(|word| word.to_le_bytes()).collect();
+            ram.write(RAM.0, &code).unwrap();
+            let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+            vm.get_preferred_target(&mut kvi).unwrap();
+            vcpu.vcpu_init(&kvi).unwrap();
+        }
+        let fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        register_ioeventfd(&vm, &fd, NOTIFY, 1).unwrap();
+
+        let exit = match vcpu.run().unwrap() {
+            VcpuExit::MmioWrite(address, data) => (address, data.to_vec()),
+            other => panic!("unexpected exit {other:?}"),
+        };
+        assert_eq!(exit, (NOTIFY, vec![2, 0, 0, 0]));
+        assert_eq!(fd.read().unwrap(), 1);
     }
 }

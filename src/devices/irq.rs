@@ -12,19 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The interrupt line a device drives.
+//! The interrupt line a device drives, and the controller it is on.
 //!
 //! The line is set under the lock that decided the level, and only when the
 //! level changes. Two threads that change one device's level then cannot leave
 //! the line at a level the device no longer has. A virtio device's level is
 //! held by its [`Interrupt`](crate::devices::virtio::mmio::Interrupt). Each
-//! backend supplies the line, since how it reaches the guest's interrupt
-//! controller is the hypervisor's.
+//! backend supplies the lines through its [`Chip`], since how a line reaches
+//! the guest's interrupt controller is the hypervisor's.
 
 use std::sync::Arc;
 
-/// A device's interrupt line, as the backend wires it to the guest.
-pub(crate) trait IrqLine: Send + Sync {
+/// A guest's interrupt controller, which gives each device its line.
+pub(crate) trait Chip {
+    /// Returns the line of interrupt `irq`, numbered as in
+    /// [`Slot::irq`](crate::devices::manager::Slot::irq).
+    fn line(&self, irq: u32) -> Arc<dyn Line>;
+}
+
+impl<C: Chip + ?Sized> Chip for &C {
+    fn line(&self, irq: u32) -> Arc<dyn Line> {
+        (**self).line(irq)
+    }
+}
+
+/// A device's interrupt line on the guest's interrupt controller.
+pub(crate) trait Line: Send + Sync {
     /// Sets the line to `level`.
     ///
     /// # Errors
@@ -37,14 +50,14 @@ pub(crate) trait IrqLine: Send + Sync {
 #[derive(Default)]
 pub(crate) struct Irq {
     /// The line, once the backend has connected one.
-    line: Option<Arc<dyn IrqLine>>,
+    line: Option<Arc<dyn Line>>,
     /// The level the line was last set to. The line starts low.
     high: bool,
 }
 
 impl Irq {
     /// Connects the backend's `line`.
-    pub(crate) fn connect(&mut self, line: Arc<dyn IrqLine>) {
+    pub(crate) fn connect(&mut self, line: Arc<dyn Line>) {
         self.line = Some(line);
     }
 
@@ -76,7 +89,7 @@ mod tests {
         sets: AtomicU32,
     }
 
-    impl IrqLine for CountingLine {
+    impl Line for CountingLine {
         fn set_level(&self, _level: bool) -> std::io::Result<()> {
             self.sets.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -93,7 +106,7 @@ mod tests {
         sets: AtomicU32,
     }
 
-    impl IrqLine for RefusesFirst {
+    impl Line for RefusesFirst {
         fn set_level(&self, _level: bool) -> std::io::Result<()> {
             if !self.refused.swap(true, Ordering::SeqCst) {
                 return Err(std::io::Error::other("refused"));
@@ -107,7 +120,7 @@ mod tests {
     fn line_is_set_only_when_the_level_changes() {
         let line = Arc::new(CountingLine::default());
         let mut irq = Irq::default();
-        irq.connect(Arc::clone(&line) as Arc<dyn IrqLine>);
+        irq.connect(Arc::clone(&line) as Arc<dyn Line>);
         for level in [false, true, true, true, false, false, true] {
             irq.set(level);
         }
@@ -118,7 +131,7 @@ mod tests {
     fn refused_set_is_tried_again() {
         let line = Arc::new(RefusesFirst::default());
         let mut irq = Irq::default();
-        irq.connect(Arc::clone(&line) as Arc<dyn IrqLine>);
+        irq.connect(Arc::clone(&line) as Arc<dyn Line>);
         irq.set(true);
         irq.set(true);
         assert_eq!(line.sets.load(Ordering::SeqCst), 1);
