@@ -1125,7 +1125,7 @@ mod device {
                 .call_fd(0)
                 .expect("queue 0")
                 .expect("a call descriptor");
-            let (interrupt, line) = testing::enabled_interrupt();
+            let (interrupt, trigger) = testing::enabled_interrupt();
             let stop = StopSource::new().expect("a stop pair");
             let serving = {
                 let (call, token) = (call.try_clone().unwrap(), stop.token());
@@ -1135,11 +1135,11 @@ mod device {
             let held = dev.lock().expect("the device");
             call.write(1).expect("signal a used buffer");
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !line.is_high() && std::time::Instant::now() < deadline {
+            while trigger.count() == 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
             drop(held);
-            assert!(line.is_high(), "a used buffer left the line low");
+            assert_eq!(trigger.count(), 1, "a used buffer triggered no interrupt");
 
             stop.request_stop();
             serving.join().expect("the stop ended the thread");

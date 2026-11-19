@@ -1365,7 +1365,7 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::devices::virtio::mmio::testing::{self, Driver, LevelLine, Rings};
+    use crate::devices::virtio::mmio::testing::{self, CountingTrigger, Driver, Rings};
     use crate::devices::virtio::mmio::{INTERRUPT_ACK, INTERRUPT_STATUS};
     use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use std::io::Read;
@@ -1724,7 +1724,7 @@ mod tests {
 
     /// Activates `net` with an 8-entry queue `index` ready at the given rings.
     ///
-    /// Returns the line the device's interrupt drives.
+    /// Returns the trigger the device's interrupt calls.
     fn activate_with_queue(
         net: &mut VirtioNet,
         mem: &GuestRam,
@@ -1732,7 +1732,7 @@ mod tests {
         desc: u64,
         avail: u64,
         used: u64,
-    ) -> Arc<LevelLine> {
+    ) -> Arc<CountingTrigger> {
         let rings = Rings {
             size: 8,
             desc_table: desc,
@@ -1742,9 +1742,9 @@ mod tests {
         let queues = (0..2)
             .map(|queue| (queue == index).then(|| testing::ready_queue(QUEUE_MAX_SIZE, rings, mem)))
             .collect();
-        let (interrupt, line) = testing::enabled_interrupt();
+        let (interrupt, trigger) = testing::enabled_interrupt();
         net.activate(mem, 0, queues, interrupt).unwrap();
-        line
+        trigger
     }
 
     // The built-in stack answers the DISCOVER inside the transmit path, so the
@@ -2116,7 +2116,7 @@ mod tests {
         const BASE: u64 = 0x4000_0000;
         let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
-        let line = activate_with_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
+        let trigger = activate_with_queue(&mut net, &mem, TX_QUEUE, desc, avail, used);
 
         // A UDP frame the flow plugin records (10.0.2.15:1234 -> 1.2.3.4:9999).
         let udp = udp_datagram(1234, 9999, b"payload");
@@ -2159,7 +2159,7 @@ mod tests {
         assert_eq!(*proto, IP_UDP);
         assert_eq!(*dst, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(*dst_port, 9999);
-        assert!(line.is_high(), "the used-buffer interrupt was raised");
+        assert_eq!(trigger.count(), 1, "the used buffer was signaled");
     }
 
     /// A guest cannot hand the host kernel checksum or segmentation metadata
@@ -2423,12 +2423,13 @@ mod tests {
     }
 
     // A vCPU acknowledges the interrupt through the transport, without the
-    // device lock, while a reader delivers the next frame under it. The vCPU
-    // reposts one RX buffer per acknowledgment, as a guest driver refills its
-    // ring. A line that ended low over a completed buffer would stop both: the
-    // vCPU waits for the line and the reader waits for the acknowledgment.
+    // device lock, while a reader delivers frames under it. The vCPU handles
+    // each trigger in the order Linux's driver does: it reads the status,
+    // acknowledges what it read, then drains the used ring and reposts each
+    // buffer it drained. A completed buffer that no trigger followed would stop
+    // both: the vCPU waits for a trigger and the reader for a free buffer.
     #[test]
-    fn line_never_ends_low_over_a_completed_buffer() {
+    fn guest_keeps_receiving_while_acknowledgments_race_deliveries() {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::time::{Duration, Instant};
         const BASE: u64 = 0x4000_0000;
@@ -2456,33 +2457,43 @@ mod tests {
         let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
         let frame = eth_frame(GUEST_MAC, OUR_MAC, ETH_IPV4, &ip);
         let done = AtomicBool::new(false);
-        let acks = AtomicU32::new(0);
+        let drained = AtomicU32::new(0);
         let (mut seen, mut quiet) = (0, 0);
         std::thread::scope(|scope| {
-            // The reader delivers as soon as the vCPU's acknowledgment has
-            // dropped the level, the moment the two race for the line.
             scope.spawn(|| {
                 while !done.load(Ordering::SeqCst) {
                     let mut net = driver.device.lock().unwrap();
-                    if !driver.line.is_high() {
+                    let free = mem.read_u16(avail + 2).unwrap() != mem.read_u16(used + 2).unwrap();
+                    if free {
                         let _ = net.deliver(&mem, &frame);
                     }
                 }
             });
             scope.spawn(|| {
+                let (mut handled, mut used_seen) = (0, 0u16);
                 while !done.load(Ordering::SeqCst) {
-                    if driver.line.is_high() {
-                        driver.write(INTERRUPT_ACK, 1);
-                        let idx = mem.read_u16(avail + 2).unwrap();
-                        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
-                        acks.fetch_add(1, Ordering::SeqCst);
+                    let triggers = driver.trigger.count();
+                    if triggers == handled {
+                        continue;
                     }
+                    handled = triggers;
+                    let status = driver.read(INTERRUPT_STATUS);
+                    driver.write(INTERRUPT_ACK, status);
+                    let used_now = mem.read_u16(used + 2).unwrap();
+                    let completed = used_now.wrapping_sub(used_seen);
+                    used_seen = used_now;
+                    let idx = mem.read_u16(avail + 2).unwrap();
+                    mem.write_u16(avail + 2, idx.wrapping_add(completed))
+                        .unwrap();
+                    drained.fetch_add(u32::from(completed), Ordering::SeqCst);
                 }
             });
             let start = Instant::now();
-            while acks.load(Ordering::SeqCst) < 20_000 && start.elapsed() < Duration::from_secs(5) {
+            while drained.load(Ordering::SeqCst) < 20_000
+                && start.elapsed() < Duration::from_secs(5)
+            {
                 std::thread::sleep(Duration::from_millis(10));
-                let now = acks.load(Ordering::SeqCst);
+                let now = drained.load(Ordering::SeqCst);
                 quiet = if now == seen { quiet + 1 } else { 0 };
                 seen = now;
                 if quiet >= 20 {
@@ -2493,9 +2504,9 @@ mod tests {
         });
         assert!(
             quiet < 20,
-            "progress stopped after {} acks: the line is {} over an interrupt status of {}",
-            acks.load(Ordering::SeqCst),
-            driver.line.is_high(),
+            "progress stopped after {} drained buffers: {} triggers over an interrupt status of {}",
+            drained.load(Ordering::SeqCst),
+            driver.trigger.count(),
             driver.read(INTERRUPT_STATUS)
         );
     }
