@@ -217,17 +217,33 @@ jobs:
       - name: build
         if: steps.kvm.outputs.ok == 'yes'
         run: cargo build --release
-      # `linux-headers-virtual` is here for `scripts/extract-vmlinux`, which the
-      # step below runs against the image `linux-image-virtual` installs.
+      # The step installs the guest kernel and its headers, and outputs the
+      # release and image of the kernel `linux-image-virtual` depends on. The
+      # boots use that kernel rather than the newest one under /boot, which can
+      # be any kernel the runner has.
       - name: guest kernel
-        if: steps.kvm.outputs.ok == 'yes'
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends linux-image-virtual linux-headers-virtual zstd binutils
-      - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
+        id: kernel
         if: steps.kvm.outputs.ok == 'yes'
         run: |
-          # Use find, not ls. SC2012 refuses a script that parses the
-          # output of ls, and it is correct to do so.
-          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1); echo "kernel: $KIMG"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            linux-image-virtual linux-headers-virtual zstd binutils
+          KREL=$(dpkg-query -W -f='${Depends}' linux-image-virtual \
+            | grep -o 'linux-image-[0-9][^ ,]*' | head -1) || true
+          test -n "$KREL" \
+            || { echo "::error::linux-image-virtual names no image"; exit 1; }
+          KREL=${KREL#linux-image-}
+          KIMG=/boot/vmlinuz-$KREL
+          test -f "$KIMG" \
+            || { echo "::error::no kernel image for '$KREL'"; exit 1; }
+          echo "kernel: $KIMG"
+          echo "release=$KREL" >> "$GITHUB_OUTPUT"
+          echo "image=$KIMG" >> "$GITHUB_OUTPUT"
+      - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
+        if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.image }}
+        run: |
           # 2>&1: the VMM's own lines (including what it says about seccomp)
           # go to stderr, and asserting on them means capturing them.
           sudo timeout 90 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 1024 --cpus 2 \
@@ -254,19 +270,20 @@ jobs:
           echo "kvm-clock and the TSC-deadline timer ✓"
       # The distribution vmlinuz is a bzImage. `scripts/extract-vmlinux` unpacks
       # the ELF inside it, which is the other x86 format hvi boots. It comes
-      # from the headers package apt installed a step ago, so it is the copy
-      # that ships with the kernel being unpacked, it arrives over the same
+      # from the headers package the guest kernel step installs, so it is the
+      # copy that ships with the kernel being unpacked, it arrives over the same
       # signed archive as everything else here, and the job reaches no host of
       # its own to get it.
       - name: boot the uncompressed vmlinux
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.image }}
+          KREL: ${{ steps.kernel.outputs.release }}
         run: |
-          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
-          EXTRACT=$(find /usr/src -maxdepth 3 -type f -path '*/scripts/extract-vmlinux' \
-            | sort -V | tail -1)
-          # Named rather than assumed: the path carries a kernel version, and a
-          # missing file would otherwise surface as an empty vmlinux below.
-          test -n "$EXTRACT" || { echo "::error::no extract-vmlinux in the installed kernel headers"; exit 1; }
+          EXTRACT=/lib/modules/$KREL/build/scripts/extract-vmlinux
+          # A missing script would otherwise surface as an empty vmlinux below.
+          test -f "$EXTRACT" \
+            || { echo "::error::no extract-vmlinux at $EXTRACT"; exit 1; }
           echo "extractor: $EXTRACT"
           sudo install -m 644 "$KIMG" vmlinuz
           bash "$EXTRACT" vmlinuz > vmlinux
@@ -285,8 +302,9 @@ jobs:
       # e820 must show the split, not the hole described as RAM.
       - name: boot with 4096 MiB, RAM split around the MMIO hole
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.image }}
         run: |
-          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
           sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 4096 --cpus 1 \
             --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-4g.log || true
           grep -q "Linux version" boot-4g.log || { echo "::error::the 4 GiB guest did not boot"; exit 1; }
@@ -304,9 +322,10 @@ jobs:
       # to one would end only at the timeout.
       - name: check that power-off and reset end the run
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.image }}
         run: |
           sudo apt-get install -y --no-install-recommends busybox-static cpio
-          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
           for cmd in poweroff reboot; do
             W=$(mktemp -d); mkdir -p "$W/bin"
             cp /bin/busybox "$W/bin/busybox"
@@ -388,11 +407,13 @@ jobs:
       # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
       - name: serve a virtio-fs export through virtiofsd
         if: steps.kvm.outputs.ok == 'yes'
+        env:
+          KIMG: ${{ steps.kernel.outputs.image }}
+          KREL: ${{ steps.kernel.outputs.release }}
         run: |
           sudo apt-get install -y --no-install-recommends virtiofsd busybox-static cpio
           VFSD=$(dpkg -L virtiofsd | grep -E "(bin|libexec)/virtiofsd$" | head -1)
           echo "daemon: $VFSD"; "$VFSD" --version
-          KREL=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)
           # The distribution kernel builds virtiofs as a module, so the guest
           # loads it before it can mount anything.
           W=$(mktemp -d); mkdir -p "$W/bin"
@@ -416,7 +437,6 @@ jobs:
           chmod +x "$W/init"
           ( cd "$W" && find . | cpio -o -H newc --quiet | gzip -1 ) > fs-initramfs.cpio.gz
           rm -rf share && mkdir share && echo "hello from the host" > share/hello.txt
-          KIMG=$(find /boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)
           # hvi starts no daemon. The step runs virtiofsd as a runtime would,
           # and the daemon exits once hvi closes the connection.
           rm -f fs.sock
