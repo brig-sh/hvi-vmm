@@ -100,8 +100,8 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         }
     }
 
-    // Each device's transport writes to the ledger, and its line kicks the
-    // vCPUs, so both exist before the devices.
+    // Each device's transport writes to the ledger, so it exists before the
+    // devices.
     let ledger = Arc::new(Ledger::new(cfg.events.as_deref(), &cfg.sandbox_id)?);
     if ledger.is_enabled() {
         eprintln!(
@@ -114,10 +114,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         Kicker::new(vm.clone(), num_cpus),
         cfg.take_stop_handle()?,
     ));
-    let irq_chip = gic::Gic {
-        vm: vm.clone(),
-        vcpus: Arc::clone(&vcpus),
-    };
+    let irq_chip = gic::Gic { vm: vm.clone() };
     let uart_line = irq_chip.line(UART_SPI);
     let mut devices = DeviceManager::new(&ram, &ledger, slots, irq_chip);
     let pl011 = devices.attach_uart_and_rtc()?;

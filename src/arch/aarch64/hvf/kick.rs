@@ -197,8 +197,3 @@ thread_local! {
     /// The handle id of this thread's vCPU, so a kick can leave it out.
     static OWN_VCPU: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
-
-/// Returns whether the calling thread runs a vCPU.
-pub(super) fn on_vcpu_thread() -> bool {
-    OWN_VCPU.with(std::cell::Cell::get).is_some()
-}
