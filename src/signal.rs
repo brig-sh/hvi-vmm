@@ -169,14 +169,14 @@ pub(crate) fn start_stop_signal_thread() -> io::Result<()> {
 /// terminal and ends the process, unless it arrives within [`STOP_TIMEOUT`] of
 /// the first.
 fn receive_stop_signals(state: &Mutex<StopSignals>, mut signals: Signals) {
-    crate::sandbox::confine_io_thread();
+    crate::sandbox::confine_io_thread(crate::sandbox::Thread::Vmm);
     // The thread inherits the mask of the one that started it, and a stop
     // signal blocked here would only pend when it is raised to end the process.
     unblock(&STOP_SIGNALS);
     for signal in signals.forever() {
         // A run with the sandbox off starts the thread unfiltered, so each wake
         // confines it under the filters a later run armed.
-        crate::sandbox::confine_io_thread();
+        crate::sandbox::confine_io_thread(crate::sandbox::Thread::Vmm);
         let escalate = {
             let mut state = state.lock().unwrap();
             match state.first {

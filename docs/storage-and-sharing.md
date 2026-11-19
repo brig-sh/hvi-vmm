@@ -8,8 +8,8 @@ have both at once, and either on its own.
 
 Each `--disk` backs one block device from one host file or block device. The
 flag is repeatable and takes either a bare path or
-`path=<file>[,readonly=on|off][,serial=<id>]`. Each disk takes one of the
-interrupt lines every virtio device shares. There is no hotplug.
+`path=<file>[,readonly=on|off][,serial=<id>][,poll-max-us=<n>]`. Each disk takes
+one of the interrupt lines every virtio device shares. There is no hotplug.
 
 ```sh
 hvi boot --kernel <Image> \
@@ -24,6 +24,12 @@ A `readonly=on` disk is opened `O_RDONLY`, so an image hvi may not write still
 attaches. hvi advertises `VIRTIO_BLK_F_RO` for it and refuses any write the
 guest sends anyway with an I/O error. A flush on it succeeds, since nothing was
 written.
+
+`poll-max-us=<n>` sets the longest, in microseconds, the disk's worker polls its
+queue after a request before it sleeps: 32 by default, at most 1000, and 0 for
+no poll. A poll makes small requests that follow one another faster and uses
+host CPU while it lasts. [limitations.md](limitations.md#devices) lists what a
+disk's worker costs the host.
 
 The image is locked for as long as the guest has it open: shared for a read-only
 disk, exclusive for a writable one, with `flock`. A second hvi on a writable

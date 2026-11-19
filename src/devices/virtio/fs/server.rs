@@ -38,13 +38,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
+use vm_memory::VolatileSlice;
+
 use crate::config::CachePolicy;
 use crate::devices::virtio::fs::fdlimit;
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::{
     self, read_config_bytes, DescriptorChain, DeviceState, Queue, QUEUE_MAX_SIZE,
 };
-use crate::memory::GuestRam;
+use crate::memory::{read_vectored_at_volatile, write_vectored_at_volatile, GuestRam, IOV_MAX};
 
 /// How many virtio-fs chains a vCPU services in its own exit before handing the
 /// rest to the device's worker thread.
@@ -58,14 +60,6 @@ const TAG_LEN: usize = 36;
 const CONFIG_LEN: usize = TAG_LEN + 4;
 const MAX_REQUEST: usize = 2 << 20;
 const MAX_WRITE: u32 = 1 << 20;
-
-/// Largest iovec count a single `preadv`/`pwritev` may carry. `libc::IOV_MAX`
-/// is only defined for BSD-family targets in the `libc` crate; on Linux this
-/// is `UIO_MAXIOV`, kernel-enforced and stable since 2.6.18.
-#[cfg(target_os = "macos")]
-const IOV_MAX: usize = libc::IOV_MAX as usize;
-#[cfg(target_os = "linux")]
-const IOV_MAX: usize = 1024;
 
 const FUSE_ROOT_ID: u64 = 1;
 const IN_HEADER_LEN: usize = 40;
@@ -3187,9 +3181,9 @@ impl VirtioFs {
 
         let capacity = max_out.saturating_sub(OUT_HEADER_LEN);
         let want = requested.min(capacity).min(MAX_WRITE as usize);
-        let (iov, _covered) = build_iov(mem, output, OUT_HEADER_LEN, want).ok()?;
+        let (buffers, _covered) = direct_buffers(mem, output, OUT_HEADER_LEN, want).ok()?;
 
-        let n = match preadv_retry(&handle.file, &iov, offset) {
+        let n = match read_vectored_at_volatile(&handle.file, &buffers, offset) {
             Ok(n) => n,
             Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
         };
@@ -3252,11 +3246,11 @@ impl VirtioFs {
         if !handle.writable {
             return None;
         }
-        let (iov, covered) = build_iov(mem, input, IN_HEADER_LEN + 40, size).ok()?;
+        let (buffers, covered) = direct_buffers(mem, input, IN_HEADER_LEN + 40, size).ok()?;
         if covered < size {
             return None;
         }
-        let n = match pwritev_retry(&handle.file, &iov, offset) {
+        let n = match write_vectored_at_volatile(&handle.file, &buffers, offset) {
             Ok(n) => n,
             Err(e) => return Some(Reply::Buffered(error_response(unique, io_errno(e)))),
         };
@@ -7202,23 +7196,24 @@ fn gather(mem: &GuestRam, descs: &[(u64, u32)], skip: usize, out: &mut [u8]) -> 
     }
 }
 
-/// Builds iovecs borrowing guest RAM directly for `descs`, skipping `skip`
-/// bytes of the logical concatenation and capping the total at `cap` bytes.
-/// Returns the iovecs and how many bytes they actually cover, which can be
-/// less than `cap` if the descriptors run out first.
+/// Returns the guest RAM of `descs` as buffers for a direct read or write,
+/// skipping `skip` bytes of the logical concatenation and capping the total at
+/// `cap` bytes, and how many bytes the buffers cover.
+///
+/// The count can be less than `cap` if the descriptors run out first.
 ///
 /// Errors (falling back to the buffered path) if there are more descriptors
 /// than `IOV_MAX`, or if a descriptor's range is not in mapped guest RAM.
-fn build_iov(
-    mem: &GuestRam,
+fn direct_buffers<'a>(
+    mem: &'a GuestRam,
     descs: &[(u64, u32)],
     skip: usize,
     cap: usize,
-) -> Result<(Vec<libc::iovec>, usize), ()> {
+) -> Result<(Vec<VolatileSlice<'a>>, usize), ()> {
     if descs.len() > IOV_MAX {
         return Err(());
     }
-    let mut iov = Vec::with_capacity(descs.len());
+    let mut buffers = Vec::with_capacity(descs.len());
     let mut pos = 0usize;
     let mut total = 0usize;
     for &(addr, len) in descs {
@@ -7232,23 +7227,20 @@ fn build_iov(
             let avail = (len - start_in_desc).min(cap - total);
             if avail > 0 {
                 let base = addr.checked_add(start_in_desc as u64).ok_or(())?;
-                let ptr = mem.host_ptr(base, avail).map_err(|_| ())?;
-                iov.push(libc::iovec {
-                    iov_base: ptr.cast(),
-                    iov_len: avail,
-                });
+                buffers.push(mem.slice(base, avail).map_err(|_| ())?);
                 total += avail;
             }
         }
         pos = desc_end;
     }
-    Ok((iov, total))
+    Ok((buffers, total))
 }
 
 /// Writes a success `fuse_out_header` (`total_len`, error 0, `unique`)
-/// scattered across `output`'s leading `OUT_HEADER_LEN` bytes -- the region
-/// `build_iov(..., OUT_HEADER_LEN, ...)` deliberately excludes, so this never
-/// overlaps the direct-path payload it is called after.
+/// scattered across `output`'s leading `OUT_HEADER_LEN` bytes.
+///
+/// `direct_buffers(..., OUT_HEADER_LEN, ...)` excludes those bytes, so this
+/// never overlaps the direct-path payload it is called after.
 fn write_direct_out_header(
     mem: &GuestRam,
     output: &[(u64, u32)],
@@ -7268,48 +7260,6 @@ fn write_direct_out_header(
         copied += n;
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn raw_preadv(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
-    let n = unsafe { libc::preadv(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off_t) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn raw_preadv(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
-    // glibc does not expose plain `preadv` (only `preadv64`/`preadv2`); on a
-    // 64-bit target `off64_t` is the same width `off_t` would be anyway.
-    let n = unsafe { libc::preadv64(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off64_t) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
-    let n = unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off_t) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn raw_pwritev(fd: i32, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
-    let n = unsafe { libc::pwritev64(fd, iov.as_ptr(), iov.len() as i32, offset as libc::off64_t) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
 }
 
 /// Makes one non-blocking lock call. `Err(None)` means another holder has
@@ -7354,37 +7304,6 @@ fn retry_on_interrupt(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
             continue;
         }
         return result;
-    }
-}
-
-/// `preadv`, retried on `EINTR`. An empty `iov` is a legitimate zero-length
-/// read (e.g. offset already at EOF with nothing requested) rather than a
-/// syscall with a null iovec pointer.
-fn preadv_retry(file: &File, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
-    if iov.is_empty() {
-        return Ok(0);
-    }
-    loop {
-        match raw_preadv(file.as_raw_fd(), iov, offset) {
-            Ok(n) => return Ok(n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// `pwritev`, retried on `EINTR`. See `preadv_retry` for the empty-`iov`
-/// case.
-fn pwritev_retry(file: &File, iov: &[libc::iovec], offset: u64) -> io::Result<usize> {
-    if iov.is_empty() {
-        return Ok(0);
-    }
-    loop {
-        match raw_pwritev(file.as_raw_fd(), iov, offset) {
-            Ok(n) => return Ok(n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
     }
 }
 

@@ -32,7 +32,7 @@ use crate::hypervisor::guest::{Guest, PluginThread};
 use crate::hypervisor::vcpus::{Kick, Outcome, Vcpus};
 use crate::plugin::Plugin;
 use crate::run::LeftRunning;
-use crate::sandbox::confine_io_thread;
+use crate::sandbox::{confine_io_thread, Thread};
 use crate::signal::kick_signal;
 use crate::teardown::{FinishCount, FinishGuard, StopSource, StopToken, STOP_TIMEOUT};
 use crate::terminal;
@@ -46,18 +46,40 @@ use crate::LOG_PREFIX;
 /// spawns them.
 #[derive(Default)]
 pub(crate) struct HostWork {
-    /// The threads, each with its name and what it runs.
-    threads: Vec<PluginThread>,
+    /// The threads, in the order they were queued.
+    threads: Vec<QueuedThread>,
     /// The actions the I/O threads' stop runs, for a thread that waits on
     /// something a stop token cannot reach.
     io_stops: Vec<Box<dyn FnOnce() + Send>>,
     /// The hooks the vCPUs' stop runs, for a vCPU that waits outside the
-    /// hypervisor.
+    /// hypervisor or a thread that may be left running.
     vcpu_stops: Vec<Box<dyn Fn() + Send + Sync>>,
 }
 
+/// A thread queued in a [`HostWork`], which [`IoThreads::start`] spawns.
+pub(crate) struct QueuedThread {
+    /// The thread's name.
+    pub(crate) name: &'static str,
+    /// The filter the thread installs before it runs `run`.
+    pub(crate) filter: Thread,
+    /// What the thread runs, with the stop token of the I/O threads.
+    pub(crate) run: Box<dyn FnOnce(StopToken) + Send>,
+}
+
+impl From<PluginThread> for QueuedThread {
+    // A plugin's thread runs under the filter of the thread that calls `boot`.
+    fn from(PluginThread { name, run }: PluginThread) -> Self {
+        Self {
+            name,
+            filter: Thread::Vmm,
+            run,
+        }
+    }
+}
+
 impl HostWork {
-    /// Queues a thread named `name` that runs `run` with a stop token.
+    /// Queues a thread named `name` that confines itself with `filter` and then
+    /// runs `run` with a stop token.
     ///
     /// The I/O threads' stop only joins the thread, so `run` has to return on
     /// its own: it watches the token, or an action queued with
@@ -66,10 +88,12 @@ impl HostWork {
     pub(crate) fn spawn(
         &mut self,
         name: &'static str,
+        filter: Thread,
         run: impl FnOnce(StopToken) + Send + 'static,
     ) {
-        self.threads.push(PluginThread {
+        self.threads.push(QueuedThread {
             name,
+            filter,
             run: Box::new(run),
         });
     }
@@ -85,7 +109,6 @@ impl HostWork {
     }
 
     /// Queues `hook` for the vCPUs' stop, as [`Vcpus::on_stop`] describes.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn on_vcpu_stop(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.vcpu_stops.push(Box::new(hook));
     }
@@ -94,6 +117,28 @@ impl HostWork {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn thread_names(&self) -> Vec<&'static str> {
         self.threads.iter().map(|thread| thread.name).collect()
+    }
+
+    /// Takes the queued threads, for a test that runs them itself.
+    #[cfg(test)]
+    pub(crate) fn take_threads(&mut self) -> Vec<QueuedThread> {
+        std::mem::take(&mut self.threads)
+    }
+
+    /// Runs the hooks queued for the vCPUs' stop, as a stop of the vCPUs does.
+    #[cfg(test)]
+    pub(crate) fn run_vcpu_stops(&self) {
+        for hook in &self.vcpu_stops {
+            hook();
+        }
+    }
+
+    /// Runs the actions queued for the I/O threads' stop, as that stop does.
+    #[cfg(test)]
+    pub(crate) fn run_io_stops(&mut self) {
+        for action in std::mem::take(&mut self.io_stops) {
+            action();
+        }
     }
 }
 
@@ -189,6 +234,7 @@ impl<K: Kick> IoThreads<K> {
         let finish_count = Arc::new(FinishCount::default());
         let console = IoThread::spawn(
             "console reader",
+            Thread::Vmm,
             source.token(),
             &finish_count,
             Arc::clone(&guest.vcpus),
@@ -218,13 +264,18 @@ impl<K: Kick> IoThreads<K> {
         for hook in vcpu_stops {
             guest.vcpus.on_stop(hook);
         }
-        io_threads.spawn_all(plugin_threads.into_iter().chain(threads))
+        io_threads.spawn_all(
+            plugin_threads
+                .into_iter()
+                .map(QueuedThread::from)
+                .chain(threads),
+        )
     }
 
     /// Starts each of `threads` in order, to be joined with the others.
     ///
     /// It has to be called from a thread with no seccomp filter, since naming
-    /// a new thread calls `prctl`, which neither allowlist has.
+    /// a new thread calls `prctl`, which no allowlist has.
     ///
     /// # Errors
     ///
@@ -232,14 +283,15 @@ impl<K: Kick> IoThreads<K> {
     /// [`start`](Self::start) describes.
     fn spawn_all(
         mut self,
-        threads: impl IntoIterator<Item = PluginThread>,
+        threads: impl IntoIterator<Item = QueuedThread>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>>
     where
         K: 'static,
     {
-        for PluginThread { name, run } in threads {
+        for QueuedThread { name, filter, run } in threads {
             let spawned = IoThread::spawn(
                 name,
+                filter,
                 self.stop.source.token(),
                 &self.finish_count,
                 Arc::clone(&self.vcpus),
@@ -292,6 +344,7 @@ impl<K: Kick + 'static> IoThreads<K> {
         let finish_count = Arc::new(FinishCount::default());
         let console = IoThread::spawn(
             "console reader",
+            Thread::Vmm,
             source.token(),
             &finish_count,
             Arc::clone(&vcpus),
@@ -334,8 +387,8 @@ fn thread_builder(name: &'static str) -> std::thread::Builder {
 }
 
 impl IoThread {
-    /// Starts a thread named `name` that confines itself and then runs `body`
-    /// with `stop`.
+    /// Starts a thread named `name` that confines itself with `filter` and then
+    /// runs `body` with `stop`.
     ///
     /// The thread holds a [`FinishGuard`] that notes on `count`, and a
     /// [`StopOnPanic`] that fails and stops the run of `vcpus` if it panics.
@@ -345,6 +398,7 @@ impl IoThread {
     /// Errors with the thread's name when the thread cannot be created.
     fn spawn<K: Kick + 'static>(
         name: &'static str,
+        filter: Thread,
         stop: StopToken,
         count: &Arc<FinishCount>,
         vcpus: Arc<Vcpus<K>>,
@@ -361,7 +415,7 @@ impl IoThread {
                     count,
                 };
                 let _panic = StopOnPanic { vcpus, name };
-                confine_io_thread();
+                confine_io_thread(filter);
                 body(stop);
             })
             .map_err(|e| io::Error::new(e.kind(), format!("spawning the {name} thread: {e}")))?;
@@ -461,6 +515,7 @@ mod tests {
         let source = StopSource::new().unwrap();
         IoThread::spawn(
             "test",
+            Thread::Vmm,
             source.token(),
             count,
             Arc::clone(vcpus),
@@ -479,8 +534,9 @@ mod tests {
         let ran = Arc::new(Mutex::new(Vec::new()));
         let thread = |name: &'static str| {
             let ran = Arc::clone(&ran);
-            PluginThread {
+            QueuedThread {
                 name,
+                filter: Thread::Vmm,
                 run: Box::new(move |stop: StopToken| {
                     let _ = stop.sleep(Duration::from_secs(5));
                     ran.lock().unwrap().push(name);
@@ -504,6 +560,42 @@ mod tests {
         let mut ran = ran.lock().unwrap().clone();
         ran.sort_unstable();
         assert_eq!(ran, ["first", "second"]);
+    }
+
+    // A test cannot install a filter in its own process, so each thread reports
+    // the filter it confined itself with.
+    #[test]
+    fn queued_thread_confines_itself_with_its_filter() {
+        crate::signal::install_kick_handler();
+        let (seen, reports) = std::sync::mpsc::channel();
+        let report = |name: &'static str| {
+            let seen = seen.clone();
+            Box::new(move |_: StopToken| {
+                seen.send((name, crate::sandbox::confined())).unwrap();
+            })
+        };
+        let plugin = PluginThread {
+            name: "plugin",
+            run: report("plugin"),
+        };
+        let device = QueuedThread {
+            name: "device",
+            filter: Thread::Vcpu,
+            run: report("device"),
+        };
+        let threads = IoThreads::idle(vcpus())
+            .spawn_all([QueuedThread::from(plugin), device])
+            .unwrap();
+        threads.stop().unwrap();
+        let mut reported: Vec<_> = reports.try_iter().collect();
+        reported.sort_by_key(|&(name, _)| name);
+        assert_eq!(
+            reported,
+            [
+                ("device", Some(Thread::Vcpu)),
+                ("plugin", Some(Thread::Vmm))
+            ]
+        );
     }
 
     // An unwind drops the threads without `stop`. They are still asked to stop,

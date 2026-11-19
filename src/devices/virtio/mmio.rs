@@ -558,6 +558,7 @@ impl<D: virtio::Device> Transport<D> {
                 Vec::new()
             } else if value & FAILED != 0 {
                 state.status.insert(FAILED);
+                self.device.lock().unwrap().driver_failed();
                 Vec::new()
             } else if previous != Some(state.status.to_bits()) {
                 Vec::new()

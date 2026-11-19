@@ -250,13 +250,15 @@ pub trait Plugin: Send + Sync {
 ///
 /// The VMM already records these in its ledger; a sink is for a tool that wants
 /// them live and unaggregated, as [`crate::plugin::builtin::IoTrace`] does.
-/// [`IoSink::on_block`] and [`IoSink::on_net`] are called with the device lock
-/// held, and [`IoSink::on_batch_end`] after it is released. No method may
-/// block. [`IoSink::on_block`] and the egress side of [`IoSink::on_net`] always
-/// run on a vCPU thread. An ingress frame reaches [`IoSink::on_net`] from the
-/// tap or gateway reader thread under those two backends, and from a vCPU
-/// thread under the built-in stack, which generates its replies inside the
-/// transmit path.
+/// [`IoSink::on_block`] runs on the disk's worker thread with the disk's queue
+/// locked, and [`IoSink::on_net`] with the device lock held.
+/// [`IoSink::on_batch_end`] runs after the lock is released. No method may
+/// block. Each disk has a worker thread of its own, so a sink gets
+/// [`IoSink::on_block`] from several threads at once when the guest has several
+/// disks. The egress side of [`IoSink::on_net`] always runs on a vCPU thread.
+/// An ingress frame reaches it from the tap or gateway reader thread under
+/// those two backends, and from a vCPU thread under the built-in stack, which
+/// generates its replies inside the transmit path.
 pub trait IoSink: Send + Sync {
     /// Receives a virtio-blk request of `length` data bytes from `sector`, a
     /// write when `write` is set.
@@ -271,12 +273,13 @@ pub trait IoSink: Send + Sync {
     /// Receives the end of a batch of [`IoSink::on_block`] or
     /// [`IoSink::on_net`] calls.
     ///
-    /// The VMM calls it once after each device access that called the sink, and
-    /// once after each burst of frames from the tap or gateway reader that did.
-    /// It runs on the thread that made those calls, with the device lock
-    /// released. A write that wakes a reader in another process belongs here,
-    /// so a burst of records costs one write. The write must not block, so it
-    /// goes to a non-blocking descriptor such as an eventfd or a pipe. The
-    /// default does nothing.
+    /// The VMM calls it once after each device access that called the sink,
+    /// once after each pass of a disk's worker that did, and once after each
+    /// burst of frames from the tap or gateway reader that did. It runs on the
+    /// thread that made those calls, with the lock released. A write that wakes
+    /// a reader in another process belongs here, so a burst of records costs
+    /// one write. The write must not block, so it goes to a non-blocking
+    /// descriptor such as an eventfd or a pipe. A batch the run's stop cuts
+    /// short can get no call. The default does nothing.
     fn on_batch_end(&self) {}
 }

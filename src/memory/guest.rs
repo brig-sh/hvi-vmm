@@ -426,6 +426,20 @@ impl GuestRam {
         Ok(self.view.slice(gpa, len)?.ptr_guard_mut().as_ptr())
     }
 
+    /// Returns `[gpa, gpa+len)` as a [`VolatileSlice`], for a read or write
+    /// between a host file and guest RAM.
+    ///
+    /// The slice holds the host address and the length, and accesses through it
+    /// are volatile, so it makes no claim on bytes the guest may change.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the range is outside guest RAM or runs from one region into
+    /// the next.
+    pub(crate) fn slice(&self, gpa: u64, len: usize) -> io::Result<VolatileSlice<'_>> {
+        self.view.slice(gpa, len)
+    }
+
     /// Writes a byte at `gpa`.
     pub fn write_u8(&self, gpa: u64, v: u8) -> io::Result<()> {
         self.store(gpa, v)

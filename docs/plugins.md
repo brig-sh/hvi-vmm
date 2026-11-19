@@ -18,22 +18,31 @@ For constructing the `BootConfig` that carries a plugin, read
 
 ## When each hook runs
 
-<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: on_attach on the thread that calls boot before any vCPU starts, on_safepoint on the boot vCPU between guest entries, IoSink on_block and on_net on a device thread with the device lock held and on_batch_end after it is released, and on_request from the console" width="760">
+<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: on_attach on the thread that calls boot before any vCPU starts, on_safepoint on the boot vCPU between guest entries, IoSink on_block on the disk's worker thread with the disk's queue locked, on_net on a device thread with the device lock held, and on_batch_end after the lock is released, and on_request from the console" width="760">
 
-| Trait | Called | Thread |
-| --- | --- | --- |
-| `Plugin::on_attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` |
-| `Plugin::on_safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU |
-| `Plugin::on_request` | when the console reads `Ctrl-]` (0x1d) | the console input thread |
-| `IoSink::on_block`, egress `IoSink::on_net` | per request or frame, device lock held | a vCPU thread |
-| ingress `IoSink::on_net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread |
-| ingress `IoSink::on_net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path |
-| `IoSink::on_batch_end` | once per device access or reader burst that called `on_block` or `on_net`, device lock released | the thread that made those calls |
+| Trait | Called | Thread | Linux filter |
+| --- | --- | --- | --- |
+| `Plugin::on_attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` | none yet |
+| `Plugin::on_safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU | `vcpu` |
+| `Plugin::on_request` | when the console reads `Ctrl-]` (0x1d) | the console input thread | `vmm` |
+| `IoSink::on_block` | per request, the disk's queue locked | the disk's worker thread | `block` |
+| egress `IoSink::on_net` | per frame, device lock held | a vCPU thread | `vcpu` |
+| ingress `IoSink::on_net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread | `vmm` |
+| ingress `IoSink::on_net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path | `vcpu` |
+| `IoSink::on_batch_end` | once per device access, run of up to a queue's worth of disk requests, or reader burst that called `on_block` or `on_net`, lock released | the thread that made those calls | that thread's |
 
 All three methods on `Plugin` are defaulted, so an implementation takes only
 what it needs. All three backends call all three hooks.
 
-## The six rules that fail quietly
+On Linux a call the hook's filter does not allow kills the VMM (see
+[security.md](security.md#linux-seccomp-bpf)). The `vcpu` filter refuses a read
+or write at an offset, a seek and a file sync, so a write to a file from
+`on_safepoint` goes at the file's position, as `IoTrace`'s does. The `block`
+filter does not allow every call the `vcpu` filter does: no `getrandom`, so no
+first use of a `HashMap` in `on_block`, and no `sendmsg`, `recvmsg` or
+`shutdown`.
+
+## The rules that fail quietly
 
 **1. `on_safepoint` is on the hot path.** It sits at the top of the vCPU run
 loop, so it runs once per guest entry. A tool with nothing to do this time
@@ -59,9 +68,10 @@ report(sample);
 
 A pause parks the vCPUs only. The host side keeps writing guest RAM while they
 are parked. The network relay and the agent bridge deliver what arrives for the
-guest, and a virtio-fs export answers the requests already on its queue, from
-hvi's worker thread on macOS and from the daemon on Linux. Memory those devices
-own can change under a read the pause holds.
+guest, a disk's worker thread completes the requests already on its queue, and a
+virtio-fs export answers the requests already on its queue, from hvi's worker
+thread on macOS and from the daemon on Linux. Memory those devices own can
+change under a read the pause holds.
 
 An `on_safepoint` may hold the pause while it waits, for example for another
 process to finish reading. It checks `cpu.is_stopping()` as it waits. Once that
@@ -93,16 +103,16 @@ reaches `on_safepoint`. The other vCPUs keep running.
 A `kick()` from the vCPU's own thread, inside `on_safepoint` or an `IoSink` on
 its exit path, is dropped. Call it from a thread of your own.
 
-**4. An `IoSink` must not block.** `on_block` and `on_net` are called with the
-device lock held. No `write(2)` there, and no allocation you can avoid. A write
-that cannot block, such as one to an eventfd or a non-blocking pipe that wakes a
-reader, goes in `on_batch_end`, which runs once per batch with the lock
-released. A write that can block, such as one to a file, waits for
-`on_safepoint`: count in the sink, set a dirty flag, and write there. `IoTrace`
-is the worked example. A sink must not keep the `VmHandle` either: the device
-holds the sink and the handle holds the device, so the three would keep one
-another alive after `boot` returns. A sink that needs the handle keeps a `Weak`
-from `Arc::downgrade`.
+**4. An `IoSink` must not block.** `on_block` is called with the disk's queue
+locked, and `on_net` with the device lock held. No `write(2)` there, and no
+allocation you can avoid. A write that cannot block, such as one to an eventfd
+or a non-blocking pipe that wakes a reader, goes in `on_batch_end`, which runs
+once per batch with the lock released. A write that can block, such as one to a
+file, waits for `on_safepoint`: count in the sink, set a dirty flag, and write
+there. `IoTrace` is the worked example. A sink must not keep the `VmHandle`
+either: the device holds the sink and the handle holds the device, so the three
+would keep one another alive after `boot` returns. A sink that needs the handle
+keeps a `Weak` from `Arc::downgrade`.
 
 **5. `on_request` must return promptly.** It runs on the VMM's console thread,
 and the stop waits for that thread. An `on_request` still running a second after
@@ -112,16 +122,21 @@ returns.
 
 **6. Start your threads with `VmHandle::spawn`.** Call it from `on_attach`, with
 a name and a boxed closure that takes a `hvi::teardown::StopToken`. The VMM
-starts the thread once the attach has succeeded, under the same seccomp filter
-as its own I/O threads on Linux, and joins it with them when the run stops. The
-token reports the stop once the vCPUs have exited or been left running: wait on
-it with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own
-`poll` set, and return when it fires. A thread still running a second after the
-token reports the stop is left running and fails the run, and a thread that
-panics fails the run and stops it, as [Panics](#panics) says. Open files and
-bind sockets in `on_attach`, since the filter refuses them. A thread you start
-any other way is neither joined nor filtered, and it keeps the `VmHandle` and
-the VM it holds alive for as long as it runs.
+starts the thread once the attach has succeeded, under the `vmm` seccomp filter
+on Linux, and joins it with its own I/O threads when the run stops. The token
+reports the stop once the vCPUs have exited or been left running: wait on it
+with `wait`, `sleep` or `keep_waiting`, or add its descriptor to your own `poll`
+set, and return when it fires. A thread still running a second after the token
+reports the stop is left running and fails the run, and a thread that panics
+fails the run and stops it, as [Panics](#panics) says. Open files and bind
+sockets in `on_attach`, since the filter refuses them. It also refuses a read at
+an offset and a seek. A thread you start any other way is neither joined nor
+filtered, and it keeps the `VmHandle` and the VM it holds alive for as long as
+it runs.
+
+**7. `on_block` runs on several threads at once.** Each disk has a worker of its
+own, so one sink gets `on_block` from several threads at once when the guest has
+several disks. Each of those threads calls its own `on_batch_end`.
 
 ## Reading guest memory
 
@@ -164,11 +179,12 @@ VMM process, `ftruncate` to a new length and `F_ADD_SEALS` fail with `EPERM`.
 That covers `on_attach`, which runs before confinement, and any process the
 descriptor was sent to. An `ftruncate` to the current length returns 0.
 Inside the VMM the seccomp filters apply, and a call a filter does not allow
-kills the whole VMM with `SIGSYS`. `ftruncate` is on neither list, so it kills
-the VMM from any thread. `F_ADD_SEALS` returns `EPERM` on a thread under the
-`vmm` filter, such as one you start with `VmHandle::spawn`. On a vCPU thread,
-where `on_safepoint`, `on_block` and egress `on_net` run, it kills the VMM. Do
-not call either from inside the VMM, and do not rely on the `EPERM` there.
+kills the whole VMM with `SIGSYS`. `ftruncate` is on no list, so it kills the
+VMM from any thread. `F_ADD_SEALS` returns `EPERM` on a thread under the `vmm`
+filter, such as one you start with `VmHandle::spawn`. On a vCPU thread, where
+`on_safepoint` and egress `on_net` run, and on a disk's worker thread, where
+`on_block` runs under the `block` filter, it kills the VMM. Do not call either
+from inside the VMM, and do not rely on the `EPERM` there.
 
 The object is not write-sealed, so a writable mapping still works. On macOS a
 POSIX shared-memory object refuses a second `ftruncate`.
@@ -253,8 +269,10 @@ thread started with `VmHandle::spawn` stops the run there, and the teardown
 writes `vmm.stop` with reason `failed`.
 
 A panic in an `IoSink` method also loses the `block` and `net` records of the
-device access that called it. The VMM adds those records to the ledger after
-`on_batch_end` returns.
+device access that called it, since the VMM adds those records to the ledger
+after `on_batch_end` returns. A disk is the exception in a binary that unwinds:
+the stop of the run adds the `block` records of the requests that completed
+before the panic.
 
 ## Running several
 

@@ -112,9 +112,13 @@ does not own. A range that would cross from one region into the next is refused.
 `scan()` takes no guest address: it walks each region's host mapping and maps
 its hits back to guest addresses.
 
-`host_ptr` is a bounds-checked raw pointer into one region for the iovec
-paths. It is a raw pointer rather than a `&mut [u8]` because a guest can point
-two descriptors at one address, which would alias the borrow.
+`slice` returns a bounds-checked `VolatileSlice` of one region, and
+`memory/io.rs` reads and writes a host file straight into and out of such slices
+with `preadv` and `pwritev`. virtio-blk and the macOS virtio-fs server use them.
+`host_ptr` is a bounds-checked raw pointer into one region, for the vhost-user
+memory table. Neither is a `&mut [u8]`: the guest changes the bytes during a
+call, and it can point two descriptors at one address, which would alias the
+borrow.
 
 The backing object comes from `memory/shared.rs`: a memfd on Linux or a POSIX
 shared-memory object on macOS, unlinked from the namespace as soon as it is
@@ -343,7 +347,7 @@ sequenceDiagram
     participant B as Backend run loop
     participant R as Bus
     participant T as virtio-mmio transport
-    participant D as Device (blk/net/vsock/fs)
+    participant D as Device (net/vsock/fs)
     participant M as GuestRam
     participant L as Event ledger
     G->>B: MMIO/PIO exit @ device range
@@ -352,7 +356,7 @@ sequenceDiagram
     T->>D: notify(queue) / configuration space
     D->>M: read/write descriptors + buffers
     D->>G: raise its interrupt (GIC SPI / IOAPIC GSI)
-    T->>L: CapturedEvent (block / net / SNI)
+    T->>L: CapturedEvent (net / SNI)
     B->>G: resume
 ```
 
@@ -365,6 +369,8 @@ its queues and its interrupt, and from then on passes it each queue
 notification. On KVM a vhost-user export's notifications do not exit to hvi:
 KVM signals the queue's eventfd, which the daemon reads. The device holds its
 configuration space and serves its queues.
+
+### Interrupt delivery
 
 A virtio device's interrupt is edge-triggered. It holds the status bits under a
 lock of its own, so a vCPU reads and acknowledges the interrupt without the
@@ -393,21 +399,21 @@ is the one device-facing thing that differs by backend:
   the interrupt.
 
 A daemon's write to a call eventfd sets no status bit. So once a device has an
-irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` beside any bit that is
-set from DRIVER_OK until the next reset, and 0 outside that time. A
-configuration change still sets its bit and triggers the interrupt. The status
-keeps `VIRTIO_MMIO_INT_VRING` beside `VIRTIO_MMIO_INT_CONFIG`, since the two can
-reach the guest as one interrupt, and the guest scans its queues only when it
-reads `VIRTIO_MMIO_INT_VRING`.
+irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` from DRIVER_OK until
+the next reset, beside any bit that is set, and reads 0 outside that time. A
+configuration change still sets its bit and triggers the interrupt. The guest
+scans its queues only when it reads `VIRTIO_MMIO_INT_VRING`, and the two bits
+can reach it as one interrupt.
 
 ### Devices
 
-- **virtio-blk** (`devices/virtio/block.rs`, id 2) backs `--disk`, one device
-  per disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real
-  sync, adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with
-  the disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image
-  is locked while open, shared for a read-only disk and exclusive for a
-  writable one.
+- **virtio-blk** (`devices/virtio/block/`, id 2) backs `--disk`, one device per
+  disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync,
+  adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with the
+  disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image is
+  locked while open, shared for a read-only disk and exclusive for a writable
+  one. Each disk has a worker thread that serves its queue, one request at a
+  time. See [The disk worker](#the-disk-worker).
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_NET_F_MAC` and no offloads.
   Queue 0 is RX, queue 1 is TX.
@@ -434,6 +440,37 @@ the wrapper tracks THR-empty itself and answers IIR reads. Both write guest
 output to stdout through `terminal::ConsoleFilter`, which drops the escape
 sequences that change host state or make the terminal answer (see
 [security.md](security.md#what-the-guest-can-reach)).
+
+### The disk worker
+
+A disk's queue is served by a worker thread of its own, which runs under the
+`block` seccomp filter and never takes the transport's device lock. On KVM a
+notification of the disk does not exit to hvi: KVM signals the worker's eventfd.
+On macOS the notification exits, and the device wakes the worker.
+
+The worker takes a request off the ring and completes it under a lock it shares
+with the device, and calls the backing file with no lock held. A read or a write
+moves its data between the backing file and the request's buffers in guest RAM
+with `preadv` and `pwritev`, so no host buffer is sized by the guest. The worker
+raises the interrupt once per request, so a slow flush does not hold back the
+requests before it.
+
+The worker serves the ring in passes of at most a queue's worth of requests, and
+it asks the driver for no notification while it serves the ring. After each pass
+it ends the sink's batch and writes the pass's records to the ledger. A stop of
+the run writes the records not in the ledger yet, since it can close the ledger
+with the worker still in a slow request.
+
+When a pass leaves the ring empty, the worker polls it for a short time before
+it sleeps, still with no notification asked for, so a request that follows
+closely costs the guest no notification and the worker no wake. The poll adapts
+to the disk. It grows while the next request keeps coming within the limit, 32
+microseconds unless the disk's `poll-max-us` sets another. It drops to zero once
+requests come further apart.
+
+The kernel writes a read's data into guest RAM during the call, so a reset waits
+for the call in flight, and no request of the reset device reaches guest RAM
+after the STATUS write returns. The vCPUs' stop ends that wait.
 
 ### Used-ring ordering
 
@@ -546,8 +583,8 @@ how it works.
 | Backends | `arch/aarch64/hvf/`, `arch/aarch64/kvm/`, `arch/x86_64/kvm/`, `arch/aarch64/smoke.rs` |
 | arm64 guest support | `arch/aarch64/`: `loader.rs`, `layout.rs`, `fdt.rs`, `esr.rs`, `psci.rs` |
 | x86-64 guest support | `arch/x86_64/`: `loader.rs`, `layout.rs`, `mptable.rs`, `acpi.rs` |
-| Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs` |
-| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
+| Guest memory | `memory/`: `guest.rs`, `shared.rs`, `region.rs`, `io.rs` |
+| Devices | `devices/bus.rs`; `devices/virtio/`: `queue.rs`, `mmio.rs`, `block/device.rs`, `block/worker.rs`, `block/request.rs`, `block/store.rs`, `net.rs`, `tap.rs`, `vsock.rs`, `wake.rs`, `fs/server.rs`, `fs/fdlimit.rs`, `fs/worker.rs`, `fs/vhost_user.rs`; `devices/legacy/`: `pl011.rs`, `uart16550.rs`, `rtc_cmos.rs`, `rtc_pl031.rs`, `acpi_pm.rs`, `i8042.rs`; `devices/irq.rs` |
 | Host terminal | `terminal/`: `filter.rs`, `raw.rs`, `input.rs` |
 | Confinement | `sandbox/seatbelt.rs` (macOS), `sandbox/seccomp.rs` (Linux), `resources/seccomp/*.json` |
 | Extension and observation | `plugin/mod.rs`, `plugin/api.rs`, `hypervisor/guest.rs`, `plugin/builtin.rs`, `events.rs`, `examples/watch_guest.rs` |

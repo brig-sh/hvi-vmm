@@ -23,12 +23,12 @@
 //! `super::loader`), and enters at the 64-bit entry with RSI pointing at the
 //! zero page.
 //!
-//! Devices are the shared virtio-mmio blk/net/vsock (serviced on
-//! `KVM_EXIT_MMIO`) plus a 16550 serial on port I/O (`KVM_EXIT_IO`). The guest
-//! powers off and resets through the ACPI PM1 control and reset registers,
-//! which the exit loop serves as ports. A guest without ACPI resets through the
-//! i8042's CPU-reset command. A plugin, if the caller supplied one, sees CR3 as
-//! the walk root.
+//! Devices are the shared virtio-mmio blk/net/vsock, whose registers are served
+//! on `KVM_EXIT_MMIO`, plus a 16550 serial on port I/O (`KVM_EXIT_IO`). The
+//! guest powers off and resets through the ACPI PM1 control and reset
+//! registers, which the exit loop serves as ports. A guest without ACPI resets
+//! through the i8042's CPU-reset command. A plugin, if the caller supplied one,
+//! sees CR3 as the walk root.
 //!
 //! A long-mode entry needs KVM's `set_tss_address` and identity map, which
 //! Intel VMX requires. It also needs `set_cpuid2`, since the guest reads CPUID

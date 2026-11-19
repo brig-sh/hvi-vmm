@@ -55,23 +55,34 @@
 //!
 //! # Where the filters go in
 //!
-//! Two filters, because the threads are not alike. `vcpu` is the tight one and
-//! it matters most: MMIO exits are serviced inline on the vCPU thread, so the
-//! virtio device models -- the code that parses guest descriptors -- run there.
-//! `vmm` covers the thread that calls `boot`, the boot thread below, the
+//! Three filters, because the threads are not alike. `vcpu` is the tight one
+//! for the vCPU threads. A vCPU thread serves its MMIO and port exits, so the
+//! virtio-mmio transport, the net and vsock device models, the vhost-user
+//! handover and the legacy devices run there, and the device models parse guest
+//! descriptors. A disk's requests run on the disk's worker, so `vcpu` allows no
+//! read or write at an offset, no seek and no file sync. `block` covers each
+//! disk's worker thread, which parses the disk's descriptors and runs its
+//! requests against the backing file. It alone allows `preadv` and `pwritev`,
+//! which move a request's data between the backing file and guest RAM. `vmm`
+//! covers the thread that calls `boot`, the boot thread below, the other
 //! host-side I/O threads (the console reader, the agent bridge and its
 //! per-connection readers, the tap and gateway readers, and the debug watchdog
 //! when it is enabled), the threads a plugin starts with `VmHandle::spawn`, the
 //! thread that receives the stop signals and the ledger writer. The ledger
 //! writer starts with the ledger, before the filters are armed, and installs
-//! `vmm` before its first write after the filters are armed.
+//! `vmm` before its first write after the filters are armed. Each queued I/O
+//! thread names its filter when it is queued.
+//!
+//! A rule may match an argument as well as the syscall. `block` allows `ioctl`
+//! only for the requests its thread makes, so a worker cannot reach the rest of
+//! KVM's ioctls, or another descriptor's.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
 //!
 //! ```text
 //! boot: acquire everything, spawn the I/O threads ─┐
-//!                     each I/O thread installs `vmm` at its start
+//!                     each I/O thread installs its filter at its start
 //! boot: spawn the vCPU threads ────────────────────┤
 //!                     each vCPU thread installs `vcpu` at its start
 //! boot: install `vmm` on itself, then join ────────┘
@@ -86,7 +97,7 @@
 //!
 //! Everything acquired during setup is finished by the time any filter is in,
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
-//! absent from both lists. A compromised virtio backend cannot open a file.
+//! absent from every list. A compromised virtio backend cannot open a file.
 //!
 //! # The files glibc opens by itself
 //!
@@ -119,17 +130,9 @@
 
 use std::io;
 
+pub use super::Thread;
 use crate::LOG_PREFIX;
 use seccompiler::{BpfProgram, TargetArch};
-
-/// Which filter a thread installs on itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Thread {
-    /// The thread that calls `boot` and the host-side I/O threads.
-    Vmm,
-    /// A vCPU thread: KVM plus the device models it services inline.
-    Vcpu,
-}
 
 impl Thread {
     /// The key this filter has in the JSON.
@@ -137,6 +140,7 @@ impl Thread {
         match self {
             Thread::Vmm => "vmm",
             Thread::Vcpu => "vcpu",
+            Thread::Block => "block",
         }
     }
 }
@@ -252,9 +256,9 @@ fn open_refusal_program() -> io::Result<BpfProgram> {
 /// Compiles the filters `thread` installs, in the order it installs them, each
 /// with a name for its errors.
 ///
-/// A glibc build puts the filter that refuses an open first, since neither
-/// allowlist allows `seccomp` and nothing can go in after one. `log` is whether
-/// the allowlist logs a syscall outside it rather than trapping.
+/// A glibc build puts the filter that refuses an open first, since no allowlist
+/// allows `seccomp` and nothing can go in after one. `log` is whether the
+/// allowlist logs a syscall outside it rather than trapping.
 fn programs(thread: Thread, log: bool) -> io::Result<Vec<(&'static str, BpfProgram)>> {
     Ok(vec![
         #[cfg(target_env = "gnu")]
@@ -326,7 +330,7 @@ pub(crate) fn is_thread_filtered() -> bool {
 /// `boot`, where it can be reported, instead of a `SIGSYS` inside a device
 /// thread later on.
 pub fn arm() -> io::Result<()> {
-    for thread in [Thread::Vmm, Thread::Vcpu] {
+    for thread in [Thread::Vmm, Thread::Vcpu, Thread::Block] {
         programs(thread, log_mode())?;
     }
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -369,17 +373,26 @@ pub fn install_thread(thread: Thread) {
     }
 }
 
-/// Number of syscalls each filter allows, for the log line and the selftest.
-pub fn allowed_counts() -> io::Result<(usize, usize)> {
+/// Returns the number of syscalls each filter allows, for `vmm`, `vcpu` and
+/// `block` in that order.
+///
+/// A syscall with a rule per argument value counts once.
+pub fn allowed_counts() -> io::Result<(usize, usize, usize)> {
     let doc: serde_json::Value =
         serde_json::from_str(FILTERS).map_err(|e| io::Error::other(format!("filters: {e}")))?;
     let count = |k: &str| -> usize {
         doc.get(k)
             .and_then(|f| f.get("filter"))
             .and_then(|f| f.as_array())
-            .map_or(0, Vec::len)
+            .map_or(0, |rules| {
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.get("syscall")?.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            })
     };
-    Ok((count("vmm"), count("vcpu")))
+    Ok((count("vmm"), count("vcpu"), count("block")))
 }
 
 /// The seccomp filters of a run, compiled before its I/O and vCPU threads
@@ -389,7 +402,7 @@ pub fn allowed_counts() -> io::Result<(usize, usize)> {
 /// [`Filters::install`] installs those of the thread that calls `boot`, last.
 pub(crate) struct Filters {
     /// The number of syscalls each filter allows, when the sandbox is on.
-    counts: Option<(usize, usize)>,
+    counts: Option<(usize, usize, usize)>,
 }
 
 impl Filters {
@@ -421,14 +434,14 @@ impl Filters {
     /// confinement on stderr.
     ///
     /// It must run once every thread that thread spawns exists. That order lets
-    /// both allowlists refuse `seccomp` itself, since nothing is created under
+    /// every allowlist refuse `seccomp` itself, since nothing is created under
     /// a filter except the per-connection vsock threads, which inherit it.
     ///
     /// # Errors
     ///
     /// Errors if the filter cannot be installed.
     pub(crate) fn install(self) -> io::Result<()> {
-        let Some((vmm, vcpu)) = self.counts else {
+        let Some((vmm, vcpu, block)) = self.counts else {
             stderrln!(
                 "{LOG_PREFIX} seccomp: OFF (--no-sandbox); the VMM keeps the full host syscall surface"
             );
@@ -446,7 +459,7 @@ impl Filters {
             );
         } else {
             stderrln!(
-                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, trap on mismatch{opens})"
+                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, block {block}, trap on mismatch{opens})"
             );
         }
         Ok(())
@@ -491,6 +504,12 @@ fn probes() -> Vec<Probe> {
             run: open_each_way,
         },
         Probe {
+            what: "open a file (block)",
+            thread: Thread::Block,
+            expected: OPEN_OUTCOME,
+            run: open_each_way,
+        },
+        Probe {
             what: "create a socket (vcpu)",
             thread: Thread::Vcpu,
             expected: Outcome::Trapped,
@@ -505,6 +524,15 @@ fn probes() -> Vec<Probe> {
             expected: Outcome::Trapped,
             // The vmm filter allows accept4 on a listener bound beforehand but
             // never socket(2): it cannot make a new one.
+            // SAFETY: socket(2) with constant arguments.
+            run: || {
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            },
+        },
+        Probe {
+            what: "create a socket (block)",
+            thread: Thread::Block,
+            expected: Outcome::Trapped,
             // SAFETY: socket(2) with constant arguments.
             run: || {
                 unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -529,6 +557,27 @@ fn probes() -> Vec<Probe> {
             // a vCPU thread servicing guest MMIO has no business making threads.
             run: || {
                 let _ = std::thread::spawn(|| 0u8).join();
+            },
+        },
+        Probe {
+            what: "spawn a thread (block)",
+            thread: Thread::Block,
+            expected: Outcome::Trapped,
+            // A disk's worker is queued before the filters go in and starts no
+            // thread of its own.
+            run: || {
+                let _ = std::thread::spawn(|| 0u8).join();
+            },
+        },
+        Probe {
+            what: "make an ioctl outside its requests (block)",
+            thread: Thread::Block,
+            expected: Outcome::Trapped,
+            // The rule matches the request number, whatever the descriptor.
+            // SAFETY: an ioctl on a descriptor that is not open, which the
+            // kernel refuses with EBADF once the filter has passed it.
+            run: || {
+                unsafe { libc::ioctl(-1, libc::FIONREAD, std::ptr::null_mut::<libc::c_int>()) };
             },
         },
         Probe {
@@ -563,32 +612,145 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::kill(1, 0) };
             },
         },
-        // The other half: what a filtered thread must still be able to do.
-        //
-        // The flush pair earns its place: the lists first shipped allowing
-        // `fsync` for "virtio-blk flush requests", but the device model calls
-        // `File::sync_data`, which is `fdatasync`. Nothing caught it, because a
-        // guest that only ever reads its disk never issues a flush -- it took a
-        // container with a writable rootfs, and the VMM died of SIGSYS mid-run.
-        // A probe per filter means the allowlist is checked against the syscall
-        // the code actually makes.
+        // A disk's requests run on its worker, so a vCPU thread reads and writes
+        // no file at an offset and flushes none. The read and the write each
+        // take one empty buffer, so a call the filter passes moves nothing.
+        Probe {
+            what: "read at an offset (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || {
+                let _ = std::os::unix::fs::FileExt::read_at(&*inherited(0), &mut [], 0);
+            },
+        },
+        Probe {
+            what: "write at an offset (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || {
+                let _ = std::os::unix::fs::FileExt::write_at(&*inherited(1), &[], 0);
+            },
+        },
         Probe {
             what: "flush an inherited descriptor (vcpu)",
             thread: Thread::Vcpu,
-            expected: Outcome::Allowed,
+            expected: Outcome::Trapped,
             run: || {
-                // SAFETY: fdatasync on fd 1, which we inherited. It is the
-                // syscall `File::sync_data` makes on the virtio-blk flush path.
+                // SAFETY: fdatasync on fd 1, which we inherited.
                 unsafe { libc::fdatasync(1) };
             },
         },
         Probe {
-            what: "flush an inherited descriptor (vmm)",
+            what: "read at an offset (vmm)",
             thread: Thread::Vmm,
+            expected: Outcome::Trapped,
+            run: || {
+                let _ = std::os::unix::fs::FileExt::read_at(&*inherited(0), &mut [], 0);
+            },
+        },
+        // The other half: what a filtered thread must still be able to do.
+        //
+        // A disk's flush calls `File::sync_data`, which is `fdatasync`, not
+        // `fsync`, so the probe makes the call the worker makes.
+        Probe {
+            what: "flush an inherited descriptor (block)",
+            thread: Thread::Block,
             expected: Outcome::Allowed,
             run: || {
-                // SAFETY: as above.
+                // SAFETY: fdatasync on fd 1, which we inherited.
                 unsafe { libc::fdatasync(1) };
+            },
+        },
+        Probe {
+            what: "write at an offset (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Allowed,
+            // The ledger writer writes the file at an offset. The probe writes
+            // one empty buffer to fd 1, which we inherited, so the call is made
+            // and writes nothing.
+            run: || {
+                let _ = std::os::unix::fs::FileExt::write_at(&*inherited(1), &[], 0);
+            },
+        },
+        // The probe calls the functions the worker calls for a virtio-blk read
+        // or write, so it makes whichever syscall the libc lowers them to.
+        Probe {
+            what: "read at an offset into buffers (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            run: || {
+                let mut empty = [0u8; 0];
+                let buffers = [vm_memory::VolatileSlice::from(&mut empty[..])];
+                // It reads one empty buffer from fd 0, which we inherited, so
+                // the call is made and reads nothing.
+                let _ = crate::memory::read_vectored_at_volatile(&inherited(0), &buffers, 0);
+            },
+        },
+        Probe {
+            what: "write at an offset from buffers (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            run: || {
+                let mut empty = [0u8; 0];
+                let buffers = [vm_memory::VolatileSlice::from(&mut empty[..])];
+                // It writes one empty buffer to fd 1, which we inherited, so
+                // the call is made and writes nothing.
+                let _ = crate::memory::write_vectored_at_volatile(&inherited(1), &buffers, 0);
+            },
+        },
+        Probe {
+            what: "poll an inherited descriptor (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            // The worker waits in `poll` on its wake beside the stop token.
+            run: || {
+                let mut fds = [libc::pollfd {
+                    fd: 1,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                }];
+                // SAFETY: one pollfd for fd 1, which we inherited, and a zero
+                // timeout, so the call returns at once.
+                unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            },
+        },
+        Probe {
+            what: "restore the terminal (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            // The fatal-signal handler and the panic hook restore the terminal
+            // from whichever thread they run on. Each request is made directly
+            // too, since a libc call may give up before its last request on a
+            // descriptor that is not open.
+            run: || {
+                // SAFETY: the terminal calls and requests on a descriptor that
+                // is not open, which the kernel refuses with EBADF once the
+                // filter has passed them. `termios` is plain data, so zeroes
+                // are valid.
+                unsafe {
+                    let mut settings: libc::termios = std::mem::zeroed();
+                    libc::ioctl(-1, libc::TCGETS, &mut settings);
+                    libc::ioctl(-1, libc::TCSETS, &settings);
+                    libc::ioctl(-1, libc::TCGETS2, &mut settings);
+                    libc::ioctl(-1, libc::TCSETS2, &settings);
+                    libc::ioctl(-1, libc::TCFLSH, libc::TCIFLUSH);
+                    libc::tcflush(-1, libc::TCIFLUSH);
+                    libc::tcgetattr(-1, &mut settings);
+                    libc::tcsetattr(-1, libc::TCSANOW, &settings);
+                }
+            },
+        },
+        #[cfg(target_arch = "x86_64")]
+        Probe {
+            what: "raise an interrupt line (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            // A worker pulses its disk's IOAPIC pin with KVM_IRQ_LINE.
+            run: || {
+                let level = kvm_bindings::kvm_irq_level::default();
+                // SAFETY: KVM_IRQ_LINE on a descriptor that is not open, which
+                // the kernel refuses with EBADF once the filter has passed it.
+                unsafe { libc::ioctl(-1, kvm_irq_line(), &level) };
             },
         },
         Probe {
@@ -720,6 +882,21 @@ fn probes() -> Vec<Probe> {
             },
         },
     ]
+}
+
+/// Returns the `KVM_IRQ_LINE` request, which the `block` filter allows on
+/// x86-64.
+#[cfg(target_arch = "x86_64")]
+const fn kvm_irq_line() -> libc::Ioctl {
+    libc::_IOW::<kvm_bindings::kvm_irq_level>(kvm_bindings::KVMIO, 0x61)
+}
+
+/// Returns the inherited descriptor `fd` as a `File` that never closes it.
+fn inherited(fd: std::os::fd::RawFd) -> std::mem::ManuallyDrop<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the `File` is never dropped, so it never closes `fd`, which the
+    // probe child inherited and owns no other handle to.
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Exit status of a probe child whose syscall failed with `EPERM`.
@@ -879,8 +1056,10 @@ pub fn selftest() -> io::Result<usize> {
              prove nothing; unset it"
         )));
     }
-    let (vmm, vcpu) = allowed_counts()?;
-    println!("hvi seccomp selftest: vmm allows {vmm} syscalls, vcpu allows {vcpu}");
+    let (vmm, vcpu, block) = allowed_counts()?;
+    println!(
+        "hvi seccomp selftest: vmm allows {vmm} syscalls, vcpu allows {vcpu}, block allows {block}"
+    );
     println!("hvi seccomp selftest: each probe runs in a child that installs the real filter\n");
 
     let mut bad = 0usize;
@@ -913,14 +1092,17 @@ pub fn selftest() -> io::Result<usize> {
 mod tests {
     use super::*;
 
-    /// Both filters must compile for the architecture the binary is built for.
-    /// A typo in a syscall name, or a name that does not exist on this arch
-    /// (`poll` is the one that differs: x86-64 has both `poll` and `ppoll`,
-    /// aarch64 has `ppoll` alone), is a startup failure in production; here it
-    /// is a test failure on any Linux host.
+    /// Every filter of a run, in the order `arm` compiles them.
+    const THREADS: [Thread; 3] = [Thread::Vmm, Thread::Vcpu, Thread::Block];
+
+    // Every filter must compile for the architecture the binary is built for.
+    // A typo in a syscall name, or a name that does not exist on this arch
+    // (`poll` is the one that differs: x86-64 has both `poll` and `ppoll`,
+    // aarch64 has `ppoll` alone), is a startup failure in production; here it
+    // is a test failure on any Linux host.
     #[test]
     fn filters_compile_for_this_arch() {
-        for thread in [Thread::Vmm, Thread::Vcpu] {
+        for thread in THREADS {
             for (_, p) in programs(thread, false).expect("filter should compile") {
                 assert!(!p.is_empty(), "{:?} compiled to an empty program", thread);
             }
@@ -934,17 +1116,20 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
 
-    /// Returns the action `program` takes for a syscall `number` with all-zero
-    /// arguments.
+    /// Returns the action `program` takes for a syscall `number` with the
+    /// arguments `args`.
     ///
     /// It runs the program as the kernel's classic BPF interpreter would. It
     /// knows the instructions seccompiler emits and panics on any other.
-    fn run_program(program: &[seccompiler::sock_filter], number: i64) -> u32 {
+    fn run_program(program: &[seccompiler::sock_filter], number: i64, args: [u64; 6]) -> u32 {
         // `seccomp_data`: the syscall number, the audit architecture, the
         // instruction pointer and six arguments.
         let mut data = [0u8; 64];
         data[0..4].copy_from_slice(&u32::try_from(number).unwrap().to_ne_bytes());
         data[4..8].copy_from_slice(&AUDIT_ARCH.to_ne_bytes());
+        for (index, arg) in args.iter().enumerate() {
+            data[16 + index * 8..24 + index * 8].copy_from_slice(&arg.to_ne_bytes());
+        }
         let (mut pc, mut acc) = (0usize, 0u32);
         loop {
             let insn = &program[pc];
@@ -970,16 +1155,32 @@ mod tests {
         }
     }
 
-    /// Returns the kernel's action for `number` under all of `programs`.
+    /// Returns the kernel's action for `number` with all-zero arguments under
+    /// all of `programs`.
+    fn verdict(programs: &[BpfProgram], number: i64) -> u32 {
+        verdict_with(programs, number, [0; 6])
+    }
+
+    /// Returns the kernel's action for `number` with the arguments `args` under
+    /// all of `programs`.
     ///
     /// That is the strictest of their actions, which is the lowest read as a
     /// signed number.
-    fn verdict(programs: &[BpfProgram], number: i64) -> u32 {
+    fn verdict_with(programs: &[BpfProgram], number: i64, args: [u64; 6]) -> u32 {
         programs
             .iter()
-            .map(|p| run_program(p, number))
+            .map(|p| run_program(p, number, args))
             .min_by_key(|&action| (action & libc::SECCOMP_RET_ACTION_FULL) as i32)
             .unwrap()
+    }
+
+    /// Returns the filters `install` installs for `thread`.
+    fn installed(thread: Thread) -> Vec<BpfProgram> {
+        programs(thread, false)
+            .unwrap()
+            .into_iter()
+            .map(|(_, program)| program)
+            .collect()
     }
 
     // It runs the filters `install` installs, so it covers the open refusal
@@ -993,12 +1194,8 @@ mod tests {
         } else {
             libc::SECCOMP_RET_TRAP
         };
-        for thread in [Thread::Vmm, Thread::Vcpu] {
-            let filters: Vec<BpfProgram> = programs(thread, false)
-                .unwrap()
-                .into_iter()
-                .map(|(_, program)| program)
-                .collect();
+        for thread in THREADS {
+            let filters = installed(thread);
             #[cfg(target_arch = "x86_64")]
             assert_eq!(verdict(&filters, libc::SYS_open), open, "open, {thread:?}");
             assert_eq!(
@@ -1032,12 +1229,12 @@ mod tests {
             .expect("the raw allowlists should compile");
     }
 
-    /// Both filters must deny by default. A filter that allowed by default
-    /// would install, run, and confine nothing.
+    // Every filter must deny by default. A filter that allowed by default
+    // would install, run, and confine nothing.
     #[test]
     fn filters_trap_on_mismatch() {
         let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        for key in ["vmm", "vcpu"] {
+        for key in THREADS.map(Thread::key) {
             assert_eq!(
                 doc[key]["default_action"], "trap",
                 "{key} must trap on a syscall outside its list"
@@ -1046,21 +1243,23 @@ mod tests {
         }
     }
 
+    /// Returns the names of the syscalls the filter `key` allows.
+    fn names(key: &str) -> std::collections::BTreeSet<String> {
+        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
+        doc[key]["filter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["syscall"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     /// The vCPU threads service guest MMIO inline, so their list is the one
     /// that matters most and it must stay a strict subset of the VMM's --
     /// if a syscall is added to `vcpu` alone, it was added without anyone
     /// thinking about the thread that actually parses guest data.
     #[test]
     fn vcpu_is_a_subset_of_vmm() {
-        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        let names = |k: &str| -> std::collections::BTreeSet<String> {
-            doc[k]["filter"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| r["syscall"].as_str().unwrap().to_string())
-                .collect()
-        };
         let vmm = names("vmm");
         let vcpu = names("vcpu");
         let extra: Vec<_> = vcpu.difference(&vmm).collect();
@@ -1068,12 +1267,111 @@ mod tests {
         assert!(vcpu.len() < vmm.len(), "vcpu should be the tighter filter");
     }
 
+    // A disk's requests run on its worker, so a vCPU thread reads and writes no
+    // file at an offset, seeks none and syncs none.
+    #[test]
+    fn vcpu_filter_has_no_positioned_io_seek_or_sync() {
+        let vcpu = names("vcpu");
+        for name in [
+            "pread64",
+            "pwrite64",
+            "preadv",
+            "pwritev",
+            "preadv2",
+            "pwritev2",
+            "lseek",
+            "fsync",
+            "fdatasync",
+            "sync_file_range",
+        ] {
+            assert!(!vcpu.contains(name), "vcpu allows {name}");
+        }
+    }
+
+    // A disk's worker parses guest descriptors too, so its list follows the
+    // same rule, apart from the two calls that move a request's data between
+    // the backing file and guest RAM. No other thread makes them, so `vmm` does
+    // not allow them.
+    #[test]
+    fn block_adds_only_the_vectored_file_calls_to_vmm() {
+        let vmm = names("vmm");
+        let block = names("block");
+        let extra: Vec<_> = block.difference(&vmm).map(String::as_str).collect();
+        assert_eq!(
+            extra,
+            ["preadv", "pwritev"],
+            "block allows what vmm does not"
+        );
+        assert!(
+            block.len() < vmm.len(),
+            "block should be the tighter filter"
+        );
+    }
+
+    // A worker takes no connection, starts no thread, makes no eventfd and
+    // sends no descriptor.
+    #[test]
+    fn block_filter_has_no_socket_thread_or_descriptor_calls() {
+        let block = names("block");
+        for name in [
+            "accept4", "recvfrom", "recvmsg", "sendmsg", "eventfd2", "clone", "clone3", "fcntl",
+            "shutdown",
+        ] {
+            assert!(!block.contains(name), "block allows {name}");
+        }
+    }
+
+    // The values are the requests the JSON names in its comments, computed here
+    // from the headers' definitions, so a wrong number in the JSON fails.
+    #[test]
+    fn block_filter_allows_only_its_ioctl_requests() {
+        let filters = installed(Thread::Block);
+        let ioctl = |request: libc::Ioctl| {
+            // A request is a 32-bit value, whatever the libc's type for it.
+            let request = u64::from(request as u32);
+            verdict_with(&filters, libc::SYS_ioctl, [0, request, 0, 0, 0, 0])
+        };
+        let allowed = [
+            libc::TCGETS,
+            libc::TCSETS,
+            libc::TCGETS2,
+            libc::TCSETS2,
+            libc::TCFLSH,
+            #[cfg(target_arch = "x86_64")]
+            kvm_irq_line(),
+        ];
+        for request in allowed {
+            assert_eq!(
+                ioctl(request),
+                libc::SECCOMP_RET_ALLOW,
+                "request {request:#x}"
+            );
+        }
+        let run = libc::_IO(kvm_bindings::KVMIO, 0x80);
+        for request in [libc::FIONREAD, libc::TIOCSTI, run] {
+            assert_eq!(
+                ioctl(request),
+                libc::SECCOMP_RET_TRAP,
+                "request {request:#x}"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            ioctl(libc::_IOW::<kvm_bindings::kvm_irq_level>(
+                kvm_bindings::KVMIO,
+                0x61
+            )),
+            libc::SECCOMP_RET_TRAP,
+            "an arm64 worker raises its interrupt with an eventfd write"
+        );
+    }
+
     /// The point of installing after setup is that the process can no longer
     /// reach the filesystem or make a socket. These are the syscalls whose
     /// presence would quietly undo that, so name them rather than trust the
     /// lists to stay short.
     #[test]
-    fn neither_filter_can_open_or_connect() {
+    fn no_filter_can_open_or_connect() {
         let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
         let forbidden = [
             "open",
@@ -1091,7 +1389,7 @@ mod tests {
             "seccomp",
             "prctl",
         ];
-        for key in ["vmm", "vcpu"] {
+        for key in THREADS.map(Thread::key) {
             for rule in doc[key]["filter"].as_array().unwrap() {
                 let name = rule["syscall"].as_str().unwrap();
                 assert!(

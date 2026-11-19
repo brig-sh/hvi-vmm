@@ -56,6 +56,7 @@ use crate::devices::virtio::vsock;
 use crate::events::Ledger;
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
+use crate::sandbox::Thread;
 
 /// The error an attach returns.
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -270,6 +271,8 @@ impl<C: irq::Chip> DeviceManager<C> {
 
     /// Attaches a disk for each entry of `disks`, in order.
     ///
+    /// It also queues each disk's worker.
+    ///
     /// # Errors
     ///
     /// Errors when `block::open_disks` refuses the disks, no slot is left for a
@@ -281,6 +284,11 @@ impl<C: irq::Chip> DeviceManager<C> {
                 .allocate()
                 .map_err(|e| format!("virtio-blk disk {index}: {e}"))?;
             self.attach_virtio(DeviceKind::Block, slot, &disk)?;
+            disk.lock()
+                .unwrap()
+                .take_worker(&self.ram, &self.ledger)
+                .expect("a disk just opened should hold its backing file")
+                .queue_thread(&mut self.devices.host);
             self.devices.disks.push(disk);
         }
         Ok(())
@@ -327,7 +335,7 @@ impl<C: irq::Chip> DeviceManager<C> {
         let bridge = agent.bridge;
         self.devices
             .host
-            .spawn("agent bridge", move |stop| bridge.run(&stop));
+            .spawn("agent bridge", Thread::Vmm, move |stop| bridge.run(&stop));
         Ok(())
     }
 
@@ -587,6 +595,7 @@ mod tests {
             path,
             read_only: false,
             serial: None,
+            poll_max: None,
         }
     }
 
@@ -660,6 +669,32 @@ mod tests {
             *ioeventfds.lock().unwrap(),
             [(first, 0x10_0250, 0), (second, 0x10_0250, 1)]
         );
+    }
+
+    // Each disk's notification eventfd is registered at its own slot, and is
+    // the one its queued worker waits on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_disk_queues_its_worker_and_registers_its_notification() {
+        use crate::devices::virtio::Device as _;
+        let (mut devices, ioeventfds) =
+            manager_with_ioeventfds(SlotAllocator::new(0x10_0000..0x10_1000, [5, 6]));
+        let disks = [disk("worker0"), disk("worker1")];
+        devices.attach_disks(&disks).unwrap();
+        let attached = devices.finish();
+        assert_eq!(attached.host.thread_names(), ["virtio-blk", "virtio-blk"]);
+        let notify_fds: Vec<_> = attached
+            .disks
+            .iter()
+            .map(|disk| disk.lock().unwrap().notify_fds()[0].as_raw_fd())
+            .collect();
+        assert_eq!(
+            *ioeventfds.lock().unwrap(),
+            [(notify_fds[0], 0x10_0050, 0), (notify_fds[1], 0x10_0250, 0)]
+        );
+        for disk in &disks {
+            let _ = std::fs::remove_file(&disk.path);
+        }
     }
 
     #[test]

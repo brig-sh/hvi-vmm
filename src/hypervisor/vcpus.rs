@@ -137,8 +137,9 @@ impl<K: Kick> Vcpus<K> {
     ///
     /// It is for a vCPU that waits outside the hypervisor on something no
     /// kick reaches, such as a vhost-user daemon that has not answered a
-    /// device reset. The hook must return at once, and it runs again on each
-    /// later stop.
+    /// device reset, and for what a thread that may be left running has to
+    /// hand over before the stop goes on. The hook must not wait on the guest,
+    /// a device or another thread's work, and it runs again on each later stop.
     pub(crate) fn on_stop(&self, hook: impl Fn() + Send + Sync + 'static) {
         self.stop_hooks.lock().unwrap().push(Box::new(hook));
     }
@@ -241,8 +242,9 @@ impl<K: Kick> Vcpus<K> {
             self.kicker.kick_all();
             self.kicker.kick_halted();
         }
-        // A hook frees a vCPU that waits outside the hypervisor. The hooks run
-        // after the flag is cleared, so that vCPU reads the stop as it returns.
+        // A hook frees a vCPU that waits outside the hypervisor, or hands over
+        // what a thread left running would add too late. The hooks run after
+        // the flag is cleared, so a freed vCPU reads the stop as it returns.
         for hook in self.stop_hooks.lock().unwrap().iter() {
             hook();
         }

@@ -18,13 +18,17 @@ three things a reader should not have to guess between:
 | The macOS backend needs macOS 15 or newer. | It calls `hv_gic_*`, which arrived in macOS 15. hvi runs no version check, so an older host fails when it first reaches the framework rather than with a clear message. | Platform |
 | The KVM backends need kernel 4.11 or newer. | hvi stops a vCPU through `kvm_run.immediate_exit` and refuses to boot without `KVM_CAP_IMMEDIATE_EXIT`, which 4.11 added. | Platform |
 | No published crate. | Build from source, or take a release binary; pin a commit or a release tag when you depend on it. | Design |
-| The arm64/KVM backend is unit-tested on its stop path only. | Its only tests are the KVM tests in `src/hypervisor/kvm.rs`: the stop tests, of how a run stops (a vCPU thread that ends, a stop request, plugin threads, the lifecycle records, and a kick), and the queue notification test, which runs a few guest instructions in a bare VM. They need `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
+| The arm64/KVM backend is unit-tested on its stop path and its vGIC irqfd list only. | Its tests are the KVM tests in `src/hypervisor/kvm.rs`: the stop tests, of how a run stops (a vCPU thread that ends, a stop request, plugin threads, the lifecycle records, and a kick), and the queue notification test, which runs a few guest instructions in a bare VM. They need `/dev/kvm`. `src/arch/aarch64/kvm/gic.rs` also tests the vGIC's irqfd list, with and without `/dev/kvm`. The rest of that backend is cross-linted and booted. | Defect |
 
 ## Devices
 
 | Limit | Consequence | Kind |
 | --- | --- | --- |
 | virtio-blk disks attach at boot only. | No hotplug, no PCI at all. | Design |
+| A disk's worker uses host CPU while it polls. | After a request the worker polls its queue before it sleeps, while the guest's requests keep coming that closely. The poll lasts up to 32 microseconds, or up to the disk's `poll-max-us`. A guest that reads or writes one small request after another keeps one host thread per such disk busy. A disk whose requests come further apart is not polled, and `poll-max-us=0` on a `--disk` turns the poll off for that disk. | Design |
+| A disk's requests run one at a time. | Each disk has one worker thread, so the host sees one request at a time whatever the guest queues, and a read waits behind a flush queued before it. | Design |
+| Several busy disks need more host cores than the guest has vCPUs. | A request runs on the disk's worker while the vCPU that sent it waits. When a guest sends small requests one after another to several disks at once, each request takes longer the more disks are busy. The cost is largest once the vCPUs and the busy workers outnumber the host's cores. On a Mac only the performance cores count, and the cost starts with the second busy disk. | Design |
+| A disk whose backing file stops answering holds the vCPU that resets the disk. | A read writes guest RAM during its call, so a reset waits for the request in flight, and nothing of it reaches the guest after the reset. The VMM's stop ends the wait. | Design |
 | An MMIO access to an address no device claims reads 0, and a write there is dropped. | The run goes on. With `HVI_MMIO_TRACE` set, hvi writes a line to stderr with the address, the width and the program counter, at most 10 at once and then one every 500 ms. It is off by default, because the line is written on the vCPU, and a full stderr would stop it. On x86-64, the program counter of a write is the next instruction's, because KVM has finished the instruction by then. | Design |
 | On arm64, an MMIO access with no instruction syndrome, such as a load pair, ends the run. | hvi cannot tell which registers the access names. A cache maintenance instruction on such an address is skipped. | Design |
 | An x86-64 port no device claims reads `0xff`, and a write there is dropped. | hvi reports nothing, because Linux probes absent ports at every boot. | Design |
@@ -96,7 +100,7 @@ three things a reader should not have to guess between:
 | --- | --- | --- |
 | Confinement does not drop privilege. | No uid, gid or capability change exists in hvi. It narrows syscalls only. | Design |
 | A thread a plugin starts outside `VmHandle::spawn` is unfiltered on Linux. | It starts in `on_attach`, before the filters are armed, and stays unfiltered. | Design |
-| No seccomp rule carries argument conditions. | `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. | Design |
+| Only the `block` filter's `ioctl` rules carry an argument condition, on the request number. | Under the `vmm` and `vcpu` filters `ioctl` and `sendmsg` are unconstrained over every descriptor the process already holds. Under `block` an allowed `ioctl` request reaches any of them. | Design |
 | `HVI_SECCOMP=log` turns enforcement off. | The kernel permits the off-list syscall and records it. It is not a softer mode. A glibc build still refuses an open, without a record. | Design |
 | Selftests check specific probes. | A pass says those probes matched the profile. It is not proof the sandbox is secure. | Design |
 | No external security audit. | Testing, not assurance. | Design |

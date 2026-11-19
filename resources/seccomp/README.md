@@ -20,11 +20,30 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-Two threads. `vcpu` is the tight one and the one that matters most, because
-MMIO exits are serviced inline on the vCPU thread -- the virtio device models,
-the code that parses guest descriptors, run there. `vmm` covers the thread that
-calls `boot`, the host-side I/O threads, the threads a plugin starts with
-`VmHandle::spawn`, the stop-signal thread and the ledger's writer.
+Three filters. `vcpu` is the tight one for the vCPU threads. A vCPU thread
+serves its MMIO and port exits, so the virtio-mmio transport, the net and vsock
+device models, the vhost-user handover and the legacy devices run there, and the
+device models parse guest descriptors. A disk's requests run on the disk's
+worker, so `vcpu` allows no read or write at an offset, no seek and no file
+sync. `block` covers each disk's worker thread, which parses the disk's
+descriptors and runs its requests against the backing file. It alone allows
+`preadv` and `pwritev`, which move a request's data between the backing file and
+guest RAM. `vmm` covers the thread that calls `boot`, the other host-side I/O
+threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal
+thread and the ledger's writer.
+
+A rule can also match an argument, as `block`'s `ioctl` rules match the request
+number:
+
+```json
+{"syscall": "ioctl",
+ "args": [{"index": 1, "type": "dword", "op": "eq", "val": 21506}],
+ "comment": "why"}
+```
+
+The rules of one syscall are joined, so the syscall is allowed when any of them
+matches. A rule without `args` beside one with `args` does not allow every call:
+only the conditions count.
 
 ## Why these are not Firecracker's lists
 
@@ -53,17 +72,17 @@ the check for that.
 
 ## The files glibc opens by itself
 
-Neither list carries an open syscall (`openat`, `openat2`, and on x86-64
-`open`). glibc's malloc opens two files on its own, from whichever thread is
-allocating or freeing at the time: `/proc/sys/vm/overcommit_memory` the first
-time the heap of a thread's arena shrinks, and `/sys/devices/system/cpu/online`,
-falling back to `/proc/stat`, when a thread needs a new arena while more than
-eight exist. It copes with each open failing, so a glibc build installs, on
-every thread and before the allowlist, a second filter that fails those open
-syscalls with `EPERM`, and adds them to the allowlist it compiles. The kernel
-takes the strictest answer of a thread's filters, so an open is refused rather
-than trapped, and the process still opens nothing. musl's malloc opens no file,
-so a musl build installs the allowlist alone.
+No list carries an open syscall (`openat`, `openat2`, and on x86-64 `open`).
+glibc's malloc opens two files on its own, from whichever thread is allocating
+or freeing at the time: `/proc/sys/vm/overcommit_memory` the first time the heap
+of a thread's arena shrinks, and `/sys/devices/system/cpu/online`, falling back
+to `/proc/stat`, when a thread needs a new arena while more than eight exist. It
+copes with each open failing, so a glibc build installs, on every thread and
+before the allowlist, a second filter that fails those open syscalls with
+`EPERM`, and adds them to the allowlist it compiles. The kernel takes the
+strictest answer of a thread's filters, so an open is refused rather than
+trapped, and the process still opens nothing. musl's malloc opens no file, so a
+musl build installs the allowlist alone.
 
 ## Changing a list
 
@@ -78,10 +97,13 @@ data, so the bar is a demonstrated need, not a suspicion:
    still refuses an open under it, without a record.
 2. Add it to the narrowest filter that needs it, with a `comment` saying which
    code path calls it.
-3. `cargo test` -- the unit tests check that both lists compile for the target
-   arch, that `vcpu` stays a strict subset of `vmm`, and that neither list ever
-   gains `open*`, `socket`, `connect`, `execve`, `seccomp` or `prctl`, each of
-   which would undo the reason the filters go in after setup. The opens a glibc
+3. `cargo test` -- the unit tests check that every list compiles for the target
+   arch, that `vcpu` stays a strict subset of `vmm`, and that `block` does too
+   apart from `preadv` and `pwritev`, which only a disk's worker makes. They
+   also check that no list ever gains `open*`, `socket`, `connect`, `execve`,
+   `seccomp` or `prctl`, each of which would undo the reason the filters go in
+   after setup. They check that `vcpu` gains no positioned read or write, seek
+   or file sync, and which `ioctl` requests `block` allows. The opens a glibc
    build adds are compiled in by the code, behind the filter that refuses them.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
