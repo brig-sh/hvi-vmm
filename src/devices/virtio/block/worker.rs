@@ -1384,14 +1384,14 @@ mod capacity_tests {
     fn read_only_disk_advertises_f_ro() {
         let (_r, ro) = ro_rig("feat", "");
         // The spec's bit numbers, not the constants the device uses:
-        // VIRTIO_BLK_F_FLUSH is bit 9, VIRTIO_BLK_F_RO bit 5 and
-        // VIRTIO_BLK_F_SEG_MAX bit 2.
-        assert_eq!(ro.features(), (1 << 9) | (1 << 5) | (1 << 2));
+        // VIRTIO_RING_F_INDIRECT_DESC is bit 28, VIRTIO_BLK_F_FLUSH bit 9,
+        // VIRTIO_BLK_F_RO bit 5 and VIRTIO_BLK_F_SEG_MAX bit 2.
+        assert_eq!(ro.features(), (1 << 28) | (1 << 9) | (1 << 5) | (1 << 2));
 
         let (_w, rw) = rig("feat");
         assert_eq!(
             rw.blk.features(),
-            (1 << 9) | (1 << 2),
+            (1 << 28) | (1 << 9) | (1 << 2),
             "a writable disk is not ro"
         );
     }
@@ -2604,7 +2604,7 @@ mod data_path_tests {
     use super::*;
     use crate::devices::virtio::mmio::testing::{self, Rings};
     use crate::devices::virtio::{
-        Device as _, QUEUE_MAX_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+        Device as _, QUEUE_MAX_SIZE, VIRTQ_DESC_F_INDIRECT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
     };
     use crate::memory;
 
@@ -2616,6 +2616,8 @@ mod data_path_tests {
         avail_ring: BASE + 0x1000,
         used_ring: BASE + 0x2000,
     };
+    /// Where a request's indirect table is, with room for 1024 entries.
+    const TABLE: u64 = BASE + 0x4000;
     /// Where a request has its header, and its status byte.
     const HEADER: u64 = BASE + 0x8000;
     const STATUS: u64 = BASE + 0x8100;
@@ -2800,33 +2802,47 @@ mod data_path_tests {
     /// A disk whose worker the test runs a pass at a time, on the test's
     /// thread.
     struct Disk<F: BackingStore = File> {
-        /// The device, activated with [`RINGS`].
+        /// The device, activated with its rings where [`RINGS`] has them.
         _blk: VirtioBlk,
         /// The device's worker.
         worker: Worker<F>,
         /// The guest RAM the queue and the buffers are in.
         ram: Arc<GuestRam>,
+        /// The number of entries the driver programmed into the queue.
+        queue_size: u16,
     }
 
     impl Disk {
         /// Returns a writable disk over an image of `len` bytes made by
-        /// [`image`], with its queue activated.
+        /// [`image`], with its queue programmed at its largest size and
+        /// activated.
         ///
         /// The image is unlinked at once, and the worker's descriptor keeps it.
         fn new(len: usize, sparse: bool) -> Self {
+            Self::with_queue_size(len, sparse, QUEUE_MAX_SIZE)
+        }
+
+        /// Returns a disk as [`new`](Self::new) does, with `queue_size` entries
+        /// programmed into its queue.
+        fn with_queue_size(len: usize, sparse: bool, queue_size: u16) -> Self {
             let path = image(len, sparse);
             let mut blk = VirtioBlk::open(path.to_str().unwrap()).unwrap();
             std::fs::remove_file(&path).unwrap();
             let ram = Arc::new(GuestRam::from_ranges(&[(BASE, RAM)]));
             let ledger = Arc::new(Ledger::new(None, "blk-data-test").unwrap());
             let worker = blk.take_worker(&ram, &ledger).unwrap();
-            let queue = testing::ready_queue(QUEUE_MAX_SIZE, RINGS, &ram);
+            let rings = Rings {
+                size: u32::from(queue_size),
+                ..RINGS
+            };
+            let queue = testing::ready_queue(QUEUE_MAX_SIZE, rings, &ram);
             let (interrupt, _) = testing::enabled_interrupt();
             blk.activate(&ram, 0, vec![Some(queue)], interrupt).unwrap();
             Self {
                 _blk: blk,
                 worker,
                 ram,
+                queue_size,
             }
         }
 
@@ -2837,6 +2853,7 @@ mod data_path_tests {
                 _blk: self._blk,
                 worker: self.worker.with_store(wrap),
                 ram: self.ram,
+                queue_size: self.queue_size,
             }
         }
 
@@ -2856,9 +2873,34 @@ mod data_path_tests {
         /// The worker serves it, and the call returns the status byte the
         /// device wrote and what the pass captured. The chain starts at
         /// descriptor 0, and each request takes the next entry of the avail
-        /// ring. The status byte is poisoned to `0xff`, so an untouched byte is
-        /// visible.
+        /// ring.
         fn submit(&self, kind: u32, sector: u64, segments: &[(u64, u32)]) -> (u8, Pass) {
+            self.write_chain(RINGS.desc_table, kind, sector, segments);
+            self.serve_head()
+        }
+
+        /// Submits a request as [`submit`](Self::submit) does, with its chain
+        /// in an indirect table at [`TABLE`], as Linux lays a request out once
+        /// `VIRTIO_RING_F_INDIRECT_DESC` is negotiated.
+        ///
+        /// Descriptor 0 of the queue refers to the table.
+        fn submit_indirect(&self, kind: u32, sector: u64, segments: &[(u64, u32)]) -> (u8, Pass) {
+            let entries = self.write_chain(TABLE, kind, sector, segments);
+            let at = RINGS.desc_table;
+            self.ram.write_u64(at, TABLE).unwrap();
+            self.ram.write_u32(at + 8, entries * 16).unwrap();
+            self.ram.write_u16(at + 12, VIRTQ_DESC_F_INDIRECT).unwrap();
+            self.ram.write_u16(at + 14, 0).unwrap();
+            self.serve_head()
+        }
+
+        /// Writes the chain of a request of type `kind` at `sector`, with its
+        /// data in the guest `segments`, from entry 0 of the descriptor table
+        /// at `table`.
+        ///
+        /// It returns the number of descriptors in the chain. The status byte
+        /// is poisoned to `0xff`, so an untouched byte is visible.
+        fn write_chain(&self, table: u64, kind: u32, sector: u64, segments: &[(u64, u32)]) -> u32 {
             let ram = &self.ram;
             ram.write_u32(HEADER, kind).unwrap();
             ram.write_u64(HEADER + 8, sector).unwrap();
@@ -2873,7 +2915,7 @@ mod data_path_tests {
                 .chain(std::iter::once((STATUS, 1, VIRTQ_DESC_F_WRITE)))
                 .collect();
             for (index, &(addr, len, flags)) in (0u64..).zip(&chain) {
-                let at = RINGS.desc_table + index * 16;
+                let at = table + index * 16;
                 let next = if index + 1 < chain.len() as u64 {
                     VIRTQ_DESC_F_NEXT
                 } else {
@@ -2884,9 +2926,19 @@ mod data_path_tests {
                 ram.write_u16(at + 12, flags | next).unwrap();
                 ram.write_u16(at + 14, (index + 1) as u16).unwrap();
             }
+            chain.len() as u32
+        }
+
+        /// Serves the chain at descriptor 0, after making it available as the
+        /// next entry of the avail ring.
+        ///
+        /// It returns the status byte the device wrote and what the pass
+        /// captured.
+        fn serve_head(&self) -> (u8, Pass) {
+            let ram = &self.ram;
             let avail = RINGS.avail_ring;
             let idx = ram.read_u16(avail + 2).unwrap();
-            ram.write_u16(avail + 4 + u64::from(idx % 256) * 2, 0)
+            ram.write_u16(avail + 4 + u64::from(idx % self.queue_size) * 2, 0)
                 .unwrap();
             ram.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
             let pass = self.worker.pass();
@@ -2899,7 +2951,7 @@ mod data_path_tests {
         fn used_len(&self) -> u32 {
             let used = RINGS.used_ring;
             let idx = self.ram.read_u16(used + 2).unwrap();
-            let entry = used + 4 + u64::from(idx.wrapping_sub(1) % 256) * 8;
+            let entry = used + 4 + u64::from(idx.wrapping_sub(1) % self.queue_size) * 8;
             self.ram.read_u32(entry + 4).unwrap()
         }
 
@@ -3007,6 +3059,59 @@ mod data_path_tests {
         assert_eq!(disk.used_len(), BYTES as u32 + 1);
         assert_eq!(disk.joined(&segments), written);
         assert_eq!(disk.take_records(), [(0, BYTES, true), (0, BYTES, false)]);
+    }
+
+    // The table holds the header, 254 data segments and the status byte, and
+    // the request takes one entry of the queue.
+    #[test]
+    fn request_through_an_indirect_table_round_trips() {
+        const BYTES: u64 = 254 * 512;
+        let disk = Disk::new(BYTES as usize, true);
+        let segments: Vec<_> = (0..254).map(|n| (BUFFERS + n * 0x800, 512)).collect();
+        let written = disk.fill(&segments, 5);
+
+        let (status, _) = disk.submit_indirect(VIRTIO_BLK_T_OUT, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.image(), written);
+
+        disk.fill(&segments, 0x99);
+        let (status, _) = disk.submit_indirect(VIRTIO_BLK_T_IN, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.used_len(), BYTES as u32 + 1);
+        assert_eq!(disk.joined(&segments), written);
+        assert_eq!(disk.take_records(), [(0, BYTES, true), (0, BYTES, false)]);
+    }
+
+    // The driver programmed 16 of the 256 entries the queue takes, as Linux
+    // programs fewer when it cannot allocate the rings. A request of `seg_max`
+    // segments through a table is past the programmed size and within the
+    // largest, so it is served.
+    #[test]
+    fn request_of_seg_max_segments_is_served_on_a_smaller_programmed_queue() {
+        const BYTES: u64 = 254 * 512;
+        let disk = Disk::with_queue_size(BYTES as usize, true, 16);
+        let segments: Vec<_> = (0..254).map(|n| (BUFFERS + n * 0x800, 512)).collect();
+        let written = disk.fill(&segments, 9);
+
+        let (status, _) = disk.submit_indirect(VIRTIO_BLK_T_OUT, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.image(), written);
+    }
+
+    // One data segment more than `seg_max` makes a table of 257 descriptors,
+    // past the largest size the queue takes. The walk ends before the status
+    // byte, so the request moves nothing and its status byte is not written.
+    #[test]
+    fn request_of_more_than_seg_max_segments_is_not_served() {
+        let disk = Disk::new(255 * 512, true);
+        let segments: Vec<_> = (0..255).map(|n| (BUFFERS + n * 0x800, 512)).collect();
+        disk.fill(&segments, 5);
+
+        let (status, _) = disk.submit_indirect(VIRTIO_BLK_T_OUT, 0, &segments);
+        assert_eq!(status, 0xff, "the status byte is untouched");
+        assert_eq!(disk.used_len(), 0);
+        assert_eq!(disk.image(), vec![0; 255 * 512]);
+        assert!(disk.take_records().is_empty());
     }
 
     // A call given only empty buffers returns 0, which reads as the end of the

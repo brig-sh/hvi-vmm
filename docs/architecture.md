@@ -448,14 +448,16 @@ can reach it as one interrupt.
 ### Devices
 
 - **virtio-blk** (`devices/virtio/block/`, id 2) backs `--disk`, one device per
-  disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync,
+  disk. It advertises `VIRTIO_BLK_F_FLUSH` and honors a flush with a real sync,
   adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with the
   disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. It advertises
   `VIRTIO_BLK_F_SEG_MAX` with a `seg_max` of 254, the queue's 256 entries less a
-  request's header and status byte, so a request can carry many pages. The image
-  is locked while open, shared for a read-only disk and exclusive for a writable
-  one. Each disk has a worker thread that serves its queue, one request at a
-  time. See [The disk worker](#the-disk-worker).
+  request's header and status byte, so a request can carry many pages. With
+  `VIRTIO_RING_F_INDIRECT_DESC`, which it advertises too, such a request takes
+  one entry of the queue. The image is locked while open, shared for a read-only
+  disk and exclusive for a writable one. Each disk has a worker thread that
+  serves its queue, one request at a time. See [The disk
+  worker](#the-disk-worker).
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See
   [networking.md](networking.md). It offers `VIRTIO_NET_F_MAC` and no offloads.
   Queue 0 is RX, queue 1 is TX.
@@ -529,16 +531,20 @@ race may not land within the test's budget, so it is `#[ignore]`d and run
 weekly.
 
 Every in-process device walks its descriptor chains through `DescriptorChain`,
-which ends after as many descriptors as the queue has entries, indirect ones
-included, so a cycle runs out of budget. A chain that never reaches a descriptor
-without NEXT is incomplete. The device completes it with a used length of 0, and
-on a receive queue the frame or packet then goes to the next buffer. A receive
-buffer with less writable room than the device's header goes back the same way.
-The replies to a transmit notification go to the receive queue in one pass after
-the drain, and a receive pass returns at most a queue's worth of malformed
-buffers. A head outside the ring gets no used entry. A queue becomes ready only
-with its rings aligned and in guest RAM and its avail ring not at address 0.
-Re-programming any queue register makes it not ready again.
+which ends after as many descriptors as the largest size its queue takes, those
+of an indirect table included, so a cycle runs out of budget. A chain in the
+descriptor table ends at the size the driver programmed. Of the in-process
+devices only virtio-blk offers `VIRTIO_RING_F_INDIRECT_DESC`, and a chain that
+uses a table on another one is followed within the same bound. A chain that
+never reaches a descriptor without NEXT is incomplete. The device completes it
+with a used length of 0, and on a receive queue the frame or packet then goes to
+the next buffer. A receive buffer with less writable room than the device's
+header goes back the same way. The replies to a transmit notification go to the
+receive queue in one pass after the drain, and a receive pass returns at most a
+queue's worth of malformed buffers. A head outside the ring gets no used entry.
+A queue becomes ready only with its rings aligned and in guest RAM and its avail
+ring not at address 0. Re-programming any queue register makes it not ready
+again.
 
 ## 5. Concurrency and failure
 

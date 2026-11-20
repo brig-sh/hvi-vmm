@@ -114,8 +114,8 @@ impl<F: BackingStore> Worker<F> {
     ///
     /// The first readable segment is the 16-byte header (type, reserved,
     /// sector), the last writable segment is the status byte, and the segments
-    /// between carry data. The walk is bounded by the queue size, so the
-    /// request holds at most that many buffers.
+    /// between carry data. The walk is bounded by the largest size the queue
+    /// takes, so the request holds at most that many buffers.
     pub(super) fn parse(&self, mut chain: DescriptorChain<'_>) -> Request<'_> {
         let head = chain.head_index();
         let mut readable = Vec::new();

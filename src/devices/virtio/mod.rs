@@ -41,7 +41,7 @@ use vmm_sys_util::eventfd::EventFd;
 use mmio::Interrupt;
 use queue::{DescriptorChain, Queue, QueueConfig, QUEUE_MAX_SIZE};
 #[cfg(test)]
-use queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use queue::{VIRTQ_DESC_F_INDIRECT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 use crate::events::CapturedEvent;
 use crate::memory::GuestRam;
