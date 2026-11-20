@@ -32,6 +32,3 @@ pub mod server;
 pub mod vhost_user;
 #[cfg(target_os = "macos")]
 pub(crate) mod worker;
-
-#[cfg(target_os = "macos")]
-pub use server::GuestIds;

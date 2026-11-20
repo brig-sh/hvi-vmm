@@ -1563,11 +1563,6 @@ impl VirtioFs {
         self.zero_copy_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Sets the waker of the worker thread that serves the queue work a vCPU
     /// leaves.
     pub(crate) fn set_waker(&mut self, waker: Waker) {
@@ -5195,10 +5190,7 @@ const MAX_NODE_ALIASES: usize = 16;
 
 /// Directory descriptors for the export, keyed by node.
 ///
-/// This is the resolver Option B is built on (#30). Nothing
-/// calls it yet: it lands first, with its tests, so the 120-odd call sites
-/// that follow are mechanical against a primitive that has already been
-/// argued about.
+/// This is the resolver Option B is built on (#30).
 ///
 /// # Why descriptors rather than paths
 ///
@@ -5218,7 +5210,6 @@ const MAX_NODE_ALIASES: usize = 16;
 /// It also closes a race the old check documented and could not fix: that one
 /// resolved a path and then let the syscall resolve it again, so anything
 /// host-side could swap a component in between.
-#[allow(dead_code)]
 struct DirCache {
     /// The export root. Pinned: never evicted, and the origin of every walk.
     root: OwnedFd,
@@ -5251,7 +5242,6 @@ struct DirCache {
     limit: usize,
 }
 
-#[allow(dead_code)]
 impl DirCache {
     fn new(root: &Path, limit: usize, caching: bool) -> io::Result<Self> {
         let root = open_dir_nofollow_at(None, root.as_os_str().as_bytes())
@@ -5505,21 +5495,9 @@ impl DirCache {
         self.root.as_fd()
     }
 
-    #[cfg(test)]
-    fn resident(&self) -> usize {
-        self.open.len()
-    }
-
     /// Returns how many host descriptors this cache is holding.
     fn held(&self) -> usize {
         self.open.len()
-    }
-
-    /// Closes all of them, for when the descriptors are worth more than the
-    /// resolutions they save.
-    fn release_all(&mut self) {
-        self.open.clear();
-        self.lru.clear();
     }
 }
 
@@ -5934,12 +5912,6 @@ impl Stat {
     fn blksize(&self) -> u64 {
         nonnegative(i64::from(self.raw.st_blksize))
     }
-    /// Unused until device nodes need it; kept so the type covers a `stat`
-    /// rather than only the fields today's callers happen to read.
-    #[allow(dead_code)]
-    fn rdev(&self) -> u64 {
-        self.raw.st_rdev as u64
-    }
     fn atime(&self) -> i64 {
         self.raw.st_atime
     }
@@ -6124,7 +6096,6 @@ fn read_dir_at(fd: OwnedFd) -> Result<Vec<DirEntryInfo>, i32> {
 /// `parent` selects the form: `Some(fd)` resolves `name` relative to that
 /// descriptor, `None` treats it as a path from the host's root, which is only
 /// used for the export root itself.
-#[allow(dead_code)]
 fn open_dir_nofollow_at(parent: Option<RawFd>, name: &[u8]) -> Result<OwnedFd, i32> {
     let name = CString::new(name).map_err(|_| EINVAL)?;
     note_host_op();
@@ -10705,7 +10676,7 @@ mod tests {
         let (dir, mut cache) = dircache_fixture();
         let fd = cache.dir_fd(Path::new("")).unwrap();
         assert!(fd.as_raw_fd() >= 0);
-        assert_eq!(cache.resident(), 0, "the root is pinned, not cached");
+        assert_eq!(cache.held(), 0, "the root is pinned, not cached");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -10714,13 +10685,13 @@ mod tests {
     fn dircache_walks_then_reuses() {
         let (dir, mut cache) = dircache_fixture();
         let first = cache.dir_fd(Path::new("usr/lib/ssl")).unwrap().as_raw_fd();
-        assert_eq!(cache.resident(), 1);
+        assert_eq!(cache.held(), 1);
         let second = cache.dir_fd(Path::new("usr/lib/ssl")).unwrap().as_raw_fd();
         assert_eq!(
             first, second,
             "a hit must hand back the descriptor already open, not walk again"
         );
-        assert_eq!(cache.resident(), 1);
+        assert_eq!(cache.held(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -10750,7 +10721,7 @@ mod tests {
             err, ENOENT,
             "an absolute target must resolve inside the export, where it is absent"
         );
-        assert_eq!(cache.resident(), 0, "nothing may be admitted on failure");
+        assert_eq!(cache.held(), 0, "nothing may be admitted on failure");
 
         // And it stays absent for a component in the middle of a path.
         fs::create_dir_all(outside.join("deeper")).unwrap();
@@ -10776,7 +10747,7 @@ mod tests {
         let (dir, mut cache) = dircache_fixture();
         assert_eq!(cache.dir_fd(Path::new("usr/../etc")).unwrap_err(), EINVAL);
         assert_eq!(cache.dir_fd(Path::new("/etc")).unwrap_err(), EINVAL);
-        assert_eq!(cache.resident(), 0);
+        assert_eq!(cache.held(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -10793,12 +10764,12 @@ mod tests {
         for i in 0..8u64 {
             cache.dir_fd(Path::new(&format!("d{i}"))).unwrap();
             assert!(
-                cache.resident() <= 3,
+                cache.held() <= 3,
                 "cache grew past its limit at {i}: {}",
-                cache.resident()
+                cache.held()
             );
         }
-        assert_eq!(cache.resident(), 3);
+        assert_eq!(cache.held(), 3);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -10828,11 +10799,11 @@ mod tests {
     fn dircache_forget_releases_the_descriptor() {
         let (dir, mut cache) = dircache_fixture();
         cache.dir_fd(Path::new("etc")).unwrap();
-        assert_eq!(cache.resident(), 1);
+        assert_eq!(cache.held(), 1);
         cache.forget(Path::new("etc"));
-        assert_eq!(cache.resident(), 0);
+        assert_eq!(cache.held(), 0);
         cache.forget(Path::new("etc")); // idempotent
-        assert_eq!(cache.resident(), 0);
+        assert_eq!(cache.held(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11488,7 +11459,7 @@ mod tests {
         // still a (now stale) entry in this node's path list.
         assert_eq!(
             dev.node_path(secondary).unwrap(),
-            dev.root().join("secondary")
+            dev.root.join("secondary")
         );
         let getattr = dev.handle_fuse(&request(GETATTR, secondary, &[]), 4096);
         assert_eq!(get_u32(&getattr, 4), Some(0));
@@ -11512,14 +11483,14 @@ mod tests {
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(fs::read(dir.join("left")).unwrap(), b"right");
         assert_eq!(fs::read(dir.join("right")).unwrap(), b"left");
-        assert_eq!(dev.node_path(left).unwrap(), dev.root().join("right"));
-        assert_eq!(dev.node_path(right).unwrap(), dev.root().join("left"));
+        assert_eq!(dev.node_path(left).unwrap(), dev.root.join("right"));
+        assert_eq!(dev.node_path(right).unwrap(), dev.root.join("left"));
 
         fs::hard_link(dir.join("right"), dir.join("alias")).unwrap();
         assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"alias"), left);
         let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"right\0"), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
-        assert_eq!(dev.node_path(left).unwrap(), dev.root().join("alias"));
+        assert_eq!(dev.node_path(left).unwrap(), dev.root.join("alias"));
         let _ = fs::remove_dir_all(dir);
     }
 
