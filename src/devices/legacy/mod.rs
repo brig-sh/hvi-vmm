@@ -19,10 +19,15 @@
 //! through the ACPI registers or the i8042. An arm64 guest reads the PL031 RTC
 //! for the wall clock at boot.
 
+#[cfg(target_arch = "x86_64")]
 pub mod acpi_pm;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod i8042;
+#[cfg(target_arch = "aarch64")]
 pub mod pl011;
+#[cfg(target_arch = "x86_64")]
 pub mod rtc_cmos;
+#[cfg(target_arch = "aarch64")]
 pub mod rtc_pl031;
+#[cfg(target_arch = "x86_64")]
 pub mod uart16550;

@@ -22,6 +22,7 @@
 //! the macOS backend serves, and `smoke` checks Hypervisor.framework without a
 //! kernel.
 
+#[cfg(target_os = "macos")]
 pub mod esr;
 pub mod fdt;
 pub mod layout;

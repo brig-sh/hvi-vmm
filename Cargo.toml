@@ -60,8 +60,8 @@ libc = "0.2.189"
 signal-hook = "0.4.5"
 # The 16550 register file for the x86 COM1 and the PL031 register file for the
 # arm64 RTC, maintained upstream. The PL011 and the MC146818 CMOS have no
-# equivalent in the crate, so those stay ours. The legacy devices build for
-# every backend, whichever guest uses them, so this is a common dependency.
+# equivalent in the crate, so those stay ours. Each guest architecture uses one
+# of the two, so this is a common dependency.
 vm-superio = "0.8.1"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
