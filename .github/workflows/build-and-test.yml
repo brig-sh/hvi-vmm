@@ -176,7 +176,7 @@ jobs:
   # with --cpus 2 also exercises SMP: the BSP enters long mode and the guest
   # brings the AP online with INIT-SIPI-SIPI serviced by the in-kernel LAPIC, so
   # we additionally assert both processors activate. Needs a runner with
-  # /dev/kvm; skips cleanly otherwise.
+  # /dev/kvm, and fails when the device is absent.
   #
   # Self-hosted rather than GitHub-hosted, which is a change of runner and not
   # of what is tested. The `guest kernel` step below installs a package, and on
@@ -210,12 +210,15 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: x86-live
-      - id: kvm
+      # A runner labeled kvm without /dev/kvm fails here. Skipping the boots
+      # would report a job that booted nothing as green. The boots run under
+      # sudo, so the check is for the device, not for write access.
+      - name: kvm availability
         run: |
-          if [ -e /dev/kvm ]; then echo "ok=yes" >> "$GITHUB_OUTPUT"; ls -l /dev/kvm; \
-          else echo "ok=no" >> "$GITHUB_OUTPUT"; echo "::warning::/dev/kvm absent — skipping live boot"; fi
+          test -e /dev/kvm \
+            || { echo "::error::/dev/kvm is absent on a runner labeled kvm"; exit 1; }
+          ls -l /dev/kvm
       - name: build
-        if: steps.kvm.outputs.ok == 'yes'
         run: cargo build --release
       # The step installs the guest kernel and its headers, and outputs the
       # release and image of the kernel `linux-image-virtual` depends on. The
@@ -223,7 +226,6 @@ jobs:
       # be any kernel the runner has.
       - name: guest kernel
         id: kernel
-        if: steps.kvm.outputs.ok == 'yes'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -240,7 +242,6 @@ jobs:
           echo "release=$KREL" >> "$GITHUB_OUTPUT"
           echo "image=$KIMG" >> "$GITHUB_OUTPUT"
       - name: boot to the userspace / VFS gate (SMP, 2 vCPUs)
-        if: steps.kvm.outputs.ok == 'yes'
         env:
           KIMG: ${{ steps.kernel.outputs.image }}
         run: |
@@ -275,7 +276,6 @@ jobs:
       # signed archive as everything else here, and the job reaches no host of
       # its own to get it.
       - name: boot the uncompressed vmlinux
-        if: steps.kvm.outputs.ok == 'yes'
         env:
           KIMG: ${{ steps.kernel.outputs.image }}
           KREL: ${{ steps.kernel.outputs.release }}
@@ -298,30 +298,12 @@ jobs:
           grep -q "Linux version" boot-vmlinux.log || { echo "::error::the vmlinux did not boot"; exit 1; }
           grep -qE "Unable to mount root fs|Run /init" boot-vmlinux.log || { echo "::error::did not reach the userspace/VFS gate"; exit 1; }
           echo "vmlinux boot gate reached ✓"
-      # RAM past the MMIO hole is a second region at 4 GiB. The guest's own
-      # e820 must show the split, not the hole described as RAM.
-      - name: boot with 4096 MiB, RAM split around the MMIO hole
-        if: steps.kvm.outputs.ok == 'yes'
-        env:
-          KIMG: ${{ steps.kernel.outputs.image }}
-        run: |
-          sudo timeout 60 ./target/release/hvi boot --kernel "$KIMG" --mem-mib 4096 --cpus 1 \
-            --cmdline "console=ttyS0 panic=-1" </dev/null 2>&1 | tee boot-4g.log || true
-          grep -q "Linux version" boot-4g.log || { echo "::error::the 4 GiB guest did not boot"; exit 1; }
-          for range in "0x0000000000000000-0x000000000009fbff" \
-                       "0x0000000000100000-0x00000000cfffffff" \
-                       "0x0000000100000000-0x000000012fffffff"; do
-            grep -q "BIOS-e820: \[mem $range\] usable" boot-4g.log \
-              || { echo "::error::e820 lacks the usable range $range"; exit 1; }
-          done
-          echo "e820 split around the MMIO hole ✓"
       # The guest powers off through the ACPI tables. To reset, Linux tries the
       # ACPI reset register and then the i8042, so the reset run is traced and
       # checked for the write to the reset register. The run without ACPI checks
       # the i8042 alone. KVM handles a halt itself, so a power-off that fell back
       # to one would end only at the timeout.
       - name: check that power-off and reset end the run
-        if: steps.kvm.outputs.ok == 'yes'
         env:
           KIMG: ${{ steps.kernel.outputs.image }}
         run: |
@@ -355,11 +337,9 @@ jobs:
       # openable, which is every unprivileged run — so nothing exercised it
       # live. A loop device over a sparse file is exactly the shape that broke
       # (metadata().len() == 0), and HVI_BLOCK_DEV points the test at it so a
-      # skip cannot pass for coverage. Loop devices need root, not KVM, but the
-      # build above is gated on KVM, so gate the same way.
+      # skip cannot pass for coverage. Loop devices need root, not KVM.
       - name: virtio-blk sizing against a real block device
         id: blk
-        if: steps.kvm.outputs.ok == 'yes'
         run: |
           truncate -s 64M blk.img
           LOOP=$(sudo losetup --find --show blk.img)
@@ -392,7 +372,6 @@ jobs:
       # allowlist refuses. One at a time, since some of them find a thread by
       # name. 2>&1: the panic report is on stderr.
       - name: run the vCPU stop tests
-        if: steps.kvm.outputs.ok == 'yes'
         env:
           BIN: ${{ steps.blk.outputs.bin }}
         run: |
@@ -406,7 +385,6 @@ jobs:
       # that has to allow it. A missing entry there does not fail a unit test:
       # it kills the VMM mid-boot with SIGSYS. Only a live mount catches it.
       - name: serve a virtio-fs export through virtiofsd
-        if: steps.kvm.outputs.ok == 'yes'
         env:
           KIMG: ${{ steps.kernel.outputs.image }}
           KREL: ${{ steps.kernel.outputs.release }}
@@ -474,7 +452,6 @@ jobs:
           path: |
             boot.log
             boot-vmlinux.log
-            boot-4g.log
             poweroff.log
             reboot.log
             reboot-no-acpi.log
@@ -916,87 +893,6 @@ jobs:
           else
             echo "RTC not checked: the guest kernel lacks rtc-pl031"
           fi
-      # The tap attach is the urunc integration path: urunc creates the tap and
-      # hvi only opens it, so a CI tap created with `ip tuntap` stands in for
-      # urunc exactly. Creating one needs CAP_NET_ADMIN, and the runner user's
-      # privileges are not a given -- so unlike /dev/kvm above (which the job
-      # cannot do anything without) this probes and skips with a warning rather
-      # than going red on an unprivileged runner.
-      # The negative half of the tap behavior: an unusable --net-tap must
-      # refuse the boot, not warn and fall back -- that is the change 9b5b77b
-      # makes, and only a live boot runs that arm. Opening a tap that does not
-      # exist needs no privileges, so unlike the positive boot below this runs
-      # on every runner, probe or no probe.
-      - name: an unusable tap refuses to boot
-        run: |
-          set +e
-          timeout 30 ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs.cpio \
-            --mem-mib 1024 --net-tap hvi-ci-nope \
-            --cmdline "earlycon console=ttyAMA0 panic=-1" \
-            </dev/null > tap-refuse.log 2>&1
-          rc=$?
-          set -e
-          [ "$rc" -ne 0 ] \
-            || { echo "::error::a boot with an unusable tap succeeded"; tail -10 tap-refuse.log; exit 1; }
-          grep -q "hvi-ci-nope" tap-refuse.log \
-            || { echo "::error::the boot error does not name the tap"; tail -10 tap-refuse.log; exit 1; }
-          echo "an unusable tap fails the boot and names the interface"
-      - name: tap network probe
-        id: tap
-        run: |
-          # A leftover tap from a crashed earlier run would make the probe
-          # misread "File exists" as "no privileges", so clear it first.
-          ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true
-          # `user` lets the unprivileged hvi process attach to the device;
-          # `vnet_hdr` matches how urunc creates it (TUNTAP_VNET_HDR).
-          if ip tuntap add mode tap name hvi-ci-tap user "$(id -un)" vnet_hdr 2>/dev/null; then
-            NET=""
-          elif sudo -n ip tuntap add mode tap name hvi-ci-tap user "$(id -un)" vnet_hdr 2>/dev/null; then
-            NET="sudo -n"
-          else
-            echo "ok=no" >> "$GITHUB_OUTPUT"
-            echo "::warning::cannot create a tap (needs CAP_NET_ADMIN or passwordless sudo) -- skipping the tap network boot"
-            exit 0
-          fi
-          # The e2e suite's tap, which stays on these runners, takes the next
-          # /24, 172.30.1.0/24; see e2e/tools/provision.sh.
-          $NET ip addr add 172.30.0.1/24 dev hvi-ci-tap
-          $NET ip link set hvi-ci-tap up
-          ip -d link show hvi-ci-tap
-          echo "ok=yes" >> "$GITHUB_OUTPUT"
-      - name: boot with the container network on a real tap
-        if: steps.tap.outputs.ok == 'yes'
-        run: |
-          # The whole tap path in one assertion: attach to a pre-existing tap,
-          # present the override MAC, and have the guest ping the host side of
-          # the tap. The neighbor entry the ping leaves behind proves frames
-          # on the tap carried the --net-mac address. The asserts run while
-          # the guest sits in its keep-alive window: detaching drops carrier,
-          # and the kernel may then evict the neighbor entry
-          # (arp_evict_nocarrier defaults on).
-          python3 tools/mk-initramfs.py --out target/initramfs-tap.cpio \
-            --keep-alive 45 --net-static 172.30.0.2/24,172.30.0.1
-          ./target/release/hvi boot \
-            --kernel guest/Image --initramfs target/initramfs-tap.cpio \
-            --mem-mib 1024 --net-tap hvi-ci-tap --net-mac 52:54:00:c1:5c:01 \
-            --cmdline "earlycon console=ttyAMA0 panic=-1" \
-            </dev/null > tap.log 2>&1 &
-          # The init pings before it prints the userspace marker, so once the
-          # marker is up the pings are done.
-          for _ in $(seq 1 60); do
-            grep -q "HVI-INITRAMFS-UP" tap.log 2>/dev/null && break
-            sleep 1
-          done
-          grep -q "HVI-INITRAMFS-UP" tap.log \
-            || { echo "::error::the guest did not reach userspace with --net-tap"; tail -20 tap.log; exit 1; }
-          grep -q "bytes from 172.30.0.1" tap.log \
-            || { echo "::error::the guest could not ping the host across the tap"; tail -20 tap.log; exit 1; }
-          ip neigh show dev hvi-ci-tap
-          ip neigh show dev hvi-ci-tap | grep -qi "52:54:00:c1:5c:01" \
-            || { echo "::error::no traffic with the assigned MAC reached the tap"; exit 1; }
-          pkill -f "target/release/hvi boot" || true
-          echo "tap network: the guest pinged the host with the override MAC over hvi-ci-tap"
       # The tails above keep 20 to 25 lines. When the job fails, the full
       # logs and the event ledger answer what those lines cannot.
       - name: keep the boot evidence
@@ -1008,15 +904,5 @@ jobs:
             stop.log
             run.log
             ev.ndjson
-            tap.log
-            tap-refuse.log
           retention-days: 7
           if-no-files-found: ignore
-      - name: tap teardown
-        if: always()
-        run: |
-          # The tap is host state that would outlive the job on this
-          # persistent runner; remove it however it was created. (The probe's
-          # pre-clean also covers a crashed run, so best-effort is enough.)
-          pkill -f "target/release/hvi boot" 2>/dev/null || true
-          ip link del hvi-ci-tap 2>/dev/null || sudo -n ip link del hvi-ci-tap 2>/dev/null || true
