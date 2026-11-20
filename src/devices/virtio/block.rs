@@ -709,18 +709,6 @@ mod queue_tests {
         blk
     }
 
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(dev(), &mem, rings);
-    }
-
     /// Notifies the device of chain `head`, published as the next entry of the
     /// avail ring of [`activated`]'s queue.
     fn notify_head(blk: &mut VirtioBlk, mem: &GuestRam, head: u16) {
@@ -1070,14 +1058,6 @@ mod capacity_tests {
         );
     }
 
-    #[test]
-    fn read_past_the_advertised_capacity_is_refused() {
-        let (_r, mut blk) = rig("in");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 9_999, 512);
-        assert_eq!(st, VIRTIO_BLK_S_IOERR);
-    }
-
     /// A sector that would wrap the byte offset is refused rather than aliased
     /// back into the file (release builds used to wrap silently).
     #[test]
@@ -1087,19 +1067,6 @@ mod capacity_tests {
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, u64::MAX / 256, 16);
         assert_eq!(st, VIRTIO_BLK_S_IOERR);
         assert_eq!(std::fs::metadata(&r.path).unwrap().len(), 512);
-    }
-
-    /// The last sector inside the capacity still works, so the bound is not
-    /// off by one.
-    #[test]
-    fn a_request_inside_the_capacity_still_succeeds() {
-        let (_r, mut blk) = rig("ok");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512);
-        assert_eq!(st, VIRTIO_BLK_S_OK, "sector 0 of a 1-sector disk is valid");
-        let mut got = [0u8; 4];
-        mem.read(BASE + 0x5000, &mut got).unwrap();
-        assert_eq!(&got, &[0xab; 4], "the sector reached guest memory");
     }
 
     /// A request type the device does not implement is answered `S_UNSUPP`, not

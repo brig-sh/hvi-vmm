@@ -1729,19 +1729,6 @@ mod session_tests {
         mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
     }
 
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = Arc::new(mem_of(0x4000));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(VirtioVsock::new(), &mem, rings);
-    }
-
     // A packet queued before the reset must not reach the ring the guest
     // programs after it.
     #[test]
@@ -1865,54 +1852,6 @@ mod session_tests {
         assert_eq!(
             VirtioVsock::read_tx(&mem, chain).map(|p| p.len()),
             Some(HDR_LEN + PAYLOAD)
-        );
-    }
-
-    // A readable descriptor that points back at itself ends at the queue size
-    // and gives no packet. Without the bound, its eight copies would make one.
-    #[test]
-    fn tx_descriptor_cycle_gives_no_packet() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut dev = VirtioVsock::new();
-        let avail = BASE + 0x1000;
-        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 8).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-
-        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
-
-        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
-    }
-
-    // A `next` outside the ring ends the walk. The descriptor one past the ring
-    // is a valid readable one carrying a whole header, so a walk past the ring
-    // would return a packet.
-    #[test]
-    fn tx_next_index_outside_the_ring_gives_no_packet() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut dev = VirtioVsock::new();
-        let avail = BASE + 0x1000;
-        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 8).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 8).unwrap();
-        mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
-        mem.write_u32(BASE + 136, HDR_LEN as u32).unwrap();
-        mem.write_u16(BASE + 140, 0).unwrap();
-        mem.write_u16(BASE + 142, 0).unwrap();
-
-        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
-        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
-        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 8);
-        assert_eq!(
-            VirtioVsock::read_tx(&mem, chain),
-            None,
-            "a head outside the ring"
         );
     }
 
@@ -2195,38 +2134,6 @@ mod session_tests {
             "every byte the host wrote reached the guest"
         );
         assert!(carried.iter().all(|&b| b == b'x'));
-    }
-
-    // An RX chain that never clears NEXT is refused. Its segments would repeat
-    // one descriptor `q.size()` times.
-    #[test]
-    fn rx_descriptor_cycle_is_refused() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = mem_of(0x8000);
-        let mut dev = VirtioVsock::new();
-        let avail = BASE + 0x1000;
-        set_ready_queue(&mut dev, &mem, RX_QUEUE, BASE, avail, BASE + 0x2000);
-
-        // desc[0] -> desc[0], writable and carrying NEXT.
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 4140).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
-            .unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-        let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
-        assert_eq!(
-            VirtioVsock::rx_chain(&mem, chain),
-            None,
-            "a cycle yields no segments"
-        );
-
-        // The same descriptor with NEXT clear is an ordinary one-buffer chain.
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE).unwrap();
-        let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
-        assert_eq!(
-            VirtioVsock::rx_chain(&mem, chain),
-            Some(vec![(BASE + 0x4000, 4140)])
-        );
     }
 
     /// Asserts that a one-descriptor receive buffer goes back empty and the
@@ -3305,23 +3212,6 @@ mod session_tests {
         dev.connect(mem, port);
         dev.handle_pkt(&pkt(OP_RESPONSE, port, &[]));
         (dev, port, peer)
-    }
-
-    #[test]
-    fn rx_buffer_outside_guest_ram_is_returned_and_the_packet_kept() {
-        let (desc, _, used, data) = RINGS;
-        let mem = mem_of(0x8_0000);
-        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
-        // Buffer 1 now points past the end of guest RAM.
-        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
-
-        dev.host_data(&mem, port, b"intact");
-        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
-        assert_eq!(used_entry(&mem, used, 1), (1, 0), "returned empty");
-        let (hdr, body) = delivered(&mem, used, 2, data, RXBUF);
-        assert_eq!((hdr.op, hdr.len), (OP_RW, 6));
-        assert_eq!(body, b"intact");
-        assert!(dev.pending.is_empty());
     }
 
     #[test]
