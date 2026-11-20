@@ -26,7 +26,7 @@ use super::request::{
     other, Request, Work, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_FLUSH,
     VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
 };
-use super::store::BackingStore;
+use super::store::{BackingStore, TransferError};
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::wake::WorkerWake;
 use crate::devices::virtio::Queue;
@@ -423,26 +423,34 @@ impl<F: BackingStore> Worker<F> {
             state.in_flight += 1;
             drop(state);
             let done = self.run_request(&request.work);
-            // Only a read or write that went through is I/O on the disk. A
-            // flush carries no data range, and a refused write
-            // moved nothing.
-            let moved = matches!(request.work, Work::Read { .. } | Work::Write { .. });
-            let recorded = done.is_ok() && moved;
-            if let (true, Some(sink)) = (recorded, sink) {
+            // Only a read or write is I/O on the disk, since a flush carries no
+            // data range. One that failed part way changed the disk or guest
+            // RAM up to where it stopped, so its record carries the bytes it
+            // moved. One that failed before its first byte moved nothing and
+            // has no record.
+            let record_len = match (&request.work, &done) {
+                (Work::Read { .. } | Work::Write { .. }, Ok(_)) => Some(request.data_len()),
+                (Work::Read { .. } | Work::Write { .. }, Err(error)) if error.moved > 0 => {
+                    Some(error.moved)
+                }
+                _ => None,
+            };
+            let done = done.map_err(|error| error.source);
+            if let (Some(len), Some(sink)) = (record_len, sink) {
                 // The sink gets the request before the driver can see it
                 // complete, so its record precedes what the guest does with the
                 // data. A sink that cannot keep up accounts for that itself: a
                 // lost record must not fail the guest's I/O.
                 sink.on_block(
                     request.sector,
-                    request.data_len(),
+                    len,
                     self.disk_id,
                     request.kind == VIRTIO_BLK_T_OUT,
                 );
                 fed.get_or_insert(sink);
             }
             state = self.shared.lock();
-            self.complete(&mut state, &request, done, recorded, &mut trace_lines);
+            self.complete(&mut state, &request, done, record_len, &mut trace_lines);
             state.in_flight -= 1;
             self.shared.idle.notify_all();
         }
@@ -504,7 +512,12 @@ impl<F: BackingStore> Worker<F> {
     /// It returns the number of bytes it wrote to guest RAM. It runs with no
     /// lock held. A read writes the request's buffers in guest RAM during the
     /// call.
-    fn run_request(&self, work: &Work<'_>) -> io::Result<u32> {
+    ///
+    /// # Errors
+    ///
+    /// Errors when the call failed or the request was refused. The error of a
+    /// read or write carries the number of bytes moved before it.
+    fn run_request(&self, work: &Work<'_>) -> Result<u32, TransferError> {
         match work {
             Work::Read { offset, buffers } => {
                 self.file
@@ -519,9 +532,12 @@ impl<F: BackingStore> Worker<F> {
                 .write_all_vectored_at_volatile(buffers, *offset)
                 .map(|()| 0),
             // Honor the guest's cache flush (durability for fsync).
-            Work::Flush => self.file.sync_data().map(|()| 0),
+            Work::Flush => {
+                self.file.sync_data()?;
+                Ok(0)
+            }
             Work::GetId { .. } | Work::Answer(_) => Ok(0),
-            Work::Refused(reason) => Err(io::Error::other(reason.clone())),
+            Work::Refused(reason) => Err(io::Error::other(reason.clone()).into()),
         }
     }
 
@@ -530,16 +546,16 @@ impl<F: BackingStore> Worker<F> {
     /// While the queue is served, the status byte and a `GET_ID` serial reach
     /// guest RAM, the chain goes on the used ring and the interrupt is raised,
     /// once per request, so a slow request does not hold back the ones before
-    /// it. After a reset none of that happens. A request that is `recorded`, a
-    /// read or write that went through, is recorded in the state either way,
-    /// since it reached the backing store. With tracing on, its console line
-    /// goes in `trace_lines`.
+    /// it. After a reset none of that happens. A request with a `record_len`, a
+    /// read or write that went through or failed part way, is recorded in the
+    /// state with that length either way, since it reached the backing store.
+    /// With tracing on, its console line goes in `trace_lines`.
     fn complete(
         &self,
         state: &mut State,
         request: &Request<'_>,
         done: io::Result<u32>,
-        recorded: bool,
+        record_len: Option<u64>,
         trace_lines: &mut Vec<String>,
     ) {
         let State { active, events, .. } = state;
@@ -578,7 +594,9 @@ impl<F: BackingStore> Worker<F> {
         // Boundary capture: the guest's disk I/O, observed at the device. The
         // console line is opt-in (HVI_BLK_TRACE), because a synchronous stderr
         // write per request would dominate the cost under a high-IOPS workload.
-        if self.trace && !failed {
+        // A request that failed part way has a line as well, with the bytes it
+        // moved.
+        if self.trace && (!failed || record_len.is_some()) {
             let kind = match request.kind {
                 VIRTIO_BLK_T_IN => "read ",
                 VIRTIO_BLK_T_OUT => "write",
@@ -586,16 +604,17 @@ impl<F: BackingStore> Worker<F> {
                 VIRTIO_BLK_T_GET_ID => "getid",
                 _ => "other",
             };
+            let bytes = record_len.unwrap_or(data_len);
             trace_lines.push(format!(
-                "\r\n[virtio-blk] {kind} sector={} bytes={data_len} status={status}\r\n",
+                "\r\n[virtio-blk] {kind} sector={} bytes={bytes} status={status}\r\n",
                 request.sector
             ));
         }
-        if recorded {
+        if let Some(len) = record_len {
             events.push(CapturedEvent::Block {
                 disk: Arc::clone(&self.serial_text),
                 lba: request.sector,
-                len: data_len,
+                len,
                 write: request.kind == VIRTIO_BLK_T_OUT,
             });
         }
@@ -2640,6 +2659,65 @@ mod data_path_tests {
         }
     }
 
+    /// A backing file on a host filesystem with room for `room` more bytes.
+    ///
+    /// A write takes what the room allows and uses it up. With none left, a
+    /// write fails as one to a full filesystem does.
+    struct Full {
+        /// The backing file.
+        file: File,
+        /// The bytes the writes may still take.
+        room: AtomicUsize,
+    }
+
+    impl BackingStore for Full {
+        fn read_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
+            memory::read_vectored_at_volatile(&self.file, bufs, offset)
+        }
+
+        fn write_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice<'_>],
+            offset: u64,
+        ) -> io::Result<usize> {
+            let mut left = self.room.load(Ordering::SeqCst);
+            if left == 0 {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            let mut cut = Vec::new();
+            for buf in bufs {
+                if left == 0 {
+                    break;
+                }
+                let len = buf.len().min(left);
+                cut.push(buf.subslice(0, len).unwrap());
+                left -= len;
+            }
+            self.room.store(left, Ordering::SeqCst);
+            memory::write_vectored_at_volatile(&self.file, &cut, offset)
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            self.file.sync_data()
+        }
+    }
+
+    /// A sink that keeps the length of each request it is fed.
+    #[derive(Default)]
+    struct Lengths(Mutex<Vec<u64>>);
+
+    impl IoSink for Lengths {
+        fn on_block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
+            self.0.lock().unwrap().push(length);
+        }
+
+        fn on_net(&self, _frame: &[u8], _egress: bool) {}
+    }
+
     /// A backing file that records each buffer it is handed.
     struct Recording {
         /// The backing file.
@@ -2804,6 +2882,22 @@ mod data_path_tests {
             self.ram.read_u32(entry + 4).unwrap()
         }
 
+        /// Returns the sector, the length and whether it is a write of each
+        /// record that is not in the ledger yet.
+        ///
+        /// It takes the records, so a second call returns none of them.
+        fn take_records(&self) -> Vec<(u64, u64, bool)> {
+            let records = self.worker.take_pending().into_iter();
+            records
+                .map(|record| match record {
+                    CapturedEvent::Block {
+                        lba, len, write, ..
+                    } => (lba, len, write),
+                    _ => panic!("a disk should record only block requests"),
+                })
+                .collect()
+        }
+
         /// Returns the bytes of the guest `segments`, joined.
         fn joined(&self, segments: &[(u64, u32)]) -> Vec<u8> {
             let mut joined = Vec::new();
@@ -2908,6 +3002,90 @@ mod data_path_tests {
         let file = &disk.worker.file.file;
         file.read_exact_at(&mut image, 1536).unwrap();
         assert_eq!(image, written);
+    }
+
+    // The host filesystem takes 612 bytes of a two-sector write and is then
+    // full. The image holds those bytes, so the failed request is recorded,
+    // fed to the sink and traced with their count.
+    #[test]
+    fn write_that_fails_part_way_is_recorded_with_the_bytes_written() {
+        let sink = Arc::new(Lengths::default());
+        let disk = Disk::new(8 * 512, false);
+        disk._blk.set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
+        let mut disk = disk.with_store(|file| Full {
+            file,
+            room: AtomicUsize::new(612),
+        });
+        disk.worker.trace = true;
+        let segments = [(BUFFERS, 512), (BUFFERS + 0x1000, 512)];
+        let written = disk.fill(&segments, 0x10);
+
+        let (status, pass) = disk.submit(VIRTIO_BLK_T_OUT, 1, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        let mut image = vec![0; 1024];
+        let file = &disk.worker.file.file;
+        file.read_exact_at(&mut image, 512).unwrap();
+        assert_eq!(&image[..612], &written[..612]);
+        assert_eq!(image[612], ((512 + 612) % 251) as u8, "the byte after");
+        assert_eq!(disk.take_records(), [(1, 612, true)]);
+        assert_eq!(*sink.0.lock().unwrap(), [612]);
+        let traced = pass.trace_lines.concat();
+        assert!(
+            traced.contains("write sector=1 bytes=612 status=1"),
+            "{traced:?}"
+        );
+    }
+
+    // The filesystem takes 100 bytes of a sector and is then full.
+    #[test]
+    fn transfer_error_gives_its_progress_and_keeps_its_cause() {
+        let ram = GuestRam::from_ranges(&[(BASE, RAM)]);
+        let disk = Disk::new(8 * 512, false).with_store(|file| Full {
+            file,
+            room: AtomicUsize::new(100),
+        });
+        let buffers = [ram.slice(BUFFERS, 512).unwrap()];
+
+        let error = disk
+            .worker
+            .file
+            .write_all_vectored_at_volatile(&buffers, 0)
+            .unwrap_err();
+        assert_eq!(error.moved, 100);
+        assert_eq!(error.to_string(), "transfer stopped after 100 bytes");
+        let cause = std::error::Error::source(&error)
+            .and_then(|cause| cause.downcast_ref::<io::Error>())
+            .expect("the cause should be the write's error");
+        assert_eq!(cause.raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    #[test]
+    fn write_that_fails_before_its_first_byte_is_not_recorded() {
+        let disk = Disk::new(8 * 512, false).with_store(|file| Full {
+            file,
+            room: AtomicUsize::new(0),
+        });
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_OUT, 1, &[(BUFFERS, 512)]);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        assert!(disk.take_records().is_empty());
+    }
+
+    // The image is cut to 700 bytes while the disk is attached, so a two-sector
+    // read ends there. The guest's buffers hold those bytes, so the failed
+    // request is recorded with their count.
+    #[test]
+    fn read_that_fails_part_way_is_recorded_with_the_bytes_read() {
+        let disk = Disk::new(8 * 512, false);
+        disk.worker.file.set_len(700).unwrap();
+        let segments = [(BUFFERS, 512), (BUFFERS + 0x1000, 512)];
+        disk.fill(&segments, 0);
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_IN, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        let image: Vec<u8> = (0..700).map(|n| (n % 251) as u8).collect();
+        assert_eq!(disk.joined(&segments)[..700], image);
+        assert_eq!(disk.take_records(), [(0, 700, false)]);
     }
 
     // The second segment starts at the end of guest RAM. The request is refused
