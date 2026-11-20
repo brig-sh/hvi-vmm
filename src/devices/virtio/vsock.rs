@@ -72,9 +72,6 @@ pub const AGENT_PORT: u32 = 1024;
 
 const RX_QUEUE: u16 = 0; // device -> guest
 const TX_QUEUE: u16 = 1; // guest -> device
-/// The event queue (index 2) exists in the config but we never post to it.
-#[allow(dead_code)]
-const EVENT_QUEUE: u16 = 2;
 
 /// virtio_vsock_hdr, 44 bytes, little-endian.
 const HDR_LEN: usize = 44;
@@ -1584,13 +1581,6 @@ mod tests {
         let _ = std::fs::remove_file(path);
         connected.expect("the bound socket");
         drop(agent);
-    }
-
-    #[test]
-    fn silences_unused_ops() {
-        // Keep the event constant referenced. The credit-request one is
-        // exercised for real by `credit_request_answers_only_a_live_session`.
-        assert_eq!(EVENT_QUEUE, 2);
     }
 
     /// Returns the result of binding the agent socket at `path`.
