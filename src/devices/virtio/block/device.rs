@@ -15,12 +15,14 @@
 //! The virtio-blk device behind the transport, and the image it opens.
 
 use std::fs::{File, OpenOptions};
+use std::mem::offset_of;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use virtio_bindings::virtio_blk::virtio_blk_config;
 #[cfg(target_os = "linux")]
 use vmm_sys_util::eventfd::EventFd;
 
@@ -42,6 +44,21 @@ const F_FLUSH: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH;
 ///
 /// Linux marks the guest's block device read-only to match.
 const F_RO: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
+/// The `VIRTIO_BLK_F_SEG_MAX` feature bit, which tells the guest that the
+/// configuration space holds the most data segments a request may carry.
+///
+/// Without it Linux puts one segment in each request.
+const F_SEG_MAX: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_SEG_MAX;
+
+/// The most data segments a request may carry, the `seg_max` of the
+/// configuration space.
+///
+/// A chain holds at most as many descriptors as the queue has entries, and a
+/// request's chain holds its header and its status byte besides its data.
+const SEG_MAX: u32 = QUEUE_MAX_SIZE as u32 - 2;
+
+/// The length of the configuration space, which ends with `seg_max`.
+const CONFIG_LEN: usize = offset_of!(virtio_blk_config, seg_max) + size_of::<u32>();
 
 /// Length of the serial `GET_ID` returns, zero-padded.
 pub const SERIAL_LEN: usize = virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES as usize;
@@ -180,6 +197,17 @@ impl VirtioBlk {
     pub fn set_io_sink(&self, sink: Arc<dyn IoSink>) {
         self.shared.lock().sink = Some(sink);
     }
+
+    /// Returns the configuration space, which holds the capacity in 512-byte
+    /// sectors, a `size_max` of zero and `seg_max`.
+    fn config_space(&self) -> [u8; CONFIG_LEN] {
+        let mut config = [0; CONFIG_LEN];
+        config[offset_of!(virtio_blk_config, capacity)..][..size_of::<u64>()]
+            .copy_from_slice(&self.capacity_sectors.to_le_bytes());
+        config[offset_of!(virtio_blk_config, seg_max)..][..size_of::<u32>()]
+            .copy_from_slice(&SEG_MAX.to_le_bytes());
+        config
+    }
 }
 
 impl virtio::Device for VirtioBlk {
@@ -189,9 +217,9 @@ impl virtio::Device for VirtioBlk {
 
     fn features(&self) -> u64 {
         if self.read_only {
-            F_FLUSH | F_RO
+            F_FLUSH | F_SEG_MAX | F_RO
         } else {
-            F_FLUSH
+            F_FLUSH | F_SEG_MAX
         }
     }
 
@@ -199,9 +227,8 @@ impl virtio::Device for VirtioBlk {
         &[QUEUE_MAX_SIZE]
     }
 
-    // The configuration space starts with the capacity, in 512-byte sectors.
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        read_config_bytes(&self.capacity_sectors.to_le_bytes(), offset, data);
+        read_config_bytes(&self.config_space(), offset, data);
     }
 
     fn activate(
