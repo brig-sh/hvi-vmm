@@ -1622,7 +1622,7 @@ mod session_tests {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
-    use crate::devices::virtio::mmio::testing::{self, Rings};
+    use crate::devices::virtio::mmio::testing::{self, make_available, write_descriptor, Rings};
     use crate::devices::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     fn mem_of(len: usize) -> GuestRam {
@@ -1704,10 +1704,7 @@ mod session_tests {
         avail: u64,
         head: u16,
     ) -> DescriptorChain<'r> {
-        let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
-            .unwrap();
-        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        make_available(mem, avail, 8, head);
         dev.queues[usize::from(index)]
             .as_mut()
             .expect("the queue should be ready")
@@ -1718,15 +1715,8 @@ mod session_tests {
     /// Posts descriptor `idx`, a 64-byte writable buffer at `buffer`, as the
     /// next entry of an 8-entry avail ring.
     fn post_rx_buffer(mem: &GuestRam, desc: u64, avail: u64, idx: u16, buffer: u64) {
-        let descriptor = desc + u64::from(idx) * 16;
-        mem.write_u64(descriptor, buffer).unwrap();
-        mem.write_u32(descriptor + 8, 64).unwrap();
-        mem.write_u16(descriptor + 12, VIRTQ_DESC_F_WRITE).unwrap();
-        mem.write_u16(descriptor + 14, 0).unwrap();
-        let avail_idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(avail_idx % 8) * 2, idx)
-            .unwrap();
-        mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
+        write_descriptor(mem, desc, idx, buffer, 64, VIRTQ_DESC_F_WRITE, 0);
+        make_available(mem, avail, 8, idx);
     }
 
     // A packet queued before the reset must not reach the ring the guest
@@ -1815,10 +1805,7 @@ mod session_tests {
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
         let oversized = (MAX_TX_PACKET + 1) as u32;
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, oversized).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
+        write_descriptor(&mem, desc, 0, data, oversized, 0, 0);
 
         let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
         assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
@@ -1843,10 +1830,7 @@ mod session_tests {
         let full = pkt(OP_RW, 40000, &vec![0xa5u8; PAYLOAD]);
         assert_eq!(full.len(), HDR_LEN + PAYLOAD);
         mem.write(data, &full).unwrap();
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, full.len() as u32).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
+        write_descriptor(&mem, desc, 0, data, full.len() as u32, 0, 0);
 
         let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
         assert_eq!(
@@ -2055,13 +2039,10 @@ mod session_tests {
         size: u32,
     ) {
         let (desc, avail, used, data) = rings;
-        for i in 0..u64::from(n) {
-            let d = desc + i * 16;
-            mem.write_u64(d, data + i * u64::from(size)).unwrap();
-            mem.write_u32(d + 8, size).unwrap();
-            mem.write_u16(d + 12, VIRTQ_DESC_F_WRITE).unwrap();
-            mem.write_u16(d + 14, 0).unwrap();
-            mem.write_u16(avail + 4 + i * 2, i as u16).unwrap();
+        for i in 0..n {
+            let addr = data + u64::from(i) * u64::from(size);
+            write_descriptor(mem, desc, i, addr, size, VIRTQ_DESC_F_WRITE, 0);
+            mem.write_u16(avail + 4 + u64::from(i) * 2, i).unwrap();
         }
         mem.write_u16(avail + 2, n).unwrap(); // avail.idx
         set_ready_queue(dev, mem, RX_QUEUE, desc, avail, used);
@@ -2148,12 +2129,8 @@ mod session_tests {
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
         set_ready_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
         let (addr, len, flags) = first(BASE + 0x3000);
-        mem.write_u64(desc, addr).unwrap();
-        mem.write_u32(desc + 8, len).unwrap();
-        mem.write_u16(desc + 12, flags).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap();
+        write_descriptor(&mem, desc, 0, addr, len, flags, 0);
+        make_available(&mem, avail, 8, 0);
         post_rx_buffer(&mem, desc, avail, 1, BASE + 0x3100);
         let (stream, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(stream).unwrap();
@@ -2239,21 +2216,15 @@ mod session_tests {
 
         // Two chains of two descriptors each: a 44-byte header buffer and a
         // 4096-byte body buffer, as pre-6.4 Linux posts them.
-        for i in 0..2u64 {
-            let (hd, bd) = (desc + i * 32, desc + i * 32 + 16);
-            let base = data + i * 0x2000;
-            mem.write_u64(hd, base).unwrap();
-            mem.write_u32(hd + 8, HDR_LEN as u32).unwrap();
-            mem.write_u16(hd + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
-                .unwrap();
-            mem.write_u16(hd + 14, (i * 2 + 1) as u16).unwrap();
-            mem.write_u64(bd, base + HDR_LEN as u64).unwrap();
-            mem.write_u32(bd + 8, 4096).unwrap();
-            mem.write_u16(bd + 12, 2).unwrap();
-            mem.write_u16(bd + 14, 0).unwrap();
-            mem.write_u16(avail + 4 + i * 2, (i * 2) as u16).unwrap();
+        for i in 0..2u16 {
+            let (hd, bd) = (i * 2, i * 2 + 1);
+            let base = data + u64::from(i) * 0x2000;
+            let flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT;
+            write_descriptor(&mem, desc, hd, base, HDR_LEN as u32, flags, bd);
+            let body = base + HDR_LEN as u64;
+            write_descriptor(&mem, desc, bd, body, 4096, VIRTQ_DESC_F_WRITE, 0);
+            make_available(&mem, avail, 8, hd);
         }
-        mem.write_u16(avail + 2, 2).unwrap();
         set_ready_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
@@ -2383,10 +2354,8 @@ mod session_tests {
         set_ready_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
         let request = pkt(OP_CREDIT_REQUEST, port, &[]);
         mem.write(packet, &request).unwrap();
-        mem.write_u64(desc, packet).unwrap();
-        mem.write_u32(desc + 8, request.len() as u32).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap();
+        write_descriptor(&mem, desc, 0, packet, request.len() as u32, 0, 0);
+        make_available(&mem, avail, 8, 0);
 
         dev.notify(&mem, TX_QUEUE);
 

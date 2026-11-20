@@ -369,6 +369,7 @@ fn set_hi(v: u64, hi: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::virtio::mmio::testing::{make_available, write_descriptor};
 
     const BASE: u64 = 0x4000_0000;
 
@@ -427,32 +428,6 @@ mod tests {
         let mut config = config(size);
         config.set_ready(1, mem);
         config.into_queue().expect("the queue should be ready")
-    }
-
-    /// Writes entry `index` of the descriptor table at `table`.
-    fn write_descriptor(
-        mem: &GuestRam,
-        table: u64,
-        index: u64,
-        addr: u64,
-        len: u32,
-        flags: u16,
-        next: u16,
-    ) {
-        let at = table + index * 16;
-        mem.write_u64(at, addr).unwrap();
-        mem.write_u32(at + 8, len).unwrap();
-        mem.write_u16(at + 12, flags).unwrap();
-        mem.write_u16(at + 14, next).unwrap();
-    }
-
-    /// Makes chain `head` available as the next entry of the avail ring of a
-    /// queue of `size` entries.
-    fn make_available(mem: &GuestRam, size: u16, head: u16) {
-        let idx = mem.read_u16(AVAIL + 2).unwrap();
-        mem.write_u16(AVAIL + 4 + u64::from(idx % size) * 2, head)
-            .unwrap();
-        mem.write_u16(AVAIL + 2, idx.wrapping_add(1)).unwrap();
     }
 
     /// Returns how many descriptors the next available chain yields, and
@@ -519,13 +494,13 @@ mod tests {
         let mem = ram();
         let mut queue = ready(&mem, 8);
         write_descriptor(&mem, DESC, 0, BASE + 0x3000, 16, 0, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
         let mut refills = 20;
 
         let served = queue.serve(&mem, |_| {
             if refills > 0 {
                 refills -= 1;
-                make_available(&mem, 8, 0);
+                make_available(&mem, AVAIL, 8, 0);
             }
             0
         });
@@ -540,7 +515,7 @@ mod tests {
         let mut queue = ready(&mem, 8);
         write_descriptor(&mem, DESC, 0, BASE + 0x3000, 16, VIRTQ_DESC_F_NEXT, 1);
         write_descriptor(&mem, DESC, 1, BASE + 0x3100, 16, VIRTQ_DESC_F_WRITE, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (2, true));
     }
@@ -550,7 +525,7 @@ mod tests {
         let mem = ram();
         let mut queue = ready(&mem, 8);
         write_descriptor(&mem, DESC, 0, BASE + 0x3000, 16, VIRTQ_DESC_F_NEXT, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (8, false));
     }
@@ -564,18 +539,10 @@ mod tests {
         let table = BASE + 0x3000;
         for index in 0..300u16 {
             let flags = if index < 299 { VIRTQ_DESC_F_NEXT } else { 0 };
-            write_descriptor(
-                &mem,
-                table,
-                u64::from(index),
-                BASE + 0x7000,
-                0,
-                flags,
-                index + 1,
-            );
+            write_descriptor(&mem, table, index, BASE + 0x7000, 0, flags, index + 1);
         }
         write_descriptor(&mem, DESC, 0, table, 300 * 16, VIRTQ_DESC_F_INDIRECT, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (8, false));
     }
@@ -592,7 +559,7 @@ mod tests {
         write_descriptor(&mem, DESC, 0, BASE + 0x7200, 16, VIRTQ_DESC_F_NEXT, 1);
         write_descriptor(&mem, DESC, 1, BASE + 0x7300, 16, VIRTQ_DESC_F_NEXT, 2);
         write_descriptor(&mem, DESC, 2, table, 2 * 16, VIRTQ_DESC_F_INDIRECT, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (4, true));
     }
@@ -604,7 +571,7 @@ mod tests {
         let table = BASE + 0x3000;
         write_descriptor(&mem, table, 0, table, 16, VIRTQ_DESC_F_INDIRECT, 0);
         write_descriptor(&mem, DESC, 0, table, 16, VIRTQ_DESC_F_INDIRECT, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (0, false));
     }
@@ -616,7 +583,7 @@ mod tests {
         let table = BASE + 0x3000;
         write_descriptor(&mem, table, 0, BASE + 0x7000, 16, 0, 0);
         write_descriptor(&mem, DESC, 0, table, 24, VIRTQ_DESC_F_INDIRECT, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         assert_eq!(walk(&mut queue, &mem), (0, false));
     }
@@ -638,7 +605,7 @@ mod tests {
             2,
         );
         write_descriptor(&mem, DESC, 2, BASE + 0x3100, 2, 0, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         let chain = queue.pop(&mem).unwrap();
 
@@ -650,7 +617,7 @@ mod tests {
         let mem = ram();
         let mut queue = ready(&mem, 8);
         write_descriptor(&mem, DESC, 0, BASE + 0x3000, 6, 0, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         let chain = queue.pop(&mem).unwrap();
 
@@ -662,7 +629,7 @@ mod tests {
         let mem = ram();
         let mut queue = ready(&mem, 8);
         write_descriptor(&mem, DESC, 0, BASE + 0x3000, 1, VIRTQ_DESC_F_NEXT, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         let chain = queue.pop(&mem).unwrap();
 
@@ -677,7 +644,7 @@ mod tests {
         let mut queue = ready(&mem, 8);
         write_descriptor(&mem, DESC, 0, BASE + 0x3000, 4, VIRTQ_DESC_F_NEXT, 8);
         write_descriptor(&mem, DESC, 8, BASE + 0x3100, 4, 0, 0);
-        make_available(&mem, 8, 0);
+        make_available(&mem, AVAIL, 8, 0);
 
         let chain = queue.pop(&mem).unwrap();
 
@@ -688,7 +655,7 @@ mod tests {
     fn head_outside_the_ring_gets_no_used_entry() {
         let mem = ram();
         let mut queue = ready(&mem, 8);
-        make_available(&mem, 8, 8);
+        make_available(&mem, AVAIL, 8, 8);
 
         let mut chain = queue.pop(&mem).expect("a chain should be available");
         let head = chain.head_index();
@@ -703,7 +670,7 @@ mod tests {
     fn serve_of_a_head_outside_the_ring_puts_nothing_on_the_used_ring() {
         let mem = ram();
         let mut queue = ready(&mem, 8);
-        make_available(&mem, 8, 8);
+        make_available(&mem, AVAIL, 8, 8);
 
         assert!(!queue.serve(&mem, |_| 0));
         assert_eq!(mem.read_u16(USED + 2).unwrap(), 0);

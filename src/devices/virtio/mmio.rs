@@ -676,6 +676,32 @@ pub(crate) mod testing {
             .expect("the rings should fit in guest RAM")
     }
 
+    /// Writes entry `index` of the descriptor table at `table`.
+    pub(crate) fn write_descriptor(
+        ram: &GuestRam,
+        table: u64,
+        index: u16,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let at = table + u64::from(index) * 16;
+        ram.write_u64(at, addr).unwrap();
+        ram.write_u32(at + 8, len).unwrap();
+        ram.write_u16(at + 12, flags).unwrap();
+        ram.write_u16(at + 14, next).unwrap();
+    }
+
+    /// Makes chain `head` available as the next entry of the avail ring at
+    /// `avail`, of a queue of `size` entries.
+    pub(crate) fn make_available(ram: &GuestRam, avail: u64, size: u16, head: u16) {
+        let idx = ram.read_u16(avail + 2).unwrap();
+        ram.write_u16(avail + 4 + u64::from(idx % size) * 2, head)
+            .unwrap();
+        ram.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+    }
+
     /// Returns an enabled interrupt and its line.
     pub(crate) fn enabled_interrupt() -> (Arc<Interrupt>, Arc<LevelLine>) {
         let line = Arc::new(LevelLine::default());
