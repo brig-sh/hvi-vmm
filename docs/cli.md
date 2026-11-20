@@ -61,12 +61,17 @@ including a typo, silently runs the plain test.
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
 | `--net-mac <mac>` | none | Guest MAC. Honoured on every backend and mode. |
 | `--agent-sock <path>` | none | Host Unix socket bridged to the guest agent over vsock. |
-| `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. An existing file is emptied when the run writes its first record, so a refused boot leaves it as it was. hvi refuses anything that is not a regular file, such as `/dev/null` or a FIFO. It also refuses a locked file, such as another run's ledger or disk, and a symbolic link as the last component of the path, such as `/dev/fd/N` on Linux. |
+| `--events <path>` | none | Write the `RawEvent` NDJSON ledger to this file. An existing file is emptied when the run writes its first record, so a refused boot leaves it as it was. hvi refuses anything that is not a regular file you own, such as `/dev/null` or a FIFO, and a file others can read that is not empty. It also refuses a locked file, such as another run's ledger or disk, and a symbolic link as the last component of the path, such as `/dev/fd/N` on Linux. |
 | `--sandbox-id <string>` | `hvi` | Written into every ledger record. |
 | `--dump-memory <path>` | none | Attach the memory dumper. |
 | `--dump-after <secs>` | none | Dump automatically after this long. Needs `--dump-memory`. `0` becomes 1. |
 | `--trace-io <path>` | none | Attach the I/O tracer. |
 | `--no-sandbox` | off | Boot unconfined. For debugging the profile or the filters. |
+
+`--events`, `--trace-io` and `--dump-memory` create their file at mode 0600.
+They refuse a symbolic link as the last component of the path, and any path
+that is not a regular file you own. See
+[observability.md](observability.md#how-hvi-creates-these-files).
 
 ### Parsing behaviour
 
@@ -170,7 +175,8 @@ hvi dump-fdt --kernel Image --mem-mib 1024 --out fdt.dtb
 | `--out <file>` | none, print only |
 
 The blob it writes carries a fresh random `rng-seed` and `kaslr-seed`, as a
-boot's would. Neither is printed, and no boot uses them.
+boot's would. Neither is printed, and no boot uses them. `--out` creates its
+file the way `--trace-io` does.
 
 It always builds a **one-vCPU devicetree with no virtio devices**, using the
 fixed QEMU virt GIC layout rather than whatever a host would negotiate. It has
