@@ -14,8 +14,11 @@ permissions:
   contents: read
 
 jobs:
+  # It reads the commit range of a pull request. A manual dispatch has no
+  # range, so the check would pass without reading a commit.
   validate-commits:
     name: Validate commits
+    if: github.event_name == 'pull_request'
     uses: ./.github/workflows/validate-commits.yml
 
   validate-code:
