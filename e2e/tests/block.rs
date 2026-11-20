@@ -104,6 +104,46 @@ fn four_disks_keep_their_order_size_and_serial() {
     assert_eq!(listing.lines().collect::<Vec<_>>(), expected);
 }
 
+// Linux puts one segment in each request unless the device gives a limit.
+#[test]
+fn guest_reads_the_segment_limit_from_the_device() {
+    let disk = sparse_file("disk.img", MIB);
+    let vm = Vm::builder().disk(&disk).boot();
+    let limit = vm
+        .sh("cat /sys/block/vda/queue/max_segments")
+        .assert_success()
+        .stdout
+        .trim()
+        .to_string();
+    vm.power_off();
+    assert_eq!(limit, "254");
+}
+
+// The guest's page cache holds the copy in pages that are not contiguous, so
+// each write request carries many segments. Requests of one segment each would
+// be about a thousand for these 4 MiB.
+#[test]
+fn buffered_guest_copy_arrives_intact_in_few_requests() {
+    let disk = sparse_file("disk.img", 64 * MIB);
+    let data = pattern(4 << 20, 3);
+    write_at(&disk, MIB, &data);
+    let vm = Vm::builder().disk(&disk).boot();
+    let copy = vm.sh("dd if=/dev/vda of=/dev/vda bs=1M skip=1 seek=16 count=4 conv=notrunc,fsync");
+    let ended = vm.power_off();
+    copy.assert_success();
+    assert_eq!(sha256(&read_at(&disk, 16 * MIB, 4 << 20)), sha256(&data));
+    let writes = ended
+        .ledger
+        .records_from("block")
+        .filter(|record| record["payload"]["rw"] == "w")
+        .count();
+    assert!(
+        (1..64).contains(&writes),
+        "the copy took {writes} write requests\n{}",
+        ended.context()
+    );
+}
+
 // virtio-blk gives the capacity in whole 512-byte sectors.
 #[test]
 fn image_not_a_multiple_of_five_hundred_twelve_bytes_loses_only_its_tail() {

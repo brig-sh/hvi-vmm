@@ -450,8 +450,10 @@ can reach it as one interrupt.
 - **virtio-blk** (`devices/virtio/block/`, id 2) backs `--disk`, one device per
   disk. It advertises `VIRTIO_BLK_F_FLUSH` and honours a flush with a real sync,
   adds `VIRTIO_BLK_F_RO` on a read-only disk, and answers `GET_ID` with the
-  disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. The image is
-  locked while open, shared for a read-only disk and exclusive for a writable
+  disk's serial. Other request types get `VIRTIO_BLK_S_UNSUPP`. It advertises
+  `VIRTIO_BLK_F_SEG_MAX` with a `seg_max` of 254, the queue's 256 entries less a
+  request's header and status byte, so a request can carry many pages. The image
+  is locked while open, shared for a read-only disk and exclusive for a writable
   one. Each disk has a worker thread that serves its queue, one request at a
   time. See [The disk worker](#the-disk-worker).
 - **virtio-net** (`devices/virtio/net.rs`, id 1) has three modes. See

@@ -1384,11 +1384,32 @@ mod capacity_tests {
     fn read_only_disk_advertises_f_ro() {
         let (_r, ro) = ro_rig("feat", "");
         // The spec's bit numbers, not the constants the device uses:
-        // VIRTIO_BLK_F_FLUSH is bit 9, VIRTIO_BLK_F_RO bit 5.
-        assert_eq!(ro.features(), (1 << 9) | (1 << 5));
+        // VIRTIO_BLK_F_FLUSH is bit 9, VIRTIO_BLK_F_RO bit 5 and
+        // VIRTIO_BLK_F_SEG_MAX bit 2.
+        assert_eq!(ro.features(), (1 << 9) | (1 << 5) | (1 << 2));
 
         let (_w, rw) = rig("feat");
-        assert_eq!(rw.blk.features(), 1 << 9, "a writable disk is not ro");
+        assert_eq!(
+            rw.blk.features(),
+            (1 << 9) | (1 << 2),
+            "a writable disk is not ro"
+        );
+    }
+
+    // The offsets are the spec's: the capacity at 0, `size_max` at 8 and
+    // `seg_max` at 12. Linux reads the space four bytes at a time.
+    #[test]
+    fn config_space_holds_the_capacity_and_seg_max() {
+        let (_r, disk) = rig("config");
+        let read = |offset| {
+            let mut field = [0xff; 4];
+            disk.blk.read_config(offset, &mut field);
+            u32::from_le_bytes(field)
+        };
+        assert_eq!((read(0), read(4)), (1, 0), "one sector");
+        assert_eq!(read(8), 0, "no size_max");
+        assert_eq!(read(12), 254, "a 256-entry queue less header and status");
+        assert_eq!(read(16), 0, "nothing past seg_max");
     }
 
     #[test]
@@ -2965,6 +2986,27 @@ mod data_path_tests {
         assert_eq!(status, VIRTIO_BLK_S_OK);
         assert_eq!(disk.used_len(), 513, "the sector and the status byte");
         assert_eq!(disk.joined(&READ_SEGMENTS), written);
+    }
+
+    // The request carries 254 data segments, the `seg_max` of the configuration
+    // space. With its header and its status byte it fills the 256-entry queue.
+    #[test]
+    fn request_of_seg_max_segments_round_trips() {
+        const BYTES: u64 = 254 * 512;
+        let disk = Disk::new(BYTES as usize, true);
+        let segments: Vec<_> = (0..254).map(|n| (BUFFERS + n * 0x800, 512)).collect();
+        let written = disk.fill(&segments, 3);
+
+        let (status, _) = disk.submit(VIRTIO_BLK_T_OUT, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.image(), written);
+
+        disk.fill(&segments, 0x77);
+        let (status, _) = disk.submit(VIRTIO_BLK_T_IN, 0, &segments);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(disk.used_len(), BYTES as u32 + 1);
+        assert_eq!(disk.joined(&segments), written);
+        assert_eq!(disk.take_records(), [(0, BYTES, true), (0, BYTES, false)]);
     }
 
     // A call given only empty buffers returns 0, which reads as the end of the
