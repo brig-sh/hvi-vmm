@@ -58,8 +58,10 @@ done
 
 Every read or write that succeeds emits a `block` record into the ledger when
 `--events` is set, unless the ledger's buffer is full (see
-[observability.md](observability.md#when-a-record-reaches-the-file)). `disk` is
-the disk's serial, so the records of two disks can be told apart:
+[observability.md](observability.md#when-a-record-reaches-the-file)). So does
+one that fails part way, such as a write to a sparse image on a full host
+filesystem, with the bytes it moved as `len`. `disk` is the disk's serial, so
+the records of two disks can be told apart:
 
 ```json
 {"sandbox_id":"hvi","ts":1788992154877294000,"provenance":"boundary","source":"block","payload":{"disk":"disk0","lba":0,"len":4096,"rw":"r"}}

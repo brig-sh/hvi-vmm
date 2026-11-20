@@ -264,7 +264,8 @@ pub trait IoSink: Send + Sync {
     /// Receives a virtio-blk request of `length` data bytes from `sector`, a
     /// write when `write` is set.
     ///
-    /// `disk_id` tells the backing stores apart.
+    /// A request that failed part way is received with the bytes it moved as
+    /// `length`. `disk_id` tells the backing stores apart.
     fn on_block(&self, sector: u64, length: u64, disk_id: u64, write: bool);
 
     /// Receives a virtio-net frame as it crosses the device, guest-to-host when

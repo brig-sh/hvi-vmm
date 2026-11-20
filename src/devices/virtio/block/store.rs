@@ -14,6 +14,7 @@
 
 //! The backing store a disk's worker runs requests against.
 
+use std::fmt;
 use std::fs::File;
 use std::io;
 
@@ -55,12 +56,13 @@ pub(crate) trait BackingStore: Send + 'static {
     /// # Errors
     ///
     /// Errors with `UnexpectedEof` when a read returns no bytes before `bufs`
-    /// are full, or with the read's own error.
+    /// are full, or with the read's own error. The error carries the number of
+    /// bytes read before it.
     fn read_exact_vectored_at_volatile(
         &self,
         bufs: &[VolatileSlice<'_>],
         offset: u64,
-    ) -> io::Result<()> {
+    ) -> Result<(), TransferError> {
         transfer_all(bufs, offset, io::ErrorKind::UnexpectedEof, |left, at| {
             self.read_vectored_at_volatile(left, at)
         })
@@ -74,12 +76,13 @@ pub(crate) trait BackingStore: Send + 'static {
     /// # Errors
     ///
     /// Errors with `WriteZero` when a write returns no bytes before `bufs` are
-    /// written, or with the write's own error.
+    /// written, or with the write's own error. The error carries the number of
+    /// bytes written before it.
     fn write_all_vectored_at_volatile(
         &self,
         bufs: &[VolatileSlice<'_>],
         offset: u64,
-    ) -> io::Result<()> {
+    ) -> Result<(), TransferError> {
         transfer_all(bufs, offset, io::ErrorKind::WriteZero, |left, at| {
             self.write_vectored_at_volatile(left, at)
         })
@@ -108,6 +111,34 @@ impl BackingStore for File {
     }
 }
 
+/// The error of a read or write that ended before it moved every byte.
+#[derive(Debug)]
+pub(crate) struct TransferError {
+    /// The number of bytes moved before the error, from the first buffer on.
+    pub(crate) moved: u64,
+    /// What ended the read or write.
+    pub(crate) source: io::Error,
+}
+
+impl From<io::Error> for TransferError {
+    /// Returns the error of a call that moved no bytes.
+    fn from(source: io::Error) -> Self {
+        Self { moved: 0, source }
+    }
+}
+
+impl fmt::Display for TransferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "transfer stopped after {} bytes", self.moved)
+    }
+}
+
+impl std::error::Error for TransferError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Calls `call` with the part of `bufs` not yet moved and its offset in the
 /// store, starting at `offset`, until every byte of `bufs` is moved.
 ///
@@ -117,24 +148,29 @@ impl BackingStore for File {
 /// # Errors
 ///
 /// Errors with `stalled` when a call moves no bytes before every byte is moved,
-/// or with the call's own error.
+/// or with the call's own error. The error carries the number of bytes the
+/// calls before it moved.
 fn transfer_all<'a>(
     bufs: &[VolatileSlice<'a>],
-    mut offset: u64,
+    offset: u64,
     stalled: io::ErrorKind,
     mut call: impl FnMut(&[VolatileSlice<'a>], u64) -> io::Result<usize>,
-) -> io::Result<()> {
+) -> Result<(), TransferError> {
     let mut left: Vec<_> = bufs.iter().filter(|buf| !buf.is_empty()).copied().collect();
     let mut left = left.as_mut_slice();
+    let mut moved = 0;
     while !left.is_empty() {
-        match call(left, offset) {
-            Ok(0) => return Err(stalled.into()),
-            Ok(moved) => {
-                offset += moved as u64;
-                advance_slices(&mut left, moved);
+        match call(left, offset + moved) {
+            Ok(0) => {
+                let source = stalled.into();
+                return Err(TransferError { moved, source });
+            }
+            Ok(count) => {
+                moved += count as u64;
+                advance_slices(&mut left, count);
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(source) => return Err(TransferError { moved, source }),
         }
     }
     Ok(())
