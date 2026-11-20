@@ -479,25 +479,13 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::hypervisor::guest::tests::NoopKicker;
     use crate::run::StopHandle;
 
     thread_local! {
         /// The name of the I/O thread whose start fails, for a test that runs on
         /// this thread.
         pub(super) static REFUSED: Cell<Option<&'static str>> = const { Cell::new(None) };
-    }
-
-    /// A kicker that reaches no thread.
-    struct NoopKicker;
-
-    impl Kick for NoopKicker {
-        fn kick(&self, _cpu: u32) {}
-
-        fn kick_all(&self) {}
-
-        fn try_kick_all(&self) -> bool {
-            true
-        }
     }
 
     /// Returns the vCPUs of a run with one vCPU and no threads.

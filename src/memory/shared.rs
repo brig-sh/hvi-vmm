@@ -180,21 +180,6 @@ impl SharedRam {
     pub fn file(&self) -> &Arc<File> {
         &self.file
     }
-
-    /// Returns the object length.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns whether the object is empty.
-    ///
-    /// Never true after `new`; it pairs with `len` for the
-    /// `len_without_is_empty` lint.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 impl AsFd for SharedRam {
@@ -232,8 +217,6 @@ mod tests {
     #[test]
     fn allocates_and_reads_back() {
         let ram = SharedRam::new(LEN).expect("allocate");
-        assert_eq!(ram.len(), LEN);
-        assert!(!ram.is_empty());
         let mem = view(&ram);
         mem.write_u8(BASE, 0xab).expect("write");
         assert_eq!(mem.read_u32(BASE).expect("read") & 0xff, 0xab);
@@ -251,7 +234,7 @@ mod tests {
         let other = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                ram.len(),
+                LEN,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 ram.as_raw_fd(),
@@ -263,7 +246,7 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(other.cast::<u8>().add(128), 10) };
         assert_eq!(seen, b"HVI-SHARED", "the plugin's view is stale");
         // SAFETY: unmapping the view we just made.
-        unsafe { libc::munmap(other, ram.len()) };
+        unsafe { libc::munmap(other, LEN) };
     }
 
     // The two platforms give the guarantee differently. On macOS the object is

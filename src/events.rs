@@ -113,8 +113,6 @@ struct RawEvent<'a, P: Serialize> {
     sandbox_id: &'a str,
     ts: i64,
     provenance: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    corroboration: Option<&'a str>,
     source: &'a str,
     payload: P,
 }
@@ -129,14 +127,10 @@ struct DroppedPayload {
 
 #[derive(Serialize)]
 struct BlockPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    disk: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lba: Option<u64>,
+    disk: String,
+    lba: u64,
     len: u64,
     rw: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -310,17 +304,8 @@ impl Ledger {
 
     /// Closes the ledger, waiting until `deadline` for the writer to write the
     /// records added before the close.
-    ///
-    /// It takes the ledger by value, so a holder of a shared handle, such as a
-    /// plugin, cannot close it.
-    ///
-    /// # Errors
-    ///
-    /// Errors with [`io::ErrorKind::TimedOut`] when the writer has not written
-    /// the records by `deadline`, and they stay buffered. A writer whose writes
-    /// fail tries them until one [`STOP_TIMEOUT`] after the close, then drops
-    /// them, and a call still waiting errors with [`io::ErrorKind::Other`].
-    pub fn close(self, deadline: Instant) -> io::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn close(self, deadline: Instant) -> io::Result<()> {
         self.close_with(deadline, |_| {})
     }
 
@@ -332,10 +317,13 @@ impl Ledger {
     ///
     /// # Errors
     ///
-    /// Errors as [`Ledger::close`] does, and with
-    /// [`io::ErrorKind::InvalidData`] when a payload fails to serialize. A
-    /// ledger already closed adds nothing, waits until `deadline` for the
-    /// records added before it closed, and then errors.
+    /// Errors with [`io::ErrorKind::TimedOut`] when the writer has not written
+    /// the records by `deadline`, and they stay buffered. A writer whose writes
+    /// fail tries them until one [`STOP_TIMEOUT`] after the close, then drops
+    /// them, and a call still waiting errors with [`io::ErrorKind::Other`].
+    /// Errors with [`io::ErrorKind::InvalidData`] when a payload fails to
+    /// serialize. A ledger already closed adds nothing, waits until `deadline`
+    /// for the records added before it closed, and then errors.
     pub(crate) fn close_with(
         &self,
         deadline: Instant,
@@ -559,7 +547,6 @@ impl Ledger {
                     sandbox_id: &self.sandbox_id,
                     ts: now_ns(),
                     provenance: "vmm",
-                    corroboration: None,
                     source: "vmm.dropped",
                     payload: DroppedPayload {
                         records: state.unmarked,
@@ -573,7 +560,6 @@ impl Ledger {
                 sandbox_id: &self.sandbox_id,
                 ts: now_ns(),
                 provenance: &record.provenance,
-                corroboration: None,
                 source: &record.source,
                 payload: &*record.payload,
             };
@@ -1153,12 +1139,6 @@ impl Batch {
         }
     }
 
-    /// Returns whether the ledger the batch is for writes a file.
-    #[must_use]
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// Adds one `RawEvent` record, a caller's payload tagged with the caller's
     /// `source`.
     ///
@@ -1214,11 +1194,10 @@ impl Batch {
                 Cow::Borrowed("boundary"),
                 Cow::Borrowed("block"),
                 &BlockPayload {
-                    disk: Some(disk.to_string()),
-                    lba: Some(*lba),
+                    disk: disk.to_string(),
+                    lba: *lba,
                     len: *len,
                     rw: if *write { "w" } else { "r" }.to_string(),
-                    path: None,
                 },
             ),
             CapturedEvent::NetFlow {
@@ -1273,7 +1252,6 @@ mod tests {
             sandbox_id: "vm1",
             ts: 1,
             provenance,
-            corroboration: None,
             source,
             payload,
         };
@@ -1286,11 +1264,10 @@ mod tests {
             "boundary",
             "block",
             BlockPayload {
-                disk: Some("disk0".into()),
-                lba: Some(2048),
+                disk: "disk0".into(),
+                lba: 2048,
                 len: 4096,
                 rw: "w".into(),
-                path: None,
             },
         );
         assert_eq!(
@@ -1522,7 +1499,7 @@ mod tests {
 
         ledger.set_paused(false);
         assert!(ledger
-            .close_with(Instant::now() + Duration::from_secs(5), |_| {})
+            .close(Instant::now() + Duration::from_secs(5))
             .is_ok());
         assert_eq!(take_lines(&path).len(), 2);
     }

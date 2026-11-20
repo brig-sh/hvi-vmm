@@ -29,10 +29,10 @@
 //!
 //! The requester is itself a vCPU thread in the in-VMM path, since vcpu0 takes
 //! the snapshot. It waits for the other vCPUs and never parks itself, so a wait
-//! takes the number of vCPUs to wait for. [`Quiesce::wait_for`] takes a fixed
-//! number, and `wait_for_with` one it reads again as each vCPU parks, for a
-//! requester whose vCPUs can start while it waits. An external requester, such
-//! as a control thread, waits for all of them.
+//! takes the number of vCPUs to wait for. `wait_for_with` reads that number
+//! again as each vCPU parks, for a requester whose vCPUs can start while it
+//! waits. An external requester, such as a control thread, waits for all of
+//! them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -100,20 +100,13 @@ impl Quiesce {
         self.requested.store(true, Ordering::SeqCst);
     }
 
-    /// Waits until `n` vCPUs have parked, for at most `PARK_TIMEOUT`.
-    ///
-    /// Returns `false` on timeout, meaning the guest is *not* fully quiesced
-    /// and any snapshot taken now is best-effort.
-    pub fn wait_for(&self, n: u32) -> bool {
-        self.wait_for_with(|| n)
-    }
-
     /// Waits until as many vCPUs have parked as `target` returns, for at most
     /// `PARK_TIMEOUT`.
     ///
     /// `target` is read under the lock a vCPU parks under, again after each
     /// park, so the wait follows a target that grows while it waits. Returns
-    /// `false` on timeout, as [`wait_for`](Self::wait_for) does.
+    /// `false` on timeout, meaning the guest is not fully quiesced and any
+    /// snapshot taken now is best-effort.
     pub(crate) fn wait_for_with(&self, target: impl Fn() -> u32) -> bool {
         self.wait_for_within(target, PARK_TIMEOUT)
     }
@@ -155,7 +148,7 @@ mod tests {
     fn wait_for_zero_is_immediate() {
         let q = Quiesce::new();
         q.request();
-        assert!(q.wait_for(0));
+        assert!(q.wait_for_with(|| 0));
         q.release();
     }
 
@@ -188,7 +181,7 @@ mod tests {
             })
             .collect();
 
-        assert!(q.wait_for(3), "workers did not park");
+        assert!(q.wait_for_with(|| 3), "workers did not park");
         assert!(
             !done.load(Ordering::SeqCst),
             "a worker ran on past the barrier while it was still held"
@@ -211,7 +204,10 @@ mod tests {
     fn wait_for_times_out_when_nobody_parks() {
         let q = Quiesce::new();
         q.request();
-        assert!(!q.wait_for(1), "expected a timeout with no parked threads");
+        assert!(
+            !q.wait_for_with(|| 1),
+            "expected a timeout with no parked threads"
+        );
         q.release();
     }
 

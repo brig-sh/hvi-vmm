@@ -284,12 +284,8 @@ impl Plugin for IoTrace {
             out: Arc::clone(&self.out),
             dirty: Arc::clone(&self.dirty),
         });
-        if vmm.has_block() {
-            vmm.set_block_sink(Arc::clone(&sink));
-        }
-        if vmm.has_net() {
-            vmm.set_net_sink(sink);
-        }
+        vmm.set_block_sink(Arc::clone(&sink));
+        vmm.set_net_sink(sink);
         Ok(())
     }
 
