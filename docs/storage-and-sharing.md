@@ -17,9 +17,11 @@ hvi boot --kernel <Image> \
 ```
 
 Every disk is its own virtio-mmio device. hvi advertises `VIRTIO_BLK_F_FLUSH`
-and honours a flush request with a real sync, so a filesystem's barriers are not
+and honors a flush request with a real sync, so a filesystem's barriers are not
 silently dropped. It advertises `VIRTIO_BLK_F_SEG_MAX` too, so the guest puts up
 to 254 data segments in one request, about 1 MiB when its pages are scattered.
+With `VIRTIO_RING_F_INDIRECT_DESC`, which it advertises as well, such a request
+takes one entry of the queue.
 
 A `readonly=on` disk is opened `O_RDONLY`, so an image hvi may not write still
 attaches. hvi advertises `VIRTIO_BLK_F_RO` for it and refuses any write the

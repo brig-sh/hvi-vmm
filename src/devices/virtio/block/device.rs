@@ -49,12 +49,17 @@ const F_RO: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_RO;
 ///
 /// Without it Linux puts one segment in each request.
 const F_SEG_MAX: u64 = 1 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_SEG_MAX;
+/// The `VIRTIO_RING_F_INDIRECT_DESC` feature bit, which lets the guest put a
+/// request's descriptors in a table of its own.
+///
+/// A request then takes one entry of the queue, whatever it carries.
+const F_INDIRECT_DESC: u64 = 1 << virtio_bindings::virtio_ring::VIRTIO_RING_F_INDIRECT_DESC;
 
 /// The most data segments a request may carry, the `seg_max` of the
 /// configuration space.
 ///
-/// A chain holds at most as many descriptors as the queue has entries, and a
-/// request's chain holds its header and its status byte besides its data.
+/// A request's chain holds its header and its status byte besides its data, and
+/// no chain is longer than the largest size its queue takes.
 const SEG_MAX: u32 = QUEUE_MAX_SIZE as u32 - 2;
 
 /// The length of the configuration space, which ends with `seg_max`.
@@ -216,10 +221,11 @@ impl virtio::Device for VirtioBlk {
     }
 
     fn features(&self) -> u64 {
+        let features = F_FLUSH | F_SEG_MAX | F_INDIRECT_DESC;
         if self.read_only {
-            F_FLUSH | F_SEG_MAX | F_RO
+            features | F_RO
         } else {
-            F_FLUSH | F_SEG_MAX
+            features
         }
     }
 

@@ -222,7 +222,7 @@ impl Queue {
         let inner = self.inner.pop_descriptor_chain(ram.memory())?;
         Some(DescriptorChain {
             inner,
-            left: self.size(),
+            left: self.inner.max_size(),
             complete: false,
         })
     }
@@ -298,17 +298,20 @@ impl Queue {
     }
 }
 
-/// The descriptors of one chain, at most as many as the queue has entries.
+/// The descriptors of one chain, at most as many as the largest size its queue
+/// takes.
 ///
 /// Virtio 1.2 (2.7.5.3.1) bounds a chain at the queue size, counting the
-/// descriptors of an indirect table too. The crate follows an indirect table
-/// whether or not the driver negotiated it and then allows the table's own
-/// length, up to 65535, so the bound is kept here instead.
+/// descriptors of an indirect table too. The crate ends a chain in the
+/// descriptor table at the size the driver programmed, and allows an indirect
+/// table its own length, up to 65535 entries, so the bound across a table is
+/// kept here. The bound is the largest size and not the programmed one, since a
+/// device derives its own limit on a chain from the largest size.
 ///
-/// No device that walks its chains through this type offers
+/// The crate follows an indirect table whether or not the driver negotiated
 /// `VIRTIO_RING_F_INDIRECT_DESC`, which the same section requires of a driver
-/// before it sets the flag. A chain that sets it anyway is followed, within the
-/// bound, rather than refused.
+/// before it sets the flag. So a chain that sets the flag on a device that does
+/// not offer the feature is followed too, within the bound.
 pub(crate) struct DescriptorChain<'r> {
     /// The crate's walk of the chain.
     inner: virtio_queue::DescriptorChain<&'r GuestMemoryMmap>,
@@ -327,7 +330,7 @@ impl DescriptorChain<'_> {
 
     /// Returns whether the walk ended at a descriptor without NEXT.
     ///
-    /// A chain is incomplete when it is longer than the queue, loops, names a
+    /// A chain is incomplete when it is longer than its bound, loops, names a
     /// descriptor outside its table or guest RAM, or has an indirect table the
     /// crate refuses.
     pub(crate) fn is_complete(&self) -> bool {
@@ -604,17 +607,18 @@ mod tests {
         assert_eq!(walk(&mut queue, &mem), (8, false));
     }
 
-    // The crate allows an indirect table its own length, up to 65535 entries.
-    // Zero-length entries add no bytes, so the queue size is the only bound.
-    #[test]
-    fn indirect_table_longer_than_the_queue_ends_incomplete_at_the_queue_size() {
-        let mem = ram();
-        let mut queue = ready(&mem, 8);
-        let table = BASE + 0x3000;
-        for index in 0..300u16 {
-            let flags = if index < 299 { VIRTQ_DESC_F_NEXT } else { 0 };
+    /// Makes a chain available whose only descriptor refers to an indirect
+    /// table at `table`, after writing the table with `len` zero-length
+    /// entries, each chained to the next.
+    fn make_table_available(mem: &GuestRam, table: u64, len: u16) {
+        for index in 0..len {
+            let flags = if index + 1 < len {
+                VIRTQ_DESC_F_NEXT
+            } else {
+                0
+            };
             write_descriptor(
-                &mem,
+                mem,
                 table,
                 u64::from(index),
                 BASE + 0x7000,
@@ -623,10 +627,33 @@ mod tests {
                 index + 1,
             );
         }
-        write_descriptor(&mem, DESC, 0, table, 300 * 16, VIRTQ_DESC_F_INDIRECT, 0);
-        make_available(&mem, 8, 0);
+        let bytes = u32::from(len) * 16;
+        write_descriptor(mem, DESC, 0, table, bytes, VIRTQ_DESC_F_INDIRECT, 0);
+        make_available(mem, 8, 0);
+    }
 
-        assert_eq!(walk(&mut queue, &mem), (8, false));
+    // The crate allows an indirect table its own length, up to 65535 entries.
+    // Zero-length entries add no bytes, so the count of descriptors is the only
+    // bound, and it is the largest size the queue takes.
+    #[test]
+    fn indirect_table_past_the_largest_queue_size_ends_incomplete_there() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        make_table_available(&mem, BASE + 0x3000, 300);
+
+        assert_eq!(walk(&mut queue, &mem), (usize::from(QUEUE_MAX_SIZE), false));
+    }
+
+    // Linux programs fewer entries than the queue takes when it cannot allocate
+    // the rings, and still sends a request of the device's `seg_max` segments
+    // through a table.
+    #[test]
+    fn indirect_table_past_the_programmed_queue_size_is_followed() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        make_table_available(&mem, BASE + 0x3000, QUEUE_MAX_SIZE);
+
+        assert_eq!(walk(&mut queue, &mem), (usize::from(QUEUE_MAX_SIZE), true));
     }
 
     // Virtio 1.2 (2.7.5.3.2) lets direct descriptors come before the one that
