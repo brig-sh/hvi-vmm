@@ -198,6 +198,8 @@ impl ReportLimiter {
 }
 
 /// Returns the value of a little-endian access of at most 8 bytes.
+// The arm64 UART and RTC use it.
+#[cfg(any(target_arch = "aarch64", test))]
 pub(crate) fn u64_from_le_bytes(data: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
     let len = data.len().min(8);
@@ -206,6 +208,8 @@ pub(crate) fn u64_from_le_bytes(data: &[u8]) -> u64 {
 }
 
 /// Fills `data` with the low bytes of `value`, little-endian.
+// The arm64 UART and RTC use it.
+#[cfg(any(target_arch = "aarch64", test))]
 pub(crate) fn fill_le_bytes(data: &mut [u8], value: u64) {
     let len = data.len().min(8);
     data[..len].copy_from_slice(&value.to_le_bytes()[..len]);

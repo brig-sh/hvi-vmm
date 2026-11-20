@@ -84,8 +84,6 @@ impl Pl011 {
     }
 
     /// Connects the UART to the interrupt line it raises.
-    // Only the arm64 backends attach a PL011.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn IrqLine>) {
         self.irq.connect(line);
     }
