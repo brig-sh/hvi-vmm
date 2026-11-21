@@ -223,7 +223,7 @@ See [benchmarking.md](benchmarking.md).
 
 ## Scheduled workflows
 
-Four run outside the two entry workflows. Each reports through a tracking issue
+Five run outside the two entry workflows. Each reports through a tracking issue
 and leaves `main` green: a failure files or updates one issue, and the next
 green run closes it.
 
@@ -237,6 +237,36 @@ green run closes it.
   ordering. It is not reliable enough to gate a pull request.
 - `schedule-reflow-drift.yml`: monthly, runs the reflow on the latest nightly
   and compares it with the pin, so the pin advances deliberately.
+- `schedule-deadcode.yml`: every Monday, runs `tools/deadcode.py` for every
+  backend and reports code that no caller reaches, and code that only tests
+  reach. See [Dead code](#dead-code).
+
+## Dead code
+
+rustc does not report a `pub` item of the library as dead, and each backend
+compiles a different part of the tree. `tools/deadcode.py` checks a copy of the
+crate in which the binary, the examples and the integration tests are modules
+of the library, and the library's items are crate-private. It checks the copy
+once per target, with and without `cfg(test)`, and reports:
+
+- `dead`: an item no code uses on any target that compiles it.
+- `test-only`: an item only `cfg(test)` code uses. Move it into the test module,
+  or delete it with the tests that use it.
+- `partial`: an item some targets compile but do not use. This is informational.
+  It often means a `cfg` gate can be narrower.
+
+Programs outside this tree link hvi as a library. An item of that API stays
+when no caller here uses it: list it in `tools/deadcode-allow.txt` with the
+reason, and do not delete it. So does any other dead or test-only item kept on
+purpose. An entry that matches nothing fails the run, so the list stays current.
+
+```
+tools/deadcode.py
+```
+
+A Mac checks every target in about half a minute, given the rustup targets of
+the Linux backends. A Linux host cannot check `aarch64-apple-darwin`, and its
+report says so.
 
 ## Distribution
 
