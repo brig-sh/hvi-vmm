@@ -60,23 +60,11 @@ pub(crate) trait Device: Send {
     /// `VIRTIO_F_VERSION_1`.
     fn features(&self) -> u64;
 
-    /// Returns whether the device supports `driver_features`, the features the
-    /// driver accepted.
-    ///
-    /// `driver_features` holds only bits of [`features`](Self::features) and
-    /// `VIRTIO_F_VERSION_1`.
-    fn accepts_features(&self, _driver_features: u64) -> bool {
-        true
-    }
-
     /// Returns the largest size of each of the device's queues, in queue order.
     fn queue_max_sizes(&self) -> &[u16];
 
     /// Fills `data` from the configuration space at `offset`.
     fn read_config(&self, offset: u64, data: &mut [u8]);
-
-    /// Applies a write of `data` to the configuration space at `offset`.
-    fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
 
     /// Starts serving `queues`, one per entry of
     /// [`queue_max_sizes`](Self::queue_max_sizes).

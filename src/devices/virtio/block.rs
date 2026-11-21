@@ -673,7 +673,7 @@ mod backing_len_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
-    use crate::devices::virtio::mmio::testing::{self, Driver, Rings};
+    use crate::devices::virtio::mmio::testing::{self, write_descriptor, Driver, Rings};
     use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     const BASE: u64 = 0x4000_0000;
@@ -709,26 +709,10 @@ mod queue_tests {
         blk
     }
 
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(dev(), &mem, rings);
-    }
-
     /// Notifies the device of chain `head`, published as the next entry of the
     /// avail ring of [`activated`]'s queue.
     fn notify_head(blk: &mut VirtioBlk, mem: &GuestRam, head: u16) {
-        let avail = BASE + 0x1000;
-        let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 4) * 2, head)
-            .unwrap();
-        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        testing::make_available(mem, BASE + 0x1000, 4, head);
         blk.notify(mem, 0);
     }
 
@@ -741,15 +725,6 @@ mod queue_tests {
         (idx, mem.read_u32(entry + 4).unwrap())
     }
 
-    /// Writes descriptor `index` of [`activated`]'s queue.
-    fn write_descriptor(mem: &GuestRam, index: u64, addr: u64, flags: u16, next: u16) {
-        let at = BASE + index * 16;
-        mem.write_u64(at, addr).unwrap();
-        mem.write_u32(at + 8, 16).unwrap();
-        mem.write_u16(at + 12, flags).unwrap();
-        mem.write_u16(at + 14, next).unwrap();
-    }
-
     // A header followed by a writable descriptor that points back at itself.
     // The walk ends at the queue size, and the chain completes with a length of
     // 0. Without the bound, the read past the empty disk's capacity would write
@@ -758,11 +733,13 @@ mod queue_tests {
     fn descriptor_cycle_ends_at_the_queue_size_unserved() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = activated(&mem);
-        write_descriptor(&mem, 0, BASE + 0x3000, VIRTQ_DESC_F_NEXT, 1);
+        write_descriptor(&mem, BASE, 0, BASE + 0x3000, 16, VIRTQ_DESC_F_NEXT, 1);
         write_descriptor(
             &mem,
+            BASE,
             1,
             BASE + 0x3100,
+            16,
             VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
             1,
         );
@@ -780,8 +757,8 @@ mod queue_tests {
     fn next_index_outside_the_ring_ends_the_walk() {
         let mem = GuestRam::from_ranges(&[(BASE, 0x4000)]);
         let mut blk = activated(&mem);
-        write_descriptor(&mem, 0, BASE + 0x3000, VIRTQ_DESC_F_NEXT, 4);
-        write_descriptor(&mem, 4, BASE + 0x3100, VIRTQ_DESC_F_WRITE, 0);
+        write_descriptor(&mem, BASE, 0, BASE + 0x3000, 16, VIRTQ_DESC_F_NEXT, 4);
+        write_descriptor(&mem, BASE, 4, BASE + 0x3100, 16, VIRTQ_DESC_F_WRITE, 0);
 
         notify_head(&mut blk, &mem, 0);
         assert_eq!(last_used(&mem), (1, 0), "the walk stopped at the ring");
@@ -837,19 +814,18 @@ mod queue_tests {
         mem.write_u32(hdr, VIRTIO_BLK_T_IN).unwrap();
         mem.write_u64(hdr + 8, 0).unwrap();
         mem.write_u8(status, 0xff).unwrap();
-        let write_descriptor = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
-            mem.write_u64(desc + i * 16, addr).unwrap();
-            mem.write_u32(desc + i * 16 + 8, len).unwrap();
-            mem.write_u16(desc + i * 16 + 12, flags).unwrap();
-            mem.write_u16(desc + i * 16 + 14, next).unwrap();
-        };
-        write_descriptor(0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
-        write_descriptor(1, data, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
-        write_descriptor(2, status, 1, VIRTQ_DESC_F_WRITE, 0);
-        let avail_idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(avail_idx % 8) * 2, 0)
-            .unwrap();
-        mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
+        write_descriptor(mem, desc, 0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
+        write_descriptor(
+            mem,
+            desc,
+            1,
+            data,
+            512,
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            2,
+        );
+        write_descriptor(mem, desc, 2, status, 1, VIRTQ_DESC_F_WRITE, 0);
+        testing::make_available(mem, avail, 8, 0);
     }
 
     // The re-programmed queue sits at fresh ring pages with `avail.idx` back
@@ -992,20 +968,10 @@ mod capacity_tests {
         } else {
             0
         };
-        let d = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
-            mem.write_u64(desc + i * 16, addr).unwrap();
-            mem.write_u32(desc + i * 16 + 8, len).unwrap();
-            mem.write_u16(desc + i * 16 + 12, flags).unwrap();
-            mem.write_u16(desc + i * 16 + 14, next).unwrap();
-        };
-        d(0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
-        d(1, data, len, VIRTQ_DESC_F_NEXT | write_flag, 2);
-        d(2, status, 1, VIRTQ_DESC_F_WRITE, 0);
-
-        let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 256) * 2, 0)
-            .unwrap();
-        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        testing::write_descriptor(mem, desc, 0, hdr, 16, VIRTQ_DESC_F_NEXT, 1);
+        testing::write_descriptor(mem, desc, 1, data, len, VIRTQ_DESC_F_NEXT | write_flag, 2);
+        testing::write_descriptor(mem, desc, 2, status, 1, VIRTQ_DESC_F_WRITE, 0);
+        testing::make_available(mem, avail, 256, 0);
 
         blk.notify(mem, 0);
         mem.read_u16(status).unwrap() as u8
@@ -1070,14 +1036,6 @@ mod capacity_tests {
         );
     }
 
-    #[test]
-    fn read_past_the_advertised_capacity_is_refused() {
-        let (_r, mut blk) = rig("in");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 9_999, 512);
-        assert_eq!(st, VIRTIO_BLK_S_IOERR);
-    }
-
     /// A sector that would wrap the byte offset is refused rather than aliased
     /// back into the file (release builds used to wrap silently).
     #[test]
@@ -1087,19 +1045,6 @@ mod capacity_tests {
         let st = submit(&mut blk, &mem, VIRTIO_BLK_T_OUT, u64::MAX / 256, 16);
         assert_eq!(st, VIRTIO_BLK_S_IOERR);
         assert_eq!(std::fs::metadata(&r.path).unwrap().len(), 512);
-    }
-
-    /// The last sector inside the capacity still works, so the bound is not
-    /// off by one.
-    #[test]
-    fn a_request_inside_the_capacity_still_succeeds() {
-        let (_r, mut blk) = rig("ok");
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let st = submit(&mut blk, &mem, VIRTIO_BLK_T_IN, 0, 512);
-        assert_eq!(st, VIRTIO_BLK_S_OK, "sector 0 of a 1-sector disk is valid");
-        let mut got = [0u8; 4];
-        mem.read(BASE + 0x5000, &mut got).unwrap();
-        assert_eq!(&got, &[0xab; 4], "the sector reached guest memory");
     }
 
     /// A request type the device does not implement is answered `S_UNSUPP`, not

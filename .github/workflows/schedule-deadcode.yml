@@ -1,0 +1,169 @@
+name: Dead code (weekly)
+
+# Reports code that no caller reaches on any backend, with tools/deadcode.py.
+#
+# rustc does not report a `pub` item of the library as dead, and each backend
+# compiles a different subset of the tree. The script checks a copy of the
+# crate in which every caller is a module of the library, once per target, and
+# an item is dead only when every target that compiles it leaves it unused.
+# The Linux targets are checked on one Linux runner. aarch64-apple-darwin needs
+# a macOS runner. The report job merges the two.
+#
+# It reports rather than blocks: a dead or test-only item, or a stale entry in
+# tools/deadcode-allow.txt, files or updates one tracking issue and leaves
+# `main` green. The fix is to delete the code, or to list it in the allowlist
+# with the reason it stays.
+
+on:
+  schedule:
+    # Weekly, Monday 07:11 UTC, clear of the 05:23 dependency audit and the
+    # 06:43 litmus lane.
+    - cron: "11 7 * * 1"
+  workflow_dispatch:
+
+# The scans only read the tree. The report job adds `issues: write`, which it
+# needs to file, comment on or close the tracking issue.
+permissions:
+  contents: read
+
+# The report path reads the issue tracker, then writes to it. Queue rather
+# than cancel, so an overlapping manual dispatch cannot file a second issue
+# and a cancelled run does not go unreported.
+concurrency:
+  group: deadcode
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Label carried by the tracking issue this lane files, and the key it
+  # dedups on.
+  ISSUE_LABEL: dead-code
+  # Deterministic (no run id): both the issue title and the dedup key, so a
+  # recurring report maps to one open issue.
+  MARKER: "Remove code that no caller reaches"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scan:
+    name: Scan ${{ matrix.name }}
+    # A fork that enables Actions would otherwise file issues in the fork.
+    if: github.repository == 'brig-sh/hvi-vmm'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runs-on: ubuntu-latest
+            targets: >-
+              x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+              aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+          # The Hypervisor.framework backend needs macOS 15+, as in
+          # validate-code.yml.
+          - name: macos
+            runs-on: macos-15
+            targets: aarch64-apple-darwin
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: deadcode-${{ matrix.name }}
+      - name: Add the targets
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          for t in $TARGETS; do rustup target add "$t"; done
+      - name: Scan
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          args=()
+          for t in $TARGETS; do args+=(--target "$t"); done
+          tools/deadcode.py "${args[@]}" --scan-only --raw-out "raw-${{ matrix.name }}.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deadcode-${{ matrix.name }}
+          path: raw-${{ matrix.name }}.json
+          retention-days: 7
+
+  report:
+    name: Report
+    needs: scan
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: deadcode-*
+          merge-multiple: true
+      # The script exits 1 for findings and 2 for an error. The `id` lets the
+      # steps below tell them apart: an error fails this step and files no
+      # issue.
+      - name: Merge the scans
+        id: report
+        run: |
+          status=0
+          tools/deadcode.py --from raw-linux.json raw-macos.json --markdown \
+            > report.md || status=$?
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          [ "$status" -le 1 ] || exit "$status"
+          echo "findings=$status" >> "$GITHUB_OUTPUT"
+      - name: File or update the tracking issue
+        if: steps.report.outputs.findings == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Best-effort: make sure the label exists so `gh issue create
+          # --label` cannot fail on a missing label. Ignores "already exists".
+          gh label create "$ISSUE_LABEL" \
+            --color C5DEF5 \
+            --description "Code that no caller reaches on any backend" \
+            2>/dev/null || true
+          # The lookup has no `|| true`: a failed query must stop the step,
+          # because "no result" then files a duplicate.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty')
+          {
+            echo "tools/deadcode.py found code that no caller reaches on any"
+            echo "backend, or code that only tests reach. Delete it, or move"
+            echo "it into the test module that uses it. An item of the library"
+            echo "API stays, since programs outside this tree link it: list it"
+            echo "in \`tools/deadcode-allow.txt\` with the reason."
+            echo
+            cat report.md
+            echo
+            echo "Run: $run_url"
+            echo
+            echo "Opened by the \`Dead code\` workflow. It closes itself on the"
+            echo "next weekly run that finds nothing."
+          } > body.md
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body-file body.md
+          fi
+      - name: Close the tracking issue once the tree is clean
+        if: steps.report.outputs.findings == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for number in $(gh issue list --state open --label "$ISSUE_LABEL" \
+            --limit 100 --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[].number'); do
+            gh issue close "$number" \
+              --comment "No dead code as of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          done

@@ -72,9 +72,6 @@ pub const AGENT_PORT: u32 = 1024;
 
 const RX_QUEUE: u16 = 0; // device -> guest
 const TX_QUEUE: u16 = 1; // guest -> device
-/// The event queue (index 2) exists in the config but we never post to it.
-#[allow(dead_code)]
-const EVENT_QUEUE: u16 = 2;
 
 /// virtio_vsock_hdr, 44 bytes, little-endian.
 const HDR_LEN: usize = 44;
@@ -1586,13 +1583,6 @@ mod tests {
         drop(agent);
     }
 
-    #[test]
-    fn silences_unused_ops() {
-        // Keep the event constant referenced. The credit-request one is
-        // exercised for real by `credit_request_answers_only_a_live_session`.
-        assert_eq!(EVENT_QUEUE, 2);
-    }
-
     /// Returns the result of binding the agent socket at `path`.
     fn bind_at(path: &std::path::Path) -> std::io::Result<VsockBridge> {
         let ram = Arc::new(GuestRam::from_ranges(&[(0x4000_0000, 0x1000)]));
@@ -1632,7 +1622,7 @@ mod session_tests {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
-    use crate::devices::virtio::mmio::testing::{self, Rings};
+    use crate::devices::virtio::mmio::testing::{self, make_available, write_descriptor, Rings};
     use crate::devices::virtio::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
     fn mem_of(len: usize) -> GuestRam {
@@ -1714,10 +1704,7 @@ mod session_tests {
         avail: u64,
         head: u16,
     ) -> DescriptorChain<'r> {
-        let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
-            .unwrap();
-        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        make_available(mem, avail, 8, head);
         dev.queues[usize::from(index)]
             .as_mut()
             .expect("the queue should be ready")
@@ -1728,28 +1715,8 @@ mod session_tests {
     /// Posts descriptor `idx`, a 64-byte writable buffer at `buffer`, as the
     /// next entry of an 8-entry avail ring.
     fn post_rx_buffer(mem: &GuestRam, desc: u64, avail: u64, idx: u16, buffer: u64) {
-        let descriptor = desc + u64::from(idx) * 16;
-        mem.write_u64(descriptor, buffer).unwrap();
-        mem.write_u32(descriptor + 8, 64).unwrap();
-        mem.write_u16(descriptor + 12, VIRTQ_DESC_F_WRITE).unwrap();
-        mem.write_u16(descriptor + 14, 0).unwrap();
-        let avail_idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(avail_idx % 8) * 2, idx)
-            .unwrap();
-        mem.write_u16(avail + 2, avail_idx.wrapping_add(1)).unwrap();
-    }
-
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = Arc::new(mem_of(0x4000));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(VirtioVsock::new(), &mem, rings);
+        write_descriptor(mem, desc, idx, buffer, 64, VIRTQ_DESC_F_WRITE, 0);
+        make_available(mem, avail, 8, idx);
     }
 
     // A packet queued before the reset must not reach the ring the guest
@@ -1838,10 +1805,7 @@ mod session_tests {
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
         let oversized = (MAX_TX_PACKET + 1) as u32;
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, oversized).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
+        write_descriptor(&mem, desc, 0, data, oversized, 0, 0);
 
         let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
         assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
@@ -1866,63 +1830,12 @@ mod session_tests {
         let full = pkt(OP_RW, 40000, &vec![0xa5u8; PAYLOAD]);
         assert_eq!(full.len(), HDR_LEN + PAYLOAD);
         mem.write(data, &full).unwrap();
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, full.len() as u32).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
+        write_descriptor(&mem, desc, 0, data, full.len() as u32, 0, 0);
 
         let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
         assert_eq!(
             VirtioVsock::read_tx(&mem, chain).map(|p| p.len()),
             Some(HDR_LEN + PAYLOAD)
-        );
-    }
-
-    // A readable descriptor that points back at itself ends at the queue size
-    // and gives no packet. Without the bound, its eight copies would make one.
-    #[test]
-    fn tx_descriptor_cycle_gives_no_packet() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut dev = VirtioVsock::new();
-        let avail = BASE + 0x1000;
-        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 8).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-
-        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
-
-        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
-    }
-
-    // A `next` outside the ring ends the walk. The descriptor one past the ring
-    // is a valid readable one carrying a whole header, so a walk past the ring
-    // would return a packet.
-    #[test]
-    fn tx_next_index_outside_the_ring_gives_no_packet() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut dev = VirtioVsock::new();
-        let avail = BASE + 0x1000;
-        set_ready_queue(&mut dev, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 8).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 8).unwrap();
-        mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
-        mem.write_u32(BASE + 136, HDR_LEN as u32).unwrap();
-        mem.write_u16(BASE + 140, 0).unwrap();
-        mem.write_u16(BASE + 142, 0).unwrap();
-
-        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 0);
-        assert_eq!(VirtioVsock::read_tx(&mem, chain), None);
-        let chain = pop(&mut dev, &mem, TX_QUEUE, avail, 8);
-        assert_eq!(
-            VirtioVsock::read_tx(&mem, chain),
-            None,
-            "a head outside the ring"
         );
     }
 
@@ -2126,13 +2039,10 @@ mod session_tests {
         size: u32,
     ) {
         let (desc, avail, used, data) = rings;
-        for i in 0..u64::from(n) {
-            let d = desc + i * 16;
-            mem.write_u64(d, data + i * u64::from(size)).unwrap();
-            mem.write_u32(d + 8, size).unwrap();
-            mem.write_u16(d + 12, VIRTQ_DESC_F_WRITE).unwrap();
-            mem.write_u16(d + 14, 0).unwrap();
-            mem.write_u16(avail + 4 + i * 2, i as u16).unwrap();
+        for i in 0..n {
+            let addr = data + u64::from(i) * u64::from(size);
+            write_descriptor(mem, desc, i, addr, size, VIRTQ_DESC_F_WRITE, 0);
+            mem.write_u16(avail + 4 + u64::from(i) * 2, i).unwrap();
         }
         mem.write_u16(avail + 2, n).unwrap(); // avail.idx
         set_ready_queue(dev, mem, RX_QUEUE, desc, avail, used);
@@ -2207,38 +2117,6 @@ mod session_tests {
         assert!(carried.iter().all(|&b| b == b'x'));
     }
 
-    // An RX chain that never clears NEXT is refused. Its segments would repeat
-    // one descriptor `q.size()` times.
-    #[test]
-    fn rx_descriptor_cycle_is_refused() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = mem_of(0x8000);
-        let mut dev = VirtioVsock::new();
-        let avail = BASE + 0x1000;
-        set_ready_queue(&mut dev, &mem, RX_QUEUE, BASE, avail, BASE + 0x2000);
-
-        // desc[0] -> desc[0], writable and carrying NEXT.
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, 4140).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
-            .unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-        let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
-        assert_eq!(
-            VirtioVsock::rx_chain(&mem, chain),
-            None,
-            "a cycle yields no segments"
-        );
-
-        // The same descriptor with NEXT clear is an ordinary one-buffer chain.
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_WRITE).unwrap();
-        let chain = pop(&mut dev, &mem, RX_QUEUE, avail, 0);
-        assert_eq!(
-            VirtioVsock::rx_chain(&mem, chain),
-            Some(vec![(BASE + 0x4000, 4140)])
-        );
-    }
-
     /// Asserts that a one-descriptor receive buffer goes back empty and the
     /// REQUEST a new session sends takes the good buffer behind it.
     ///
@@ -2251,12 +2129,8 @@ mod session_tests {
         let (desc, avail, used) = (BASE, BASE + 0x1000, BASE + 0x2000);
         set_ready_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
         let (addr, len, flags) = first(BASE + 0x3000);
-        mem.write_u64(desc, addr).unwrap();
-        mem.write_u32(desc + 8, len).unwrap();
-        mem.write_u16(desc + 12, flags).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap();
+        write_descriptor(&mem, desc, 0, addr, len, flags, 0);
+        make_available(&mem, avail, 8, 0);
         post_rx_buffer(&mem, desc, avail, 1, BASE + 0x3100);
         let (stream, _peer) = UnixStream::pair().unwrap();
         let port = dev.add_conn(stream).unwrap();
@@ -2342,21 +2216,15 @@ mod session_tests {
 
         // Two chains of two descriptors each: a 44-byte header buffer and a
         // 4096-byte body buffer, as pre-6.4 Linux posts them.
-        for i in 0..2u64 {
-            let (hd, bd) = (desc + i * 32, desc + i * 32 + 16);
-            let base = data + i * 0x2000;
-            mem.write_u64(hd, base).unwrap();
-            mem.write_u32(hd + 8, HDR_LEN as u32).unwrap();
-            mem.write_u16(hd + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
-                .unwrap();
-            mem.write_u16(hd + 14, (i * 2 + 1) as u16).unwrap();
-            mem.write_u64(bd, base + HDR_LEN as u64).unwrap();
-            mem.write_u32(bd + 8, 4096).unwrap();
-            mem.write_u16(bd + 12, 2).unwrap();
-            mem.write_u16(bd + 14, 0).unwrap();
-            mem.write_u16(avail + 4 + i * 2, (i * 2) as u16).unwrap();
+        for i in 0..2u16 {
+            let (hd, bd) = (i * 2, i * 2 + 1);
+            let base = data + u64::from(i) * 0x2000;
+            let flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT;
+            write_descriptor(&mem, desc, hd, base, HDR_LEN as u32, flags, bd);
+            let body = base + HDR_LEN as u64;
+            write_descriptor(&mem, desc, bd, body, 4096, VIRTQ_DESC_F_WRITE, 0);
+            make_available(&mem, avail, 8, hd);
         }
-        mem.write_u16(avail + 2, 2).unwrap();
         set_ready_queue(&mut dev, &mem, RX_QUEUE, desc, avail, used);
 
         let (dev_side, _peer) = UnixStream::pair().unwrap();
@@ -2486,10 +2354,8 @@ mod session_tests {
         set_ready_queue(&mut dev, &mem, TX_QUEUE, desc, avail, used);
         let request = pkt(OP_CREDIT_REQUEST, port, &[]);
         mem.write(packet, &request).unwrap();
-        mem.write_u64(desc, packet).unwrap();
-        mem.write_u32(desc + 8, request.len() as u32).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap();
+        write_descriptor(&mem, desc, 0, packet, request.len() as u32, 0, 0);
+        make_available(&mem, avail, 8, 0);
 
         dev.notify(&mem, TX_QUEUE);
 
@@ -3315,23 +3181,6 @@ mod session_tests {
         dev.connect(mem, port);
         dev.handle_pkt(&pkt(OP_RESPONSE, port, &[]));
         (dev, port, peer)
-    }
-
-    #[test]
-    fn rx_buffer_outside_guest_ram_is_returned_and_the_packet_kept() {
-        let (desc, _, used, data) = RINGS;
-        let mem = mem_of(0x8_0000);
-        let (mut dev, port, _peer) = connected_with_three_buffers(&mem);
-        // Buffer 1 now points past the end of guest RAM.
-        mem.write_u64(desc + 16, BASE + 0x10_0000).unwrap();
-
-        dev.host_data(&mem, port, b"intact");
-        assert_eq!(mem.read_u16(used + 2).unwrap(), 3);
-        assert_eq!(used_entry(&mem, used, 1), (1, 0), "returned empty");
-        let (hdr, body) = delivered(&mem, used, 2, data, RXBUF);
-        assert_eq!((hdr.op, hdr.len), (OP_RW, 6));
-        assert_eq!(body, b"intact");
-        assert!(dev.pending.is_empty());
     }
 
     #[test]

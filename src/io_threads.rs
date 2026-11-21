@@ -390,20 +390,8 @@ impl IoThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hypervisor::guest::tests::NoopKicker;
     use crate::run::StopHandle;
-
-    /// A kicker that reaches no thread.
-    struct NoopKicker;
-
-    impl Kick for NoopKicker {
-        fn kick(&self, _cpu: u32) {}
-
-        fn kick_all(&self) {}
-
-        fn try_kick_all(&self) -> bool {
-            true
-        }
-    }
 
     /// Returns the vCPUs of a run with one vCPU and no threads.
     fn vcpus() -> Arc<Vcpus<NoopKicker>> {

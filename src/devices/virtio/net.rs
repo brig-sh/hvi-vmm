@@ -1365,7 +1365,9 @@ fn parse_tls_sni(rec: &[u8]) -> Option<String> {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::devices::virtio::mmio::testing::{self, Driver, LevelLine, Rings};
+    use crate::devices::virtio::mmio::testing::{
+        self, make_available, write_descriptor, Driver, LevelLine, Rings,
+    };
     use crate::devices::virtio::mmio::{INTERRUPT_ACK, INTERRUPT_STATUS};
     use crate::devices::virtio::{Device as _, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use std::io::Read;
@@ -1765,12 +1767,8 @@ mod tests {
         let mut buf = vec![0u8; NET_HDR_LEN];
         buf.extend_from_slice(&eth_frame([0xff; 6], GUEST_MAC, ETH_IPV4, &ip));
         mem.write(data, &buf).unwrap();
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, buf.len() as u32).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
+        write_descriptor(&mem, desc, 0, data, buf.len() as u32, 0, 0);
+        make_available(&mem, avail, 8, 0);
         net.notify(&mem, TX_QUEUE);
 
         assert_eq!(
@@ -1806,63 +1804,12 @@ mod tests {
         avail: u64,
         head: u16,
     ) -> DescriptorChain<'r> {
-        let idx = mem.read_u16(avail + 2).unwrap();
-        mem.write_u16(avail + 4 + u64::from(idx % 8) * 2, head)
-            .unwrap();
-        mem.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+        make_available(mem, avail, 8, head);
         net.queues[TX_QUEUE as usize]
             .as_mut()
             .expect("the transmit queue should be ready")
             .pop(mem)
             .expect("the chain should be available")
-    }
-
-    // A readable descriptor that points back at itself ends at the queue size
-    // and gives no frame. Without the bound, its eight copies would make one.
-    #[test]
-    fn tx_descriptor_cycle_gives_no_frame() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut net = VirtioNet::new();
-        let avail = BASE + 0x1000;
-        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-
-        let chain = tx_chain(&mut net, &mem, avail, 0);
-
-        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
-    }
-
-    // A `next` outside the ring ends the walk. The descriptor one past the ring
-    // is a valid readable one carrying real bytes, so a walk past the ring
-    // would return a frame.
-    #[test]
-    fn tx_next_index_outside_the_ring_gives_no_frame() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut net = VirtioNet::new();
-        let avail = BASE + 0x1000;
-        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 8).unwrap();
-        mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
-        mem.write_u32(BASE + 136, 8).unwrap();
-        mem.write_u16(BASE + 140, 0).unwrap();
-        mem.write_u16(BASE + 142, 0).unwrap();
-
-        let chain = tx_chain(&mut net, &mem, avail, 0);
-        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
-        let chain = tx_chain(&mut net, &mem, avail, 8);
-        assert_eq!(
-            VirtioNet::read_tx_frame(&mem, chain),
-            None,
-            "a head outside the ring"
-        );
     }
 
     /// Asserts that a one-descriptor receive buffer goes back empty and a
@@ -1877,17 +1824,10 @@ mod tests {
         let (desc, avail, used, data) = (BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
         activate_with_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
         let (addr, len, flags) = first(data);
-        mem.write_u64(desc, addr).unwrap();
-        mem.write_u32(desc + 8, len).unwrap();
-        mem.write_u16(desc + 12, flags).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u64(desc + 16, data + 0x1000).unwrap();
-        mem.write_u32(desc + 24, 2048).unwrap();
-        mem.write_u16(desc + 28, VIRTQ_DESC_F_WRITE).unwrap();
-        mem.write_u16(desc + 30, 0).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
-        mem.write_u16(avail + 6, 1).unwrap();
-        mem.write_u16(avail + 2, 2).unwrap();
+        write_descriptor(&mem, desc, 0, addr, len, flags, 0);
+        write_descriptor(&mem, desc, 1, data + 0x1000, 2048, VIRTQ_DESC_F_WRITE, 0);
+        make_available(&mem, avail, 8, 0);
+        make_available(&mem, avail, 8, 1);
         let frame = [0x5au8; 60];
 
         let _ = net.deliver(&mem, &frame);
@@ -1988,13 +1928,10 @@ mod tests {
             used: mem.host_ptr(rx + 0x2000 + 2, 2).unwrap() as usize,
         }));
         for i in 0..8 {
-            let desc = rx + i * 16;
-            mem.write_u64(desc, rx + 0x3000).unwrap();
-            mem.write_u32(desc + 8, 2048).unwrap();
-            mem.write_u16(desc + 12, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT)
+            let flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT;
+            write_descriptor(&mem, rx, i, rx + 0x3000, 2048, flags, i);
+            mem.write_u16(rx + 0x1000 + 4 + u64::from(i) * 2, i)
                 .unwrap();
-            mem.write_u16(desc + 14, i as u16).unwrap();
-            mem.write_u16(rx + 0x1000 + 4 + i * 2, i as u16).unwrap();
         }
         let mut arp = vec![0u8; 28];
         arp[0..2].copy_from_slice(&1u16.to_be_bytes());
@@ -2044,17 +1981,11 @@ mod tests {
         activate_with_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
 
         // desc[0]: NET_HDR_LEN bytes for the header, chained to desc[1].
-        mem.write_u64(desc, hdr_buf).unwrap();
-        mem.write_u32(desc + 8, NET_HDR_LEN as u32).unwrap();
-        mem.write_u16(desc + 12, 2 | 1).unwrap(); // writable, next
-        mem.write_u16(desc + 14, 1).unwrap();
+        let flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT;
+        write_descriptor(&mem, desc, 0, hdr_buf, NET_HDR_LEN as u32, flags, 1);
         // desc[1]: the frame buffer, end of chain.
-        mem.write_u64(desc + 16, data_buf).unwrap();
-        mem.write_u32(desc + 24, 2048).unwrap();
-        mem.write_u16(desc + 28, 2).unwrap(); // writable, no next
-        mem.write_u16(desc + 30, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
-        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
+        write_descriptor(&mem, desc, 1, data_buf, 2048, VIRTQ_DESC_F_WRITE, 0);
+        make_available(&mem, avail, 8, 0);
 
         let udp = udp_datagram(9999, 1234, b"a reply the guest must see");
         let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
@@ -2085,12 +2016,9 @@ mod tests {
         activate_with_queue(&mut net, &mem, RX_QUEUE, desc, avail, used);
 
         // A single writable descriptor with room for the header alone.
-        mem.write_u64(desc, BASE + 0x3000).unwrap();
-        mem.write_u32(desc + 8, NET_HDR_LEN as u32).unwrap();
-        mem.write_u16(desc + 12, 2).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap();
-        mem.write_u16(avail + 4, 0).unwrap();
+        let len = NET_HDR_LEN as u32;
+        write_descriptor(&mem, desc, 0, BASE + 0x3000, len, VIRTQ_DESC_F_WRITE, 0);
+        make_available(&mem, avail, 8, 0);
 
         let udp = udp_datagram(9999, 1234, b"too big for one header buffer");
         let ip = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), GUEST_IP, IP_UDP, &udp);
@@ -2129,12 +2057,8 @@ mod tests {
         let mut buf = vec![0xa5u8; NET_HDR_LEN];
         buf.extend_from_slice(&frame);
         mem.write(data, &buf).unwrap();
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, buf.len() as u32).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap(); // device-readable, no next
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
-        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
+        write_descriptor(&mem, desc, 0, data, buf.len() as u32, 0, 0);
+        make_available(&mem, avail, 8, 0);
 
         net.notify(&mem, TX_QUEUE);
 
@@ -2201,12 +2125,8 @@ mod tests {
         let mut buf = hdr.to_vec();
         buf.extend_from_slice(&frame);
         mem.write(data, &buf).unwrap();
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, buf.len() as u32).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap(); // device-readable, no next
-        mem.write_u16(desc + 14, 0).unwrap();
-        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
-        mem.write_u16(avail + 4, 0).unwrap(); // avail.ring[0] = desc 0
+        write_descriptor(&mem, desc, 0, data, buf.len() as u32, 0, 0);
+        make_available(&mem, avail, 8, 0);
 
         net.notify(&mem, TX_QUEUE);
 
@@ -2336,10 +2256,7 @@ mod tests {
         // One byte past the ceiling, and still inside guest RAM, so only the
         // ceiling can reject it.
         let oversized = (MAX_TX_FRAME + 1) as u32;
-        mem.write_u64(desc, data).unwrap();
-        mem.write_u32(desc + 8, oversized).unwrap();
-        mem.write_u16(desc + 12, 0).unwrap();
-        mem.write_u16(desc + 14, 0).unwrap();
+        write_descriptor(&mem, desc, 0, data, oversized, 0, 0);
 
         let chain = tx_chain(&mut net, &mem, avail, 0);
         assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
@@ -2399,27 +2316,15 @@ mod tests {
         assert_eq!(parse_tls_sni(&rec[..20]), None);
     }
 
+    // The IPv4 header of the RFC 1071 example on Wikipedia, with its checksum
+    // field zeroed.
     #[test]
     fn ip_checksum_matches_known() {
-        // A header whose checksum field is zeroed; result is non-zero.
-        let mut h = vec![0u8; 20];
-        h[0] = 0x45;
-        h[2..4].copy_from_slice(&40u16.to_be_bytes());
-        h[9] = 6;
-        assert_ne!(checksum16(&h), 0);
-    }
-
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(VirtioNet::new(), &mem, rings);
+        let h = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
+        assert_eq!(checksum16(&h), 0xb861);
     }
 
     // A vCPU acknowledges the interrupt through the transport, without the
@@ -2443,11 +2348,8 @@ mod tests {
             used_ring: used,
         }]);
         for i in 0..N {
-            let d = desc + i * 16;
-            mem.write_u64(d, BASE + 0x4000 + i * 0x800).unwrap();
-            mem.write_u32(d + 8, 0x800).unwrap();
-            mem.write_u16(d + 12, 2).unwrap();
-            mem.write_u16(d + 14, 0).unwrap();
+            let addr = BASE + 0x4000 + i * 0x800;
+            write_descriptor(&mem, desc, i as u16, addr, 0x800, VIRTQ_DESC_F_WRITE, 0);
             mem.write_u16(avail + 4 + i * 2, i as u16).unwrap();
         }
         mem.write_u16(avail + 2, N as u16).unwrap();

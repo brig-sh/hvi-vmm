@@ -67,9 +67,7 @@ pub fn queue_count(request_queues: usize) -> usize {
 
 // The device needs the `vhost` crate, which only the Linux build has.
 #[cfg(target_os = "linux")]
-pub use self::device::{
-    attach, connect_waiting, shut_down, Export, ShutdownFds, VhostUserFs, SOCKET_WAIT,
-};
+pub use self::device::{attach, shut_down};
 
 #[cfg(target_os = "linux")]
 mod device {
@@ -298,20 +296,7 @@ mod device {
             ram_fd: RawFd,
         ) -> io::Result<Self> {
             let queues = queue_count(request_queues);
-            let frontend = Frontend::from_stream(stream, queues as u64);
-            Self::over(frontend, tag, request_queues, queue_size, ram_fd)
-        }
-
-        /// Runs the feature handshake and builds the device around
-        /// `frontend`.
-        fn over(
-            mut frontend: Frontend,
-            tag: &str,
-            request_queues: usize,
-            queue_size: u16,
-            ram_fd: RawFd,
-        ) -> io::Result<Self> {
-            let queues = queue_count(request_queues);
+            let mut frontend = Frontend::from_stream(stream, queues as u64);
             frontend
                 .set_owner()
                 .map_err(|e| io::Error::other(format!("vhost-user: SET_OWNER: {e}")))?;
@@ -387,29 +372,6 @@ mod device {
                 queue_max_sizes: vec![queue_size; queues],
                 protocol_features_offered,
             })
-        }
-
-        /// Returns the mount tag the guest reads from the config space.
-        #[must_use]
-        pub fn tag(&self) -> &str {
-            &self.tag
-        }
-
-        /// Returns the number of virtqueues, which is how many call
-        /// descriptors a caller has to wait on.
-        #[must_use]
-        pub fn queues(&self) -> usize {
-            self.queue_max_sizes.len()
-        }
-
-        /// Returns a duplicate of the call descriptor for queue `index`, or
-        /// `None` when there is no such queue.
-        ///
-        /// # Errors
-        ///
-        /// Errors if the descriptor cannot be duplicated.
-        pub fn call_fd(&self, index: usize) -> Option<io::Result<EventFd>> {
-            self.call.get(index).map(EventFd::try_clone)
         }
 
         /// Returns the call descriptors of every queue, duplicated.
@@ -1111,9 +1073,9 @@ mod device {
             let call = dev
                 .lock()
                 .expect("the device")
-                .call_fd(0)
-                .expect("queue 0")
-                .expect("a call descriptor");
+                .call_fds()
+                .expect("the call descriptors")
+                .swap_remove(0);
             let (interrupt, line) = testing::enabled_interrupt();
             let stop = StopSource::new().expect("a stop pair");
             let serving = {

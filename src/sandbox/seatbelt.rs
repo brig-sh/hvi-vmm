@@ -160,20 +160,7 @@ pub(crate) fn is_entered() -> bool {
 /// nobody has tested, and continuing would silently return the process to full
 /// ambient authority.
 pub fn enter() -> io::Result<()> {
-    enter_with_readonly_shares(&[])
-}
-
-/// Backwards-compatible single-export entry point.
-pub fn enter_with_readonly_share(root: Option<&Path>) -> io::Result<()> {
-    enter_with_paths(root.into_iter().map(|path| (path, false)))
-}
-
-/// Installs the production profile, granting read-only access to each
-/// canonical virtio-fs export. Devices open files lazily as the guest requests
-/// them, unlike virtio-blk's already-open descriptor, so one narrow subtree
-/// grant per export is required after confinement.
-pub fn enter_with_readonly_shares(roots: &[PathBuf]) -> io::Result<()> {
-    enter_with_paths(roots.iter().map(|root| (root.as_path(), false)))
+    enter_with_shares(&[])
 }
 
 /// Installs the production profile with independently read-only or writable

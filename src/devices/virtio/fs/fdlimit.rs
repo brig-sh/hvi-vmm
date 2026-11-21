@@ -112,22 +112,16 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
         return Ok(current);
     }
 
-    let mut next = lim;
-    next.rlim_cur = wanted;
-    // SAFETY: setrlimit reads a struct we own and fully initialized.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
-        return Ok(wanted);
-    }
-    // Raising to the hard limit can still be refused. Try the largest value
-    // that is accepted rather than giving up on the first refusal: a partial
-    // raise is worth having, and on macOS the hard limit is reported as
-    // unlimited while the kernel enforces kern.maxfilesperproc.
+    // Raising to the hard limit can be refused. Try the largest value that is
+    // accepted rather than giving up on the first refusal: a partial raise is
+    // worth having, and on macOS the hard limit is reported as unlimited while
+    // the kernel enforces kern.maxfilesperproc.
     let mut best = current;
     let mut candidate = wanted;
     while candidate > current {
         let mut attempt = lim;
         attempt.rlim_cur = candidate;
-        // SAFETY: as above.
+        // SAFETY: setrlimit reads a struct we own and fully initialized.
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &attempt) } == 0 {
             best = candidate;
             break;

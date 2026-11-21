@@ -180,10 +180,11 @@ records, and a kick before the run. The suite runs on arm64 Linux, on the
 self-hosted boot runners and on a hosted `ubuntu-24.04-arm` runner; the boot
 runners also run the stop tests.
 
-Four scheduled workflows run outside the two entry points, each reporting
+Five scheduled workflows run outside the two entry points, each reporting
 through a tracking issue so `main` stays green: the nightly e2e suite on every
-backend, the weekly dependency audit, the weekly used-ring litmus on arm64, and
-a monthly check that the pinned reflow nightly still agrees with the latest one.
+backend, the weekly dependency audit, the weekly used-ring litmus on arm64, the
+weekly dead-code scan, and a monthly check that the pinned reflow nightly still
+agrees with the latest one.
 The nightly e2e run also keeps an issue that lists the tests ready to leave
 probation.
 
