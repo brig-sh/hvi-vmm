@@ -1,0 +1,46 @@
+# Items tools/deadcode.py reports that stay on purpose.
+#
+# One per line: <path> <item> <reason>. The path and the item are as the report
+# prints them. An entry that matches nothing fails the scan, so delete an entry
+# with the item it names.
+
+# The library API. Programs outside this tree link hvi as a library, so a pub
+# item of the API stays when no caller here uses it: list it, do not delete it.
+# docs/embedding.md and docs/plugins.md document most of these.
+src/lib.rs Run docs/embedding.md: hvi::spawn returns a Run.
+src/lib.rs spawn docs/embedding.md: hvi::spawn runs the guest beside the caller.
+src/run/spawn.rs Run docs/embedding.md: the handle hvi::spawn returns.
+src/run/spawn.rs spawn docs/embedding.md: hvi::spawn.
+src/run/spawn.rs request_stop docs/embedding.md: Run::request_stop.
+src/run/spawn.rs stop_handle docs/embedding.md: Run::stop_handle.
+src/run/spawn.rs is_finished docs/embedding.md: Run::is_finished.
+src/run/spawn.rs wait docs/embedding.md: Run::wait.
+src/run/stop.rs handle hvi::spawn takes the stop handle from its registration.
+src/run/mod.rs record_panic docs/embedding.md: for a panic hook of the caller's own.
+src/run/panic.rs record_panic docs/embedding.md: for a panic hook of the caller's own.
+src/terminal/mod.rs fatal_signals docs/embedding.md: the signals restore_on_fatal_signals handles.
+src/config.rs get_ref docs/embedding.md: BootError::get_ref for a downcast.
+src/config.rs into_inner docs/embedding.md: BootError::into_inner.
+src/config.rs ro docs/embedding.md: DiskConfig::ro.
+src/arch/aarch64/layout.rs DEVICE_WINDOW_BASE docs/architecture.md and docs/guest-images.md name it.
+src/plugin/api.rs arch The plugin API: CpuHandle::arch.
+src/plugin/api.rs ram The plugin API: VmHandle::ram and CpuHandle::ram (docs/plugins.md).
+src/plugin/api.rs ledger The plugin API: VmHandle::ledger.
+src/plugin/api.rs request_stop The plugin API: VmHandle::request_stop (docs/plugins.md).
+src/plugin/api.rs is_stopping The plugin API: CpuHandle::is_stopping (docs/plugins.md).
+src/plugin/api.rs root The plugin API: RegsView::root (docs/plugins.md).
+src/plugin/api.rs cpsr The plugin API: a RegsView field.
+src/plugin/api.rs ttbr0 The plugin API: a RegsView field.
+src/plugin/api.rs ttbr1 The plugin API: a RegsView field.
+src/plugin/api.rs sctlr The plugin API: a RegsView field.
+src/plugin/api.rs sp_el1 The plugin API: a RegsView field.
+src/plugin/api.rs tcr The plugin API: a RegsView field.
+src/plugin/api.rs current_task The plugin API: a RegsView field.
+src/plugin/builtin.rs regions MemoryDump::regions, public on the builtin plugin.
+src/memory/guest.rs scan GuestRamView::scan, named in docs/architecture.md.
+
+# Test support that lives beside the code it tests.
+src/memory/guest.rs read_u16 The virtio tests build rings with it.
+src/memory/guest.rs write_u16 The virtio tests build rings with it.
+src/devices/virtio/fs/server.rs descriptor_cache_stats The virtio-fs tests pin the cache hits with it.
+src/sandbox/seatbelt.rs enter tests/sandbox_stays_on.rs enters the profile without a boot.
