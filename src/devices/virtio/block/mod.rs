@@ -23,10 +23,10 @@
 //! [`VirtioBlk`] behind the transport holds what the registers read, and a
 //! notification only wakes the worker. The two share the queue, its interrupt
 //! and the sink behind one lock, which is never held across a call to the
-//! backing file. The worker takes a request off the ring under the lock, makes
-//! its call with no lock held, and completes it under the lock, unless a reset
-//! took the queue in between. One worker serves the requests in the order the
-//! ring holds them.
+//! backing file or to the sink. The worker takes a request off the ring under
+//! the lock, makes its call and feeds the sink with no lock held, and completes
+//! the request under the lock, unless a reset took the queue in between. One
+//! worker serves the requests in the order the ring holds them.
 //!
 //! A read or a write moves its data between the backing file and the request's
 //! buffers in guest RAM with `preadv` and `pwritev`, so no host buffer is sized

@@ -18,14 +18,14 @@ For constructing the `BootConfig` that carries a plugin, read
 
 ## When each hook runs
 
-<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: on_attach on the thread that calls boot before any vCPU starts, on_safepoint on the boot vCPU between guest entries, IoSink on_block on the disk's worker thread with the disk's queue locked, on_net on a device thread with the device lock held, and on_batch_end after the lock is released, and on_request from the console" width="760">
+<img src="img/plugin-lifecycle.svg" alt="Plugin lifecycle: on_attach on the thread that calls boot before any vCPU starts, on_safepoint on the boot vCPU between guest entries, IoSink on_block on the disk's worker thread before the request completes, on_net on a device thread with the device lock held, and on_batch_end with no lock held, and on_request from the console" width="760">
 
 | Trait | Called | Thread | Linux filter |
 | --- | --- | --- | --- |
 | `Plugin::on_attach` | once, from `boot()`, before any vCPU thread exists and before the sandbox is entered | the thread that calls `boot` | none yet |
 | `Plugin::on_safepoint` | between guest entries, only when `cpu_id == 0` | the boot vCPU | `vcpu` |
 | `Plugin::on_request` | when the console reads `Ctrl-]` (0x1d) | the console input thread | `vmm` |
-| `IoSink::on_block` | per request, the disk's queue locked | the disk's worker thread | `block` |
+| `IoSink::on_block` | per request, before it completes | the disk's worker thread | `block` |
 | egress `IoSink::on_net` | per frame, device lock held | a vCPU thread | `vcpu` |
 | ingress `IoSink::on_net`, under `--net-tap` or `--net-gateway` | per frame, device lock held | the tap or gateway reader thread | `vmm` |
 | ingress `IoSink::on_net`, under the built-in `--net-stub` stack | per reply, device lock held | a vCPU thread, inside the transmit path | `vcpu` |
@@ -103,8 +103,9 @@ reaches `on_safepoint`. The other vCPUs keep running.
 A `kick()` from the vCPU's own thread, inside `on_safepoint` or an `IoSink` on
 its exit path, is dropped. Call it from a thread of your own.
 
-**4. An `IoSink` must not block.** `on_block` is called with the disk's queue
-locked, and `on_net` with the device lock held. No `write(2)` there, and no
+**4. An `IoSink` must not block.** `on_block` is called before the disk's
+request completes, so the guest waits for it, and so does a vCPU that resets the
+disk, and `on_net` with the device lock held. No `write(2)` there, and no
 allocation you can avoid. A write that cannot block, such as one to an eventfd
 or a non-blocking pipe that wakes a reader, goes in `on_batch_end`, which runs
 once per batch with the lock released. A write that can block, such as one to a

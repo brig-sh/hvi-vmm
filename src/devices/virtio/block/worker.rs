@@ -29,7 +29,7 @@ use super::request::{
 use super::store::BackingStore;
 use crate::devices::virtio::mmio::Interrupt;
 use crate::devices::virtio::wake::WorkerWake;
-use crate::devices::virtio::{Queue, SinkSlot};
+use crate::devices::virtio::Queue;
 use crate::events::{CapturedEvent, Ledger};
 use crate::io_threads::HostWork;
 use crate::memory::GuestRam;
@@ -47,11 +47,12 @@ const POLL_START: Duration = Duration::from_micros(4);
 
 /// The state a disk's device and its worker share.
 ///
-/// The state's lock is never held across a call to the backing file. It is
-/// taken before the lock of the device's [`Interrupt`], never after it, and
-/// after the lock that orders the records, never before it.
+/// The state's lock is never held across a call to the backing file or to a
+/// plugin's sink. It is taken before the lock of the device's [`Interrupt`],
+/// never after it, and after the lock that orders the records, never before
+/// it.
 pub(super) struct Shared {
-    /// The queue, the sink and the requests in flight.
+    /// The queue, the sink's slot and the requests in flight.
     state: Mutex<State>,
     /// The condition notified when a request leaves flight and when the vCPUs
     /// stop.
@@ -70,9 +71,10 @@ pub(super) struct State {
     /// stop.
     active: Option<Active>,
     /// The sink each request also feeds, when a plugin installed one.
-    pub(super) sink: SinkSlot,
-    /// The number of requests taken off the ring whose call to the backing file
-    /// has not completed.
+    pub(super) sink: Option<Arc<dyn IoSink>>,
+    /// The number of requests taken off the ring that the worker has not
+    /// completed: their call to the backing file or to the sink has not
+    /// returned.
     in_flight: u32,
     /// The records of the completed requests that are not in the ledger yet.
     events: Vec<CapturedEvent>,
@@ -99,7 +101,7 @@ impl Shared {
         Ok(Self {
             state: Mutex::new(State {
                 active: None,
-                sink: SinkSlot::default(),
+                sink: None,
                 in_flight: 0,
                 events: Vec::new(),
                 stopping: false,
@@ -112,8 +114,8 @@ impl Shared {
 
     /// Returns the state, locked, whether or not a panic poisoned the lock.
     ///
-    /// A plugin's sink runs under the lock, so a panic there poisons it, and
-    /// the vCPUs' stop still has to free a vCPU waiting in a reset.
+    /// A worker that panics under the lock poisons it, and the vCPUs' stop
+    /// still has to free a vCPU waiting in a reset.
     pub(super) fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -383,13 +385,16 @@ impl<F: BackingStore> Worker<F> {
     /// off.
     ///
     /// It returns what it captured. Each request is parsed under the lock and
-    /// counted in flight, its call to the backing store runs with no lock held,
-    /// and it completes under the lock. A pass ends early when a reset takes
-    /// the queue. Notifications stay off when the pass ends, and
+    /// counted in flight, its call to the backing store and the sink's
+    /// `on_block` run with no lock held, and it completes under the lock. A
+    /// sink that blocks then holds up its request, and a reset that waits for
+    /// that request, but not the vCPUs' stop. A pass ends early when a reset
+    /// takes the queue. Notifications stay off when the pass ends, and
     /// [`poll`](Self::poll) turns them on.
     fn pass(&self) -> Pass {
         let mut trace_lines = Vec::new();
         let mut served = false;
+        let mut fed: Option<Arc<dyn IoSink>> = None;
         let mut state = self.shared.lock();
         let Some(active) = state.active.as_mut() else {
             return Pass {
@@ -414,11 +419,30 @@ impl<F: BackingStore> Worker<F> {
             };
             served = true;
             let request = self.parse(chain);
+            let sink = state.sink.clone();
             state.in_flight += 1;
             drop(state);
             let done = self.run_request(&request.work);
+            // Only a read or write that went through is I/O on the disk. A
+            // flush carries no data range, and a refused write
+            // moved nothing.
+            let moved = matches!(request.work, Work::Read { .. } | Work::Write { .. });
+            let recorded = done.is_ok() && moved;
+            if let (true, Some(sink)) = (recorded, sink) {
+                // The sink gets the request before the driver can see it
+                // complete, so its record precedes what the guest does with the
+                // data. A sink that cannot keep up accounts for that itself: a
+                // lost record must not fail the guest's I/O.
+                sink.on_block(
+                    request.sector,
+                    request.data_len(),
+                    self.disk_id,
+                    request.kind == VIRTIO_BLK_T_OUT,
+                );
+                fed.get_or_insert(sink);
+            }
             state = self.shared.lock();
-            self.complete(&mut state, &request, done, &mut trace_lines);
+            self.complete(&mut state, &request, done, recorded, &mut trace_lines);
             state.in_flight -= 1;
             self.shared.idle.notify_all();
         }
@@ -428,7 +452,7 @@ impl<F: BackingStore> Worker<F> {
             .is_some_and(|active| !active.queue.is_empty(&self.ram));
         Pass {
             trace_lines,
-            fed: state.sink.take_fed(),
+            fed,
             served,
             more,
         }
@@ -477,9 +501,9 @@ impl<F: BackingStore> Worker<F> {
 
     /// Runs `work` against the backing store.
     ///
-    /// It returns the number of bytes it wrote to guest RAM. It is the one step
-    /// of a request that runs with no lock held. A read writes the request's
-    /// buffers in guest RAM during the call.
+    /// It returns the number of bytes it wrote to guest RAM. It runs with no
+    /// lock held. A read writes the request's buffers in guest RAM during the
+    /// call.
     fn run_request(&self, work: &Work<'_>) -> io::Result<u32> {
         match work {
             Work::Read { offset, buffers } => {
@@ -506,23 +530,19 @@ impl<F: BackingStore> Worker<F> {
     /// While the queue is served, the status byte and a `GET_ID` serial reach
     /// guest RAM, the chain goes on the used ring and the interrupt is raised,
     /// once per request, so a slow request does not hold back the ones before
-    /// it. After a reset none of that happens. A read or write that went
-    /// through is recorded in the state and fed to the sink either way, since
-    /// it reached the backing store. With tracing on, its console line goes
-    /// in `trace_lines`.
+    /// it. After a reset none of that happens. A request that is `recorded`, a
+    /// read or write that went through, is recorded in the state either way,
+    /// since it reached the backing store. With tracing on, its console line
+    /// goes in `trace_lines`.
     fn complete(
         &self,
         state: &mut State,
         request: &Request<'_>,
         done: io::Result<u32>,
+        recorded: bool,
         trace_lines: &mut Vec<String>,
     ) {
-        let State {
-            active,
-            sink,
-            events,
-            ..
-        } = state;
+        let State { active, events, .. } = state;
         let Some(status_at) = request.status else {
             if let Some(active) = active {
                 // The ring takes no entry for a head outside it, and then the
@@ -543,18 +563,6 @@ impl<F: BackingStore> Worker<F> {
             }
         };
         let data_len = request.data_len();
-        // Only a read or write that went through is I/O on the disk. A flush
-        // carries no data range, and a refused write moved nothing.
-        let moved = matches!(request.work, Work::Read { .. } | Work::Write { .. });
-        let recorded = status == VIRTIO_BLK_S_OK && moved;
-        let write = request.kind == VIRTIO_BLK_T_OUT;
-        if recorded {
-            // The sink gets the request before the driver can see it complete,
-            // so its record precedes what the guest does with the data. A sink
-            // that cannot keep up accounts for that itself: a lost record must
-            // not fail the guest's I/O.
-            sink.feed(|sink| sink.on_block(request.sector, data_len, self.disk_id, write));
-        }
         if let Some(active) = active {
             // A failure writes the status byte too. An untouched byte reads
             // back as whatever the driver put there, so a refused or failed
@@ -588,7 +596,7 @@ impl<F: BackingStore> Worker<F> {
                 disk: Arc::clone(&self.serial_text),
                 lba: request.sector,
                 len: data_len,
-                write,
+                write: request.kind == VIRTIO_BLK_T_OUT,
             });
         }
     }
@@ -2070,8 +2078,7 @@ mod worker_tests {
         fn on_net(&self, _frame: &[u8], _egress: bool) {}
     }
 
-    // The sink runs under the lock the worker shares with the device, so its
-    // panic poisons the lock and leaves the request counted in flight. The
+    // The sink's panic ends the worker with the request counted in flight. The
     // vCPUs' stop still runs, and a reset after it does not wait.
     #[test]
     fn vcpu_stop_after_a_sink_panic_frees_a_reset() {
@@ -2093,7 +2100,7 @@ mod worker_tests {
         let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rig.host.run_vcpu_stops();
         }));
-        assert!(stopped.is_ok(), "the stop panicked on the poisoned lock");
+        assert!(stopped.is_ok(), "the stop panicked");
         rig.driver.reset();
         assert_eq!(rig.in_flight(), 1, "the panic left the request in flight");
     }
@@ -2226,21 +2233,30 @@ mod worker_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A sink whose `on_batch_end` waits until it is released.
-    #[derive(Default)]
-    struct HeldBatchEnd {
-        /// Whether a batch's end has been entered.
+    /// A sink one of whose calls waits until it is released.
+    struct HeldSink {
+        /// Whether `on_block` is the call that waits, in place of
+        /// `on_batch_end`.
+        at_block: bool,
+        /// Whether the call has been entered.
         entered: AtomicBool,
-        /// Whether the batch's end may return.
+        /// Whether the call may return.
         released: AtomicBool,
     }
 
-    impl IoSink for HeldBatchEnd {
-        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {}
+    impl HeldSink {
+        /// Returns a sink that waits in `on_block` when `at_block` is set, and
+        /// in `on_batch_end` otherwise.
+        fn new(at_block: bool) -> Self {
+            Self {
+                at_block,
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+            }
+        }
 
-        fn on_net(&self, _frame: &[u8], _egress: bool) {}
-
-        fn on_batch_end(&self) {
+        /// Waits until the sink is released.
+        fn hold(&self) {
             self.entered.store(true, Ordering::SeqCst);
             while !self.released.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
@@ -2248,9 +2264,25 @@ mod worker_tests {
         }
     }
 
-    /// Releases the batch's end of a [`HeldBatchEnd`] when dropped, so a test
-    /// that fails still lets the worker's thread end.
-    struct ReleaseGuard(Arc<HeldBatchEnd>);
+    impl IoSink for HeldSink {
+        fn on_block(&self, _sector: u64, _length: u64, _disk_id: u64, _write: bool) {
+            if self.at_block {
+                self.hold();
+            }
+        }
+
+        fn on_net(&self, _frame: &[u8], _egress: bool) {}
+
+        fn on_batch_end(&self) {
+            if !self.at_block {
+                self.hold();
+            }
+        }
+    }
+
+    /// Releases a [`HeldSink`] when dropped, so a test that fails still lets
+    /// the worker's thread end.
+    struct ReleaseGuard(Arc<HeldSink>);
 
     impl Drop for ReleaseGuard {
         fn drop(&mut self) {
@@ -2265,7 +2297,7 @@ mod worker_tests {
         let path = fresh_ledger_path();
         let ledger = Arc::new(Ledger::new(Some(path.to_str().unwrap()), "vm").unwrap());
         ledger.set_gather_interval(Duration::from_millis(1));
-        let sink = Arc::new(HeldBatchEnd::default());
+        let sink = Arc::new(HeldSink::new(false));
         {
             let rig = Rig::new("disk0", &ledger, false);
             rig.driver
@@ -2297,6 +2329,53 @@ mod worker_tests {
             "the worker wrote it no second time"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // The worker waits in the sink's `on_block`, which it calls with no lock
+    // held. The vCPUs' stop returns while it waits, and a reset after the stop
+    // returns too, with the request still in flight and off the used ring.
+    #[test]
+    fn vcpu_stop_returns_while_a_sink_holds_on_block() {
+        let sink = Arc::new(HeldSink::new(true));
+        let rig = Rig::new("disk0", &no_ledger(), false);
+        rig.driver
+            .device
+            .lock()
+            .unwrap()
+            .set_io_sink(Arc::clone(&sink) as Arc<dyn IoSink>);
+        rig.driver.start(&[RINGS]);
+        rig.publish(0, VIRTIO_BLK_T_IN, 1);
+        let _release = ReleaseGuard(Arc::clone(&sink));
+        rig.kick();
+        wait_until("the sink was not reached", || {
+            sink.entered.load(Ordering::SeqCst)
+        });
+        // A watcher releases the sink if the stop or the reset waits for it, so
+        // a failure ends the test.
+        let (stopped, waited) = (AtomicBool::new(false), AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                if !holds_in_time(|| stopped.load(Ordering::SeqCst)) {
+                    waited.store(true, Ordering::SeqCst);
+                    sink.released.store(true, Ordering::SeqCst);
+                }
+            });
+            rig.host.run_vcpu_stops();
+            rig.driver.reset();
+            stopped.store(true, Ordering::SeqCst);
+        });
+        assert!(
+            !waited.load(Ordering::SeqCst),
+            "the stop or the reset waited for the sink"
+        );
+        assert_eq!(rig.in_flight(), 1, "the request is still in flight");
+        sink.released.store(true, Ordering::SeqCst);
+        wait_until("the request did not leave flight", || rig.in_flight() == 0);
+        assert_eq!(
+            rig.used_idx(),
+            0,
+            "a request of the reset device is not completed"
+        );
     }
 
     // Two disks share the ledger and the sink, each served by its own worker.
