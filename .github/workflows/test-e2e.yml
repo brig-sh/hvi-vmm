@@ -38,11 +38,11 @@ jobs:
       matrix:
         include:
           - platform: x86
-            runs-on: [self-hosted, Linux, X64, kvm]
+            runs-on: kvm-dind-2604-amd64
             guest-target: x86_64-unknown-linux-musl
             timeout-scale: "1"
           - platform: arm64-kvm-vGICv2
-            runs-on: [self-hosted, Linux, ARM64, nbfc]
+            runs-on: kvm-dind-2604-arm64
             guest-target: aarch64-unknown-linux-musl
             vgic: v2
             timeout-scale: "2"
@@ -55,8 +55,9 @@ jobs:
             runs-on: [self-hosted, macOS, ARM64]
             guest-target: aarch64-unknown-linux-musl
             timeout-scale: "1"
-    # A fork's pull request is untrusted code, and these runners are persistent
-    # machines; see the note on boot-x86 in build-and-test.yml.
+    # A fork's pull request is untrusted code, and every lane here runs either
+    # on a persistent machine or in a privileged pod; see the note on boot-x86
+    # in build-and-test.yml.
     if: >-
       github.event_name != 'pull_request'
       || github.event.pull_request.head.repo.full_name == github.repository
