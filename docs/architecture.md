@@ -449,11 +449,11 @@ notification of the disk does not exit to hvi: KVM signals the worker's eventfd.
 On macOS the notification exits, and the device wakes the worker.
 
 The worker takes a request off the ring and completes it under a lock it shares
-with the device, and calls the backing file with no lock held. A read or a write
-moves its data between the backing file and the request's buffers in guest RAM
-with `preadv` and `pwritev`, so no host buffer is sized by the guest. The worker
-raises the interrupt once per request, so a slow flush does not hold back the
-requests before it.
+with the device, and calls the backing file and a plugin's sink with no lock
+held. A read or a write moves its data between the backing file and the
+request's buffers in guest RAM with `preadv` and `pwritev`, so no host buffer is
+sized by the guest. The worker raises the interrupt once per request, so a slow
+flush does not hold back the requests before it.
 
 The worker serves the ring in passes of at most a queue's worth of requests, and
 it asks the driver for no notification while it serves the ring. After each pass
@@ -469,8 +469,9 @@ microseconds unless the disk's `poll-max-us` sets another. It drops to zero once
 requests come further apart.
 
 The kernel writes a read's data into guest RAM during the call, so a reset waits
-for the call in flight, and no request of the reset device reaches guest RAM
-after the STATUS write returns. The vCPUs' stop ends that wait.
+for the request in flight, which is its call to the backing file and then to a
+plugin's sink, and no request of the reset device reaches guest RAM after the
+STATUS write returns. The vCPUs' stop ends that wait.
 
 ### Used-ring ordering
 

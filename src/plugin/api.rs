@@ -250,15 +250,16 @@ pub trait Plugin: Send + Sync {
 ///
 /// The VMM already records these in its ledger; a sink is for a tool that wants
 /// them live and unaggregated, as [`crate::plugin::builtin::IoTrace`] does.
-/// [`IoSink::on_block`] runs on the disk's worker thread with the disk's queue
-/// locked, and [`IoSink::on_net`] with the device lock held.
-/// [`IoSink::on_batch_end`] runs after the lock is released. No method may
-/// block. Each disk has a worker thread of its own, so a sink gets
-/// [`IoSink::on_block`] from several threads at once when the guest has several
-/// disks. The egress side of [`IoSink::on_net`] always runs on a vCPU thread.
-/// An ingress frame reaches it from the tap or gateway reader thread under
-/// those two backends, and from a vCPU thread under the built-in stack, which
-/// generates its replies inside the transmit path.
+/// [`IoSink::on_block`] runs on the disk's worker thread with no lock held,
+/// before the request completes, and [`IoSink::on_net`] with the device lock
+/// held. [`IoSink::on_batch_end`] runs with no lock held. No method may block:
+/// the guest waits for its request or its device until the call returns. Each
+/// disk has a worker thread of its own, so a sink gets [`IoSink::on_block`]
+/// from several threads at once when the guest has several disks. The egress
+/// side of [`IoSink::on_net`] always runs on a vCPU thread. An ingress frame
+/// reaches it from the tap or gateway reader thread under those two backends,
+/// and from a vCPU thread under the built-in stack, which generates its replies
+/// inside the transmit path.
 pub trait IoSink: Send + Sync {
     /// Receives a virtio-blk request of `length` data bytes from `sector`, a
     /// write when `write` is set.

@@ -178,7 +178,7 @@ impl VirtioBlk {
 
     /// Feeds each request to `sink` as well as the ledger.
     pub fn set_io_sink(&self, sink: Arc<dyn IoSink>) {
-        self.shared.lock().sink.set(sink);
+        self.shared.lock().sink = Some(sink);
     }
 }
 

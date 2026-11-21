@@ -39,12 +39,12 @@
 //! 3. A thread of your own sets its flag and *then* calls [`VmHandle::kick`].
 //!    An idle guest sits in WFI or HLT and never reaches `on_safepoint` on its
 //!    own.
-//! 4. An [`IoSink`] must not block. [`IoSink::on_block`] and [`IoSink::on_net`]
-//!    are called with a lock held, on a thread that depends on the device and
-//!    the networking mode, so do not assume one. Count in the sink. A write
+//! 4. An [`IoSink`] must not block. The guest waits for [`IoSink::on_block`]
+//!    and [`IoSink::on_net`] to return, on a thread that depends on the device
+//!    and the networking mode, so do not assume one. Count in the sink. A write
 //!    that can block waits for the safe point. One that cannot, such as an
 //!    eventfd write that wakes a reader, goes in [`IoSink::on_batch_end`],
-//!    which runs after the lock is released.
+//!    which runs with no lock held.
 //! 5. `on_request` runs on the console thread, which the stop waits for, so it
 //!    sets a flag and returns.
 //! 6. A thread of your own starts from `on_attach` with [`VmHandle::spawn`], so
@@ -75,9 +75,9 @@ struct Counters {
 /// Follows rule 4 with two relaxed adds and nothing else: no allocation, no
 /// `write(2)`, no lock.
 ///
-/// `on_block` is called with the disk's queue locked, from that disk's worker
-/// thread. `on_net` is called with the device lock held, from a vCPU thread or
-/// from a tap or gateway reader thread depending on the mode.
+/// `on_block` is called before the disk's request completes, from that disk's
+/// worker thread. `on_net` is called with the device lock held, from a vCPU
+/// thread or from a tap or gateway reader thread depending on the mode.
 impl IoSink for Counters {
     fn on_block(&self, _sector: u64, length: u64, _disk_id: u64, _write: bool) {
         self.block_requests.fetch_add(1, Ordering::Relaxed);
