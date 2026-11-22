@@ -58,7 +58,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use hvi::config::BootConfig;
+use hvi::config::{BootConfig, KernelImage};
 use hvi::plugin::{CpuHandle, IoSink, Plugin, VmHandle};
 
 /// The counts of what crosses the devices.
@@ -199,7 +199,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cfg = BootConfig {
-        kernel: std::fs::read(kernel)?,
+        kernel: KernelImage::open(kernel)?,
         initramfs: args.get(2).map(std::fs::read).transpose()?,
         mem_bytes: 512 << 20,
         cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),

@@ -16,8 +16,13 @@
 //! hypervisor backend.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use vm_memory::bitmap::BitmapSlice;
+use vm_memory::{ReadVolatile, VolatileMemoryError, VolatileSlice};
 
 /// Access granted to a host directory exported through virtio-fs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,9 +655,133 @@ pub fn check_disks(disks: &[DiskConfig]) -> Result<(), String> {
     Ok(())
 }
 
+/// A kernel image for [`BootConfig::kernel`], an open file or bytes in memory.
+///
+/// The loader reads the parts of a file it places straight into guest RAM. A
+/// `vmlinux` carries sections it does not load, and those are never read.
+pub enum KernelImage {
+    /// An open image file, read from its start.
+    File(File),
+    /// The image bytes.
+    Bytes(Vec<u8>),
+}
+
+impl KernelImage {
+    /// Opens the image file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file cannot be opened for reading.
+    // The caller's kernel path, opened once before any guest runs; see
+    // clippy.toml.
+    #[allow(clippy::disallowed_methods)]
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        File::open(path).map(Self::File)
+    }
+
+    /// Returns the size of the image in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file's metadata cannot be read.
+    pub fn size(&self) -> io::Result<u64> {
+        match self {
+            Self::File(file) => Ok(file.metadata()?.len()),
+            Self::Bytes(bytes) => Ok(bytes.len() as u64),
+        }
+    }
+
+    /// Returns the first `len` bytes of the image, or the whole image when it
+    /// is shorter.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file cannot be read.
+    pub(crate) fn head(&self, len: usize) -> io::Result<Vec<u8>> {
+        let mut reader = self.reader();
+        reader.rewind()?;
+        let mut head = Vec::with_capacity(len);
+        reader.take(len as u64).read_to_end(&mut head)?;
+        Ok(head)
+    }
+
+    /// Returns a reader over the image for `linux-loader`.
+    ///
+    /// A file's readers share its offset, and `linux-loader` seeks before it
+    /// reads.
+    pub(crate) fn reader(&self) -> KernelReader<'_> {
+        match self {
+            Self::File(file) => KernelReader::File(file),
+            Self::Bytes(bytes) => KernelReader::Bytes(Cursor::new(bytes)),
+        }
+    }
+}
+
+impl From<Vec<u8>> for KernelImage {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl From<File> for KernelImage {
+    fn from(file: File) -> Self {
+        Self::File(file)
+    }
+}
+
+impl fmt::Debug for KernelImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(file) => f.debug_tuple("File").field(file).finish(),
+            Self::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
+        }
+    }
+}
+
+/// A reader over a [`KernelImage`], with the volatile reads `linux-loader`
+/// uses to fill guest RAM.
+pub(crate) enum KernelReader<'a> {
+    /// Reads the file with `read(2)`, so the bytes land in guest RAM directly.
+    File(&'a File),
+    /// Copies from the bytes.
+    Bytes(Cursor<&'a [u8]>),
+}
+
+impl Read for KernelReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buf),
+            Self::Bytes(bytes) => bytes.read(buf),
+        }
+    }
+}
+
+impl Seek for KernelReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(file) => file.seek(pos),
+            Self::Bytes(bytes) => bytes.seek(pos),
+        }
+    }
+}
+
+impl ReadVolatile for KernelReader<'_> {
+    fn read_volatile<B: BitmapSlice>(
+        &mut self,
+        buf: &mut VolatileSlice<B>,
+    ) -> Result<usize, VolatileMemoryError> {
+        match self {
+            Self::File(file) => file.read_volatile(buf),
+            Self::Bytes(bytes) => bytes.read_volatile(buf),
+        }
+    }
+}
+
 /// Inputs for a boot, which [`boot`](crate::boot) takes.
 pub struct BootConfig {
-    pub kernel: Vec<u8>,
+    /// The arm64 `Image`, or the x86-64 `bzImage` or `vmlinux`, that matches
+    /// the target.
+    pub kernel: KernelImage,
     pub initramfs: Option<Vec<u8>>,
     pub mem_bytes: u64,
     pub cmdline: String,
@@ -821,7 +950,7 @@ impl BootConfig {
     /// for a test to fill in.
     pub(crate) fn with_no_devices(vcpus: u32) -> Self {
         Self {
-            kernel: Vec::new(),
+            kernel: Vec::new().into(),
             initramfs: None,
             mem_bytes: 128 << 20,
             cmdline: String::new(),
@@ -841,6 +970,32 @@ impl BootConfig {
             sandbox: false,
             stop: None,
         }
+    }
+}
+
+#[cfg(test)]
+impl KernelImage {
+    /// Returns `bytes` as an open file whose path is already removed.
+    pub(crate) fn temp_file(bytes: &[u8]) -> Self {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "hvi-kernel-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        #[allow(clippy::disallowed_methods)]
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        #[allow(clippy::disallowed_methods)]
+        std::fs::remove_file(&path).unwrap();
+        (&file).write_all(bytes).unwrap();
+        Self::File(file)
     }
 }
 
@@ -924,7 +1079,7 @@ impl std::error::Error for BootError {
 mod tests {
     use super::{
         check_disks, check_export_overlap, check_fs, disk_serial, BootConfig, BootError,
-        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, IrqChip, ShareMode,
+        CachePolicy, DiskConfig, FsConfig, FsShare, FsSpec, IrqChip, KernelImage, ShareMode,
     };
     use crate::hypervisor::vcpus::Outcome;
     use std::path::{Path, PathBuf};
@@ -1515,6 +1670,46 @@ mod tests {
             ..BootConfig::with_no_devices(1)
         };
         assert_eq!(cfg.check().unwrap_err(), "--irqchip kernel: x86-64 only");
+    }
+
+    /// Returns a 1000-byte pattern for the image tests.
+    fn image_bytes() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_file_image_reads_as_its_bytes() {
+        let bytes = image_bytes();
+        for image in [
+            KernelImage::temp_file(&bytes),
+            KernelImage::from(bytes.clone()),
+        ] {
+            assert_eq!(image.size().unwrap(), 1000, "{image:?}");
+            assert_eq!(image.head(16).unwrap(), bytes[..16], "{image:?}");
+            assert_eq!(image.head(4096).unwrap(), bytes, "shorter than asked");
+        }
+    }
+
+    // `linux-loader` seeks to each segment and reads it with `read_volatile`.
+    #[test]
+    fn a_file_reader_seeks_and_reads_into_volatile_memory() {
+        use std::io::{Seek, SeekFrom};
+        use vm_memory::{ReadVolatile, VolatileSlice};
+        let bytes = image_bytes();
+        for image in [
+            KernelImage::temp_file(&bytes),
+            KernelImage::from(bytes.clone()),
+        ] {
+            let mut reader = image.reader();
+            reader.seek(SeekFrom::Start(100)).unwrap();
+            let mut buf = vec![0u8; 300];
+            reader
+                .read_exact_volatile(&mut VolatileSlice::from(&mut buf[..]))
+                .unwrap();
+            assert_eq!(buf, bytes[100..400], "{image:?}");
+            // `head` starts from the beginning wherever a reader left off.
+            assert_eq!(image.head(4).unwrap(), bytes[..4], "{image:?}");
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

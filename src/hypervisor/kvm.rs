@@ -557,7 +557,7 @@ mod stop_tests {
     /// refuses, so there the filters stay off.
     fn config(kernel: Vec<u8>, plugin: Option<Arc<dyn Plugin>>) -> BootConfig {
         BootConfig {
-            kernel,
+            kernel: kernel.into(),
             initramfs: None,
             mem_bytes: 128 << 20,
             cmdline: String::new(),

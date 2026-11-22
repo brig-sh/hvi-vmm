@@ -21,7 +21,7 @@ use hvi::config::BootConfig;
 /// guest runs.
 fn config(sandbox: bool) -> BootConfig {
     BootConfig {
-        kernel: Vec::new(),
+        kernel: Vec::new().into(),
         initramfs: None,
         mem_bytes: 128 << 20,
         cmdline: String::new(),

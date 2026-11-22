@@ -31,6 +31,7 @@ use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryBackend};
 
 use crate::arch::aarch64::fdt::{self, MmioDevice};
 use crate::arch::aarch64::layout::{GicLayout, GuestLayout, RAM_BASE};
+use crate::config::KernelImage;
 
 /// arm64 `Image` magic, "ARM\x64" read as a little-endian `u32`.
 const IMAGE_MAGIC: u32 = 0x644d_5241;
@@ -59,17 +60,22 @@ impl LoadedKernel {
     ///
     /// # Errors
     ///
-    /// Errors when `kernel` is too short for a header or is not a flat arm64
-    /// `Image` (a gzip-compressed `Image.gz` must be decompressed first).
-    pub fn from_header(kernel: &[u8]) -> Result<Self, String> {
-        let Some(bytes) = kernel.get(..size_of::<arm64_image_header>()) else {
+    /// Errors when `kernel` cannot be read, is too short for a header or is
+    /// not a flat arm64 `Image` (a gzip-compressed `Image.gz` must be
+    /// decompressed first).
+    pub fn from_header(kernel: &KernelImage) -> Result<Self, String> {
+        let read_error = |e: std::io::Error| format!("reading the kernel image: {e}");
+        let bytes = kernel
+            .head(size_of::<arm64_image_header>())
+            .map_err(read_error)?;
+        if bytes.len() < size_of::<arm64_image_header>() {
             return Err(format!(
                 "image too short for an arm64 Image header: {} bytes",
-                kernel.len()
+                bytes.len()
             ));
-        };
+        }
         let mut header = arm64_image_header::default();
-        header.as_mut_slice().copy_from_slice(bytes);
+        header.as_mut_slice().copy_from_slice(&bytes);
         if u32::from_le(header.magic) != IMAGE_MAGIC {
             return Err(
                 "not an arm64 Image (a compressed Image.gz must be decompressed first)".into(),
@@ -83,21 +89,23 @@ impl LoadedKernel {
         };
         Ok(Self {
             addr: RAM_BASE + text_offset,
-            size: image_size.max(kernel.len() as u64),
+            size: image_size.max(kernel.size().map_err(read_error)?),
         })
     }
 
     /// Copies the flat `Image` in `kernel` to `RAM_BASE + text_offset`.
     ///
+    /// `linux-loader` reads a file straight into `mem`.
+    ///
     /// # Errors
     ///
-    /// Errors when `kernel` is not a flat arm64 `Image` or does not fit in
-    /// RAM.
-    pub fn load<M: GuestMemoryBackend>(mem: &M, kernel: &[u8]) -> Result<Self, String> {
+    /// Errors when `kernel` cannot be read, is not a flat arm64 `Image` or
+    /// does not fit in RAM.
+    pub fn load<M: GuestMemoryBackend>(mem: &M, kernel: &KernelImage) -> Result<Self, String> {
         let loaded = PE::load(
             mem,
             Some(GuestAddress(RAM_BASE)),
-            &mut Cursor::new(kernel),
+            &mut kernel.reader(),
             None,
         )
         .map_err(|e| format!("loading the arm64 Image: {e}"))?;
@@ -217,7 +225,7 @@ pub struct Plan {
 #[derive(Debug, Clone, Copy)]
 pub struct Payload<'a> {
     /// The flat arm64 `Image`.
-    pub kernel: &'a [u8],
+    pub kernel: &'a KernelImage,
     /// The initramfs cpio, if any.
     pub initramfs: Option<&'a [u8]>,
     /// The kernel command line for `/chosen`.
@@ -299,7 +307,8 @@ pub(crate) mod tests {
     fn loads_the_image_at_ram_base_plus_text_offset() {
         let mem = GuestRam::from_ranges(&[(RAM_BASE, RAM_LEN)]);
         let image = synthetic_image(0x8_0000, 0x40_0000, 0x3000);
-        let kernel = LoadedKernel::load(mem.memory(), &image).expect("a flat Image loads");
+        let kernel =
+            LoadedKernel::load(mem.memory(), &image.clone().into()).expect("a flat Image loads");
         assert_eq!(kernel.addr, RAM_BASE + 0x8_0000);
         assert_eq!(
             kernel.size, 0x40_0000,
@@ -323,16 +332,35 @@ pub(crate) mod tests {
             synthetic_image(0x20_0000, 0x30_0000, 0x1000),
             synthetic_image(0, 0, 0x3000),
         ] {
-            let placed = LoadedKernel::from_header(&image).expect("header");
-            let loaded = LoadedKernel::load(mem.memory(), &image).expect("load");
+            let placed = LoadedKernel::from_header(&image.clone().into()).expect("header");
+            let loaded = LoadedKernel::load(mem.memory(), &image.clone().into()).expect("load");
             assert_eq!(placed, loaded);
         }
+    }
+
+    // The loader reads a file straight into guest RAM, and must leave RAM and
+    // the placement as the same bytes in memory do.
+    #[test]
+    fn a_kernel_file_loads_as_its_bytes() {
+        let image = synthetic_image(0x8_0000, 0x40_0000, 0x3000);
+        let file = KernelImage::temp_file(&image);
+        let mem = GuestRam::from_ranges(&[(RAM_BASE, RAM_LEN)]);
+        let loaded = LoadedKernel::load(mem.memory(), &file).expect("load");
+        assert_eq!(
+            loaded,
+            LoadedKernel::from_header(&image.clone().into()).unwrap()
+        );
+        assert_eq!(loaded, LoadedKernel::from_header(&file).unwrap());
+        let mut back = vec![0u8; image.len()];
+        mem.read(loaded.addr, &mut back).unwrap();
+        assert_eq!(back, image);
     }
 
     #[test]
     fn header_without_image_size_reserves_the_file_at_the_legacy_offset() {
         let image = synthetic_image(0, 0, 0x3000);
-        let kernel = LoadedKernel::from_header(&image).expect("an old header still places");
+        let kernel =
+            LoadedKernel::from_header(&image.clone().into()).expect("an old header still places");
         assert_eq!(kernel.addr, RAM_BASE + LEGACY_TEXT_OFFSET);
         assert_eq!(kernel.size, image.len() as u64);
     }
@@ -341,13 +369,16 @@ pub(crate) mod tests {
     fn rejects_a_compressed_or_truncated_image() {
         let mut gz = vec![0x1f, 0x8b, 0x08, 0x00];
         gz.resize(0x1000, 0);
-        let err = LoadedKernel::from_header(&gz).expect_err("gzip is not a flat Image");
+        let err =
+            LoadedKernel::from_header(&gz.clone().into()).expect_err("gzip is not a flat Image");
         assert!(err.contains("arm64 Image"), "{err}");
-        let err = LoadedKernel::from_header(&gz[..16]).expect_err("shorter than a header");
+        let err = LoadedKernel::from_header(&gz[..16].to_vec().into())
+            .expect_err("shorter than a header");
         assert!(err.contains("too short"), "{err}");
 
         let mem = GuestRam::from_ranges(&[(RAM_BASE, RAM_LEN)]);
-        let err = LoadedKernel::load(mem.memory(), &gz).expect_err("linux-loader refuses it too");
+        let err = LoadedKernel::load(mem.memory(), &gz.clone().into())
+            .expect_err("linux-loader refuses it too");
         assert!(err.contains("arm64 Image"), "{err}");
     }
 
@@ -355,7 +386,7 @@ pub(crate) mod tests {
     fn rejects_an_image_larger_than_ram() {
         let mem = GuestRam::from_ranges(&[(RAM_BASE, RAM_LEN)]);
         let image = synthetic_image(0, 0, RAM_LEN);
-        assert!(LoadedKernel::load(mem.memory(), &image).is_err());
+        assert!(LoadedKernel::load(mem.memory(), &image.clone().into()).is_err());
     }
 
     #[test]
@@ -410,7 +441,7 @@ pub(crate) mod tests {
         let image = synthetic_image(0, 0x40_0000, 0x2000);
         let initramfs: Vec<u8> = (0..0x1800u32).map(|i| (i % 241) as u8).collect();
         let layout = Payload {
-            kernel: &image,
+            kernel: &image.clone().into(),
             initramfs: Some(&initramfs),
             cmdline: "console=ttyAMA0",
         }

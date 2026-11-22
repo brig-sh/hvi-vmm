@@ -197,7 +197,7 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let kernel_path = kernel.ok_or("dump-fdt needs --kernel <Image>")?;
-    let kernel_bytes = std::fs::read(&kernel_path)?;
+    let kernel_image = config::KernelImage::open(&kernel_path)?;
     let initrd_size = match &initramfs {
         Some(p) => std::fs::metadata(p)?.len(),
         None => 0,
@@ -205,7 +205,7 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let ram_size = mem_mib << 20;
     let gic = GicLayout::QEMU_VIRT;
-    let kernel = loader::LoadedKernel::from_header(&kernel_bytes)?;
+    let kernel = loader::LoadedKernel::from_header(&kernel_image)?;
     let loader::Plan { layout, dtb } =
         kernel.plan(ram_size, initrd_size, &gic, 1, &cmdline, &[])?;
 
@@ -213,7 +213,7 @@ fn dump_fdt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "kernel {kernel_path}: kernel@{:#x} reserved_size={:#x} (file {} bytes)",
         kernel.addr,
         kernel.size,
-        kernel_bytes.len()
+        kernel_image.size()?
     );
     println!("RAM   {:#x} + {mem_mib} MiB", layout.ram_base);
     println!(
@@ -448,7 +448,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Refused here, before the VM exists, as the other argument errors are.
     config::check_disks(&disks)?;
     let cfg = config::BootConfig {
-        kernel: std::fs::read(&kernel_path)?,
+        kernel: config::KernelImage::open(&kernel_path)?,
         initramfs: initramfs.map(std::fs::read).transpose()?,
         mem_bytes: mem_mib << 20,
         cmdline,
