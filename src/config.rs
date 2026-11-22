@@ -65,7 +65,8 @@ pub enum CachePolicy {
 /// and a PIT.
 ///
 /// KVM runs the local APICs in either mode. The guest's firmware tables
-/// describe the same IOAPIC in both.
+/// describe the same IOAPIC in both. They declare a virtio device's interrupt
+/// edge-triggered with `Split` and level-triggered with `Kernel`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[non_exhaustive]
 pub enum IrqChip {

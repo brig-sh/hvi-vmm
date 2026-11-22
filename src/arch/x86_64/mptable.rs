@@ -18,9 +18,9 @@
 //! Layout follows the MP spec 1.4 and mirrors Firecracker's small table: an MP
 //! floating pointer, a config header, then one processor entry per vCPU, a bus
 //! entry, an IOAPIC entry, and an interrupt entry for each of the IOAPIC's 24
-//! inputs, as Firecracker writes them. All checksums are one's-of-sum-is-zero
-//! over the relevant bytes. Returns the bytes to place at [`MPTABLE_ADDR`]; the
-//! floating pointer sits first and points at the config table right after it.
+//! inputs. All checksums are one's-of-sum-is-zero over the relevant bytes.
+//! Returns the bytes to place at [`MPTABLE_ADDR`]; the floating pointer sits
+//! first and points at the config table right after it.
 
 use crate::arch::x86_64::layout::{IOAPIC_ADDR, IOAPIC_INPUTS, LAPIC_ADDR, MPTABLE_ADDR};
 use crate::arch::x86_64::MAX_VCPUS;
@@ -36,6 +36,14 @@ const ENTRY_BUS: u8 = 1;
 const ENTRY_IOAPIC: u8 = 2;
 const ENTRY_IOINT: u8 = 3;
 
+/// The polarity and the trigger in the flags of an I/O interrupt entry. The
+/// defaults are the bus's own, which on the ISA bus are active-high and
+/// edge-triggered.
+const IRQPOL_DEFAULT: u16 = 0x0;
+const IRQPOL_ACTIVE_HIGH: u16 = 0x1;
+const IRQTRIG_DEFAULT: u16 = 0x0;
+const IRQTRIG_LEVEL: u16 = 0xc;
+
 fn checksum(bytes: &[u8]) -> u8 {
     let sum = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
     (!sum).wrapping_add(1) // value that makes the total sum zero
@@ -44,11 +52,14 @@ fn checksum(bytes: &[u8]) -> u8 {
 /// Builds the MP table for `num_cpus` vCPUs, as the bytes to write at
 /// `MPTABLE_ADDR`.
 ///
+/// The IOAPIC inputs in `level_triggered` are described as level-triggered, and
+/// every other input as the ISA bus has it, edge-triggered.
+///
 /// # Panics
 ///
 /// Panics if `num_cpus` exceeds [`MAX_VCPUS`].
 #[must_use]
-pub fn build(num_cpus: u32) -> Vec<u8> {
+pub fn build(num_cpus: u32, level_triggered: &[u32]) -> Vec<u8> {
     assert!(
         num_cpus <= MAX_VCPUS,
         "{num_cpus} vCPUs, at most {MAX_VCPUS}"
@@ -94,7 +105,12 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
         let mut it = vec![0u8; 8];
         it[0] = ENTRY_IOINT;
         it[1] = 0; // INT
-        it[2..4].copy_from_slice(&0u16.to_le_bytes()); // flags: conforming
+        let flags = if level_triggered.contains(&u32::from(irq)) {
+            IRQPOL_ACTIVE_HIGH | IRQTRIG_LEVEL
+        } else {
+            IRQPOL_DEFAULT | IRQTRIG_DEFAULT
+        };
+        it[2..4].copy_from_slice(&flags.to_le_bytes());
         it[4] = 0; // source bus id (ISA)
         it[5] = irq; // source bus irq
         it[6] = ioapic_id; // dest IOAPIC id
@@ -137,4 +153,31 @@ pub fn build(num_cpus: u32) -> Vec<u8> {
     let mut out = fp;
     out.extend_from_slice(&out_config);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns the flags of the I/O interrupt entry of `input` in `table`,
+    /// which was built for one vCPU.
+    fn flags(table: &[u8], input: usize) -> u16 {
+        // The floating pointer, the header, one processor entry, the bus entry
+        // and the IOAPIC entry come first.
+        let entry = 16 + 44 + 20 + 8 + 8 + 8 * input;
+        assert_eq!(table[entry], ENTRY_IOINT);
+        assert_eq!(usize::from(table[entry + 7]), input);
+        u16::from_le_bytes([table[entry + 2], table[entry + 3]])
+    }
+
+    #[test]
+    fn level_triggered_inputs_are_described_as_level() {
+        let level = IRQPOL_ACTIVE_HIGH | IRQTRIG_LEVEL;
+        let default = IRQPOL_DEFAULT | IRQTRIG_DEFAULT;
+        let table = build(1, &[5, 23]);
+        assert_eq!(flags(&table, 4), default, "the UART's input");
+        assert_eq!(flags(&table, 5), level);
+        assert_eq!(flags(&table, 23), level);
+        assert_eq!(flags(&build(1, &[]), 5), default);
+    }
 }

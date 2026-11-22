@@ -745,7 +745,7 @@ fn probes() -> Vec<Probe> {
             what: "raise an interrupt line (block)",
             thread: Thread::Block,
             expected: Outcome::Allowed,
-            // With the in-kernel irqchip, a worker pulses its disk's IOAPIC pin
+            // With the in-kernel irqchip, a worker raises its disk's IOAPIC pin
             // with KVM_IRQ_LINE.
             run: || {
                 let level = kvm_bindings::kvm_irq_level::default();

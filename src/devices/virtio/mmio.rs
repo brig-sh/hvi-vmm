@@ -154,19 +154,21 @@ impl DeviceStatus {
 /// The interrupt of one virtio device, with the interrupt status the guest
 /// reads.
 ///
-/// The interrupt is edge-triggered. A raise triggers it only when the raised
-/// bit was clear. A raise of a bit already set needs no trigger, since the
-/// guest has not read the status yet, or it acknowledges the bit before it
-/// drains the queues. An acknowledgment clears bits and makes no call to the
-/// trigger.
+/// A raise triggers the interrupt only when the raised bit was clear. A raise
+/// of a bit already set needs no trigger, since the guest has not read the
+/// status yet, or it acknowledges the bit before it drains the queues. An
+/// acknowledgment clears bits, and clears the trigger once none is set, as a
+/// reset does. An error from the trigger there is dropped, since a register
+/// write cannot report it.
 ///
-/// The status, the generation and `enabled` change under one lock, and a raise
-/// triggers inside it. A raise that has passed the `enabled` check then cannot
-/// set its bit after a reset has cleared the status. Such a bit would outlive
-/// the reset, and the first raise after the next DRIVER_OK would find it set
-/// and send no trigger. The lock is separate from the transport state lock and
-/// the device lock, so an interrupt status read or an acknowledgment never
-/// waits for a device that is serving its queues.
+/// The status, the generation and `enabled` change under one lock, and every
+/// call to the trigger is made inside it, so the trigger takes its calls in the
+/// order the status changed. A raise that has passed the `enabled` check then
+/// cannot set its bit after a reset has cleared the status. Such a bit would
+/// outlive the reset, and the first raise after the next DRIVER_OK would find
+/// it set and send no trigger. The lock is separate from the transport state
+/// lock and the device lock, so an interrupt status read or an acknowledgment
+/// never waits for a device that is serving its queues.
 ///
 /// On Linux an eventfd can deliver the interrupt in the kernel, for a writer
 /// outside hvi such as a vhost-user daemon. Such a write sets no status bit, so
@@ -267,11 +269,15 @@ impl Interrupt {
         self.status() != 0
     }
 
-    /// Clears the notification `bits`, when the interrupt is enabled.
+    /// Clears the notification `bits`, when the interrupt is enabled, and the
+    /// trigger once none is set.
     fn acknowledge(&self, bits: u32) {
         let mut state = self.state.lock().unwrap();
         if state.enabled {
             state.status &= !bits;
+            if state.status == 0 {
+                let _ = state.trigger.clear();
+            }
         }
     }
 
@@ -287,12 +293,13 @@ impl Interrupt {
 
     /// Disables the interrupt.
     ///
-    /// The pending notifications are dropped, and the configuration generation
-    /// is kept.
+    /// The pending notifications are dropped and the trigger is cleared. The
+    /// configuration generation is kept.
     fn reset(&self) {
         let mut state = self.state.lock().unwrap();
         state.enabled = false;
         state.status = 0;
+        let _ = state.trigger.clear();
     }
 }
 
@@ -702,20 +709,36 @@ pub(crate) mod testing {
     use crate::devices::bus::Device as _;
     use crate::devices::virtio::Queue;
 
-    /// A trigger that counts the interrupts it delivered.
+    /// A trigger that counts the interrupts it delivered and the times it was
+    /// cleared.
     #[derive(Default)]
-    pub(crate) struct CountingTrigger(AtomicU32);
+    pub(crate) struct CountingTrigger {
+        /// The number of interrupts delivered.
+        triggers: AtomicU32,
+        /// The number of times the trigger was cleared.
+        clears: AtomicU32,
+    }
 
     impl CountingTrigger {
         /// Returns the number of interrupts delivered.
         pub(crate) fn count(&self) -> u32 {
-            self.0.load(Ordering::SeqCst)
+            self.triggers.load(Ordering::SeqCst)
+        }
+
+        /// Returns the number of times the trigger was cleared.
+        pub(crate) fn clears(&self) -> u32 {
+            self.clears.load(Ordering::SeqCst)
         }
     }
 
     impl irq::Trigger for CountingTrigger {
         fn trigger(&self) -> std::io::Result<()> {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.triggers.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear(&self) -> std::io::Result<()> {
+            self.clears.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -980,7 +1003,7 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Weak;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::testing::{self, Driver, Rings};
     use super::*;
@@ -1043,6 +1066,38 @@ mod tests {
                 return Err(io::Error::other("refused"));
             }
             self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A trigger whose clear waits a moment for a trigger call, and records
+    /// whether one came meanwhile.
+    #[derive(Default)]
+    struct SlowClear {
+        /// Whether a clear is in progress.
+        clearing: AtomicBool,
+        /// Whether a trigger call came during a clear.
+        overlapped: AtomicBool,
+        /// The number of interrupts delivered.
+        count: AtomicUsize,
+    }
+
+    impl irq::Trigger for SlowClear {
+        fn trigger(&self) -> io::Result<()> {
+            if self.clearing.load(Ordering::SeqCst) {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear(&self) -> io::Result<()> {
+            self.clearing.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline && !self.overlapped.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.clearing.store(false, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1499,6 +1554,52 @@ mod tests {
         assert_eq!(driver.read(INTERRUPT_STATUS), VIRTIO_MMIO_INT_CONFIG);
         driver.transport.interrupt.signal_used_buffer();
         assert_eq!(driver.trigger.count(), 3, "VRING was acknowledged");
+    }
+
+    #[test]
+    fn trigger_is_cleared_once_no_bit_is_set() {
+        let driver = driver();
+        driver.start(&[RINGS]);
+        driver.transport.interrupt.signal_config_change();
+        assert_eq!(
+            driver.read(INTERRUPT_STATUS),
+            VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG
+        );
+        driver.write(INTERRUPT_ACK, VIRTIO_MMIO_INT_VRING);
+        assert_eq!(driver.trigger.clears(), 0, "CONFIG is set");
+        driver.write(INTERRUPT_ACK, VIRTIO_MMIO_INT_CONFIG);
+        assert_eq!(driver.trigger.clears(), 1);
+        driver.transport.interrupt.signal_used_buffer();
+        driver.reset();
+        assert_eq!(driver.trigger.clears(), 2, "the reset dropped VRING");
+    }
+
+    // A trigger that holds a line lowers it at a clear. A raise that reached
+    // the trigger while an acknowledgment's clear was in progress would have
+    // its line lowered with its bit set, and no later raise would trigger.
+    #[test]
+    fn raise_waits_for_a_clear_in_progress() {
+        let ram = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
+        let driver = Driver::with_trigger(Stub::new(), &ram, Arc::<SlowClear>::default());
+        driver.start(&[RINGS]);
+        let interrupt = Arc::clone(&driver.transport.interrupt);
+        let trigger = Arc::clone(&driver.trigger);
+        interrupt.signal_used_buffer();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !trigger.clearing.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                interrupt.signal_used_buffer();
+            });
+            driver.write(INTERRUPT_ACK, VIRTIO_MMIO_INT_VRING);
+        });
+        assert!(!trigger.overlapped.load(Ordering::SeqCst));
+        assert_eq!(
+            trigger.count.load(Ordering::SeqCst),
+            2,
+            "the raise followed"
+        );
     }
 
     #[test]

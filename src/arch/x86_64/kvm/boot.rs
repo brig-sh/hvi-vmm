@@ -146,11 +146,16 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     if let (Some(addr), Some(initramfs)) = (kernel.initrd_addr, &cfg.initramfs) {
         ram.write(addr, initramfs)?;
     }
-    ram.write(MPTABLE_ADDR, &mptable::build(num_cpus))?;
-    ram.write(
-        ACPI_ADDR,
-        &acpi::build(num_cpus, &acpi::virtio_devices(devices.records())),
-    )?;
+    // The in-kernel IOAPIC's virtio triggers hold a level-triggered line, and
+    // both tables tell the guest so.
+    let virtio = acpi::virtio_devices(devices.records(), mode == IrqChip::Kernel);
+    let level_triggered: Vec<u32> = virtio
+        .iter()
+        .filter(|device| device.level_triggered)
+        .map(|device| device.gsi)
+        .collect();
+    ram.write(MPTABLE_ADDR, &mptable::build(num_cpus, &level_triggered))?;
+    ram.write(ACPI_ADDR, &acpi::build(num_cpus, &virtio))?;
     write_boot_page_tables(&ram)?;
     write_boot_gdt(&ram)?;
     eprintln!(
