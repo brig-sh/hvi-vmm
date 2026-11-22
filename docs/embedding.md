@@ -114,6 +114,7 @@ let cfg = BootConfig {
     events: None,
     sandbox_id: String::from("my-sandbox"),
     vcpus: 2,
+    irqchip: None,
     agent_sock: None,
     plugin: None,
     sandbox: true,
@@ -153,6 +154,7 @@ cargo build --release --example watch_guest
 | `events` | `Option<String>` | The ledger path. `boot` refuses anything there other than a regular file, a file locked by this process or another, and a symbolic link as the last component of the path. |
 | `sandbox_id` | `String` | Written into every ledger record. |
 | `vcpus` | `u32` | 1 or more. Linux/arm64 refuses more than 8 on a GICv2 host and more than 507 on a GICv3 one, and x86-64 more than 254. |
+| `irqchip` | `Option<IrqChip>` | Where an x86-64 guest's IOAPIC runs: `IrqChip::Split`, hvi's over KVM's split irqchip, or `IrqChip::Kernel`, KVM's with a PIC and a PIT. `None` is `Split`. The arm64 backends refuse `Some`. |
 | `agent_sock` | `Option<String>` | Host Unix socket bridged to the guest agent over vsock. |
 | `plugin` | `Option<Arc<dyn Plugin>>` | See [plugins.md](plugins.md). The CLI sets it only for `--dump-memory` and `--trace-io`, chained into one. |
 | `sandbox` | `bool` | Confinement. Leave it `true`. |

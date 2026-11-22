@@ -69,16 +69,20 @@ Where it actually runs in CI:
 | x86-64 Linux, musl (`ubuntu-latest`) | The full suite for `x86_64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 | arm64 Linux, musl (`ubuntu-24.04-arm`) | The full suite for `aarch64-unknown-linux-musl`, then the seccomp selftest on the static binary. |
 
-`src/arch/x86_64/kvm/` has unit tests and they run on `ubuntu-latest`, so the
-x86-64/KVM backend is unit-tested. `src/arch/aarch64/kvm/gic.rs` has unit tests
-of the vGIC's irqfd list, which run on the arm64 runners. The KVM stop tests and
-the queue notification test in `src/hypervisor/kvm.rs` run on whichever KVM
-backend the host has, and they need `/dev/kvm`. The vGIC irqfd tests in
-`src/arch/aarch64/kvm/gic.rs` need `/dev/kvm` on an arm64 host.
+The KVM backends' own tests are these:
 
-The used-ring litmus, the virtio-fs benchmarks, the KVM stop tests, the queue
-notification test and the vGIC irqfd tests are `#[ignore]`d and do not run in a
-normal `cargo test`. The `kvm` profile below runs the last three.
+| Tests | File | Needs `/dev/kvm` | In a normal `cargo test` |
+| --- | --- | --- | --- |
+| x86-64/KVM unit tests | `src/arch/x86_64/kvm/` | no | yes, on `ubuntu-latest` |
+| split irqchip tests | `src/arch/x86_64/kvm/ioapic.rs` | yes, on an x86-64 host | no, `#[ignore]`d |
+| vGIC irqfd list unit tests | `src/arch/aarch64/kvm/gic.rs` | no | yes, on the arm64 runners |
+| vGIC irqfd tests | `src/arch/aarch64/kvm/gic.rs` | yes, on an arm64 host | no, `#[ignore]`d |
+| KVM stop tests, queue notification test | `src/hypervisor/kvm.rs` | yes, on either KVM backend | no, `#[ignore]`d |
+
+So the x86-64/KVM backend is unit-tested. The arm64/KVM backend's gap is in
+[limitations.md](limitations.md#platforms-and-features). The used-ring litmus
+and the virtio-fs benchmarks are `#[ignore]`d too. The `kvm` profile below runs
+the `#[ignore]`d tests of the table.
 
 The stop tests boot a guest on the terminal, and two of them find a thread by
 name. Run them with the `kvm` profile in `.config/nextest.toml`, which runs each
@@ -119,7 +123,7 @@ console log:
 
 | Job | Runner | Asserts |
 | --- | --- | --- |
-| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`; the guest starts on kvm-clock and finds the TSC-deadline timer. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. A guest's `poweroff -f` ends the run as `SystemOff`, and its `reboot -f` ends it as `SystemReset` both with ACPI and with `acpi=off`. Also runs the virtio-blk sizing test against a real loop device, the vCPU stop tests and the queue notification test. |
+| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`; the guest starts on kvm-clock and finds the TSC-deadline timer. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. A guest's `poweroff -f` ends the run as `SystemOff`, and its `reboot -f` ends it as `SystemReset` both with ACPI and with `acpi=off`. Also runs the virtio-blk sizing test against a real loop device, the vCPU stop tests, the queue notification test and the split irqchip tests. |
 | `boot-arm64-hvf` | self-hosted Apple silicon | `hvi smoke`, `hvi smoke --shm`, then a boot reaching `Linux version` and `HVI-INITRAMFS-UP`. |
 | `boot-unikraft-hvf` | self-hosted Apple silicon | Two public Unikraft images, over four boots. A DHCP boot asserts the banner, `Set IPv4 address 10.0.2.15` and `Listening on port 8123`, with a share attached so the VMM has to place a virtio-fs device -- no other job does. A second boot passes `netdev.ip=` and asserts the guest took `10.0.2.99` and did *not* fall through to `10.0.2.15`, which is what fails if an image loses `CONFIG_LIBUKNETDEV_EINFO_LIBPARAM`. A third boots a padded cpio -- the pinned one is two whole pages, so the job adds 512 bytes to make the length ragged -- and asserts the banner, no memory-region assertion failure, and no `nginx:` error line. |
 | `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the vCPU stop tests, the queue notification test, the vGIC irqfd tests, the aarch64 seccomp selftest, a boot that checks the guest gets pointer authentication when the host CPU and the guest kernel have it, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
@@ -151,6 +155,14 @@ its `guest stopped:` line and the event ledger. It runs under cargo-nextest.
 [e2e/README.md](../e2e/README.md) covers the setup it needs, running it, its
 layout, and adding a test.
 
+On x86-64 the suite runs in either irqchip mode. `HVI_E2E_IRQCHIP=kernel` makes
+every run pass `--irqchip kernel`, and `split` passes `--irqchip split`. Unset,
+the runs take hvi's default, the split irqchip.
+
+```sh
+HVI_E2E_IRQCHIP=kernel cargo nextest run --manifest-path e2e/Cargo.toml
+```
+
 ### Tiers
 
 | Profile | What it runs | Where |
@@ -171,7 +183,7 @@ failure rather than as a pass. A test that pins a bug not fixed yet carries
 
 | Where | What runs |
 | --- | --- |
-| Self-hosted x86, arm64/KVM (vGICv2 and vGICv3) and Apple silicon | `test-e2e.yml`: the `default` profile for same-repository pull requests and `main`. `schedule-e2e-nightly.yml` runs the `full` profile there every night. |
+| Self-hosted x86, arm64/KVM (vGICv2 and vGICv3) and Apple silicon | `test-e2e.yml`: the `default` profile for same-repository pull requests and `main`. `schedule-e2e-nightly.yml` runs the `full` profile there every night. On x86 the suite runs twice, once with each irqchip. |
 | The same runners, on a pull request | `e2e/tools/check-probation.sh`: every new test is on the probation or nightly list, and a test that leaves the nightly list goes on probation. |
 | `ubuntu-latest`, once every backend has passed | The filter-name check: each exact name in the nextest filters names a test on some backend. |
 | x86-64 Linux (`ubuntu-latest`) | The e2e workspace's unit tests, which need no hypervisor, so a fork's pull request runs them too. |

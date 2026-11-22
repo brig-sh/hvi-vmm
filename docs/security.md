@@ -28,6 +28,7 @@ Everything a hostile guest can touch, it touches through hvi:
 | --- | --- |
 | virtio device registers | Parsed on the vCPU thread, from guest-controlled memory. |
 | Descriptor chains and buffers | Guest-controlled indices and lengths, bounds-checked against guest RAM. A disk's chains are parsed on its worker thread. |
+| IOAPIC registers (x86-64, split irqchip) | Parsed on the vCPU thread. A redirection entry whose MSI changes becomes a `KVM_SET_GSI_ROUTING` call. |
 | virtio-blk backing file | Whatever `--disk` names. |
 | virtio-fs shares | The exported tree, read-only or read-write. |
 | Network frames | Parsed by the built-in stack, or relayed without the guest's virtio-net header. |
@@ -88,14 +89,14 @@ touches guest data unconfined.
 
 ### Linux: seccomp-bpf
 
-Three allowlists per architecture, in `resources/seccomp/`, installed by each
-thread for itself:
+An allowlist per kind of thread, per architecture, in `resources/seccomp/`,
+installed by each thread for itself:
 
-| Filter | Covers | aarch64 | x86-64 |
-| --- | --- | --- | --- |
-| `vcpu` | the vCPU threads, where guest descriptors are parsed | 34 syscalls | 35 syscalls |
-| `block` | each disk's worker thread, which parses the disk's descriptors and runs its requests | 34 syscalls | 35 syscalls |
-| `vmm` | the thread that calls `boot`, the other host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer | 45 syscalls | 46 syscalls |
+| Filter | Covers |
+| --- | --- |
+| `vcpu` | the vCPU threads, where guest descriptors are parsed |
+| `block` | each disk's worker thread, which parses the disk's descriptors and runs its requests |
+| `vmm` | the thread that calls `boot`, the other host-side I/O threads, the threads a plugin starts with `VmHandle::spawn`, the stop-signal thread and the ledger writer |
 
 The stop-signal thread starts in the first run after a call to
 `hvi::signal::stop_on_signals`, once that run's filters are armed, and installs
@@ -114,22 +115,22 @@ starts.
 requests run on the disk's worker, so `vcpu` allows no read or write at an
 offset, no seek and no file sync. `block` is a subset of `vmm` too, apart from
 `preadv` and `pwritev`, with which a worker reads and writes a request's data
-straight between the backing file and guest RAM. No other thread makes them, so
-`vmm` does not allow them. `vmm` keeps `fdatasync` and `fsync`, which only a
-worker calls, so that `block` stays within it. Tests check these rules. All
-three filters use a default action of `trap`, so an off-list syscall raises
-`SIGSYS` and kills the process.
+straight between the backing file and guest RAM. Tests check these rules. Every
+filter uses a default action of `trap`, so an off-list syscall raises `SIGSYS`
+and kills the process.
 
 `block` allows `ioctl` only for the requests a worker makes: `KVM_IRQ_LINE` on
-x86-64, which raises the disk's interrupt, and `TCGETS`, `TCSETS` and `TCFLSH`,
-which the fatal-signal handler and the panic hook make from whichever thread
-they run on to restore the terminal. The rule matches the request number, not
-the descriptor. A syscall with a rule per request counts once in the table.
+x86-64, which raises the disk's interrupt with the in-kernel irqchip, and
+`TCGETS`, `TCSETS`, `TCGETS2`, `TCSETS2` and `TCFLSH`, which the fatal-signal
+handler and the panic hook make from whichever thread they run on to restore the
+terminal. Which of the first four a restore makes depends on the libc. The rule
+matches the request number, not the descriptor. A syscall with a rule per
+request counts once in the table.
 
-No list carries an open syscall (`openat`, `openat2`, and on x86-64
-`open`). A glibc build also installs, on every filtered thread and before the
-allowlist, a filter that fails those with `EPERM`, and adds them to the
-allowlist it compiles. glibc's malloc opens `/proc/sys/vm/overcommit_memory`,
+No list carries an open syscall (`openat`, `openat2`, and on x86-64 `open`). A
+glibc build also installs, on every filtered thread and before the allowlist, a
+filter that fails those with `EPERM`, and adds them to the allowlist it
+compiles. glibc's malloc opens `/proc/sys/vm/overcommit_memory`,
 `/sys/devices/system/cpu/online` and `/proc/stat` on its own, from whichever
 thread is allocating or freeing, and copes with each open failing. The open is
 refused rather than trapped, and the process still opens nothing. A musl build,
@@ -166,13 +167,13 @@ vulnerability report.
 ## The selftests
 
 ```sh
-hvi sandbox-selftest    # macOS: 23 probes, 14 expect denial, 9 expect success
-hvi seccomp-selftest    # Linux: 34 probes, 17 expect denial, 17 expect success
+hvi sandbox-selftest    # macOS
+hvi seccomp-selftest    # Linux
 ```
 
-On aarch64 the Linux selftest has 33 probes, since the `KVM_IRQ_LINE` probe is
-x86-64 only. A glibc build expects 3 of the 17 denials, the three opens, to fail
-with `EPERM`, and a musl build expects all 17 to raise `SIGSYS`.
+The Linux selftest runs its `KVM_IRQ_LINE` probe on x86-64 only. A glibc build
+expects the open probes, one per filter, to fail with `EPERM`, and a musl build
+expects every denial to raise `SIGSYS`.
 
 Both install the profile or the filters that actually ship and check both
 directions: what a confined thread must keep, and what it must lose. Neither

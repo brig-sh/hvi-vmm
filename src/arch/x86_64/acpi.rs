@@ -15,8 +15,8 @@
 //! The ACPI tables an x86-64 guest powers off and resets through.
 //!
 //! These tables give the guest a power-off. Without them, Linux turns
-//! `poweroff` into a halt, which KVM's in-kernel irqchip handles with no exit
-//! to the VMM.
+//! `poweroff` into a halt, which KVM's in-kernel local APIC handles with no
+//! exit to the VMM.
 //!
 //! The FADT describes a PC's fixed hardware: the [`PmRegisters`] at
 //! [`ACPI_PM_PORT`], and a system control interrupt hvi never raises. The DSDT
@@ -200,8 +200,8 @@ fn build_fadt(dsdt: u64, facs: u64) -> FADT {
 ///
 /// The processor UID and the APIC id of each CPU are its vCPU index, and the
 /// IOAPIC takes the id after the last CPU, as in the MP table. The table leaves
-/// the PC-AT flag clear, so Linux probes for the 8259 by its ports and finds
-/// KVM's.
+/// the PC-AT flag clear, so Linux probes for the 8259 by its ports rather than
+/// assuming one. A guest of the split irqchip has none.
 fn build_madt(num_cpus: u32) -> MADT {
     let mut madt = MADT::new(
         OEM_ID,

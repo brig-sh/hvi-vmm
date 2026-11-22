@@ -49,6 +49,7 @@ including a typo, silently runs the plain test.
 | `--initramfs <path>` | none | Read whole into memory. |
 | `--mem-mib <N>` | 512 | Guest RAM. On x86-64 it is split around the MMIO hole. |
 | `--cpus <N>` | 1 | vCPUs. `0` becomes 1 silently. |
+| `--irqchip split\|kernel` | `split` | Where an x86-64 guest's IOAPIC runs. `split` serves it in hvi over KVM's split irqchip, with no PIC and no PIT. `kernel` runs it, a PIC and a PIT in KVM. x86-64 only. |
 | `--cmdline <string>` | `earlycon console=ttyAMA0 panic=-1` | Kernel command line. The default is arm64-flavoured on every backend. |
 | `--disk <path>` | none | A writable virtio-blk disk. Repeatable. Each disk takes one of the interrupt lines every virtio device shares. A failure to open, or a lock another hvi holds on the image, fails the boot. |
 | `--disk path=<path>[,readonly=on\|off][,serial=<id>][,poll-max-us=<n>]` | none | The same disk with options. `readonly=on` opens the image `O_RDONLY` and advertises `VIRTIO_BLK_F_RO`. `serial` is what the guest reads from `/sys/block/vdX/serial`, 1 to 20 printable ASCII bytes, `disk<N>` by default with `N` the disk's position. Two disks may not share one. `poll-max-us` is the longest, in microseconds, the disk's worker polls after a request: 32 by default, at most 1000, 0 for no poll. See [storage-and-sharing.md](storage-and-sharing.md#virtio-blk---disk-file-and---disk-pathfile). |
@@ -96,7 +97,7 @@ hvi: boot needs --kernel <Image>
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
 `--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`,
-`--cpus`, `--dump-after`.
+`--cpus`, `--irqchip`, `--dump-after`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -115,17 +116,25 @@ are three behaviours, not two.
 | `--fs socket=` | **refused**, boot fails | acted on | acted on |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
+| `--irqchip` | **refused**, boot fails | **refused**, boot fails | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
 | everything else | acted on | acted on | acted on |
 
-Two of those errors appear **after** `booting <kernel> with <N> MiB ...` has
-printed, because they are raised inside the backend rather than at parse time:
-`--net-tap` and `--fs socket=` on macOS, and `--fs path=`, `--share-ro` and
-`--share-rw` on either Linux backend.
+Those errors appear **after** `booting <kernel> with <N> MiB ...` has printed,
+because they are raised inside the backend rather than at parse time:
+`--net-tap` and `--fs socket=` on macOS, `--fs path=`, `--share-ro` and
+`--share-rw` on either Linux backend, and `--irqchip` on macOS and Linux arm64.
 
 ```text
 booting Image with 512 MiB ...
 hvi: --net-tap tap0: no /dev/net/tun on macOS; use --net-gateway
+```
+
+On x86-64 the default, `--irqchip split`, needs `KVM_CAP_SPLIT_IRQCHIP`. A host
+whose KVM lacks it fails the boot, and `--irqchip kernel` runs there:
+
+```text
+hvi: enabling the split irqchip: this host's KVM lacks KVM_CAP_SPLIT_IRQCHIP; --irqchip kernel boots without it
 ```
 
 Unknown flags are the one class caught before anything prints.
@@ -148,6 +157,7 @@ hvi: duplicate virtio-fs tag "dup"
 hvi: virtio-fs export /path/to/missing: No such file or directory (os error 2)
 hvi: virtio-fs export is not a directory: /path/to/file
 hvi: unknown cache policy "bogus"; expected auto, always or none
+hvi: unknown irqchip "on"; expected split or kernel
 hvi: --dump-after needs --dump-memory <path>
 hvi: unknown boot arg "--nope"
 ```
@@ -332,6 +342,14 @@ On a clean stop, macOS reports each share's peak handle count:
 ```text
 [hvi] virtio-fs[0]: peak 1 of 1048448 guest handles
 guest stopped: SystemOff
+```
+
+On Linux x86-64 the line after `booting` names the irqchip, `split` or `kernel`,
+the kernel's format and its entry point:
+
+```text
+booting bzImage with 1024 MiB ...
+[hvi] 2 vCPU(s)  irqchip split  bzImage entry@0x100200
 ```
 
 ## vCPU limits

@@ -44,9 +44,6 @@ fn spi_gsi(spi: u32) -> u32 {
     (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | (SPI_BASE + spi)
 }
 
-/// A function that registers an eventfd as an irqfd on an SPI.
-type IrqfdRegistrar = Box<dyn Fn(&EventFd, u32) -> io::Result<()> + Send + Sync>;
-
 /// The eventfds a VM's SPIs are delivered through, as irqfds.
 ///
 /// An eventfd registered before the vGIC is initialized is kept, and
@@ -57,7 +54,7 @@ struct Irqfds {
     ///
     /// It takes the SPI number, which is the SPI's GSI in the routing KVM sets
     /// up when the vGIC is initialized.
-    registrar: IrqfdRegistrar,
+    registrar: kvm::IrqfdRegistrar,
     /// The eventfds kept until the vGIC is initialized, each with its SPI, or
     /// `None` once it is.
     pending: Mutex<Option<Vec<(EventFd, u32)>>>,
@@ -66,7 +63,7 @@ struct Irqfds {
 impl Irqfds {
     /// Returns a list with nothing pending, which registers through `registrar`
     /// once the vGIC is initialized.
-    fn new(registrar: IrqfdRegistrar) -> Self {
+    fn new(registrar: kvm::IrqfdRegistrar) -> Self {
         Self {
             registrar,
             pending: Mutex::new(Some(Vec::new())),
