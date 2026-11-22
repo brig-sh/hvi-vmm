@@ -248,22 +248,27 @@ impl<C: irq::Chip> DeviceManager<C> {
     /// Attaches the virtio devices `cfg` asks for, the disks first and in argv
     /// order, then the network, the agent device and the exports.
     ///
-    /// On Linux the exports' daemons map guest RAM through `ram_fd`.
+    /// On Linux the exports' daemons map guest RAM through `ram_fd`, which is
+    /// `None` when guest RAM is private memory.
     ///
     /// # Errors
     ///
     /// Errors when a device does not open, the machine has no slot left for it,
-    /// or a range overlaps one already on the bus.
+    /// a range overlaps one already on the bus, or on Linux when there are
+    /// exports and no `ram_fd`.
     pub(crate) fn attach_virtio_devices(
         &mut self,
         cfg: &BootConfig,
-        #[cfg(target_os = "linux")] ram_fd: RawFd,
+        #[cfg(target_os = "linux")] ram_fd: Option<RawFd>,
     ) -> Result<(), Error> {
         self.attach_disks(&cfg.disks)?;
         self.attach_net(cfg)?;
         self.attach_vsock(cfg.agent_sock.as_deref())?;
         #[cfg(target_os = "linux")]
-        self.attach_exports(&cfg.fs, ram_fd)?;
+        if !cfg.fs.is_empty() {
+            let ram_fd = ram_fd.ok_or("the virtio-fs exports need guest RAM in a memfd")?;
+            self.attach_exports(&cfg.fs, ram_fd)?;
+        }
         #[cfg(target_os = "macos")]
         self.attach_exports(&cfg.fs_shares)?;
         Ok(())
@@ -612,7 +617,7 @@ mod tests {
             ..BootConfig::with_no_devices(1)
         };
         #[cfg(target_os = "linux")]
-        devices.attach_virtio_devices(&cfg, -1).unwrap();
+        devices.attach_virtio_devices(&cfg, None).unwrap();
         #[cfg(target_os = "macos")]
         devices.attach_virtio_devices(&cfg).unwrap();
         let slot = |base: u64, irq, kind| DeviceRecord {
@@ -643,6 +648,26 @@ mod tests {
         for path in disks.iter().map(|disk| &disk.path).chain([&agent]) {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    // Private guest RAM has no descriptor to hand a daemon. The socket is
+    // never reached, since the export is refused first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exports_without_a_ram_descriptor_are_refused() {
+        let mut devices = manager(SlotAllocator::new(0x10_0000..0x10_1000, [5]));
+        let cfg = BootConfig {
+            fs: vec![FsConfig {
+                tag: "t".to_string(),
+                socket: "/nonexistent/vhost-user.sock".into(),
+                num_queues: 1,
+                queue_size: 1024,
+            }],
+            ..BootConfig::with_no_devices(1)
+        };
+        let err = devices.attach_virtio_devices(&cfg, None).unwrap_err();
+        assert!(err.to_string().contains("guest RAM in a memfd"), "{err}");
+        assert!(devices.records().is_empty());
     }
 
     // The device takes the second slot, so the address is the slot's own.

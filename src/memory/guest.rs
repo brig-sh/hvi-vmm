@@ -36,32 +36,8 @@ impl RamRegion {
     ///
     /// The file's length is read from the descriptor, so a region past the end
     /// of the object is refused here; mapped, it would fault on first access.
-    /// On Linux the mapping is marked `MADV_DONTDUMP` and left out of core
-    /// files, since guest RAM holds the guest's data and is most of the
-    /// process's memory. It is also marked for huge pages, as
-    /// `advise_huge_pages` describes.
     fn map(self, file: &Arc<File>, prot: i32) -> io::Result<Arc<GuestRegionMmap>> {
-        if self.size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("guest RAM region {:#x} is empty", self.gpa),
-            ));
-        }
-        if [self.gpa, self.size, self.file_offset]
-            .iter()
-            .any(|v| v % Self::ALIGN != 0)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "guest RAM region {:#x}+{:#x} at file offset {:#x} is not 1 MiB-aligned",
-                    self.gpa, self.size, self.file_offset
-                ),
-            ));
-        }
-        let size = usize::try_from(self.size).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "guest RAM region too large")
-        })?;
+        let size = self.checked_size()?;
         let object_len = file.metadata()?.len();
         if self
             .file_offset
@@ -84,9 +60,63 @@ impl RamRegion {
             libc::MAP_NORESERVE | libc::MAP_SHARED,
         )
         .map_err(io::Error::other)?;
+        self.place(mapping)
+    }
+
+    /// Maps this region as private anonymous memory, readable and writable,
+    /// after checking that it is aligned.
+    ///
+    /// No other process can map these pages, and the region's `file_offset` is
+    /// not used.
+    #[cfg(target_os = "linux")]
+    fn map_private(self) -> io::Result<Arc<GuestRegionMmap>> {
+        let size = self.checked_size()?;
+        let mapping = MmapRegion::build(
+            None,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        )
+        .map_err(io::Error::other)?;
+        self.place(mapping)
+    }
+
+    /// Returns the region's size in bytes, after checking that the region is
+    /// not empty and is [`RamRegion::ALIGN`]-aligned.
+    fn checked_size(&self) -> io::Result<usize> {
+        if self.size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guest RAM region {:#x} is empty", self.gpa),
+            ));
+        }
+        if [self.gpa, self.size, self.file_offset]
+            .iter()
+            .any(|v| v % Self::ALIGN != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "guest RAM region {:#x}+{:#x} at file offset {:#x} is not 1 MiB-aligned",
+                    self.gpa, self.size, self.file_offset
+                ),
+            ));
+        }
+        usize::try_from(self.size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "guest RAM region too large"))
+    }
+
+    /// Places `mapping` at this region's guest address.
+    ///
+    /// On Linux the mapping is marked `MADV_DONTDUMP` and left out of core
+    /// files, since guest RAM holds the guest's data and is most of the
+    /// process's memory. It is also marked for huge pages, as
+    /// `advise_huge_pages` describes.
+    fn place(self, mapping: MmapRegion) -> io::Result<Arc<GuestRegionMmap>> {
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: the range is the mapping just made, and `MADV_DONTDUMP`
+            let size = mapping.size();
+            // SAFETY: the range is the whole mapping, and `MADV_DONTDUMP`
             // changes none of its bytes.
             if unsafe { libc::madvise(mapping.as_ptr().cast(), size, libc::MADV_DONTDUMP) } != 0 {
                 let e = io::Error::last_os_error();
@@ -363,6 +393,42 @@ impl GuestRam {
         GuestRamView::from_arc_regions(mappings).map(|view| GuestRam { view })
     }
 
+    /// Allocates guest RAM and maps `regions` of it into this process, from a
+    /// `len`-byte shareable object when `shared` is set and from private
+    /// anonymous memory otherwise.
+    ///
+    /// Returns the object with the mapping, or `None` for private memory. Each
+    /// region of the object is mapped at its `file_offset`. Each private region
+    /// is a mapping of its own, so its `file_offset` is not used.
+    ///
+    /// Private memory gets transparent huge pages under the host's default THP
+    /// mode, `madvise`. A memfd needs the host's `shmem_enabled` set as well.
+    /// See `docs/architecture.md`. Private memory has no descriptor, so it fits
+    /// only a guest whose RAM no other process maps, as
+    /// [`BootConfig::shares_guest_ram`](crate::config::BootConfig::shares_guest_ram)
+    /// decides.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the object cannot be allocated, and as [`GuestRam::new`] does.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn allocate(
+        len: usize,
+        regions: &[RamRegion],
+        shared: bool,
+    ) -> io::Result<(Self, Option<SharedRam>)> {
+        if shared {
+            let object = SharedRam::new(len)?;
+            return Self::new(&object, regions).map(|ram| (ram, Some(object)));
+        }
+        let mappings = regions
+            .iter()
+            .map(|region| region.map_private())
+            .collect::<io::Result<Vec<_>>>()?;
+        let view = GuestRamView::from_arc_regions(mappings)?;
+        Ok((GuestRam { view }, None))
+    }
+
     /// Builds guest RAM from anonymous mappings, one region per `(gpa, len)`,
     /// for unit tests that need guest memory without a shareable object.
     #[cfg(test)]
@@ -515,30 +581,114 @@ mod tests {
         if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
             return;
         }
-        let shared = SharedRam::new(4 * ALIGN).expect("allocate");
-        let ram = GuestRam::new(&shared, &[shared.region_at(0)]).expect("map");
-        let flags = vm_flags(&ram, 0);
-        assert!(flags.split_whitespace().any(|flag| flag == "hg"), "{flags}");
+        let region = RamRegion {
+            gpa: 0,
+            size: 4 * ALIGN as u64,
+            file_offset: 0,
+        };
+        for shared in [true, false] {
+            let (ram, _object) =
+                GuestRam::allocate(4 * ALIGN, &[region], shared).expect("allocate");
+            let flags = vm_flags(&ram, 0);
+            assert!(flags.split_whitespace().any(|flag| flag == "hg"), "{flags}");
+        }
     }
 
-    /// Returns the `VmFlags` line `/proc/self/smaps` shows for the mapping of
-    /// `ram` that holds guest address `gpa`, which must be the mapping's first
-    /// byte.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_guest_ram_comes_without_an_object() {
+        let size = 2 * ALIGN as u64;
+        let high = 8 * ALIGN as u64;
+        let regions = [
+            RamRegion {
+                gpa: 0,
+                size,
+                file_offset: 0,
+            },
+            RamRegion {
+                gpa: high,
+                size,
+                file_offset: size,
+            },
+        ];
+        let (ram, object) = GuestRam::allocate(4 * ALIGN, &regions, false).expect("allocate");
+        assert!(object.is_none());
+        ram.write_u64(0x10, 1).unwrap();
+        ram.write_u64(high + 0x10, 2).unwrap();
+        assert_eq!(ram.read_u64(0x10).unwrap(), 1);
+        assert_eq!(ram.read_u64(high + 0x10).unwrap(), 2);
+        for gpa in [0, high] {
+            // An smaps header reads `start-end perms offset dev inode [path]`.
+            // A private anonymous mapping has `p` permissions and no path.
+            let header = smaps_line(&ram, gpa, |_| true);
+            let fields: Vec<&str> = header.split_whitespace().collect();
+            assert!(fields[1].ends_with('p'), "{header}");
+            assert_eq!(fields.len(), 5, "{header}");
+            let flags = vm_flags(&ram, gpa);
+            assert!(flags.split_whitespace().any(|flag| flag == "dd"), "{flags}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_guest_ram_comes_with_its_object() {
+        let region = RamRegion {
+            gpa: 0,
+            size: 2 * ALIGN as u64,
+            file_offset: 0,
+        };
+        let (ram, object) = GuestRam::allocate(2 * ALIGN, &[region], true).expect("allocate");
+        let object = object.expect("shared guest RAM should come with its object");
+        let header = smaps_line(&ram, 0, |_| true);
+        assert!(header.contains("/memfd:hvi-guest-ram"), "{header}");
+        // A second mapping of the object sees what the guest wrote.
+        ram.write_u32(0x40, 0xfeed).unwrap();
+        let view = GuestRamView::map(&[(Arc::clone(object.file()), region)]).expect("view");
+        assert_eq!(view.read_u32(0x40).unwrap(), 0xfeed);
+    }
+
+    /// Returns the first line for which `wanted` holds in the
+    /// `/proc/self/smaps` entry of the mapping that holds guest address `gpa`
+    /// of `ram`.
     ///
-    /// It reads the process's own `smaps`, which the host-path ban in
-    /// clippy.toml is not aimed at.
+    /// The entry's header line comes first. The kernel can merge two adjacent
+    /// anonymous mappings into one entry, so the entry is the one whose range
+    /// holds the address. The function reads the process's own `smaps`, which
+    /// the host-path ban in clippy.toml is not aimed at.
     #[cfg(target_os = "linux")]
     #[allow(clippy::disallowed_methods)]
-    fn vm_flags(ram: &GuestRam, gpa: u64) -> String {
-        let start = ram.host_ptr(gpa, 1).unwrap() as usize;
+    fn smaps_line(ram: &GuestRam, gpa: u64, wanted: impl Fn(&str) -> bool) -> String {
+        let addr = ram.host_ptr(gpa, 1).unwrap() as usize;
+        let holds_addr = |line: &str| {
+            let Some((start, end)) = line
+                .split_whitespace()
+                .next()
+                .and_then(|r| r.split_once('-'))
+            else {
+                return false;
+            };
+            match (
+                usize::from_str_radix(start, 16),
+                usize::from_str_radix(end, 16),
+            ) {
+                (Ok(start), Ok(end)) => (start..end).contains(&addr),
+                _ => false,
+            }
+        };
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-        let header = format!("{start:x}-");
         smaps
             .lines()
-            .skip_while(|line| !line.starts_with(&header))
-            .find(|line| line.starts_with("VmFlags:"))
-            .expect("guest RAM should be in smaps with its flags")
+            .skip_while(|line| !holds_addr(line))
+            .find(|line| wanted(line))
+            .expect("guest RAM should be in smaps")
             .to_string()
+    }
+
+    /// Returns the `VmFlags` line of the `/proc/self/smaps` entry of the
+    /// mapping that holds guest address `gpa` of `ram`.
+    #[cfg(target_os = "linux")]
+    fn vm_flags(ram: &GuestRam, gpa: u64) -> String {
+        smaps_line(ram, gpa, |line| line.starts_with("VmFlags:"))
     }
 
     #[test]

@@ -42,7 +42,7 @@ use crate::hypervisor::kvm::{
     kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
 };
 use crate::hypervisor::vcpus::Vcpus;
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::{GuestRam, RamRegion};
 use crate::plugin::GuestArch;
 use crate::signal::install_kick_handler;
 use crate::LOG_PREFIX;
@@ -88,14 +88,20 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         gic.gicr_size
     );
 
-    // Guest RAM: one region at RAM_BASE, backed by a shareable object (a memfd)
-    // so an out-of-process plugin can map the same pages. KVM only needs a
-    // valid host address, so the guest is unaffected.
-    let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
-    let ram = Arc::new(GuestRam::new(
-        &shared_ram,
-        &[shared_ram.region_at(RAM_BASE)],
-    )?);
+    // Guest RAM: one region at RAM_BASE. It is a memfd when another process
+    // maps it (a plugin's tool or a vhost-user daemon), and private memory
+    // otherwise. KVM only needs a valid host address, so the guest sees no
+    // difference.
+    let (ram, shared_ram) = GuestRam::allocate(
+        cfg.mem_bytes as usize,
+        &[RamRegion {
+            gpa: RAM_BASE,
+            size: cfg.mem_bytes,
+            file_offset: 0,
+        }],
+        cfg.shares_guest_ram(),
+    )?;
+    let ram = Arc::new(ram);
     ram.register_kvm_slots(&vm)?;
 
     // The ledger exists first, since each device's transport writes to it.
@@ -106,7 +112,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         move |fd, address, value| register_ioeventfd(&vm, fd, address, value)
     });
     let pl011 = devices.attach_uart_and_rtc()?;
-    devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
+    devices.attach_virtio_devices(&cfg, shared_ram.as_ref().map(AsRawFd::as_raw_fd))?;
     let fdt_devices = fdt::virtio_devices(devices.records());
 
     let layout = loader::Payload {

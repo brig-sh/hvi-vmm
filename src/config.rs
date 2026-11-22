@@ -801,6 +801,18 @@ impl BootConfig {
             + self.fs_shares.len()
     }
 
+    /// Returns whether guest RAM must be an object that another process can
+    /// map.
+    ///
+    /// A plugin can hand the object's descriptor to a process of its own, and
+    /// the daemon of each vhost-user export in [`fs`](Self::fs) maps all of
+    /// guest RAM. A guest with neither has no other process that maps its RAM,
+    /// and is backed by private anonymous memory.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn shares_guest_ram(&self) -> bool {
+        self.plugin.is_some() || !self.fs.is_empty()
+    }
+
     /// Takes the run's stop out of [`stop`](Self::stop) as a handle, or returns
     /// a new handle when it is `None`.
     ///
@@ -1429,6 +1441,33 @@ mod tests {
             ..BootConfig::with_no_devices(1)
         };
         assert_eq!(cfg.virtio_device_count(), 5);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_ram_is_shared_only_with_a_plugin_or_a_daemon_export() {
+        struct Nothing;
+        impl crate::plugin::Plugin for Nothing {}
+
+        assert!(!BootConfig::with_no_devices(1).shares_guest_ram());
+        // The devices served in this process take guest RAM from its mapping.
+        let devices = BootConfig {
+            disks: vec![DiskConfig::rw("a.img")],
+            net: true,
+            agent_sock: Some("/agent".to_string()),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert!(!devices.shares_guest_ram());
+        let export = BootConfig {
+            fs: vec![socket("tag=t,socket=/s")],
+            ..BootConfig::with_no_devices(1)
+        };
+        assert!(export.shares_guest_ram());
+        let plugin = BootConfig {
+            plugin: Some(std::sync::Arc::new(Nothing)),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert!(plugin.shares_guest_ram());
     }
 
     #[cfg(target_os = "linux")]

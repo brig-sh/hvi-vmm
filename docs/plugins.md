@@ -169,7 +169,9 @@ Guest RAM is allocated from a memfd on Linux and a POSIX shared-memory object on
 macOS, unlinked as soon as it is created, so `ram_fd()` is a descriptor another
 process can map and no other process can open by name. It is a `BorrowedFd` tied
 to the handle. It stays open as long as the handle does, and you must not close
-it. To hold it past the borrow, on a thread of your own or for an `SCM_RIGHTS`
+it. A guest with a plugin always has this object. Only on Linux, and only
+without a plugin or a vhost-user export, is guest RAM private memory with no
+descriptor. To hold it past the borrow, on a thread of your own or for an `SCM_RIGHTS`
 send, keep the `OwnedFd` that `try_clone_to_owned()` returns. `hvi smoke --shm`
 proves that path on macOS.
 

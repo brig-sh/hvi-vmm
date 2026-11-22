@@ -128,6 +128,13 @@ pages, read-only; no other process can open them by name. Each region is a
 it as a KVM memory slot or through `hv_vm_map`. A region's address, size and
 file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
+On Linux only a guest whose RAM another process maps needs the object: a guest
+with a plugin, which can hand the descriptor to a tool of its own, or with a
+vhost-user export, whose daemon maps all of guest RAM
+(`BootConfig::shares_guest_ram`). Any other guest gets private anonymous memory,
+one `MAP_PRIVATE` mapping per region, as Cloud Hypervisor does. Its RAM has no
+descriptor, and the devices hvi serves in-process reach it through `GuestRam`.
+
 ### Huge pages on Linux
 
 On Linux every guest RAM mapping is marked `MADV_HUGEPAGE`, so the host can back
@@ -136,9 +143,11 @@ page faults and EPT or stage-2 faults as it first touches its memory, and boots
 faster. A kernel without THP refuses the advice, and hvi carries on with base
 pages.
 
-A memfd is shmem, and shmem has a THP setting of its own. Most distributions,
-Ubuntu among them, ship it as `never`, and then the advice has no effect. To let
-hvi's guest RAM use huge pages, set it to `advise`:
+Private guest RAM is anonymous memory, which gets huge pages under the default
+THP mode, `madvise`, with no change to the host. A memfd is shmem, and shmem has
+a THP setting of its own. Most distributions, Ubuntu among them, ship it as
+`never`, and then the advice has no effect. To let a guest with a plugin or a
+vhost-user export use huge pages, set it to `advise`:
 
 ```sh
 cat /sys/kernel/mm/transparent_hugepage/shmem_enabled

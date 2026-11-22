@@ -46,8 +46,10 @@ pub(crate) struct Guest<K> {
     /// Guest RAM.
     pub(crate) ram: Arc<GuestRam>,
     /// The object backing guest RAM, for a plugin that hands the same pages to
-    /// another process.
-    pub(crate) shared_ram: SharedRam,
+    /// another process, or `None` when guest RAM is private memory.
+    ///
+    /// Only a Linux guest with no plugin has private RAM.
+    pub(crate) shared_ram: Option<SharedRam>,
     /// The `RawEvent` ledger.
     pub(crate) ledger: Arc<Ledger>,
     /// The devices a vCPU reaches through MMIO.
@@ -278,7 +280,12 @@ impl<K: Kick> VmHandle for Guest<K> {
     }
 
     fn ram_fd(&self) -> BorrowedFd<'_> {
-        self.shared_ram.as_fd()
+        // Only a plugin holds this handle, and a guest with a plugin has
+        // shareable RAM.
+        self.shared_ram
+            .as_ref()
+            .expect("a guest with a plugin has shareable RAM")
+            .as_fd()
     }
 
     fn ram_regions(&self) -> Vec<RamRegion> {
@@ -443,7 +450,7 @@ pub(crate) mod tests {
             arch: GuestArch::X86_64,
             sandbox_id: String::new(),
             ram: Arc::new(ram),
-            shared_ram,
+            shared_ram: Some(shared_ram),
             ledger: Arc::new(Ledger::new(None, "test").unwrap()),
             mmio_bus: Bus::new(),
             mmio_report_limiter: Some(ReportLimiter::new()),

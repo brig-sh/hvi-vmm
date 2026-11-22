@@ -14,15 +14,19 @@
 
 //! Guest RAM and the shareable object behind it.
 //!
-//! Guest RAM is a shareable object rather than a private anonymous mapping, so
-//! a plugin that only reads guest memory can run in a process of its own.
-//! [`SharedRam`] allocates the object. The VMM maps it as a [`GuestRam`], the
-//! writable region collection that it and the rust-vmm crates take as guest
-//! memory. A tool that received the object's descriptor maps it read-only as a
-//! [`GuestRamView`]. A `GuestRam` dereferences to the view, so code written
-//! against the view runs on either. [`RamRegion`] describes one region: where
-//! it sits in the guest and in the object. Inside the crate, `io` moves data
-//! between a host file and guest RAM with no host buffer.
+//! Guest RAM is a shareable object, so a plugin that only reads guest memory
+//! can run in a process of its own. [`SharedRam`] allocates the object. The VMM
+//! maps it as a [`GuestRam`], the writable region collection that it and the
+//! rust-vmm crates take as guest memory. A tool that received the object's
+//! descriptor maps it read-only as a [`GuestRamView`]. A `GuestRam`
+//! dereferences to the view, so code written against the view runs on either.
+//! [`RamRegion`] describes one region: where it sits in the guest and in the
+//! object. Inside the crate, `io` moves data between a host file and guest RAM
+//! with no host buffer.
+//!
+//! On Linux, a guest whose RAM no other process maps has no object. Its
+//! `GuestRam` maps private anonymous memory, which gets transparent huge pages
+//! under the host's default THP mode.
 
 mod guest;
 mod io;
