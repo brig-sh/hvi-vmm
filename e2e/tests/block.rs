@@ -175,3 +175,48 @@ fn large_direct_reads_complete() {
         .assert_success();
     vm.power_off();
 }
+
+// Linux masks an interrupt's IOAPIC pin while it moves the interrupt off a CPU
+// that goes offline, and a disk's worker can complete a request at that moment.
+// The guest sends the disk's interrupt to the second CPU each time that CPU is
+// back, so each offline moves it. The reads count themselves in a file, which
+// is renamed into place so that a read of it never finds it empty.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn disk_reads_survive_cpu_offline() {
+    let disk = sparse_file("disk.img", 64 * MIB);
+    let vm = Vm::builder().cpus(2).disk(&disk).boot();
+    vm.sh("blk=$(basename $(readlink /sys/block/vda/device)); \
+           irq=$(grep \" $blk\\$\" /proc/interrupts | cut -d: -f1 | tr -d ' '); \
+           [ -n \"$irq\" ] || exit 1; \
+           echo 0 > /tmp/reads; \
+           (while :; do echo 2 > /proc/irq/$irq/smp_affinity; \
+              echo 0 > /sys/devices/system/cpu/cpu1/online; \
+              echo 1 > /sys/devices/system/cpu/cpu1/online; done) >/dev/null 2>&1 & \
+           (n=0; while :; do dd if=/dev/vda of=/dev/null bs=4k count=64 iflag=direct 2>/dev/null; \
+              n=$((n+1)); echo $n > /tmp/reads.new; mv /tmp/reads.new /tmp/reads; done) \
+              >/dev/null 2>&1 &")
+        .assert_success();
+    let window = hvi_e2e::Suite::get().timeout(Duration::from_secs(5));
+    let mut reads = 0;
+    for _ in 0..4 {
+        std::thread::sleep(window);
+        let now: u64 = vm
+            .sh("cat /tmp/reads")
+            .assert_success()
+            .stdout
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            now > reads,
+            "the disk answered no read in {window:?}, after {reads} reads"
+        );
+        reads = now;
+    }
+    assert!(
+        vm.sh("dmesg | grep -q 'is now offline'").is_success(),
+        "the second CPU never went offline"
+    );
+    vm.power_off();
+}

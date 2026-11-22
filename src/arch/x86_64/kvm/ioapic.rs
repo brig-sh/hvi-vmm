@@ -23,13 +23,13 @@
 //! that GSI delivers the input's interrupt. KVM delivers an irqfd on an MSI
 //! route in the thread that writes it.
 //!
-//! An [`IoApic`] serves edge-triggered inputs, which every hvi device on x86
-//! drives. It holds an edge that arrives while the guest has the input masked
-//! and sends it when the guest unmasks the input. A level-triggered entry gets
-//! its route too, but the IOAPIC keeps no remote IRR, and the vCPU loop ignores
-//! the EOI exit KVM reports for it. A split irqchip has no PIC and no PIT.
-//! [`NoPic`] answers the 8259's ports, and [`NmiStatus`] the port KVM serves
-//! beside its PIT.
+//! An [`IoApic`] serves edge-triggered inputs, which every hvi device drives on
+//! the split irqchip. It holds an edge that arrives while the guest has the
+//! input masked and sends it when the guest unmasks the input. A
+//! level-triggered entry gets its route too, but the IOAPIC keeps no remote
+//! IRR, and the vCPU loop ignores the EOI exit KVM reports for it. A split
+//! irqchip has no PIC and no PIT. [`NoPic`] answers the 8259's ports, and
+//! [`NmiStatus`] the port KVM serves beside its PIT.
 //!
 //! The registers follow the 82093AA's layout and answer as KVM's in-kernel
 //! IOAPIC does, so a guest reads the same values in either mode.
@@ -64,43 +64,31 @@ impl irq::Chip for KernelIoApic {
     }
 
     fn trigger(&self, gsi: u32) -> io::Result<Arc<dyn irq::Trigger>> {
-        Ok(Arc::new(Pulsed::new(kvm::IrqLine::new(
-            Arc::clone(&self.vm),
-            gsi,
-        ))))
+        Ok(Arc::new(Held(kvm::IrqLine::new(Arc::clone(&self.vm), gsi))))
     }
 }
 
-/// The trigger of an edge-triggered IOAPIC pin, which raises the pin's line and
-/// lowers it again.
+/// The trigger of a level-triggered pin of the in-kernel IOAPIC, which holds
+/// the pin's line high from a trigger until it is cleared.
 ///
-/// The IOAPIC takes an edge only on a 0 to 1 transition. The line is locked
-/// across the raise and the lower, so two calls cannot both raise it before
-/// either lowers it, which the IOAPIC would take as one edge. The lock covers
-/// the pin because the pin has one trigger, as each virtio device has a pin of
-/// its own.
-struct Pulsed<L> {
-    /// The pin's line.
-    line: Mutex<L>,
-}
+/// The pin is level-triggered because KVM's IOAPIC delivers at the guest's
+/// unmask only an interrupt whose pin is level-triggered and whose line is
+/// high. It drops an edge that arrives while the pin is masked. The line needs
+/// no lock here, since the calls come one at a time.
+struct Held<L>(L);
 
-impl<L> Pulsed<L> {
-    /// Returns the trigger that pulses `line`.
-    fn new(line: L) -> Self {
-        Self {
-            line: Mutex::new(line),
-        }
-    }
-}
-
-// `Pulsed` keeps the default `register_irqfd`, which answers `Unsupported`. KVM
-// delivers an irqfd on a pin of the in-kernel IOAPIC from a kernel worker
-// thread, which is slower than a pulse from the thread that reads the eventfd.
-impl<L: irq::Line> irq::Trigger for Pulsed<L> {
+// `Held` keeps the default `register_irqfd`, which answers `Unsupported`. A
+// plain irqfd on a pin of the in-kernel IOAPIC raises the line and lowers it at
+// once, which a masked pin loses and which would lower a line this trigger
+// holds. KVM also delivers it from a kernel worker thread, which is slower than
+// a call from the thread that reads the eventfd.
+impl<L: irq::Line> irq::Trigger for Held<L> {
     fn trigger(&self) -> io::Result<()> {
-        let line = self.line.lock().unwrap();
-        line.set_level(true)?;
-        line.set_level(false)
+        self.0.set_level(true)
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        self.0.set_level(false)
     }
 }
 
@@ -702,35 +690,20 @@ mod tests {
         }
     }
 
-    impl Pulsed<RecordingLine> {
+    impl Held<RecordingLine> {
         /// Returns the levels the line was set to, in order.
         fn levels(&self) -> Vec<bool> {
-            self.line.lock().unwrap().levels.lock().unwrap().clone()
+            self.0.levels.lock().unwrap().clone()
         }
     }
 
     #[test]
-    fn pulse_raises_the_line_then_lowers_it() {
-        let pulse = Pulsed::new(RecordingLine::default());
-        pulse.trigger().unwrap();
-        assert_eq!(pulse.levels(), [true, false]);
-    }
-
-    #[test]
-    fn concurrent_pulses_do_not_interleave() {
-        let pulse = Pulsed::new(RecordingLine::default());
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    for _ in 0..1000 {
-                        pulse.trigger().unwrap();
-                    }
-                });
-            }
-        });
-        let levels = pulse.levels();
-        assert_eq!(levels.len(), 8000);
-        assert!(levels.chunks(2).all(|pair| pair == [true, false]));
+    fn held_line_stays_high_until_it_is_cleared() {
+        let held = Held(RecordingLine::default());
+        held.trigger().unwrap();
+        assert_eq!(held.levels(), [true]);
+        held.clear().unwrap();
+        assert_eq!(held.levels(), [true, false]);
     }
 
     /// The input the tests program, a virtio device's.

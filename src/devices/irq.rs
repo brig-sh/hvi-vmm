@@ -20,13 +20,14 @@
 //! Two threads that change one device's level then cannot leave the line at a
 //! level the device no longer has.
 //!
-//! A [`Trigger`] delivers one interrupt per call, on an interrupt the guest is
-//! told is edge-triggered. A virtio device's
-//! [`Interrupt`](crate::devices::virtio::mmio::Interrupt) calls it. On Linux a
-//! trigger may also take an eventfd that delivers the interrupt in the kernel,
-//! for a writer outside hvi. Each backend supplies the lines and the triggers
-//! through its [`Chip`], since how an interrupt reaches the guest's interrupt
-//! controller is the hypervisor's.
+//! A [`Trigger`] delivers the interrupt of a virtio device, whose
+//! [`Interrupt`](crate::devices::virtio::mmio::Interrupt) calls it. A trigger
+//! on an edge-triggered interrupt delivers one interrupt per call. A trigger on
+//! a level-triggered interrupt holds its line from the call until it is
+//! cleared. On Linux a trigger may also take an eventfd that delivers the
+//! interrupt in the kernel, for a writer outside hvi. Each backend supplies the
+//! lines and the triggers through its [`Chip`], since how an interrupt reaches
+//! the guest's interrupt controller is the hypervisor's.
 
 use std::sync::Arc;
 
@@ -43,7 +44,8 @@ pub(crate) trait Chip {
     /// Returns the trigger of interrupt `irq`, numbered as in
     /// [`Slot::irq`](crate::devices::manager::Slot::irq).
     ///
-    /// The guest's firmware tables declare the interrupt edge-triggered.
+    /// The guest's firmware tables declare the interrupt as the trigger
+    /// delivers it, edge-triggered or level-triggered.
     ///
     /// # Errors
     ///
@@ -71,14 +73,30 @@ pub(crate) trait Line: Send + Sync {
     fn set_level(&self, level: bool) -> std::io::Result<()>;
 }
 
-/// A device's edge-triggered interrupt on the guest's interrupt controller.
+/// A virtio device's interrupt on the guest's interrupt controller.
+///
+/// A caller makes its calls to [`trigger`](Self::trigger) and
+/// [`clear`](Self::clear) one at a time, in the order the notifications
+/// changed.
 pub(crate) trait Trigger: Send + Sync {
-    /// Delivers one interrupt.
+    /// Delivers the interrupt, for a notification that became pending.
     ///
     /// # Errors
     ///
     /// Errors if the hypervisor does not deliver it.
     fn trigger(&self) -> std::io::Result<()>;
+
+    /// Clears the interrupt, once no notification is pending.
+    ///
+    /// The default does nothing, which suits an edge-triggered interrupt. A
+    /// trigger on a level-triggered one lowers its line.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the hypervisor does not set the line.
+    fn clear(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Makes every write to `fd` deliver the interrupt in the kernel, with no
     /// call to [`trigger`](Self::trigger).

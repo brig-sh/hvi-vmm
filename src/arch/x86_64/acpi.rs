@@ -95,16 +95,20 @@ pub struct MmioDevice {
     pub size: u64,
     /// The IOAPIC line the device raises.
     pub gsi: u32,
+    /// Whether the line is level-triggered rather than edge-triggered.
+    pub level_triggered: bool,
 }
 
-/// Returns the virtio devices of `records`, in their order.
-pub(crate) fn virtio_devices(records: &[DeviceRecord]) -> Vec<MmioDevice> {
+/// Returns the virtio devices of `records`, in their order, with lines that are
+/// level-triggered when `level_triggered` is set.
+pub(crate) fn virtio_devices(records: &[DeviceRecord], level_triggered: bool) -> Vec<MmioDevice> {
     records
         .iter()
         .map(|record| MmioDevice {
             base: record.range.start,
             size: record.range.end - record.range.start,
             gsi: record.irq,
+            level_triggered,
         })
         .collect()
 }
@@ -134,7 +138,10 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     Name::new("_S5_".into(), &Package::new(vec![&SLP_TYP_S5])).to_aml_bytes(&mut dsdt);
     let com1_len = u8::try_from(UART_REGISTERS_LEN).expect("eight UART registers");
     let com1_io = IO::new(COM1_PORT, COM1_PORT, 1, com1_len);
-    let com1_line = line(COM1_GSI);
+    // The arguments of an `Interrupt` are whether the device consumes it, and
+    // whether it is edge-triggered, active-low and shared. The ISA lines are
+    // active-high, and a device on a line past them is wired the same way.
+    let com1_line = Interrupt::new(true, true, false, false, COM1_GSI);
     let com1_crs = ResourceTemplate::new(vec![&com1_io, &com1_line]);
     let com1_hid = EISAName::new(COM1_HID);
     let [hid, uid, crs] = [
@@ -148,7 +155,10 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
         .map(|device| {
             let base = u32::try_from(device.base).expect("a range under 4 GiB");
             let size = u32::try_from(device.size).expect("a range under 4 GiB");
-            (Memory32Fixed::new(true, base, size), line(device.gsi))
+            (
+                Memory32Fixed::new(true, base, size),
+                Interrupt::new(true, !device.level_triggered, false, false, device.gsi),
+            )
         })
         .collect();
     let crs: Vec<ResourceTemplate> = resources
@@ -186,14 +196,6 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     xsdt.add_entry(madt);
     let xsdt = tables.place(&xsdt, 1);
     tables.finish(xsdt)
-}
-
-/// Returns the `_CRS` line of a device on GSI `gsi`: consumed by the device,
-/// edge-triggered, active-high and exclusive. The ISA lines are wired that
-/// way, and so are the lines past them, so COM1 and every virtio device share
-/// this description.
-fn line(gsi: u32) -> Interrupt {
-    Interrupt::new(true, true, false, false, gsi)
 }
 
 /// Returns the FADT that points at the DSDT at `dsdt` and the FACS at `facs`.
@@ -532,11 +534,13 @@ mod tests {
                 base: 0xd000_0000,
                 size: 0x200,
                 gsi: 5,
+                level_triggered: false,
             },
             MmioDevice {
                 base: 0xd000_1000,
                 size: 0x200,
                 gsi: 23,
+                level_triggered: true,
             },
         ];
         let blob = build(1, &devices);
@@ -550,9 +554,10 @@ mod tests {
             memory.extend((device.base as u32).to_le_bytes());
             memory.extend((device.size as u32).to_le_bytes());
             assert_eq!(count(dsdt, &memory), 1, "range of {device:?}");
-            // Extended IRQ: tag 0x89, length 6, consumer edge high exclusive,
-            // one line.
-            let mut irq = vec![0x89, 6, 0, 0b11, 1];
+            // Extended IRQ: tag 0x89, length 6, consumer high exclusive, with
+            // the edge bit set or clear, one line.
+            let edge = u8::from(!device.level_triggered) << 1;
+            let mut irq = vec![0x89, 6, 0, 0b01 | edge, 1];
             irq.extend(device.gsi.to_le_bytes());
             assert_eq!(count(dsdt, &irq), 1, "line of {device:?}");
         }

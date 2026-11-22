@@ -383,13 +383,15 @@ configuration space and serves its queues.
 
 ### Interrupt delivery
 
-A virtio device's interrupt is edge-triggered. It holds the status bits under a
-lock of its own, so a vCPU reads and acknowledges the interrupt without the
-device's lock. A raise triggers the interrupt only when its bit was clear, and
-an acknowledgment only clears bits. A raise whose trigger fails leaves its bit
-clear, so the next raise tries again. A legacy device sets its line under its
-own lock, and only when the level changes. The level is recorded only when the
-set succeeds, so a failed set is tried again.
+A virtio device's interrupt is edge-triggered, except with x86's in-kernel
+irqchip, where it is level-triggered. It holds the status bits under a lock of
+its own, so a vCPU reads and acknowledges the interrupt without the device's
+lock. A raise triggers the interrupt only when its bit was clear. An
+acknowledgment clears bits, and with a level-triggered interrupt it also lowers
+the line once no bit is set, as a reset of the device does. A raise whose
+trigger fails leaves its bit clear, so the next raise tries again. A legacy
+device sets its line under its own lock, and only when the level changes. The
+level is recorded only when the set succeeds, so a failed set is tried again.
 
 An irqfd is an eventfd that KVM ties to a guest interrupt. A write to the
 eventfd makes KVM deliver that interrupt, and hvi makes no further call. How an
@@ -426,10 +428,15 @@ reaches the guest with no hvi thread, also while the guest has the input masked.
 
 **x86, in-kernel irqchip** (`--irqchip kernel`). KVM runs the IOAPIC, a PIC and
 a PIT. A line is `vm.set_irq_line(GSI, level)`, GSIs 4 to 7 and 9 to 22. A
-virtio trigger raises the pin and lowers it again, under a lock, since the
-IOAPIC takes an edge only on a 0 to 1 transition. KVM delivers an irqfd on an
-IOAPIC pin from a kernel worker thread, so a vhost-user export instead has an
-hvi thread per queue that reads its call eventfd and triggers the interrupt.
+virtio interrupt is level-triggered here, as the DSDT says: a trigger raises the
+pin, and the pin stays high until the guest has acknowledged every notification
+or reset the device. KVM's IOAPIC delivers a level-triggered pin when the guest
+unmasks it, and drops an edge that arrives while a pin is masked, as Linux masks
+one to move its interrupt off a CPU that goes offline. A plain irqfd on an
+IOAPIC pin raises the line and lowers it at once, which would lower a line a
+trigger holds, and KVM delivers it from a kernel worker thread. So a vhost-user
+export instead has an hvi thread per queue that reads its call eventfd and
+triggers the interrupt.
 
 A daemon's write to a call eventfd sets no status bit. So once a device has an
 irqfd, its interrupt status reads `VIRTIO_MMIO_INT_VRING` from DRIVER_OK until

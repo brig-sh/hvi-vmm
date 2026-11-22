@@ -105,7 +105,7 @@
             {"syscall": "writev", "comment": "safety net: glibc's fatal-error message (heap corruption, fortify) before it aborts; musl's C stdio output"},
             {"syscall": "poll", "comment": "the wait on the wake eventfd beside the stop token, and the panic hook's waits for the lock on the current run and for the vCPUs to exit"},
             {"syscall": "ppoll", "comment": "safety net: glibc may lower poll() to ppoll"},
-            {"syscall": "ioctl", "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1074310753, "comment": "KVM_IRQ_LINE"}], "comment": "raising the disk's interrupt with the in-kernel irqchip, a pulse of its IOAPIC pin"},
+            {"syscall": "ioctl", "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1074310753, "comment": "KVM_IRQ_LINE"}], "comment": "raising the disk's interrupt with the in-kernel irqchip, on its IOAPIC pin"},
             {"syscall": "ioctl", "args": [{"index": 1, "type": "dword", "op": "eq", "val": 21505, "comment": "TCGETS"}], "comment": "the terminal restore of the fatal-signal handler and of the panic hook: glibc's tcsetattr reads the settings around its write"},
             {"syscall": "ioctl", "args": [{"index": 1, "type": "dword", "op": "eq", "val": 21506, "comment": "TCSETS"}], "comment": "the terminal restore of the fatal-signal handler and of the panic hook: tcsetattr"},
             {"syscall": "ioctl", "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2150388778, "comment": "TCGETS2"}], "comment": "the terminal restore of the fatal-signal handler and of the panic hook: tcgetattr and tcsetattr of a glibc that uses the termios2 requests"},
