@@ -180,10 +180,9 @@ hvi is young. Read these before you build on it.
   the gateway and DNS addresses, ICMP echo requests, and DHCP, all inside the
   VMM. TCP is seen but not forwarded. Real egress needs `--net-gateway`, or
   `--net-tap` on Linux.
-- **The built-in stack cannot resolve DNS while confined.** It records the
-  queried name, then asks the host to resolve it. The default sandbox denies
-  the socket that needs, so the guest gets a reply with no addresses in it.
-  Only `--no-sandbox` resolves.
+- **The built-in stack resolves no DNS name.** It records the queried name and
+  replies with no addresses in it. Name resolution needs `--net-gateway`, or
+  `--net-tap` on Linux.
 - **Disks and one NIC, attached at boot.** No hotplug, and no PCI at all.
 - **virtio-fs** is served in-process on macOS. On Linux it is served by a
   vhost-user daemon the caller runs, such as `virtiofsd`. One request queue per

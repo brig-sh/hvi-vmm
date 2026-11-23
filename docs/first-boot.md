@@ -225,7 +225,7 @@ This is a check of the pre-boot pipeline. It is not a boot, and a successful
 | The kernel panics at `Unable to mount root fs` | No initramfs and no `--disk`. Expected without a root filesystem. |
 | An x86-64 guest stops early in its boot and prints no reason | The guest needs a PIT or a PIC, which the default split irqchip does not have. Boot it with `--irqchip kernel`. |
 | `hvi: enabling the split irqchip: this host's KVM lacks KVM_CAP_SPLIT_IRQCHIP; --irqchip kernel boots without it` | Linux x86-64: the host's KVM cannot run the default irqchip. Boot with `--irqchip kernel`. |
-| `--net-stub` gives the guest an address but no name resolution | Expected while confined. See [networking.md](networking.md#dns). |
+| `--net-stub` gives the guest an address but no name resolution | Expected. See [networking.md](networking.md#dns). |
 
 ## Next
 

@@ -199,18 +199,24 @@ mod stub {
         );
     }
 
-    // The lookup's result is ignored, since a name under `.example` has no
-    // address.
+    // busybox's nslookup exits 0 on a reply with no answer, so the test reads
+    // what it prints.
     #[test]
-    #[cfg_attr(
-        target_os = "linux",
-        ignore = "fails until a guest DNS query no longer ends a confined stub on Linux (#124)"
-    )]
     fn dns_question_is_recorded_and_hvi_keeps_running() {
         let vm = Vm::builder().net_stub().boot();
         dhcp(&vm);
-        vm.sh("nslookup hvi-e2e.example 10.0.2.3 >/dev/null 2>&1; true")
+        let lookup = vm
+            .sh("nslookup hvi-e2e.example 10.0.2.3 2>&1; true")
             .assert_success();
+        let printed = &lookup.stdout;
+        assert!(printed.contains("Non-authoritative answer:"), "{printed}");
+        // The messages are matched in lowercase: busybox prints "server can't
+        // find" for an error from the server, and "Can't find" for a reply it
+        // cannot parse.
+        let lowercase = printed.to_lowercase();
+        for unexpected in ["name:", "can't find", "timed out"] {
+            assert!(!lowercase.contains(unexpected), "{printed}");
+        }
         vm.sh("true").assert_success();
         let ended = vm.power_off();
         assert!(

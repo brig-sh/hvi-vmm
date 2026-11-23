@@ -17,8 +17,8 @@
 //!
 //! No `vmnet` (and so no entitlement): the backend is a tiny user-space stack.
 //! The guest self-configures a static address (see the initramfs `/init`); this
-//! device answers ARP and ICMP, resolves DNS through the host (capturing the
-//! queried names), and — the point — captures every frame the guest transmits,
+//! device answers ARP and ICMP, answers a DNS question with no records
+//! (capturing the queried name), and captures every frame the guest transmits,
 //! logging each IPv4 flow. Because we are the device, that capture is
 //! intrinsic.
 //!
@@ -43,7 +43,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::Ipv4Addr;
 use std::ops::ControlFlow;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -1096,7 +1096,11 @@ impl VirtioNet {
         Some(self.ipv4_to_guest(GW_IP, Ipv4Addr::BROADCAST, IP_UDP, &udp))
     }
 
-    /// Captures the queried name, resolves it through the host, and replies.
+    /// Returns the reply to a DNS question, or `None` when the question does
+    /// not parse.
+    ///
+    /// Captures the queried name. The reply is NOERROR with no answer record,
+    /// so a resolver fails the lookup at once.
     fn handle_dns(&mut self, client_port: u16, dns: &[u8]) -> Option<Vec<u8>> {
         if dns.len() < 12 {
             return None;
@@ -1110,39 +1114,18 @@ impl VirtioNet {
             DNS_IP,
             53,
             (dns.len() + 8) as u64,
-            Some(name.clone()),
+            Some(name),
         );
-
-        // Resolve through the host (getaddrinfo); first IPv4 answer, if any.
-        let ip = (name.as_str(), 0u16)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| {
-                it.find_map(|s| match s.ip() {
-                    std::net::IpAddr::V4(v4) => Some(v4),
-                    std::net::IpAddr::V6(_) => None,
-                })
-            });
 
         let mut resp = Vec::new();
         resp.extend_from_slice(&dns[0..2]); // id
-        let answers = u16::from(ip.is_some());
-        // response, recursion available
-        resp.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes()); // QR, RD, RA, NOERROR
         resp.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-        resp.extend_from_slice(&answers.to_be_bytes()); // ancount
+        resp.extend_from_slice(&[0, 0]); // ancount
         resp.extend_from_slice(&[0, 0, 0, 0]); // ns/ar count
 
         // the question (name+type+class)
         resp.extend_from_slice(&dns[12..qend]);
-        if let Some(v4) = ip {
-            resp.extend_from_slice(&[0xc0, 0x0c]); // name pointer to offset 12
-            resp.extend_from_slice(&1u16.to_be_bytes()); // type A
-            resp.extend_from_slice(&1u16.to_be_bytes()); // class IN
-            resp.extend_from_slice(&300u32.to_be_bytes()); // TTL
-            resp.extend_from_slice(&4u16.to_be_bytes()); // rdlength
-            resp.extend_from_slice(&v4.octets());
-        }
         let udp = udp_datagram(53, client_port, &resp);
         Some(self.ipv4_to_guest(DNS_IP, GUEST_IP, IP_UDP, &udp))
     }
@@ -2344,6 +2327,30 @@ mod tests {
 
         let chain = tx_chain(&mut net, &mem, avail, 0);
         assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
+    }
+
+    // NOERROR with no answer record tells a resolver the name has no address.
+    #[test]
+    fn dns_question_gets_a_reply_with_no_answer() {
+        // id 0xbeef, one question: `example.com`, type A, class IN.
+        let mut query = vec![0xbe, 0xef, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        let question = b"\x07example\x03com\x00\x00\x01\x00\x01";
+        query.extend_from_slice(question);
+
+        let mut net = VirtioNet::new();
+        let frame = net.handle_dns(1234, &query).expect("a reply");
+        // Ethernet (14), IPv4 (20) and UDP (8) headers precede the message.
+        let dns = &frame[42..];
+        assert_eq!(&dns[0..2], &[0xbe, 0xef], "id");
+        assert_eq!(dns[2] & 0x80, 0x80, "a response");
+        assert_eq!(dns[3] & 0x0f, 0, "NOERROR");
+        assert_eq!(&dns[4..6], &[0, 1], "one question");
+        assert_eq!(&dns[6..8], &[0, 0], "no answer record");
+        assert_eq!(&dns[12..], question);
+        assert!(matches!(
+            net.take_events().as_slice(),
+            [CapturedEvent::NetFlow { dns: Some(name), .. }] if name == "example.com"
+        ));
     }
 
     /// A question that ends before its type and class fields must be refused.

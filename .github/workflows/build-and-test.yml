@@ -701,12 +701,10 @@ jobs:
           # this asserts the address that was asked for, not merely that some
           # address arrived. An image rebuilt without the knob fails here.
           #
-          # The DNS address is the stub's own (10.0.2.3): it answers queries
-          # for that address only, so any other resolver would leave a guest
-          # that takes the right address and resolves nothing. console= mirrors
-          # what urunc emits; arm64 has a PL011 and ignores it.
-          # The guest takes one address or the other, so 10.0.2.99 on the
-          # console is also the evidence for the DHCP assertion below.
+          # The DNS address is the stub's own (10.0.2.3). console= mirrors what
+          # urunc emits; arm64 has a PL011 and ignores it. The guest takes one
+          # address or the other, so 10.0.2.99 on the console is also the
+          # evidence for the DHCP assertion below.
           tools/boot-until.sh unikraft-static.log 120 \
             "Set IPv4 address 10.0.2.99" \
             -- ./target/release/hvi boot \
