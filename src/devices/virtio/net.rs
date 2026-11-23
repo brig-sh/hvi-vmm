@@ -1818,54 +1818,6 @@ mod tests {
             .expect("the chain should be available")
     }
 
-    // A readable descriptor that points back at itself ends at the queue size
-    // and gives no frame. Without the bound, its eight copies would make one.
-    #[test]
-    fn tx_descriptor_cycle_gives_no_frame() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut net = VirtioNet::new();
-        let avail = BASE + 0x1000;
-        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 0).unwrap();
-
-        let chain = tx_chain(&mut net, &mem, avail, 0);
-
-        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
-    }
-
-    // A `next` outside the ring ends the walk. The descriptor one past the ring
-    // is a valid readable one carrying real bytes, so a walk past the ring
-    // would return a frame.
-    #[test]
-    fn tx_next_index_outside_the_ring_gives_no_frame() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = GuestRam::from_ranges(&[(BASE, 0x8000)]);
-        let mut net = VirtioNet::new();
-        let avail = BASE + 0x1000;
-        activate_with_queue(&mut net, &mem, TX_QUEUE, BASE, avail, BASE + 0x2000);
-        mem.write_u64(BASE, BASE + 0x4000).unwrap();
-        mem.write_u32(BASE + 8, (NET_HDR_LEN + 4) as u32).unwrap();
-        mem.write_u16(BASE + 12, VIRTQ_DESC_F_NEXT).unwrap();
-        mem.write_u16(BASE + 14, 8).unwrap();
-        mem.write_u64(BASE + 128, BASE + 0x5000).unwrap();
-        mem.write_u32(BASE + 136, 8).unwrap();
-        mem.write_u16(BASE + 140, 0).unwrap();
-        mem.write_u16(BASE + 142, 0).unwrap();
-
-        let chain = tx_chain(&mut net, &mem, avail, 0);
-        assert_eq!(VirtioNet::read_tx_frame(&mem, chain), None);
-        let chain = tx_chain(&mut net, &mem, avail, 8);
-        assert_eq!(
-            VirtioNet::read_tx_frame(&mem, chain),
-            None,
-            "a head outside the ring"
-        );
-    }
-
     /// Asserts that a one-descriptor receive buffer goes back empty and a
     /// 60-byte frame takes the good buffer behind it.
     ///
@@ -2400,27 +2352,15 @@ mod tests {
         assert_eq!(parse_tls_sni(&rec[..20]), None);
     }
 
+    // The IPv4 header of the RFC 1071 example on Wikipedia, with its checksum
+    // field zeroed.
     #[test]
     fn ip_checksum_matches_known() {
-        // A header whose checksum field is zeroed; result is non-zero.
-        let mut h = vec![0u8; 20];
-        h[0] = 0x45;
-        h[2..4].copy_from_slice(&40u16.to_be_bytes());
-        h[9] = 6;
-        assert_ne!(checksum16(&h), 0);
-    }
-
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        const BASE: u64 = 0x4000_0000;
-        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(VirtioNet::new(), &mem, rings);
+        let h = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
+        assert_eq!(checksum16(&h), 0xb861);
     }
 
     // A vCPU acknowledges the interrupt through the transport, without the

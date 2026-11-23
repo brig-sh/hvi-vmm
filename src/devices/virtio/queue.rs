@@ -718,6 +718,21 @@ mod tests {
         assert_eq!(chain.read_to_vec(&mem, 64), None);
     }
 
+    // Descriptor 8, one past the ring, is a valid readable one, so a walk that
+    // followed the `next` would return its bytes.
+    #[test]
+    fn read_to_vec_stops_at_a_next_outside_the_ring() {
+        let mem = ram();
+        let mut queue = ready(&mem, 8);
+        write_descriptor(&mem, DESC, 0, BASE + 0x3000, 4, VIRTQ_DESC_F_NEXT, 8);
+        write_descriptor(&mem, DESC, 8, BASE + 0x3100, 4, 0, 0);
+        make_available(&mem, 8, 0);
+
+        let chain = queue.pop(&mem).unwrap();
+
+        assert_eq!(chain.read_to_vec(&mem, 64), None);
+    }
+
     #[test]
     fn head_outside_the_ring_gets_no_used_entry() {
         let mem = ram();
