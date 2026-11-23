@@ -288,7 +288,8 @@ components itself. Treat containment as strong and tested, not as proven.
   device.
 - **The descriptor budget is per export, the descriptor table is per process.**
   Each export refuses an `OPEN` or `OPENDIR` past its budget with `ENFILE`.
-  The budget is the process file limit less a reserve of 128. `CREATE` and
+  The budget is the soft open-file limit or `kern.maxfilesperproc`,
+  whichever is lower, less a reserve of 128. `CREATE` and
   `TMPFILE` are not counted against it, and directory descriptors cached for
   readdir are not either, so several busy exports can still exhaust the table.
 - **One request queue per share on macOS**, plus a hiprio queue. A Linux
@@ -305,7 +306,7 @@ components itself. Treat containment as strong and tested, not as proven.
 Each export reports its peak handle count on a clean stop:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 1048448 guest handles
+[hvi] virtio-fs[0]: peak 1 of 92032 guest handles
 ```
 
 ### What to share
