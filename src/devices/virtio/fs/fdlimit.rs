@@ -52,6 +52,9 @@ use std::sync::OnceLock;
 /// So the guest never gets the last of them. This is the reserve.
 const RESERVED_FOR_THE_VMM: u64 = 128;
 
+/// The most this module asks the kernel for.
+const CEILING: u64 = 65_536;
+
 /// How many host descriptors a virtio-fs export may pin for guest handles.
 ///
 /// Derived from the limit actually in force rather than written down, which
@@ -203,9 +206,6 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
     }
 }
 
-/// The most this module asks the kernel for.
-const CEILING: u64 = 65_536;
-
 /// The limit to ask for.
 ///
 /// `RLIM_INFINITY` is not a number of descriptors, and asking for it on macOS
@@ -264,13 +264,44 @@ mod tests {
         // refuses the 92,161st descriptor. A budget taken from the soft limit
         // alone never fires, and a guest reading a large tree gets EMFILE from
         // the host before this device refuses or evicts anything.
-        raise_open_file_limit().expect("could not raise the open-file limit");
-        let budget = u64::try_from(guest_handle_budget()).unwrap();
+        //
+        // The test puts the process in that state itself. Started from the
+        // default soft limit, `raise_open_file_limit` asks for `CEILING`,
+        // which is below the cap on the hosts measured, and the unclamped
+        // budget fits too, so the check would pass with the bug in place.
         let cap = kernel_per_process_cap();
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into a struct we own and fully initialized.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let mut above = original;
+        above.rlim_cur = cap + 1024;
+        // SAFETY: setrlimit reads a struct we own and fully initialized.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &above) },
+            0,
+            "could not set a soft limit above kern.maxfilesperproc"
+        );
+        let reported = raise_open_file_limit();
+        let budget = u64::try_from(guest_handle_budget()).unwrap();
+        // Put the limit back before asserting, so a failure here does not
+        // leave the rest of the suite running above the cap. Raising again
+        // afterwards keeps the tests that run alongside this one from losing
+        // a raise they already made.
+        // SAFETY: as above.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) };
+        let _ = raise_open_file_limit();
+
         assert!(
             budget + RESERVED_FOR_THE_VMM <= cap,
             "budget {budget} plus the reserve exceeds kern.maxfilesperproc {cap}"
         );
+        assert_eq!(reported, Ok(cap), "the startup log would not show the cap");
     }
 
     #[test]
