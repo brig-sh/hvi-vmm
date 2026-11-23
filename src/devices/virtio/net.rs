@@ -132,15 +132,8 @@ pub(crate) enum NetOutcome {
     Tap(String),
     /// A gvisor-tap-vsock gateway, by the path of its socket.
     Gateway(String),
-    /// The built-in stub stack, as asked for.
+    /// The built-in stub stack.
     Stub,
-    /// The built-in stub stack, because the gateway could not be reached.
-    StubAfterGateway {
-        /// The path of the gateway's socket.
-        socket: String,
-        /// Why the connection failed.
-        error: io::Error,
-    },
 }
 
 impl std::fmt::Display for NetOutcome {
@@ -150,11 +143,6 @@ impl std::fmt::Display for NetOutcome {
             Self::Tap(ifname) => write!(f, "virtio-net: tap {ifname}"),
             Self::Gateway(socket) => write!(f, "virtio-net: gvisor-tap gateway relay via {socket}"),
             Self::Stub => write!(f, "virtio-net: {}", stub_stack_line()),
-            Self::StubAfterGateway { socket, error } => write!(
-                f,
-                "WARNING: gateway {socket} unreachable ({error}); falling back to the {}",
-                stub_stack_line()
-            ),
         }
     }
 }
@@ -222,8 +210,8 @@ struct Connected {
 ///
 /// # Errors
 ///
-/// Errors when the tap does not open or a connection does not clone, as
-/// [`connect`] describes.
+/// Errors when the tap does not open, the gateway cannot be reached or a
+/// connection does not clone, as [`connect`] describes.
 pub(crate) fn open(cfg: &BootConfig) -> Result<Option<Network>, String> {
     let Some(Connected {
         mut device,
@@ -245,15 +233,14 @@ pub(crate) fn open(cfg: &BootConfig) -> Result<Option<Network>, String> {
 
 /// Sets up the network `cfg` asks for, or returns `None` when it asks for none.
 ///
-/// A tap takes precedence over a gateway, and a gateway over the stub stack. An
-/// unreachable gateway falls back to the stub stack, which `docs/networking.md`
-/// describes.
+/// A tap takes precedence over a gateway, and a gateway over the stub stack.
 ///
 /// # Errors
 ///
-/// Errors when the tap does not open, since the stub stack would put the guest
-/// on the wrong network and nothing outside the guest could tell, and when the
-/// tap fd or the gateway connection does not clone for the relay.
+/// Errors when the tap does not open or the gateway cannot be reached: on the
+/// stub stack the guest would be on the wrong network and nothing outside the
+/// guest could tell. Errors when the tap fd or the gateway connection does not
+/// clone for the relay.
 fn connect(cfg: &BootConfig) -> Result<Option<Connected>, String> {
     // The caller created the tap, so this only attaches to it, which brings
     // carrier up.
@@ -270,25 +257,15 @@ fn connect(cfg: &BootConfig) -> Result<Option<Connected>, String> {
         }));
     }
     let connected = if let Some(socket) = &cfg.net_gateway {
-        match UnixStream::connect(socket) {
-            Ok(stream) => {
-                let reader = stream
-                    .try_clone()
-                    .map_err(|e| format!("--net-gateway {socket}: cloning the socket: {e}"))?;
-                Connected {
-                    device: VirtioNet::with_gateway(stream),
-                    source: Some(NetSource::Gateway(reader)),
-                    outcome: NetOutcome::Gateway(socket.clone()),
-                }
-            }
-            Err(error) => Connected {
-                device: VirtioNet::new(),
-                source: None,
-                outcome: NetOutcome::StubAfterGateway {
-                    socket: socket.clone(),
-                    error,
-                },
-            },
+        let stream = UnixStream::connect(socket)
+            .map_err(|e| format!("--net-gateway {socket}: connecting to the gateway: {e}"))?;
+        let reader = stream
+            .try_clone()
+            .map_err(|e| format!("--net-gateway {socket}: cloning the socket: {e}"))?;
+        Connected {
+            device: VirtioNet::with_gateway(stream),
+            source: Some(NetSource::Gateway(reader)),
+            outcome: NetOutcome::Gateway(socket.clone()),
         }
     } else if cfg.net {
         Connected {
@@ -2532,30 +2509,38 @@ mod tests {
         assert!(connect(&BootConfig::with_no_devices(1)).unwrap().is_none());
     }
 
-    // docs/networking.md tells operators to match "falling back to".
+    // `--net-stub` beside the gateway does not change the error.
     #[test]
-    fn unreachable_gateway_falls_back_to_the_stub() {
+    fn unreachable_gateway_is_an_error_that_names_the_socket() {
         let socket = socket_path("unreachable");
+        for net in [false, true] {
+            let cfg = BootConfig {
+                net_gateway: Some(socket.clone()),
+                net,
+                ..BootConfig::with_no_devices(1)
+            };
+            let Err(error) = connect(&cfg) else {
+                panic!("an unreachable gateway should be an error");
+            };
+            assert!(
+                error.starts_with(&format!(
+                    "--net-gateway {socket}: connecting to the gateway: "
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_sets_the_override_mac() {
+        let mac = [0x52, 0x54, 0x00, 0xe2, 0xe0, 0x01];
         let cfg = BootConfig {
-            net_gateway: Some(socket.clone()),
+            net: true,
+            net_mac: Some(mac),
             ..BootConfig::with_no_devices(1)
         };
-        let connected = connect(&cfg).unwrap().expect("a network");
-        assert!(connected.source.is_none());
-        let text = connected.outcome.to_string();
-        let NetOutcome::StubAfterGateway {
-            socket: named,
-            error,
-        } = connected.outcome
-        else {
-            panic!("{text}");
-        };
-        assert_eq!(named, socket);
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert!(
-            text.contains("falling back to the built-in stub stack"),
-            "{text}"
-        );
+        let network = open(&cfg).unwrap().expect("a network");
+        assert_eq!(network.device.lock().unwrap().mac, mac);
     }
 
     #[test]
@@ -2571,19 +2556,5 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
         assert!(matches!(connected.source, Some(NetSource::Gateway(_))));
         assert!(matches!(connected.outcome, NetOutcome::Gateway(named) if named == socket));
-    }
-
-    // The fallback device answers to the MAC the caller gave too.
-    #[test]
-    fn mac_applies_to_the_stub_after_a_fallback() {
-        let mac = [0x52, 0x54, 0x00, 0xe2, 0xe0, 0x01];
-        let cfg = BootConfig {
-            net_gateway: Some(socket_path("mac")),
-            net_mac: Some(mac),
-            ..BootConfig::with_no_devices(1)
-        };
-        let network = open(&cfg).unwrap().expect("a network");
-        let device = network.device;
-        assert_eq!(device.lock().unwrap().mac, mac);
     }
 }

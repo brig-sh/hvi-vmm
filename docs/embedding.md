@@ -366,7 +366,7 @@ handshake.
 | Thing | Who creates it | What hvi does |
 | --- | --- | --- |
 | Agent socket | hvi creates the host listener | Relays bytes to guest CID 3 port 1024. |
-| Gateway socket | an external gvisor-tap process | Connects as a client. Warns and falls back to the built-in stub stack if it cannot. |
+| Gateway socket | an external gvisor-tap process | Connects as a client. Fails the boot if it cannot. |
 | Tap device | whoever owns the network namespace | Opens it. Never creates, configures or brings one up. Fails the boot if it cannot open it. |
 
 ## Platform gating
