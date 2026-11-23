@@ -167,8 +167,9 @@ impl Export {
         host.on_io_stop(move || stop.stop());
     }
 
-    /// Prints the peak handle count, the operation counts and times, and the
-    /// readahead counts of the device, as export `index`.
+    /// Prints the peak handle count, the operation counts and times, the
+    /// parked-descriptor and readahead counts of the device, as export
+    /// `index`.
     ///
     /// A worker left running at the stop deadline can still hold the device,
     /// stuck in a host call, so the lock is only tried. When the device is
@@ -208,11 +209,25 @@ impl Export {
             })
             .collect();
         stderrln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
+        let (hits, misses, parked) = dev.descriptor_cache_stats();
+        stderrln!("{}", parked_line(index, hits, misses, parked));
         let (hits, waits, misses) = dev.readahead_stats();
         stderrln!(
             "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
         );
     }
+}
+
+/// The stop report's line on parked descriptors: opens served from one, opens
+/// that reached the host, and how many were parked at the stop.
+///
+/// The parked cache is sized as a share of the descriptor budget, not from
+/// what a workload reopens. The one measurement behind it is a kernel build
+/// that kept 8,231 descriptors parked and served 697,487 of 726,175 opens
+/// from them. This line is how a real workload says whether the bound
+/// costs it hits.
+fn parked_line(index: usize, hits: u64, misses: u64, parked: usize) -> String {
+    format!("{LOG_PREFIX} virtio-fs[{index}] parked: hits={hits} misses={misses} held={parked}")
 }
 
 /// How often the worker retries the SETLKW requests parked on the device
@@ -291,6 +306,14 @@ mod tests {
 
     use super::*;
     use crate::config::CachePolicy;
+
+    #[test]
+    fn the_stop_report_names_parked_hits_and_misses() {
+        assert_eq!(
+            parked_line(1, 697_487, 28_688, 8_231),
+            format!("{LOG_PREFIX} virtio-fs[1] parked: hits=697487 misses=28688 held=8231")
+        );
+    }
 
     // A worker stuck in a host call holds the device past the stop deadline.
     // The report must not wait for it, or `boot` never returns the error that
