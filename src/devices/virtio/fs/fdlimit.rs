@@ -38,6 +38,8 @@
 //! So: ask for as much as the kernel will give, once, at startup. virtiofsd
 //! does the same thing and exposes it as `--rlimit-nofile`.
 
+use std::sync::OnceLock;
+
 /// Descriptors held back for everything in the VMM that is not virtio-fs.
 ///
 /// The descriptor table belongs to the process, not to one device: the block
@@ -55,8 +57,17 @@ const RESERVED_FOR_THE_VMM: u64 = 128;
 /// Derived from the limit actually in force rather than written down, which
 /// is the point: a fixed number is either so low that it breaks a real build
 /// -- the measured working set of one is ~2134 descriptors, see above -- or
-/// so high that it is not a limit. This one is whatever the process was
-/// granted, less the reserve, so raising `RLIMIT_NOFILE` raises it too.
+/// so high that it is not a limit. This one is what the process can really
+/// open, less the reserve, so raising `RLIMIT_NOFILE` raises it too.
+///
+/// "Really open" is the soft limit or the kernel's per-process cap, whichever
+/// is lower. A soft limit inherited from a shell can sit far above that cap:
+/// `ulimit -n 1048576` is accepted, and macOS still refuses the 92,161st
+/// descriptor. A budget taken from the soft limit alone was then a million,
+/// the parked-descriptor cache a quarter of that, and neither ever fired. A
+/// guest that read a 100,000-file tree left hvi holding 91,000 descriptors
+/// until the kernel answered EMFILE, and no limit or eviction in this device
+/// had run.
 ///
 /// The guest sees ENFILE on the request that would have crossed it, which is
 /// the errno for "the host is out", and the VMM keeps working.
@@ -69,9 +80,54 @@ const RESERVED_FOR_THE_VMM: u64 = 128;
 #[must_use]
 pub fn guest_handle_budget() -> usize {
     let soft = current_open_file_limit().unwrap_or(256);
-    usize::try_from(soft.saturating_sub(RESERVED_FOR_THE_VMM))
+    let usable = usable_limit(soft, per_process_cap());
+    usize::try_from(usable.saturating_sub(RESERVED_FOR_THE_VMM))
         .unwrap_or(usize::MAX)
         .max(64)
+}
+
+/// The most descriptors one process can hold, given its soft limit and the
+/// kernel's per-process cap.
+///
+/// When the cap cannot be read, the soft limit is trusted only up to
+/// [`CEILING`], the most this module ever asks for, rather than in full: the
+/// soft limit alone is the number that was wrong.
+fn usable_limit(soft: u64, cap: Option<u64>) -> u64 {
+    match cap {
+        Some(cap) => soft.min(cap),
+        None => soft.min(CEILING),
+    }
+}
+
+/// `kern.maxfilesperproc`, read once.
+///
+/// First read by `raise_open_file_limit`, before the Seatbelt sandbox is
+/// entered: the deny-default profile does not list `sysctl-read`. Exports are
+/// built before the sandbox too, but caching it means a later caller does not
+/// depend on that order.
+fn per_process_cap() -> Option<u64> {
+    static CAP: OnceLock<Option<u64>> = OnceLock::new();
+    *CAP.get_or_init(read_per_process_cap)
+}
+
+fn read_per_process_cap() -> Option<u64> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and the output is a c_int we own,
+    // with its size passed alongside.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&raw mut value).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    u64::try_from(value).ok().filter(|&cap| cap > 0)
 }
 
 /// The soft `RLIMIT_NOFILE` in force right now.
@@ -90,11 +146,14 @@ fn current_open_file_limit() -> Option<u64> {
 /// Raises the soft open-file limit to the hard limit, and reports what was
 /// obtained.
 ///
-/// Returns the soft limit now in force, whether or not it was raised, so the
-/// caller can log it. A failure to raise is not fatal: hvi still works, it
-/// simply cannot serve as many open files at once, and saying so is more useful
-/// than refusing to start.
+/// Returns how many descriptors the process can now hold, whether or not the
+/// limit was raised, so the caller can log it. That is the soft limit or the
+/// kernel's per-process cap, whichever is lower; see [`guest_handle_budget`].
+/// A failure to raise is not fatal: hvi still works, it simply cannot serve as
+/// many open files at once, and saying so is more useful than refusing to
+/// start.
 pub fn raise_open_file_limit() -> Result<u64, String> {
+    let cap = per_process_cap();
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -109,14 +168,14 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
     let current: u64 = lim.rlim_cur;
     let wanted = desired_limit(lim.rlim_max);
     if current >= wanted {
-        return Ok(current);
+        return Ok(usable_limit(current, cap));
     }
 
     let mut next = lim;
     next.rlim_cur = wanted;
     // SAFETY: setrlimit reads a struct we own and fully initialized.
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
-        return Ok(wanted);
+        return Ok(usable_limit(wanted, cap));
     }
     // Raising to the hard limit can still be refused. Try the largest value
     // that is accepted rather than giving up on the first refusal: a partial
@@ -135,7 +194,7 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
         candidate /= 2;
     }
     if best > current {
-        Ok(best)
+        Ok(usable_limit(best, cap))
     } else {
         Err(format!(
             "could not raise the open-file limit above {current}: {}",
@@ -144,6 +203,9 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
     }
 }
 
+/// The most this module asks the kernel for.
+const CEILING: u64 = 65_536;
+
 /// The limit to ask for.
 ///
 /// `RLIM_INFINITY` is not a number of descriptors, and asking for it on macOS
@@ -151,7 +213,6 @@ pub fn raise_open_file_limit() -> Result<u64, String> {
 /// of what the hard limit claims. Clamp to something large but real, and let
 /// the halving loop above find the ceiling if even that is refused.
 fn desired_limit(hard: u64) -> u64 {
-    const CEILING: u64 = 65_536;
     if hard == u64::MAX || hard == libc::RLIM_INFINITY {
         return CEILING;
     }
@@ -176,6 +237,54 @@ mod tests {
         assert_eq!(desired_limit(200_000), 65_536);
     }
 
+    /// `kern.maxfilesperproc`, read directly so the test does not trust the
+    /// code it checks.
+    fn kernel_per_process_cap() -> u64 {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the name is NUL-terminated and the output is a c_int we own,
+        // with its size passed alongside.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&raw mut value).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "could not read kern.maxfilesperproc");
+        u64::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn the_budget_fits_under_what_the_kernel_gives_one_process() {
+        // A soft limit inherited from a shell can be far above the kernel's
+        // per-process cap: `ulimit -n 1048576` is accepted, and macOS still
+        // refuses the 92,161st descriptor. A budget taken from the soft limit
+        // alone never fires, and a guest reading a large tree gets EMFILE from
+        // the host before this device refuses or evicts anything.
+        raise_open_file_limit().expect("could not raise the open-file limit");
+        let budget = u64::try_from(guest_handle_budget()).unwrap();
+        let cap = kernel_per_process_cap();
+        assert!(
+            budget + RESERVED_FOR_THE_VMM <= cap,
+            "budget {budget} plus the reserve exceeds kern.maxfilesperproc {cap}"
+        );
+    }
+
+    #[test]
+    fn the_usable_limit_is_the_lower_of_soft_and_cap() {
+        assert_eq!(usable_limit(1_048_576, Some(92_160)), 92_160);
+        assert_eq!(usable_limit(256, Some(92_160)), 256);
+    }
+
+    #[test]
+    fn an_unreadable_cap_trusts_the_soft_limit_only_up_to_the_ceiling() {
+        assert_eq!(usable_limit(1_048_576, None), CEILING);
+        assert_eq!(usable_limit(1024, None), 1024);
+    }
+
     #[test]
     fn raising_gives_at_least_what_we_started_with() {
         // The point of the exercise: after this call the process can hold more
@@ -189,6 +298,9 @@ mod tests {
             assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
             lim.rlim_cur
         };
+        // What is reported is the usable limit, which a soft limit above the
+        // kernel's cap was never worth more than.
+        let before = usable_limit(before, per_process_cap());
         match raise_open_file_limit() {
             Ok(now) => assert!(now >= before, "the limit went down: {before} -> {now}"),
             Err(e) => panic!("could not raise the open-file limit: {e}"),
