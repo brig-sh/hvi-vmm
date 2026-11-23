@@ -72,21 +72,12 @@ hvi is the client here. The gateway must already be listening.
 hvi boot --kernel <Image> --net-gateway /run/hvi/gateway.qemu
 ```
 
-If the socket cannot be reached, hvi does not fail. It warns and falls back to
-the built-in stub stack, so a guest can come up with no egress and no error.
-
-All three backends word it the same:
+If the socket cannot be reached, hvi fails the boot with an error that names the
+socket:
 
 ```text
-[hvi] WARNING: gateway /run/hvi/gateway.qemu unreachable (No such file or
-directory (os error 2)); falling back to the built-in stub stack (guest
-10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
+hvi: --net-gateway /run/hvi/gateway.qemu: connecting to the gateway: No such file or directory (os error 2)
 ```
-
-To detect this in a log pipeline, match `falling back to`. Do not match
-`built-in stub stack`: a deliberate `--net-stub` boot announces itself with
-the same words, so that substring fires on every stub guest rather than only
-on a failed gateway.
 
 A socket path is also subject to the platform's `sockaddr_un` length limit,
 and an over-long path fails the same way.
@@ -115,8 +106,7 @@ hvi. The host kernel still needs its own fix for any other VMM on the same
 host that forwards the guest's header.
 
 An interface name must be 1 to 15 bytes. A tap that cannot be opened fails the
-boot and names the interface, which is the opposite of the gateway's silent
-fallback.
+boot and names the interface.
 
 On macOS the flag is refused after the backend starts:
 

@@ -198,8 +198,8 @@ mod tests {
     fn tap_names_are_length_checked() {
         // The name lands in a fixed `IFNAMSIZ`-byte ifreq field, NUL included:
         // empty names and names past IFNAMSIZ-1 must be refused before any
-        // ioctl, and a bad name is a boot error (not a fallback), so
-        // the message is what an operator sees.
+        // ioctl, and a bad name is a boot error, so the message is what an
+        // operator sees.
         assert!(validate_name("").is_err(), "empty");
         assert!(
             validate_name("0123456789abcdef").is_err(),

@@ -145,8 +145,8 @@ Unknown flags are the one class caught before anything prints.
 wins and the rest are ignored with no message. See
 [networking.md](networking.md).
 
-An unreachable `--net-gateway` warns and falls back to the built-in stub stack.
-An unopenable `--net-tap` fails the boot.
+An unreachable `--net-gateway` fails the boot, and so does an unopenable
+`--net-tap`.
 
 ### Parse-time validation
 

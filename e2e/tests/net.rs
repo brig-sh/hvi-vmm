@@ -25,13 +25,6 @@ use hvi_e2e::{pattern, scratch_dir, sha256, Gateway, Suite, Vm};
 /// A locally administered MAC address for the tests that set one.
 const MAC: &str = "52:54:00:e2:e0:01";
 
-/// What hvi prints when it falls back from a gateway to the stub.
-///
-/// When hvi cannot reach a gateway it warns and keeps booting, so a gateway
-/// test checks for this line. The full phrase is needed, since an arm64 host
-/// that falls back to vGICv2 also prints "falling back to".
-const FALLBACK: &str = "falling back to the built-in stub stack";
-
 /// Returns the address and default route DHCP gives `eth0`, as `ip` prints
 /// them.
 ///
@@ -259,8 +252,7 @@ mod gateway {
         let gateway = Gateway::start();
         let vm = Vm::builder().net_gateway(&gateway).boot();
         let lease = dhcp(&vm);
-        let ended = vm.power_off();
-        assert!(!ended.stderr.contains(FALLBACK), "{}", ended.context());
+        vm.power_off();
         assert!(
             lease.contains(&format!("inet {}", Gateway::SUBNET_PREFIX)),
             "{lease}"
@@ -277,8 +269,7 @@ mod gateway {
         let vm = Vm::builder().net_gateway(&gateway).boot();
         dhcp(&vm);
         transfers_both_ways(&vm, Gateway::HOST, Ipv4Addr::LOCALHOST);
-        let ended = vm.power_off();
-        assert!(!ended.stderr.contains(FALLBACK), "{}", ended.context());
+        vm.power_off();
     }
 
     #[test]
@@ -290,8 +281,7 @@ mod gateway {
             "nslookup gateway.containers.internal {}",
             Gateway::ADDRESS
         ));
-        let ended = vm.power_off();
-        assert!(!ended.stderr.contains(FALLBACK), "{}", ended.context());
+        vm.power_off();
         let answer = answer.assert_success();
         // nslookup prints the server it asked, the gateway, before the answer,
         // so only an address under the answer's `Name:` line counts.
@@ -315,28 +305,31 @@ mod gateway {
         let gateway = Gateway::start();
         let vm = Vm::builder().net_gateway(&gateway).net_mac(MAC).boot();
         let mac = guest_mac(&vm);
-        let ended = vm.power_off();
-        assert!(!ended.stderr.contains(FALLBACK), "{}", ended.context());
+        vm.power_off();
         assert_eq!(mac, MAC);
     }
 
     #[test]
-    fn missing_socket_falls_back_to_the_stub_with_a_warning() {
+    fn missing_socket_is_refused_and_named() {
         let missing = scratch_dir().join("missing.sock");
-        let vm = Vm::builder().arg("--net-gateway").arg(&missing).boot();
-        let lease = dhcp(&vm);
-        let ended = vm.power_off();
-        assert!(ended.stderr.contains(FALLBACK), "{}", ended.context());
-        assert!(lease.contains("inet 10.0.2.15/24"), "{lease}");
+        Vm::builder()
+            .arg("--net-gateway")
+            .arg(&missing)
+            .spawn()
+            .wait(Duration::from_secs(10))
+            .assert_refused("missing.sock: connecting to the gateway");
     }
 
     // A path past the platform's `sockaddr_un` limit cannot be connected to.
     #[test]
-    fn socket_path_too_long_falls_back_to_the_stub() {
+    fn socket_path_too_long_is_refused() {
         let long = scratch_dir().join(format!("{}.sock", "x".repeat(120)));
-        let vm = Vm::builder().arg("--net-gateway").arg(&long).boot();
-        let ended = vm.power_off();
-        assert!(ended.stderr.contains(FALLBACK), "{}", ended.context());
+        Vm::builder()
+            .arg("--net-gateway")
+            .arg(&long)
+            .spawn()
+            .wait(Duration::from_secs(10))
+            .assert_refused("connecting to the gateway");
     }
 
     #[test]
@@ -363,8 +356,7 @@ mod gateway {
         ))
         .assert_success();
         vm.sh("true").assert_success();
-        let ended = vm.power_off();
-        assert!(!ended.stderr.contains(FALLBACK), "{}", ended.context());
+        vm.power_off();
     }
 
     // A ping goes out whether or not it is answered, so 4000 large ones fill
@@ -387,8 +379,7 @@ mod gateway {
         .assert_success();
         vm.sh("true").assert_success();
         gateway.signal(libc::SIGCONT);
-        let ended = vm.power_off();
-        assert!(!ended.stderr.contains(FALLBACK), "{}", ended.context());
+        vm.power_off();
     }
 }
 
