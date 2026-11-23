@@ -42,14 +42,12 @@ connection gets nothing back.
 
 ### DNS
 
-The stack parses the question, records the name, and asks the host to resolve
-it. It refuses a question that uses a compression pointer, and one whose name
-runs past the end of the message without room for the type and class.
+The stack parses the question and records the name. It refuses a question that
+uses a compression pointer, and one whose name runs past the end of the message
+without room for the type and class.
 
-**Name resolution does not work while confined.** Resolving needs a socket,
-and neither the macOS Seatbelt profile nor the Linux seccomp allowlists grant
-one. The query is still parsed and recorded, so the reply reaches the guest
-with no addresses in it:
+**The stack resolves no name.** The reply carries the question and no answer
+record, so the guest's resolver gets no address and does not wait:
 
 ```text
 $ nslookup example.com 10.0.2.3
@@ -59,17 +57,8 @@ Address:	10.0.2.3:53
 Non-authoritative answer:
 ```
 
-With `--no-sandbox` the same command answers:
-
-```text
-Non-authoritative answer:
-Name:	example.com
-Address: 104.20.23.154
-```
-
-Do not run a workload under `--no-sandbox` to obtain name resolution. Use
-`--net-gateway` or `--net-tap`, which resolve through something outside the
-VMM and keep confinement on.
+For name resolution use `--net-gateway` or `--net-tap`, which resolve through
+something outside the VMM.
 
 ## An external gateway: `--net-gateway <socket>`
 
@@ -200,5 +189,5 @@ hostile guest chose to put on the wire.
 ## See also
 
 - [observability.md](observability.md) for the ledger and the I/O trace.
-- [security.md](security.md) for why the confinement denies the resolver.
+- [security.md](security.md) for the confinement.
 - [cli.md](cli.md) for the flags.
