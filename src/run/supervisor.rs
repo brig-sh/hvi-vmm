@@ -830,6 +830,7 @@ mod tests {
                             bytes: 64,
                             dns: None,
                             sni: None,
+                            src_leased: Some(true),
                         }]);
                         std::thread::sleep(Duration::from_millis(1));
                     }
