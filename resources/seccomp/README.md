@@ -1,8 +1,9 @@
 # hvi seccomp-bpf allowlists
 
-One file per architecture, compiled into the binary by `src/sandbox/seccomp.rs`
-and installed per thread. The reasoning behind the design lives in that module's
-docs; this file covers what you need to change one of these safely.
+One file per architecture, compiled into the binary by
+`src/sandbox/seccomp/mod.rs` and installed per thread. The reasoning behind the
+design lives in that module's docs; this file covers what you need to change one
+of these safely.
 
 The prose that would normally sit at the top of the JSON is here instead:
 seccompiler parses **every** top-level key as a filter, so a `__comment` key is
