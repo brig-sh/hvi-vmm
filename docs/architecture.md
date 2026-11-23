@@ -292,7 +292,7 @@ decompressor, so it boots without KASLR.
 flowchart TB
     A["linux-loader BzImage::load: 0xAA55, 'HdrS', protocol ≥ 2.00, LOADED_HIGH<br/>kernel@code32_start (1 MiB), entry +0x200<br/>or Elf::load(vmlinux): PT_LOADs @p_paddr, entry e_entry"] --> B
     B["boot_params @0x7000 via LinuxBootConfigurator<br/>setup hdr from the image or synthesized; type_of_loader=0xff, cmd_line_ptr=0x20000<br/>e820 from the RAM regions + ramdisk image/size"] --> C
-    C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs<br/>acpi::build @0xe0000<br/>RSDP, DSDT (_S5), FACS,<br/>FADT (PM1 @0x600), MADT, XSDT"] --> D
+    C["mptable::build @0x9fc00<br/>_MP_ + PCMP: N CPUs, ISA bus,<br/>IOAPIC@0xfec00000, 16 ISA IRQs<br/>acpi::build @0xe0000<br/>RSDP, DSDT (_S5, COM1, virtio), FACS,<br/>FADT (PM1 @0x600), MADT, XSDT"] --> D
     D["long mode<br/>PML4@0x9000, PDPT 4 GiB identity map, 1 GiB pages<br/>GDT@0xc000<br/>CR0=0x80050033 CR4=PAE EFER=LME|LMA"] --> E
     E["KVM: set_tss_address(0xfffbd000)<br/>set_identity_map_address(0xfffbc000)<br/>split irqchip, or irqchip + PIT2<br/>CPUID +hypervisor +TSC-deadline"] --> F
     F["BSP: rip=entry, rsi=0x7000, rsp=0x6ff0<br/>APs wait for the guest's INIT-SIPI-SIPI"]
@@ -343,8 +343,9 @@ INIT-SIPI-SIPI serviced by the in-kernel LAPIC.
 hvi appends `console=ttyS0` to the command line, spliced in before the first
 standalone `--`, so arguments meant for `init` are not read by the kernel. The
 devices are not on the command line. Each virtio-mmio device is an `LNRO0005`
-entry in the ACPI DSDT with its range and its GSI, as on Firecracker. A guest
-that does not read ACPI finds no device.
+entry in the ACPI DSDT with its range and its GSI, as on Firecracker. COM1 is
+a `PNP0501` entry with its ports and its GSI. A guest that does not read ACPI
+finds no virtio device, and finds COM1 at its legacy address.
 
 ## 4. Device model
 

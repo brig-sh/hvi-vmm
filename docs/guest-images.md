@@ -82,6 +82,8 @@ CONFIG_RTC_DRV_CMOS=y               # not optional, see below
 CONFIG_X86_MPPARSE=y                # the CPUs from the MP table, without ACPI
 CONFIG_KVM_GUEST=y                  # kvm-clock, which the split irqchip needs
 CONFIG_ACPI=y                       # power off, see below
+CONFIG_SERIAL_8250_PNP=y            # COM1 from the DSDT, see below
+# CONFIG_SERIAL_8250_DETECT_IRQ is not set   # 250 ms at boot, see below
 ```
 
 hvi implements the CMOS real-time clock on x86-64 because a guest that reads
@@ -127,6 +129,14 @@ A guest that needs a PIT or a PIC stops early in its boot with the split irqchip
 and prints no reason. It runs with the in-kernel irqchip, `--irqchip kernel`,
 where KVM provides both. hvi's boot line names the irqchip in use (see
 [cli.md](cli.md#startup-output)).
+
+The DSDT also describes COM1, as a `PNP0501` device with its ports and its
+line. The 8250 driver takes the port from there through
+`CONFIG_SERIAL_8250_PNP`, which `x86_64_defconfig` builds in. Without it, or
+with `acpi=off` or `pnpacpi=off`, the driver probes the legacy address. A
+kernel built with `CONFIG_SERIAL_8250_DETECT_IRQ`, as `x86_64_defconfig` is,
+then autodetects the line, which sleeps about 250 ms at boot. Leaving that
+option unset covers those guests too.
 
 There is no PCI at all. A kernel that expects to find its devices on a PCI bus
 finds nothing.
@@ -185,7 +195,7 @@ console.
 hvi appends `console=ttyS0`, and only on x86-64. The devices are described to
 the guest out of band: by the devicetree on arm64, and by the ACPI DSDT on
 x86-64, where each virtio-mmio device is an `LNRO0005` entry the kernel's
-`virtio_mmio` driver binds to.
+`virtio_mmio` driver binds to, and COM1 is a `PNP0501` entry.
 
 Because hvi appends `console=ttyS0` itself, an x86-64 guest gets console
 output even with the default. The default's `console=ttyAMA0` is simply inert

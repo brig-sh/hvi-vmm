@@ -20,17 +20,27 @@
 //!
 //! The FADT describes a PC's fixed hardware: the [`PmRegisters`] at
 //! [`ACPI_PM_PORT`], and a system control interrupt hvi never raises. The DSDT
-//! holds only `\_S5`, the sleep type the guest writes to power off. The MADT
-//! lists the CPUs and the IOAPIC as the MP table does, since a guest that finds
-//! ACPI tables without a MADT discards the MP table.
+//! holds `\_S5`, the sleep type the guest writes to power off, and the devices:
+//! COM1 and the virtio-mmio transports. The MADT lists the CPUs and the IOAPIC
+//! as the MP table does, since a guest that finds ACPI tables without a MADT
+//! discards the MP table.
 //!
-//! The FADT is not hardware-reduced. A hardware-reduced guest drops the legacy
-//! PIC and numbers its interrupts dynamically, so the ISA lines the console and
-//! the virtio-mmio devices use would no longer reach their drivers.
+//! COM1 is in the DSDT for the time it saves at boot. Linux's 8250 driver
+//! takes a port it finds in ACPI with the line the table gives. A port it
+//! finds only at the legacy ISA address carries the flag that asks for its
+//! line to be autodetected, on a kernel built with
+//! `CONFIG_SERIAL_8250_DETECT_IRQ`. The autodetection calls `probe_irq_on`
+//! twice, and each call sleeps 120 ms to let stray interrupts arrive.
+//!
+//! The FADT is not hardware-reduced. A hardware-reduced guest powers off
+//! through the FADT's sleep control and status registers, which hvi does not
+//! provide. It writes the sleep type to PM1 instead.
 //!
 //! [`PmRegisters`]: crate::devices::legacy::acpi_pm::PmRegisters
 
-use acpi_tables::aml::{Device, Interrupt, Memory32Fixed, Name, Package, ResourceTemplate, Scope};
+use acpi_tables::aml::{
+    Device, EISAName, Interrupt, Memory32Fixed, Name, Package, ResourceTemplate, Scope, IO,
+};
 use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags, FADT};
 use acpi_tables::gas::{AccessSize, AddressSpace, GAS};
@@ -42,12 +52,15 @@ use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
 use acpi_tables::Aml;
 
-use crate::arch::x86_64::layout::{ACPI_ADDR, ACPI_PM_PORT, IOAPIC_ADDR, LAPIC_ADDR, SCI_GSI};
+use crate::arch::x86_64::layout::{
+    ACPI_ADDR, ACPI_PM_PORT, COM1_GSI, COM1_PORT, IOAPIC_ADDR, LAPIC_ADDR, SCI_GSI,
+};
 use crate::arch::x86_64::MAX_VCPUS;
 use crate::devices::legacy::acpi_pm::{
     PM1_CONTROL, PM1_CONTROL_LEN, PM1_EVENT_LEN, PM1_STATUS, RESET_REGISTER, RESET_VALUE,
     SLP_TYP_S5,
 };
+use crate::devices::legacy::uart16550::UART_REGISTERS_LEN;
 use crate::devices::manager::DeviceRecord;
 
 /// The OEM id every table carries.
@@ -68,6 +81,10 @@ const IAPC_MSI_NOT_SUPPORTED: u16 = 1 << 3;
 /// The `_HID` of a virtio-mmio transport, which the guest's `virtio_mmio`
 /// driver binds to.
 const VIRTIO_MMIO_HID: &str = "LNRO0005";
+
+/// The `_HID` of a 16550-compatible serial port, which the guest's 8250
+/// driver binds to.
+const COM1_HID: &str = "PNP0501";
 
 /// One virtio-mmio device the DSDT describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +114,9 @@ pub(crate) fn virtio_devices(records: &[DeviceRecord]) -> Vec<MmioDevice> {
 ///
 /// The guest finds the devices in the DSDT, as it does on Firecracker, so the
 /// kernel command line carries no `virtio_mmio.device=`. A guest that does not
-/// read ACPI finds no device, and the DSDT is the only description there is of
-/// a device on an IOAPIC line past 15, which Linux maps through ACPI.
+/// read ACPI finds no virtio device, and the DSDT is the only description there
+/// is of a device on an IOAPIC line past 15, which Linux maps through ACPI.
+/// Such a guest still finds COM1 at its legacy address.
 ///
 /// # Panics
 ///
@@ -114,17 +132,23 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     let mut tables = Tables::new();
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, OEM_TABLE_ID, OEM_REVISION);
     Name::new("_S5_".into(), &Package::new(vec![&SLP_TYP_S5])).to_aml_bytes(&mut dsdt);
-    // The ISA lines are edge-triggered and active-high, and a device on a line
-    // past them is wired the same way, so one description fits every device.
+    let com1_len = u8::try_from(UART_REGISTERS_LEN).expect("eight UART registers");
+    let com1_io = IO::new(COM1_PORT, COM1_PORT, 1, com1_len);
+    let com1_line = line(COM1_GSI);
+    let com1_crs = ResourceTemplate::new(vec![&com1_io, &com1_line]);
+    let com1_hid = EISAName::new(COM1_HID);
+    let [hid, uid, crs] = [
+        Name::new("_HID".into(), &com1_hid),
+        Name::new("_UID".into(), &0usize),
+        Name::new("_CRS".into(), &com1_crs),
+    ];
+    let com1 = Device::new("COM1".into(), vec![&hid, &uid, &crs]);
     let resources: Vec<(Memory32Fixed, Interrupt)> = devices
         .iter()
         .map(|device| {
             let base = u32::try_from(device.base).expect("a range under 4 GiB");
             let size = u32::try_from(device.size).expect("a range under 4 GiB");
-            (
-                Memory32Fixed::new(true, base, size),
-                Interrupt::new(true, true, false, false, device.gsi),
-            )
+            (Memory32Fixed::new(true, base, size), line(device.gsi))
         })
         .collect();
     let crs: Vec<ResourceTemplate> = resources
@@ -149,10 +173,10 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
             Device::new(format!("VR{index:02}").as_str().into(), vec![hid, uid, crs])
         })
         .collect();
-    if !entries.is_empty() {
-        let children: Vec<&dyn Aml> = entries.iter().map(|d| d as &dyn Aml).collect();
-        Scope::new("\\_SB_".into(), children).to_aml_bytes(&mut dsdt);
-    }
+    let children: Vec<&dyn Aml> = std::iter::once(&com1 as &dyn Aml)
+        .chain(entries.iter().map(|d| d as &dyn Aml))
+        .collect();
+    Scope::new("\\_SB_".into(), children).to_aml_bytes(&mut dsdt);
     let dsdt = tables.place(&dsdt, 1);
     let facs = tables.place(&FACS::new(), FACS_ALIGN);
     let fadt = tables.place(&build_fadt(dsdt, facs), 1);
@@ -162,6 +186,14 @@ pub fn build(num_cpus: u32, devices: &[MmioDevice]) -> Vec<u8> {
     xsdt.add_entry(madt);
     let xsdt = tables.place(&xsdt, 1);
     tables.finish(xsdt)
+}
+
+/// Returns the `_CRS` line of a device on GSI `gsi`: consumed by the device,
+/// edge-triggered, active-high and exclusive. The ISA lines are wired that
+/// way, and so are the lines past them, so COM1 and every virtio device share
+/// this description.
+fn line(gsi: u32) -> Interrupt {
+    Interrupt::new(true, true, false, false, gsi)
 }
 
 /// Returns the FADT that points at the DSDT at `dsdt` and the FACS at `facs`.
@@ -322,6 +354,19 @@ mod tests {
         table(blob, xsdt_entries(blob)[0])
     }
 
+    /// Returns the DSDT of `blob`, found through the FADT.
+    fn dsdt_of(blob: &[u8]) -> &[u8] {
+        table(blob, u64_at(fadt(blob), FADT_X_DSDT))
+    }
+
+    /// Returns how many times `needle` occurs in `haystack`.
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
     // The guest scans 0xe0000-0xfffff on 16-byte boundaries for the RSDP.
     #[test]
     fn rsdp_sits_where_the_guest_scans() {
@@ -439,7 +484,7 @@ mod tests {
     #[test]
     fn s5_package_powers_off() {
         let blob = build(1, &[]);
-        let dsdt = table(&blob, u64_at(fadt(&blob), FADT_X_DSDT));
+        let dsdt = dsdt_of(&blob);
         let name = dsdt.windows(4).position(|w| w == b"_S5_").unwrap();
         let package = &dsdt[name + 4..];
         assert_eq!(package[0], AML_PACKAGE_OP);
@@ -455,6 +500,27 @@ mod tests {
             pm.write(PM1_CONTROL, &off.to_le_bytes()),
             Some(Stop::SystemOff)
         ));
+    }
+
+    // The guest's 8250 driver binds to the PNP0501 device under \_SB_ and takes
+    // the ports and the line from its _CRS. The ports must be COM1's legacy
+    // ones, because hvi emulates the UART at 0x3f8.
+    #[test]
+    fn dsdt_describes_com1() {
+        let blob = build(1, &[]);
+        let dsdt = dsdt_of(&blob);
+        assert_eq!(count(dsdt, b"COM1"), 1);
+        // EisaId ("PNP0501"), a DWord.
+        assert_eq!(count(dsdt, b"_HID\x0c\x41\xd0\x05\x01"), 1);
+        // I/O port: tag 0x47, 16-bit decode, 0x3f8 to 0x3f8, alignment 1,
+        // eight ports. Extended IRQ: tag 0x89, length 6, consumer edge high
+        // exclusive, one line, GSI 4. Then the end tag.
+        let crs = [
+            0x47, 1, 0xf8, 0x03, 0xf8, 0x03, 1, 8, //
+            0x89, 6, 0, 0b11, 1, 4, 0, 0, 0, //
+            0x79, 0,
+        ];
+        assert_eq!(count(dsdt, &crs), 1);
     }
 
     // The guest's virtio_mmio driver binds to LNRO0005 devices under \_SB_, and
@@ -474,25 +540,24 @@ mod tests {
             },
         ];
         let blob = build(1, &devices);
-        let dsdt = table(&blob, u64_at(fadt(&blob), FADT_X_DSDT));
-        let count = |needle: &[u8]| dsdt.windows(needle.len()).filter(|w| *w == needle).count();
-        assert_eq!(count(b"LNRO0005"), 2, "one _HID per device");
-        assert_eq!(count(b"VR00"), 1);
-        assert_eq!(count(b"VR01"), 1);
+        let dsdt = dsdt_of(&blob);
+        assert_eq!(count(dsdt, b"LNRO0005"), 2, "one _HID per device");
+        assert_eq!(count(dsdt, b"VR00"), 1);
+        assert_eq!(count(dsdt, b"VR01"), 1);
         for device in devices {
             // Memory32Fixed: tag 0x86, length 9, read-write, base, length.
             let mut memory = vec![0x86, 9, 0, 1];
             memory.extend((device.base as u32).to_le_bytes());
             memory.extend((device.size as u32).to_le_bytes());
-            assert_eq!(count(&memory), 1, "range of {device:?}");
+            assert_eq!(count(dsdt, &memory), 1, "range of {device:?}");
             // Extended IRQ: tag 0x89, length 6, consumer edge high exclusive,
             // one line.
             let mut irq = vec![0x89, 6, 0, 0b11, 1];
             irq.extend(device.gsi.to_le_bytes());
-            assert_eq!(count(&irq), 1, "line of {device:?}");
+            assert_eq!(count(dsdt, &irq), 1, "line of {device:?}");
         }
         let none = build(1, &[]);
-        let dsdt = table(&none, u64_at(fadt(&none), FADT_X_DSDT));
+        let dsdt = dsdt_of(&none);
         assert!(!dsdt.windows(8).any(|w| w == b"LNRO0005"));
     }
 }
