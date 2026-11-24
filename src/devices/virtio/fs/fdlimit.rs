@@ -317,7 +317,13 @@ mod tests {
         assert!(status.success(), "the child failed:\n{out}\n{err}");
         if out.contains("above-cap-child: skipped") {
             // Passing, but without having checked the bug: say so in the log.
-            eprintln!("the_budget_fits_under_what_the_kernel_gives_one_process:\n{out}");
+            // Written to stderr directly, since the harness captures what
+            // `eprintln!` prints from a test that passes.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "the_budget_fits_under_what_the_kernel_gives_one_process:\n{out}"
+            );
         } else {
             assert!(
                 out.contains("above-cap-child: checked"),
