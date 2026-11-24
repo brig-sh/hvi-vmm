@@ -34,8 +34,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
 
 use vm_memory::VolatileSlice;
@@ -448,7 +448,7 @@ struct ParkedFd {
     /// open that asks for exactly these.
     flags: u32,
     attrs: HandleAttrs,
-    /// The stamp of this entry's live appearance in `parked_order`.
+    /// The stamp of this entry's live appearance in `ParkedCache::order`.
     tick: u64,
 }
 
@@ -554,8 +554,7 @@ const READAHEAD_MAX_DIRS: usize = 256;
 ///
 /// A queued directory holds its parent's descriptor, shared with its siblings,
 /// so this also bounds the descriptors the queue holds. They are not in the
-/// guest's handle budget and come out of the VMM's reserve in [`fdlimit`],
-/// which is larger.
+/// descriptor budget and come out of the VMM's reserve in [`fdlimit`].
 const READAHEAD_MAX_QUEUED: usize = 64;
 
 /// Subdirectories a worker queues from one directory it prepared, the first
@@ -1203,6 +1202,222 @@ pub(crate) fn sync_volume(fd: BorrowedFd<'_>) -> io::Result<()> {
     }
 }
 
+/// The descriptors one export keeps only for speed: the parked ones, which
+/// the guest closed and may open again.
+///
+/// Kept apart from the device, under a lock of their own, so another export
+/// of the same VM can close them when the VM's budget is spent. That lock is
+/// a leaf: nothing else is locked while it is held, so taking it from another
+/// export's request cannot deadlock against this export's.
+struct ParkedCache {
+    /// The parked descriptors, by node.
+    map: HashMap<u64, ParkedFd>,
+    /// Park order, oldest first, so eviction has something to pick. Each entry
+    /// carries the stamp it was pushed at, as `DirCache::lru` does.
+    ///
+    /// Entries are left behind when a descriptor is taken or dropped, because
+    /// removing one by value is a scan of the whole queue, and this is the path
+    /// a build spends its requests on. Most of a build's opens are served from
+    /// here, and a scan of every parked entry on each of them costs more than
+    /// the host open it replaces. The stamp is what separates a live entry
+    /// from one the node has been parked past, so eviction drops the stale
+    /// ones rather than closing a descriptor that has since been re-parked.
+    order: VecDeque<(u64, u64)>,
+    /// Stamp counter for `order`.
+    ticks: u64,
+    /// How many descriptors may sit parked at once. They are host descriptors
+    /// like any other, so they count against the same budget as the guest's
+    /// own handles rather than adding to it.
+    limit: usize,
+}
+
+impl ParkedCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            ticks: 0,
+            limit,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Parks `file` for `node`, evicting the oldest while the cache is full.
+    fn insert(&mut self, node: u64, flags: u32, attrs: HandleAttrs, file: File) {
+        self.map.remove(&node);
+        if self.limit == 0 {
+            return;
+        }
+        while self.map.len() >= self.limit {
+            if !self.evict_one() {
+                return;
+            }
+        }
+        self.ticks += 1;
+        let tick = self.ticks;
+        self.map.insert(
+            node,
+            ParkedFd {
+                file,
+                flags,
+                attrs,
+                tick,
+            },
+        );
+        self.order.push_back((node, tick));
+        self.compact();
+    }
+
+    /// Drops the oldest parked descriptor. Returns whether one went.
+    fn evict_one(&mut self) -> bool {
+        while let Some((node, tick)) = self.order.pop_front() {
+            // An appearance the node has since been parked past is not its
+            // place in the order, so it says nothing about what to evict.
+            if self.map.get(&node).map(|p| p.tick) != Some(tick) {
+                continue;
+            }
+            drop(self.map.remove(&node));
+            return true;
+        }
+        false
+    }
+
+    /// Drops the older half, and one at least when there is one. Returns
+    /// whether any went.
+    fn evict_half(&mut self) -> bool {
+        let mut closed = false;
+        for _ in 0..self.map.len().div_ceil(2) {
+            closed |= self.evict_one();
+        }
+        closed
+    }
+
+    /// Drops the appearances nodes have been parked past, once they outnumber
+    /// the live ones. Amortised, as `DirCache::compact_lru` is: each compaction
+    /// is paid for by the pushes that made it necessary.
+    fn compact(&mut self) {
+        if self.order.len() <= 4 * self.map.len().max(1) {
+            return;
+        }
+        let map = &self.map;
+        let order = std::mem::take(&mut self.order);
+        self.order = order
+            .into_iter()
+            .filter(|&(node, tick)| map.get(&node).map(|p| p.tick) == Some(tick))
+            .collect();
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
+/// What one export holds, as the other exports of its VM see it.
+struct ExportDescriptors {
+    /// The descriptors the export holds that only it can close: open file
+    /// and directory handles and cached directories. Published by the export
+    /// after each request, so another export reading it sees a count at most
+    /// one request old.
+    pinned: AtomicUsize,
+    /// The descriptors the export keeps for speed, which any export of the VM
+    /// may close.
+    parked: Mutex<ParkedCache>,
+}
+
+impl ExportDescriptors {
+    fn new(parked_limit: usize) -> Self {
+        Self {
+            pinned: AtomicUsize::new(0),
+            parked: Mutex::new(ParkedCache::new(parked_limit)),
+        }
+    }
+
+    /// The parked cache. A panic while it was held left a cache of open
+    /// descriptors and nothing half-written that matters, so poison is
+    /// ignored.
+    fn parked(&self) -> MutexGuard<'_, ParkedCache> {
+        self.parked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn held(&self) -> usize {
+        self.pinned.load(Ordering::Relaxed) + self.parked().len()
+    }
+}
+
+/// The host descriptors one VM's exports may hold between them.
+///
+/// The descriptor table is the process's, and one hvi process is one VM. A
+/// budget per export would let a VM with a root filesystem export and a
+/// project export ask for twice what the process can hold, and the export
+/// that met the host's limit could not make the other give anything back. So
+/// every export counts against one limit, and an export that needs room can
+/// close what another keeps only for speed.
+pub(crate) struct DescriptorBudget {
+    /// The most descriptors the exports may hold together, fixed when the VM
+    /// starts. An atomic only so a test can set a small one on a device it
+    /// has already built.
+    limit: AtomicUsize,
+    /// Every export drawing on this budget. Locked before an export's parked
+    /// cache and never after one, so the order is always the same.
+    exports: Mutex<Vec<Arc<ExportDescriptors>>>,
+}
+
+impl DescriptorBudget {
+    pub(crate) fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(limit),
+            exports: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn exports(&self) -> MutexGuard<'_, Vec<Arc<ExportDescriptors>>> {
+        self.exports.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register(&self, export: Arc<ExportDescriptors>) {
+        self.exports().push(export);
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The descriptors every export of the VM holds together.
+    fn held(&self) -> usize {
+        self.exports().iter().map(|export| export.held()).sum()
+    }
+
+    /// Closes the oldest parked descriptor of some export other than `own`.
+    /// Returns whether one went.
+    fn evict_one_elsewhere(&self, own: &Arc<ExportDescriptors>) -> bool {
+        self.exports()
+            .iter()
+            .filter(|export| !Arc::ptr_eq(export, own))
+            .any(|export| export.parked().evict_one())
+    }
+
+    /// Closes the older half of every other export's parked descriptors.
+    /// Returns whether any went.
+    fn give_back_elsewhere(&self, own: &Arc<ExportDescriptors>) -> bool {
+        let mut closed = false;
+        for export in self.exports().iter() {
+            if !Arc::ptr_eq(export, own) {
+                closed |= export.parked().evict_half();
+            }
+        }
+        closed
+    }
+}
+
 /// A virtio-fs device exporting exactly one canonical host directory.
 pub struct VirtioFs {
     /// The canonical host directory the export serves.
@@ -1282,41 +1497,24 @@ pub struct VirtioFs {
     readahead: Readahead,
     /// The fh the next open gets.
     next_handle: u64,
-    /// Most guest handles this export will hold open at once (#34).
+    /// What this export holds, as the VM's other exports see it, with its
+    /// parked descriptors.
+    own: Arc<ExportDescriptors>,
+    /// The budget this export draws on with the VM's other exports.
     ///
-    /// Each OPEN pins a host `File` in `handles` and each OPENDIR one in
-    /// `dir_handles`, released only when the guest sends RELEASE or RELEASEDIR.
-    /// Without this limit the guest alone would decide how much of the
-    /// process's descriptor table it spends. See
-    /// [`fdlimit::guest_handle_budget`] for why the number is derived rather
-    /// than written down.
-    handle_limit: usize,
+    /// Each OPEN, CREATE and TMPFILE pins a host `File` in `handles`,
+    /// released only when the guest sends RELEASE, and each OPENDIR one in
+    /// `dir_handles`, released by RELEASEDIR. Without a limit the guest alone
+    /// would decide how much of the process's descriptor table it spends.
+    /// See [`fdlimit::guest_handle_budget`] for why the number is derived
+    /// rather than written down, and [`DescriptorBudget`] for why it is
+    /// shared.
+    budget: Arc<DescriptorBudget>,
     /// The most handles this export has held at once, for the report when the
     /// VM stops. The issue asks for this before any limit is tightened: a
     /// number chosen without knowing what a real build needs is a number that
     /// breaks one.
     peak_handles: usize,
-    /// Descriptors the guest has closed, kept for its next open of the same
-    /// node. Bounded by `parked_limit` and evicted oldest-first.
-    parked: HashMap<u64, ParkedFd>,
-    /// Park order, oldest first, so eviction has something to pick. Each entry
-    /// carries the stamp it was pushed at, as `DirCache::lru` does.
-    ///
-    /// Entries are left behind when a descriptor is taken or dropped, because
-    /// removing one by value is a scan of the whole queue, and this is the path
-    /// a build spends its requests on. On the macro workload 698,000 of 726,000
-    /// opens were served from here, and a scan of 8,000 parked entries on each
-    /// of them cost more than the host open it replaced. The stamp is what
-    /// separates a live entry from one the node has been parked past, so
-    /// eviction drops the stale ones rather than closing a descriptor that has
-    /// since been re-parked.
-    parked_order: VecDeque<(u64, u64)>,
-    /// Stamp counter for `parked_order`.
-    parked_ticks: u64,
-    /// How many descriptors may sit parked at once. They are host descriptors
-    /// like any other, so this comes out of the same budget as the guest's own
-    /// handles (#34) rather than adding to it.
-    parked_limit: usize,
     /// Opens served from `parked`.
     parked_hits: u64,
     /// Opens that had to reach the host.
@@ -1429,6 +1627,13 @@ impl VirtioFs {
         );
         let mut inode_ids = HashMap::new();
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
+        // A budget of its own until `join_budget` gives it the VM's. The
+        // parked cache is a quarter of it: enough for the working set of
+        // headers a compiler reopens, small enough that the guest can still
+        // hold the handles it is entitled to.
+        let own = Arc::new(ExportDescriptors::new(fdlimit::guest_handle_budget() / 4));
+        let budget = DescriptorBudget::new(fdlimit::guest_handle_budget());
+        budget.register(Arc::clone(&own));
         Ok(Self {
             root,
             writable,
@@ -1452,14 +1657,8 @@ impl VirtioFs {
             fh0_finished: HashSet::new(),
             readahead: Readahead::new(),
             next_handle: 1,
-            handle_limit: fdlimit::guest_handle_budget(),
-            parked: HashMap::new(),
-            parked_order: VecDeque::new(),
-            parked_ticks: 0,
-            // A quarter of the guest's own budget: enough for the working set
-            // of headers a compiler reopens, small enough that the guest can
-            // still hold the handles it is entitled to.
-            parked_limit: fdlimit::guest_handle_budget() / 4,
+            own,
+            budget,
             parked_hits: 0,
             parked_misses: 0,
             peak_handles: 0,
@@ -1622,6 +1821,7 @@ impl VirtioFs {
         // Node ids restart here, so a descriptor left parked would sit under an
         // id the rebooted guest is handed for a different file.
         self.drain_parked();
+        self.publish_pinned();
         // Their chains went with the queues.
         self.lock_waiters.clear();
         self.lock_to_park = None;
@@ -2063,9 +2263,12 @@ impl VirtioFs {
             SETUPMAPPING | REMOVEMAPPING => Err(EOPNOTSUPP),
             _ => Err(ENOSYS),
         };
-        if self.host_refused(opcode, &result) {
+        // The budget's own ENFILE comes from `make_room`, which has already
+        // closed everything `shrink_caches` could, so then it closes nothing.
+        if matches!(result, Err(EMFILE | ENFILE)) {
             self.shrink_caches();
         }
+        self.publish_pinned();
         self.note_op_time(opcode, op_start);
         if self.lock_to_park.is_some() {
             // A SETLKW on a held lock: answered from `retry_lock_waiters`
@@ -2078,31 +2281,17 @@ impl VirtioFs {
         }
     }
 
-    /// Returns whether `result` is the host refusing request `opcode` a
-    /// descriptor.
-    ///
-    /// The device's own ENFILE is not: OPEN checks the guest's handle limit
-    /// before it asks the host. What is spent then is the guest's handles, not
-    /// the caches, so closing those would cost the next opens their hits and
-    /// make no room.
-    fn host_refused(&self, opcode: u32, result: &Result<Vec<u8>, i32>) -> bool {
-        let at_handle_limit = opcode == OPEN
-            && *result == Err(ENFILE)
-            && self.open_handle_count() >= self.handle_limit;
-        matches!(result, Err(EMFILE | ENFILE)) && !at_handle_limit
-    }
-
-    /// Closes half the parked descriptors and half the cached directories,
-    /// oldest first, and at least one of each where there is one. The device
-    /// calls it after the host refused a descriptor, and the guest gets that
-    /// refusal either way.
+    /// Closes half this export's parked descriptors and cached directories and
+    /// half the parked descriptors of the VM's other exports, oldest first, and
+    /// at least one of each where there is one. The device calls it after the
+    /// host refused a descriptor, and the guest gets that refusal either way.
     ///
     /// The host refuses below the budget only when something the budget does
-    /// not count has taken the room: another export, the rest of the VMM,
-    /// another process filling the system-wide table, or the descriptors of a
-    /// program that embeds hvi. The parked descriptors and cached directories
-    /// are kept only for speed, so closing them takes nothing the guest holds,
-    /// and the requests after the refusal find room.
+    /// not count has taken the room: the rest of the VMM, another process
+    /// filling the system-wide table, or the descriptors of a program that
+    /// embeds hvi. The parked descriptors and cached directories are kept only
+    /// for speed, so closing them takes nothing the guest holds, and the
+    /// requests after the refusal find room.
     ///
     /// Only half is closed, because the refusal says the table is full now, not
     /// how much room the next requests need. Closing all of both caches would
@@ -2113,12 +2302,12 @@ impl VirtioFs {
     /// [`READAHEAD_MAX_QUEUED`], few next to what the caches hold, and closing
     /// them would discard listings prepared for the guest's walk.
     fn shrink_caches(&mut self) {
-        for _ in 0..self.parked.len().div_ceil(2) {
-            self.evict_one_parked();
-        }
+        self.own.parked().evict_half();
         for _ in 0..self.dirs.held().div_ceil(2) {
             self.dirs.evict_one();
         }
+        self.budget.give_back_elsewhere(&self.own);
+        self.publish_pinned();
     }
 
     fn init(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -2887,6 +3076,9 @@ impl VirtioFs {
         let open_flags = get_u32(input, 12).ok_or(EINVAL)?;
         let name = nul_name(input, 16)?;
         let path = self.child_path(parent, name)?;
+        // The handle pins a descriptor as an OPEN's does. Checked before the
+        // file is made, so a refusal leaves nothing behind.
+        self.make_room()?;
         let host_mode = host_creation_mode(mode, false);
         let file = {
             let (dirfd, name) = self.at_relative(&self.relative_of_path(&path)?)?;
@@ -2961,30 +3153,9 @@ impl VirtioFs {
         } else {
             None
         };
-        // Before anything is opened. Each handle pins a host descriptor until
-        // the guest releases it, and the descriptor table is the process's
-        // rather than this device's, so a guest that spends the last one breaks
-        // the block device, the ledger and the control socket, none of which
-        // can tell the guest anything (#34). ENFILE is the errno for
-        // "the host is out", as distinct from the EMFILE the host
-        // itself would raise.
-        //
-        // Both caches are this device's to give back, so they yield first and
-        // the guest reaches the limit no sooner than it did before they
-        // existed. One descriptor at a time, and only while the budget
-        // is spent: emptying them whole let the next open refill the
-        // directory cache and empty it again, so neither cache held
-        // anything and every open paid the host for a walk it had
-        // already made.
+        // Before anything is opened. A reused descriptor is already counted.
         if reused.is_none() {
-            while self.descriptors_held() >= self.handle_limit {
-                if !self.evict_one_parked() && !self.dirs.evict_one() {
-                    break;
-                }
-            }
-            if self.open_handle_count() >= self.handle_limit {
-                return Err(ENFILE);
-            }
+            self.make_room()?;
         }
         let fh = if directory {
             self.insert_dir_handle(&path)?
@@ -3090,9 +3261,6 @@ impl VirtioFs {
         if directory {
             return Err(ENOENT);
         }
-        if self.open_handle_count() >= self.handle_limit {
-            return Err(ENFILE);
-        }
         let writable = flags & LINUX_O_ACCMODE != 0;
         let wants_write =
             writable || flags & LINUX_O_TRUNC != 0 || open_flags & FUSE_OPEN_KILL_SUIDGID != 0;
@@ -3100,6 +3268,10 @@ impl VirtioFs {
         if wants_write && !handle.writable {
             return Err(EACCES);
         }
+        // Once the request is known to be served, so one that fails anyway
+        // costs the caches nothing.
+        self.make_room()?;
+        let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
         let path = handle.path.clone();
         // SAFETY: a descriptor this call owns and hands over.
         let file = File::from(dup_cloexec(handle.file.as_fd())?);
@@ -3326,14 +3498,62 @@ impl VirtioFs {
         self.handles.len() + self.dir_handles.len()
     }
 
-    /// Returns how many host descriptors this device is holding, the guest's
-    /// and its own.
-    ///
-    /// The guest's entitlement is the whole budget, so the caches cannot be
-    /// spent on top of it: what they hold counts here, and they are emptied
-    /// before the guest is told the host is out.
+    /// Returns how many host descriptors this export is holding, the guest's
+    /// and its own. The budget counts the same descriptors across the VM;
+    /// see [`DescriptorBudget::held`].
+    #[cfg(test)]
     fn descriptors_held(&self) -> usize {
-        self.open_handle_count() + self.parked.len() + self.dirs.held()
+        self.open_handle_count() + self.own.parked().len() + self.dirs.held()
+    }
+
+    /// Tells the VM's other exports what this one holds that they cannot
+    /// close.
+    fn publish_pinned(&self) {
+        self.own.pinned.store(
+            self.open_handle_count() + self.dirs.held(),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Makes this export draw on `budget` with the VM's other exports.
+    pub(crate) fn join_budget(&mut self, budget: &Arc<DescriptorBudget>) {
+        budget.register(Arc::clone(&self.own));
+        self.budget = Arc::clone(budget);
+    }
+
+    /// Makes room under the VM's budget for one more descriptor, or answers
+    /// ENFILE.
+    ///
+    /// Each handle pins a host descriptor until the guest releases it, and
+    /// the descriptor table is the process's rather than this device's, so a
+    /// guest that spends the last one breaks the block device, the ledger and
+    /// the control socket, none of which can tell the guest anything.
+    /// ENFILE is the errno for "the host is out", as distinct from the EMFILE
+    /// the host itself would raise.
+    ///
+    /// The caches are given back first, so the guest reaches the limit no
+    /// sooner than it did before they existed: this export's parked
+    /// descriptors, then its cached directories, then the parked descriptors
+    /// of the VM's other exports. One descriptor at a time, and only while
+    /// the budget is spent: emptying them whole let the next open refill the
+    /// directory cache and empty it again, so neither cache held anything and
+    /// every open paid the host for a walk it had already made.
+    fn make_room(&mut self) -> Result<(), i32> {
+        self.publish_pinned();
+        while self.budget.held() >= self.budget.limit() {
+            if self.evict_one_parked() {
+                continue;
+            }
+            if self.dirs.evict_one() {
+                self.publish_pinned();
+                continue;
+            }
+            if self.budget.evict_one_elsewhere(&self.own) {
+                continue;
+            }
+            return Err(ENFILE);
+        }
+        Ok(())
     }
 
     /// Records the high-water mark, so the stop report can name it. The issue
@@ -3352,7 +3572,7 @@ impl VirtioFs {
     /// The ceiling those handles are counted against.
     #[must_use]
     pub fn handle_limit(&self) -> usize {
-        self.handle_limit
+        self.budget.limit()
     }
 
     /// Returns the open flags that decide what reads and writes through a
@@ -3388,9 +3608,14 @@ impl VirtioFs {
     /// refuse is not answered from a descriptor it granted earlier.
     fn take_parked(&mut self, node: u64, flags: u32) -> Option<(File, HandleAttrs)> {
         let wanted = Self::parked_flag_key(flags);
-        if self.parked.get(&node).map(|p| p.flags) != Some(wanted) {
-            return None;
-        }
+        let attrs = {
+            let parked = self.own.parked();
+            let entry = parked.map.get(&node)?;
+            if entry.flags != wanted {
+                return None;
+            }
+            entry.attrs
+        };
         // A node whose name no longer resolves, or whose entry the host has
         // removed, will never match again: the descriptor goes now rather than
         // waiting for an eviction that only a busy cache performs.
@@ -3404,12 +3629,13 @@ impl VirtioFs {
                 return None;
             }
         };
-        let parked = self.parked.get(&node)?;
-        if HandleAttrs::of(&meta) != parked.attrs {
+        if HandleAttrs::of(&meta) != attrs {
             self.drop_parked(node);
             return None;
         }
-        let parked = self.parked.remove(&node)?;
+        // Another export may have closed it since it was looked at above,
+        // and then the open reaches the host like any other.
+        let parked = self.own.parked().map.remove(&node)?;
         Some((parked.file, parked.attrs))
     }
 
@@ -3422,75 +3648,35 @@ impl VirtioFs {
         if !self.nodes.contains_key(&node) || self.is_orphan(node) {
             return;
         }
-        self.drop_parked(node);
-        if self.parked_limit == 0 {
-            return;
-        }
-        while self.parked.len() >= self.parked_limit {
-            if !self.evict_one_parked() {
-                return;
-            }
-        }
-        self.parked_ticks += 1;
-        let tick = self.parked_ticks;
-        self.parked.insert(
-            node,
-            ParkedFd {
-                file,
-                flags: Self::parked_flag_key(flags),
-                attrs,
-                tick,
-            },
-        );
-        self.parked_order.push_back((node, tick));
-        self.compact_parked_order();
+        self.own
+            .parked()
+            .insert(node, Self::parked_flag_key(flags), attrs, file);
     }
 
     /// Closes any descriptor parked for `node`.
     fn drop_parked(&mut self, node: u64) {
-        self.parked.remove(&node);
+        self.own.parked().map.remove(&node);
     }
 
     /// Drops the oldest parked descriptor. Returns whether one went.
     fn evict_one_parked(&mut self) -> bool {
-        while let Some((node, tick)) = self.parked_order.pop_front() {
-            // An appearance the node has since been parked past is not its
-            // place in the order, so it says nothing about what to evict.
-            if self.parked.get(&node).map(|p| p.tick) != Some(tick) {
-                continue;
-            }
-            drop(self.parked.remove(&node));
-            return true;
-        }
-        false
-    }
-
-    /// Drops the appearances nodes have been parked past, once they outnumber
-    /// the live ones. Amortised, as `DirCache::compact_lru` is: each compaction
-    /// is paid for by the pushes that made it necessary.
-    fn compact_parked_order(&mut self) {
-        if self.parked_order.len() <= 4 * self.parked.len().max(1) {
-            return;
-        }
-        let parked = &self.parked;
-        let order = std::mem::take(&mut self.parked_order);
-        self.parked_order = order
-            .into_iter()
-            .filter(|&(node, tick)| parked.get(&node).map(|p| p.tick) == Some(tick))
-            .collect();
+        self.own.parked().evict_one()
     }
 
     /// Closes every parked descriptor, for the paths that need the host
     /// descriptor table back rather than the speed.
     fn drain_parked(&mut self) {
-        self.parked.clear();
-        self.parked_order.clear();
+        self.own.parked().clear();
     }
 
     /// Opens served from a parked descriptor, and opens that reached the host.
     #[must_use]
     pub fn descriptor_cache_stats(&self) -> (u64, u64, usize) {
-        (self.parked_hits, self.parked_misses, self.parked.len())
+        (
+            self.parked_hits,
+            self.parked_misses,
+            self.own.parked().len(),
+        )
     }
 
     fn insert_handle(
@@ -4086,6 +4272,8 @@ impl VirtioFs {
         let flags = get_u32(input, 0).ok_or(EINVAL)?;
         let mode = get_u32(input, 4).ok_or(EINVAL)?;
         let parent_path = self.node_path(parent)?.to_owned();
+        // As CREATE: the handle pins a descriptor.
+        self.make_room()?;
         let id = self.next_tmpfile;
         self.next_tmpfile = self.next_tmpfile.saturating_add(1).max(1);
         let path = parent_path.join(format!(".hvi-tmp-{}-{id}", std::process::id()));
@@ -13028,9 +13216,9 @@ mod tests {
             "one file, one descriptor"
         );
         assert!(
-            dev.parked_order.len() <= 8,
+            dev.own.parked().order.len() <= 8,
             "the order holds {} entries for one parked descriptor",
-            dev.parked_order.len()
+            dev.own.parked().order.len()
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -13046,7 +13234,7 @@ mod tests {
         for i in 0..5 {
             fs::write(dir.join(format!("f{i}")), b"x").unwrap();
         }
-        dev.parked_limit = 4;
+        dev.own.parked().limit = 4;
         let nodes: Vec<u64> = (0..5)
             .map(|i| lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes()))
             .collect();
@@ -13167,11 +13355,11 @@ mod tests {
         }
         // Set before the lookups below, so the directory cache is never larger
         // than its bound.
-        dev.parked_limit = FILES;
+        dev.own.parked().limit = FILES;
         dev.dirs.limit = 2;
         // What the two caches hold together once they are full, so every open
         // below finds the budget spent.
-        dev.handle_limit = FILES + 2;
+        dev.budget.set_limit(FILES + 2);
 
         let mut nodes = Vec::new();
         for d in 0..FILES {
@@ -13186,7 +13374,7 @@ mod tests {
         }
         assert_eq!(dev.descriptor_cache_stats().2, FILES, "all four are parked");
         assert!(
-            dev.descriptors_held() >= dev.handle_limit,
+            dev.descriptors_held() >= dev.handle_limit(),
             "the budget is spent, so the gate runs"
         );
 
@@ -13218,8 +13406,8 @@ mod tests {
         for i in 0..8 {
             fs::write(dir.join(format!("f{i}")), b"x").unwrap();
         }
-        dev.handle_limit = 4;
-        dev.parked_limit = 4;
+        dev.budget.set_limit(4);
+        dev.own.parked().limit = 4;
 
         // Fill the parked set: open and release four different files.
         for i in 0..4 {
@@ -13241,15 +13429,203 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // The exports of one VM draw on one budget; see `DescriptorBudget` for
+    // why. An export that needs room takes it from what another keeps only
+    // for speed, and the VM as a whole never holds more than the budget.
+    #[test]
+    fn exports_draw_on_one_budget() {
+        const LIMIT: usize = 8;
+        let (dir_a, mut a) = fixture_with_access(true);
+        let (dir_b, mut b) = fixture_with_access(true);
+        for i in 0..LIMIT + 1 {
+            fs::write(dir_a.join(format!("f{i}")), b"x").unwrap();
+            fs::write(dir_b.join(format!("f{i}")), b"x").unwrap();
+        }
+        let budget = DescriptorBudget::new(LIMIT);
+        a.join_budget(&budget);
+        b.join_budget(&budget);
+        a.own.parked().limit = LIMIT;
+
+        // A spends the whole budget on parked descriptors.
+        for i in 0..LIMIT {
+            let node = lookup_node(&mut a, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            let fh = try_open(&mut a, node, 0).unwrap();
+            release_handle(&mut a, node, fh);
+        }
+        assert_eq!(a.descriptor_cache_stats().2, LIMIT);
+        assert_eq!(budget.held(), LIMIT);
+
+        // B is still entitled to the whole budget, and gets it from A's cache,
+        // one descriptor per open rather than half the cache at a time.
+        let mut held = Vec::new();
+        let node = lookup_node(&mut b, FUSE_ROOT_ID, b"f0");
+        held.push((node, try_open(&mut b, node, 0).unwrap()));
+        assert_eq!(
+            a.descriptor_cache_stats().2,
+            LIMIT - 1,
+            "A gave back exactly one"
+        );
+        for i in 1..LIMIT {
+            let node = lookup_node(&mut b, FUSE_ROOT_ID, format!("f{i}").as_bytes());
+            let fh = try_open(&mut b, node, 0)
+                .unwrap_or_else(|e| panic!("B's open {i} was refused with {e}"));
+            held.push((node, fh));
+            assert!(
+                budget.held() <= LIMIT,
+                "the VM holds {} descriptors against a budget of {LIMIT}",
+                budget.held()
+            );
+        }
+        assert_eq!(a.descriptor_cache_stats().2, 0, "A gave back its cache");
+
+        // One more is refused by the budget, not by the host.
+        let node = lookup_node(&mut b, FUSE_ROOT_ID, format!("f{LIMIT}").as_bytes());
+        assert_eq!(try_open(&mut b, node, 0), Err(ENFILE));
+        // And A, holding nothing, is refused too: the budget is the VM's.
+        let node = lookup_node(&mut a, FUSE_ROOT_ID, b"f0");
+        assert_eq!(try_open(&mut a, node, 0), Err(ENFILE));
+
+        for (node, fh) in held {
+            release_handle(&mut b, node, fh);
+        }
+        let _ = fs::remove_dir_all(dir_a);
+        let _ = fs::remove_dir_all(dir_b);
+    }
+
+    // CREATE pins a descriptor as OPEN does, so it is counted against the
+    // budget too. Otherwise a guest could hold any number of files it had
+    // created.
+    #[test]
+    fn creates_stop_at_the_handle_limit() {
+        let (dir, mut dev) = fixture_with_access(true);
+        dev.budget.set_limit(4);
+        let mut created = 0;
+        for i in 0..8 {
+            let mut input = vec![0u8; 16];
+            input[0..4].copy_from_slice(&0o1u32.to_le_bytes()); // O_WRONLY
+            input[4..8].copy_from_slice(&0o644u32.to_le_bytes());
+            input.extend_from_slice(format!("c{i}\0").as_bytes());
+            let out = dev.handle_fuse(&request(CREATE, FUSE_ROOT_ID, &input), 4096);
+            match get_u32(&out, 4).map(|e| e as i32) {
+                Some(0) => created += 1,
+                Some(e) => {
+                    assert_eq!(-e, ENFILE);
+                    break;
+                }
+                None => panic!("no status"),
+            }
+        }
+        assert_eq!(created, 4, "exactly the limit was served");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // TMPFILE pins a descriptor as CREATE does, and is counted the same way.
+    #[test]
+    fn tmpfiles_stop_at_the_handle_limit() {
+        let (dir, mut dev) = fixture_with_access(true);
+        dev.budget.set_limit(4);
+        let mut made = 0;
+        for _ in 0..8 {
+            let mut input = vec![0u8; 16];
+            input[0..4].copy_from_slice(&LINUX_O_RDWR.to_le_bytes());
+            input[4..8].copy_from_slice(&(S_IFREG | 0o600).to_le_bytes());
+            let out = dev.handle_fuse(&request(TMPFILE, FUSE_ROOT_ID, &input), 4096);
+            match get_u32(&out, 4).map(|e| e as i32) {
+                Some(0) => made += 1,
+                Some(e) => {
+                    assert_eq!(-e, ENFILE);
+                    break;
+                }
+                None => panic!("no status"),
+            }
+        }
+        assert_eq!(made, 4, "exactly the limit was served");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Each export has its own worker thread, so one export closes another's
+    // parked descriptors while that export is serving requests of its own.
+    // Two threads open, hold and release against one small budget. Nothing
+    // deadlocks, and the VM never holds more than the limit plus one
+    // descriptor per export, which is how far a count published once per
+    // request can lag when, as here, every file is at the export's root. A
+    // request that walks a path can also admit a directory to the cache
+    // before its open.
+    #[test]
+    fn exports_share_a_budget_across_their_threads() {
+        const LIMIT: usize = 16;
+        const FILES: usize = 32;
+        const ROUNDS: usize = 3000;
+        let budget = DescriptorBudget::new(LIMIT);
+        let mut dirs = Vec::new();
+        let mut workers = Vec::new();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for export in 0..2 {
+            let (dir, mut dev) = fixture_with_access(true);
+            for i in 0..FILES {
+                fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+            }
+            dev.join_budget(&budget);
+            // The first export keeps nothing for speed, so the room it needs
+            // comes from the other export's parked descriptors, closed from
+            // this thread while the other thread is using them.
+            if export == 0 {
+                dev.own.parked().limit = 0;
+            }
+            dirs.push(dir);
+            let budget = Arc::clone(&budget);
+            let done = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let nodes: Vec<u64> = (0..FILES)
+                    .map(|i| lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes()))
+                    .collect();
+                let mut held = VecDeque::new();
+                let mut worst = 0;
+                for round in 0..ROUNDS {
+                    let node = nodes[round % FILES];
+                    match try_open(&mut dev, node, 0) {
+                        Ok(fh) => held.push_back((node, fh)),
+                        Err(e) => assert_eq!(e, ENFILE, "round {round}"),
+                    }
+                    if held.len() > 4 {
+                        let (node, fh) = held.pop_front().unwrap();
+                        release_handle(&mut dev, node, fh);
+                    }
+                    worst = worst.max(budget.held());
+                }
+                for (node, fh) in held {
+                    release_handle(&mut dev, node, fh);
+                }
+                done.send(worst).unwrap();
+            }));
+        }
+        drop(done_tx);
+        for _ in 0..2 {
+            let worst = done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a worker did not finish: deadlock or panic");
+            assert!(
+                worst <= LIMIT + 2,
+                "the VM held {worst} descriptors against a budget of {LIMIT}"
+            );
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for dir in dirs {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
     /// The environment variable that marks the child process
     /// [`host_refusal_child`] runs in.
     const HOST_REFUSAL_CHILD: &str = "HVI_VIRTIO_FS_HOST_REFUSAL_CHILD";
 
     // The budget leaves the rest of the process a reserve, but something it
-    // does not count can still take the room: another export, the rest of the
-    // VMM or another process. Then the host refuses first, and the device
-    // closes half of what it keeps only for speed, so the guest's next request
-    // is served.
+    // does not count can still take the room: the rest of the VMM or another
+    // process. Then the host refuses first, and the device closes half of what
+    // the VM's exports keep only for speed, so the guest's next request is
+    // served.
     //
     // Run in a process of its own, because it lowers the open-file limit.
     #[test]
@@ -13274,15 +13650,23 @@ mod tests {
             return;
         }
         let (dir, mut dev) = fixture_with_access(true);
+        let (other_dir, mut other) = fixture_with_access(true);
         for i in 0..FILES {
             fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+            fs::write(other_dir.join(format!("f{i}")), b"x").unwrap();
         }
         // A budget far above what the host will give, so the host refuses
-        // before the budget does.
-        dev.handle_limit = 1_000_000;
-        dev.parked_limit = 1_000_000;
+        // before the budget does. Two exports of one VM, as a root filesystem
+        // and a project share are.
+        let budget = DescriptorBudget::new(1_000_000);
+        dev.join_budget(&budget);
+        other.join_budget(&budget);
+        dev.own.parked().limit = 1_000_000;
         let nodes: Vec<u64> = (0..FILES)
             .map(|i| lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes()))
+            .collect();
+        let other_nodes: Vec<u64> = (0..FILES)
+            .map(|i| lookup_node(&mut other, FUSE_ROOT_ID, format!("f{i}").as_bytes()))
             .collect();
         let mut lim = libc::rlimit {
             rlim_cur: 0,
@@ -13314,6 +13698,26 @@ mod tests {
             release_handle(&mut dev, *node, fh);
         }
 
+        // The first export now holds parked descriptors. Fill what is left of
+        // the table, so the other export is refused by the host on its first
+        // open, and keep it from parking, so it has nothing of its own to
+        // close. The refusal closes half of the first export's cache, so the
+        // guest's next open on the other export is served: the guest's root
+        // filesystem keeps working while a project share holds the
+        // descriptors.
+        let mut ballast = Vec::new();
+        while let Ok(file) = File::open("/dev/null") {
+            ballast.push(file);
+        }
+        other.own.parked().limit = 0;
+        for (i, node) in other_nodes.iter().enumerate() {
+            let fh = open_again_once(&mut other, *node).unwrap_or_else(|e| {
+                panic!("the other export's open {i} was refused twice, with {e}")
+            });
+            release_handle(&mut other, *node, fh);
+        }
+        drop(ballast);
+
         // Now hold every handle. Once the caches are empty, the host refuses
         // again on the second try, and the guest is told so.
         let mut held = Vec::new();
@@ -13332,7 +13736,6 @@ mod tests {
             "the guest got {refusal:?} rather than a descriptor-limit errno"
         );
         assert!(held.len() > 64, "only {} handles were served", held.len());
-
         // Once the guest lets go, it is served again: nothing it did left the
         // export stuck at the host's limit.
         for (node, fh) in held {
@@ -13345,19 +13748,20 @@ mod tests {
         }
         assert!(refused > 0, "the host never refused, so nothing was tested");
         let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(other_dir);
         println!("host-refusal-child: ok");
     }
 
     // A guest cannot spend the host's whole descriptor table on open handles.
-    // The cap is per export and derived from the process limit, so this sets a
-    // small one rather than opening thousands of files.
+    // The cap is the VM's budget, derived from the process limit, so this sets
+    // a small one rather than opening thousands of files.
     #[test]
     fn opens_stop_at_the_handle_limit() {
         let (dir, mut dev) = fixture_with_access(true);
         for i in 0..8 {
             fs::write(dir.join(format!("f{i}")), b"x").unwrap();
         }
-        dev.handle_limit = 4;
+        dev.budget.set_limit(4);
 
         let mut opened = 0;
         for i in 0..8 {

@@ -68,6 +68,9 @@ pub(crate) fn attach(shares: &[FsShare]) -> io::Result<Vec<Export>> {
             ),
         }
     }
+    // One budget for every export: the descriptor table they draw on is the
+    // process's, and one process is one VM.
+    let budget = server::DescriptorBudget::new(fdlimit::guest_handle_budget());
     let mut exports = Vec::with_capacity(shares.len());
     for (index, share) in shares.iter().enumerate() {
         let root = std::fs::canonicalize(&share.path)?;
@@ -79,6 +82,7 @@ pub(crate) fn attach(shares: &[FsShare]) -> io::Result<Vec<Export>> {
             if writable { "read-write" } else { "read-only" }
         );
         let mut dev = VirtioFs::new(root.clone(), &share.tag, writable, share.cache)?;
+        dev.join_budget(&budget);
         dev.set_guest_ids(server::GuestIds {
             uid: share.uid,
             gid: share.gid,

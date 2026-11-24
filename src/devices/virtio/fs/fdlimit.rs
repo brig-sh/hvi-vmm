@@ -67,11 +67,8 @@ const CEILING: u64 = 65_536;
 /// The guest sees ENFILE on the request that would have crossed it, which is
 /// the errno for "the host is out", and the VMM keeps working.
 ///
-/// One caveat, written down rather than hidden: this is a per-export budget
-/// and the table is per-process, so two exports can each stay inside it and
-/// still exhaust the process together. hvi runs a handful of shares at most
-/// and the reserve absorbs that, but a shared budget is the honest fix if the
-/// share count ever grows.
+/// The budget is the VM's, shared by all its exports, because the table is
+/// the process's: see `server::DescriptorBudget`.
 #[must_use]
 pub fn guest_handle_budget() -> usize {
     let soft = current_open_file_limit().unwrap_or(256);
