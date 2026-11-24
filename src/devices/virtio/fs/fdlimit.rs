@@ -315,10 +315,15 @@ mod tests {
             .read_to_string(&mut err)
             .unwrap();
         assert!(status.success(), "the child failed:\n{out}\n{err}");
-        assert!(
-            out.contains("above-cap-child: ok"),
-            "the child did not run its checks:\n{out}\n{err}"
-        );
+        if out.contains("above-cap-child: skipped") {
+            // Passing, but without having checked the bug: say so in the log.
+            eprintln!("the_budget_fits_under_what_the_kernel_gives_one_process:\n{out}");
+        } else {
+            assert!(
+                out.contains("above-cap-child: checked"),
+                "the child did not run its checks:\n{out}\n{err}"
+            );
+        }
     }
 
     #[test]
@@ -348,12 +353,12 @@ mod tests {
         );
         if above {
             assert_eq!(reported, Ok(cap), "the startup log would not show the cap");
+            println!("above-cap-child: checked");
         } else {
             // This host will not hold a soft limit above the cap, so the
             // state the bug needs cannot be set up here.
-            println!("above-cap-child: the soft limit could not go above the cap");
+            println!("above-cap-child: skipped, the soft limit could not go above the cap");
         }
-        println!("above-cap-child: ok");
     }
 
     #[test]
