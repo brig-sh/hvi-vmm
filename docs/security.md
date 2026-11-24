@@ -136,6 +136,14 @@ thread is allocating or freeing, and copes with each open failing. The open is
 refused rather than trapped, and the process still opens nothing. A musl build,
 whose malloc opens no file, installs the allowlist alone.
 
+In the `vmm` and `vcpu` lists the `ioctl` rule refuses `TIOCSTI` and
+`TIOCLINUX` on any descriptor, and a refused request traps like an off-list
+syscall. `block` allows neither. Each request can push bytes into a
+terminal's input, and the process shares the operator's terminal. The
+kernel's own checks vary by host. Its `TIOCSTI` check depends on
+`dev.tty.legacy_tiocsti`, and neither check applies to a caller with
+`CAP_SYS_ADMIN`.
+
 The two architecture files are not generated from one source. `poll` is the
 only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
 `ppoll` alone, because aarch64 has no `poll` syscall.
@@ -199,10 +207,12 @@ sandbox is secure.
   a thread starts in `on_attach`, before the Linux filters are armed, and stays
   unfiltered. A thread started with `VmHandle::spawn` installs the `vmm` filter
   as it begins, as the memory-dump plugin's `--dump-after` timer does.
-- **It constrains syscall arguments on one filter only.** The `block` filter
-  limits `ioctl` to the requests its thread makes. No `vmm` or `vcpu` rule
-  carries an argument condition, so `ioctl` and `sendmsg` are unconstrained
-  there over every descriptor the process already holds.
+- **It constrains syscall arguments only for `ioctl`.** The `block` filter
+  limits `ioctl` to the requests its thread makes. The `vmm` and `vcpu`
+  filters refuse `TIOCSTI` and `TIOCLINUX` and allow every other `ioctl`
+  request. `sendmsg` is unconstrained under `vmm` and `vcpu`. Every `ioctl`
+  request that is allowed, in all three, reaches every descriptor the process
+  already holds.
 - **It does not remove the risk of an escape.** It reduces what an escape
   reaches first.
 

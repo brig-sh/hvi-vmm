@@ -20,8 +20,8 @@ Firecracker and reads the same files:
                 "filter": [ {"syscall": "read", "comment": "why"} ] } }
 ```
 
-A rule can also match an argument, as `block`'s `ioctl` rules match the request
-number:
+A rule can also match an argument. Only the `ioctl` rules do, on the request
+number. `block`'s rules allow a request with `eq`:
 
 ```json
 {"syscall": "ioctl",
@@ -29,9 +29,23 @@ number:
  "comment": "why"}
 ```
 
+The one `ioctl` rule of `vmm` and `vcpu` refuses `TIOCSTI` and `TIOCLINUX`
+with `ne`:
+
+```json
+{"syscall": "ioctl", "args": [
+    {"index": 1, "type": "dword", "op": "ne", "val": 21522, "comment": "TIOCSTI (0x5412)"},
+    {"index": 1, "type": "dword", "op": "ne", "val": 21532, "comment": "TIOCLINUX (0x541C)"}
+]}
+```
+
+- JSON has no hex literals, so `val` is decimal and the comment gives the hex.
+- Compare a request as a `dword`, the low 32 bits. The module docs say why.
+
 The rules of one syscall are joined, so the syscall is allowed when any of them
-matches. A rule without `args` beside one with `args` does not allow every call:
-only the conditions count.
+matches. Every condition of one rule must hold for the rule to match. A call
+that matches no rule traps like an off-list syscall. A rule without `args`
+beside one with `args` does not allow every call: only the conditions count.
 
 A filter per kind of thread:
 
@@ -113,6 +127,8 @@ data, so the bar is a demonstrated need, not a suspicion:
    after setup. They check that `vcpu` gains no positioned read or write, seek
    or file sync, and which `ioctl` requests `block` allows. The opens a glibc
    build adds are compiled in by the code, behind the filter that refuses them.
+   One more runs the `vmm` and `vcpu` `ioctl` rules of the test's own
+   architecture over the refused requests and a few allowed ones.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
 

@@ -73,10 +73,6 @@
 //! `vmm` before its first write after the filters are armed. Each queued I/O
 //! thread names its filter when it is queued.
 //!
-//! A rule may match an argument as well as the syscall. `block` allows `ioctl`
-//! only for the requests its thread makes, so a worker cannot reach the rest of
-//! KVM's ioctls, or another descriptor's.
-//!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
 //!
@@ -127,6 +123,27 @@
 //! action changed to `log`, which lets the kernel record what would have been
 //! killed (`dmesg`, or `auditctl`) while the VMM keeps running. The open
 //! refusal stays in under it, unrecorded.
+//!
+//! # Argument conditions
+//!
+//! A rule may match an argument as well as the syscall. Only the `ioctl` rules
+//! do, on the request number. `block` allows `ioctl` only for the requests its
+//! thread makes, so a worker cannot reach the rest of KVM's ioctls, or another
+//! descriptor's. The `ioctl` rule of `vmm` and `vcpu` refuses `TIOCSTI` and
+//! `TIOCLINUX` on any descriptor and allows every other request. A refused
+//! request traps like an off-list syscall.
+//!
+//! The process shares the operator's terminal. Each request can push bytes
+//! into a terminal's input, and the operator's shell reads them as typed input
+//! once hvi exits. The kernel's own checks depend on the host. On the caller's
+//! controlling terminal it refuses `TIOCSTI` only under
+//! `dev.tty.legacy_tiocsti = 0`, and it refuses neither request to a caller
+//! with `CAP_SYS_ADMIN`.
+//!
+//! Each condition compares the low 32 bits of the request (`"type": "dword"`),
+//! because the kernel reads the request as an `unsigned int`. A 64-bit
+//! comparison would pass `TIOCSTI` with a bit set above bit 31, and the kernel
+//! would still run it as `TIOCSTI`.
 
 use std::io;
 
@@ -612,6 +629,46 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::kill(1, 0) };
             },
         },
+        // The ioctl rule's conditions. Each list carries its own copy, so each
+        // list gets its own probes.
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || ioctl_on_no_descriptor(libc::TIOCSTI as libc::c_ulong),
+        },
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Trapped,
+            run: || ioctl_on_no_descriptor(libc::TIOCSTI as libc::c_ulong),
+        },
+        // The kernel drops bits 32-63 of the request, so these still reach it
+        // as TIOCSTI.
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI | 0xffffffff << 32 (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || ioctl_on_no_descriptor(0xffff_ffff_0000_0000 | libc::TIOCSTI as libc::c_ulong),
+        },
+        Probe {
+            what: "push a byte into terminal input, TIOCSTI | 0xffffffff << 32 (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Trapped,
+            run: || ioctl_on_no_descriptor(0xffff_ffff_0000_0000 | libc::TIOCSTI as libc::c_ulong),
+        },
+        Probe {
+            what: "paste a console selection, TIOCLINUX (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Trapped,
+            run: || ioctl_on_no_descriptor(libc::TIOCLINUX as libc::c_ulong),
+        },
+        Probe {
+            what: "paste a console selection, TIOCLINUX (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Trapped,
+            run: || ioctl_on_no_descriptor(libc::TIOCLINUX as libc::c_ulong),
+        },
         // A disk's requests run on its worker, so a vCPU thread reads and writes
         // no file at an offset and flushes none. The read and the write each
         // take one empty buffer, so a call the filter passes moves nothing.
@@ -718,27 +775,7 @@ fn probes() -> Vec<Probe> {
             what: "restore the terminal (block)",
             thread: Thread::Block,
             expected: Outcome::Allowed,
-            // The fatal-signal handler and the panic hook restore the terminal
-            // from whichever thread they run on. Each request is made directly
-            // too, since a libc call may give up before its last request on a
-            // descriptor that is not open.
-            run: || {
-                // SAFETY: the terminal calls and requests on a descriptor that
-                // is not open, which the kernel refuses with EBADF once the
-                // filter has passed them. `termios` is plain data, so zeroes
-                // are valid.
-                unsafe {
-                    let mut settings: libc::termios = std::mem::zeroed();
-                    libc::ioctl(-1, libc::TCGETS, &mut settings);
-                    libc::ioctl(-1, libc::TCSETS, &settings);
-                    libc::ioctl(-1, libc::TCGETS2, &mut settings);
-                    libc::ioctl(-1, libc::TCSETS2, &settings);
-                    libc::ioctl(-1, libc::TCFLSH, libc::TCIFLUSH);
-                    libc::tcflush(-1, libc::TCIFLUSH);
-                    libc::tcgetattr(-1, &mut settings);
-                    libc::tcsetattr(-1, libc::TCSANOW, &settings);
-                }
-            },
+            run: restore_terminal,
         },
         #[cfg(target_arch = "x86_64")]
         Probe {
@@ -894,7 +931,55 @@ fn probes() -> Vec<Probe> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             },
         },
+        // The ioctl rule refuses two requests and passes every other one.
+        Probe {
+            what: "run a vCPU, KVM_RUN (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Allowed,
+            run: || ioctl_on_no_descriptor(kvm_run() as libc::c_ulong),
+        },
+        Probe {
+            what: "restore the terminal (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Allowed,
+            run: restore_terminal,
+        },
+        Probe {
+            what: "restore the terminal (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Allowed,
+            run: restore_terminal,
+        },
     ]
+}
+
+/// Makes the terminal calls and requests of the terminal restore.
+///
+/// `boot` restores the terminal on the main thread, after that thread has
+/// filtered itself. The fatal-signal handler and the panic hook restore it from
+/// whichever thread they run on. Each request is made directly too, since a
+/// libc call may give up before its last request on a descriptor that is not
+/// open.
+fn restore_terminal() {
+    // SAFETY: the terminal calls and requests on a descriptor that is not open,
+    // which the kernel refuses with EBADF once the filter has passed them.
+    // `termios` is plain data, so zeroes are valid.
+    unsafe {
+        let mut settings: libc::termios = std::mem::zeroed();
+        libc::ioctl(-1, libc::TCGETS, &mut settings);
+        libc::ioctl(-1, libc::TCSETS, &settings);
+        libc::ioctl(-1, libc::TCGETS2, &mut settings);
+        libc::ioctl(-1, libc::TCSETS2, &settings);
+        libc::ioctl(-1, libc::TCFLSH, libc::TCIFLUSH);
+        libc::tcflush(-1, libc::TCIFLUSH);
+        libc::tcgetattr(-1, &mut settings);
+        libc::tcsetattr(-1, libc::TCSANOW, &settings);
+    }
+}
+
+/// Returns the `KVM_RUN` request, which `vmm` and `vcpu` allow.
+const fn kvm_run() -> libc::Ioctl {
+    libc::_IO(kvm_bindings::KVMIO, 0x80)
 }
 
 /// Returns the `KVM_IRQ_LINE` request, which the `block` filter allows on
@@ -964,6 +1049,25 @@ fn open_each_way() {
         // SAFETY: terminating the child without running destructors.
         unsafe { libc::_exit(EXIT_REFUSED) };
     }
+}
+
+/// Calls `ioctl(-1, request, NULL)` through `syscall(2)`.
+///
+/// `syscall(2)` passes the request as a full 64-bit argument, which
+/// `libc::ioctl` cannot do on musl. The kernel refuses descriptor -1 with
+/// `EBADF` before it reads the request, so a call the filter passes reaches no
+/// terminal.
+fn ioctl_on_no_descriptor(request: libc::c_ulong) {
+    // SAFETY: an invalid descriptor and a null argument, which the kernel
+    // rejects without dereferencing anything.
+    unsafe {
+        libc::syscall(
+            libc::SYS_ioctl,
+            -1 as libc::c_long,
+            request,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
 }
 
 /// What a filter did with a probe's syscall, or is meant to do with it.
@@ -1360,8 +1464,7 @@ mod tests {
                 "request {request:#x}"
             );
         }
-        let run = libc::_IO(kvm_bindings::KVMIO, 0x80);
-        for request in [libc::FIONREAD, libc::TIOCSTI, run] {
+        for request in [libc::FIONREAD, libc::TIOCSTI, kvm_run()] {
             assert_eq!(
                 ioctl(request),
                 libc::SECCOMP_RET_TRAP,
@@ -1408,6 +1511,43 @@ mod tests {
                 assert!(
                     !forbidden.contains(&name),
                     "{key} allows {name}, which defeats installing the filter after setup"
+                );
+            }
+        }
+    }
+
+    // The filters of the architecture the test runs on. The kernel reads the
+    // request as a 32-bit unsigned int, so every refused request is also tried
+    // with bits 32-63 set.
+    #[test]
+    fn ioctl_traps_terminal_input_requests() {
+        let high = 0xffff_ffff_0000_0000u64;
+        for thread in [Thread::Vmm, Thread::Vcpu] {
+            let filters = installed(thread);
+            let ioctl =
+                |request: u64| verdict_with(&filters, libc::SYS_ioctl, [0, request, 0, 0, 0, 0]);
+            // A request is a 32-bit value, whatever the libc's type for it.
+            for refused in [libc::TIOCSTI as u32, libc::TIOCLINUX as u32] {
+                for request in [u64::from(refused), high | u64::from(refused)] {
+                    assert_eq!(
+                        ioctl(request),
+                        libc::SECCOMP_RET_TRAP,
+                        "{} passes ioctl request {request:#x}",
+                        thread.key()
+                    );
+                }
+            }
+            // KVM_RUN, TCSETS, and TIOCGWINSZ one above TIOCSTI.
+            for request in [
+                kvm_run() as u32,
+                libc::TCSETS as u32,
+                libc::TIOCGWINSZ as u32,
+            ] {
+                assert_eq!(
+                    ioctl(u64::from(request)),
+                    libc::SECCOMP_RET_ALLOW,
+                    "{} refuses ioctl request {request:#x}",
+                    thread.key()
                 );
             }
         }
