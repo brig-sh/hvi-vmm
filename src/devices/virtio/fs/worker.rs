@@ -157,7 +157,7 @@ impl Export {
             }
         };
         stderrln!(
-            "{LOG_PREFIX} virtio-fs[{index}]: peak {} of {} guest handles",
+            "{LOG_PREFIX} virtio-fs[{index}]: peak {} of the VM's {} guest handles",
             dev.peak_handles(),
             dev.handle_limit()
         );

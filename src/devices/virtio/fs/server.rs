@@ -1392,7 +1392,7 @@ impl DescriptorBudget {
             stderrln!(
                 "{} virtio-fs: the VM's exports hold their whole descriptor budget of {}, \
                  so the guest's opens get ENFILE until it closes some; a higher open-file \
-                 limit raises it",
+                 limit or kern.maxfilesperproc raises it",
                 crate::LOG_PREFIX,
                 self.limit()
             );

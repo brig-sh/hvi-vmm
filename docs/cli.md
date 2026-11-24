@@ -342,10 +342,11 @@ one handle budget, that number less a reserve for the rest of the VMM: 128, plus
 small to leave the guest 64 after the reserve, a second line says so, and the
 guest gets 64 anyway.
 
-On a clean stop, macOS reports each share's peak handle count:
+On a clean stop, macOS reports each share's peak handle count, against the
+budget the VM's shares draw on together:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 91964 guest handles
+[hvi] virtio-fs[0]: peak 1 of the VM's 91964 guest handles
 guest stopped: SystemOff
 ```
 

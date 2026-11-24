@@ -311,10 +311,11 @@ components itself. Treat containment as strong and tested, not as proven.
   macOS device's. On Linux those belong to the daemon, and its own
   documentation covers them.
 
-Each export reports its peak handle count on a clean stop:
+Each export reports its peak handle count on a clean stop, against the budget
+the VM's exports share:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 91964 guest handles
+[hvi] virtio-fs[0]: peak 1 of the VM's 91964 guest handles
 ```
 
 ### What to share
