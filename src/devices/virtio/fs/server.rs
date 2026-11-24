@@ -2086,8 +2086,13 @@ impl VirtioFs {
     /// not count has spent the room: another export, the rest of the VMM,
     /// another process filling the system-wide table, or the descriptors of a
     /// program that embeds hvi. The parked descriptors and cached directories
-    /// are the only descriptors the device can close without the guest's
-    /// say, so the requests after the refusal find room in what they held.
+    /// are kept only for speed, so closing them takes nothing the guest
+    /// holds, and the requests after the refusal find room in what they held.
+    ///
+    /// The readahead queue also holds descriptors the guest has no claim on,
+    /// a parent for each queued directory. They stay: there are at most
+    /// [`READAHEAD_MAX_QUEUED`], few next to what the caches give back, and
+    /// closing them would throw away listings prepared for the guest's walk.
     fn after_host_refusal(&mut self, opcode: u32, result: &Result<Vec<u8>, i32>) {
         // The device's own ENFILE: OPEN checks the guest's handle limit before
         // it asks the host. What is spent then is the guest's handles, not
