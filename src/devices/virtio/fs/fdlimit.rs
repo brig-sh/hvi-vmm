@@ -220,6 +220,10 @@ fn desired_limit(hard: u64) -> u64 {
 mod tests {
     use super::*;
 
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     #[test]
     fn an_unlimited_hard_limit_is_clamped_to_something_real() {
         // RLIM_INFINITY is not a descriptor count. Asking the kernel for it is
@@ -254,50 +258,102 @@ mod tests {
         u64::try_from(value).unwrap()
     }
 
+    /// Set in the child [`budget_above_cap_child`] runs in.
+    const ABOVE_CAP_CHILD: &str = "HVI_FDLIMIT_ABOVE_CAP_CHILD";
+
+    // A soft limit inherited from a shell can be far above the kernel's
+    // per-process cap, and macOS accepts it. A budget taken from the soft
+    // limit alone never fires, and a guest reading a large tree gets EMFILE
+    // from the host before this device refuses or evicts anything.
+    //
+    // The child puts its process in that state itself. Started from the
+    // default soft limit, `raise_open_file_limit` asks for `CEILING`, which
+    // can be below the cap, and then the unclamped budget fits too, so the
+    // check would pass with the bug in place.
+    //
+    // Run in a process of its own: the open-file limit is the process's, and
+    // the tests running alongside this one read it.
     #[test]
     fn the_budget_fits_under_what_the_kernel_gives_one_process() {
-        // A soft limit inherited from a shell can be far above the kernel's
-        // per-process cap, and macOS accepts it. A budget taken from the soft
-        // limit alone never fires, and a guest reading a large tree gets EMFILE
-        // from the host before this device refuses or evicts anything.
-        //
-        // The test puts the process in that state itself. Started from the
-        // default soft limit, `raise_open_file_limit` asks for `CEILING`,
-        // which can be below the cap, and then the unclamped budget fits
-        // too, so the check would pass with the bug in place.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "devices::virtio::fs::fdlimit::tests::budget_above_cap_child",
+                "--nocapture",
+            ])
+            .env(ABOVE_CAP_CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A child that hangs fails the test rather than holding it up.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child did not end");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert!(status.success(), "the child failed:\n{out}\n{err}");
+        assert!(
+            out.contains("above-cap-child: ok"),
+            "the child did not run its checks:\n{out}\n{err}"
+        );
+    }
+
+    #[test]
+    fn budget_above_cap_child() {
+        if std::env::var_os(ABOVE_CAP_CHILD).is_none() {
+            return;
+        }
         let cap = kernel_per_process_cap();
-        let mut original = libc::rlimit {
+        let mut lim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         // SAFETY: getrlimit writes into a struct we own and fully initialized.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
-            0
-        );
-        let mut above = original;
-        above.rlim_cur = cap + 1024;
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        lim.rlim_cur = cap + 1024;
         // SAFETY: setrlimit reads a struct we own and fully initialized.
-        assert_eq!(
-            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &above) },
-            0,
-            "could not set a soft limit above kern.maxfilesperproc"
-        );
+        let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0;
+        // Read back, since a host may hold the soft limit at the cap rather
+        // than refuse, and a hard limit below the cap refuses it outright.
+        let above = set && current_open_file_limit().is_some_and(|soft| soft > cap);
+
         let reported = raise_open_file_limit();
         let budget = u64::try_from(guest_handle_budget()).unwrap();
-        // Put the limit back before asserting, so a failure here does not
-        // leave the rest of the suite running above the cap. Raising again
-        // afterwards keeps the tests that run alongside this one from losing
-        // a raise they already made.
-        // SAFETY: as above.
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) };
-        let _ = raise_open_file_limit();
-
         assert!(
             budget + RESERVED_FOR_THE_VMM <= cap,
             "budget {budget} plus the reserve exceeds kern.maxfilesperproc {cap}"
         );
-        assert_eq!(reported, Ok(cap), "the startup log would not show the cap");
+        if above {
+            assert_eq!(reported, Ok(cap), "the startup log would not show the cap");
+        } else {
+            // This host will not hold a soft limit above the cap, so the
+            // state the bug needs cannot be set up here.
+            println!("above-cap-child: the soft limit could not go above the cap");
+        }
+        println!("above-cap-child: ok");
     }
 
     #[test]
