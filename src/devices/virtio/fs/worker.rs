@@ -222,10 +222,8 @@ impl Export {
 /// that reached the host, and how many were parked at the stop.
 ///
 /// The parked cache is sized as a share of the descriptor budget, not from
-/// what a workload reopens. The one measurement behind it is a kernel build
-/// that kept 8,231 descriptors parked and served 697,487 of 726,175 opens
-/// from them. This line is how a real workload says whether the bound
-/// costs it hits.
+/// what a workload reopens. This line is how a workload shows whether that
+/// bound costs it hits.
 fn parked_line(index: usize, hits: u64, misses: u64, parked: usize) -> String {
     format!("{LOG_PREFIX} virtio-fs[{index}] parked: hits={hits} misses={misses} held={parked}")
 }
