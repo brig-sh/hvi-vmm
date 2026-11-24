@@ -767,7 +767,7 @@ impl VirtioVsock {
     /// Returns whether connection `host_port` is still registered, so the
     /// device still holds its host stream.
     #[must_use]
-    pub fn has_conn(&self, host_port: u32) -> bool {
+    pub(crate) fn has_conn(&self, host_port: u32) -> bool {
         self.conns.contains_key(&host_port)
     }
 
@@ -1603,7 +1603,6 @@ pub fn wait_host_close(stream: &UnixStream, stop: &StopToken) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn hdr_roundtrip() {

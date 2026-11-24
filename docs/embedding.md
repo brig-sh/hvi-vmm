@@ -335,7 +335,9 @@ the device, ends the host connection.
 hvi relays at most 64 connections at once, since each one holds three host
 descriptors and two threads until it ends. A connection past that is accepted
 and closed at once, so the client reads EOF, and hvi logs that it reached the
-bound. A connection's place is free again once both sides have closed it.
+bound. A connection's place is free again once hvi has dropped the connection
+and both its relay threads have ended. A client that closes is enough for that,
+whether or not the guest ever answered.
 
 hvi sends host bytes only as fast as the guest reads them, and guest bytes only
 as fast as the host client reads them. While one side is behind, the other
