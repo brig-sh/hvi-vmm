@@ -70,6 +70,19 @@ pub const HOST_CID: u64 = 2;
 pub const GUEST_CID: u64 = 3;
 pub const AGENT_PORT: u32 = 1024;
 
+/// The most host connections the agent bridge relays at once.
+///
+/// Each one holds three descriptors until it ends: the host stream, and the
+/// two clones its reader and writer threads use. The descriptor table is the
+/// process's, so with no bound a host that opens connections faster than
+/// they end spends descriptors the rest of the VMM needs, virtio-fs among
+/// them. Past the bound the bridge accepts a connection and closes it at
+/// once, as Firecracker does.
+///
+/// An exec is one connection for as long as it runs, and a sandbox runs a
+/// few at once, so this leaves room for many more than it needs.
+pub(crate) const MAX_HOST_CONNECTIONS: usize = 64;
+
 const RX_QUEUE: u16 = 0; // device -> guest
 const TX_QUEUE: u16 = 1; // guest -> device
 /// The event queue (index 2) exists in the config but we never post to it.
@@ -751,6 +764,13 @@ impl VirtioVsock {
             .map(|c| Arc::clone(&c.writer_gate))
     }
 
+    /// Returns whether connection `host_port` is still registered, so the
+    /// device still holds its host stream.
+    #[must_use]
+    pub fn has_conn(&self, host_port: u32) -> bool {
+        self.conns.contains_key(&host_port)
+    }
+
     /// Sends what the host socket takes of the guest bytes waiting for it, and
     /// returns whether the connection still needs its bridge writer.
     ///
@@ -1319,6 +1339,31 @@ pub(crate) fn open(path: Option<&str>, ram: &Arc<GuestRam>) -> std::io::Result<O
     Ok(Some(Agent { device, bridge }))
 }
 
+/// One connection the bridge relays, and the threads that relay it.
+struct Relay {
+    /// The connection's host port in the device.
+    port: u32,
+    /// The thread that sends the host the guest's bytes, which holds one
+    /// clone of the host stream.
+    writer: JoinHandle<()>,
+    /// The thread that hands the device the host's bytes, which holds the
+    /// other clone.
+    reader: JoinHandle<()>,
+}
+
+impl Relay {
+    /// Returns whether any of the connection's descriptors is still open: the
+    /// device's stream while `dev` has the connection, and a clone while its
+    /// thread runs. A thread drops its clone before it is finished.
+    ///
+    /// The device can drop a connection while its threads still run, and the
+    /// threads can end while the device still has it, so the bridge counts a
+    /// connection against [`MAX_HOST_CONNECTIONS`] until all three are gone.
+    fn holds_descriptors(&self, dev: &VirtioVsock) -> bool {
+        !self.writer.is_finished() || !self.reader.is_finished() || dev.has_conn(self.port)
+    }
+}
+
 impl VsockBridge {
     /// Binds the agent socket at `path` for `dev`, first removing a stale
     /// socket a previous run left, which would make `bind` fail with
@@ -1360,8 +1405,9 @@ impl VsockBridge {
     /// seccomp filter of the thread that runs this.
     pub(crate) fn run(self, stop: &StopToken) {
         let Self { listener, dev, mem } = self;
-        let mut relays: Vec<JoinHandle<()>> = Vec::new();
+        let mut relays: Vec<Relay> = Vec::new();
         let mut gates = WriterGates(Vec::new());
+        let mut refusing = false;
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1374,6 +1420,23 @@ impl VsockBridge {
             let Ok((stream, _)) = listener.accept() else {
                 continue;
             };
+            {
+                let d = dev.lock().unwrap();
+                relays.retain(|relay| relay.holds_descriptors(&d));
+            }
+            if relays.len() >= MAX_HOST_CONNECTIONS {
+                // Logged once each time the bridge reaches the bound, rather
+                // than for every connection a busy client opens past it.
+                if !refusing {
+                    stderrln!(
+                        "{LOG_PREFIX} vsock bridge: {MAX_HOST_CONNECTIONS} connections are open; closing new ones until one ends"
+                    );
+                    refusing = true;
+                }
+                drop(stream);
+                continue;
+            }
+            refusing = false;
             let Ok(reader) = stream.try_clone() else {
                 continue;
             };
@@ -1392,26 +1455,22 @@ impl VsockBridge {
             let Some(writer_gate) = writer_gate else {
                 continue;
             };
-            relays.retain(|handle| !handle.is_finished());
             // A gate only this list holds belongs to a connection that is gone.
             gates.0.retain(|gate| Arc::strong_count(gate) > 1);
             gates.0.push(Arc::clone(&writer_gate));
-            relays.push(Self::spawn_writer(
-                &dev,
-                &mem,
-                stop,
+            relays.push(Relay {
                 port,
-                writer,
-                writer_gate,
-            ));
-            relays.push(Self::spawn_reader(&dev, &mem, stop, port, reader));
+                writer: Self::spawn_writer(&dev, &mem, stop, port, writer, writer_gate),
+                reader: Self::spawn_reader(&dev, &mem, stop, port, reader),
+            });
         }
         // Dropping the connections shuts their sockets down and opens their
         // gates, so every reader and writer ends.
         drop(gates);
         dev.lock().unwrap().drop_conns();
         for relay in relays {
-            let _ = relay.join();
+            let _ = relay.writer.join();
+            let _ = relay.reader.join();
         }
     }
 
@@ -1544,6 +1603,7 @@ pub fn wait_host_close(stream: &UnixStream, stop: &StopToken) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn hdr_roundtrip() {
@@ -1622,6 +1682,65 @@ mod tests {
         let bound = bind_at(&path);
         let _ = std::fs::remove_file(&path);
         bound.expect("the stale socket replaced");
+    }
+
+    /// Returns whether the bridge closed `conn`. A connection it relays to a
+    /// guest that has not answered carries nothing, so it stays unreadable.
+    ///
+    /// Polled rather than read with a timeout: macOS refuses to set a timeout
+    /// on a socket whose peer has closed it.
+    fn bridge_closed(conn: &mut UnixStream) -> bool {
+        let mut fds = [pollfd(conn.as_raw_fd())];
+        poll(&mut fds, Some(Instant::now() + Duration::from_millis(200))).unwrap();
+        fds[0].revents != 0 && matches!(conn.read(&mut [0u8; 1]), Ok(0))
+    }
+
+    // Every connection holds descriptors and threads until it ends, out of a
+    // table virtio-fs and the rest of the VMM draw on too. A client that opens
+    // them faster than they end must not spend it.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn the_bridge_closes_connections_past_its_bound() {
+        let path = std::env::temp_dir().join(format!("hvi-agent-bound-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let bridge = bind_at(&path).unwrap();
+        let stop = crate::teardown::StopSource::new().unwrap();
+        let token = stop.token();
+        let running = std::thread::spawn(move || bridge.run(&token));
+        let connect = || UnixStream::connect(&path).unwrap();
+
+        let mut open: Vec<UnixStream> = (0..MAX_HOST_CONNECTIONS).map(|_| connect()).collect();
+        let mut past = connect();
+        assert!(
+            bridge_closed(&mut past),
+            "a connection past the bound was kept"
+        );
+        // The bridge accepts in order, so every earlier one was taken.
+        for (i, conn) in open.iter_mut().enumerate().take(3) {
+            assert!(
+                !bridge_closed(conn),
+                "connection {i}, within the bound, was closed"
+            );
+        }
+
+        // One ends, and once its descriptors are closed its place is free.
+        drop(open.pop());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let kept = loop {
+            let mut next = connect();
+            if !bridge_closed(&mut next) {
+                break next;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the place of a closed connection was never freed"
+            );
+        };
+
+        stop.request_stop();
+        running.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        drop(kept);
     }
 }
 

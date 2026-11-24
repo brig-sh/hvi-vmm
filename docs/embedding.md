@@ -332,6 +332,11 @@ ways. When either side closes, the other reads EOF: a host client that closes
 ends the guest stream, and a guest that closes, or a guest driver that resets
 the device, ends the host connection.
 
+hvi relays at most 64 connections at once, since each one holds three host
+descriptors and two threads until it ends. A connection past that is accepted
+and closed at once, so the client reads EOF, and hvi logs that it reached the
+bound. A connection's place is free again once both sides have closed it.
+
 hvi sends host bytes only as fast as the guest reads them, and guest bytes only
 as fast as the host client reads them. While one side is behind, the other
 side's writes block. A host client that writes without reading can therefore
