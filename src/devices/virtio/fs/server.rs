@@ -2063,6 +2063,9 @@ impl VirtioFs {
             SETUPMAPPING | REMOVEMAPPING => Err(EOPNOTSUPP),
             _ => Err(ENOSYS),
         };
+        if matches!(result, Err(EMFILE | ENFILE)) {
+            self.after_host_refusal(opcode, &result);
+        }
         self.note_op_time(opcode, op_start);
         if self.lock_to_park.is_some() {
             // A SETLKW on a held lock: answered from `retry_lock_waiters`
@@ -2072,6 +2075,43 @@ impl VirtioFs {
         match result {
             Ok(payload) => success_response(unique, &payload),
             Err(errno) => error_response(unique, errno),
+        }
+    }
+
+    /// Gives back part of what the device keeps for speed after a request
+    /// failed with `result` for want of a descriptor. The guest gets the
+    /// refusal either way.
+    ///
+    /// The host refuses below the budget only when something the budget does
+    /// not count has spent the room: another export, the rest of the VMM,
+    /// another process filling the system-wide table, or the descriptors of a
+    /// program that embeds hvi. The parked descriptors and cached directories
+    /// are the only descriptors the device can close without the guest's
+    /// say, so the requests after the refusal find room in what they held.
+    fn after_host_refusal(&mut self, opcode: u32, result: &Result<Vec<u8>, i32>) {
+        // The device's own ENFILE: OPEN checks the guest's handle limit before
+        // it asks the host. What is spent then is the guest's handles, not
+        // the caches, so closing those would cost the next opens their hits
+        // and win nothing.
+        if opcode == OPEN && *result == Err(ENFILE) && self.open_handle_count() >= self.handle_limit
+        {
+            return;
+        }
+        self.give_back_descriptors();
+    }
+
+    /// Closes half the parked descriptors and half the cached directories,
+    /// oldest first, and at least one of each where there is one.
+    ///
+    /// Half rather than all: the refusal says the table is full now, not how
+    /// much room the next requests need, and emptying both caches would make
+    /// every open after it pay the host for a walk it had already made.
+    fn give_back_descriptors(&mut self) {
+        for _ in 0..self.parked.len().div_ceil(2) {
+            self.evict_one_parked();
+        }
+        for _ in 0..self.dirs.held().div_ceil(2) {
+            self.dirs.evict_one();
         }
     }
 
@@ -13193,6 +13233,150 @@ mod tests {
         }
         assert_eq!(opened, 4, "the guest got its four handles");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Set in the child [`host_refusal_child`] runs in.
+    const HOST_REFUSAL_CHILD: &str = "HVI_VIRTIO_FS_HOST_REFUSAL_CHILD";
+
+    // The budget leaves the rest of the process a reserve, but something it
+    // does not count can still spend the room: the rest of the VMM, another
+    // process, or a soft limit the budget got wrong. Then the host refuses
+    // first, and the device gives back what it keeps only for speed, so the
+    // guest's next request is served.
+    //
+    // Run in a process of its own, because it lowers the open-file limit.
+    #[test]
+    fn a_host_refusal_gives_back_parked_descriptors() {
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "devices::virtio::fs::server::tests::host_refusal_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HOST_REFUSAL_CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A child that hangs fails the test rather than holding it up.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child did not end");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert!(status.success(), "the child failed:\n{out}\n{err}");
+        assert!(
+            out.contains("host-refusal-child: ok"),
+            "the child did not run its checks:\n{out}\n{err}"
+        );
+    }
+
+    #[test]
+    fn host_refusal_child() {
+        const FILES: usize = 400;
+        if std::env::var_os(HOST_REFUSAL_CHILD).is_none() {
+            return;
+        }
+        let (dir, mut dev) = fixture_with_access(true);
+        for i in 0..FILES {
+            fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        // An estimate far above what the host will give, as a soft limit
+        // above kern.maxfilesperproc produced.
+        dev.handle_limit = 1_000_000;
+        dev.parked_limit = 1_000_000;
+        let nodes: Vec<u64> = (0..FILES)
+            .map(|i| lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes()))
+            .collect();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into a struct we own and fully initialized.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        lim.rlim_cur = 128;
+        // SAFETY: setrlimit reads a struct we own and fully initialized.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
+
+        // The guest gets the host's refusal, as a program would, and tries
+        // again once, as one that handles it would.
+        let mut refused = 0;
+        let mut open_again_once = |dev: &mut VirtioFs, node: u64| match try_open(dev, node, 0) {
+            Err(e) if e == EMFILE || e == ENFILE => {
+                refused += 1;
+                try_open(dev, node, 0)
+            }
+            other => other,
+        };
+
+        // Open and release every file once. Each release parks a descriptor,
+        // so the host refuses long before the last file. Each refusal closes
+        // half the parked descriptors, so the open after it is served.
+        for (i, node) in nodes.iter().enumerate() {
+            let fh = open_again_once(&mut dev, *node)
+                .unwrap_or_else(|e| panic!("open {i} of {FILES} was refused twice, with {e}"));
+            release_handle(&mut dev, *node, fh);
+        }
+
+        // Now hold every handle. Once nothing is left to give back, the host
+        // refuses for real, and the guest is told so.
+        let mut held = Vec::new();
+        let mut refusal = None;
+        for node in &nodes {
+            match open_again_once(&mut dev, *node) {
+                Ok(fh) => held.push((*node, fh)),
+                Err(e) => {
+                    refusal = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(refusal, Some(e) if e == EMFILE || e == ENFILE),
+            "the guest got {refusal:?} rather than a descriptor-limit errno"
+        );
+        assert!(held.len() > 64, "only {} handles were served", held.len());
+
+        // Once the guest lets go, it is served again: nothing it did left the
+        // export stuck at the host's limit.
+        for (node, fh) in held {
+            release_handle(&mut dev, node, fh);
+        }
+        for node in &nodes {
+            let fh = open_again_once(&mut dev, *node)
+                .expect("refused twice after the handles were released");
+            release_handle(&mut dev, *node, fh);
+        }
+        assert!(refused > 0, "the host never refused, so nothing was tested");
+        let _ = fs::remove_dir_all(dir);
+        println!("host-refusal-child: ok");
     }
 
     // A guest cannot spend the host's whole descriptor table on open handles.
