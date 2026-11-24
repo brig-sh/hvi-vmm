@@ -64,13 +64,10 @@ const CEILING: u64 = 65_536;
 /// open, less the reserve, so raising `RLIMIT_NOFILE` raises it too.
 ///
 /// "Really open" is the soft limit or the kernel's per-process cap, whichever
-/// is lower. A soft limit inherited from a shell can sit far above that cap:
-/// `ulimit -n 1048576` is accepted, and macOS still refuses the 92,161st
-/// descriptor. A budget taken from the soft limit alone was then a million,
-/// the parked-descriptor cache a quarter of that, and neither ever fired. A
-/// guest that read a 100,000-file tree left hvi holding 91,000 descriptors
-/// until the kernel answered EMFILE, and no limit or eviction in this device
-/// had run.
+/// is lower. A soft limit inherited from a shell can sit far above that cap,
+/// and macOS accepts it. A budget taken from the soft limit alone is then
+/// never reached: the kernel answers EMFILE first, before any limit or
+/// eviction in this device has run.
 ///
 /// The guest sees ENFILE on the request that would have crossed it, which is
 /// the errno for "the host is out", and the VMM keeps working.
@@ -260,15 +257,14 @@ mod tests {
     #[test]
     fn the_budget_fits_under_what_the_kernel_gives_one_process() {
         // A soft limit inherited from a shell can be far above the kernel's
-        // per-process cap: `ulimit -n 1048576` is accepted, and macOS still
-        // refuses the 92,161st descriptor. A budget taken from the soft limit
-        // alone never fires, and a guest reading a large tree gets EMFILE from
-        // the host before this device refuses or evicts anything.
+        // per-process cap, and macOS accepts it. A budget taken from the soft
+        // limit alone never fires, and a guest reading a large tree gets EMFILE
+        // from the host before this device refuses or evicts anything.
         //
         // The test puts the process in that state itself. Started from the
         // default soft limit, `raise_open_file_limit` asks for `CEILING`,
-        // which is below the cap on the hosts measured, and the unclamped
-        // budget fits too, so the check would pass with the bug in place.
+        // which can be below the cap, and then the unclamped budget fits
+        // too, so the check would pass with the bug in place.
         let cap = kernel_per_process_cap();
         let mut original = libc::rlimit {
             rlim_cur: 0,
