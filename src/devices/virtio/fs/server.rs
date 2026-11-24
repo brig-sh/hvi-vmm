@@ -1370,6 +1370,8 @@ pub(crate) struct DescriptorBudget {
     /// Every export drawing on this budget. Locked before an export's parked
     /// cache and never after one, so the order is always the same.
     exports: Mutex<Vec<Arc<ExportDescriptors>>>,
+    /// Whether the budget has refused a request, so that is logged once.
+    refused: AtomicBool,
 }
 
 impl DescriptorBudget {
@@ -1377,7 +1379,23 @@ impl DescriptorBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(limit),
             exports: Mutex::new(Vec::new()),
+            refused: AtomicBool::new(false),
         })
+    }
+
+    /// Logs the first refusal, so the operator of a guest that sees ENFILE
+    /// can tell which limit it met and what raises it.
+    fn note_refusal(&self) {
+        if !self.refused.swap(true, Ordering::Relaxed) {
+            // stderrln!, not eprintln!: a failed write to stderr must not
+            // abort the VM.
+            stderrln!(
+                "{} virtio-fs: the guest holds its whole descriptor budget of {}, so its \
+                 opens get ENFILE until it closes some; a higher open-file limit raises it",
+                crate::LOG_PREFIX,
+                self.limit()
+            );
+        }
     }
 
     fn exports(&self) -> MutexGuard<'_, Vec<Arc<ExportDescriptors>>> {
@@ -3558,6 +3576,7 @@ impl VirtioFs {
             if self.budget.evict_one_elsewhere(&self.own) {
                 continue;
             }
+            self.budget.note_refusal();
             return Err(ENFILE);
         }
         Ok(())
@@ -13788,6 +13807,10 @@ mod tests {
         assert_eq!(opened, 4, "exactly the limit was served");
         assert_eq!(dev.open_handle_count(), 4);
         assert_eq!(dev.peak_handles(), 4, "the high-water mark was recorded");
+        assert!(
+            dev.budget.refused.load(Ordering::Relaxed),
+            "the refusal was not noted for the log"
+        );
 
         // Releasing one lets the next through, so the limit is a ceiling on
         // what is held at once and not on what a guest may ever open.

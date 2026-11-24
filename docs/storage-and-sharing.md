@@ -294,11 +294,12 @@ components itself. Treat containment as strong and tested, not as proven.
   `CREATE` or `TMPFILE` past it first closes descriptors kept only for speed:
   its own export's parked descriptors and cached directories, then the parked
   descriptors of the other exports. It is refused with `ENFILE` if none are
-  left. If the host refuses a descriptor first, the guest gets the refusal, and
-  the export closes half of its own parked descriptors and cached directories
-  and half of the other exports' parked descriptors, so the requests after it
-  find room. The budget does not move. An export's cached directories are closed
-  only by that export.
+  left, and the first such refusal is logged with the budget. If the host
+  refuses a descriptor first, the guest gets the refusal, and the export closes
+  half of its own parked descriptors and cached directories and half of the
+  other exports' parked descriptors, so the requests after it find room. The
+  budget does not move. An export's cached directories are closed only by that
+  export.
 - **One request queue per share on macOS**, plus a hiprio queue. A Linux
   export takes `num_queues=`. No DAX window. The
   device reports no shared memory region, and a guest built with `FUSE_DAX`
