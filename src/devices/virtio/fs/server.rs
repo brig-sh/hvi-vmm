@@ -1390,8 +1390,9 @@ impl DescriptorBudget {
             // stderrln!, not eprintln!: a failed write to stderr must not
             // abort the VM.
             stderrln!(
-                "{} virtio-fs: the guest holds its whole descriptor budget of {}, so its \
-                 opens get ENFILE until it closes some; a higher open-file limit raises it",
+                "{} virtio-fs: the VM's exports hold their whole descriptor budget of {}, \
+                 so the guest's opens get ENFILE until it closes some; a higher open-file \
+                 limit raises it",
                 crate::LOG_PREFIX,
                 self.limit()
             );

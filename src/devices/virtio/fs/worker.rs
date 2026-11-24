@@ -64,21 +64,22 @@ pub(crate) fn attach(shares: &[FsShare], agent: bool) -> io::Result<Vec<Export>>
     let reserve = fdlimit::reserve(shares.len(), agent);
     if !shares.is_empty() {
         match fdlimit::raise_open_file_limit() {
-            Ok(limit) => {
-                eprintln!("{LOG_PREFIX} open-file limit: {limit}");
-                if limit < reserve.saturating_add(fdlimit::MIN_BUDGET as u64) {
-                    eprintln!(
-                        "{LOG_PREFIX} open-file limit: {limit} leaves no room for the \
-                         {reserve} the VMM holds beside the shares; the guest gets \
-                         {} anyway, so a busy guest can make the host refuse the VMM",
-                        fdlimit::MIN_BUDGET
-                    );
-                }
-            }
+            Ok(limit) => eprintln!("{LOG_PREFIX} open-file limit: {limit}"),
             Err(e) => eprintln!(
                 "{LOG_PREFIX} open-file limit: could not raise it ({e}); \
                  a busy guest may see EMFILE as I/O errors"
             ),
+        }
+        // Checked after the raise whether or not it worked: a process that
+        // could not raise its limit is the one most likely to be short.
+        let limit = fdlimit::usable_now();
+        if limit < reserve.saturating_add(fdlimit::MIN_BUDGET as u64) {
+            eprintln!(
+                "{LOG_PREFIX} open-file limit: {limit} leaves no room for the \
+                 {reserve} the VMM holds beside the shares; the guest gets \
+                 {} anyway, so a busy guest can make the host refuse the VMM",
+                fdlimit::MIN_BUDGET
+            );
         }
     }
     // One budget for every export: the descriptor table they draw on is the

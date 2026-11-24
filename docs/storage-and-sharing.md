@@ -314,7 +314,7 @@ components itself. Treat containment as strong and tested, not as proven.
 Each export reports its peak handle count on a clean stop:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 92032 guest handles
+[hvi] virtio-fs[0]: peak 1 of 91964 guest handles
 ```
 
 ### What to share

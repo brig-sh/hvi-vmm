@@ -101,8 +101,15 @@ const CEILING: u64 = 65_536;
 /// the process's: see `server::DescriptorBudget`.
 #[must_use]
 pub fn guest_handle_budget(reserve: u64) -> usize {
+    budget_within(usable_now(), reserve)
+}
+
+/// How many descriptors the process can hold right now: the soft limit or
+/// the kernel's per-process cap, whichever is lower.
+#[must_use]
+pub fn usable_now() -> u64 {
     let soft = current_open_file_limit().unwrap_or(256);
-    budget_within(clamp_soft_limit(soft, per_process_cap()), reserve)
+    clamp_soft_limit(soft, per_process_cap())
 }
 
 /// What a process that can hold `usable` descriptors gives the guest when the

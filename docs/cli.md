@@ -345,7 +345,7 @@ guest gets 64 anyway.
 On a clean stop, macOS reports each share's peak handle count:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 92032 guest handles
+[hvi] virtio-fs[0]: peak 1 of 91964 guest handles
 guest stopped: SystemOff
 ```
 
