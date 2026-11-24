@@ -209,8 +209,8 @@ impl Export {
             })
             .collect();
         stderrln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
-        let (hits, misses, parked) = dev.descriptor_cache_stats();
-        stderrln!("{}", parked_line(index, hits, misses, parked));
+        let (parked_hits, parked_misses, parked) = dev.descriptor_cache_stats();
+        stderrln!("{}", parked_line(index, parked_hits, parked_misses, parked));
         let (hits, waits, misses) = dev.readahead_stats();
         stderrln!(
             "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
@@ -219,7 +219,9 @@ impl Export {
 }
 
 /// The stop report's line on parked descriptors: opens served from one, opens
-/// that reached the host, and how many were parked at the stop.
+/// that reached the host, and how many were parked at the stop. The first two
+/// count from boot and the third is the moment of the stop, so a guest that
+/// reset the device shows few held next to large counts.
 ///
 /// The parked cache is sized as a share of the descriptor budget, not from
 /// what a workload reopens. This line is how a workload shows whether that
