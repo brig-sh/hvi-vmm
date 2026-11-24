@@ -337,7 +337,10 @@ booting Image with 1024 MiB ...
 share is configured, because the limit is raised while the first share is set
 up. The number is what the process can really hold: the soft `RLIMIT_NOFILE` or
 the kernel's `kern.maxfilesperproc`, whichever is lower. The VM's shares draw on
-one handle budget, that number less 128.
+one handle budget, that number less a reserve for the rest of the VMM: 128, plus
+68 for each share and 3069 when `--agent-sock` is set. When the limit is too
+small to leave the guest 64 after the reserve, a second line says so, and the
+guest gets 64 anyway.
 
 On a clean stop, macOS reports each share's peak handle count:
 

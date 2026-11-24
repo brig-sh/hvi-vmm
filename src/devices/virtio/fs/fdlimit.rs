@@ -40,29 +40,59 @@
 
 use std::sync::OnceLock;
 
-/// Descriptors held back for everything in the VMM that is not virtio-fs.
+/// Descriptors held back for the parts of the VMM whose count is fixed when
+/// it starts.
 ///
 /// The descriptor table belongs to the process, not to one device: the block
-/// device, the event ledger, the control socket, the vsock bridge and stdio
-/// all draw on it. A guest that spends the last descriptor therefore breaks
-/// parts of the VMM it never talks to, and only virtio-fs translates the
-/// failure into an errno the guest can understand -- everything else fails
-/// with no clear cause (#34).
+/// device, the event ledger, the control socket, the network connection,
+/// stdio and the devices' notification descriptors all draw on it, and so
+/// does a virtio-fs request while it is served. A guest that spends the last
+/// descriptor therefore breaks parts of the VMM it never talks to, and only
+/// virtio-fs translates the failure into an errno the guest can understand
+/// -- everything else fails with no clear cause.
 ///
-/// So the guest never gets the last of them. This is the reserve.
+/// So the guest never gets the last of them. This is the fixed part of the
+/// reserve; see [`reserve`] for the rest.
 const RESERVED_FOR_THE_VMM: u64 = 128;
+
+/// The descriptors a VM with `exports` exports, and an agent bridge if
+/// `agent`, holds beside its exports' budget.
+///
+/// Beside a fixed part, `RESERVED_FOR_THE_VMM`, two parts grow while the VM
+/// runs, and each is bounded where it is made: an export's readahead workers
+/// hold up to `server::READAHEAD_DESCRIPTORS`, and the agent bridge relays
+/// up to `vsock::MAX_HOST_CONNECTIONS` connections of
+/// `vsock::DESCRIPTORS_PER_CONNECTION` each. With every part reserved, the
+/// host refuses a descriptor below the budget only when the system-wide
+/// table is full or a program that embeds hvi holds the room.
+#[must_use]
+pub fn reserve(exports: usize, agent: bool) -> u64 {
+    let readahead = exports.saturating_mul(super::server::READAHEAD_DESCRIPTORS);
+    let bridge = if agent {
+        crate::devices::virtio::vsock::MAX_HOST_CONNECTIONS
+            * crate::devices::virtio::vsock::DESCRIPTORS_PER_CONNECTION
+    } else {
+        0
+    };
+    RESERVED_FOR_THE_VMM
+        .saturating_add(u64::try_from(readahead.saturating_add(bridge)).unwrap_or(u64::MAX))
+}
+
+/// The fewest descriptors a guest is given, whatever the reserve: fewer
+/// cannot run a shell.
+pub const MIN_BUDGET: usize = 64;
 
 /// The most this module asks the kernel for.
 const CEILING: u64 = 65_536;
 
-/// How many host descriptors a virtio-fs export may pin for guest handles.
+/// How many host descriptors a VM's exports may pin between them, when the
+/// rest of the VM holds `reserve`.
 ///
 /// Derived from the limit actually in force rather than written down, which
 /// is the point: a fixed number is either so low that it breaks a real build
-/// -- the measured working set of one is ~2134 descriptors, see above -- or
-/// so high that it is not a limit. This one is what the process can really
-/// open, less the reserve, so raising `RLIMIT_NOFILE` raises it too. See
-/// `clamp_soft_limit` for what the process can really open.
+/// or so high that it is not a limit. This one is what the process can
+/// really open, less the reserve, so raising `RLIMIT_NOFILE` raises it too.
+/// See `clamp_soft_limit` for what the process can really open.
 ///
 /// The guest sees ENFILE on the request that would have crossed it, which is
 /// the errno for "the host is out", and the VMM keeps working.
@@ -70,12 +100,20 @@ const CEILING: u64 = 65_536;
 /// The budget is the VM's, shared by all its exports, because the table is
 /// the process's: see `server::DescriptorBudget`.
 #[must_use]
-pub fn guest_handle_budget() -> usize {
+pub fn guest_handle_budget(reserve: u64) -> usize {
     let soft = current_open_file_limit().unwrap_or(256);
-    let usable = clamp_soft_limit(soft, per_process_cap());
-    usize::try_from(usable.saturating_sub(RESERVED_FOR_THE_VMM))
+    budget_within(clamp_soft_limit(soft, per_process_cap()), reserve)
+}
+
+/// What a process that can hold `usable` descriptors gives the guest when the
+/// rest of the VM holds `reserve`: the difference, but never less than
+/// [`MIN_BUDGET`]. When the floor applies, the guest's handles eat into the
+/// reserve, and the caller says so.
+#[must_use]
+pub fn budget_within(usable: u64, reserve: u64) -> usize {
+    usize::try_from(usable.saturating_sub(reserve))
         .unwrap_or(usize::MAX)
-        .max(64)
+        .max(MIN_BUDGET)
 }
 
 /// Returns how many descriptors a process with the soft limit `soft` can hold
@@ -312,7 +350,7 @@ mod tests {
         let above = set && current_open_file_limit().is_some_and(|soft| soft > cap);
 
         let reported = raise_open_file_limit();
-        let budget = u64::try_from(guest_handle_budget()).unwrap();
+        let budget = u64::try_from(guest_handle_budget(RESERVED_FOR_THE_VMM)).unwrap();
         assert!(
             budget + RESERVED_FOR_THE_VMM <= cap,
             "budget {budget} plus the reserve exceeds kern.maxfilesperproc {cap}"
@@ -359,5 +397,30 @@ mod tests {
             Ok(now) => assert!(now >= before, "the limit went down: {before} -> {now}"),
             Err(e) => panic!("could not raise the open-file limit: {e}"),
         }
+    }
+
+    // The reserve grows with what the VM can hold beside its budget, so a
+    // second export or an agent bridge takes its descriptors from the guest's
+    // budget rather than from the room the rest of the VMM needs.
+    #[test]
+    fn the_reserve_counts_each_export_and_the_agent_bridge() {
+        let readahead = u64::try_from(super::super::server::READAHEAD_DESCRIPTORS).unwrap();
+        let bridge = u64::try_from(
+            crate::devices::virtio::vsock::MAX_HOST_CONNECTIONS
+                * crate::devices::virtio::vsock::DESCRIPTORS_PER_CONNECTION,
+        )
+        .unwrap();
+        assert_eq!(reserve(0, false), RESERVED_FOR_THE_VMM);
+        assert_eq!(reserve(2, false), RESERVED_FOR_THE_VMM + 2 * readahead);
+        assert_eq!(reserve(1, true), RESERVED_FOR_THE_VMM + readahead + bridge);
+    }
+
+    // The budget is what the process can hold less the reserve. A limit too
+    // small to leave a guest a shell after the reserve still gives it one.
+    #[test]
+    fn the_budget_is_the_usable_limit_less_the_reserve() {
+        assert_eq!(budget_within(16_384, 456), 16_384 - 456);
+        assert_eq!(budget_within(256, 456), MIN_BUDGET);
+        assert_eq!(budget_within(456 + MIN_BUDGET as u64, 456), MIN_BUDGET);
     }
 }

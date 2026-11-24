@@ -554,7 +554,7 @@ const READAHEAD_MAX_DIRS: usize = 256;
 ///
 /// A queued directory holds its parent's descriptor, shared with its siblings,
 /// so this also bounds the descriptors the queue holds. They are not in the
-/// descriptor budget and come out of the VMM's reserve in [`fdlimit`].
+/// descriptor budget; see [`READAHEAD_DESCRIPTORS`].
 const READAHEAD_MAX_QUEUED: usize = 64;
 
 /// Subdirectories a worker queues from one directory it prepared, the first
@@ -571,6 +571,12 @@ const READAHEAD_DEPTH: u8 = 3;
 /// Worker threads a readahead runs. Two measured better than one or
 /// three: one falls behind a walk, three take CPU from the vCPUs.
 const READAHEAD_WORKERS: usize = 2;
+
+/// The most descriptors one export's readahead holds outside the descriptor
+/// budget: a parent descriptor for each queued directory, and two for each
+/// worker while it opens a directory. `fdlimit::reserve` leaves room for
+/// them.
+pub(crate) const READAHEAD_DESCRIPTORS: usize = READAHEAD_MAX_QUEUED + 2 * READAHEAD_WORKERS;
 
 /// How long a thread spins before it parks. A parked thread on macOS wakes
 /// tens of microseconds after it is signaled, which is longer than a small
@@ -1631,8 +1637,9 @@ impl VirtioFs {
         // parked cache is a quarter of it: enough for the working set of
         // headers a compiler reopens, small enough that the guest can still
         // hold the handles it is entitled to.
-        let own = Arc::new(ExportDescriptors::new(fdlimit::guest_handle_budget() / 4));
-        let budget = DescriptorBudget::new(fdlimit::guest_handle_budget());
+        let limit = fdlimit::guest_handle_budget(fdlimit::reserve(1, false));
+        let own = Arc::new(ExportDescriptors::new(limit / 4));
+        let budget = DescriptorBudget::new(limit);
         budget.register(Arc::clone(&own));
         Ok(Self {
             root,
@@ -5421,7 +5428,7 @@ fn sync_file(file: &File, flags: u32) -> Result<(), i32> {
 /// budget on a 256-descriptor soft limit, which would let the cache meet the
 /// handle limit with no guest handle open at all.
 fn dir_cache_limit() -> usize {
-    let budget = fdlimit::guest_handle_budget();
+    let budget = fdlimit::guest_handle_budget(fdlimit::reserve(1, false));
     (budget / 16).clamp(128, 4096).min(budget / 4)
 }
 
