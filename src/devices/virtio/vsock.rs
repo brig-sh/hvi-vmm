@@ -1700,6 +1700,33 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     #[test]
     fn the_bridge_closes_connections_past_its_bound() {
+        // The test holds a descriptor per client and the bridge three per
+        // connection, more than macOS's default soft limit of 256. Raising
+        // it toward the hard limit touches no other test; a host that will
+        // not raise it far enough cannot run this one.
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into a struct we own and fully initialized.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        let needed = 1024;
+        if lim.rlim_cur < needed {
+            let mut raised = lim;
+            raised.rlim_cur = needed.min(lim.rlim_max);
+            // SAFETY: setrlimit reads a struct we own and fully initialized.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0
+                || raised.rlim_cur < needed
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "the_bridge_closes_connections_past_its_bound: skipped, \
+                     the open-file limit cannot reach {needed}"
+                );
+                return;
+            }
+        }
         let path = std::env::temp_dir().join(format!("hvi-agent-bound-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let bridge = bind_at(&path).unwrap();
