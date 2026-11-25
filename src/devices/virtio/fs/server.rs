@@ -230,7 +230,6 @@ const HVI_XATTR_LINUX_ATTR: &[u8] = b"com.nofire.hvi.linux-attr";
 const HOST_XATTR_PREFIX: &[u8] = b"com.apple.";
 /// Length of the `HVI_XATTR_LINUX_ATTR` value: mode, uid and gid, each a
 /// little-endian `u32`.
-#[cfg(target_os = "macos")]
 const GUEST_ATTR_LEN: usize = 12;
 
 const LINUX_F_RDLCK: u32 = 0;
@@ -528,10 +527,7 @@ struct PreparedDir {
 /// host sleeps, so a listing prepared before a lid close would come back
 /// from it no older than it went in.
 fn clock_with_sleep() -> std::time::Duration {
-    #[cfg(target_os = "macos")]
     const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
-    #[cfg(not(target_os = "macos"))]
-    const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -1037,12 +1033,9 @@ fn prepare_dir(dir_fd: BorrowedFd<'_>, stopping: &AtomicBool) -> Option<Prepared
         let Ok(meta) = Stat::at(dir_fd, &name) else {
             continue;
         };
-        #[cfg(target_os = "macos")]
         let guest = open_entry_nofollow(dir_fd, &name)
             .ok()
             .and_then(|fd| stored_guest_attr(fd.as_fd()));
-        #[cfg(not(target_os = "macos"))]
-        let guest = None;
         entries.push(PreparedEntry { info, meta, guest });
     }
     // Listing order, which is the order a walk descends in.
@@ -1162,8 +1155,7 @@ struct Node {
     open_handles: u64,
     /// Cached `com.nofire.hvi.linux-attr`. `Some(None)` means "checked, not
     /// present" so a miss costs no syscall either. Invalidated whenever this
-    /// module writes the xattr or changes ownership/mode. macOS only; on
-    /// Linux `guest_attr` has no xattr path, so this is simply never filled.
+    /// module writes the xattr or changes ownership/mode.
     guest_attr: Option<Option<GuestAttr>>,
 }
 
@@ -1569,11 +1561,6 @@ impl VirtioFs {
 
     fn note_zero_copy_write(&self) {
         self.zero_copy_writes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Sets the waker of the worker thread that serves the queue work a vCPU
@@ -2361,13 +2348,11 @@ impl VirtioFs {
         // descriptor for it rather than for its parent. A request carrying a
         // handle already has one open; otherwise the entry is opened through
         // the parent resolved above.
-        #[cfg(target_os = "macos")]
         let metadata_fd: Option<OwnedFd> = match (handle, entry.as_ref()) {
             (Some(_), _) => None,
             (None, Some((dirfd, name))) => Some(open_entry_nofollow(dirfd.as_fd(), name)?),
             (None, None) => None,
         };
-        #[cfg(target_os = "macos")]
         let meta_fd: Option<BorrowedFd<'_>> = match handle {
             Some(h) => Some(h.file.as_fd()),
             None => metadata_fd.as_ref().map(|fd| fd.as_fd()),
@@ -2387,41 +2372,20 @@ impl VirtioFs {
         }
 
         if valid & (FATTR_UID | FATTR_GID) != 0 {
-            #[cfg(target_os = "macos")]
-            {
-                let current_meta = if let Some(handle) = handle {
-                    Stat::of_file(&handle.file)?
-                } else {
-                    let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
-                    Stat::at(dirfd.as_fd(), name)?
-                };
-                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids);
-                if valid & FATTR_UID != 0 {
-                    guest.uid = uid;
-                }
-                if valid & FATTR_GID != 0 {
-                    guest.gid = gid;
-                }
-                set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
+            let current_meta = if let Some(handle) = handle {
+                Stat::of_file(&handle.file)?
+            } else {
+                let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
+                Stat::at(dirfd.as_fd(), name)?
+            };
+            let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids);
+            if valid & FATTR_UID != 0 {
+                guest.uid = uid;
             }
-            #[cfg(target_os = "linux")]
-            {
-                let host_uid = if valid & FATTR_UID != 0 {
-                    Some(guest_uid_to_host(uid, self.ids))
-                } else {
-                    None
-                };
-                let host_gid = if valid & FATTR_GID != 0 {
-                    Some(guest_gid_to_host(gid, self.ids))
-                } else {
-                    None
-                };
-                if let Some(handle) = handle {
-                    host_fchown(&handle.file, host_uid, host_gid)?;
-                } else {
-                    host_lchown(path.as_deref().ok_or(EINVAL)?, host_uid, host_gid)?;
-                }
+            if valid & FATTR_GID != 0 {
+                guest.gid = gid;
             }
+            set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
         }
 
         if valid & (FATTR_MODE | FATTR_KILL_SUIDGID) != 0 {
@@ -2439,47 +2403,31 @@ impl VirtioFs {
             if valid & FATTR_KILL_SUIDGID != 0 {
                 new_mode &= !0o6000;
             }
-            #[cfg(target_os = "macos")]
-            {
-                if !current_meta.is_symlink() {
-                    // The host copy of a setuid or setgid bit is left exactly
-                    // as found. The guest-visible mode lives in the private
-                    // xattr, so the host bit carries no meaning here, and an
-                    // image unpacked with its setuid bits intact (every
-                    // /usr/bin/passwd, su and sudo) has them on the host.
-                    // Clearing such a bit is a distinct seatbelt operation,
-                    // file-write-setugid, which the sandbox profile does not
-                    // grant: fchmodat fails with EPERM and every chmod the
-                    // guest makes on the file fails with it, dpkg's
-                    // chmod-before-unlink of the old binary included.
-                    let host_mode = host_creation_mode(new_mode, current_meta.is_dir())
-                        | (current_meta.mode() & 0o6000);
-                    if let Some(handle) = handle {
-                        handle
-                            .file
-                            .set_permissions(Permissions::from_mode(host_mode))
-                            .map_err(io_errno)?;
-                    } else {
-                        let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
-                        chmod_at(dirfd.as_fd(), name, host_mode)?;
-                    }
-                }
-                let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids);
-                guest.mode = (current_meta.mode() & S_IFMT) | new_mode;
-                set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
-            }
-            #[cfg(target_os = "linux")]
-            {
+            if !current_meta.is_symlink() {
+                // The host copy of a setuid or setgid bit is left exactly as
+                // found. The guest-visible mode lives in the private xattr, so
+                // the host bit carries no meaning here, and an image unpacked
+                // with its setuid bits intact (every /usr/bin/passwd, su and
+                // sudo) has them on the host. Clearing such a bit is a
+                // distinct seatbelt operation, file-write-setugid, which the
+                // sandbox profile does not grant: fchmodat fails with EPERM
+                // and every chmod the guest makes on the file fails with it,
+                // dpkg's chmod-before-unlink of the old binary included.
+                let host_mode = host_creation_mode(new_mode, current_meta.is_dir())
+                    | (current_meta.mode() & 0o6000);
                 if let Some(handle) = handle {
                     handle
                         .file
-                        .set_permissions(Permissions::from_mode(new_mode))
+                        .set_permissions(Permissions::from_mode(host_mode))
                         .map_err(io_errno)?;
                 } else {
                     let (dirfd, name) = entry.as_ref().ok_or(EINVAL)?;
-                    chmod_at(dirfd.as_fd(), name, new_mode)?;
+                    chmod_at(dirfd.as_fd(), name, host_mode)?;
                 }
             }
+            let mut guest = guest_attr(Some(meta_fd.ok_or(EINVAL)?), &current_meta, self.ids);
+            guest.mode = (current_meta.mode() & S_IFMT) | new_mode;
+            set_guest_attr(meta_fd.ok_or(EINVAL)?, guest)?;
         }
 
         if valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
@@ -2851,7 +2799,7 @@ impl VirtioFs {
             initialize_guest_metadata(dirfd, &name, mode, context)?;
         }
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-            clear_suid_sgid(&path, &file, self.ids)?;
+            clear_suid_sgid(&file, self.ids)?;
         }
         let meta = Stat::of_file(&file)?;
         let node = self.node_for(path.clone(), &meta);
@@ -3003,7 +2951,7 @@ impl VirtioFs {
                 }
             };
             if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-                clear_suid_sgid(&path, &file, self.ids)?;
+                clear_suid_sgid(&file, self.ids)?;
                 self.invalidate_guest_attr(node);
             }
             // The access mode, like CREATE above and the orphan path below.
@@ -3061,7 +3009,7 @@ impl VirtioFs {
             file.set_len(0).map_err(io_errno)?;
         }
         if open_flags & FUSE_OPEN_KILL_SUIDGID != 0 {
-            clear_suid_sgid(&path, &file, self.ids)?;
+            clear_suid_sgid(&file, self.ids)?;
             self.invalidate_guest_attr(node);
         }
         // The attributes come from the descriptor, after any bits the open
@@ -3133,7 +3081,7 @@ impl VirtioFs {
             .map_err(io_errno)?;
         if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
             let handle = self.handles.get(&fh).ok_or(EBADF)?;
-            clear_suid_sgid(&handle.path, &handle.file, self.ids)?;
+            clear_suid_sgid(&handle.file, self.ids)?;
             self.invalidate_guest_attr(node);
         }
         let mut out = Vec::with_capacity(8);
@@ -3257,7 +3205,7 @@ impl VirtioFs {
         self.note_zero_copy_write();
         if write_flags & FUSE_WRITE_KILL_SUIDGID != 0 {
             if let Some(handle) = self.handles.get(&fh) {
-                if let Err(errno) = clear_suid_sgid(&handle.path, &handle.file, self.ids) {
+                if let Err(errno) = clear_suid_sgid(&handle.file, self.ids) {
                     return Some(Reply::Buffered(error_response(unique, errno)));
                 }
             }
@@ -4664,7 +4612,6 @@ impl VirtioFs {
     /// resolves to a dup of one of its handles instead. Putting the fallback
     /// in the resolver rather than in each handler is what keeps the next
     /// descriptor-reachable request working without a fifth copy of it.
-    #[cfg(target_os = "macos")]
     fn open_entry_at(&mut self, node: u64) -> Result<OwnedFd, i32> {
         if self.is_orphan(node) {
             let (_, handle) = self.handle_of_node(node).ok_or(ENOENT)?;
@@ -5011,7 +4958,6 @@ impl VirtioFs {
     /// The mode's file-type bits still always come from the live `meta`, only
     /// the permission bits and uid/gid are cached.
     fn guest_attr(&mut self, node: u64, path: Option<&Path>, meta: &Stat) -> GuestAttr {
-        #[cfg(target_os = "macos")]
         if path.is_some() {
             let stored = match self.nodes.get(&node).map(|n| n.guest_attr) {
                 Some(Some(cached)) => cached,
@@ -5034,8 +4980,6 @@ impl VirtioFs {
                 return guest;
             }
         }
-        #[cfg(target_os = "linux")]
-        let _ = (node, path);
         GuestAttr {
             mode: meta.mode(),
             uid: host_uid_to_guest(meta.uid(), self.ids),
@@ -5046,8 +4990,7 @@ impl VirtioFs {
     /// Drops a node's cached guest attribute after this module writes
     /// `HVI_XATTR_LINUX_ATTR` or otherwise changes what it reports for that
     /// node, so the next attribute reply re-reads it instead of serving the
-    /// value from before the change. A no-op on Linux, where the field is
-    /// never populated.
+    /// value from before the change.
     fn invalidate_guest_attr(&mut self, node: u64) {
         if let Some(n) = self.nodes.get_mut(&node) {
             n.guest_attr = None;
@@ -5247,10 +5190,7 @@ const MAX_NODE_ALIASES: usize = 16;
 
 /// Directory descriptors for the export, keyed by node.
 ///
-/// This is the resolver Option B is built on (#30). Nothing
-/// calls it yet: it lands first, with its tests, so the 120-odd call sites
-/// that follow are mechanical against a primitive that has already been
-/// argued about.
+/// This is the resolver Option B is built on (#30).
 ///
 /// # Why descriptors rather than paths
 ///
@@ -5270,7 +5210,6 @@ const MAX_NODE_ALIASES: usize = 16;
 /// It also closes a race the old check documented and could not fix: that one
 /// resolved a path and then let the syscall resolve it again, so anything
 /// host-side could swap a component in between.
-#[allow(dead_code)]
 struct DirCache {
     /// The export root. Pinned: never evicted, and the origin of every walk.
     root: OwnedFd,
@@ -5303,7 +5242,6 @@ struct DirCache {
     limit: usize,
 }
 
-#[allow(dead_code)]
 impl DirCache {
     fn new(root: &Path, limit: usize, caching: bool) -> io::Result<Self> {
         let root = open_dir_nofollow_at(None, root.as_os_str().as_bytes())
@@ -5557,21 +5495,9 @@ impl DirCache {
         self.root.as_fd()
     }
 
-    #[cfg(test)]
-    fn resident(&self) -> usize {
-        self.open.len()
-    }
-
     /// Returns how many host descriptors this cache is holding.
     fn held(&self) -> usize {
         self.open.len()
-    }
-
-    /// Closes all of them, for when the descriptors are worth more than the
-    /// resolutions they save.
-    fn release_all(&mut self) {
-        self.open.clear();
-        self.lru.clear();
     }
 }
 
@@ -5627,7 +5553,6 @@ fn unlink_at(dirfd: BorrowedFd<'_>, name: &CStr, directory: bool) -> Result<(), 
 /// opened, and this call happens with the device mutex held, so without it a
 /// guest could stop the VM by asking for the attributes of a pipe it never
 /// opens.
-#[cfg(target_os = "macos")]
 fn open_entry_nofollow(dirfd: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, i32> {
     note_host_op();
     let base = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -5668,7 +5593,6 @@ fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd, i32> {
 }
 
 /// Reads an extended attribute from an open descriptor.
-#[cfg(target_os = "macos")]
 fn fd_getxattr(fd: BorrowedFd<'_>, name: &[u8]) -> Result<Vec<u8>, i32> {
     let name = xattr_name(name)?;
     // SAFETY: `fd` is open for the call and `name` is NUL-terminated. A null
@@ -5701,7 +5625,6 @@ fn fd_getxattr(fd: BorrowedFd<'_>, name: &[u8]) -> Result<Vec<u8>, i32> {
 ///
 /// A read-only descriptor is enough, which was also measured: the guest's
 /// request may name a file this device has no reason to open for writing.
-#[cfg(target_os = "macos")]
 fn fd_setxattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
     let name = xattr_name(name)?;
     let host_flags = if flags & LINUX_XATTR_CREATE != 0 {
@@ -5730,7 +5653,6 @@ fn fd_setxattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8], flags: u32) -> Res
 }
 
 /// Lists the extended attributes on an open descriptor.
-#[cfg(target_os = "macos")]
 fn fd_listxattr(fd: BorrowedFd<'_>) -> Result<Vec<u8>, i32> {
     // SAFETY: `fd` is open for the call; a null buffer asks for the size.
     let needed = unsafe { libc::flistxattr(fd.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
@@ -5755,7 +5677,6 @@ fn fd_listxattr(fd: BorrowedFd<'_>) -> Result<Vec<u8>, i32> {
 }
 
 /// Removes an extended attribute from an open descriptor.
-#[cfg(target_os = "macos")]
 fn fd_removexattr(fd: BorrowedFd<'_>, name: &[u8]) -> Result<(), i32> {
     let name = xattr_name(name)?;
     // SAFETY: `fd` is open for the call and `name` is NUL-terminated.
@@ -5913,7 +5834,7 @@ impl Stat {
     /// through its descriptor, and everything below it through its parent.
     #[cfg(test)]
     fn lstat(path: &Path) -> Result<Self, i32> {
-        let path = path_cstring(path)?;
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)?;
         note_host_op();
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is NUL-terminated and outlives the call; `raw` is a
@@ -5990,12 +5911,6 @@ impl Stat {
     }
     fn blksize(&self) -> u64 {
         nonnegative(i64::from(self.raw.st_blksize))
-    }
-    /// Unused until device nodes need it; kept so the type covers a `stat`
-    /// rather than only the fields today's callers happen to read.
-    #[allow(dead_code)]
-    fn rdev(&self) -> u64 {
-        self.raw.st_rdev as u64
     }
     fn atime(&self) -> i64 {
         self.raw.st_atime
@@ -6181,7 +6096,6 @@ fn read_dir_at(fd: OwnedFd) -> Result<Vec<DirEntryInfo>, i32> {
 /// `parent` selects the form: `Some(fd)` resolves `name` relative to that
 /// descriptor, `None` treats it as a path from the host's root, which is only
 /// used for the export root itself.
-#[allow(dead_code)]
 fn open_dir_nofollow_at(parent: Option<RawFd>, name: &[u8]) -> Result<OwnedFd, i32> {
     let name = CString::new(name).map_err(|_| EINVAL)?;
     note_host_op();
@@ -6313,17 +6227,10 @@ fn open_host_file_at(
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(target_os = "macos")]
 fn host_creation_mode(mode: u32, directory: bool) -> u32 {
     (mode & 0o777) | if directory { 0o700 } else { 0o600 }
 }
 
-#[cfg(target_os = "linux")]
-fn host_creation_mode(mode: u32, _directory: bool) -> u32 {
-    mode & 0o7777
-}
-
-#[cfg(target_os = "macos")]
 fn initialize_guest_metadata(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
@@ -6346,22 +6253,7 @@ fn initialize_guest_metadata(
     )
 }
 
-#[cfg(target_os = "linux")]
-fn initialize_guest_metadata(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    mode: u32,
-    _context: RequestContext,
-) -> Result<(), i32> {
-    let meta = Stat::at(dirfd, name)?;
-    if !meta.is_symlink() {
-        chmod_at(dirfd, name, mode & 0o7777)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn clear_suid_sgid(_path: &Path, file: &File, ids: GuestIds) -> Result<(), i32> {
+fn clear_suid_sgid(file: &File, ids: GuestIds) -> Result<(), i32> {
     // The open file is the entry, so its own descriptor answers this without
     // naming anything.
     let meta = Stat::of_file(file)?;
@@ -6369,16 +6261,6 @@ fn clear_suid_sgid(_path: &Path, file: &File, ids: GuestIds) -> Result<(), i32> 
     if guest.mode & 0o6000 != 0 {
         guest.mode &= !0o6000;
         set_guest_attr(file.as_fd(), guest)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn clear_suid_sgid(_path: &Path, file: &File, _ids: GuestIds) -> Result<(), i32> {
-    let mode = Stat::of_file(file)?.mode() & 0o7777;
-    if mode & 0o6000 != 0 {
-        file.set_permissions(Permissions::from_mode(mode & !0o6000))
-            .map_err(io_errno)?;
     }
     Ok(())
 }
@@ -6422,7 +6304,6 @@ fn filter_hidden_xattrs(value: Vec<u8>) -> Vec<u8> {
     filtered
 }
 
-#[cfg(target_os = "macos")]
 fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
     let mut value = [0u8; GUEST_ATTR_LEN];
     value[0..4].copy_from_slice(&(guest.mode & 0o177777).to_le_bytes());
@@ -6431,7 +6312,6 @@ fn set_guest_attr(fd: BorrowedFd<'_>, guest: GuestAttr) -> Result<(), i32> {
     fd_setxattr(fd, HVI_XATTR_LINUX_ATTR, &value, 0)
 }
 
-#[cfg(target_os = "macos")]
 fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
     let name = xattr_name(HVI_XATTR_LINUX_ATTR).ok()?;
     // A buffer of the value's length reads it in one call. The general form
@@ -6458,7 +6338,6 @@ fn stored_guest_attr(fd: BorrowedFd<'_>) -> Option<GuestAttr> {
     decode_guest_attr(&value)
 }
 
-#[cfg(target_os = "macos")]
 fn decode_guest_attr(value: &[u8]) -> Option<GuestAttr> {
     if value.len() != GUEST_ATTR_LEN {
         return None;
@@ -6471,7 +6350,6 @@ fn decode_guest_attr(value: &[u8]) -> Option<GuestAttr> {
 }
 
 fn guest_attr(fd: Option<BorrowedFd<'_>>, meta: &Stat, ids: GuestIds) -> GuestAttr {
-    #[cfg(target_os = "macos")]
     if let Some(fd) = fd {
         if let Some(mut guest) = stored_guest_attr(fd) {
             guest.mode = (meta.mode() & S_IFMT) | (guest.mode & 0o7777);
@@ -6483,29 +6361,6 @@ fn guest_attr(fd: Option<BorrowedFd<'_>>, meta: &Stat, ids: GuestIds) -> GuestAt
         mode: meta.mode(),
         uid: host_uid_to_guest(meta.uid(), ids),
         gid: host_gid_to_guest(meta.gid(), ids),
-    }
-}
-
-#[cfg(test)]
-fn path_cstring(path: &Path) -> Result<CString, i32> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)
-}
-
-#[cfg(target_os = "linux")]
-fn guest_uid_to_host(uid: u32, ids: GuestIds) -> libc::uid_t {
-    if uid == ids.uid {
-        unsafe { libc::geteuid() }
-    } else {
-        uid
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn guest_gid_to_host(gid: u32, ids: GuestIds) -> libc::gid_t {
-    if gid == ids.gid {
-        unsafe { libc::getegid() }
-    } else {
-        gid
     }
 }
 
@@ -6543,39 +6398,6 @@ fn host_gid_to_guest(gid: u32, ids: GuestIds) -> u32 {
         ids.gid
     } else {
         gid
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn host_fchown(file: &File, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> Result<(), i32> {
-    let result = unsafe {
-        libc::fchown(
-            file.as_raw_fd(),
-            uid.unwrap_or(!0 as libc::uid_t),
-            gid.unwrap_or(!0 as libc::gid_t),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn host_lchown(path: &Path, uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let result = unsafe {
-        libc::lchown(
-            path.as_ptr(),
-            uid.unwrap_or(!0 as libc::uid_t),
-            gid.unwrap_or(!0 as libc::gid_t),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
     }
 }
 
@@ -6676,66 +6498,6 @@ fn xattr_response(requested: usize, value: Vec<u8>) -> Result<Vec<u8>, i32> {
     Ok(value)
 }
 
-#[cfg(target_os = "linux")]
-fn host_getxattr(path: &Path, name: &[u8]) -> Result<Vec<u8>, i32> {
-    let path = path_cstring(path)?;
-    let name = xattr_name(name)?;
-    let needed = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    if needed < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    let mut value = vec![0u8; needed as usize];
-    let got = unsafe {
-        libc::lgetxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-        )
-    };
-    if got < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    value.truncate(got as usize);
-    Ok(value)
-}
-
-#[cfg(target_os = "linux")]
-fn host_setxattr(path: &Path, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let name = xattr_name(name)?;
-    let result = unsafe {
-        libc::lsetxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            flags as i32,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn host_listxattr(path: &Path) -> Result<Vec<u8>, i32> {
-    let path = path_cstring(path)?;
-    let needed = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
-    if needed < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    let mut value = vec![0u8; needed as usize];
-    let got = unsafe { libc::llistxattr(path.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
-    if got < 0 {
-        return Err(io_errno(io::Error::last_os_error()));
-    }
-    value.truncate(got as usize);
-    Ok(value)
-}
-
 fn linux_lock_to_host(lock_type: u32) -> Result<i16, i32> {
     match lock_type {
         LINUX_F_RDLCK => Ok(libc::F_RDLCK),
@@ -6796,7 +6558,6 @@ fn host_link(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn host_rename(
     old_dir: BorrowedFd<'_>,
     old: &CStr,
@@ -6843,30 +6604,6 @@ fn host_rename(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn host_rename(old: &Path, new: &Path, flags: u32) -> Result<(), i32> {
-    if flags == 0 {
-        return fs::rename(old, new).map_err(io_errno);
-    }
-    let old = path_cstring(old)?;
-    let new = path_cstring(new)?;
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            old.as_ptr(),
-            libc::AT_FDCWD,
-            new.as_ptr(),
-            flags,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
-}
-
-#[cfg(target_os = "macos")]
 fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<(), i32> {
     let unsupported = FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE | FALLOC_FL_UNSHARE_RANGE;
     if mode & unsupported != 0
@@ -6952,33 +6689,10 @@ fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<()
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn host_fallocate(file: &File, offset: u64, length: u64, mode: u32) -> Result<(), i32> {
-    let offset = i64::try_from(offset).map_err(|_| EFBIG)?;
-    let length = i64::try_from(length).map_err(|_| EFBIG)?;
-    let result = unsafe { libc::fallocate(file.as_raw_fd(), mode as i32, offset, length) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
-}
-
 const STATX_BASIC_STATS: u32 = 0x07ff;
 const STATX_BTIME: u32 = 0x0800;
 
-#[cfg(target_os = "macos")]
-fn metadata_btime(meta: &Stat) -> Option<(i64, u32)> {
-    Some((meta.birthtime(), meta.birthtime_nsec().max(0) as u32))
-}
-
-#[cfg(target_os = "linux")]
-fn metadata_btime(_meta: &Stat) -> Option<(i64, u32)> {
-    None
-}
-
 fn statx_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Vec<u8> {
-    let btime = metadata_btime(meta);
     let mut out = Vec::with_capacity(288);
     put_u64(&mut out, cache_seconds);
     put_u32(&mut out, 0);
@@ -6986,10 +6700,7 @@ fn statx_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Ve
     put_u64(&mut out, 0);
     put_u64(&mut out, 0);
 
-    put_u32(
-        &mut out,
-        STATX_BASIC_STATS | if btime.is_some() { STATX_BTIME } else { 0 },
-    );
+    put_u32(&mut out, STATX_BASIC_STATS | STATX_BTIME);
     put_u32(&mut out, meta.blksize() as u32);
     put_u64(&mut out, 0);
     put_u32(&mut out, meta.nlink() as u32);
@@ -7002,8 +6713,7 @@ fn statx_out(node: u64, meta: &Stat, cache_seconds: u64, guest: GuestAttr) -> Ve
     put_u64(&mut out, meta.blocks());
     put_u64(&mut out, 0);
     put_statx_time(&mut out, meta.atime(), meta.atime_nsec());
-    let (birth_seconds, birth_nanos) = btime.unwrap_or((0, 0));
-    put_statx_time(&mut out, birth_seconds, birth_nanos as i64);
+    put_statx_time(&mut out, meta.birthtime(), meta.birthtime_nsec());
     put_statx_time(&mut out, meta.ctime(), meta.ctime_nsec());
     put_statx_time(&mut out, meta.mtime(), meta.mtime_nsec());
     for _ in 0..4 {
@@ -7020,18 +6730,6 @@ fn put_statx_time(out: &mut Vec<u8>, seconds: i64, nanos: i64) {
     put_i64(out, seconds);
     put_u32(out, nanos.max(0) as u32);
     put_i32(out, 0);
-}
-
-#[cfg(target_os = "linux")]
-fn host_removexattr(path: &Path, name: &[u8]) -> Result<(), i32> {
-    let path = path_cstring(path)?;
-    let name = xattr_name(name)?;
-    let result = unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_errno(io::Error::last_os_error()))
-    }
 }
 
 fn nul_name(input: &[u8], offset: usize) -> Result<&[u8], i32> {
@@ -7126,7 +6824,7 @@ fn io_errno(err: io::Error) -> i32 {
         Some(code) if code == libc::ENOSPC => return ENOSPC,
         Some(code) if code == libc::EROFS => return EROFS,
         Some(code) if code == libc::ERANGE => return ERANGE,
-        Some(code) if is_no_xattr(code) => return ENODATA,
+        Some(code) if code == libc::ENOATTR => return ENODATA,
         Some(code) if code == libc::EOPNOTSUPP => return EOPNOTSUPP,
         Some(code) if code == libc::ENOSYS => return ENOSYS,
         Some(code) if code == libc::ENOTEMPTY => return ENOTEMPTY,
@@ -7154,16 +6852,6 @@ fn io_errno(err: io::Error) -> i32 {
         io::ErrorKind::Unsupported => ENOSYS,
         _ => EIO,
     }
-}
-
-#[cfg(target_os = "macos")]
-fn is_no_xattr(code: i32) -> bool {
-    code == libc::ENOATTR
-}
-
-#[cfg(target_os = "linux")]
-fn is_no_xattr(code: i32) -> bool {
-    code == libc::ENODATA
 }
 
 /// Reads `out.len()` bytes from the logical concatenation of `descs`,
@@ -7266,10 +6954,7 @@ fn write_direct_out_header(
 /// the lock; `Err(Some(errno))` is any other failure, as the guest sees it.
 ///
 /// A held lock comes back as `EWOULDBLOCK` from `flock` and as `EAGAIN` from
-/// `fcntl`, which are one value on macOS and Linux alike. Linux also answers
-/// an `F_SETLK` conflict with `EACCES`. This server is built for macOS only,
-/// which never returns that, so the arm is kept for a Linux build of it and
-/// read by none today.
+/// `fcntl`, which are one value on macOS.
 fn try_lock(file: &File, call: LockCall) -> Result<(), Option<i32>> {
     let fd = file.as_raw_fd();
     let result = match call {
@@ -7285,10 +6970,8 @@ fn try_lock(file: &File, call: LockCall) -> Result<(), Option<i32>> {
         return Ok(());
     }
     let err = io::Error::last_os_error();
-    let posix = matches!(call, LockCall::Posix(_));
     match err.raw_os_error() {
         Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Err(None),
-        Some(code) if posix && code == libc::EACCES => Err(None),
         _ => Err(Some(io_errno(err))),
     }
 }
@@ -9695,7 +9378,6 @@ mod tests {
     #[test]
     fn writable_operations_follow_directory_symlinks() {
         let (dir, mut dev) = fixture_with_access(true);
-        #[cfg(unix)]
         std::os::unix::fs::symlink("etc", dir.join("include")).expect("create directory symlink");
 
         let lookup = dev.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, b"include\0"), 4096);
@@ -9739,7 +9421,6 @@ mod tests {
 
     // The identity used to be one per process, so two exports could not give
     // the host user's files two different owners.
-    #[cfg(target_os = "macos")]
     #[test]
     fn each_export_reports_the_host_users_files_as_its_own_guest_ids() {
         let (_mapped_dir, mut mapped) = fixture_with_access(true);
@@ -9767,7 +9448,6 @@ mod tests {
     /// one. Before the cache every attribute reply re-read the xattr, so a
     /// stale value was not representable; the cache makes it possible, and
     /// this pins the invalidation that prevents it.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_new_path_for_a_known_inode_drops_the_cached_guest_attribute() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -10611,22 +10291,15 @@ mod tests {
     /// Returns the path descriptor `fd` refers to, or `None` when it is
     /// closed or the host cannot say.
     fn descriptor_path(fd: RawFd) -> Option<PathBuf> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut buf = vec![0u8; libc::PATH_MAX as usize];
-            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which
-            // is that long.
-            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
-                return None;
-            }
-            let len = buf.iter().position(|&byte| byte == 0)?;
-            buf.truncate(len);
-            Some(PathBuf::from(OsString::from_vec(buf)))
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which is
+        // that long.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            return None;
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            fs::read_link(format!("/proc/self/fd/{fd}")).ok()
-        }
+        let len = buf.iter().position(|&byte| byte == 0)?;
+        buf.truncate(len);
+        Some(PathBuf::from(OsString::from_vec(buf)))
     }
 
     /// Returns how many of the process's descriptors refer to `root` or
@@ -11003,7 +10676,7 @@ mod tests {
         let (dir, mut cache) = dircache_fixture();
         let fd = cache.dir_fd(Path::new("")).unwrap();
         assert!(fd.as_raw_fd() >= 0);
-        assert_eq!(cache.resident(), 0, "the root is pinned, not cached");
+        assert_eq!(cache.held(), 0, "the root is pinned, not cached");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11012,13 +10685,13 @@ mod tests {
     fn dircache_walks_then_reuses() {
         let (dir, mut cache) = dircache_fixture();
         let first = cache.dir_fd(Path::new("usr/lib/ssl")).unwrap().as_raw_fd();
-        assert_eq!(cache.resident(), 1);
+        assert_eq!(cache.held(), 1);
         let second = cache.dir_fd(Path::new("usr/lib/ssl")).unwrap().as_raw_fd();
         assert_eq!(
             first, second,
             "a hit must hand back the descriptor already open, not walk again"
         );
-        assert_eq!(cache.resident(), 1);
+        assert_eq!(cache.held(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11048,7 +10721,7 @@ mod tests {
             err, ENOENT,
             "an absolute target must resolve inside the export, where it is absent"
         );
-        assert_eq!(cache.resident(), 0, "nothing may be admitted on failure");
+        assert_eq!(cache.held(), 0, "nothing may be admitted on failure");
 
         // And it stays absent for a component in the middle of a path.
         fs::create_dir_all(outside.join("deeper")).unwrap();
@@ -11074,7 +10747,7 @@ mod tests {
         let (dir, mut cache) = dircache_fixture();
         assert_eq!(cache.dir_fd(Path::new("usr/../etc")).unwrap_err(), EINVAL);
         assert_eq!(cache.dir_fd(Path::new("/etc")).unwrap_err(), EINVAL);
-        assert_eq!(cache.resident(), 0);
+        assert_eq!(cache.held(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11091,12 +10764,12 @@ mod tests {
         for i in 0..8u64 {
             cache.dir_fd(Path::new(&format!("d{i}"))).unwrap();
             assert!(
-                cache.resident() <= 3,
+                cache.held() <= 3,
                 "cache grew past its limit at {i}: {}",
-                cache.resident()
+                cache.held()
             );
         }
-        assert_eq!(cache.resident(), 3);
+        assert_eq!(cache.held(), 3);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11126,11 +10799,11 @@ mod tests {
     fn dircache_forget_releases_the_descriptor() {
         let (dir, mut cache) = dircache_fixture();
         cache.dir_fd(Path::new("etc")).unwrap();
-        assert_eq!(cache.resident(), 1);
+        assert_eq!(cache.held(), 1);
         cache.forget(Path::new("etc"));
-        assert_eq!(cache.resident(), 0);
+        assert_eq!(cache.held(), 0);
         cache.forget(Path::new("etc")); // idempotent
-        assert_eq!(cache.resident(), 0);
+        assert_eq!(cache.held(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11273,7 +10946,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn setattr_leaves_host_setugid_bits_alone() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -11297,7 +10969,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn restrictive_modes_and_linux_owners_persist_without_locking_out_host() {
         let (dir, mut dev) = fixture_with_access(true);
@@ -11788,7 +11459,7 @@ mod tests {
         // still a (now stale) entry in this node's path list.
         assert_eq!(
             dev.node_path(secondary).unwrap(),
-            dev.root().join("secondary")
+            dev.root.join("secondary")
         );
         let getattr = dev.handle_fuse(&request(GETATTR, secondary, &[]), 4096);
         assert_eq!(get_u32(&getattr, 4), Some(0));
@@ -11812,14 +11483,14 @@ mod tests {
         assert_eq!(get_u32(&out, 4), Some(0));
         assert_eq!(fs::read(dir.join("left")).unwrap(), b"right");
         assert_eq!(fs::read(dir.join("right")).unwrap(), b"left");
-        assert_eq!(dev.node_path(left).unwrap(), dev.root().join("right"));
-        assert_eq!(dev.node_path(right).unwrap(), dev.root().join("left"));
+        assert_eq!(dev.node_path(left).unwrap(), dev.root.join("right"));
+        assert_eq!(dev.node_path(right).unwrap(), dev.root.join("left"));
 
         fs::hard_link(dir.join("right"), dir.join("alias")).unwrap();
         assert_eq!(lookup_node(&mut dev, FUSE_ROOT_ID, b"alias"), left);
         let out = dev.handle_fuse(&request(UNLINK, FUSE_ROOT_ID, b"right\0"), 4096);
         assert_eq!(get_u32(&out, 4), Some(0));
-        assert_eq!(dev.node_path(left).unwrap(), dev.root().join("alias"));
+        assert_eq!(dev.node_path(left).unwrap(), dev.root.join("alias"));
         let _ = fs::remove_dir_all(dir);
     }
 

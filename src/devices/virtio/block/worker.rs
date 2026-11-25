@@ -773,18 +773,6 @@ mod queue_tests {
         }
     }
 
-    #[test]
-    fn common_registers_follow_virtio_1_2() {
-        let mem = Arc::new(GuestRam::from_ranges(&[(BASE, 0x4000)]));
-        let rings = Rings {
-            size: 8,
-            desc_table: BASE,
-            avail_ring: BASE + 0x1000,
-            used_ring: BASE + 0x2000,
-        };
-        testing::assert_common_registers(dev(), &mem, rings);
-    }
-
     /// Makes chain `head` available as the next entry of the avail ring of
     /// [`activated`]'s queue.
     ///
@@ -1269,13 +1257,6 @@ mod capacity_tests {
             512,
             "the backing file was not extended"
         );
-    }
-
-    #[test]
-    fn read_past_the_advertised_capacity_is_refused() {
-        let (_r, mut disk) = rig("in");
-        let (st, _) = disk.submit(VIRTIO_BLK_T_IN, 9_999, 512);
-        assert_eq!(st, VIRTIO_BLK_S_IOERR);
     }
 
     // A sector that would wrap the byte offset is refused rather than aliased

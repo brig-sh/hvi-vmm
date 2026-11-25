@@ -123,13 +123,13 @@ console log:
 
 | Job | Runner | Asserts |
 | --- | --- | --- |
-| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`; the guest starts on kvm-clock and finds the TSC-deadline timer. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate, and a 4096 MiB guest's e820 shows the three usable ranges of RAM split around the MMIO hole. A guest's `poweroff -f` ends the run as `SystemOff`, and its `reboot -f` ends it as `SystemReset` both with ACPI and with `acpi=off`. Also runs the virtio-blk sizing test against a real loop device, the vCPU stop tests, the queue notification test and the split irqchip tests. |
+| `boot-x86` | self-hosted x86 with `/dev/kvm` | `Linux version`; `seccomp: on`; the userspace or VFS gate; both processors online with `--cpus 2`; the guest starts on kvm-clock and finds the TSC-deadline timer. Then the `vmlinux` that `scripts/extract-vmlinux` unpacks from the same image reaches the gate. A guest's `poweroff -f` ends the run as `SystemOff`, and its `reboot -f` ends it as `SystemReset` both with ACPI and with `acpi=off`. Also runs the virtio-blk sizing test against a real loop device, the vCPU stop tests, the queue notification test and the split irqchip tests. |
 | `boot-arm64-hvf` | self-hosted Apple silicon | `hvi smoke`, `hvi smoke --shm`, then a boot reaching `Linux version` and `HVI-INITRAMFS-UP`. |
 | `boot-unikraft-hvf` | self-hosted Apple silicon | Two public Unikraft images, over four boots. A DHCP boot asserts the banner, `Set IPv4 address 10.0.2.15` and `Listening on port 8123`, with a share attached so the VMM has to place a virtio-fs device -- no other job does. A second boot passes `netdev.ip=` and asserts the guest took `10.0.2.99` and did *not* fall through to `10.0.2.15`, which is what fails if an image loses `CONFIG_LIBUKNETDEV_EINFO_LIBPARAM`. A third boots a padded cpio -- the pinned one is two whole pages, so the job adds 512 bytes to make the length ragged -- and asserts the banner, no memory-region assertion failure, and no `nginx:` error line. |
-| `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the vCPU stop tests, the queue notification test, the vGIC irqfd tests, the aarch64 seccomp selftest, a boot that checks the guest gets pointer authentication when the host CPU and the guest kernel have it, a boot on a real tap when one can be created, and a check that an unusable tap refuses to boot and names the interface. |
+| `boot-arm64-kvm` | self-hosted arm64, two hosts | A matrix over a GIC-400 host and a GICv3 host, so both vGIC paths run. Each runs the unit suite, the vCPU stop tests, the queue notification test, the vGIC irqfd tests, the aarch64 seccomp selftest, and a boot that checks the guest gets pointer authentication when the host CPU and the guest kernel have it. |
 
-`boot-x86` skips itself with a warning when the runner has no `/dev/kvm`. A
-skip is not a pass.
+`boot-x86` fails when the runner has no `/dev/kvm`. A skip would report a job
+that booted nothing as green.
 
 The self-hosted lanes are withheld from pull requests opened from a fork,
 because these are persistent machines rather than ephemeral VMs. A fork still
@@ -223,7 +223,7 @@ See [benchmarking.md](benchmarking.md).
 
 ## Scheduled workflows
 
-Four run outside the two entry workflows. Each reports through a tracking issue
+Five run outside the two entry workflows. Each reports through a tracking issue
 and leaves `main` green: a failure files or updates one issue, and the next
 green run closes it.
 
@@ -237,6 +237,36 @@ green run closes it.
   ordering. It is not reliable enough to gate a pull request.
 - `schedule-reflow-drift.yml`: monthly, runs the reflow on the latest nightly
   and compares it with the pin, so the pin advances deliberately.
+- `schedule-deadcode.yml`: every Monday, runs `tools/deadcode.py` for every
+  backend and reports code that no caller reaches, and code that only tests
+  reach. See [Dead code](#dead-code).
+
+## Dead code
+
+rustc does not report a `pub` item of the library as dead, and each backend
+compiles a different part of the tree. `tools/deadcode.py` checks a copy of the
+crate in which the binary, the examples and the integration tests are modules
+of the library, and the library's items are crate-private. It checks the copy
+once per target, with and without `cfg(test)`, and reports:
+
+- `dead`: an item no code uses on any target that compiles it.
+- `test-only`: an item only `cfg(test)` code uses. Move it into the test module,
+  or delete it with the tests that use it.
+- `partial`: an item some targets compile but do not use. This is informational.
+  It often means a `cfg` gate can be narrower.
+
+Programs outside this tree link hvi as a library. An item of that API stays
+when no caller here uses it: list it in `tools/deadcode-allow.txt` with the
+reason, and do not delete it. So does any other dead or test-only item kept on
+purpose. An entry that matches nothing fails the run, so the list stays current.
+
+```
+tools/deadcode.py
+```
+
+A Mac checks every target in about half a minute, given the rustup targets of
+the Linux backends. A Linux host cannot check `aarch64-apple-darwin`, and its
+report says so.
 
 ## Distribution
 

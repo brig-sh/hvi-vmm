@@ -131,8 +131,6 @@ impl Uart16550 {
     }
 
     /// Connects the UART to the interrupt line it raises.
-    // Only the x86-64 backend attaches a 16550.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn connect_irq(&mut self, line: Arc<dyn irq::Line>) {
         self.irq.connect(line);
     }

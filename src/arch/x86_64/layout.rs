@@ -39,10 +39,9 @@ pub const MPTABLE_ADDR: u64 = EBDA_START;
 ///
 /// The e820 map leaves the area out, so the guest never takes it for RAM.
 pub const ACPI_ADDR: u64 = 0xe_0000;
-/// Boot page tables (PML4/PDPT/PD) for the initial long-mode identity map.
+/// Boot page tables (PML4/PDPT) for the initial long-mode identity map.
 pub const PML4_ADDR: u64 = 0x9000;
 pub const PDPT_ADDR: u64 = 0xa000;
-pub const PD_ADDR: u64 = 0xb000;
 /// A small boot GDT.
 pub const GDT_ADDR: u64 = 0xc000;
 /// The 64-bit protected-mode kernel loads at 1 MiB.

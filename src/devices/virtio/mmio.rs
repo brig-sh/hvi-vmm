@@ -18,9 +18,9 @@
 //! [`virtio::Device`], as virtio 1.2 section 4.2.2 specifies them: the feature
 //! words, the device status and the order the driver sets it in, the queue
 //! registers and the interrupt registers. It passes configuration space
-//! accesses, activation, queue notifications and reset to the device.
-//! [`Interrupt`] holds the interrupt status and the trigger, which the
-//! transport and the device share.
+//! reads, activation, queue notifications and reset to the device, and ignores
+//! configuration space writes. [`Interrupt`] holds the interrupt status and the
+//! trigger, which the transport and the device share.
 //!
 //! The offsets come from `virtio-bindings`, which bindgen generates from the
 //! kernel headers. They are `u64`, the offset type an MMIO dispatch matches on.
@@ -325,7 +325,7 @@ impl InterruptState {
 ///
 /// The transport state and the device each have a lock, taken in that order and
 /// never the reverse. The state lock is released before a queue notification or
-/// a configuration space access reaches the device, so a vCPU's register access
+/// a configuration space read reaches the device, so a vCPU's register access
 /// does not wait for another vCPU's queue work. It is held across activation
 /// and reset, so two STATUS writes cannot leave the device activated under a
 /// transport that reset.
@@ -583,15 +583,9 @@ impl<D: virtio::Device> Transport<D> {
         }
     }
 
-    /// Returns whether `driver_features` include `VIRTIO_F_VERSION_1` and the
-    /// device accepts them.
+    /// Returns whether `driver_features` include `VIRTIO_F_VERSION_1`.
     fn accepts_features(&self, driver_features: u64) -> bool {
         driver_features & F_VERSION_1 != 0
-            && self
-                .device
-                .lock()
-                .unwrap()
-                .accepts_features(driver_features)
     }
 
     /// Activates the device with the queues the driver made ready.
@@ -682,19 +676,13 @@ impl<D: virtio::Device> bus::Device for Transport<D> {
         }
     }
 
-    // A configuration space write is taken once DRIVER is set and before
-    // FAILED. A common register write of any width but 4 is ignored.
+    // Every device's configuration space is read-only, so a write there is
+    // ignored. A common register write of any width but 4 is ignored.
     fn write(&self, offset: u64, data: &[u8]) -> Option<Stop> {
-        if offset >= CONFIG {
-            let status = self.state.lock().unwrap().status;
-            if status.contains(DRIVER) && status.is_disjoint(FAILED) {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .write_config(offset - CONFIG, data);
+        if offset < CONFIG {
+            if let Ok(bytes) = <[u8; 4]>::try_from(data) {
+                self.write_register(offset, u32::from_le_bytes(bytes));
             }
-        } else if let Ok(bytes) = <[u8; 4]>::try_from(data) {
-            self.write_register(offset, u32::from_le_bytes(bytes));
         }
         None
     }
@@ -853,6 +841,32 @@ pub(crate) mod testing {
             .expect("the rings should fit in guest RAM")
     }
 
+    /// Writes entry `index` of the descriptor table at `table`.
+    pub(crate) fn write_descriptor(
+        ram: &GuestRam,
+        table: u64,
+        index: u16,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let at = table + u64::from(index) * 16;
+        ram.write_u64(at, addr).unwrap();
+        ram.write_u32(at + 8, len).unwrap();
+        ram.write_u16(at + 12, flags).unwrap();
+        ram.write_u16(at + 14, next).unwrap();
+    }
+
+    /// Makes chain `head` available as the next entry of the avail ring at
+    /// `avail`, of a queue of `size` entries.
+    pub(crate) fn make_available(ram: &GuestRam, avail: u64, size: u16, head: u16) {
+        let idx = ram.read_u16(avail + 2).unwrap();
+        ram.write_u16(avail + 4 + u64::from(idx % size) * 2, head)
+            .unwrap();
+        ram.write_u16(avail + 2, idx.wrapping_add(1)).unwrap();
+    }
+
     /// Returns an enabled interrupt and its trigger.
     pub(crate) fn enabled_interrupt() -> (Arc<Interrupt>, Arc<CountingTrigger>) {
         let trigger = Arc::new(CountingTrigger::default());
@@ -1009,7 +1023,6 @@ mod tests {
     use super::*;
     use crate::devices::bus::Device as _;
     use crate::devices::virtio::{read_config_bytes, DeviceState, Queue};
-    use crate::events::CapturedEvent;
     use crate::plugin::IoSink;
 
     const BASE: u64 = 0x4000_0000;
@@ -1115,8 +1128,6 @@ mod tests {
         notified: Vec<u16>,
         /// Whether activation fails.
         refuse_activation: bool,
-        /// The configuration space writes, as offset and data.
-        config_writes: Vec<(u64, Vec<u8>)>,
         /// The resets since the stub was built.
         resets: usize,
         /// The sink a notification feeds, when a test set one.
@@ -1134,7 +1145,6 @@ mod tests {
                 state: DeviceState::Inactive,
                 notified: Vec::new(),
                 refuse_activation: false,
-                config_writes: Vec::new(),
                 resets: 0,
                 sink: None,
                 fed_sink: None,
@@ -1157,10 +1167,6 @@ mod tests {
 
         fn read_config(&self, offset: u64, data: &mut [u8]) {
             read_config_bytes(b"configuration", offset, data);
-        }
-
-        fn write_config(&mut self, offset: u64, data: &[u8]) {
-            self.config_writes.push((offset, data.to_vec()));
         }
 
         fn activate(
@@ -1194,10 +1200,6 @@ mod tests {
             self.resets += 1;
             self.queues.clear();
             self.state = DeviceState::Inactive;
-        }
-
-        fn take_events(&mut self) -> Vec<CapturedEvent> {
-            Vec::new()
         }
 
         fn take_fed_sink(&mut self) -> Option<Arc<dyn IoSink>> {
@@ -1764,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_space_takes_any_width_and_writes_after_driver() {
+    fn configuration_space_takes_any_width() {
         let driver = driver();
         let mut byte = [0; 1];
         driver.transport.read(CONFIG + 1, &mut byte);
@@ -1772,15 +1774,6 @@ mod tests {
         let mut past = [0xff; 2];
         driver.transport.read(CONFIG + 12, &mut past);
         assert_eq!(&past, b"n\0");
-
-        driver.transport.write(CONFIG, &[1]);
-        driver.write(STATUS, STATUS_STEPS[0]);
-        driver.write(STATUS, STATUS_STEPS[1]);
-        driver.transport.write(CONFIG + 4, &[2, 3]);
-        assert_eq!(
-            driver.device.lock().unwrap().config_writes,
-            [(4, vec![2, 3])]
-        );
     }
 
     #[test]
