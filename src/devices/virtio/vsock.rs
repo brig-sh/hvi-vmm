@@ -51,7 +51,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex};
@@ -63,7 +63,8 @@ use crate::devices::virtio::{
     self, read_config_bytes, DescriptorChain, DeviceState, Queue, QUEUE_MAX_SIZE,
 };
 use crate::memory::GuestRam;
-use crate::teardown::{poll, pollfd, StopToken, HANGUP};
+use crate::poll::{Interest, Poll};
+use crate::teardown::StopToken;
 use crate::LOG_PREFIX;
 
 pub const HOST_CID: u64 = 2;
@@ -1517,9 +1518,10 @@ pub fn retry_read(e: &std::io::Error) -> bool {
 /// by [`wait_host_close`] or by the next send to the host, see
 /// [`VirtioVsock::host_gone`].
 fn peer_hung_up(stream: &UnixStream) -> bool {
-    let mut fds = [pollfd(stream.as_raw_fd())];
-    fds[0].events = libc::POLLOUT;
-    poll(&mut fds, Some(Instant::now())).is_ok() && fds[0].revents & HANGUP != 0
+    let mut poll = Poll::new();
+    let token = poll.add(stream.as_fd(), Interest::WRITABLE);
+    poll.wait_deadline(Instant::now())
+        .is_ok_and(|ready| ready.is_hung_up(token) || ready.is_error(token))
 }
 
 /// Blocks until the host end of `stream`, which shut down only its write half,

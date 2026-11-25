@@ -36,11 +36,7 @@
 //! The request shuts down the write half of a socket pair, which leaves the
 //! read half readable for every token from then on. Dropping the `StopSource`
 //! closes the write half with the same effect, so a token also reports the stop
-//! when `boot` unwinds past it.
-//!
-//! `poll` is the wake primitive on every backend. Both Linux `vmm` seccomp
-//! allowlists carry it (as `ppoll` on aarch64, which is what glibc's `poll`
-//! calls there), and the pair is created before any filter installs.
+//! when `boot` unwinds past it. The pair is created before any filter installs.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -48,6 +44,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::poll::{Interest, Poll};
 
 /// How long the stop waits for the vCPU threads, then for the helper threads,
 /// and then for the ledger, after it is requested.
@@ -174,12 +172,13 @@ impl StopToken {
     /// Errors if `poll` fails for a reason other than a signal, or if the
     /// descriptor reports an error or is not open.
     pub fn wait(&self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        let mut fds = [pollfd(fd.as_raw_fd()), pollfd(self.0.as_raw_fd())];
-        poll(&mut fds, None)?;
-        if fds[1].revents != 0 {
+        let mut poll = Poll::with_stop(self);
+        let incoming = (!self.holds(fd)).then(|| poll.add(fd, Interest::READABLE));
+        let ready = poll.wait()?;
+        if ready.is_stopped() {
             return Ok(false);
         }
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if incoming.is_some_and(|incoming| ready.is_readable(incoming)) {
             Ok(true)
         } else {
             Err(io::Error::other("cannot be read anymore"))
@@ -196,11 +195,14 @@ impl StopToken {
     ///
     /// Errors if `poll` fails for a reason other than a signal.
     pub fn wait_writable(&self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        let mut out = pollfd(fd.as_raw_fd());
-        out.events = libc::POLLOUT;
-        let mut fds = [out, pollfd(self.0.as_raw_fd())];
-        poll(&mut fds, None)?;
-        Ok(fds[1].revents == 0)
+        let mut poll = Poll::with_stop(self);
+        if self.holds(fd) {
+            // The token's socket takes a write, so there is nothing to wait
+            // for.
+            return Ok(!poll.wait_deadline(Instant::now())?.is_stopped());
+        }
+        poll.add(fd, Interest::WRITABLE);
+        Ok(!poll.wait()?.is_stopped())
     }
 
     /// Returns whether a helper that waits on something other than `fd` should
@@ -211,11 +213,13 @@ impl StopToken {
     /// intervals, so it notices both without polling `fd` for data.
     #[must_use]
     pub fn keep_waiting(&self, fd: BorrowedFd<'_>) -> bool {
-        let mut fds = [pollfd(fd.as_raw_fd()), pollfd(self.0.as_raw_fd())];
-        if poll(&mut fds, Some(Instant::now())).is_err() {
-            return false;
-        }
-        fds[1].revents == 0 && fds[0].revents & HANGUP == 0
+        let mut poll = Poll::with_stop(self);
+        let watched = (!self.holds(fd)).then(|| poll.add(fd, Interest::HANGUP));
+        poll.wait_deadline(Instant::now()).is_ok_and(|ready| {
+            !ready.is_stopped()
+                && watched
+                    .is_none_or(|watched| !ready.is_hung_up(watched) && !ready.is_error(watched))
+        })
     }
 
     /// Sleeps for `duration` unless the stop is requested first.
@@ -227,49 +231,15 @@ impl StopToken {
     ///
     /// Errors if `poll` fails for a reason other than a signal.
     pub fn sleep(&self, duration: Duration) -> io::Result<bool> {
-        let mut fds = [pollfd(self.0.as_raw_fd())];
-        poll(&mut fds, Instant::now().checked_add(duration))?;
-        Ok(fds[0].revents == 0)
+        // A duration past the end of the clock is a sleep with no end.
+        let deadline = Instant::now().checked_add(duration);
+        Ok(!Poll::with_stop(self).wait_until(deadline)?.is_stopped())
     }
-}
 
-/// The `revents` bits that say a descriptor has hung up or failed.
-pub(crate) const HANGUP: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-
-/// Builds a `pollfd` that waits for `fd` to become readable.
-pub(crate) fn pollfd(fd: libc::c_int) -> libc::pollfd {
-    libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }
-}
-
-/// Polls `fds` until one of them is ready or `deadline` passes, with no limit
-/// when `deadline` is `None`.
-///
-/// Each call waits only for the time left, rounded up to whole milliseconds, so
-/// a signal that interrupts the call does not extend the wait, and a wait
-/// shorter than a millisecond still sleeps.
-pub(crate) fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
-    loop {
-        let timeout_millis = deadline.map_or(-1, |deadline| {
-            let left = deadline.saturating_duration_since(Instant::now());
-            libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
-        });
-        // SAFETY: `fds` is a live slice of `pollfd` and the length matches.
-        let ret =
-            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_millis) };
-        // A timeout short of the deadline is waited out by the next call.
-        if ret > 0 || (ret == 0 && timeout_millis == 0) {
-            return Ok(());
-        }
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
+    /// Returns whether `fd` is the token's own descriptor, which a poll with
+    /// the stop already holds.
+    fn holds(&self, fd: BorrowedFd<'_>) -> bool {
+        fd.as_raw_fd() == self.0.as_raw_fd()
     }
 }
 
@@ -279,7 +249,7 @@ pub(crate) fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::R
 /// can call it. `clock_nanosleep` is in the `vmm` allowlist only.
 pub(crate) fn sleep_step(deadline: Instant) {
     let next = (Instant::now() + Duration::from_millis(1)).min(deadline);
-    let _ = poll(&mut [], Some(next));
+    let _ = Poll::new().wait_deadline(next);
 }
 
 #[cfg(test)]
@@ -345,6 +315,40 @@ mod tests {
         let (_peer, idle) = UnixStream::pair().expect("pair");
         source.request_stop();
         assert!(!token.keep_waiting(idle.as_fd()), "the stop was requested");
+    }
+
+    // A plugin may hand a wait the descriptor of its own token, which the wait
+    // already holds for the stop, or a duplicate of it.
+    #[test]
+    fn waits_take_the_descriptor_of_their_own_token() {
+        let source = StopSource::new().expect("pair");
+        let token = source.token();
+        let duplicate = token.as_fd().try_clone_to_owned().expect("dup");
+        for fd in [token.as_fd(), duplicate.as_fd()] {
+            assert!(token.keep_waiting(fd));
+            assert!(token.wait_writable(fd).expect("poll"));
+        }
+        let waiters = [None, Some(duplicate.try_clone().expect("dup"))].map(|fd| {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let fd = fd.as_ref().map_or(token.as_fd(), |fd| fd.as_fd());
+                token.wait(fd).expect("poll")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            waiters.iter().all(|waiter| !waiter.is_finished()),
+            "the waits block until the stop"
+        );
+        source.request_stop();
+        for waiter in waiters {
+            assert!(!waiter.join().expect("thread"), "the stop ends the wait");
+        }
+        for fd in [token.as_fd(), duplicate.as_fd()] {
+            assert!(!token.keep_waiting(fd));
+            assert!(!token.wait_writable(fd).expect("poll"));
+            assert!(!token.wait(fd).expect("poll"));
+        }
     }
 
     #[test]

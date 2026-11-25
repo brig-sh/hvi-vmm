@@ -17,21 +17,20 @@
 use std::io;
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
-#[cfg(target_os = "macos")]
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::task::Wake;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::poll::{Interest, Poll};
 use crate::teardown::StopToken;
-#[cfg(target_os = "macos")]
-use crate::teardown::{poll, pollfd};
 
 /// What wakes a device's worker thread.
 ///
@@ -51,7 +50,7 @@ pub(crate) struct WorkerWake(EventFd);
 /// beside the I/O threads' stop token.
 #[cfg(target_os = "macos")]
 pub(crate) struct WorkerWake {
-    /// The end the worker polls and drains.
+    /// The end the worker polls and clears.
     read: io::PipeReader,
     /// The end a signal writes one byte to.
     write: io::PipeWriter,
@@ -83,27 +82,19 @@ impl WorkerWake {
         let _ = self.0.write(1);
     }
 
-    /// Blocks until the next signal.
-    ///
-    /// It returns `false` once `stop` is requested.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the wait fails, since the device would no longer be served.
-    pub(crate) fn wait(&self, stop: &StopToken) -> bool {
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        // SAFETY: the eventfd is open for as long as `self` lives, which spans
-        // the call.
-        let fd = unsafe { BorrowedFd::borrow_raw(self.0.as_raw_fd()) };
-        let signaled = stop
-            .wait(fd)
-            .unwrap_or_else(|e| panic!("waiting for a worker's wake: {e}"));
-        if signaled {
-            // The read clears the count, so the signals that arrived before it
-            // wake the worker once.
-            let _ = self.0.read();
-        }
-        signaled
+    /// Takes the signals that arrived, so they wake the worker once.
+    fn clear(&self) {
+        // The read clears the count.
+        let _ = self.0.read();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsFd for WorkerWake {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the eventfd is open for as long as `self` lives, which
+        // outlives the borrow.
+        unsafe { BorrowedFd::borrow_raw(self.0.as_raw_fd()) }
     }
 }
 
@@ -139,6 +130,24 @@ impl WorkerWake {
         let _ = (&self.write).write(&[1]);
     }
 
+    /// Takes the signals that arrived, so they wake the worker once.
+    ///
+    /// One read takes at most 512 of them. With more pending, the next wait
+    /// returns at once and clears again.
+    fn clear(&self) {
+        let mut signals = [0u8; 512];
+        let _ = (&self.read).read(&mut signals);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl AsFd for WorkerWake {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.read.as_fd()
+    }
+}
+
+impl WorkerWake {
     /// Blocks until the next signal.
     ///
     /// It returns `false` once `stop` is requested.
@@ -147,13 +156,7 @@ impl WorkerWake {
     ///
     /// Panics if the wait fails, since the device would no longer be served.
     pub(crate) fn wait(&self, stop: &StopToken) -> bool {
-        let signaled = stop
-            .wait(self.read.as_fd())
-            .unwrap_or_else(|e| panic!("waiting for a worker's wake: {e}"));
-        if signaled {
-            self.drain();
-        }
-        signaled
+        self.wait_until(stop, None)
     }
 
     /// Blocks like [`wait`](Self::wait), for at most `timeout`.
@@ -163,26 +166,33 @@ impl WorkerWake {
     /// # Panics
     ///
     /// Panics if the wait fails, since the device would no longer be served.
+    #[cfg(target_os = "macos")]
     pub(crate) fn wait_timeout(&self, stop: &StopToken, timeout: Duration) -> bool {
-        let mut fds = [
-            pollfd(self.read.as_raw_fd()),
-            pollfd(stop.as_fd().as_raw_fd()),
-        ];
-        poll(&mut fds, Some(Instant::now() + timeout))
-            .unwrap_or_else(|e| panic!("waiting for a worker's wake: {e}"));
-        if fds[1].revents != 0 {
-            return false;
-        }
-        if fds[0].revents != 0 {
-            self.drain();
-        }
-        true
+        self.wait_until(stop, Some(Instant::now() + timeout))
     }
 
-    /// Takes the signals that arrived, so they wake the worker once.
-    fn drain(&self) {
-        let mut signals = [0u8; 512];
-        let _ = (&self.read).read(&mut signals);
+    /// Blocks until the next signal, or until `deadline` when there is one, and
+    /// clears the signal.
+    ///
+    /// It returns `false` once `stop` is requested.
+    fn wait_until(&self, stop: &StopToken, deadline: Option<Instant>) -> bool {
+        let mut poll = Poll::with_stop(stop);
+        let signal = poll.add(self.as_fd(), Interest::READABLE);
+        let ready = poll
+            .wait_until(deadline)
+            .unwrap_or_else(|e| panic!("waiting for a worker's wake: {e}"));
+        if ready.is_stopped() {
+            return false;
+        }
+        if ready.is_readable(signal) {
+            self.clear();
+            return true;
+        }
+        assert!(
+            !ready.is_error(signal),
+            "waiting for a worker's wake: cannot be read anymore"
+        );
+        true
     }
 }
 
@@ -193,11 +203,31 @@ impl Wake for WorkerWake {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::teardown::StopSource;
 
+    #[test]
+    fn signals_before_a_wait_wake_it_once() {
+        let wake = WorkerWake::new().unwrap();
+        let source = StopSource::new().unwrap();
+        let stop = source.token();
+        wake.signal();
+        wake.signal();
+        assert!(wake.wait(&stop));
+
+        let mut poll = Poll::with_stop(&stop);
+        let signal = poll.add(wake.as_fd(), Interest::READABLE);
+        let soon = Instant::now() + std::time::Duration::from_millis(20);
+        let ready = poll.wait_deadline(soon).unwrap();
+        assert!(!ready.is_readable(signal), "the wait took both signals");
+
+        source.request_stop();
+        assert!(!wake.wait(&stop), "a stop ends the wait and says so");
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn timed_wait_ends_at_its_deadline_or_at_a_signal_or_a_stop() {
         let wake = WorkerWake::new().unwrap();

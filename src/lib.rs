@@ -96,6 +96,7 @@ pub mod hypervisor;
 pub(crate) mod io_threads;
 pub mod memory;
 pub mod plugin;
+mod poll;
 pub mod run;
 pub mod sandbox;
 pub mod signal;

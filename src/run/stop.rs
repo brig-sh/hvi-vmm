@@ -16,12 +16,12 @@
 //! that owns the stop.
 
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::teardown::{poll, pollfd};
+use crate::poll::{Interest, Poll};
 
 /// A handle that asks a run to stop.
 ///
@@ -220,9 +220,10 @@ impl Waker {
     ///
     /// Errors if `poll` or the read fails for a reason other than a signal.
     fn wait(&self, deadline: Option<Instant>) -> io::Result<()> {
-        let mut fds = [pollfd(self.read.as_raw_fd())];
-        poll(&mut fds, deadline)?;
-        if fds[0].revents == 0 {
+        let mut poll = Poll::new();
+        let wake = poll.add(self.read.as_fd(), Interest::READABLE);
+        let ready = poll.wait_until(deadline)?;
+        if !ready.is_readable(wake) && !ready.is_error(wake) {
             return Ok(());
         }
         let mut drained = [0u8; 64];
