@@ -46,7 +46,7 @@ use crate::hypervisor::kvm::{
     kick_handle, register_ioeventfd, run_guest, start_io_threads, Kicker,
 };
 use crate::hypervisor::vcpus::{Kick, Vcpus};
-use crate::memory::{GuestRam, SharedRam};
+use crate::memory::GuestRam;
 use crate::plugin::{GuestArch, RamRegion};
 use crate::sandbox::Thread;
 use crate::signal::install_kick_handler;
@@ -75,14 +75,13 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
     vm.set_tss_address(0xfffb_d000)?;
     vm.set_identity_map_address(0xfffb_c000)?;
 
-    // Guest RAM, split around the sub-4 GiB MMIO hole (see MMIO_GAP_START): the
-    // backing object is one contiguous memfd, and the high half is the bytes
-    // after the low half, mapped at HIGH_RAM_BASE. The object is shareable so
-    // an out-of-process plugin can map the same pages; KVM only needs a valid
-    // host address, so the guest is unaffected.
+    // Guest RAM, split around the sub-4 GiB MMIO hole (see MMIO_GAP_START). It
+    // is a memfd when another process maps it (a plugin's tool or a vhost-user
+    // daemon), and private memory otherwise. In a memfd the high half is the
+    // bytes after the low half, mapped at HIGH_RAM_BASE. KVM only needs a valid
+    // host address, so the guest sees no difference.
     let low_bytes = cfg.mem_bytes.min(MMIO_GAP_START);
     let high_bytes = cfg.mem_bytes.saturating_sub(low_bytes);
-    let shared_ram = SharedRam::new(cfg.mem_bytes as usize)?;
     let mut regions = vec![RamRegion {
         gpa: RAM_BASE,
         size: low_bytes,
@@ -102,7 +101,9 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             high_bytes >> 20
         );
     }
-    let ram = Arc::new(GuestRam::new(&shared_ram, &regions)?);
+    let (ram, shared_ram) =
+        GuestRam::allocate(cfg.mem_bytes as usize, &regions, cfg.shares_guest_ram())?;
+    let ram = Arc::new(ram);
     ram.register_kvm_slots(&vm)?;
 
     let mode = cfg.irqchip.unwrap_or_default();
@@ -132,7 +133,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
         let vm = Arc::clone(&vm);
         move |fd, address, value| register_ioeventfd(&vm, fd, address, value)
     });
-    devices.attach_virtio_devices(&cfg, shared_ram.as_raw_fd())?;
+    devices.attach_virtio_devices(&cfg, shared_ram.as_ref().map(AsRawFd::as_raw_fd))?;
 
     // Kernel command line: the caller's args and the ttyS0 console. The devices
     // are in the DSDT.

@@ -144,7 +144,7 @@ pub(crate) fn boot(mut cfg: BootConfig) -> Result<Stop, Box<dyn std::error::Erro
             arch: GuestArch::Aarch64,
             sandbox_id: cfg.sandbox_id.clone(),
             ram,
-            shared_ram,
+            shared_ram: Some(shared_ram),
             ledger,
             mmio_bus,
             mmio_report_limiter: mmio_report_limiter(),

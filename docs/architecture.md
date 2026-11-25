@@ -128,6 +128,46 @@ pages, read-only; no other process can open them by name. Each region is a
 it as a KVM memory slot or through `hv_vm_map`. A region's address, size and
 file offset are multiples of 1 MiB, so they are page-aligned on any host.
 
+On Linux only a guest whose RAM another process maps needs the object: a guest
+with a plugin, which can hand the descriptor to a tool of its own, or with a
+vhost-user export, whose daemon maps all of guest RAM
+(`BootConfig::shares_guest_ram`). Any other guest gets private anonymous memory,
+one `MAP_PRIVATE` mapping per region, as Cloud Hypervisor does. Its RAM has no
+descriptor, and the devices hvi serves in-process reach it through `GuestRam`.
+
+### Huge pages on Linux
+
+On Linux every guest RAM mapping is marked `MADV_HUGEPAGE`, so the host can back
+it with 2 MiB transparent huge pages. A guest on huge pages takes fewer host
+page faults and EPT or stage-2 faults as it first touches its memory, and boots
+faster. A kernel without THP refuses the advice, and hvi carries on with base
+pages.
+
+Private guest RAM is anonymous memory, which gets huge pages under the default
+THP mode, `madvise`, with no change to the host. A memfd is shmem, and shmem has
+a THP setting of its own. Most distributions, Ubuntu among them, ship it as
+`never`, and then the advice has no effect. To let a guest with a plugin or a
+vhost-user export use huge pages, set it to `advise`:
+
+```sh
+cat /sys/kernel/mm/transparent_hugepage/shmem_enabled
+echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+```
+
+`advise` gives huge pages only to the mappings that ask for them, so other shmem
+users on the host keep base pages. Kernels since 6.11 also have a setting per
+page size, `hugepages-2048kB/shmem_enabled`, which follows the global one while
+it reads `inherit`. Neither setting survives a reboot, so set it from the host's
+boot configuration: a systemd-tmpfiles rule, or `transparent_hugepage_shmem=` on
+the command line of Linux 6.14 and later.
+
+The cost is memory. The host allocates guest RAM in 2 MiB steps, so a guest
+that touches one byte of a 2 MiB range holds all of it. khugepaged can also
+collapse ranges of base pages into huge pages later, in the background. Guest
+RAM the guest never touches still costs nothing. Under the default `defrag`
+setting, a fault in a range marked for huge pages may compact host memory first,
+which adds latency on a fragmented host.
+
 ### Guest memory maps
 
 <img src="img/guest-memory-arm64.svg" alt="arm64 guest physical address space: GIC at 0x08000000, PL011 UART at 0x0c000000, PL031 RTC at 0x0c001000, virtio-mmio window from 0x0d000000 with one page per device in attach order, RAM at 0x40000000" width="720">
