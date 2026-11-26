@@ -32,7 +32,6 @@
 //! This module mirrors Firecracker's `arch::x86_64` loader.
 
 use std::fmt;
-use std::io::Cursor;
 
 use linux_loader::configurator::linux::LinuxBootConfigurator;
 use linux_loader::configurator::{BootConfigurator, BootParams};
@@ -46,6 +45,7 @@ use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
 use crate::arch::x86_64::layout::{
     CMDLINE_ADDR, CMDLINE_MAX, EBDA_START, HIGH_MEM_START, KERNEL_ENTRY_OFF, RAM_BASE, ZERO_PAGE,
 };
+use crate::config::KernelImage;
 
 /// The e820 type of usable RAM (`E820_TYPE_RAM`); the bindings carry the table
 /// but not the type constants.
@@ -114,14 +114,14 @@ impl LoadedKernel {
     ///
     /// # Errors
     ///
-    /// Errors when `kernel` is neither a `vmlinux` ELF nor a `bzImage` with
-    /// boot protocol 2.00 or later, when `mem` has no region at address 0,
-    /// when the kernel or the command line does not fit, when the
-    /// initramfs would overlap the kernel in low RAM or does not fit its
-    /// 32-bit header fields, or when the e820 table is full.
+    /// Errors when `kernel` cannot be read, when it is neither a `vmlinux` ELF
+    /// nor a `bzImage` with boot protocol 2.00 or later, when `mem` has no
+    /// region at address 0, when the kernel or the command line does not fit,
+    /// when the initramfs would overlap the kernel in low RAM or does not fit
+    /// its 32-bit header fields, or when the e820 table is full.
     pub fn load<M: GuestMemoryBackend>(
         mem: &M,
-        kernel: &[u8],
+        kernel: &KernelImage,
         cmdline: &str,
         initrd_len: u64,
     ) -> Result<Self, String> {
@@ -220,13 +220,19 @@ impl LoadedKernel {
 
 /// Loads `kernel` as the format `detect` reports; either lands at the
 /// address the image names.
+///
+/// `linux-loader` reads each part it places from `kernel` straight into
+/// `mem`. Only the detection reads the first bytes on their own.
 fn load_kernel<M: GuestMemoryBackend>(
     mem: &M,
-    kernel: &[u8],
+    kernel: &KernelImage,
 ) -> Result<(KernelLoaderResult, KernelFormat), String> {
-    let mut image = Cursor::new(kernel);
+    let head = kernel
+        .head(ELFMAG.len())
+        .map_err(|e| format!("reading the kernel image: {e}"))?;
+    let format = KernelFormat::detect(&head);
+    let mut image = kernel.reader();
     let highmem = Some(GuestAddress(HIGH_MEM_START));
-    let format = KernelFormat::detect(kernel);
     if format == KernelFormat::Vmlinux {
         let loaded = Elf::load(mem, None, &mut image, highmem)
             .map_err(|e| format!("loading the vmlinux: {e}"))?;
@@ -424,7 +430,8 @@ pub(crate) mod tests {
     fn bzimage_lands_at_code32_start_with_its_header_in_the_zero_page() {
         let ram = guest_ram(1024 << 20);
         let image = synthetic_bzimage();
-        let kernel = LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0).expect("load");
+        let kernel = LoadedKernel::load(ram.memory(), &image.clone().into(), "console=ttyS0", 0)
+            .expect("load");
         assert_eq!(kernel.format, KernelFormat::BzImage);
         assert_eq!(kernel.entry, HIGH_MEM_START + KERNEL_ENTRY_OFF);
         assert_eq!(kernel.initrd_addr, None);
@@ -453,7 +460,8 @@ pub(crate) mod tests {
     fn vmlinux_is_entered_at_e_entry_with_a_synthesized_header() {
         let ram = guest_ram(1024 << 20);
         let image = synthetic_vmlinux();
-        let kernel = LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0).expect("load");
+        let kernel = LoadedKernel::load(ram.memory(), &image.clone().into(), "console=ttyS0", 0)
+            .expect("load");
         assert_eq!(kernel.format, KernelFormat::Vmlinux);
         assert_eq!(
             kernel.entry,
@@ -486,16 +494,46 @@ pub(crate) mod tests {
         assert_eq!(u64::from(cmd_line_ptr), CMDLINE_ADDR);
     }
 
-    // Both a header-sized and a shorter file are refused.
+    // Both a header-sized and a shorter file are refused, and so are the
+    // same bytes in memory.
     #[test]
     fn rejects_an_image_of_neither_format() {
         let ram = guest_ram(1024 << 20);
-        let err = LoadedKernel::load(ram.memory(), &[0u8; 0x1000], "console=ttyS0", 0)
-            .expect_err("no HdrS");
-        assert!(err.contains("bzImage"), "{err}");
-        let err = LoadedKernel::load(ram.memory(), &[0u8; 16], "console=ttyS0", 0)
-            .expect_err("too short");
-        assert!(err.contains("bzImage"), "{err}");
+        for len in [0x1000, 16, 0] {
+            let bytes = vec![0u8; len];
+            for image in [KernelImage::temp_file(&bytes), bytes.clone().into()] {
+                let err = LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0)
+                    .expect_err("neither format");
+                assert!(err.contains("bzImage"), "{len} bytes, {image:?}: {err}");
+            }
+        }
+    }
+
+    // The loader reads a file's segments straight into guest RAM, and must
+    // leave RAM as the same bytes in memory do.
+    #[test]
+    fn a_kernel_file_loads_as_its_bytes() {
+        // The kernel, the zero page and the command line all sit below this.
+        const SPAN: usize = VMLINUX_LOAD as usize + 0x10_0000;
+        for image in [synthetic_bzimage(), synthetic_vmlinux()] {
+            let from_bytes = guest_ram(64 << 20);
+            let from_file = guest_ram(64 << 20);
+            let line = "console=ttyS0";
+            let want = LoadedKernel::load(from_bytes.memory(), &image.clone().into(), line, 0x1000)
+                .expect("bytes");
+            let got = LoadedKernel::load(
+                from_file.memory(),
+                &KernelImage::temp_file(&image),
+                line,
+                0x1000,
+            )
+            .expect("file");
+            assert_eq!(got, want);
+            let (mut a, mut b) = (vec![0u8; SPAN], vec![0u8; SPAN]);
+            from_bytes.read(RAM_BASE, &mut a).unwrap();
+            from_file.read(RAM_BASE, &mut b).unwrap();
+            assert!(a == b, "{} RAM differs", want.format);
+        }
     }
 
     // `linux-loader`'s own checks pass; the signature check is hvi's.
@@ -505,8 +543,8 @@ pub(crate) mod tests {
         let mut image = synthetic_bzimage();
         image[0x1fe] = 0;
         image[0x1ff] = 0;
-        let err =
-            LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0).expect_err("no 0xAA55");
+        let err = LoadedKernel::load(ram.memory(), &image.clone().into(), "console=ttyS0", 0)
+            .expect_err("no 0xAA55");
         assert!(err.contains("boot sector"), "{err}");
     }
 
@@ -515,8 +553,8 @@ pub(crate) mod tests {
         let ram = guest_ram(1024 << 20);
         let mut image = synthetic_vmlinux();
         image[EI_DATA] = 2; // big-endian
-        let err =
-            LoadedKernel::load(ram.memory(), &image, "console=ttyS0", 0).expect_err("not for us");
+        let err = LoadedKernel::load(ram.memory(), &image.clone().into(), "console=ttyS0", 0)
+            .expect_err("not for us");
         assert!(err.contains("vmlinux"), "{err}");
     }
 
@@ -526,7 +564,7 @@ pub(crate) mod tests {
     fn cmdline_with_init_args_is_written_verbatim() {
         let ram = guest_ram(1024 << 20);
         let line = "console=ttyS0 rdinit=/init -- --flag value";
-        LoadedKernel::load(ram.memory(), &synthetic_bzimage(), line, 0).expect("load");
+        LoadedKernel::load(ram.memory(), &synthetic_bzimage().into(), line, 0).expect("load");
         let mut back = vec![0u8; line.len() + 1];
         ram.read(CMDLINE_ADDR, &mut back).unwrap();
         assert_eq!(&back[..line.len()], line.as_bytes());
@@ -540,7 +578,13 @@ pub(crate) mod tests {
         let ram = guest_ram(4096 << 20);
         let regions = ram.regions();
         assert_eq!(regions.len(), 2, "a 4 GiB guest must split");
-        LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0).expect("load");
+        LoadedKernel::load(
+            ram.memory(),
+            &synthetic_bzimage().into(),
+            "console=ttyS0",
+            0,
+        )
+        .expect("load");
 
         let map = e820(&ram);
         assert_eq!(map.len(), 3, "e820: {map:x?}");
@@ -564,7 +608,7 @@ pub(crate) mod tests {
         let initrd_len = 8 << 20;
         let kernel = LoadedKernel::load(
             ram.memory(),
-            &synthetic_bzimage(),
+            &synthetic_bzimage().into(),
             "console=ttyS0",
             initrd_len,
         )
@@ -588,8 +632,13 @@ pub(crate) mod tests {
     #[test]
     fn initrd_that_would_overlap_the_kernel_is_refused() {
         let ram = guest_ram(3 << 20);
-        let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 2 << 20)
-            .expect_err("2 MiB initrd in 3 MiB of low RAM lands on the kernel");
+        let err = LoadedKernel::load(
+            ram.memory(),
+            &synthetic_bzimage().into(),
+            "console=ttyS0",
+            2 << 20,
+        )
+        .expect_err("2 MiB initrd in 3 MiB of low RAM lands on the kernel");
         assert!(err.contains("initramfs"), "{err}");
     }
 
@@ -601,14 +650,23 @@ pub(crate) mod tests {
         // own load address.
         let low = VMLINUX_LOAD + VMLINUX_MEMSZ + 0x1000;
         let ram = guest_ram(low);
-        let err = LoadedKernel::load(ram.memory(), &synthetic_vmlinux(), "console=ttyS0", 0x1000)
-            .expect_err("the slot is inside the kernel");
+        let err = LoadedKernel::load(
+            ram.memory(),
+            &synthetic_vmlinux().into(),
+            "console=ttyS0",
+            0x1000,
+        )
+        .expect_err("the slot is inside the kernel");
         assert!(err.contains("initramfs"), "{err}");
 
         let ram = guest_ram(low + (2 << 20));
-        let kernel =
-            LoadedKernel::load(ram.memory(), &synthetic_vmlinux(), "console=ttyS0", 0x1000)
-                .expect("the next slot is clear of the kernel");
+        let kernel = LoadedKernel::load(
+            ram.memory(),
+            &synthetic_vmlinux().into(),
+            "console=ttyS0",
+            0x1000,
+        )
+        .expect("the next slot is clear of the kernel");
         assert!(kernel.initrd_addr.unwrap() >= VMLINUX_LOAD + VMLINUX_MEMSZ);
     }
 
@@ -616,7 +674,13 @@ pub(crate) mod tests {
     fn small_guest_is_unsplit() {
         let ram = guest_ram(1024 << 20);
         assert_eq!(ram.regions().len(), 1);
-        LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0).expect("load");
+        LoadedKernel::load(
+            ram.memory(),
+            &synthetic_bzimage().into(),
+            "console=ttyS0",
+            0,
+        )
+        .expect("load");
 
         assert_eq!(
             e820(&ram),
@@ -636,16 +700,26 @@ pub(crate) mod tests {
         // Low RAM of 5 GiB is not a layout the hypervisor backend builds; it is
         // the one shape in which a 4 GiB initramfs passes the placement check.
         let ram = GuestRam::from_ranges(&[(0, 5 << 30)]);
-        let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 1 << 32)
-            .expect_err("4 GiB initramfs");
+        let err = LoadedKernel::load(
+            ram.memory(),
+            &synthetic_bzimage().into(),
+            "console=ttyS0",
+            1 << 32,
+        )
+        .expect_err("4 GiB initramfs");
         assert!(err.contains("ramdisk_size"), "{err}");
     }
 
     #[test]
     fn ram_without_a_low_region_is_refused() {
         let ram = GuestRam::from_ranges(&[(HIGH_RAM_BASE, 32 << 20)]);
-        let err = LoadedKernel::load(ram.memory(), &synthetic_bzimage(), "console=ttyS0", 0)
-            .expect_err("nothing at address 0");
+        let err = LoadedKernel::load(
+            ram.memory(),
+            &synthetic_bzimage().into(),
+            "console=ttyS0",
+            0,
+        )
+        .expect_err("nothing at address 0");
         assert!(err.contains("address 0"), "{err}");
     }
 }

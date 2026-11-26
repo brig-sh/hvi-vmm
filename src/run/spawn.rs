@@ -122,7 +122,7 @@ mod tests {
     fn run_keeps_the_stop_its_config_holds() {
         let (handle, registration) = StopHandle::new_pair().unwrap();
         let cfg = BootConfig {
-            kernel: Vec::new(),
+            kernel: Vec::new().into(),
             initramfs: None,
             mem_bytes: 128 << 20,
             cmdline: String::new(),

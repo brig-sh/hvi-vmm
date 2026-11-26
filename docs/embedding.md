@@ -1,7 +1,7 @@
 # Embedding hvi
 
 hvi is a library as well as a command. The `hvi` binary is a thin CLI over it:
-it parses flags, reads the kernel, and hands a `BootConfig` to the active
+it parses flags, opens the kernel, and hands a `BootConfig` to the active
 backend. Everything of substance is in the library.
 
 This page is the path from running the CLI to linking the VMM. For attaching a
@@ -97,10 +97,10 @@ open elsewhere" while it lives.
 ## A minimal caller
 
 ```rust
-use hvi::config::BootConfig;
+use hvi::config::{BootConfig, KernelImage};
 
 let cfg = BootConfig {
-    kernel: std::fs::read("Image")?,
+    kernel: KernelImage::open("Image")?,
     initramfs: Some(std::fs::read("initramfs.cpio")?),
     mem_bytes: 1024 << 20,
     cmdline: String::from("earlycon console=ttyAMA0 panic=-1"),
@@ -140,7 +140,7 @@ cargo build --release --example watch_guest
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `kernel` | `Vec<u8>` | The image bytes. arm64 `Image`, x86-64 `bzImage` or uncompressed `vmlinux`, matching the target. |
+| `kernel` | `KernelImage` | arm64 `Image`, x86-64 `bzImage` or uncompressed `vmlinux`, matching the target. `KernelImage::open(path)` keeps the file open, and the loader reads what it places straight into guest RAM. A `Vec<u8>` converts with `.into()`. |
 | `initramfs` | `Option<Vec<u8>>` | Bytes, not a path. |
 | `mem_bytes` | `u64` | Guest RAM. |
 | `cmdline` | `String` | The backend appends what its own devices need. |
