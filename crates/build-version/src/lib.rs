@@ -24,13 +24,12 @@ const UNKNOWN: &str = "0.0.0+unknown";
 /// Paths, relative to the crate, that the binary is built from. A change under
 /// any of them makes the build differ from the commit it names, and reruns the
 /// derivation so the version says so.
-const INPUTS: [&str; 7] = [
+const INPUTS: [&str; 6] = [
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",
     "rust-toolchain.toml",
     "crates",
-    "resources",
     "src",
 ];
 

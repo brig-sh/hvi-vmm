@@ -1,52 +1,47 @@
 # hvi seccomp-bpf allowlists
 
-One file per architecture, compiled into the binary by
-`src/sandbox/seccomp/mod.rs` and installed per thread. The reasoning behind the
-design lives in that module's docs; this file covers what you need to change one
-of these safely.
+The lists are constants in `src/sandbox/seccomp/allowlists.rs`, compiled into
+filters by `src/sandbox/seccomp/mod.rs` and installed per thread. The reasoning
+behind the design lives in the module docs of `mod.rs`; this file covers what
+you need to change a list safely.
 
-The prose that would normally sit at the top of the JSON is here instead:
-seccompiler parses **every** top-level key as a filter, so a `__comment` key is
-a parse error, not a comment. Per-rule `"comment"` fields are supported and are
-where each syscall's justification lives.
+## How a list is written
 
-## Schema
+A list is an array of rules. A rule takes the syscall's number from libc's
+constant, under a comment that says why the call is there:
 
-seccompiler's, which is Firecracker's -- seccompiler was extracted from
-Firecracker and reads the same files:
-
-```json
-{ "<thread>": { "default_action": "trap",     // mismatch: what happens off-list
-                "filter_action": "allow",     // match: what happens on-list
-                "filter": [ {"syscall": "read", "comment": "why"} ] } }
+```rust
+// The ledger writer.
+Rule::syscall(libc::SYS_pwrite64),
 ```
 
-A rule can also match an argument. Only the `ioctl` rules do, on the request
-number. `block`'s rules allow a request with `eq`:
+A rule can also match the request of an `ioctl`. No other rule matches an
+argument. Each of `block`'s `ioctl` rules allows one request, which comes from
+libc's constant, or is built as the header builds it where libc has none:
 
-```json
-{"syscall": "ioctl",
- "args": [{"index": 1, "type": "dword", "op": "eq", "val": 21506}],
- "comment": "why"}
+```rust
+// The terminal restore of the fatal-signal handler and of the panic hook:
+// tcsetattr.
+Rule::ioctl(libc::TCSETS),
 ```
 
-The one `ioctl` rule of `vmm` and `vcpu` refuses `TIOCSTI` and `TIOCLINUX`
-with `ne`:
+The one `ioctl` rule of `vmm` and `vcpu` allows every request but `TIOCSTI` and
+`TIOCLINUX`:
 
-```json
-{"syscall": "ioctl", "args": [
-    {"index": 1, "type": "dword", "op": "ne", "val": 21522, "comment": "TIOCSTI (0x5412)"},
-    {"index": 1, "type": "dword", "op": "ne", "val": 21532, "comment": "TIOCLINUX (0x541C)"}
-]}
+```rust
+Rule::ioctl_except(TERMINAL_INPUT),
 ```
 
-- JSON has no hex literals, so `val` is decimal and the comment gives the hex.
-- Compare a request as a `dword`, the low 32 bits. The module docs say why.
+A request is compared in its low 32 bits. The module docs of `mod.rs` say why.
 
 The rules of one syscall are joined, so the syscall is allowed when any of them
-matches. Every condition of one rule must hold for the rule to match. A call
-that matches no rule traps like an off-list syscall. A rule without `args`
-beside one with `args` does not allow every call: only the conditions count.
+matches. A call that matches no rule traps like an off-list syscall. A list
+states a syscall once, or once per request it allows, and a test holds that.
+
+Each list serves both architectures. An entry only one of them has is behind a
+`cfg`. `poll` is the one syscall that differs: x86-64 has both `poll` and
+`ppoll`, and aarch64 has `ppoll` alone, because aarch64 has no `poll` syscall.
+`block`'s `KVM_IRQ_LINE` rule is the other entry behind a `cfg`, on x86-64 only.
 
 A filter per kind of thread:
 
@@ -64,7 +59,7 @@ A filter per kind of thread:
   does not allow them. It keeps `fdatasync` and `fsync`, which only a worker
   calls, so that `block` stays within it apart from those two.
 
-One list serves both x86-64 irqchip modes. `block`'s `KVM_IRQ_LINE` rule serves
+Each list serves both x86-64 irqchip modes. `block`'s `KVM_IRQ_LINE` rule serves
 the in-kernel irqchip only: with the split irqchip, a worker raises its disk's
 interrupt with a `write` to an irqfd, as it does on arm64.
 
@@ -85,9 +80,8 @@ loose and fatally too tight, so no code or list of theirs is included here and
 no attribution is owed.
 
 What does transfer is their production experience about the rare paths a single
-trace never shows. Entries our own trace did not produce are marked
-`"comment": "safety net: ..."`, and most of those came from reading their
-lists.
+trace never shows. Entries our own trace did not produce have a comment that
+starts with `Safety net:`, and most of those came from reading their lists.
 
 The musl build shares the lists. musl can reach a different syscall than glibc
 for the same library call, so `hvi seccomp-selftest` run on the musl binary is
@@ -118,7 +112,7 @@ data, so the bar is a demonstrated need, not a suspicion:
    keeps running. That names the syscall. It also means enforcement is off for
    that run, so it is a diagnostic and never a way to operate. A glibc build
    still refuses an open under it, without a record.
-2. Add it to the narrowest filter that needs it, with a `comment` saying which
+2. Add it to the narrowest list that needs it, under a comment that says which
    code path calls it.
 3. `cargo test` -- the unit tests check that every list compiles for the target
    arch, that `vcpu` stays a strict subset of `vmm`, and that `block` does too
@@ -132,8 +126,3 @@ data, so the bar is a demonstrated need, not a suspicion:
    architecture over the refused requests and a few allowed ones.
 4. `hvi seccomp-selftest` -- installs the real filters in child processes and
    checks what survives.
-
-`poll` is the only name that differs between the two files: x86-64 has both
-`poll` and `ppoll`, and aarch64 has `ppoll` alone, because aarch64 has no
-`poll` syscall. That asymmetry is why the two files are not generated from one
-source, and the compile test is what catches getting it wrong.

@@ -106,12 +106,12 @@ hvi sandbox-selftest    # macOS
 hvi seccomp-selftest    # Linux
 ```
 
-Neither needs a hypervisor or privileges, so a hosted runner that cannot boot
-a guest can still fail a bad profile or a bad list. CI runs the Seatbelt one
-on hosted macOS, and the seccomp one on hosted x86 Linux, on both hosted musl
-builds and on the self-hosted arm64 runners. The aarch64 list runs on the
-hosted arm64 musl build, and the self-hosted runners are the only place it
-runs on the glibc build.
+Neither needs a hypervisor or privileges, so a hosted runner that cannot boot a
+guest can still fail a bad profile or a bad list. CI runs the Seatbelt one on
+hosted macOS, and the seccomp one on hosted x86 Linux, on both hosted musl
+builds and on the self-hosted arm64 runners. The aarch64 filters run on the
+hosted arm64 musl build, and the self-hosted runners are the only place they run
+on the glibc build.
 
 The macOS job asserts the success line, so a change of runner image cannot
 quietly turn the step into a no-op.

@@ -79,17 +79,15 @@ applevisor-sys = "1.0.0"
 kvm-ioctls = "0.25"
 kvm-bindings = "0.14"
 # seccomp-bpf allowlists for the Linux backends. The rust-vmm crate extracted
-# from Firecracker: it owns the syscall tables and the BPF codegen, so
-# `resources/seccomp/*.json` is all we write. The `json` feature pulls
-# serde/serde_json, which this crate already depends on.
-seccompiler = { version = "0.5", features = ["json"] }
+# from Firecracker: it owns the BPF codegen, so the lists are all we write.
+seccompiler = "0.5"
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 kvm-ioctls = "0.25"
 # fam-wrappers gives the CpuId FAM wrapper for KVM_GET_SUPPORTED_CPUID / SET_CPUID2.
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 # See the aarch64 section above.
-seccompiler = { version = "0.5", features = ["json"] }
+seccompiler = "0.5"
 # The ACPI tables an x86-64 guest powers off and resets through.
 acpi_tables = "0.2.1"
 
