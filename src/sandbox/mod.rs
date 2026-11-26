@@ -29,7 +29,11 @@ pub mod seccomp;
 ///
 /// macOS has no filter per thread, since the Seatbelt profile covers the whole
 /// process.
+///
+/// A kind of thread that gets a filter of its own adds a variant, so a `match`
+/// on this outside the crate takes a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Thread {
     /// The thread that calls `boot` and the host-side I/O threads.
     Vmm,
