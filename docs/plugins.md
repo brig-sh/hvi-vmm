@@ -38,9 +38,8 @@ On Linux a call the hook's filter does not allow kills the VMM (see
 [security.md](security.md#linux-seccomp-bpf)). The `vcpu` filter refuses a read
 or write at an offset, a seek and a file sync, so a write to a file from
 `on_safepoint` goes at the file's position, as `IoTrace`'s does. The `block`
-filter does not allow every call the `vcpu` filter does: no `getrandom`, so no
-first use of a `HashMap` in `on_block`, and no `sendmsg`, `recvmsg` or
-`shutdown`.
+filter does not allow every call the `vcpu` filter does: no `sendmsg`, `recvmsg`
+or `shutdown`, and `ioctl` only for the requests a worker makes.
 
 ## The rules that fail quietly
 

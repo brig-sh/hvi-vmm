@@ -140,6 +140,9 @@ const BASE: &[Rule] = &[
     Rule::syscall(libc::SYS_madvise),
     // glibc malloc for small allocations.
     Rule::syscall(libc::SYS_brk),
+    // std seeding the first HashMap a thread makes, which a plugin's code may
+    // make on any thread.
+    Rule::syscall(libc::SYS_getrandom),
     // The panic hook's waits for the lock on the current run and for the vCPUs
     // to exit, and the waits each list states.
     #[cfg(target_arch = "x86_64")]
@@ -252,8 +255,6 @@ const VMM: &[Rule] = &[
     // A plugin thread that wakes on a timer; the ledger writer's wait before it
     // tries a failed write again.
     Rule::syscall(libc::SYS_clock_nanosleep),
-    // HashMap seeding on first use.
-    Rule::syscall(libc::SYS_getrandom),
 ];
 
 /// The calls of a vCPU thread, beside [`BASE`].
@@ -269,6 +270,7 @@ const VMM: &[Rule] = &[
 ///   writer.
 /// - `mmap` for a device's allocations, and `mremap`, a safety net, for the
 ///   realloc of a frame buffer.
+/// - `getrandom` for the first `HashMap` a device makes.
 /// - `poll` for a plugin's own wait at the safe point on vcpu0, and for the
 ///   vsock device's check for a host hangup, which does not wait.
 /// - `clock_gettime`, a safety net as in the base, for the PL031 data-register
@@ -286,8 +288,6 @@ const VCPU: &[Rule] = &[
     Rule::ioctl_except(TERMINAL_INPUT),
     // A plugin draining its doorbell eventfd at the safe point.
     Rule::syscall(libc::SYS_read),
-    // HashMap seeding inside a device.
-    Rule::syscall(libc::SYS_getrandom),
     // Safety net: a device dropping a descriptor.
     Rule::syscall(libc::SYS_close),
     // virtio-vsock shutting down a session's host end; vhost-user: the
