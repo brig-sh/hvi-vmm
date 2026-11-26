@@ -487,6 +487,27 @@ fn probes() -> Vec<Probe> {
             expected: Outcome::Allowed,
             run: restore_terminal,
         },
+        // std seeds the first `HashMap` a thread makes with `getrandom`, and a
+        // sink may make one on a disk's worker. The syscall is made directly,
+        // since a libc may serve `getrandom` without one.
+        Probe {
+            what: "read random bytes (block)",
+            thread: Thread::Block,
+            expected: Outcome::Allowed,
+            run: || {
+                let mut seed = [0u8; 16];
+                // SAFETY: the syscall writes at most `seed.len()` bytes into
+                // `seed`.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_getrandom,
+                        seed.as_mut_ptr(),
+                        seed.len(),
+                        libc::GRND_NONBLOCK,
+                    )
+                };
+            },
+        },
     ]
 }
 
