@@ -89,7 +89,7 @@ touches guest data unconfined.
 
 ### Linux: seccomp-bpf
 
-An allowlist per kind of thread, per architecture, in `resources/seccomp/`,
+An allowlist per kind of thread, in `src/sandbox/seccomp/allowlists.rs`,
 installed by each thread for itself:
 
 | Filter | Covers |
@@ -144,9 +144,9 @@ kernel's own checks vary by host. Its `TIOCSTI` check depends on
 `dev.tty.legacy_tiocsti`, and neither check applies to a caller with
 `CAP_SYS_ADMIN`.
 
-The two architecture files are not generated from one source. `poll` is the
-only name that differs: x86-64 has both `poll` and `ppoll`, and aarch64 has
-`ppoll` alone, because aarch64 has no `poll` syscall.
+Each filter serves both architectures. `poll` is the only syscall that differs:
+x86-64 has both `poll` and `ppoll`, and aarch64 has `ppoll` alone, because
+aarch64 has no `poll` syscall. `block`'s `KVM_IRQ_LINE` rule is on x86-64 only.
 
 Failure behaviour differs by install site, and all three fail closed:
 
@@ -159,7 +159,7 @@ Failure behaviour differs by install site, and all three fail closed:
 
 ### `HVI_SECCOMP=log` turns enforcement off
 
-The variable rewrites every filter's mismatch action to `log`. The kernel then
+The variable changes every filter's mismatch action to `log`. The kernel then
 **permits** the off-list syscall and records it. This is not a softer
 enforcement mode. It is no enforcement, with logging. A glibc build still
 refuses an open under it, without a record.
@@ -245,5 +245,4 @@ Weigh that before you put something valuable behind it.
   with security consequences.
 - [storage-and-sharing.md](storage-and-sharing.md) before exporting a writable
   directory.
-- [../resources/seccomp/README.md](../resources/seccomp/README.md) to change
-  an allowlist.
+- [seccomp-allowlists.md](seccomp-allowlists.md) to change an allowlist.

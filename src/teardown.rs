@@ -38,9 +38,9 @@
 //! closes the write half with the same effect, so a token also reports the stop
 //! when `boot` unwinds past it.
 //!
-//! `poll` is the wake primitive on every backend. Both Linux `vmm` seccomp
-//! allowlists carry it (as `ppoll` on aarch64, which is what glibc's `poll`
-//! calls there), and the pair is created before any filter installs.
+//! `poll` is the wake primitive on every backend. Every Linux seccomp allowlist
+//! carries it (as `ppoll` on aarch64, which is what glibc's `poll` calls
+//! there), and the pair is created before any filter installs.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};

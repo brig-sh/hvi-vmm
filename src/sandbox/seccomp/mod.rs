@@ -24,10 +24,11 @@
 //! # What is reused, and what is not
 //!
 //! The mechanism is [`seccompiler`], the rust-vmm crate extracted from
-//! Firecracker: it compiles a declarative allowlist to BPF and installs it. We
-//! write no BPF and no syscall-number tables. The filter files in
-//! `resources/seccomp/` are in seccompiler's JSON schema, which is
-//! Firecracker's schema, so they are reviewable the same way theirs are.
+//! Firecracker: it compiles an allowlist to BPF and installs it. We write no
+//! BPF and no syscall-number tables. The lists are constants in the
+//! `allowlists` module, where an entry takes its syscall number from libc's
+//! constant, and an `ioctl` request from libc's constant or the header's
+//! definition, under a comment that says why the call is there.
 //!
 //! What is deliberately *not* reused is the content of Firecracker's filters,
 //! and that is worth writing down because it is the opposite of what you would
@@ -40,7 +41,7 @@
 //! `clone3`, without which a glibc Rust binary dies before it reaches `main`.
 //! Vendoring them would have been simultaneously too loose and fatally too
 //! tight. So the lists are measured from hvi under `strace -f`, and the entries
-//! that our trace did *not* show are marked in the JSON as safety nets taken
+//! that our trace did *not* show are marked in the lists as safety nets taken
 //! from their production experience, which is the part of Firecracker's work
 //! that transfers. The musl build shares the lists. musl can reach a different
 //! syscall than glibc for the same library call, so `hvi seccomp-selftest` run
@@ -140,20 +141,28 @@
 //! `dev.tty.legacy_tiocsti = 0`, and it refuses neither request to a caller
 //! with `CAP_SYS_ADMIN`.
 //!
-//! Each condition compares the low 32 bits of the request (`"type": "dword"`),
-//! because the kernel reads the request as an `unsigned int`. A 64-bit
-//! comparison would pass `TIOCSTI` with a bit set above bit 31, and the kernel
-//! would still run it as `TIOCSTI`.
+//! Each condition compares the low 32 bits of the request, because the kernel
+//! reads the request as an `unsigned int`. A 64-bit comparison would pass
+//! `TIOCSTI` with a bit set above bit 31, and the kernel would still run it as
+//! `TIOCSTI`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 pub use super::Thread;
 use crate::LOG_PREFIX;
-use seccompiler::{BpfProgram, TargetArch};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
+};
+
+mod allowlists;
+
+use allowlists::Request;
 
 impl Thread {
-    /// The key this filter has in the JSON.
-    fn key(self) -> &'static str {
+    /// Returns the name the filter has in a message.
+    fn name(self) -> &'static str {
         match self {
             Thread::Vmm => "vmm",
             Thread::Vcpu => "vcpu",
@@ -162,38 +171,24 @@ impl Thread {
     }
 }
 
-/// The allowlists, per architecture. Compiled in, so the running binary carries
-/// the filters it was reviewed with rather than reading them from a path an
-/// attacker might control.
-#[cfg(target_arch = "x86_64")]
-pub const FILTERS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/seccomp/x86_64.json"
-));
-/// The allowlists, per architecture.
-#[cfg(target_arch = "aarch64")]
-pub const FILTERS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/seccomp/aarch64.json"
-));
-
-/// The architecture seccompiler compiles syscall names for. Getting this wrong
-/// would compile a filter against the wrong syscall numbers, which is why it
-/// comes from `cfg` rather than from anything at run time.
+/// The architecture seccompiler compiles a filter for.
+///
+/// It comes from `cfg`, as the syscall numbers in the lists do, so a filter
+/// checks for the architecture its numbers belong to.
 #[cfg(target_arch = "x86_64")]
 const ARCH: TargetArch = TargetArch::x86_64;
-/// The architecture seccompiler compiles syscall names for.
+/// The architecture seccompiler compiles a filter for.
 #[cfg(target_arch = "aarch64")]
 const ARCH: TargetArch = TargetArch::aarch64;
 
 /// The open syscalls of this architecture, which a glibc build refuses with
 /// [`open_refusal_program`].
 #[cfg(target_env = "gnu")]
-const OPEN_SYSCALLS: &[(&str, i64)] = &[
+const OPEN_SYSCALLS: &[i64] = &[
     #[cfg(target_arch = "x86_64")]
-    ("open", libc::SYS_open),
-    ("openat", libc::SYS_openat),
-    ("openat2", libc::SYS_openat2),
+    libc::SYS_open,
+    libc::SYS_openat,
+    libc::SYS_openat2,
 ];
 
 /// Environment variable that swaps the mismatch action for `log`, so a syscall
@@ -207,46 +202,48 @@ pub fn log_mode() -> bool {
     std::env::var(LOG_ENV).is_ok_and(|v| v == "log")
 }
 
-/// Returns the allowlist for `thread`, compiled from [`FILTERS`].
+/// Returns the allowlist for `thread`, compiled from its rules.
 ///
-/// The JSON is rewritten before compiling rather than kept as a second copy of
-/// the lists that could drift from the real one. With `log` set,
-/// `default_action`, the mismatch action in seccompiler's schema, becomes
-/// `log`. A glibc build adds the open syscalls to each list, which is safe only
-/// behind the filter that refuses them, so the allowlist is compiled through
+/// With `log` set, a syscall outside the list is logged rather than trapped. A
+/// glibc build adds the open syscalls to the list, which is safe only behind
+/// the filter that refuses them, so the allowlist is compiled through
 /// [`programs`] alone.
 fn allowlist(thread: Thread, log: bool) -> io::Result<BpfProgram> {
-    let mut doc: serde_json::Value =
-        serde_json::from_str(FILTERS).map_err(|e| io::Error::other(format!("filters: {e}")))?;
-    let Some(map) = doc.as_object_mut() else {
-        return Err(io::Error::other("filters: expected a JSON object"));
+    let failed = |e: seccompiler::BackendError| {
+        io::Error::other(format!("compiling the {} filter: {e}", thread.name()))
     };
-    for (_name, filter) in map.iter_mut() {
-        let Some(obj) = filter.as_object_mut() else {
-            continue;
+    // A condition on the request of an `ioctl`, compared in its low 32 bits,
+    // whatever the libc's type for a request.
+    let condition = |op, request: libc::Ioctl| {
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, op, u64::from(request as u32))
+            .map_err(failed)
+    };
+    // A syscall with no condition is allowed whatever its arguments.
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for rule in thread.rules() {
+        let allowed = rules.entry(rule.number).or_default();
+        let conditions = match rule.request {
+            Request::Any => continue,
+            Request::Is(request) => vec![condition(SeccompCmpOp::Eq, request)?],
+            Request::IsNot(requests) => requests
+                .iter()
+                .map(|&request| condition(SeccompCmpOp::Ne, request))
+                .collect::<io::Result<_>>()?,
         };
-        if log {
-            obj.insert(
-                "default_action".to_string(),
-                serde_json::Value::String("log".to_string()),
-            );
-        }
-        #[cfg(target_env = "gnu")]
-        if let Some(list) = obj.get_mut("filter").and_then(|f| f.as_array_mut()) {
-            list.extend(
-                OPEN_SYSCALLS
-                    .iter()
-                    .map(|(name, _)| serde_json::json!({ "syscall": name })),
-            );
-        }
+        allowed.push(SeccompRule::new(conditions).map_err(failed)?);
     }
-    let json =
-        serde_json::to_string(&doc).map_err(|e| io::Error::other(format!("filters: {e}")))?;
-
-    let mut map = seccompiler::compile_from_json(json.as_bytes(), ARCH)
-        .map_err(|e| io::Error::other(format!("compiling the {} filter: {e}", thread.key())))?;
-    map.remove(thread.key())
-        .ok_or_else(|| io::Error::other(format!("no {} filter in the allowlists", thread.key())))
+    #[cfg(target_env = "gnu")]
+    for &number in OPEN_SYSCALLS {
+        rules.entry(number).or_default();
+    }
+    let mismatch = if log {
+        SeccompAction::Log
+    } else {
+        SeccompAction::Trap
+    };
+    SeccompFilter::new(rules, mismatch, SeccompAction::Allow, ARCH)
+        .and_then(BpfProgram::try_from)
+        .map_err(failed)
 }
 
 /// Compiles the filter a glibc build installs before each allowlist.
@@ -258,12 +255,12 @@ fn allowlist(thread: Thread, log: bool) -> io::Result<BpfProgram> {
 fn open_refusal_program() -> io::Result<BpfProgram> {
     let rules = OPEN_SYSCALLS
         .iter()
-        .map(|&(_, number)| (number, Vec::new()))
+        .map(|&number| (number, Vec::new()))
         .collect();
-    seccompiler::SeccompFilter::new(
+    SeccompFilter::new(
         rules,
-        seccompiler::SeccompAction::Allow,
-        seccompiler::SeccompAction::Errno(libc::EPERM.unsigned_abs()),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM.unsigned_abs()),
         ARCH,
     )
     .and_then(BpfProgram::try_from)
@@ -280,7 +277,7 @@ fn programs(thread: Thread, log: bool) -> io::Result<Vec<(&'static str, BpfProgr
     Ok(vec![
         #[cfg(target_env = "gnu")]
         ("open refusal", open_refusal_program()?),
-        (thread.key(), allowlist(thread, log)?),
+        (thread.name(), allowlist(thread, log)?),
     ])
 }
 
@@ -342,12 +339,11 @@ pub(crate) fn is_thread_filtered() -> bool {
 
 /// Turns filtering on for the threads spawned after this call.
 ///
-/// It compiles every filter first. That turns "this distro's kernel headers
-/// spell a syscall differently" into a boot error on the thread that calls
-/// `boot`, where it can be reported, instead of a `SIGSYS` inside a device
-/// thread later on.
+/// It compiles every filter first, so a list seccompiler refuses is a boot
+/// error on the thread that calls `boot`, where it can be reported, and no
+/// thread aborts later because its filter does not compile.
 pub fn arm() -> io::Result<()> {
-    for thread in [Thread::Vmm, Thread::Vcpu, Thread::Block] {
+    for thread in Thread::ALL {
         programs(thread, log_mode())?;
     }
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -384,32 +380,27 @@ pub fn install_thread(thread: Thread) {
     if let Err(e) = install(thread) {
         stderrln!(
             "{LOG_PREFIX} FATAL: cannot filter the {} thread: {e}",
-            thread.key()
+            thread.name()
         );
         std::process::abort();
     }
 }
 
-/// Returns the number of syscalls each filter allows, for `vmm`, `vcpu` and
-/// `block` in that order.
+/// Returns the number of syscalls the filter of `thread` allows.
 ///
 /// A syscall with a rule per argument value counts once.
-pub fn allowed_counts() -> io::Result<(usize, usize, usize)> {
-    let doc: serde_json::Value =
-        serde_json::from_str(FILTERS).map_err(|e| io::Error::other(format!("filters: {e}")))?;
-    let count = |k: &str| -> usize {
-        doc.get(k)
-            .and_then(|f| f.get("filter"))
-            .and_then(|f| f.as_array())
-            .map_or(0, |rules| {
-                rules
-                    .iter()
-                    .filter_map(|rule| rule.get("syscall")?.as_str())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-            })
-    };
-    Ok((count("vmm"), count("vcpu"), count("block")))
+pub fn allowed_count(thread: Thread) -> usize {
+    thread
+        .rules()
+        .iter()
+        .map(|rule| rule.number)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// Returns the `KVM_RUN` request, which `vmm` and `vcpu` allow.
+const fn kvm_run() -> libc::Ioctl {
+    libc::_IO(kvm_bindings::KVMIO, 0x80)
 }
 
 /// The seccomp filters of a run, compiled before its I/O and vCPU threads
@@ -418,33 +409,31 @@ pub fn allowed_counts() -> io::Result<(usize, usize, usize)> {
 /// Each thread installs its own filters as it starts, with [`install_thread`].
 /// [`Filters::install`] installs those of the thread that calls `boot`, last.
 pub(crate) struct Filters {
-    /// The number of syscalls each filter allows, when the sandbox is on.
-    counts: Option<(usize, usize, usize)>,
+    /// Whether the sandbox is on.
+    armed: bool,
 }
 
 impl Filters {
     /// Arms the seccomp filters when `sandbox` is set.
     ///
-    /// This compiles every filter, so a bad list fails the boot here rather
-    /// than as a `SIGSYS` inside a device thread later. Nothing is filtered
-    /// yet: each thread installs its own as it starts.
+    /// This compiles every filter, so a list that does not compile fails the
+    /// boot here. Nothing is filtered yet: each thread installs its own as it
+    /// starts.
     ///
     /// # Errors
     ///
     /// Errors if a filter does not compile.
     pub(crate) fn arm(sandbox: bool) -> io::Result<Self> {
         if !sandbox {
-            return Ok(Self { counts: None });
+            return Ok(Self { armed: false });
         }
         arm()?;
-        Ok(Self {
-            counts: Some(allowed_counts()?),
-        })
+        Ok(Self { armed: true })
     }
 
     /// Returns whether the filters are armed.
     pub(crate) fn is_armed(&self) -> bool {
-        self.counts.is_some()
+        self.armed
     }
 
     /// Filters the calling thread, the one that called `boot`, and reports the
@@ -458,12 +447,12 @@ impl Filters {
     ///
     /// Errors if the filter cannot be installed.
     pub(crate) fn install(self) -> io::Result<()> {
-        let Some((vmm, vcpu, block)) = self.counts else {
+        if !self.armed {
             stderrln!(
                 "{LOG_PREFIX} seccomp: OFF (--no-sandbox); the VMM keeps the full host syscall surface"
             );
             return Ok(());
-        };
+        }
         install(Thread::Vmm)?;
         let opens = if cfg!(target_env = "gnu") {
             "; open is refused"
@@ -476,7 +465,10 @@ impl Filters {
             );
         } else {
             stderrln!(
-                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, block {block}, trap on mismatch{opens})"
+                "{LOG_PREFIX} seccomp: on (vmm {vmm} syscalls, vcpu {vcpu}, block {block}, trap on mismatch{opens})",
+                vmm = allowed_count(Thread::Vmm),
+                vcpu = allowed_count(Thread::Vcpu),
+                block = allowed_count(Thread::Block),
             );
         }
         Ok(())
@@ -629,8 +621,8 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::kill(1, 0) };
             },
         },
-        // The ioctl rule's conditions. Each list carries its own copy, so each
-        // list gets its own probes.
+        // The ioctl rule's conditions. `vmm` and `vcpu` each state the rule, so
+        // each gets its own probes.
         Probe {
             what: "push a byte into terminal input, TIOCSTI (vcpu)",
             thread: Thread::Vcpu,
@@ -788,7 +780,7 @@ fn probes() -> Vec<Probe> {
                 let level = kvm_bindings::kvm_irq_level::default();
                 // SAFETY: KVM_IRQ_LINE on a descriptor that is not open, which
                 // the kernel refuses with EBADF once the filter has passed it.
-                unsafe { libc::ioctl(-1, kvm_irq_line(), &level) };
+                unsafe { libc::ioctl(-1, allowlists::KVM_IRQ_LINE, &level) };
             },
         },
         Probe {
@@ -977,18 +969,6 @@ fn restore_terminal() {
     }
 }
 
-/// Returns the `KVM_RUN` request, which `vmm` and `vcpu` allow.
-const fn kvm_run() -> libc::Ioctl {
-    libc::_IO(kvm_bindings::KVMIO, 0x80)
-}
-
-/// Returns the `KVM_IRQ_LINE` request, which the `block` filter allows on
-/// x86-64.
-#[cfg(target_arch = "x86_64")]
-const fn kvm_irq_line() -> libc::Ioctl {
-    libc::_IOW::<kvm_bindings::kvm_irq_level>(kvm_bindings::KVMIO, 0x61)
-}
-
 /// Returns the inherited descriptor `fd` as a `File` that never closes it.
 fn inherited(fd: std::os::fd::RawFd) -> std::mem::ManuallyDrop<std::fs::File> {
     use std::os::fd::FromRawFd;
@@ -1160,9 +1140,9 @@ fn run_probe(probe: &Probe) -> io::Result<Result<Outcome, i32>> {
 /// survived.
 ///
 /// This is the negative test for the confinement. It checks the filters that
-/// actually ship -- compiled from the same JSON the VMM compiles -- rather than
-/// a restatement of them, and it runs anywhere Linux does, so a hosted runner
-/// can prove the filter even where it cannot boot a guest.
+/// ship, compiled from the same lists the VMM compiles, rather than a
+/// restatement of them, and it runs anywhere Linux does, even on a host that
+/// cannot boot a guest.
 ///
 /// Returns the number of probes that did not behave as the filters say they
 /// should.
@@ -1173,9 +1153,11 @@ pub fn selftest() -> io::Result<usize> {
              prove nothing; unset it"
         )));
     }
-    let (vmm, vcpu, block) = allowed_counts()?;
     println!(
-        "hvi seccomp selftest: vmm allows {vmm} syscalls, vcpu allows {vcpu}, block allows {block}"
+        "hvi seccomp selftest: vmm allows {vmm} syscalls, vcpu allows {vcpu}, block allows {block}",
+        vmm = allowed_count(Thread::Vmm),
+        vcpu = allowed_count(Thread::Vcpu),
+        block = allowed_count(Thread::Block),
     );
     println!("hvi seccomp selftest: each probe runs in a child that installs the real filter\n");
 
@@ -1209,17 +1191,11 @@ pub fn selftest() -> io::Result<usize> {
 mod tests {
     use super::*;
 
-    /// Every filter of a run, in the order `arm` compiles them.
-    const THREADS: [Thread; 3] = [Thread::Vmm, Thread::Vcpu, Thread::Block];
-
-    // Every filter must compile for the architecture the binary is built for.
-    // A typo in a syscall name, or a name that does not exist on this arch
-    // (`poll` is the one that differs: x86-64 has both `poll` and `ppoll`,
-    // aarch64 has `ppoll` alone), is a startup failure in production; here it
-    // is a test failure on any Linux host.
+    // A list seccompiler refuses is a startup failure in production. Here it is
+    // a test failure on any Linux host.
     #[test]
     fn filters_compile_for_this_arch() {
-        for thread in THREADS {
+        for thread in Thread::ALL {
             for (_, p) in programs(thread, false).expect("filter should compile") {
                 assert!(!p.is_empty(), "{:?} compiled to an empty program", thread);
             }
@@ -1311,7 +1287,7 @@ mod tests {
         } else {
             libc::SECCOMP_RET_TRAP
         };
-        for thread in THREADS {
+        for thread in Thread::ALL {
             let filters = installed(thread);
             #[cfg(target_arch = "x86_64")]
             assert_eq!(verdict(&filters, libc::SYS_open), open, "open, {thread:?}");
@@ -1338,108 +1314,27 @@ mod tests {
         }
     }
 
-    // `programs` compiles the lists through `serde_json::Value`, which keeps
-    // the last of two duplicate keys. Compiling the raw JSON fails on one.
-    #[test]
-    fn raw_filters_compile() {
-        seccompiler::compile_from_json(FILTERS.as_bytes(), ARCH)
-            .expect("the raw allowlists should compile");
-    }
-
     // Every filter must deny by default. A filter that allowed by default
     // would install, run, and confine nothing.
     #[test]
     fn filters_trap_on_mismatch() {
-        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        for key in THREADS.map(Thread::key) {
-            assert_eq!(
-                doc[key]["default_action"], "trap",
-                "{key} must trap on a syscall outside its list"
-            );
-            assert_eq!(doc[key]["filter_action"], "allow");
+        for thread in Thread::ALL {
+            for (log, action) in [
+                (false, libc::SECCOMP_RET_TRAP),
+                (true, libc::SECCOMP_RET_LOG),
+            ] {
+                let program = allowlist(thread, log).unwrap();
+                assert_eq!(
+                    run_program(&program, libc::SYS_socket, [0; 6]),
+                    action,
+                    "{thread:?} on a syscall outside its list, log {log}"
+                );
+            }
         }
     }
 
-    /// Returns the names of the syscalls the filter `key` allows.
-    fn names(key: &str) -> std::collections::BTreeSet<String> {
-        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        doc[key]["filter"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["syscall"].as_str().unwrap().to_string())
-            .collect()
-    }
-
-    /// The vCPU threads service guest MMIO inline, so their list is the one
-    /// that matters most and it must stay a strict subset of the VMM's --
-    /// if a syscall is added to `vcpu` alone, it was added without anyone
-    /// thinking about the thread that actually parses guest data.
-    #[test]
-    fn vcpu_is_a_subset_of_vmm() {
-        let vmm = names("vmm");
-        let vcpu = names("vcpu");
-        let extra: Vec<_> = vcpu.difference(&vmm).collect();
-        assert!(extra.is_empty(), "vcpu allows what vmm does not: {extra:?}");
-        assert!(vcpu.len() < vmm.len(), "vcpu should be the tighter filter");
-    }
-
-    // A disk's requests run on its worker, so a vCPU thread reads and writes no
-    // file at an offset, seeks none and syncs none.
-    #[test]
-    fn vcpu_filter_has_no_positioned_io_seek_or_sync() {
-        let vcpu = names("vcpu");
-        for name in [
-            "pread64",
-            "pwrite64",
-            "preadv",
-            "pwritev",
-            "preadv2",
-            "pwritev2",
-            "lseek",
-            "fsync",
-            "fdatasync",
-            "sync_file_range",
-        ] {
-            assert!(!vcpu.contains(name), "vcpu allows {name}");
-        }
-    }
-
-    // A disk's worker parses guest descriptors too, so its list follows the
-    // same rule, apart from the two calls that move a request's data between
-    // the backing file and guest RAM. No other thread makes them, so `vmm` does
-    // not allow them.
-    #[test]
-    fn block_adds_only_the_vectored_file_calls_to_vmm() {
-        let vmm = names("vmm");
-        let block = names("block");
-        let extra: Vec<_> = block.difference(&vmm).map(String::as_str).collect();
-        assert_eq!(
-            extra,
-            ["preadv", "pwritev"],
-            "block allows what vmm does not"
-        );
-        assert!(
-            block.len() < vmm.len(),
-            "block should be the tighter filter"
-        );
-    }
-
-    // A worker takes no connection, starts no thread, makes no eventfd and
-    // sends no descriptor.
-    #[test]
-    fn block_filter_has_no_socket_thread_or_descriptor_calls() {
-        let block = names("block");
-        for name in [
-            "accept4", "recvfrom", "recvmsg", "sendmsg", "eventfd2", "clone", "clone3", "fcntl",
-            "shutdown",
-        ] {
-            assert!(!block.contains(name), "block allows {name}");
-        }
-    }
-
-    // The values are the requests the JSON names in its comments, computed here
-    // from the headers' definitions, so a wrong number in the JSON fails.
+    // The compiled filter is asked about each request a worker makes and about
+    // some it does not, so a request the list lacks or gains fails.
     #[test]
     fn block_filter_allows_only_its_ioctl_requests() {
         let filters = installed(Thread::Block);
@@ -1455,7 +1350,7 @@ mod tests {
             libc::TCSETS2,
             libc::TCFLSH,
             #[cfg(target_arch = "x86_64")]
-            kvm_irq_line(),
+            allowlists::KVM_IRQ_LINE,
         ];
         for request in allowed {
             assert_eq!(
@@ -1482,40 +1377,6 @@ mod tests {
         );
     }
 
-    /// The point of installing after setup is that the process can no longer
-    /// reach the filesystem or make a socket. These are the syscalls whose
-    /// presence would quietly undo that, so name them rather than trust the
-    /// lists to stay short.
-    #[test]
-    fn no_filter_can_open_or_connect() {
-        let doc: serde_json::Value = serde_json::from_str(FILTERS).unwrap();
-        let forbidden = [
-            "open",
-            "openat",
-            "openat2",
-            "creat",
-            "socket",
-            "connect",
-            "execve",
-            "execveat",
-            "ptrace",
-            "process_vm_readv",
-            "process_vm_writev",
-            "memfd_create",
-            "seccomp",
-            "prctl",
-        ];
-        for key in THREADS.map(Thread::key) {
-            for rule in doc[key]["filter"].as_array().unwrap() {
-                let name = rule["syscall"].as_str().unwrap();
-                assert!(
-                    !forbidden.contains(&name),
-                    "{key} allows {name}, which defeats installing the filter after setup"
-                );
-            }
-        }
-    }
-
     // The filters of the architecture the test runs on. The kernel reads the
     // request as a 32-bit unsigned int, so every refused request is also tried
     // with bits 32-63 set.
@@ -1533,7 +1394,7 @@ mod tests {
                         ioctl(request),
                         libc::SECCOMP_RET_TRAP,
                         "{} passes ioctl request {request:#x}",
-                        thread.key()
+                        thread.name()
                     );
                 }
             }
@@ -1547,7 +1408,7 @@ mod tests {
                     ioctl(u64::from(request)),
                     libc::SECCOMP_RET_ALLOW,
                     "{} refuses ioctl request {request:#x}",
-                    thread.key()
+                    thread.name()
                 );
             }
         }

@@ -111,8 +111,9 @@ jobs:
 
   # The arm64/KVM backend against musl, on a hosted arm64 runner: the same
   # build, unit suite and seccomp selftest as the x86-64 job above. Each
-  # architecture has its own allowlist and its own backend code, so one musl
-  # build does not stand in for the other. It needs no /dev/kvm either.
+  # architecture has its own syscall numbers and backend code, and x86-64 has a
+  # few allowlist entries aarch64 lacks, so one musl build does not stand in for
+  # the other. It needs no /dev/kvm either.
   test-linux-musl-arm64:
     name: Test linux/musl (arm64)
     runs-on: ubuntu-24.04-arm
@@ -880,9 +881,10 @@ jobs:
             | tee irqfd.log || true
           grep -q "test result: ok. 2 passed" irqfd.log \
             || { echo "::error::the vGIC irqfd tests did not pass"; exit 1; }
-      # The aarch64 allowlist is a different file from the x86 one. The hosted
-      # arm64 musl job runs it on the static musl binary. This is the only place
-      # it runs on the glibc build, and where another page size appears.
+      # The aarch64 filters differ from the x86 ones in their syscall numbers
+      # and in a few entries. The hosted arm64 musl job runs them on the static
+      # musl binary. This is the only place they run on the glibc build, and
+      # where another page size appears.
       - name: seccomp filters (aarch64)
         run: ./target/release/hvi seccomp-selftest
       - name: guest kernel
@@ -920,8 +922,8 @@ jobs:
           if grep -qa "GICv3:" run.log; then SAW=yes; else SAW=no; fi
           [ "$SAW" = "${{ matrix.expect_gicv3 }}" ] \
             || { echo "::error::expected GICv3=${{ matrix.expect_gicv3 }}, guest reported GICv3=$SAW"; exit 1; }
-          # aarch64 has its own allowlist, so "the filters work" has to be
-          # asserted on an arm64 host and not inferred from the x86 run.
+          # The aarch64 filters are not the x86 ones, so "the filters work" has
+          # to be asserted on an arm64 host and not inferred from the x86 run.
           grep -qa "seccomp: on" run.log \
             || { echo "::error::booted without seccomp enforcement"; exit 1; }
           echo "seccomp enforced during the live boot ✓"
