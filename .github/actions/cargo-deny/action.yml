@@ -15,7 +15,7 @@ runs:
   steps:
     - name: Install cargo-deny
       id: install
-      uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+      uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
       with:
         # renovate: datasource=crate depName=cargo-deny
         tool: cargo-deny@0.20.2

@@ -32,7 +32,7 @@ runs:
     # Renovate does not read. `.github/renovate.json` holds a custom manager for
     # the line below. Keep the `# renovate:` marker with it.
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
       with:
         # renovate: datasource=crate depName=cargo-nextest
         tool: cargo-nextest@0.9.149
