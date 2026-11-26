@@ -395,7 +395,6 @@ pub fn install_thread(thread: Thread) {
 pub fn allowed_count(thread: Thread) -> usize {
     thread
         .rules()
-        .iter()
         .map(|rule| rule.number)
         .collect::<BTreeSet<_>>()
         .len()

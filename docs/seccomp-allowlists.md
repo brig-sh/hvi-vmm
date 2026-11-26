@@ -38,10 +38,19 @@ The rules of one syscall are joined, so the syscall is allowed when any of them
 matches. A call that matches no rule traps like an off-list syscall. A list
 states a syscall once, or once per request it allows, and a test holds that.
 
-Each list serves both architectures. An entry only one of them has is behind a
-`cfg`. `poll` is the one syscall that differs: x86-64 has both `poll` and
-`ppoll`, and aarch64 has `ppoll` alone, because aarch64 has no `poll` syscall.
-`block`'s `KVM_IRQ_LINE` rule is the other entry behind a `cfg`, on x86-64 only.
+A thread's filter allows the base and the list of its kind of thread. The base
+is the calls a thread makes whatever it serves: those of the Rust runtime and
+the allocator, of the locks, of the signal handlers and of the panic hook.
+`ioctl` is not in it, since each list states which requests it allows, and
+neither are `read` and `close`, which a thread makes on what it serves. Where a
+kind of thread has a reason of its own for a call of the base, or the call is
+only a safety net for it, the doc comment of its list says so.
+
+The base and each list serve both architectures. An entry only one of them has
+is behind a `cfg`. `poll` is the one syscall that differs: x86-64 has both
+`poll` and `ppoll`, and aarch64 has `ppoll` alone, because aarch64 has no `poll`
+syscall. `block`'s `KVM_IRQ_LINE` rule is the other entry behind a `cfg`, on
+x86-64 only.
 
 A filter per kind of thread:
 
@@ -113,7 +122,8 @@ data, so the bar is a demonstrated need, not a suspicion:
    that run, so it is a diagnostic and never a way to operate. A glibc build
    still refuses an open under it, without a record.
 2. Add it to the narrowest list that needs it, under a comment that says which
-   code path calls it.
+   code path calls it. The base is for a call every thread makes for the same
+   reason, and a call added there is granted to the vCPU threads too.
 3. `cargo test` -- the unit tests check that every list compiles for the target
    arch, that `vcpu` stays a strict subset of `vmm`, and that `block` does too
    apart from `preadv` and `pwritev`, which only a disk's worker makes. They
