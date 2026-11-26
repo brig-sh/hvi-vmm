@@ -21,11 +21,12 @@
 //! left running, every poll returns, and it joins the threads before `boot`
 //! returns. Some helpers need more than the poll. A macOS virtio-fs device's
 //! readahead workers wait on no descriptor; each parks on a condition variable,
-//! and a stop action that `IoThreads::stop` runs wakes it. The console reader
-//! reads stdin, which the whole process shares, so a byte another reader took
-//! between the poll and the read would leave it blocked; `IoThreads::stop`
-//! sends it the kick signal until it has finished, with
-//! `IoThread::kick_until_finished`.
+//! and a stop action that `IoThreads::stop` runs wakes it. A vsock connection's
+//! writer parks on its gate while it has nothing to send, and the bridge opens
+//! every gate when it stops. The console reader reads stdin, which the whole
+//! process shares, so a byte another reader took between the poll and the read
+//! would leave it blocked; `IoThreads::stop` sends it the kick signal until it
+//! has finished, with `IoThread::kick_until_finished`.
 //!
 //! Every join is bounded by [`STOP_TIMEOUT`]. A helper that has not exited by
 //! the deadline is left running and `boot` returns an error naming it, since a

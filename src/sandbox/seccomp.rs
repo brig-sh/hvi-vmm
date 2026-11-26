@@ -66,12 +66,12 @@
 //! which move a request's data between the backing file and guest RAM. `vmm`
 //! covers the thread that calls `boot`, the boot thread below, the other
 //! host-side I/O threads (the console reader, the agent bridge and its
-//! per-connection readers, the tap and gateway readers, and the debug watchdog
-//! when it is enabled), the threads a plugin starts with `VmHandle::spawn`, the
-//! thread that receives the stop signals and the ledger writer. The ledger
-//! writer starts with the ledger, before the filters are armed, and installs
-//! `vmm` before its first write after the filters are armed. Each queued I/O
-//! thread names its filter when it is queued.
+//! per-connection readers and writers, the tap and gateway readers, and the
+//! debug watchdog when it is enabled), the threads a plugin starts with
+//! `VmHandle::spawn`, the thread that receives the stop signals and the ledger
+//! writer. The ledger writer starts with the ledger, before the filters are
+//! armed, and installs `vmm` before its first write after the filters are
+//! armed. Each queued I/O thread names its filter when it is queued.
 //!
 //! Ordering is the interesting part, and it is chosen so that **no filter has
 //! to allow `seccomp` itself**:
@@ -85,11 +85,11 @@
 //! ```
 //!
 //! Nothing is ever spawned *underneath* a filter except the per-connection
-//! vsock readers, which the agent bridge creates and which correctly inherit
-//! `vmm`. Had the boot thread instead installed its filter first and relied on
-//! inheritance, every thread wanting a filter of its own would have needed
-//! `seccomp` allowed, which hands a compromised backend the ability to install
-//! filters. The order above costs nothing and avoids that.
+//! vsock readers and writers, which the agent bridge creates and which
+//! correctly inherit `vmm`. Had the boot thread instead installed its filter
+//! first and relied on inheritance, every thread wanting a filter of its own
+//! would have needed `seccomp` allowed, which hands a compromised backend the
+//! ability to install filters. The order above costs nothing and avoids that.
 //!
 //! Everything acquired during setup is finished by the time any filter is in,
 //! so `openat`, `memfd_create`, `ftruncate` and the glibc startup calls are
@@ -359,9 +359,9 @@ pub fn arm() -> io::Result<()> {
 /// Called at the top of each thread hvi spawns *before* the thread that calls
 /// `boot` filters itself, and before each pass of a thread that can start
 /// before [`arm`]: the stop-signal thread and a ledger's writer. Not called by
-/// the per-connection vsock readers: those are spawned by an already-filtered
-/// thread and correctly inherit its filter. Calling `seccomp` from under a
-/// filter that does not allow it would trap.
+/// the per-connection vsock readers and writers: those are spawned by an
+/// already-filtered thread and correctly inherit its filter. Calling `seccomp`
+/// from under a filter that does not allow it would trap.
 ///
 /// It aborts if it cannot, rather than returning an error. There is no
 /// meaningful recovery inside a worker thread: continuing would run a
@@ -895,6 +895,29 @@ fn probes() -> Vec<Probe> {
                 unsafe { libc::recv(1, std::ptr::null_mut(), 0, libc::MSG_DONTWAIT) };
             },
         },
+        // `UnixStream::write` is a `send` with `MSG_NOSIGNAL`. The vCPU thread
+        // makes it for the gateway and for virtio-vsock, and each vsock
+        // writer makes it under the vmm filter.
+        Probe {
+            what: "send on an inherited descriptor (vcpu)",
+            thread: Thread::Vcpu,
+            expected: Outcome::Allowed,
+            run: || {
+                // SAFETY: a zero-length send on fd 1, which we inherited. The
+                // filter has passed the call before the kernel looks at the
+                // descriptor.
+                unsafe { libc::send(1, std::ptr::null(), 0, libc::MSG_NOSIGNAL) };
+            },
+        },
+        Probe {
+            what: "send on an inherited descriptor (vmm)",
+            thread: Thread::Vmm,
+            expected: Outcome::Allowed,
+            run: || {
+                // SAFETY: as above.
+                unsafe { libc::send(1, std::ptr::null(), 0, libc::MSG_NOSIGNAL) };
+            },
+        },
         Probe {
             what: "signal a thread of this process (vmm)",
             thread: Thread::Vmm,
@@ -914,8 +937,8 @@ fn probes() -> Vec<Probe> {
             what: "spawn a thread (vmm)",
             thread: Thread::Vmm,
             expected: Outcome::Allowed,
-            // The agent bridge spawns a reader per accepted connection, after
-            // the filter is in.
+            // The agent bridge spawns a reader and a writer per accepted
+            // connection, after the filter is in.
             run: || {
                 let _ = std::thread::spawn(|| 0u8).join();
             },
