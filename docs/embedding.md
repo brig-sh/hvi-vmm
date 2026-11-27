@@ -332,12 +332,22 @@ ways. When either side closes, the other reads EOF: a host client that closes
 ends the guest stream, and a guest that closes, or a guest driver that resets
 the device, ends the host connection.
 
-hvi relays at most 64 connections at once, since each one holds three host
-descriptors and two threads until it ends. A connection past that is accepted
-and closed at once, so the client reads EOF, and hvi logs that it reached the
-bound. A connection's place is free again once hvi has dropped the connection
-and both its relay threads have ended. A client that closes is enough for that,
-whether or not the guest ever answered.
+hvi relays at most 1023 connections at once, the bound that Firecracker and
+Cloud Hypervisor use. A connection past the bound is accepted and closed at
+once, so the client reads EOF, and hvi logs that it reached the bound. The
+client cannot tell that EOF from a session the agent lost, so it cannot know
+that its request did not run.
+
+Each connection holds three host descriptors and two threads until it ends. When
+it sets up the agent socket, hvi raises its soft open-file limit by what the
+connections hold at the bound, once for the process. If the limit that results
+is too low for them, hvi logs it and carries on.
+
+A connection's place is free again once hvi has dropped the connection and both
+its relay threads have ended. hvi drops a connection whose client has closed
+once the guest has taken the bytes the client wrote, or has reset the
+connection. A guest that never answers therefore keeps the place of a client
+that wrote and then closed, until the VM stops.
 
 hvi sends host bytes only as fast as the guest reads them, and guest bytes only
 as fast as the host client reads them. While one side is behind, the other
