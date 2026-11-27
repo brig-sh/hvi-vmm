@@ -52,13 +52,13 @@ use std::sync::OnceLock;
 /// -- everything else fails with no clear cause.
 ///
 /// So the guest never gets the last of them. This is the fixed part of the
-/// reserve; see [`reserve`] for the rest.
-const RESERVED_FOR_THE_VMM: u64 = 128;
+/// reserve; see [`vmm_reserve`] for the rest.
+const BASE_RESERVE: u64 = 128;
 
 /// The descriptors a VM with `exports` exports, and an agent bridge if
 /// `agent`, holds beside its exports' budget.
 ///
-/// Beside a fixed part, `RESERVED_FOR_THE_VMM`, two parts grow while the VM
+/// Beside a fixed part, `BASE_RESERVE`, two parts grow while the VM
 /// runs, and each is bounded where it is made: an export's readahead workers
 /// hold up to `server::READAHEAD_DESCRIPTORS`, and the agent bridge relays
 /// up to `vsock::MAX_HOST_CONNECTIONS` connections of
@@ -66,7 +66,7 @@ const RESERVED_FOR_THE_VMM: u64 = 128;
 /// host refuses a descriptor below the budget only when the system-wide
 /// table is full or a program that embeds hvi holds the room.
 #[must_use]
-pub fn reserve(exports: usize, agent: bool) -> u64 {
+pub fn vmm_reserve(exports: usize, agent: bool) -> u64 {
     let readahead = exports.saturating_mul(super::server::READAHEAD_DESCRIPTORS);
     let bridge = if agent {
         crate::devices::virtio::vsock::MAX_HOST_CONNECTIONS
@@ -74,8 +74,7 @@ pub fn reserve(exports: usize, agent: bool) -> u64 {
     } else {
         0
     };
-    RESERVED_FOR_THE_VMM
-        .saturating_add(u64::try_from(readahead.saturating_add(bridge)).unwrap_or(u64::MAX))
+    BASE_RESERVE.saturating_add(u64::try_from(readahead.saturating_add(bridge)).unwrap_or(u64::MAX))
 }
 
 /// The fewest descriptors a guest is given, whatever the reserve: fewer
@@ -101,13 +100,13 @@ const CEILING: u64 = 65_536;
 /// the process's: see `server::DescriptorBudget`.
 #[must_use]
 pub fn guest_handle_budget(reserve: u64) -> usize {
-    budget_within(usable_now(), reserve)
+    process_budget(usable_limit(), reserve)
 }
 
 /// How many descriptors the process can hold right now: the soft limit or
 /// the kernel's per-process cap, whichever is lower.
 #[must_use]
-pub fn usable_now() -> u64 {
+pub fn usable_limit() -> u64 {
     let soft = current_open_file_limit().unwrap_or(256);
     clamp_soft_limit(soft, per_process_cap())
 }
@@ -117,7 +116,7 @@ pub fn usable_now() -> u64 {
 /// [`MIN_BUDGET`]. When the floor applies, the guest's handles eat into the
 /// reserve, and the caller says so.
 #[must_use]
-pub fn budget_within(usable: u64, reserve: u64) -> usize {
+pub fn process_budget(usable: u64, reserve: u64) -> usize {
     usize::try_from(usable.saturating_sub(reserve))
         .unwrap_or(usize::MAX)
         .max(MIN_BUDGET)
@@ -357,9 +356,9 @@ mod tests {
         let above = set && current_open_file_limit().is_some_and(|soft| soft > cap);
 
         let reported = raise_open_file_limit();
-        let budget = u64::try_from(guest_handle_budget(RESERVED_FOR_THE_VMM)).unwrap();
+        let budget = u64::try_from(guest_handle_budget(BASE_RESERVE)).unwrap();
         assert!(
-            budget + RESERVED_FOR_THE_VMM <= cap,
+            budget + BASE_RESERVE <= cap,
             "budget {budget} plus the reserve exceeds kern.maxfilesperproc {cap}"
         );
         if above {
@@ -417,17 +416,17 @@ mod tests {
                 * crate::devices::virtio::vsock::DESCRIPTORS_PER_CONNECTION,
         )
         .unwrap();
-        assert_eq!(reserve(0, false), RESERVED_FOR_THE_VMM);
-        assert_eq!(reserve(2, false), RESERVED_FOR_THE_VMM + 2 * readahead);
-        assert_eq!(reserve(1, true), RESERVED_FOR_THE_VMM + readahead + bridge);
+        assert_eq!(vmm_reserve(0, false), BASE_RESERVE);
+        assert_eq!(vmm_reserve(2, false), BASE_RESERVE + 2 * readahead);
+        assert_eq!(vmm_reserve(1, true), BASE_RESERVE + readahead + bridge);
     }
 
     // The budget is what the process can hold less the reserve. A limit too
     // small to leave a guest a shell after the reserve still gives it one.
     #[test]
     fn the_budget_is_the_usable_limit_less_the_reserve() {
-        assert_eq!(budget_within(16_384, 456), 16_384 - 456);
-        assert_eq!(budget_within(256, 456), MIN_BUDGET);
-        assert_eq!(budget_within(456 + MIN_BUDGET as u64, 456), MIN_BUDGET);
+        assert_eq!(process_budget(16_384, 456), 16_384 - 456);
+        assert_eq!(process_budget(256, 456), MIN_BUDGET);
+        assert_eq!(process_budget(456 + MIN_BUDGET as u64, 456), MIN_BUDGET);
     }
 }

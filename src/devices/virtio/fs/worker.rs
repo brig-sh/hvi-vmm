@@ -61,7 +61,7 @@ pub(crate) struct Export {
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn attach(shares: &[FsShare], agent: bool) -> io::Result<Vec<Export>> {
     // What the rest of the VM may hold beside the exports' budget.
-    let reserve = fdlimit::reserve(shares.len(), agent);
+    let reserve = fdlimit::vmm_reserve(shares.len(), agent);
     if !shares.is_empty() {
         match fdlimit::raise_open_file_limit() {
             Ok(limit) => eprintln!("{LOG_PREFIX} open-file limit: {limit}"),
@@ -72,7 +72,7 @@ pub(crate) fn attach(shares: &[FsShare], agent: bool) -> io::Result<Vec<Export>>
         }
         // Checked after the raise whether or not it worked: a process that
         // could not raise its limit is the one most likely to be short.
-        let limit = fdlimit::usable_now();
+        let limit = fdlimit::usable_limit();
         if limit < reserve.saturating_add(fdlimit::MIN_BUDGET as u64) {
             eprintln!(
                 "{LOG_PREFIX} open-file limit: {limit} leaves no room for the \
@@ -159,7 +159,7 @@ impl Export {
         stderrln!(
             "{LOG_PREFIX} virtio-fs[{index}]: peak {} of the VM's {} guest handles",
             dev.peak_handles(),
-            dev.handle_limit()
+            dev.descriptor_budget()
         );
         let hist: Vec<String> = dev
             .op_stats()

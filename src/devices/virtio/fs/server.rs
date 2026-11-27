@@ -574,7 +574,7 @@ const READAHEAD_WORKERS: usize = 2;
 
 /// The most descriptors one export's readahead holds outside the descriptor
 /// budget: a parent descriptor for each queued directory, and two for each
-/// worker while it opens a directory. `fdlimit::reserve` leaves room for
+/// worker while it opens a directory. `fdlimit::vmm_reserve` leaves room for
 /// them.
 pub(crate) const READAHEAD_DESCRIPTORS: usize = READAHEAD_MAX_QUEUED + 2 * READAHEAD_WORKERS;
 
@@ -1328,7 +1328,7 @@ struct ExportDescriptors {
     /// and directory handles and cached directories. Published by the export
     /// after each request, so another export reading it sees a count at most
     /// one request old.
-    pinned: AtomicUsize,
+    exclusive: AtomicUsize,
     /// The descriptors the export keeps for speed, which any export of the VM
     /// may close.
     parked: Mutex<ParkedCache>,
@@ -1337,7 +1337,7 @@ struct ExportDescriptors {
 impl ExportDescriptors {
     fn new(parked_limit: usize) -> Self {
         Self {
-            pinned: AtomicUsize::new(0),
+            exclusive: AtomicUsize::new(0),
             parked: Mutex::new(ParkedCache::new(parked_limit)),
         }
     }
@@ -1350,7 +1350,7 @@ impl ExportDescriptors {
     }
 
     fn held(&self) -> usize {
-        self.pinned.load(Ordering::Relaxed) + self.parked().len()
+        self.exclusive.load(Ordering::Relaxed) + self.parked().len()
     }
 }
 
@@ -1423,7 +1423,7 @@ impl DescriptorBudget {
 
     /// Closes the oldest parked descriptor of some export other than `own`.
     /// Returns whether one went.
-    fn evict_one_elsewhere(&self, own: &Arc<ExportDescriptors>) -> bool {
+    fn evict_other(&self, own: &Arc<ExportDescriptors>) -> bool {
         self.exports()
             .iter()
             .filter(|export| !Arc::ptr_eq(export, own))
@@ -1432,7 +1432,7 @@ impl DescriptorBudget {
 
     /// Closes the older half of every other export's parked descriptors.
     /// Returns whether any went.
-    fn give_back_elsewhere(&self, own: &Arc<ExportDescriptors>) -> bool {
+    fn shrink_others(&self, own: &Arc<ExportDescriptors>) -> bool {
         let mut closed = false;
         for export in self.exports().iter() {
             if !Arc::ptr_eq(export, own) {
@@ -1656,7 +1656,7 @@ impl VirtioFs {
         // parked cache is a quarter of it: enough for the working set of
         // headers a compiler reopens, small enough that the guest can still
         // hold the handles it is entitled to.
-        let limit = fdlimit::guest_handle_budget(fdlimit::reserve(1, false));
+        let limit = fdlimit::guest_handle_budget(fdlimit::vmm_reserve(1, false));
         let own = Arc::new(ExportDescriptors::new(limit / 4));
         let budget = DescriptorBudget::new(limit);
         budget.register(Arc::clone(&own));
@@ -1847,7 +1847,7 @@ impl VirtioFs {
         // Node ids restart here, so a descriptor left parked would sit under an
         // id the rebooted guest is handed for a different file.
         self.drain_parked();
-        self.publish_pinned();
+        self.publish_exclusive();
         // Their chains went with the queues.
         self.lock_waiters.clear();
         self.lock_to_park = None;
@@ -2294,7 +2294,7 @@ impl VirtioFs {
         if matches!(result, Err(EMFILE | ENFILE)) {
             self.shrink_caches();
         }
-        self.publish_pinned();
+        self.publish_exclusive();
         self.note_op_time(opcode, op_start);
         if self.lock_to_park.is_some() {
             // A SETLKW on a held lock: answered from `retry_lock_waiters`
@@ -2332,8 +2332,8 @@ impl VirtioFs {
         for _ in 0..self.dirs.held().div_ceil(2) {
             self.dirs.evict_one();
         }
-        self.budget.give_back_elsewhere(&self.own);
-        self.publish_pinned();
+        self.budget.shrink_others(&self.own);
+        self.publish_exclusive();
     }
 
     fn init(&self, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -3534,8 +3534,8 @@ impl VirtioFs {
 
     /// Tells the VM's other exports what this one holds that they cannot
     /// close.
-    fn publish_pinned(&self) {
-        self.own.pinned.store(
+    fn publish_exclusive(&self) {
+        self.own.exclusive.store(
             self.open_handle_count() + self.dirs.held(),
             Ordering::Relaxed,
         );
@@ -3565,16 +3565,16 @@ impl VirtioFs {
     /// directory cache and empty it again, so neither cache held anything and
     /// every open paid the host for a walk it had already made.
     fn make_room(&mut self) -> Result<(), i32> {
-        self.publish_pinned();
+        self.publish_exclusive();
         while self.budget.held() >= self.budget.limit() {
             if self.evict_one_parked() {
                 continue;
             }
             if self.dirs.evict_one() {
-                self.publish_pinned();
+                self.publish_exclusive();
                 continue;
             }
-            if self.budget.evict_one_elsewhere(&self.own) {
+            if self.budget.evict_other(&self.own) {
                 continue;
             }
             self.budget.note_refusal();
@@ -3598,7 +3598,7 @@ impl VirtioFs {
 
     /// The ceiling those handles are counted against.
     #[must_use]
-    pub fn handle_limit(&self) -> usize {
+    pub fn descriptor_budget(&self) -> usize {
         self.budget.limit()
     }
 
@@ -5448,7 +5448,7 @@ fn sync_file(file: &File, flags: u32) -> Result<(), i32> {
 /// budget on a 256-descriptor soft limit, which would let the cache meet the
 /// handle limit with no guest handle open at all.
 fn dir_cache_limit() -> usize {
-    let budget = fdlimit::guest_handle_budget(fdlimit::reserve(1, false));
+    let budget = fdlimit::guest_handle_budget(fdlimit::vmm_reserve(1, false));
     (budget / 16).clamp(128, 4096).min(budget / 4)
 }
 
@@ -13401,7 +13401,7 @@ mod tests {
         }
         assert_eq!(dev.descriptor_cache_stats().2, FILES, "all four are parked");
         assert!(
-            dev.descriptors_held() >= dev.handle_limit(),
+            dev.descriptors_held() >= dev.descriptor_budget(),
             "the budget is spent, so the gate runs"
         );
 
