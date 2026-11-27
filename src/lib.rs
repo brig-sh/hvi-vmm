@@ -101,6 +101,8 @@ pub mod sandbox;
 pub mod signal;
 pub mod teardown;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod testing;
 
 /// The prefix of the library's log lines on stderr.
 pub(crate) const LOG_PREFIX: &str = "[hvi]";

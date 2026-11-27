@@ -327,7 +327,7 @@ booting Image with 1024 MiB ...
 [hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
 [hvi] virtio-blk[0]: /path/to/disk.img (rw, serial disk0)
 [hvi] virtio-net: built-in stub stack (guest 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
-[hvi] open-file limit: 1048576
+[hvi] open-file limit: 92160
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)
 [hvi] event ledger: /path/to/ledger.ndjson
 [hvi] seatbelt: on (deny default)
@@ -335,12 +335,14 @@ booting Image with 1024 MiB ...
 
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
 share is configured, because the limit is raised while the first share is set
-up.
+up. The number is what the process can really hold: the soft `RLIMIT_NOFILE` or
+the kernel's `kern.maxfilesperproc`, whichever is lower. Each share's handle
+budget is that number less 128.
 
 On a clean stop, macOS reports each share's peak handle count:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 1048448 guest handles
+[hvi] virtio-fs[0]: peak 1 of 92032 guest handles
 guest stopped: SystemOff
 ```
 
