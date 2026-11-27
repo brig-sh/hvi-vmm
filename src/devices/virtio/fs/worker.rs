@@ -46,7 +46,8 @@ pub(crate) struct Export {
 }
 
 /// Builds an export for each of `shares`, in order, for a VM that has `disks`
-/// disks, and an agent bridge if `agent`.
+/// disks, an agent bridge if `agent`, and the open-file limit `max_open_files`
+/// or the default when that is `None`.
 ///
 /// The open-file limit is raised before the first export, since an export holds
 /// a host descriptor for each handle the guest has open. macOS gives a process
@@ -56,12 +57,34 @@ pub(crate) struct Export {
 /// # Errors
 ///
 /// Errors if a share's directory does not resolve, or its device cannot be
-/// made.
+/// made. Errors with `InvalidInput` if the VM's open-file limit leaves the
+/// exports fewer than `fdlimit::MIN_BUDGET` descriptors beside what hvi
+/// reserves for itself.
 // An export's root is resolved once, before any guest request; see clippy.toml.
 #[allow(clippy::disallowed_methods)]
-pub(crate) fn attach(shares: &[FsShare], disks: usize, agent: bool) -> io::Result<Vec<Export>> {
+pub(crate) fn attach(
+    shares: &[FsShare],
+    disks: usize,
+    agent: bool,
+    max_open_files: Option<usize>,
+) -> io::Result<Vec<Export>> {
     let reserve = fdlimit::vmm_reserve(disks, shares.len(), agent);
+    let floor = fdlimit::MIN_BUDGET;
     if !shares.is_empty() {
+        // Refused, where a process limit that is too small only gets a warning
+        // below: the caller set this one and can set another.
+        let wanted = fdlimit::vm_limit(max_open_files, u64::MAX);
+        let least = reserve.saturating_add(floor as u64);
+        if wanted < least {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the VM's open-file limit (--max-open-files) is {wanted}, and this VM \
+                     needs at least {least}: {reserve} that hvi reserves for itself and \
+                     {floor} for the exports"
+                ),
+            ));
+        }
         match fdlimit::raise_open_file_limit() {
             Ok(limit) => eprintln!("{LOG_PREFIX} open-file limit: {limit}"),
             Err(e) => eprintln!(
@@ -76,19 +99,21 @@ pub(crate) fn attach(shares: &[FsShare], disks: usize, agent: bool) -> io::Resul
     if !shares.is_empty() && fdlimit::is_floored(usable, reserve) {
         eprintln!(
             "{LOG_PREFIX} open-file limit: {usable} is less than the {reserve} descriptors \
-             hvi reserves for itself and {} for the exports; the exports get {} anyway",
-            fdlimit::MIN_BUDGET,
-            fdlimit::MIN_BUDGET
+             hvi reserves for itself and {floor} for the exports; the exports get {floor} \
+             anyway"
         );
     }
-    // One budget for every export; see `server::DescriptorBudget`.
-    let budget = Arc::new(server::DescriptorBudget::new(fdlimit::process_budget(
-        usable, reserve,
-    )));
+    // One budget for every export; see `server::DescriptorBudget`. It is what
+    // the VM's limit leaves after the reserve; see `fdlimit::vm_limit`.
+    let limit = fdlimit::vm_limit(max_open_files, usable);
+    let budget = Arc::new(server::DescriptorBudget::with_remedy(
+        fdlimit::process_budget(limit, reserve),
+        remedy(fdlimit::vm_limit(max_open_files, u64::MAX), usable),
+    ));
     if !shares.is_empty() {
         eprintln!(
-            "{LOG_PREFIX} virtio-fs: the exports may hold {} open files together; hvi \
-             reserves {reserve} for itself",
+            "{LOG_PREFIX} virtio-fs: the exports may hold {} of the VM's {limit} open files \
+             together; hvi reserves {reserve} for itself",
             budget.limit()
         );
     }
@@ -103,7 +128,7 @@ pub(crate) fn attach(shares: &[FsShare], disks: usize, agent: bool) -> io::Resul
             if writable { "read-write" } else { "read-only" }
         );
         let mut dev = VirtioFs::new(root.clone(), &share.tag, writable, share.cache)?;
-        dev.join_budget(&budget);
+        dev.join_budget(&budget, shares.len());
         dev.set_guest_ids(server::GuestIds {
             uid: share.uid,
             gid: share.gid,
@@ -245,6 +270,21 @@ pub(crate) fn run_fs_worker(
     dev.lock().unwrap().drain_notified(mem);
 }
 
+/// Returns what the log of a budget refusal says raises the budget, for a VM
+/// whose caller asked for an open-file limit of `wanted` in a process that can
+/// hold `usable`.
+///
+/// The VM's limit bounds the budget unless the process can hold less. `hvi
+/// boot` sets its process's limit to the VM's, so the two are then equal, and
+/// the VM's limit is the one to raise.
+fn remedy(wanted: u64, usable: u64) -> &'static str {
+    if wanted <= usable {
+        server::RAISE_VM_LIMIT
+    } else {
+        server::RAISE_PROCESS_LIMIT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -295,5 +335,12 @@ mod tests {
         report.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(finished, "the report waited for the device");
+    }
+
+    #[test]
+    fn refusal_names_the_limit_that_bounds_the_budget() {
+        assert_eq!(remedy(16_384, 92_160), server::RAISE_VM_LIMIT);
+        assert_eq!(remedy(16_384, 16_384), server::RAISE_VM_LIMIT);
+        assert_eq!(remedy(16_384, 4_096), server::RAISE_PROCESS_LIMIT);
     }
 }

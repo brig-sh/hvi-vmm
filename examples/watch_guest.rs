@@ -206,6 +206,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         disks: Vec::new(),
         fs_shares: Vec::new(),
         fs: Vec::new(),
+        max_open_files: None,
         net: true,
         net_gateway: None,
         net_tap: None,

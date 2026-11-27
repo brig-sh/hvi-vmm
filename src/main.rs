@@ -252,6 +252,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // to.
     let mut legacy_shares: Vec<usize> = Vec::new();
     let mut fs: Vec<config::FsConfig> = Vec::new();
+    let mut max_open_files = None;
     let mut net = false;
     let mut net_gateway = None;
     let mut net_tap = None;
@@ -274,6 +275,15 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--mem-mib" => mem_mib = it.next().ok_or("--mem-mib needs a value")?.parse()?,
             "--cmdline" => cmdline = it.next().ok_or("--cmdline needs a value")?.clone(),
             "--disk" => push_disk(&mut disks, it.next())?,
+            "--max-open-files" => {
+                let limit = it.next().ok_or("--max-open-files needs a value")?.parse()?;
+                #[cfg(target_os = "linux")]
+                eprintln!(
+                    "[hvi] note: --max-open-files has no effect on Linux; the vhost-user \
+                     daemon holds the descriptors (virtiofsd: --rlimit-nofile)"
+                );
+                max_open_files = Some(limit);
+            }
             // The old names of `uid=` and `gid=` on an `--fs path=` export.
             // They apply to every `--share-ro`/`--share-rw` export, which is
             // what they did when the identity was one per process. Kept
@@ -455,6 +465,7 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         disks,
         fs_shares,
         fs,
+        max_open_files,
         net,
         net_gateway,
         net_tap,
@@ -474,6 +485,19 @@ fn boot_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         },
         stop: Some(stop_registration),
     };
+    // This process is the VM's alone, so the kernel holds it to the VM's
+    // open-file limit.
+    #[cfg(target_os = "macos")]
+    {
+        use hvi::devices::virtio::fs::fdlimit;
+
+        let limit = cfg
+            .max_open_files
+            .unwrap_or(fdlimit::DEFAULT_MAX_OPEN_FILES);
+        if let Err(e) = fdlimit::limit_open_files(limit) {
+            eprintln!("[hvi] note: {e}");
+        }
+    }
     eprintln!("booting {kernel_path} with {mem_mib} MiB ...");
     signals.finish(hvi::boot(cfg))
 }

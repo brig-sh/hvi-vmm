@@ -1464,15 +1464,36 @@ pub(crate) struct DescriptorBudget {
     exports: Mutex<Vec<Arc<ExportDescriptors>>>,
     /// Whether the budget has refused a request, so that is logged once.
     refused: AtomicBool,
+    /// What the log of that refusal says raises the budget.
+    remedy: &'static str,
 }
 
+/// What the log of a refusal says raises a budget that the process's open-file
+/// limit bounds.
+pub(crate) const RAISE_PROCESS_LIMIT: &str =
+    "a higher open-file limit or kern.maxfilesperproc raises the budget";
+
+/// What the log of a refusal says raises a budget that the VM's open-file limit
+/// bounds. It names the limit in words that fit a program that embeds hvi as
+/// well as the flag.
+pub(crate) const RAISE_VM_LIMIT: &str =
+    "a higher open-file limit for the VM (--max-open-files) raises the budget";
+
 impl DescriptorBudget {
-    /// Returns a budget of `limit` descriptors that no export draws on yet.
+    /// Returns a budget of `limit` descriptors that no export draws on yet, and
+    /// that the process's open-file limit bounds.
     pub(crate) fn new(limit: usize) -> Self {
+        Self::with_remedy(limit, RAISE_PROCESS_LIMIT)
+    }
+
+    /// Returns a budget of `limit` descriptors that no export draws on yet, and
+    /// whose refusal says that `remedy` raises it.
+    pub(crate) fn with_remedy(limit: usize, remedy: &'static str) -> Self {
         Self {
             limit,
             exports: Mutex::new(Vec::new()),
             refused: AtomicBool::new(false),
+            remedy,
         }
     }
 
@@ -1484,9 +1505,9 @@ impl DescriptorBudget {
             // the VM.
             stderrln!(
                 "{LOG_PREFIX} virtio-fs: the VM's exports reached their budget of {} open \
-                 files, and an open got ENFILE; a higher open-file limit or \
-                 kern.maxfilesperproc raises the budget",
-                self.limit
+                 files, and an open got ENFILE; {}",
+                self.limit,
+                self.remedy
             );
         }
     }
@@ -1760,7 +1781,14 @@ impl VirtioFs {
         // node's key is taken from the same descriptor below, so a host-side
         // swap of the path cannot leave the key on one inode and the walks on
         // another.
-        let dirs = DirCache::new(&root, dir_cache_limit(), cache_policy != CachePolicy::None)?;
+        // A budget of its own until `join_budget` gives it the VM's.
+        let limit =
+            fdlimit::process_budget(fdlimit::usable_limit(), fdlimit::vmm_reserve(0, 1, false));
+        let dirs = DirCache::new(
+            &root,
+            dir_cache_limit(limit),
+            cache_policy != CachePolicy::None,
+        )?;
         let mut nodes = HashMap::new();
         let root_meta = Stat::of_fd(dirs.root_fd()).map_err(io::Error::from_raw_os_error)?;
         nodes.insert(
@@ -1775,9 +1803,6 @@ impl VirtioFs {
         );
         let mut inode_ids = HashMap::new();
         inode_ids.insert((root_meta.dev(), root_meta.ino()), FUSE_ROOT_ID);
-        // A budget of its own until `join_budget` gives it the VM's.
-        let limit =
-            fdlimit::process_budget(fdlimit::usable_limit(), fdlimit::vmm_reserve(0, 1, false));
         let own = Arc::new(ExportDescriptors::new(parked_limit(limit)));
         let budget = Arc::new(DescriptorBudget::new(limit));
         budget.register(Arc::clone(&own));
@@ -3669,10 +3694,21 @@ impl VirtioFs {
             .store(self.exclusive_count(), Ordering::Relaxed);
     }
 
-    /// Makes this export draw on `budget` with the VM's other exports.
-    pub(crate) fn join_budget(&mut self, budget: &Arc<DescriptorBudget>) {
+    /// Makes this export draw on `budget` with the VM's other exports, and
+    /// sizes its caches from that budget: [`parked_limit`] of it for parked
+    /// descriptors, and for cached directories [`dir_cache_limit`] of its share
+    /// of the budget among the VM's `exports`.
+    ///
+    /// Any export can close another's parked descriptors, but only an export
+    /// itself can close its cached directories. If each export's directory
+    /// cache were bounded by the whole budget, the caches of a few exports that
+    /// had walked their trees could hold all of it, and an export with nothing
+    /// cached would be refused every open.
+    pub(crate) fn join_budget(&mut self, budget: &Arc<DescriptorBudget>, exports: usize) {
         budget.register(Arc::clone(&self.own));
         self.budget = Arc::clone(budget);
+        self.own.parked().limit = parked_limit(budget.limit());
+        self.dirs.limit = dir_cache_limit(budget.limit() / exports.max(1));
     }
 
     /// Makes room under the VM's budget for one more descriptor of this export.
@@ -5592,23 +5628,19 @@ fn regular_file(meta: &Stat) -> Result<&Stat, i32> {
     }
 }
 
-/// Returns how many directory descriptors [`DirCache`] keeps open.
+/// Returns how many directory descriptors [`DirCache`] keeps open under a
+/// descriptor budget of `budget`.
 ///
-/// Descriptors are a budget this device already spends: it pins one per open
-/// guest handle, and exhausting them reaches the guest as EMFILE
-/// (#34). `fdlimit::raise_open_file_limit` lifts the soft
-/// limit to the hard one at startup, so the ceiling is not macOS's bare 256.
-/// That is still not unlimited, and a cache that grows with the guest's
-/// directory count is a way to spend the whole budget on lookups.
-///
-/// What the cache holds counts against the guest's descriptor budget, so the
+/// A cache that grows with the guest's directory count would take the whole
+/// budget for lookups. What the cache holds counts against the budget, so the
 /// bound is a quarter of it at most. The floor of 128 is otherwise the whole
 /// budget on a 256-descriptor soft limit, which would let the cache meet the
-/// handle limit with no guest handle open at all.
-fn dir_cache_limit() -> usize {
-    let budget =
-        fdlimit::process_budget(fdlimit::usable_limit(), fdlimit::vmm_reserve(0, 1, false));
-    (budget / 16).clamp(128, 4096).min(budget / 4)
+/// budget with no guest handle open at all.
+///
+/// The bound is at least one, as [`DirCache::new`] keeps it: an export's share
+/// of a budget split between many exports can be smaller than four.
+fn dir_cache_limit(budget: usize) -> usize {
+    (budget / 16).clamp(128, 4096).min(budget / 4).max(1)
 }
 
 /// Returns how many descriptors an export parks at most under a descriptor
@@ -11440,7 +11472,7 @@ mod tests {
         fs::create_dir_all(dir.join("usr/lib/ssl")).unwrap();
         fs::create_dir_all(dir.join("etc")).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        let cache = DirCache::new(&dir, dir_cache_limit(), true).unwrap();
+        let cache = DirCache::new(&dir, dir_cache_limit(16_384), true).unwrap();
         (dir, cache)
     }
 
@@ -13646,7 +13678,7 @@ mod tests {
     /// a test to spend, and returns it.
     fn set_budget(dev: &mut VirtioFs, limit: usize) -> Arc<DescriptorBudget> {
         let budget = Arc::new(DescriptorBudget::new(limit));
-        dev.join_budget(&budget);
+        dev.join_budget(&budget, 1);
         budget
     }
 
@@ -13663,8 +13695,8 @@ mod tests {
             fs::write(dir_b.join(format!("f{i}")), b"x").unwrap();
         }
         let budget = Arc::new(DescriptorBudget::new(LIMIT));
-        a.join_budget(&budget);
-        b.join_budget(&budget);
+        a.join_budget(&budget, 2);
+        b.join_budget(&budget, 2);
         a.own.parked().limit = LIMIT;
 
         // A spends the whole budget on parked descriptors.
@@ -13765,6 +13797,68 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // The caches are a part of the budget they draw on. Sized from the
+    // process's limit instead, they could be larger than a VM budget set lower,
+    // with room for more parked descriptors than the whole budget.
+    #[test]
+    fn joining_a_budget_sizes_the_caches_from_it() {
+        let (dir, mut dev) = fixture_with_access(true);
+        let mut join = |limit, exports| {
+            dev.join_budget(&Arc::new(DescriptorBudget::new(limit)), exports);
+            (dev.own.parked().limit, dev.dirs.limit)
+        };
+        assert_eq!(join(16_384, 1), (4096, 1024));
+        assert_eq!(join(16_384, 2), (4096, 512));
+        assert_eq!(join(512, 1), (128, 128));
+        // The smallest budget split many ways still leaves a cache of one, as
+        // `DirCache::new` keeps it.
+        assert_eq!(join(64, 17).1, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Only an export itself can close its cached directories; see `join_budget`
+    // for why each cache is bounded by a share of the budget.
+    #[test]
+    fn other_exports_directory_caches_leave_room_for_an_open() {
+        const EXPORTS: usize = 5;
+        const DIRS: usize = 32;
+
+        let budget = Arc::new(DescriptorBudget::new(64));
+        let mut exports: Vec<(PathBuf, VirtioFs)> = (0..EXPORTS)
+            .map(|_| {
+                let (dir, mut dev) = fixture_with_access(true);
+                dev.join_budget(&budget, EXPORTS);
+                (dir, dev)
+            })
+            .collect();
+        // Every export but the last walks a tree wide enough to fill its
+        // directory cache, and parks nothing.
+        for (dir, dev) in &mut exports[..EXPORTS - 1] {
+            for d in 0..DIRS {
+                let sub = dir.join(format!("d{d}"));
+                fs::create_dir(&sub).unwrap();
+                fs::write(sub.join("f"), b"x").unwrap();
+            }
+            for d in 0..DIRS {
+                let sub = lookup_node(dev, FUSE_ROOT_ID, format!("d{d}").as_bytes());
+                lookup_node(dev, sub, b"f");
+            }
+            assert_eq!(dev.dirs.held(), dev.dirs.limit, "the walk filled the cache");
+            assert_eq!(dev.descriptor_cache_stats().2, 0, "nothing is parked");
+        }
+
+        let (dir, dev) = &mut exports[EXPORTS - 1];
+        fs::write(dir.join("f"), b"x").unwrap();
+        let node = lookup_node(dev, FUSE_ROOT_ID, b"f");
+        let fh = try_open(dev, node, 0)
+            .expect("refused while the other exports held only cached directories");
+        release_handle(dev, node, fh);
+
+        for (dir, _) in exports {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
     // A request that resolves a path caches the directory it walked, and no
     // gate stood between that and the budget. With the budget spent the walk is
     // still served, and the cache grows only into room that a parked descriptor
@@ -13830,7 +13924,7 @@ mod tests {
         let mut exports: Vec<(PathBuf, VirtioFs)> = (0..3)
             .map(|_| {
                 let (dir, mut dev) = fixture_with_access(true);
-                dev.join_budget(&budget);
+                dev.join_budget(&budget, 3);
                 dev.own.parked().limit = LIMIT;
                 dev.dirs.limit = LIMIT;
                 (dir, dev)
@@ -13936,7 +14030,7 @@ mod tests {
             for i in 0..FILES {
                 fs::write(dir.join(format!("f{i}")), b"x").unwrap();
             }
-            dev.join_budget(&budget);
+            dev.join_budget(&budget, 2);
             // The first export keeps nothing for speed, so the room it needs
             // comes from the other export's parked descriptors, closed from
             // this thread while the other thread is using them.
@@ -14029,8 +14123,8 @@ mod tests {
         // before the budget does. Two exports of one VM, as a root filesystem
         // and a project share are.
         let budget = Arc::new(DescriptorBudget::new(1_000_000));
-        dev.join_budget(&budget);
-        other.join_budget(&budget);
+        dev.join_budget(&budget, 2);
+        other.join_budget(&budget, 2);
         dev.own.parked().limit = 1_000_000;
         let nodes: Vec<u64> = (0..FILES)
             .map(|i| lookup_node(&mut dev, FUSE_ROOT_ID, format!("f{i}").as_bytes()))

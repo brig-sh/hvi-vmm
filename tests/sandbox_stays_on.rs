@@ -28,6 +28,7 @@ fn config(sandbox: bool) -> BootConfig {
         disks: Vec::new(),
         fs_shares: Vec::new(),
         fs: Vec::new(),
+        max_open_files: None,
         net: false,
         net_gateway: None,
         net_tap: None,

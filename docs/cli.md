@@ -57,6 +57,7 @@ including a typo, silently runs the plain test.
 | `--fs tag=<tag>,socket=<socket>[,num_queues=<n>][,queue_size=<size>]` | none | virtio-fs export served by the vhost-user daemon listening on `<socket>`, which the caller runs. The defaults are one request queue, at most one per vCPU, and a queue size of 1024, a power of two up to 32768. hvi waits up to 60 s for the socket to accept. Repeatable. Each export takes one of the interrupt lines every virtio device shares: 17 on x86-64, 222 on arm64. Linux only. |
 | `--share-ro <dir> <tag> [cache=…]`, `--share-rw <dir> <tag> [cache=…]` | none | Deprecated: `--fs tag=<tag>,path=<dir>` with `readonly=on` or off. Each prints a note. macOS only. |
 | `--fs-uid <N>`, `--fs-gid <N>` | 0 | Deprecated: `uid=` and `gid=` on every `--share-ro`/`--share-rw` export. An `--fs` export keeps its own. Each prints a note. No effect on Linux. |
+| `--max-open-files <N>` | 16384 | The most open files hvi holds for this VM. `hvi boot` sets its own open-file limit to `N`, and the `--fs path=` exports share what is left after hvi's own descriptors; see [Startup output](#startup-output). A host running several VMs sets it so that their sum stays under `kern.maxfiles`. `boot` refuses a value that leaves the exports fewer than 64. macOS only. |
 | `--net-stub` | off | The built-in stub stack: answers ARP, ICMP, DNS and DHCP, forwards nothing in either direction. `--net` is a deprecated alias. |
 | `--net-gateway <socket>` | none | Relay to an external gvisor-tap process. |
 | `--net-tap <dev>` | none | Attach to an existing tap. Linux only. |
@@ -96,8 +97,8 @@ hvi: boot needs --kernel <Image>
 ```
 
 The rest do error at parse time: `--mem-mib`, `--cmdline`, `--fs-uid`,
-`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--sandbox-id`,
-`--cpus`, `--irqchip`, `--dump-after`.
+`--fs-gid`, `--share-ro`, `--share-rw`, `--fs`, `--max-open-files`,
+`--sandbox-id`, `--cpus`, `--irqchip`, `--dump-after`.
 
 **A bad number reports the raw parse error, without the flag name.**
 
@@ -115,6 +116,7 @@ are three behaviours, not two.
 | `--fs path=`, `--share-ro`, `--share-rw` | acted on | **refused**, boot fails | **refused**, boot fails |
 | `--fs socket=` | **refused**, boot fails | acted on | acted on |
 | `--fs-uid`, `--fs-gid` | acted on | **ignored**, with a note | **ignored**, with a note |
+| `--max-open-files` | acted on | **ignored**, with a note; below 64 still **refused** | **ignored**, with a note; below 64 still **refused** |
 | `--net-tap` | **refused**, boot fails | acted on | acted on |
 | `--irqchip` | **refused**, boot fails | **refused**, boot fails | acted on |
 | `--dump-memory` | acted on, but see below | acted on | acted on |
@@ -327,30 +329,33 @@ booting Image with 1024 MiB ...
 [hvi] 2 vCPU(s)  GICD 0x8000000+0x10000  GICR 0x80a0000+0x2000000  UART 0xc000000
 [hvi] virtio-blk[0]: /path/to/disk.img (rw, serial disk0)
 [hvi] virtio-net: built-in stub stack (guest 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
-[hvi] open-file limit: 92160
-[hvi] virtio-fs: the exports may hold 91957 open files together; hvi reserves 203 for itself
+[hvi] open-file limit: 16384
+[hvi] virtio-fs: the exports may hold 16181 of the VM's 16384 open files together; hvi reserves 203 for itself
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)
 [hvi] event ledger: /path/to/ledger.ndjson
 [hvi] seatbelt: on (deny default)
 ```
 
 `[hvi] open-file limit:` appears only on macOS, and only when at least one share
-is configured, because the limit is raised while the first share is set up. The
-number is what the process can really hold: the soft `RLIMIT_NOFILE` or the
-kernel's `kern.maxfilesperproc`, whichever is lower.
+is configured, because the first share's setup prints it. The number is what the
+process can really hold: the soft `RLIMIT_NOFILE` or the kernel's
+`kern.maxfilesperproc`, whichever is lower. `hvi boot` sets its soft and hard
+limits to `--max-open-files` before it boots, so the number is no more than
+that.
 
 The line after it gives the budget of open files that the VM's shares draw on
-together: that limit, less what hvi reserves for itself. The reserve covers
-hvi's own descriptors, those of each disk and each share, and those of the
-connections the agent socket may relay. When the limit is smaller than the
-reserve and 64 for the shares, another line says so, and the shares get 64
-anyway.
+together: the VM's open-file limit, less what hvi reserves for itself. The
+reserve covers hvi's own descriptors, those of each disk and each share, and
+those of the connections the agent socket may relay. When the process's limit is
+smaller than the reserve and 64 for the shares, another line says so, and the
+shares get 64 anyway. When `--max-open-files` itself is that small, the boot
+fails and names the least value that works.
 
 On a clean stop, macOS reports each share's peak handle count, and repeats the
 budget:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 guest handles; the VM's exports may hold 91957 open files together
+[hvi] virtio-fs[0]: peak 1 guest handles; the VM's exports may hold 16181 open files together
 guest stopped: SystemOff
 ```
 

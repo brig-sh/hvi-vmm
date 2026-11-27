@@ -668,6 +668,12 @@ pub struct BootConfig {
     /// virtio-fs exports served by vhost-user daemons the caller runs, one
     /// device each. Only the Linux backends serve these, and only these.
     pub fs: Vec<FsConfig>,
+    /// The most host descriptors hvi holds for the VM, or `None` for
+    /// `devices::virtio::fs::fdlimit::DEFAULT_MAX_OPEN_FILES`. The `fs_shares`
+    /// exports share what is left of it after hvi's own descriptors; see
+    /// `docs/embedding.md`. Only the macOS backend uses it: on Linux the
+    /// daemons hold the exports' descriptors.
+    pub max_open_files: Option<usize>,
     pub net: bool,
     /// When set, virtio-net relays frames to this gvisor-tap-vsock gateway QEMU
     /// stream socket (real egress) instead of the built-in user-space stack.
@@ -726,6 +732,10 @@ pub struct BootConfig {
     pub stop: Option<crate::run::StopRegistration>,
 }
 
+/// The fewest open files a VM's exports are given, and so the least
+/// [`BootConfig::max_open_files`] may be: a guest cannot run a shell on fewer.
+pub(crate) const MIN_EXPORT_OPEN_FILES: usize = 64;
+
 impl BootConfig {
     /// Refuses a configuration the host's backend cannot boot.
     ///
@@ -736,6 +746,17 @@ impl BootConfig {
     /// on arm64 for an irqchip choice, and on x86-64 for more vCPUs than
     /// `arch::x86_64::MAX_VCPUS`.
     pub(crate) fn check(&self) -> Result<(), String> {
+        // The macOS backend also refuses a limit that leaves the exports less
+        // than this beside what hvi itself holds, which depends on the VM's
+        // devices.
+        if let Some(limit) = self
+            .max_open_files
+            .filter(|&limit| limit < MIN_EXPORT_OPEN_FILES)
+        {
+            return Err(format!(
+                "--max-open-files {limit}: at least {MIN_EXPORT_OPEN_FILES}"
+            ));
+        }
         // The arm64 backends have a GIC, whose kind follows the host.
         #[cfg(not(target_arch = "x86_64"))]
         if let Some(irqchip) = self.irqchip {
@@ -829,6 +850,7 @@ impl BootConfig {
             disks: Vec::new(),
             fs_shares: Vec::new(),
             fs: Vec::new(),
+            max_open_files: None,
             net: false,
             net_gateway: None,
             net_tap: None,
@@ -1417,6 +1439,20 @@ mod tests {
     #[test]
     fn configuration_with_no_devices_passes() {
         BootConfig::with_no_devices(1).check().unwrap();
+    }
+
+    #[test]
+    fn open_file_limit_below_the_exports_floor_is_refused() {
+        let cfg = BootConfig {
+            max_open_files: Some(63),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert_eq!(cfg.check().unwrap_err(), "--max-open-files 63: at least 64");
+        let cfg = BootConfig {
+            max_open_files: Some(64),
+            ..BootConfig::with_no_devices(1)
+        };
+        assert!(cfg.check().is_ok());
     }
 
     #[test]

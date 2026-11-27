@@ -107,6 +107,7 @@ let cfg = BootConfig {
     disks: Vec::new(),
     fs_shares: Vec::new(),
     fs: Vec::new(),
+    max_open_files: None,
     net: true,
     net_gateway: None,
     net_tap: None,
@@ -147,6 +148,7 @@ cargo build --release --example watch_guest
 | `disks` | `Vec<DiskConfig>` | virtio-blk disks, in guest order. `DiskConfig::rw(path)`, `DiskConfig::ro(path)` or `DiskConfig::parse(spec)`. A disk without a `serial` answers `disk<N>` for its index `N`. |
 | `fs_shares` | `Vec<FsShare>` | virtio-fs exports served in-process. macOS only. |
 | `fs` | `Vec<FsConfig>` | virtio-fs exports served by vhost-user daemons the caller runs. Linux only. |
+| `max_open_files` | `Option<usize>` | The most open files hvi holds for the VM. The `fs_shares` exports share what is left after hvi's own descriptors, or less when the process can hold less. `None` is 16384. `boot` refuses a value that leaves the exports fewer than 64. hvi does not set the process's limit to it, as `hvi boot` does for its own process. A caller running several VMs sets it so their sum stays under `kern.maxfiles`. macOS only. |
 | `net` | `bool` | The built-in stub stack. |
 | `net_gateway` | `Option<String>` | A gvisor-tap socket path. Takes precedence over `net`. |
 | `net_tap` | `Option<String>` | An existing tap. Linux only. Takes precedence over both. |
